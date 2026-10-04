@@ -1,0 +1,583 @@
+// tools/gens3 — renders the XML response deserializers of the pinned S3 model
+// as Bit source (#6628, epic #6565): `pkg/s3/gen_xmlde_NN.bit`. The runtime
+// they are written against is pkg/s3/xmlde.bit (std/xml's element tree, one
+// reader per scalar, the list, map and attribute shapes).
+//
+// What is emitted, from the operations whose output body is XML (the blocks
+// emitresp.bit marks `body: xml`):
+//
+//   - `deserialize<Op>Output(h)`: parses `h.text`, builds the output from the
+//     root element (or, for an `httpPayload` structure, reads that structure
+//     from the root), and calls `fill<Op>Output(h, out)` for the status, the
+//     headers and the metadata. The `s3UnwrappedXmlOutput` operation
+//     (GetBucketLocation) reads its one body member from the text of the root.
+//   - `xmlRead<Shape>(e)` for every structure, union and list or map shape an
+//     XML body reaches, and for an enum that is a list item, a map value, a
+//     union member or an unwrapped root. A structure member that is an enum
+//     is read with the enum's `parse<Enum>` (gen_resp_enums_*.bit), so a value
+//     the model does not name is `Unknown(wire)`.
+//
+// Per member, by its Smithy traits: the element is `xmlName` or the member
+// name; a list is wrapped (the member's element holds items named by the
+// list's member `xmlName`, `member` when it has none) or `xmlFlattened` (the
+// member's elements are the items); a map is wrapped (`entry` elements) or
+// flattened, each entry holding a `key` and a `value` child named by those
+// members' `xmlName`; an `xmlAttribute` member is read from the attribute.
+// A timestamp is `date-time` unless the member or its target says otherwise.
+//
+// A required member with a zero value (string, number, boolean, enum, list,
+// map) that is absent reads as that value, as the SDK leaves it unset; one
+// with none (a structure, a union, a timestamp) fails naming it. A union is
+// the variant of its first child element, `Unknown(name)` for a name the
+// model does not have.
+//
+// A shape the generator cannot read (a blob in an XML body, an attribute that
+// is not a string or an enum, a map not keyed by strings, a union over the
+// complexity ceiling) is an error, so a model bump that brings one stops here.
+
+import { Builder, contains } from "std/strings"
+
+// Statement lines of one generated function (the lint ceiling is 80).
+const xmlMaxFnLines: int = 70
+
+// The most variants a union reader holds: one `if` each, under complexity 10.
+const xmlMaxUnionMembers: int = 8
+
+// The shapes an XML body reaches, parallel to `Plan.m.shapes`.
+class XmlSet {
+  seen: []bool,
+  enumItem: []bool,
+  // Reached shapes whose members are not yet marked.
+  stack: []int,
+}
+
+// The name a reader of shape `i` carries: the type's, or the shape's own.
+fn readerName(p: Plan, i: int): string {
+  if (p.names[i] != "") {
+    return p.names[i]
+  }
+  return shortName(p.m.shapes[i].id)
+}
+
+// The element or attribute name of a member: its `xmlName`, else its name.
+fn xmlMemberName(mem: Member): string {
+  if (mem.xmlName != "") {
+    return mem.xmlName
+  }
+  return mem.name
+}
+
+// The name of the item, key or value element of a list or map member, with the
+// Smithy default when the member names none.
+fn xmlPartName(mem: Member, dflt: string): string {
+  if (mem.xmlName != "") {
+    return mem.xmlName
+  }
+  return dflt
+}
+
+fn quoted(s: string): string {
+  return "\"${s}\""
+}
+
+// The reader of timestamp text for the format `f` ("" is `date-time`).
+fn xmlStampReader(f: string, at: string): string! {
+  if (f == "" || f == "date-time") {
+    return "xmlDateTime"
+  }
+  if (f == "epoch-seconds") {
+    return "xmlEpoch"
+  }
+  if (f == "http-date") {
+    return "xmlHttpDate"
+  }
+  fail newError("${at}: timestamp format ${f} is not one the generator reads")
+}
+
+// The name of the function reading an element as the target of `mem`.
+fn elementReader(p: Plan, mem: Member, at: string): string! {
+  let i = shapeIndex(p.m, mem.target)
+  let s = p.m.shapes[i]
+  if (s.kind == ShapeKind.Blob) {
+    fail newError("${at}: a blob in an XML body is not one the generator reads")
+  }
+  return match (s.kind) {
+    String => "xmlStr"
+    Integer => "xmlInt"
+    Long => "xmlInt"
+    Boolean => "xmlBool"
+    Timestamp => xmlStampReader(firstNonEmpty(mem.timestampFormat, s.timestampFormat), at)?
+    _ => "xmlRead${readerName(p, i)}"
+  }
+}
+
+fn firstNonEmpty(a: string, b: string): string {
+  if (a != "") {
+    return a
+  }
+  return b
+}
+
+// `fnName(a, b)` on one line.
+fn oneLineCall(fnName: string, args: []string): string {
+  return "${fnName}(${commaList(args)})"
+}
+
+// `<indent><lhs><call><tail>`, the call wrapped one argument per line when the
+// line is wider than `respMaxWidth`, as `bit fmt` writes it.
+fn callLine(indent: string, lhs: string, fnName: string, args: []string, tail: string): string! {
+  let one = "${indent}${lhs}${oneLineCall(fnName, args)}${tail}"
+  if (len(one) <= respMaxWidth) {
+    return one + "\n"
+  }
+  let b = Builder()
+  b.write("${indent}${lhs}${fnName}(\n")
+  for a of args {
+    if (len(indent) + 2 + len(a) + 1 > respMaxWidth) {
+      fail newError("${a}: wider than ${respMaxWidth} columns as an argument")
+    }
+    b.write("${indent}  ${a},\n")
+  }
+  b.write("${indent})${tail}\n")
+  return b.toString()
+}
+
+// The `[]T` or `map<K, V>` zero value of a shape.
+fn emptyOf(p: Plan, id: string): string! {
+  let t = typeExpr(p, Role.Output, id)?
+  if (p.m.shapes[shapeIndex(p.m, id)].kind == ShapeKind.List) {
+    return "${t}(0)"
+  }
+  return "${t}()"
+}
+
+// The value a required member holds when its element is absent, "" when it has
+// none (a structure, a union, a timestamp).
+fn xmlZero(p: Plan, mem: Member, at: string): string! {
+  let i = shapeIndex(p.m, mem.target)
+  let dflt = defaultSuffix(p, mem, at)?
+  if (dflt != "") {
+    return dflt[3:len(dflt)]
+  }
+  return match (p.m.shapes[i].kind) {
+    String => "\"\""
+    Integer => "0"
+    Long => "0"
+    Boolean => "false"
+    Enum => "${p.names[i]}.Unknown(\"\")"
+    List => emptyOf(p, mem.target)?
+    Map => emptyOf(p, mem.target)?
+    _ => ""
+  }
+}
+
+// The namespace URI a prefix is declared with somewhere in the model, "" when
+// no member declares it. S3 declares `xsi` on `Grant.Grantee` and reads it
+// on `Grantee.Type`, so the reader's member carries no namespace of its own.
+fn prefixUri(p: Plan, prefix: string): string {
+  for s of p.m.shapes {
+    for mem of s.members {
+      if (mem.xmlNsPrefix == prefix && mem.xmlNsUri != "") {
+        return mem.xmlNsUri
+      }
+    }
+  }
+  return ""
+}
+
+// One call of the runtime: `fn(args)` and the `?` that follows when it can fail.
+class XmlCall {
+  name: string,
+  args: []string,
+  q: string,
+}
+
+fn xmlCall(fnName: string, args: []string, q: string): XmlCall {
+  return XmlCall{ name = fnName, args = args, q = q }
+}
+
+// An attribute member: a string or an enum, read as text.
+fn attributeExpr(p: Plan, mem: Member, src: string, at: string): XmlCall! {
+  let name = xmlMemberName(mem)
+  let colon = indexOfColon(name)
+  let local = name[colon + 1:len(name)]
+  let space = ""
+  if (colon >= 0) {
+    space = prefixUri(p, name[0:colon])
+    if (space == "") {
+      fail newError("${at}: the prefix of attribute ${name} is declared nowhere in the model")
+    }
+  }
+  let i = shapeIndex(p.m, mem.target)
+  let k = p.m.shapes[i].kind
+  if (k == ShapeKind.String) {
+    return xmlCall("xmlAttr", [src, quoted(local), quoted(space)], "")
+  }
+  if (k == ShapeKind.Enum) {
+    return xmlCall("xmlAttrEnum", [src, quoted(local), quoted(space), "parse${p.names[i]}"], "")
+  }
+  fail newError("${at}: an attribute of this kind is not one the generator reads")
+}
+
+fn indexOfColon(s: string): int {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == ':') {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// A list member: wrapped (`xmlList`) or flattened (`xmlFlat`).
+fn listExpr(p: Plan, mem: Member, src: string, at: string): XmlCall! {
+  let l = p.m.shapes[shapeIndex(p.m, mem.target)]
+  let item = l.members[0]
+  let read = elementReader(p, item, at)?
+  let name = quoted(xmlMemberName(mem))
+  if (mem.xmlFlattened) {
+    return xmlCall("xmlFlat", [src, name, read], "?")
+  }
+  return xmlCall("xmlList", [src, name, quoted(xmlPartName(item, "member")), read], "?")
+}
+
+fn checkMapKey(p: Plan, m: Shape, at: string): ()! {
+  if (p.m.shapes[shapeIndex(p.m, m.members[0].target)].kind != ShapeKind.String) {
+    fail newError("${at}: a map in an XML body must be keyed by strings")
+  }
+}
+
+// A map member: wrapped (the reader of the map shape) or flattened.
+fn mapExpr(p: Plan, mem: Member, src: string, at: string): XmlCall! {
+  let m = p.m.shapes[shapeIndex(p.m, mem.target)]
+  checkMapKey(p, m, at)?
+  if (!mem.xmlFlattened) {
+    let read = "xmlRead${readerName(p, shapeIndex(p.m, mem.target))}"
+    return xmlCall("xmlOpt", [src, quoted(xmlMemberName(mem)), read], "?")
+  }
+  let args = [
+    src,
+    quoted(xmlMemberName(mem)),
+    quoted(xmlPartName(m.members[0], "key")),
+    quoted(xmlPartName(m.members[1], "value")),
+    elementReader(p, m.members[1], at)?,
+  ]
+  return xmlCall("xmlFlatMap", args, "?")
+}
+
+// The expression reading member `mem` of the element `src` as an `Option`.
+fn memberExpr(p: Plan, mem: Member, src: string, at: string): XmlCall! {
+  if (mem.xmlAttribute) {
+    return attributeExpr(p, mem, src, at)?
+  }
+  let i = shapeIndex(p.m, mem.target)
+  let k = p.m.shapes[i].kind
+  if (k == ShapeKind.List) {
+    return listExpr(p, mem, src, at)?
+  }
+  if (k == ShapeKind.Map) {
+    return mapExpr(p, mem, src, at)?
+  }
+  let name = quoted(xmlMemberName(mem))
+  if (k == ShapeKind.Enum) {
+    return xmlCall("xmlEnum", [src, name, "parse${p.names[i]}"], "")
+  }
+  return xmlCall("xmlOpt", [src, name, elementReader(p, mem, at)?], "?")
+}
+
+// `    field = expr,` for member `mem`: the `Option` itself when the field is
+// one, else the value with the zero or the failure of an absent element.
+fn memberLine(p: Plan, owner: string, mem: Member, src: string, indent: string): string! {
+  let at = "${owner}.${mem.name}"
+  let c = memberExpr(p, mem, src, at)?
+  let lhs = "${fieldName(mem.name)} = "
+  if (isOptionalMember(mem)) {
+    return callLine(indent, lhs, c.name, c.args, "${c.q},")?
+  }
+  let inner = oneLineCall(c.name, c.args) + c.q
+  let zero = xmlZero(p, mem, at)?
+  if (zero == "") {
+    return callLine(indent, lhs, "xmlNeed", [inner, quoted(at)], "?,")?
+  }
+  return callLine(indent, lhs, "unwrapOr", [inner, zero], ",")?
+}
+
+// A member of the body: not bound to a header, a prefix, the status or a payload.
+fn isBodyMember(mem: Member): bool {
+  return !isBound(mem)
+}
+
+// The member lines of a structure literal read from `src`.
+fn bodyLines(p: Plan, s: Shape, src: string, indent: string): string! {
+  let b = Builder()
+  let n = 0
+  for mem of s.members {
+    if (isBodyMember(mem)) {
+      b.write(memberLine(p, shortName(s.id), mem, src, indent)?)
+      n = n + 1
+    }
+  }
+  if (n > xmlMaxFnLines) {
+    fail newError("${s.id}: ${n} body members do not fit one function")
+  }
+  return b.toString()
+}
+
+// `T{ ... }` over the member lines `lines`, `T{}` when there are none.
+fn literalOf(name: string, lines: string, indent: string): string {
+  if (lines == "") {
+    return "${name}{}"
+  }
+  return "${name}{\n${lines}${indent}}"
+}
+
+// The literal of a structure read from `src`.
+fn structLiteral(p: Plan, s: Shape, name: string, src: string, indent: string): string! {
+  return literalOf(name, bodyLines(p, s, src, indent + "  ")?, indent)
+}
+
+// `xmlRead<Struct>(e)`.
+fn renderStructReader(p: Plan, i: int): string! {
+  let s = p.m.shapes[i]
+  let n = readerName(p, i)
+  let lit = structLiteral(p, s, n, "e", "  ")?
+  return "// ${s.id}\nfn xmlRead${n}(e: Element): ${n}! {\n  return ${lit}\n}\n"
+}
+
+// The member of a union that `c`'s name selects.
+fn unionBranch(p: Plan, owner: string, mem: Member): string! {
+  let v = unionVariant(mem.name, owner)?
+  let read = elementReader(p, mem, "${owner}.${mem.name}")?
+  let name = xmlMemberName(mem)
+  return "  if (c.local == ${quoted(name)}) {\n    return ${owner}.${v}(${read}(c)?)\n  }\n"
+}
+
+// `xmlRead<Union>(e)`: the variant of the first child element.
+fn renderUnionReader(p: Plan, i: int): string! {
+  let s = p.m.shapes[i]
+  let n = readerName(p, i)
+  if (len(s.members) > xmlMaxUnionMembers) {
+    fail newError("${s.id}: ${len(s.members)} members, a union reader holds ${xmlMaxUnionMembers}")
+  }
+  let b = Builder()
+  b.write("// ${s.id}\nfn xmlRead${n}(e: Element): ${n}! {\n  let c = xmlFirst(e)?\n")
+  for mem of s.members {
+    b.write(unionBranch(p, n, mem)?)
+  }
+  b.write("  return ${n}.Unknown(c.local)\n}\n")
+  return b.toString()
+}
+
+// `xmlRead<List>(e)`: the items of a list element, for a nested list.
+fn renderListReader(p: Plan, i: int): string! {
+  let s = p.m.shapes[i]
+  let item = s.members[0]
+  let read = elementReader(p, item, s.id)?
+  let t = typeExpr(p, Role.Output, s.id)?
+  let call = oneLineCall("xmlItems", ["e", quoted(xmlPartName(item, "member")), read])
+  return "// ${s.id}\nfn xmlRead${readerName(p, i)}(e: Element): ${t}! {\n  return ${call}?\n}\n"
+}
+
+// `xmlRead<Map>(e)`: the entries of a map element.
+fn renderMapReader(p: Plan, i: int): string! {
+  let s = p.m.shapes[i]
+  checkMapKey(p, s, s.id)?
+  let t = typeExpr(p, Role.Output, s.id)?
+  let args = [
+    "e",
+    quoted(xmlPartName(s.members[0], "key")),
+    quoted(xmlPartName(s.members[1], "value")),
+    elementReader(p, s.members[1], s.id)?,
+  ]
+  let head = "// ${s.id}\nfn xmlRead${readerName(p, i)}(e: Element): ${t}! {\n"
+  return head + callLine("  ", "return ", "xmlMap", args, "?")? + "}\n"
+}
+
+// `xmlRead<Enum>(e)`: an enum as the item of a list, the value of a map or a
+// union member.
+fn renderEnumReader(p: Plan, i: int): string {
+  let n = p.names[i]
+  return "// ${p.m.shapes[i].id}\nfn xmlRead${n}(e: Element): ${n}! {\n  return parse${n}(e.text())\n}\n"
+}
+
+fn renderReader(p: Plan, i: int): string! {
+  return match (p.m.shapes[i].kind) {
+    Structure => renderStructReader(p, i)?
+    Union => renderUnionReader(p, i)?
+    List => renderListReader(p, i)?
+    Map => renderMapReader(p, i)?
+    Enum => ""
+    _ => ""
+  }
+}
+
+// What an XML-bodied output reads its members from, and which members.
+fn isXmlOutput(p: Plan, op: Operation): bool! {
+  if (isUnitOutput(op)) {
+    return false
+  }
+  return bodyKind(p, outputUnit(p, op)?)? == RespBody.Xml
+}
+
+fn xmlOutputs(p: Plan): []Operation! {
+  let ops = []Operation(0)
+  for op of p.m.operations {
+    if (isXmlOutput(p, op)?) {
+      ops = append(ops, op)
+    }
+  }
+  return ops
+}
+
+// Marks shape `i` as reached and queued, and as an element-level enum when `item`.
+fn markShape(p: Plan, set: XmlSet, i: int, item: bool) {
+  if (item && p.m.shapes[i].kind == ShapeKind.Enum) {
+    set.enumItem[i] = true
+  }
+  if (set.seen[i]) {
+    return
+  }
+  set.seen[i] = true
+  set.stack = append(set.stack, i)
+}
+
+// Marks the members' targets of reached shape `i`. An enum's members are
+// values, not shapes.
+fn markMembers(p: Plan, set: XmlSet, i: int) {
+  let s = p.m.shapes[i]
+  if (s.kind == ShapeKind.Enum) {
+    return
+  }
+  for mem of s.members {
+    markShape(p, set, shapeIndex(p.m, mem.target), s.kind != ShapeKind.Structure)
+  }
+}
+
+// The shapes the XML bodies of `ops` reach, to a fixed point over members.
+fn reachedShapes(p: Plan, ops: []Operation): XmlSet! {
+  let n = len(p.m.shapes)
+  let set = XmlSet{ seen = []bool(n), enumItem = []bool(n), stack = []int(0) }
+  for op of ops {
+    let u = outputUnit(p, op)?
+    for mem of u.shape.members {
+      if (isBodyMember(mem) || mem.payload) {
+        markShape(p, set, shapeIndex(p.m, mem.target), op.unwrappedXmlOutput)
+      }
+    }
+  }
+  while (len(set.stack) > 0) {
+    let i = set.stack[len(set.stack) - 1]
+    set.stack = set.stack[0:len(set.stack) - 1]
+    markMembers(p, set, i)
+  }
+  return set
+}
+
+// The statement filling an output from the root element `root`.
+fn outputLiteral(p: Plan, op: Operation, u: Unit): string! {
+  if (op.unwrappedXmlOutput) {
+    return unwrappedLiteral(p, u)?
+  }
+  for mem of u.shape.members {
+    if (mem.payload) {
+      return payloadLiteral(p, u, mem)?
+    }
+  }
+  return structLiteral(p, u.shape, u.name, "root", "  ")?
+}
+
+// The one line of an output's literal that reads member `mem` from the root
+// with `read(root)`.
+fn rootLine(mem: Member, read: string): string! {
+  let lhs = "${fieldName(mem.name)} = "
+  if (isOptionalMember(mem)) {
+    return callLine("    ", lhs, "Option.Some", ["${read}(root)?"], ",")?
+  }
+  return "    ${lhs}${read}(root)?,\n"
+}
+
+// An output whose one body member is the text of the root element.
+fn unwrappedLiteral(p: Plan, u: Unit): string! {
+  let body = []Member(0)
+  for mem of u.shape.members {
+    if (isBodyMember(mem)) {
+      body = append(body, mem)
+    }
+  }
+  let at = "${u.shape.id}: unwrapped output"
+  if (len(body) != 1) {
+    fail newError("${at}: ${len(body)} body members, want 1")
+  }
+  let k = p.m.shapes[shapeIndex(p.m, body[0].target)].kind
+  if (k != ShapeKind.Enum && k != ShapeKind.String) {
+    fail newError("${at}: the root text is not an enum or a string")
+  }
+  return literalOf(u.name, rootLine(body[0], elementReader(p, body[0], at)?)?, "  ")
+}
+
+// An output whose payload member is a structure read from the root element.
+fn payloadLiteral(p: Plan, u: Unit, mem: Member): string! {
+  let read = "xmlRead${readerName(p, shapeIndex(p.m, mem.target))}"
+  return literalOf(u.name, rootLine(mem, read)?, "  ")
+}
+
+// `deserialize<Op>Output(h)`: the body, then `fill` for the rest.
+fn renderXmlOp(p: Plan, op: Operation): string! {
+  let u = outputUnit(p, op)?
+  let lit = outputLiteral(p, op, u)?
+  let b = Builder()
+  b.write("// ${u.shape.id}: ${op.id}\n")
+  b.write("fn deserialize${u.name}(h: ResponseHead): ${u.name}! {\n")
+  b.write("  let root = xmlRoot(h)?\n  let out = ${lit}\n")
+  b.write("  fill${u.name}(h, out)?\n  return out\n}\n")
+  return b.toString()
+}
+
+// Every block: the readers of the reached shapes, then the operations.
+fn xmlBlocks(p: Plan): []string! {
+  let ops = xmlOutputs(p)?
+  let set = reachedShapes(p, ops)?
+  let blocks = []string(0)
+  let i = 0
+  while (i < len(p.m.shapes)) {
+    if (set.seen[i]) {
+      let text = renderReader(p, i)?
+      if (p.m.shapes[i].kind == ShapeKind.Enum && set.enumItem[i]) {
+        text = renderEnumReader(p, i)
+      }
+      if (text != "") {
+        blocks = append(blocks, text)
+      }
+    }
+    i = i + 1
+  }
+  for op of ops {
+    blocks = append(blocks, renderXmlOp(p, op)?)
+  }
+  return blocks
+}
+
+// Every `gen_xmlde_*.bit`. `commit` and `sha` are the model pin.
+fn renderXmlDe(m: Model, commit: string, sha: string): []GenFile! {
+  return renderXmlDeFrom(planShapes(m)?, commit, sha)?
+}
+
+// The files for an already planned model (the vector model is planned the same way).
+fn renderXmlDeFrom(p: Plan, commit: string, sha: string): []GenFile! {
+  let head = headerLines("xmlde", commit, sha) + "\n"
+  let files = []GenFile(0)
+  for f of packRespFiles("gen_xmlde_", head, xmlBlocks(p)?) {
+    files = append(files, withElementImport(f, head))
+  }
+  return files
+}
+
+// `f` with the `Element` import after its header when a reader names `Element`.
+fn withElementImport(f: GenFile, head: string): GenFile {
+  if (!contains(f.text, "(e: Element)")) {
+    return f
+  }
+  let rest = f.text[len(head):len(f.text)]
+  return GenFile{ name = f.name, text = head + "import { Element } from \"std/xml\"\n\n" + rest }
+}
