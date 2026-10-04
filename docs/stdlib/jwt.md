@@ -85,10 +85,14 @@ the ASN.1/DER form.
 
 The inverse of `ecdsaSigToRaw`. Fails on any length other than 64 bytes.
 
-### `sign(key: SigningKey, payload: Json): string!`
+### `sign(key: SigningKey, payload: Json, typ: string = "JWT", kid: string = ""): string!`
 
 Sign `payload` as a compact JWS (`header.payload.signature`, base64url). The
-header is always `{"alg":"<key's own algorithm>","typ":"JWT"}`.
+header is `{"alg":"<key's own algorithm>","typ":"<typ>"}`, with `"kid"` added
+when `kid` is not empty. `typ` is `JWT` unless you name another: an access token
+(RFC 9068) is `sign(key, payload, typ = "at+jwt", kid = "2026-10")`, and a
+rotating issuer names its key by `kid` so a verifier can pick the right one. An
+empty `typ` fails.
 
 ### `verify(token: string, key: VerifyKey): Json!`
 

@@ -122,6 +122,13 @@ protected route that is not itself doing the authenticating just reads
   for every address, `authenticate` spends it once, refuses another browser's
   copy, and regenerates the session id; optionally throttled with a
   `LoginThrottle`; see [Sign in with a link in an email](docs/magic-link.md).
+- `AccessTokens`, `KeySet`, `TokenOptions`, `BearerStrategy`, `BearerChallenge` -
+  JWT bearer access tokens for an API (RFC 9068): `issue` signs one with a
+  pinned algorithm, `kid` and a random `jti`, `verify` refuses `none`, a wrong
+  `typ`, issuer or audience and an expired token, keys rotate by listing the
+  retired one, and `BearerStrategy` answers a failure with the 401 and
+  `WWW-Authenticate` header RFC 6750 asks for, never saying why; see
+  [Bearer tokens for an API](docs/bearer-tokens.md).
 - `generateRecoveryCodes`, `RecoveryOptions`, `RecoverySet`,
   `redeemRecoveryCode`, `RedeemOptions`, `RecoveryRedeem` - single-use
   recovery codes for a lost authenticator: generated from the CSPRNG, stored
