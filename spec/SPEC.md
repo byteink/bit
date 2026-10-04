@@ -2849,8 +2849,8 @@ Rules - **E0079** `symbol_attr_invalid` unless all hold:
   and not a generic function (each instantiation would need its own name);
 - the signature must cross the C ABI: every parameter and the result is a scalar
   or a raw pointer (`*T`), and the function is not variadic. A fallible result
-  (`T!E`) returns through the thread-local error slot rather than the C return
-  register, so it is rejected too. This is the same restriction §11.7 applies in
+  (`T!E`) returns its error in an extra return register (runtime/ABI.md §13)
+  rather than the C return register, so it is rejected too. This is the same restriction §11.7 applies in
   the consuming direction, and for the same reason - one shared marshaller,
   which marshals nothing else.
 
