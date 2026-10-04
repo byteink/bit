@@ -314,6 +314,38 @@ Rejected at `render()`, as `smtp: '<id>' is not a valid Message-ID`, unless it
 is RFC 5322 `id-left "@" id-right`: dot-atom-text on both sides, printable
 ASCII with no space, CR, LF or NUL, at most 250 octets.
 
+### `Message.setHeader(name: string, value: string)`
+
+Set a custom header: `In-Reply-To` and `References` to thread a reply,
+`List-Unsubscribe` and `List-Unsubscribe-Post` for bulk mail, `Auto-Submitted`
+for an automated one, or a provider's own `X-` field. The fields are written
+after `Message-ID` and before `MIME-Version`, in the order first set. Setting a
+name again, in any letter case, replaces its value and keeps its place:
+
+```bit
+import { Message, Address } from "std/smtp"
+
+// A reply that threads under the receipt sent earlier.
+fn followUp(order: string): string! {
+  let m = Message(Address{ name = "Billing", email = "billing@inkwell.dev" })
+  m.addTo(Address{ name = "", email = "customer@example.net" })
+  m.setSubject("Re: your receipt")
+  m.setHeader("In-Reply-To", "<receipt-${order}@inkwell.dev>")
+  m.setHeader("References", "<receipt-${order}@inkwell.dev>")
+  m.setHeader("Auto-Submitted", "auto-generated")
+  return m.render()?
+}
+```
+
+The value is folded, or encoded as RFC 2047 words, like a subject, and is
+rejected at `render()` if it carries a CR, LF or NUL. The name is checked at
+`render()` too: it must be 1 to 76 octets of printable ASCII other than a space
+or `:`, else `smtp: '<name>' is not a valid header name`. A name a typed setter
+owns is refused, in any letter case, as `smtp: header <name> is set by its own
+method, not setHeader`: `From`, `To`, `Cc`, `Bcc`, `Reply-To`, `Subject`,
+`Date`, `Message-ID`, `MIME-Version` and every `Content-*` name. Two ways to set
+one field would let a receiver read either, so there is only one.
+
 ### `Message.recipients(): []Address`
 
 Every address this message is delivered to, `To:`, then `Cc:`, then `Bcc:`, in
@@ -324,7 +356,7 @@ the order added - the envelope `RCPT TO` list. `Reply-To:` is not in it.
 The complete RFC 5322 message: headers, a blank line, and the body, CRLF
 throughout, dot-stuffing NOT applied (that belongs to the transmission, not to
 the message). The headers are, in order, `Date`, `From`, `To`, `Cc`, `Reply-To`, `Subject`,
-`Message-ID`, `MIME-Version` and the `Content-*` fields. `Date` is the time of
+`Message-ID`, the `setHeader` fields, `MIME-Version` and the `Content-*` fields. `Date` is the time of
 the render in RFC 5322 form with a numeric zone, `Date: Sun, 06 Nov 1994
 08:49:37 +0000`, and `Message-ID` is `<uuidv7@sender-domain>` unless
 `setMessageId` set one. Both are written here rather than left to a relay: a
