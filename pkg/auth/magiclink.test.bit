@@ -1,0 +1,397 @@
+// pkg/auth/magiclink.test.bit — #6934's acceptance: MagicLinkStrategy through
+// the real `App.handle` seam, on an injected clock and an in-memory store. A
+// link works once, an expired one does not, an unknown address is answered like
+// a known one, the session id is regenerated, a link opened in another browser
+// is refused (and accepted with the binding off), another purpose's token is
+// refused, each missing option fails at construction, and the throttle is
+// consulted for both the request and the redeem.
+//
+// `FakeClock`, `FakeStore`, `fakeStore`, `freshClock` and `throttleOn` come from
+// throttle.test.bit and `RecordingStore`, `recordingStore` from onetime.test.bit
+// (one module); `App`, `Config`, `MemoryStore`, `Request` and `Response` are bound by
+// the other test files, `split` by the sources.
+
+// The app's side: its users (address to id), what `deliver` was handed and what
+// the delivery-failure hook heard.
+class MlWorld {
+  ids: map<string, string>,
+  tokens: []string,
+  sentTo: []string,
+  expiries: []i64,
+  errors: []string,
+  deliverFails: bool,
+}
+
+fn mlWorld(): MlWorld {
+  let ids = map<string, string>()
+  ids["ada@example.com"] = "author-17"
+  return MlWorld{
+    ids = ids,
+    tokens = []string{},
+    sentTo = []string{},
+    expiries = []i64{},
+    errors = []string{},
+    deliverFails = false,
+  }
+}
+
+fn mlOptions(w: MlWorld): MagicLinkOptions {
+  let lookup: (string) => Option<MagicLinkUser> = (address) => {
+    let (id, found) = w.ids[address]
+    if (!found) {
+      return Option<MagicLinkUser>.None
+    }
+    return Option<MagicLinkUser>.Some(MagicLinkUser{ id = id, claims = Json.JsonNull })
+  }
+  let deliver: Deliver = (to, token, expiresAt) => {
+    w.tokens = append(w.tokens, token)
+    w.sentTo = append(w.sentTo, to)
+    w.expiries = append(w.expiries, expiresAt)
+    if (w.deliverFails) {
+      fail newError("smtp down")
+    }
+  }
+  let heard: MagicLinkErrorHook = (e) => {
+    w.errors = append(w.errors, e.message())
+  }
+  return MagicLinkOptions{ lookup = lookup, deliver = deliver, onDeliveryError = heard }
+}
+
+fn mlStrategyOn(store: OneTimeStore, clock: FakeClock, opts: MagicLinkOptions): MagicLinkStrategy {
+  let read: () => i64 = () => clock.t
+  let tokens = OneTimeTokens(store, OneTimeOptions{ clock = read }) catch e {
+    panic("OneTimeTokens: ${e.message()}")
+  }
+  return MagicLinkStrategy(tokens, opts) catch e {
+    panic("MagicLinkStrategy: ${e.message()}")
+  }
+}
+
+fn mlStrategy(clock: FakeClock, opts: MagicLinkOptions): MagicLinkStrategy {
+  return mlStrategyOn(MemoryOneTimeStore(100), clock, opts)
+}
+
+fn mlAppOn(s: MagicLinkStrategy, sessions: MemoryStore): App {
+  let app = App(Config{ secret = "test-secret", sessions = sessions })
+  app.post("/magic", (c) => {
+    s.request(c, c.query("email"))?
+    return c.status(202)
+  })
+  app.post("/magic/redeem", (c) => {
+    let who = s.authenticate(c)?
+    return c.text(who.id)
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+fn mlApp(s: MagicLinkStrategy): App {
+  return mlAppOn(s, MemoryStore(1000))
+}
+
+fn mlHeaders(cookie: string): string {
+  if (cookie == "") {
+    return "Content-Type: application/json"
+  }
+  return "Content-Type: application/json\r\nCookie: ${cookie}"
+}
+
+fn mlAsk(app: App, email: string, cookie: string): Response {
+  return app.handle(
+    Request{
+      method = "POST",
+      path = "/magic?email=${email}",
+      headers = mlHeaders(cookie),
+      body = "",
+      peer = "203.0.113.7",
+    },
+  )
+}
+
+fn mlRedeem(app: App, token: string, cookie: string): Response {
+  return app.handle(
+    Request{
+      method = "POST",
+      path = "/magic/redeem",
+      headers = mlHeaders(cookie),
+      body = "{\"token\":\"${token}\"}",
+      peer = "203.0.113.7",
+    },
+  )
+}
+
+// The `sid=...` pair of a response's `Set-Cookie`, "" when it sets none.
+fn mlCookie(res: Response): string {
+  let line = res.getHeader("Set-Cookie")
+  if (line == "") {
+    return ""
+  }
+  return split(line, ";")[0]
+}
+
+fn mlOff(w: MlWorld): MagicLinkOptions {
+  let o = mlOptions(w)
+  o.bindToBrowser = false
+  return o
+}
+
+test "a link signs the user in once, and a second use of it is refused" {
+  let w = mlWorld()
+  let app = mlApp(mlStrategy(freshClock(), mlOff(w)))
+  let ask = mlAsk(app, "ada@example.com", "")
+  assert(ask.status == 202, "want 202, got ${ask.status}")
+  assert(
+    len(w.tokens) == 1 && w.sentTo[0] == "ada@example.com",
+    "delivered ${len(w.tokens)} link(s)",
+  )
+  let first = mlRedeem(app, w.tokens[0], "")
+  assert(
+    first.status == 200 && first.body == "author-17",
+    "want 200 author-17, got ${first.status} '${first.body}'",
+  )
+  let again = mlRedeem(app, w.tokens[0], "")
+  assert(again.status == 401, "the second use must be refused, got ${again.status}")
+}
+
+test "deliver gets the address, a 43 character token and the expiry" {
+  let w = mlWorld()
+  let clock = freshClock()
+  let app = mlApp(mlStrategy(clock, mlOptions(w)))
+  let _ = mlAsk(app, "ada@example.com", "")
+  assert(w.sentTo[0] == "ada@example.com", "sent to ${w.sentTo[0]}")
+  assert(len(w.tokens[0]) == 43, "token length ${len(w.tokens[0])}")
+  assert(w.expiries[0] == clock.t + 600, "expiry ${w.expiries[0]}")
+}
+
+test "an expired link is refused" {
+  let w = mlWorld()
+  let clock = freshClock()
+  let app = mlApp(mlStrategy(clock, mlOff(w)))
+  let _ = mlAsk(app, "ada@example.com", "")
+  clock.t = clock.t + 600
+  let res = mlRedeem(app, w.tokens[0], "")
+  assert(res.status == 401, "an expired link must be refused, got ${res.status}")
+}
+
+test "a request for an unknown address is answered and stored like one for a known address" {
+  let known = mlWorld()
+  let knownStore = recordingStore()
+  let knownApp = mlApp(mlStrategyOn(knownStore, freshClock(), mlOptions(known)))
+  let unknown = mlWorld()
+  let unknownStore = recordingStore()
+  let unknownApp = mlApp(mlStrategyOn(unknownStore, freshClock(), mlOptions(unknown)))
+
+  let a = mlAsk(knownApp, "ada@example.com", "")
+  let b = mlAsk(unknownApp, "ghost@example.com", "")
+
+  assert(a.status == 202 && b.status == 202, "want 202 and 202, got ${a.status} and ${b.status}")
+  assert(a.body == b.body, "bodies differ: '${a.body}' and '${b.body}'")
+  assert(mlCookie(a) != "" && mlCookie(b) != "", "both must set the session cookie")
+  assert(len(mlCookie(a)) == len(mlCookie(b)), "the cookies differ in shape")
+  assert(len(knownStore.hashes) == 1, "known: ${len(knownStore.hashes)} store step(s), want 1")
+  assert(
+    len(unknownStore.hashes) == 1,
+    "unknown: ${len(unknownStore.hashes)} store step(s), want 1",
+  )
+  assert(
+    len(known.tokens) == 1 && len(unknown.tokens) == 0,
+    "known ${len(known.tokens)}, unknown ${len(unknown.tokens)} delivery(ies)",
+  )
+  assert(len(unknown.errors) == 0, "an unknown address reported an error")
+}
+
+test "a login regenerates the session id and the old one is dead" {
+  let w = mlWorld()
+  let sessions = MemoryStore(1000)
+  let app = mlAppOn(mlStrategy(freshClock(), mlOptions(w)), sessions)
+  let before = mlCookie(mlAsk(app, "ada@example.com", ""))
+  let res = mlRedeem(app, w.tokens[0], before)
+  assert(res.status == 200, "want 200, got ${res.status}")
+  let after = mlCookie(res)
+  assert(
+    after != "" && after != before,
+    "the session id was not regenerated: '${before}' then '${after}'",
+  )
+  let old = sessions.load(before[4:len(before)]) catch e {
+    panic("load: ${e.message()}")
+  }
+  assert(!isSome(old), "the old session id still loads")
+}
+
+test "a link opened in another browser is refused when bound, and spent" {
+  let w = mlWorld()
+  let app = mlApp(mlStrategy(freshClock(), mlOptions(w)))
+  let mine = mlCookie(mlAsk(app, "ada@example.com", ""))
+  let other = mlRedeem(app, w.tokens[0], "")
+  assert(other.status == 401, "a link from another browser must be refused, got ${other.status}")
+  let rightBrowser = mlRedeem(app, w.tokens[0], mine)
+  assert(rightBrowser.status == 401, "the refused link must be spent, got ${rightBrowser.status}")
+}
+
+test "the browser that asked can use the link" {
+  let w = mlWorld()
+  let app = mlApp(mlStrategy(freshClock(), mlOptions(w)))
+  let mine = mlCookie(mlAsk(app, "ada@example.com", ""))
+  let res = mlRedeem(app, w.tokens[0], mine)
+  assert(
+    res.status == 200 && res.body == "author-17",
+    "want 200 author-17, got ${res.status} '${res.body}'",
+  )
+}
+
+test "a link opened in another browser is accepted when the binding is off" {
+  let w = mlWorld()
+  let app = mlApp(mlStrategy(freshClock(), mlOff(w)))
+  let _ = mlAsk(app, "ada@example.com", "")
+  let res = mlRedeem(app, w.tokens[0], "")
+  assert(
+    res.status == 200 && res.body == "author-17",
+    "want 200 author-17, got ${res.status} '${res.body}'",
+  )
+}
+
+test "a token issued for another purpose does not log in" {
+  let w = mlWorld()
+  let s = mlStrategy(freshClock(), mlOff(w))
+  let app = mlApp(s)
+  let reset = s.tokens.issue("password-reset", "author-17", 600) catch e {
+    panic("issue: ${e.message()}")
+  }
+  let res = mlRedeem(app, reset, "")
+  assert(res.status == 401, "a reset token must not log in, got ${res.status}")
+}
+
+test "a new link kills the earlier one" {
+  let w = mlWorld()
+  let app = mlApp(mlStrategy(freshClock(), mlOff(w)))
+  let _ = mlAsk(app, "ada@example.com", "")
+  let _ = mlAsk(app, "ada@example.com", "")
+  assert(len(w.tokens) == 2 && w.tokens[0] != w.tokens[1], "want two different links")
+  assert(mlRedeem(app, w.tokens[0], "").status == 401, "the first link must be dead")
+  assert(mlRedeem(app, w.tokens[1], "").status == 200, "the newest link must work")
+}
+
+test "a failed delivery revokes the link, tells the hook, and the caller sees the usual answer" {
+  let w = mlWorld()
+  w.deliverFails = true
+  let app = mlApp(mlStrategy(freshClock(), mlOff(w)))
+  let res = mlAsk(app, "ada@example.com", "")
+  assert(res.status == 202, "want 202, got ${res.status}")
+  assert(len(w.errors) == 1 && w.errors[0] == "smtp down", "hook heard ${len(w.errors)} error(s)")
+  assert(mlRedeem(app, w.tokens[0], "").status == 401, "the undelivered link must be dead")
+}
+
+test "a user deleted after the request is refused" {
+  let w = mlWorld()
+  let app = mlApp(mlStrategy(freshClock(), mlOff(w)))
+  let _ = mlAsk(app, "ada@example.com", "")
+  delete(w.ids, "ada@example.com")
+  assert(mlRedeem(app, w.tokens[0], "").status == 401, "a deleted user must be refused")
+}
+
+test "an address that is not one address is a 400 and sends nothing" {
+  let w = mlWorld()
+  let app = mlApp(mlStrategy(freshClock(), mlOptions(w)))
+  let res = mlAsk(app, "ada@example.com,eve@example.com", "")
+  assert(res.status == 400, "want 400, got ${res.status}")
+  assert(len(w.tokens) == 0, "delivered ${len(w.tokens)} link(s)")
+}
+
+// The message construction fails with, "" when it succeeds.
+fn mlBuildError(tokens: OneTimeTokens, o: MagicLinkOptions): string {
+  let _ = MagicLinkStrategy(tokens, o) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+test "construction fails for each of 3 missing or unusable options" {
+  let w = mlWorld()
+  let tokens = OneTimeTokens(MemoryOneTimeStore(10)) catch e {
+    panic("OneTimeTokens: ${e.message()}")
+  }
+  let noLookup = mlOptions(w)
+  noLookup.lookup = nil
+  let noDeliver = mlOptions(w)
+  noDeliver.deliver = nil
+  let badTtl = mlOptions(w)
+  badTtl.ttl = 0
+  let cases = []MagicLinkOptions{ noLookup, noDeliver, badTtl }
+  let names = []string{ "lookup", "deliver", "ttl" }
+  let i = 0
+  while (i < len(cases)) {
+    let msg = mlBuildError(tokens, cases[i])
+    assert(msg != "", "construction accepted a missing ${names[i]}")
+    assert(contains(msg, "`${names[i]}`"), "the error does not name ${names[i]}: ${msg}")
+    i = i + 1
+  }
+}
+
+test "a ttl above the token store's maximum fails at construction" {
+  let w = mlWorld()
+  let tokens = OneTimeTokens(MemoryOneTimeStore(10)) catch e {
+    panic("OneTimeTokens: ${e.message()}")
+  }
+  let o = mlOptions(w)
+  o.ttl = tokens.opts.maxTtl + 1
+  assert(mlBuildError(tokens, o) != "", "an over-long ttl was accepted")
+}
+
+// --- the throttle ------------------------------------------------------
+
+fn mlThrottled(w: MlWorld, clock: FakeClock): MagicLinkStrategy {
+  let o = mlOff(w)
+  o.throttle = Option<LoginThrottle>.Some(throttleOn(fakeStore(clock), clock, ThrottleOptions{}))
+  return mlStrategy(clock, o)
+}
+
+test "the throttle refuses a second request at once, the same for a known and an unknown address" {
+  let clock = freshClock()
+  let w = mlWorld()
+  let app = mlApp(mlThrottled(w, clock))
+  let first = mlAsk(app, "ada@example.com", "")
+  let known = mlAsk(app, "ada@example.com", "")
+  let ghost = mlAsk(app, "ghost@example.com", "")
+  let ghostAgain = mlAsk(app, "ghost@example.com", "")
+  assert(first.status == 202 && ghost.status == 202, "the first requests want 202")
+  assert(
+    known.status == 429 && ghostAgain.status == 429,
+    "want 429 and 429, got ${known.status} and ${ghostAgain.status}",
+  )
+  assert(known.body == ghostAgain.body, "bodies differ")
+  assert(
+    known.getHeader("Retry-After") == ghostAgain.getHeader("Retry-After"),
+    "Retry-After differs",
+  )
+  assert(len(w.tokens) == 1, "delivered ${len(w.tokens)} link(s), want 1")
+}
+
+test "the throttle counts refused links, then clears on a success" {
+  let clock = freshClock()
+  let w = mlWorld()
+  let app = mlApp(mlThrottled(w, clock))
+  let _ = mlAsk(app, "ada@example.com", "")
+  clock.t = clock.t + 60
+  let bad = mlRedeem(app, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "")
+  assert(bad.status == 401, "want 401, got ${bad.status}")
+  let held = mlRedeem(app, w.tokens[0], "")
+  assert(held.status == 429, "a second attempt at once must wait, got ${held.status}")
+  clock.t = clock.t + 60
+  let good = mlRedeem(app, w.tokens[0], "")
+  assert(good.status == 200, "after the wait the link must work, got ${good.status}")
+}
+
+test "a throttle whose store is down refuses the request" {
+  let clock = freshClock()
+  let w = mlWorld()
+  let store = fakeStore(clock)
+  store.broken = true
+  let o = mlOff(w)
+  o.throttle = Option<LoginThrottle>.Some(throttleOn(store, clock, ThrottleOptions{}))
+  let app = mlApp(mlStrategy(clock, o))
+  let res = mlAsk(app, "ada@example.com", "")
+  assert(res.status == 500, "want 500, got ${res.status}")
+  assert(len(w.tokens) == 0, "delivered ${len(w.tokens)} link(s)")
+}
