@@ -209,12 +209,12 @@ import { open } from "redis"
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
   let tags = r.sset("tags:all")
-  for tag of tags.scan("re*", 100) {
+  for tag of tags.scan("re*", 100)? {
     println(tag)
   }
 
   let it = tags.scan()
-  match (it.next()) {
+  match (it.next()?) {
     Some(first) => println("first: ${first}")
     None => println("(empty)")
   }
@@ -225,9 +225,15 @@ fn main(): ()! {
 
 `pattern` filters members on the server (`SSCAN`'s own `MATCH`); `count` is a
 hint for how many members to fetch per round trip, not a promise. The
-iterator's `next(): Option<string>` returns `Option.None` once the cursor has
+iterator's `next(): Option<string>!` returns `Option.None` once the cursor has
 come all the way round. Small sets can come back in a single page whatever
 `count` says.
+
+`next()` is fallible because every page is a network read: a dropped
+connection, a timeout or a server error on page 5 comes back as a
+`RedisError`, never a panic. That is why the loop is written `for tag of
+it?` and sits in a function that returns `()!`; the error leaves the loop the
+way `?` does anywhere else.
 
 A scan is not a snapshot: a member added or removed while you iterate may or
 may not be seen, and a member can be returned more than once. If you need a
@@ -263,6 +269,34 @@ fn main(): ()! {
   return
 }
 ```
+
+## Reading a set inside a transaction
+
+`tx.sset(key)` only queues, so it cannot answer "is this member already
+there?" before you decide what to write. `tx.read.sset(key)` is the immediate
+view of the same set, run now on the transaction's own connection, between
+`WATCH` and `MULTI`. If another client changes a watched key first, the
+transaction retries and your body runs again with fresh reads:
+
+```bit
+import { open } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let key = "article:3:tags"
+  r.transaction<()>([key], (tx) => {
+    if (!tx.read.sset(key).has("howto")?) {
+      tx.sset(key).add("howto")
+    }
+    return
+  })?
+  r.close()
+  return
+}
+```
+
+Use `tx.read` only for reads. A write such as `tx.read.sset(key).add(...)`
+would run immediately, outside the transaction's `MULTI`/`EXEC`.
 
 ## Sharp edges
 
