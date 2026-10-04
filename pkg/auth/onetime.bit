@@ -1,0 +1,336 @@
+// pkg/auth/onetime.bit — the one-time token primitive behind password reset,
+// email verification and magic links (#6925, epic #3960).
+//
+//   let tokens = OneTimeTokens(MemoryOneTimeStore())?
+//   let token = tokens.issue("password-reset", "u1", 900)?   // mail this
+//   ... the user comes back with it ...
+//   let rec = tokens.redeem(token, "password-reset")?        // rec.subject == "u1"
+//
+// STANDARDS. OWASP ASVS v5 (V2 and V6, recovery and verification tokens: at
+// least 112 bits of entropy, stored hashed, single use, expiring), the OWASP
+// Forgot Password Cheat Sheet and NIST SP 800-63B section 5.1.3.
+//
+// ## What is guaranteed
+//
+//  - The token is 32 bytes from the OS CSPRNG (256 bits), base64url, 43 chars.
+//  - The store only ever sees the SHA-256 of the token, in hex. A stolen store
+//    or backup yields nothing a user can redeem. The token is already
+//    uniformly random, so a plain hash needs no salt or stretching.
+//  - A token is bound to a purpose. A verification token cannot reset a
+//    password.
+//  - A token expires, by an injectable clock.
+//  - A token is redeemed once. `OneTimeStore.take` is an atomic read-and-delete,
+//    so under concurrency exactly one caller wins.
+//  - Every failure, whether the token is malformed, unknown, expired, already
+//    used or issued for another purpose, is the same `InvalidToken`. The caller
+//    cannot learn which, and neither can a client who probes.
+//
+// ## Wrong purpose burns the token
+//
+// A token presented for the wrong purpose is consumed by the `take` before the
+// purpose is compared. That is deliberate: someone replaying a mailed
+// verification link at the reset endpoint is guessing, and the honest user can
+// ask for a new one. A guess that left the token alive would be free.
+//
+// ## Timing
+//
+// The store is looked up by the SHA-256 of the presented token, so how long a
+// lookup takes reveals nothing about the token itself. The purpose comparison
+// is `ctEq` anyway; the expiry is not secret.
+//
+// ## A new request replaces the old one
+//
+// `revokeSubject(purpose, subject)` drops every live token of that purpose for
+// that subject. Call it before `issue` when a second reset request should
+// invalidate the first mail.
+import { Mutex } from "std/sync"
+import { isSome, unwrap } from "std/core"
+import { now, Second } from "std/time"
+import { digest, encodeHex, Sha256, randomBytes, encodeBase64Url, ctEq } from "std/crypto"
+
+// Delivers a token to the person it was issued for, however the app does that:
+// a mail, a text message, a log line in development. `expiresAt` is seconds
+// since the epoch, so the message can say when the link stops working. A
+// failure means the message was not sent, and the flow reports it.
+// The arguments are `to`, `token` and `expiresAt`.
+export type Deliver = (string, string, i64) => ()!
+
+// What a store keeps for one token, under the token's hash.
+export class OneTimeRecord {
+  // What the token is for: "password-reset", "verify-email", "magic-link".
+  export purpose: string,
+  // Whom it is for: a user id, usually.
+  export subject: string,
+  // Seconds since the epoch; the token is dead from this instant.
+  export expiresAt: i64,
+  // Whatever the flow needs back at redemption, for example the address being
+  // verified. Stored as given, so keep secrets out of it.
+  export data: string,
+}
+
+// Where records live. Structural (§14.3): any type with these three methods
+// is a store, so a database or Redis table fits with no declaration.
+//
+// `hash` is the SHA-256 hex of the token, never the token. `ttl` is the
+// seconds the record lives, for a store that expires by itself; `rec.expiresAt`
+// is the same instant in absolute seconds.
+//
+// `take` MUST be one atomic step that reads and deletes (a `DELETE ... RETURNING`
+// or a `GETDEL`), answering `Option.None` for a record that is not there. Two
+// callers taking one hash must never both get `Some`: that is single use.
+export interface OneTimeStore {
+  put(hash: string, rec: OneTimeRecord, ttl: i64): ()!,
+  take(hash: string): Option<OneTimeRecord>!,
+  revokeSubject(purpose: string, subject: string): ()!,
+}
+
+// The one failure `redeem` gives for a token it will not honour.
+export class InvalidToken {
+  export message(): string {
+    return "auth: invalid or expired token"
+  }
+}
+
+// The default number of records a `MemoryOneTimeStore` holds.
+const memoryOneTimeCapacity: int = 10_000
+
+// An in-process store, for tests, development and a single-process app. Its
+// records die with the process, so a restart invalidates every mailed link.
+//
+// Bounded: at `capacity` records a `put` first drops every expired one, then,
+// if the store is still full, the one expiring soonest, so memory cannot be
+// exhausted by requesting tokens for many subjects. "Now" for the sweep is
+// `rec.expiresAt - ttl`, the instant the issuing `OneTimeTokens` read from its
+// own clock, so the store needs no clock of its own.
+export class MemoryOneTimeStore {
+  entries: map<string, OneTimeRecord>
+  capacity: int
+  mu: Mutex
+
+  // A capacity below 1 could hold no token at all, so it panics, as
+  // `MemoryCounter` (pkg/web) does: a mistake at startup, not a runtime
+  // condition, and it keeps `MemoryOneTimeStore()` infallible.
+  init(capacity: int = memoryOneTimeCapacity) {
+    if (capacity < 1) {
+      panic("auth: MemoryOneTimeStore(): `capacity` is ${capacity} — it must be at least 1")
+    }
+    this.entries = map<string, OneTimeRecord>()
+    this.capacity = capacity
+    this.mu = Mutex()
+  }
+
+  export put(hash: string, rec: OneTimeRecord, ttl: i64): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (_, present) = this.entries[hash]
+    if (!present && len(this.entries) >= this.capacity) {
+      this.sweepExpired(rec.expiresAt - ttl)
+    }
+    if (!present && len(this.entries) >= this.capacity) {
+      this.evictSoonestExpiring()
+    }
+    this.entries[hash] = rec
+  }
+
+  // Read and delete under one lock hold: the atomic step `OneTimeStore.take`
+  // demands.
+  export take(hash: string): Option<OneTimeRecord>! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (rec, ok) = this.entries[hash]
+    if (!ok) {
+      return Option.None
+    }
+    delete(this.entries, hash)
+    return Option.Some(rec)
+  }
+
+  // A scan, O(n): the honest cost of no second index in a store meant for one
+  // process. A database store answers it with one indexed DELETE.
+  export revokeSubject(purpose: string, subject: string): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let dead = []string(0)
+    for (hash, rec) of this.entries {
+      if (rec.purpose == purpose && rec.subject == subject) {
+        dead = append(dead, hash)
+      }
+    }
+    for hash of dead {
+      delete(this.entries, hash)
+    }
+  }
+
+  // The lock is held by `put`, the only caller; `Mutex` is not reentrant.
+  sweepExpired(nowSec: i64) {
+    let dead = []string(0)
+    for (hash, rec) of this.entries {
+      if (rec.expiresAt <= nowSec) {
+        dead = append(dead, hash)
+      }
+    }
+    for hash of dead {
+      delete(this.entries, hash)
+    }
+  }
+
+  // The lock is held by `put`, the only caller.
+  evictSoonestExpiring() {
+    let victim = ""
+    let victimAt: i64 = 0
+    let found = false
+    for (hash, rec) of this.entries {
+      if (!found || rec.expiresAt < victimAt) {
+        victim = hash
+        victimAt = rec.expiresAt
+        found = true
+      }
+    }
+    if (found) {
+      delete(this.entries, victim)
+    }
+  }
+}
+
+// The optional second argument of `OneTimeTokens`.
+export class OneTimeOptions {
+  // Seconds since the epoch. The zero value, `nil`, is the wall clock; a test
+  // passes its own and moves it by hand.
+  export clock: () => i64,
+  // The longest `ttl` `issue` accepts, in seconds: 30 days. A one-time link
+  // that lives longer is a standing credential, and a `ttl` given in the wrong
+  // unit is caught here instead of at the first audit.
+  export maxTtl: i64 = 2_592_000,
+}
+
+// Random bytes in a token: 256 bits, twice the 128 this package asks of itself
+// and well past ASVS's 112.
+const oneTimeTokenBytes: int = 32
+
+// Length of 32 bytes in unpadded base64url.
+const oneTimeTokenChars: int = 43
+
+// Issues and redeems one-time tokens over a `OneTimeStore`. Stateless apart
+// from the store, so one value is shared by every request.
+export class OneTimeTokens {
+  store: OneTimeStore
+  opts: OneTimeOptions
+
+  // Fails for a missing store or an option that cannot work, so the mistake
+  // shows when the app starts.
+  init(store: OneTimeStore, opts: OneTimeOptions = OneTimeOptions{})! {
+    if (store == nil) {
+      fail newError("auth: OneTimeTokens(): no store — pass one, for example `OneTimeTokens(MemoryOneTimeStore())`")
+    }
+    if (opts.maxTtl < 1) {
+      fail newError("auth: OneTimeTokens(): `maxTtl` is ${opts.maxTtl} second(s) — it must be at least 1")
+    }
+    this.store = store
+    this.opts = opts
+  }
+
+  // A new token for `subject`, good for `ttl` seconds for `purpose` only. The
+  // string returned is the only copy of the token: it goes to the user and
+  // nowhere else; the store gets its hash. `data` comes back from `redeem`.
+  //
+  // Fails, loudly, for an empty `purpose` or `subject`, a `ttl` that is not
+  // between 1 and `maxTtl`, or a store that refuses the record.
+  export issue(purpose: string, subject: string, ttl: i64, data: string = ""): string! {
+    if (purpose == "") {
+      fail newError("auth: OneTimeTokens.issue(): `purpose` is empty — name what the token is for")
+    }
+    if (subject == "") {
+      fail newError("auth: OneTimeTokens.issue(): `subject` is empty — name whom the token is for")
+    }
+    if (ttl <= 0 || ttl > this.opts.maxTtl) {
+      fail newError("auth: OneTimeTokens.issue(): `ttl` is ${ttl} second(s) — it must be between 1 and ${this.opts.maxTtl}")
+    }
+    let raw = randomBytes(oneTimeTokenBytes)
+    if (len(raw) != oneTimeTokenBytes) {
+      fail newError("auth: OneTimeTokens.issue(): the system random source returned ${len(raw)} bytes, wanted ${oneTimeTokenBytes}")
+    }
+    let token = encodeBase64Url(raw)
+    let rec = OneTimeRecord{
+      purpose = purpose,
+      subject = subject,
+      expiresAt = this.nowSec() + ttl,
+      data = data,
+    }
+    this.store.put(oneTimeHash(token), rec, ttl)?
+    return token
+  }
+
+  // Consumes `token` and returns what it was issued with, or fails with
+  // `InvalidToken` for every reason it cannot: malformed, unknown, used,
+  // expired, or issued for another purpose. The token is consumed even when the
+  // purpose or the expiry is wrong (see the file header).
+  //
+  // A store failure is returned as it came, since it is the operator's to see
+  // and nothing a client can cause.
+  export redeem(token: string, purpose: string): OneTimeRecord! {
+    if (purpose == "") {
+      fail newError("auth: OneTimeTokens.redeem(): `purpose` is empty — name what the token is for")
+    }
+    if (!oneTimeWellFormed(token)) {
+      fail InvalidToken{}
+    }
+    let found = this.store.take(oneTimeHash(token))?
+    if (!isSome(found)) {
+      fail InvalidToken{}
+    }
+    let rec = unwrap(found)
+    let samePurpose = ctEq([]byte(rec.purpose), []byte(purpose))
+    let live = rec.expiresAt > this.nowSec()
+    if (!samePurpose || !live) {
+      fail InvalidToken{}
+    }
+    return rec
+  }
+
+  // Drops every live token of `purpose` for `subject`, so a new request can
+  // replace the last one. Fails for an empty `purpose` or `subject`.
+  export revokeSubject(purpose: string, subject: string): ()! {
+    if (purpose == "" || subject == "") {
+      fail newError("auth: OneTimeTokens.revokeSubject(): `purpose` and `subject` must both be given")
+    }
+    this.store.revokeSubject(purpose, subject)?
+  }
+
+  nowSec(): i64 {
+    let clock = this.opts.clock
+    if (clock == nil) {
+      return now().ns / Second
+    }
+    return clock()
+  }
+}
+
+// The key a token is stored under: the SHA-256 of the token text, in hex.
+fn oneTimeHash(token: string): string {
+  return encodeHex(digest(Sha256(), []byte(token)))
+}
+
+// Whether `token` has the shape `issue` makes: 43 base64url characters. A
+// cheap reject for noise before the store is asked; it says nothing about
+// whether the token is real.
+fn oneTimeWellFormed(token: string): bool {
+  if (len(token) != oneTimeTokenChars) {
+    return false
+  }
+  let i = 0
+  while (i < oneTimeTokenChars) {
+    if (!oneTimeAlphabet(token[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn oneTimeAlphabet(c: byte): bool {
+  return (c >= 'a' && c <= 'z') ||
+    (c >= 'A' && c <= 'Z') ||
+    (c >= '0' && c <= '9') ||
+    c == '-' ||
+    c == '_'
+}

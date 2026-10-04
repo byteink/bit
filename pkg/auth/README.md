@@ -104,6 +104,12 @@ protected route that is not itself doing the authenticating just reads
   (RFC 6238) two-factor codes: enrollment, the `otpauth://` QR-code URI, and
   verifying a submitted code with a skew window and caller-owned replay
   protection.
+- `OneTimeTokens`, `OneTimeStore`, `OneTimeRecord`, `OneTimeOptions`,
+  `MemoryOneTimeStore`, `InvalidToken`, `Deliver` - the one-time token behind
+  password reset, email verification and magic links: 256 random bits stored
+  only as a SHA-256 hash, bound to a purpose, expiring, redeemed once, with a
+  pluggable store and the `Deliver` function the app supplies to send them; see
+  [One-time tokens for account emails](docs/account-tokens.md).
 
 Every one of these is used in a full example in [`docs/`](docs/README.md),
 along with the security properties this package enforces (PKCE, constant-time

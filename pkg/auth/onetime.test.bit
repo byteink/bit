@@ -1,0 +1,360 @@
+// pkg/auth/onetime.test.bit — #6925's acceptance: OneTimeTokens issue/redeem,
+// the single use guarantee under 100 concurrent redeems, the identical failure
+// for every cause, hashing at rest, expiry on an injected clock, subject
+// revocation and the memory store's capacity bound.
+//
+// `contains`, `Mutex`, `now`, `Second` and the hashing names are already bound
+// module-wide by the other files of this package; `WaitGroup` is new.
+import { WaitGroup } from "std/sync"
+
+// The hand-moved clock the tokens share.
+class OtClock {
+  t: i64,
+}
+
+fn otTokens(store: OneTimeStore, clock: OtClock): OneTimeTokens {
+  let read: () => i64 = () => clock.t
+  return OneTimeTokens(store, OneTimeOptions{ clock = read }) catch e {
+    panic("OneTimeTokens: ${e.message()}")
+  }
+}
+
+fn otMemory(capacity: int): MemoryOneTimeStore {
+  return MemoryOneTimeStore(capacity)
+}
+
+fn otIssue(t: OneTimeTokens, purpose: string, subject: string, ttl: i64): string {
+  return t.issue(purpose, subject, ttl) catch e {
+    panic("issue: ${e.message()}")
+  }
+}
+
+// The text of what `redeem` fails with, "" when it succeeds.
+fn otFailure(t: OneTimeTokens, token: string, purpose: string): string {
+  t.redeem(token, purpose) catch e {
+    let (_, ok) = e.(InvalidToken)
+    assert(ok, "redeem failed with something other than InvalidToken: ${e.message()}")
+    return e.message()
+  }
+  return ""
+}
+
+// A store that remembers every hash and record it was handed, then delegates.
+class RecordingStore {
+  inner: MemoryOneTimeStore
+  hashes: []string
+  datas: []string
+
+  export put(hash: string, rec: OneTimeRecord, ttl: i64): ()! {
+    this.hashes = append(this.hashes, hash)
+    this.datas = append(this.datas, rec.data)
+    this.inner.put(hash, rec, ttl)?
+  }
+
+  export take(hash: string): Option<OneTimeRecord>! {
+    return this.inner.take(hash)?
+  }
+
+  export revokeSubject(purpose: string, subject: string): ()! {
+    this.inner.revokeSubject(purpose, subject)?
+  }
+}
+
+fn recordingStore(): RecordingStore {
+  return RecordingStore{ inner = otMemory(100), hashes = []string{}, datas = []string{} }
+}
+
+// A store whose every call fails, to prove the failure is not turned into
+// "invalid token".
+class BrokenStore {
+  export put(hash: string, rec: OneTimeRecord, ttl: i64): ()! {
+    fail newError("store down")
+  }
+
+  export take(hash: string): Option<OneTimeRecord>! {
+    fail newError("store down")
+  }
+
+  export revokeSubject(purpose: string, subject: string): ()! {
+    fail newError("store down")
+  }
+}
+
+test "a token redeems once and returns what it was issued with" {
+  let clock = OtClock{ t = 1000 }
+  let t = otTokens(otMemory(10), clock)
+  let token = t.issue("verify-email", "u1", 600, "ada@example.com") catch e {
+    panic("issue: ${e.message()}")
+  }
+  let rec = t.redeem(token, "verify-email") catch e {
+    panic("redeem: ${e.message()}")
+  }
+  assert(rec.purpose == "verify-email" && rec.subject == "u1", "got ${rec.purpose}/${rec.subject}")
+  assert(rec.data == "ada@example.com", "data was '${rec.data}'")
+  assert(rec.expiresAt == 1600, "expiresAt was ${rec.expiresAt}")
+}
+
+test "a token is 43 base64url characters, 32 random bytes, and no two are alike" {
+  let t = otTokens(otMemory(100), OtClock{ t = 0 })
+  let seen = map<string, bool>()
+  let i = 0
+  while (i < 50) {
+    let token = otIssue(t, "magic-link", "u1", 60)
+    assert(len(token) == 43, "length ${len(token)}")
+    assert(
+      !contains(token, "=") && !contains(token, "+") && !contains(token, "/"),
+      "not base64url: ${token}",
+    )
+    let (_, dup) = seen[token]
+    assert(!dup, "token repeated")
+    seen[token] = true
+    i = i + 1
+  }
+}
+
+test "a second redeem of the same token fails" {
+  let t = otTokens(otMemory(10), OtClock{ t = 0 })
+  let token = otIssue(t, "password-reset", "u1", 60)
+  assert(otFailure(t, token, "password-reset") == "", "the first redeem must succeed")
+  assert(otFailure(t, token, "password-reset") != "", "the second redeem must fail")
+}
+
+test "the four failure causes return one identical error" {
+  let clock = OtClock{ t = 0 }
+  let t = otTokens(otMemory(10), clock)
+  let good = otIssue(t, "password-reset", "u1", 60)
+  let wrongPurpose = otFailure(t, good, "verify-email")
+  let expired = otIssue(t, "password-reset", "u1", 10)
+  clock.t = 10
+  let expiredMsg = otFailure(t, expired, "password-reset")
+  let unknown = otFailure(t, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "password-reset")
+  let malformed = otFailure(t, "not a token!", "password-reset")
+  assert(wrongPurpose != "", "wrong purpose must fail")
+  assert(expiredMsg == wrongPurpose, "expired '${expiredMsg}' vs '${wrongPurpose}'")
+  assert(unknown == wrongPurpose, "unknown '${unknown}' vs '${wrongPurpose}'")
+  assert(malformed == wrongPurpose, "malformed '${malformed}' vs '${wrongPurpose}'")
+}
+
+test "a token fails at its expiry instant, not before" {
+  let clock = OtClock{ t = 100 }
+  let t = otTokens(otMemory(10), clock)
+  let early = otIssue(t, "magic-link", "u1", 30)
+  let late = otIssue(t, "magic-link", "u1", 30)
+  clock.t = 129
+  assert(otFailure(t, early, "magic-link") == "", "one second before expiry must redeem")
+  clock.t = 130
+  assert(otFailure(t, late, "magic-link") != "", "at expiry must fail")
+}
+
+test "a token for another purpose is consumed by the attempt" {
+  let t = otTokens(otMemory(10), OtClock{ t = 0 })
+  let token = otIssue(t, "verify-email", "u1", 60)
+  assert(otFailure(t, token, "password-reset") != "", "wrong purpose must fail")
+  assert(otFailure(t, token, "verify-email") != "", "the probe must have burned the token")
+}
+
+test "an expired token is consumed too" {
+  let clock = OtClock{ t = 0 }
+  let mem = otMemory(10)
+  let t = otTokens(mem, clock)
+  let token = otIssue(t, "magic-link", "u1", 5)
+  clock.t = 50
+  assert(otFailure(t, token, "magic-link") != "", "expired must fail")
+  assert(len(mem.entries) == 0, "the expired record must be gone")
+}
+
+test "the store never holds a plaintext token, only its SHA-256 hex" {
+  let rs = recordingStore()
+  let t = otTokens(rs, OtClock{ t = 0 })
+  let tokens = []string{}
+  let i = 0
+  while (i < 20) {
+    tokens = append(tokens, otIssue(t, "password-reset", "u${i}", 60))
+    i = i + 1
+  }
+  assert(len(rs.hashes) == 20, "puts: ${len(rs.hashes)}")
+  let plaintext = 0
+  for tok of tokens {
+    for h of rs.hashes {
+      if (h == tok || contains(h, tok)) {
+        plaintext = plaintext + 1
+      }
+    }
+    for (k, _) of rs.inner.entries {
+      if (k == tok) {
+        plaintext = plaintext + 1
+      }
+    }
+  }
+  assert(plaintext == 0, "${plaintext} of 20 tokens appeared in plaintext")
+  let want = encodeHex(digest(Sha256(), []byte(tokens[0])))
+  assert(rs.hashes[0] == want && len(want) == 64, "stored '${rs.hashes[0]}', want '${want}'")
+}
+
+fn otRedeemWorker(t: OneTimeTokens, token: string, wins: chan<bool>, wg: WaitGroup) {
+  defer wg.done()
+  t.redeem(token, "password-reset") catch _ {
+    wins <- false
+    return
+  }
+  wins <- true
+}
+
+test "100 concurrent redeems of one token succeed exactly once" {
+  let t = otTokens(otMemory(10), OtClock{ t = 0 })
+  let token = otIssue(t, "password-reset", "u1", 60)
+  let wins = chan<bool>(100)
+  let wg = WaitGroup()
+  wg.add(100)
+  let i = 0
+  while (i < 100) {
+    spawn otRedeemWorker(t, token, wins, wg)
+    i = i + 1
+  }
+  wg.wait()
+  let won = 0
+  let n = 0
+  while (n < 100) {
+    let ok = <- wins
+    if (ok) {
+      won = won + 1
+    }
+    n = n + 1
+  }
+  assert(won == 1, "${won} of 100 concurrent redeems succeeded, want 1")
+}
+
+test "revokeSubject drops that subject's tokens for that purpose only" {
+  let t = otTokens(otMemory(10), OtClock{ t = 0 })
+  let first = otIssue(t, "password-reset", "u1", 60)
+  let other = otIssue(t, "password-reset", "u2", 60)
+  let verify = otIssue(t, "verify-email", "u1", 60)
+  t.revokeSubject("password-reset", "u1") catch e {
+    panic("revokeSubject: ${e.message()}")
+  }
+  assert(otFailure(t, first, "password-reset") != "", "the revoked token must fail")
+  assert(otFailure(t, other, "password-reset") == "", "another subject must be untouched")
+  assert(otFailure(t, verify, "verify-email") == "", "another purpose must be untouched")
+}
+
+test "a new request replaces the old one" {
+  let t = otTokens(otMemory(10), OtClock{ t = 0 })
+  let old = otIssue(t, "magic-link", "u1", 60)
+  t.revokeSubject("magic-link", "u1") catch e {
+    panic("revokeSubject: ${e.message()}")
+  }
+  let fresh = otIssue(t, "magic-link", "u1", 60)
+  assert(otFailure(t, old, "magic-link") != "", "the old link must be dead")
+  assert(otFailure(t, fresh, "magic-link") == "", "the new link must work")
+}
+
+// Whether `issue` fails with a message containing `needle`.
+fn otIssueFails(
+  t: OneTimeTokens,
+  purpose: string,
+  subject: string,
+  ttl: i64,
+  needle: string,
+): bool {
+  t.issue(purpose, subject, ttl) catch e {
+    return contains(e.message(), needle)
+  }
+  return false
+}
+
+test "issue refuses an empty purpose, an empty subject and a ttl out of range" {
+  let t = otTokens(otMemory(10), OtClock{ t = 0 })
+  assert(otIssueFails(t, "", "u1", 60, "`purpose` is empty"), "empty purpose")
+  assert(otIssueFails(t, "magic-link", "", 60, "`subject` is empty"), "empty subject")
+  assert(otIssueFails(t, "magic-link", "u1", 0, "`ttl` is 0"), "zero ttl")
+  assert(otIssueFails(t, "magic-link", "u1", -5, "`ttl` is -5"), "negative ttl")
+  assert(
+    otIssueFails(t, "magic-link", "u1", 2_592_001, "between 1 and 2592000"),
+    "ttl above maxTtl",
+  )
+}
+
+test "redeem refuses an empty purpose as a developer mistake" {
+  let t = otTokens(otMemory(10), OtClock{ t = 0 })
+  let token = otIssue(t, "magic-link", "u1", 60)
+  t.redeem(token, "") catch e {
+    let (_, invalid) = e.(InvalidToken)
+    assert(!invalid && contains(e.message(), "`purpose` is empty"), "got '${e.message()}'")
+    return
+  }
+  assert(false, "an empty purpose must fail")
+}
+
+test "construction refuses a missing store, a bad maxTtl and a bad capacity" {
+  let nostore = false
+  let none: OneTimeStore = nil
+  OneTimeTokens(none) catch e {
+    nostore = contains(e.message(), "no store")
+  }
+  assert(nostore, "a nil store must be refused")
+  let badTtl = false
+  OneTimeTokens(otMemory(1), OneTimeOptions{ maxTtl = 0 }) catch e {
+    badTtl = contains(e.message(), "`maxTtl` is 0")
+  }
+  assert(badTtl, "maxTtl 0 must be refused")
+  let (panicked, msg) = runRecovering(() => {
+    MemoryOneTimeStore(0)
+  })
+  assert(panicked && contains(msg, "`capacity` is 0"), "capacity 0 must panic, got '${msg}'")
+}
+
+test "a full store drops expired records before a live one" {
+  let clock = OtClock{ t = 0 }
+  let mem = otMemory(3)
+  let t = otTokens(mem, clock)
+  let short = otIssue(t, "magic-link", "a", 10)
+  let b = otIssue(t, "magic-link", "b", 1000)
+  let c = otIssue(t, "magic-link", "c", 1000)
+  clock.t = 50
+  let d = otIssue(t, "magic-link", "d", 1000)
+  assert(len(mem.entries) == 3, "entries: ${len(mem.entries)}")
+  assert(
+    otFailure(t, short, "magic-link") != "",
+    "the expired record must have been the one dropped",
+  )
+  assert(otFailure(t, b, "magic-link") == "", "b must survive")
+  assert(otFailure(t, c, "magic-link") == "", "c must survive")
+  assert(otFailure(t, d, "magic-link") == "", "d must be stored")
+}
+
+test "a store full of live records drops the one expiring soonest" {
+  let mem = otMemory(2)
+  let t = otTokens(mem, OtClock{ t = 0 })
+  let soon = otIssue(t, "magic-link", "a", 10)
+  let later = otIssue(t, "magic-link", "b", 1000)
+  let newest = otIssue(t, "magic-link", "c", 500)
+  assert(len(mem.entries) == 2, "entries: ${len(mem.entries)}")
+  assert(otFailure(t, soon, "magic-link") != "", "the soonest-expiring record must be dropped")
+  assert(otFailure(t, later, "magic-link") == "", "the later record must survive")
+  assert(otFailure(t, newest, "magic-link") == "", "the new record must be stored")
+}
+
+test "a store failure is returned as itself, not as an invalid token" {
+  let t = otTokens(BrokenStore{}, OtClock{ t = 0 })
+  let token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  t.redeem(token, "magic-link") catch e {
+    let (_, invalid) = e.(InvalidToken)
+    assert(!invalid && contains(e.message(), "store down"), "got '${e.message()}'")
+    return
+  }
+  assert(false, "a broken store must fail redeem")
+}
+
+test "a Deliver receives the address, the token and the expiry" {
+  let clock = OtClock{ t = 1000 }
+  let t = otTokens(otMemory(10), clock)
+  let got = []string{}
+  let deliver: Deliver = (to, token, expiresAt) => {
+    got = append(got, "${to}|${len(token)}|${expiresAt}")
+  }
+  let token = otIssue(t, "magic-link", "u1", 300)
+  deliver("ada@example.com", token, clock.t + 300) catch e {
+    panic("deliver: ${e.message()}")
+  }
+  assert(len(got) == 1 && got[0] == "ada@example.com|43|1300", "got ${len(got)} deliveries")
+}
