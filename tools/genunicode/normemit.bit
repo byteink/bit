@@ -1,25 +1,34 @@
-// tools/genunicode — renders `stdlib/strings/gen_normalize.bit` (#6877), the
-// Unicode normalization data NFC/NFKC need: canonical combining class,
-// single-level canonical and compatibility decompositions, and primary
-// composition.
+// tools/genunicode — renders `stdlib/strings/gen_normalize.bit` (#6877,
+// #7150), the Unicode normalization data NFC/NFD/NFKC/NFKD need.
 //
-// Layout: every table is ONE string constant of fixed-width uppercase-hex
-// records sorted by key, so a lookup is a binary search straight over the
-// constant — O(log n), no decode step, no allocation, no module state. A
-// codepoint is five hex digits (`maxNormCodepoint`, ucdparse.bit).
+// Layout (#7150): every table is ONE string constant of raw bytes, so a
+// lookup is a few byte loads — no hex parsing, no search, no allocation, no
+// module state. Bytes outside printable ASCII are written as `\xNN`.
 //
-//   ccc      lo(5) hi(5) ccc(2)       one record per run of one class
-//   canon /  key(5) off(5)            `off` indexes the paired data string in
-//   compat   runes; a final sentinel record gives the last entry's end
-//   data     rune(5)...               every mapping, concatenated
-//   compose  a(5) b(5) composite(5)   keyed by a*2^20+b
+//   normStage1   2 bytes per block of 2^shift codepoints: the block's index
+//                in normStage2 (identical blocks are stored once)
+//   normStage2   2 bytes per codepoint: its record index in normInfo
+//   normInfo     8 bytes per record: ccc, quick-check flags, then three
+//                16-bit entry indices: full canonical decomposition, full
+//                compatibility decomposition (only where it differs from the
+//                canonical one), composition list (0 = none for all three)
+//   normDecomp   4-byte entries; a sequence is a header [0,0,0,len] then
+//                `len` elements [ccc, second-flag<<7 | cp>>16, cp>>8, cp]
+//   normCompose  6-byte entries; a list is a header [0,0,0,0,0,len] then
+//                `len` pairs [second(3), composite(3)] sorted by second
 //
-// Hangul syllables are algorithmic and appear in none of these.
-//
-// `Builder` (std/strings) and `sortInPlace` (std/sort) are imported by
-// emit.bit and rangeutil.bit; imports are per module.
+// Record 0 is all zero: a codepoint normalization leaves alone. Codepoints at
+// or past `normTrieLimit` all have it. The shift is the one that makes the
+// two stages smallest. Hangul syllables are algorithmic and are not tabled.
 
 class ComposePair { key: int, composite: int }
+
+// The record bytes, the flag that marks a codepoint as the second half of
+// some primary composite, and the entry widths.
+const normRecSize: int = 8
+const normSecondFlag: int = 64
+const normHangulFirst: int = 0xAC00
+const normHangulLast: int = 0xD7A3
 
 // `v` as exactly `width` uppercase hex digits.
 fn hexPad(v: int, width: int): string {
@@ -48,56 +57,49 @@ fn writeNormHeader(b: Builder) {
   b.write("//   bit run tools/genunicode -- norm \\\n")
   b.write("//     <UnicodeData.txt> <DerivedNormalizationProps.txt> stdlib/strings\n")
   b.write("//\n")
-  b.write("// `ccc` is the canonical combining class. `canonicalDecomp` is the\n")
-  b.write("// SINGLE-level canonical mapping (UnicodeData.txt field 5 without a\n")
-  b.write("// `<tag>`); `compatDecomp` is the single-level mapping of characters whose\n")
-  b.write("// field 5 carries a `<tag>` — the two tables are disjoint, so NFKD takes\n")
-  b.write("// `compatDecomp` first and `canonicalDecomp` second, and recurses on the\n")
-  b.write("// result. Both return an empty slice when the rune has no such mapping.\n")
-  b.write("// `compose` is the primary composite of a canonical pair, or 0: pairs in\n")
-  b.write("// Full_Composition_Exclusion are never returned. Hangul syllables are\n")
-  b.write("// algorithmic and are not tabled here.\n\n")
+  b.write("// A two-stage table (#7150) maps a codepoint to an 8-byte record: its\n")
+  b.write("// canonical combining class, its UAX #15 quick-check flags, and where its\n")
+  b.write("// FULL canonical and compatibility decompositions and its composition list\n")
+  b.write("// sit in the data strings. A lookup is five byte loads, no search and no\n")
+  b.write("// allocation. tools/genunicode/normemit.bit documents the byte layout.\n")
+  b.write("// Pairs in Full_Composition_Exclusion are never composed. Hangul syllables\n")
+  b.write("// are algorithmic and are not tabled here.\n\n")
 }
 
-fn packCcc(ranges: []CccRange): string {
-  let b = Builder()
-  let i = 0
-  // Bounded by `len(ranges)`, fixed before the loop starts.
-  while (i < len(ranges)) {
-    b.write(hexPad(ranges[i].lo, 5) + hexPad(ranges[i].hi, 5) + hexPad(ranges[i].ccc, 2))
-    i = i + 1
+// Appends `v` as `n` big-endian bytes.
+fn putBytes(out: []int, v: int, n: int): []int {
+  let k = n - 1
+  // Bounded by `n`, at most 3.
+  while (k >= 0) {
+    out = append(out, (v >> (8 * k)) & 0xFF)
+    k = k - 1
   }
-  return b.toString()
+  return out
 }
 
-// The key records of `entries`, then the sentinel (key = the largest
-// five-digit value, never a real codepoint; offset = total rune count).
-fn packDecompKeys(entries: []DecompEntry): string {
-  let b = Builder()
-  let off = 0
-  let i = 0
-  // Bounded by `len(entries)`, fixed before the loop starts.
-  while (i < len(entries)) {
-    b.write(hexPad(entries[i].code, 5) + hexPad(off, 5))
-    off = off + len(entries[i].mapping)
-    i = i + 1
-  }
-  b.write(hexPad(maxNormCodepoint, 5) + hexPad(off, 5))
-  return b.toString()
-}
-
-fn packDecompData(entries: []DecompEntry): string {
+// `bs` as the body of a Bit string literal.
+fn byteLiteral(bs: []int): string {
   let b = Builder()
   let i = 0
-  // Bounded by `len(entries)`, fixed before the loop starts.
-  while (i < len(entries)) {
-    let m = entries[i].mapping
-    let j = 0
-    // Bounded by `len(m)`, at most 18 runes in UCD 17.0.0.
-    while (j < len(m)) {
-      b.write(hexPad(m[j], 5))
-      j = j + 1
+  // Bounded by `len(bs)`, fixed before the loop starts.
+  while (i < len(bs)) {
+    let v = bs[i]
+    if (v >= 0x20 && v < 0x7F && v != 0x22 && v != 0x24 && v != 0x5C) {
+      b.writeByte(u8(v))
+    } else {
+      b.write("\\x" + hexPad(v, 2))
     }
+    i = i + 1
+  }
+  return b.toString()
+}
+
+fn intsKey(xs: []int): string {
+  let b = Builder()
+  let i = 0
+  // Bounded by `len(xs)`, fixed before the loop starts.
+  while (i < len(xs)) {
+    b.write(toHex(xs[i]) + ",")
     i = i + 1
   }
   return b.toString()
@@ -119,7 +121,8 @@ fn composePairLess(a: ComposePair, b: ComposePair): bool {
   return a.key < b.key
 }
 
-// Every canonical two-rune mapping whose composite is not excluded.
+// Every canonical two-rune mapping whose composite is not excluded, sorted by
+// (first, second).
 fn collectComposePairs(d: NormData): []ComposePair {
   let out: []ComposePair = []ComposePair(0)
   let i = 0
@@ -129,7 +132,7 @@ fn collectComposePairs(d: NormData): []ComposePair {
     if (len(e.mapping) == 2 && !inRanges(d.excluded, e.code)) {
       out = append(
         out,
-        ComposePair{ key = e.mapping[0] * 0x100000 + e.mapping[1], composite = e.code },
+        ComposePair{ key = e.mapping[0] * 0x200000 + e.mapping[1], composite = e.code },
       )
     }
     i = i + 1
@@ -138,163 +141,423 @@ fn collectComposePairs(d: NormData): []ComposePair {
   return out
 }
 
-fn packCompose(pairs: []ComposePair): string {
-  let b = Builder()
+fn mappingTable(es: []DecompEntry): map<int, []int> {
+  let m: map<int, []int> = map<int, []int>{}
   let i = 0
-  // Bounded by `len(pairs)`, fixed before the loop starts.
-  while (i < len(pairs)) {
-    if (i > 0 && pairs[i].key == pairs[i - 1].key) {
-      panic("genunicode: two composites for one pair, key ${toHex(pairs[i].key)}")
-    }
-    b.write(
-        hexPad(pairs[i].key / 0x100000, 5) +
-        hexPad(pairs[i].key % 0x100000, 5) +
-        hexPad(pairs[i].composite, 5),
-    )
+  // Bounded by `len(es)`, fixed before the loop starts.
+  while (i < len(es)) {
+    m[es[i].code] = es[i].mapping
     i = i + 1
   }
-  return b.toString()
+  return m
 }
 
-fn writeNormConst(b: Builder, name: string, doc: string, packed: string) {
+// The working tables of one run: per-codepoint class and flags, the two
+// single-level mappings, and the byte strings being built.
+class NormBuild {
+  ccc: []int,
+  flags: []int,
+  canon: map<int, []int>,
+  compat: map<int, []int>,
+  decomp: []int,
+  decompAt: map<string, int>,
+  compose: []int,
+  firsts: map<int, int>,
+}
+
+// Appends the full decomposition of `cp` to `out`: Hangul by arithmetic,
+// the compatibility mapping first when `k`, then the canonical one.
+fn expandCp(nb: NormBuild, out: []int, cp: int, k: bool): []int {
+  if (cp >= normHangulFirst && cp <= normHangulLast) {
+    let s = cp - normHangulFirst
+    out = append(out, 0x1100 + s / 588)
+    out = append(out, 0x1161 + s % 588 / 28)
+    if (s % 28 != 0) {
+      out = append(out, 0x11A7 + s % 28)
+    }
+    return out
+  }
+  let (m, ok) = nb.compat[cp]
+  if (!k || !ok) {
+    let (cm, cok) = nb.canon[cp]
+    if (!cok) {
+      return append(out, cp)
+    }
+    m = cm
+  }
+  let i = 0
+  // Bounded: every chain of mappings in the UCD ends, at most 18 runes each.
+  while (i < len(m)) {
+    out = expandCp(nb, out, m[i], k)
+    i = i + 1
+  }
+  return out
+}
+
+// The entry index of the sequence `xs` in `nb.decomp`, adding it once.
+fn decompIndex(nb: NormBuild, xs: []int): int {
+  let key = intsKey(xs)
+  let (at, ok) = nb.decompAt[key]
+  if (ok) {
+    return at
+  }
+  at = len(nb.decomp) / 4
+  nb.decompAt[key] = at
+  nb.decomp = putBytes(nb.decomp, len(xs), 4)
+  let i = 0
+  // Bounded by `len(xs)`, at most 18 in UCD 17.0.0.
+  while (i < len(xs)) {
+    let second = 0
+    if ((nb.flags[xs[i]] & normSecondFlag) != 0) {
+      second = 0x800000
+    }
+    nb.decomp = append(nb.decomp, nb.ccc[xs[i]])
+    nb.decomp = putBytes(nb.decomp, xs[i] | second, 3)
+    i = i + 1
+  }
+  return at
+}
+
+fn sameInts(a: []int, b: []int): bool {
+  if (len(a) != len(b)) {
+    return false
+  }
+  let i = 0
+  // Bounded by `len(a)`.
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The canonical and compatibility decomposition entries of `cp`.
+fn decompOffsets(nb: NormBuild, cp: int): (int, int) {
+  let (_, hasCanon) = nb.canon[cp]
+  let (_, hasCompat) = nb.compat[cp]
+  if (!hasCanon && !hasCompat) {
+    return 0, 0
+  }
+  let one = []int{ cp }
+  let cd = expandCp(nb, []int(0), cp, false)
+  let kd = expandCp(nb, []int(0), cp, true)
+  let canon = 0
+  if (!sameInts(cd, one)) {
+    canon = decompIndex(nb, cd)
+  }
+  let compat = 0
+  if (!sameInts(kd, cd)) {
+    compat = decompIndex(nb, kd)
+  }
+  return canon, compat
+}
+
+// Fills `nb.compose` with one list per first codepoint, recording each list's
+// entry index in `nb.firsts`, and flags every second codepoint.
+fn buildComposeLists(nb: NormBuild, pairs: []ComposePair) {
+  nb.compose = putBytes([]int(0), 0, 6)
+  let i = 0
+  // Bounded by `len(pairs)`; the inner loop advances `i`.
+  while (i < len(pairs)) {
+    let first = pairs[i].key / 0x200000
+    let j = i
+    // Bounded by `len(pairs)`.
+    while (j < len(pairs) && pairs[j].key / 0x200000 == first) {
+      j = j + 1
+    }
+    nb.firsts[first] = len(nb.compose) / 6
+    nb.compose = putBytes(nb.compose, j - i, 6)
+    // Bounded by `j`.
+    while (i < j) {
+      let second = pairs[i].key % 0x200000
+      if (i > 0 && pairs[i].key == pairs[i - 1].key) {
+        panic("genunicode: two composites for one pair, key ${toHex(pairs[i].key)}")
+      }
+      nb.flags[second] = nb.flags[second] | normSecondFlag
+      nb.compose = putBytes(nb.compose, second, 3)
+      nb.compose = putBytes(nb.compose, pairs[i].composite, 3)
+      i = i + 1
+    }
+  }
+}
+
+fn newNormBuild(d: NormData): NormBuild {
+  let nb = NormBuild{
+    ccc = []int(0x110000),
+    flags = []int(0x110000),
+    canon = mappingTable(d.canon),
+    compat = mappingTable(d.compat),
+    decomp = putBytes([]int(0), 0, 4),
+    decompAt = map<string, int>{},
+    compose = []int(0),
+    firsts = map<int, int>{},
+  }
+  let i = 0
+  // Bounded by `len(d.ccc)`; the inner loops by each range's width.
+  while (i < len(d.ccc)) {
+    let c = d.ccc[i].lo
+    while (c <= d.ccc[i].hi) {
+      nb.ccc[c] = d.ccc[i].ccc
+      c = c + 1
+    }
+    i = i + 1
+  }
+  i = 0
+  while (i < len(d.qc)) {
+    let c = d.qc[i].lo
+    while (c <= d.qc[i].hi) {
+      nb.flags[c] = nb.flags[c] | d.qc[i].bit
+      c = c + 1
+    }
+    i = i + 1
+  }
+  // Hangul V and T jamo are the second halves of the arithmetic pairs.
+  let j = 0x1161
+  while (j <= 0x11C2) {
+    if (j <= 0x1175 || j >= 0x11A8) {
+      nb.flags[j] = nb.flags[j] | normSecondFlag
+    }
+    j = j + 1
+  }
+  buildComposeLists(nb, collectComposePairs(d))
+  return nb
+}
+
+// The record index of every codepoint, and the record bytes.
+fn buildRecords(nb: NormBuild): ([]int, []int) {
+  let idx = []int(0x110000)
+  let recs = []int(0)
+  recs = putBytes(recs, 0, normRecSize)
+  let seen: map<string, int> = map<string, int>{}
+  seen[intsKey(recs)] = 0
+  let cp = 0
+  // Bounded by the codepoint space.
+  while (cp < 0x110000) {
+    let (canon, compat) = decompOffsets(nb, cp)
+    let (first, isFirst) = nb.firsts[cp]
+    if (!isFirst) {
+      first = 0
+    }
+    let r = []int{ nb.ccc[cp], nb.flags[cp] }
+    r = putBytes(putBytes(putBytes(r, canon, 2), compat, 2), first, 2)
+    let key = intsKey(r)
+    let (at, ok) = seen[key]
+    if (!ok) {
+      at = len(recs) / normRecSize
+      seen[key] = at
+      let k = 0
+      // Bounded by `normRecSize`.
+      while (k < normRecSize) {
+        recs = append(recs, r[k])
+        k = k + 1
+      }
+    }
+    idx[cp] = at
+    cp = cp + 1
+  }
+  return idx, recs
+}
+
+class NormTrie { shift: int, limit: int, stage1: []int, stage2: []int }
+
+// The two stages of `idx` with blocks of 2^shift codepoints, up to the
+// first block past the last codepoint with a record.
+fn buildTrie(idx: []int, shift: int): NormTrie {
+  let size = 1 << shift
+  let last = len(idx) - 1
+  // Bounded: `last` only falls.
+  while (last > 0 && idx[last] == 0) {
+    last = last - 1
+  }
+  let t = NormTrie{
+    shift = shift,
+    limit = (last / size + 1) * size,
+    stage1 = []int(0),
+    stage2 = []int(0),
+  }
+  let blocks: map<string, int> = map<string, int>{}
+  let lo = 0
+  // Bounded by `t.limit`.
+  while (lo < t.limit) {
+    let key = intsKey(idx[lo:lo + size])
+    let (at, ok) = blocks[key]
+    if (!ok) {
+      at = len(t.stage2) / (2 * size)
+      blocks[key] = at
+      let c = lo
+      while (c < lo + size) {
+        t.stage2 = putBytes(t.stage2, idx[c], 2)
+        c = c + 1
+      }
+    }
+    t.stage1 = putBytes(t.stage1, at, 2)
+    lo = lo + size
+  }
+  return t
+}
+
+// The trie with the smallest two stages over block sizes 2^4..2^9.
+fn smallestTrie(idx: []int): NormTrie {
+  let best = buildTrie(idx, 4)
+  let shift = 5
+  while (shift <= 9) {
+    let t = buildTrie(idx, shift)
+    if (len(t.stage1) + len(t.stage2) < len(best.stage1) + len(best.stage2)) {
+      best = t
+    }
+    shift = shift + 1
+  }
+  return best
+}
+
+fn writeNormConst(b: Builder, name: string, doc: string, bs: []int) {
+  if (len(bs) / 4 >= 0x10000 && name == "normDecomp") {
+    panic("genunicode: ${name} needs more than 16-bit entry indices")
+  }
   b.write("// " + doc + "\n")
-  b.write("const " + name + ": string = \"" + packed + "\"\n\n")
+  b.write("const " + name + ": string = \"" + byteLiteral(bs) + "\"\n\n")
 }
 
 fn emitNormalize(d: NormData): string {
+  let nb = newNormBuild(d)
+  let (idx, recs) = buildRecords(nb)
+  if (len(recs) / normRecSize >= 0x10000 || len(nb.compose) / 6 >= 0x10000) {
+    panic("genunicode: a normalization table needs more than 16-bit indices")
+  }
+  let t = smallestTrie(idx)
   let b = Builder()
   writeNormHeader(b)
-  writeNormConst(
-    b,
-    "normCccTable",
-    "ccc records: lo(5) hi(5) class(2), sorted by lo.",
-    packCcc(d.ccc),
-  )
-  writeNormConst(
-    b,
-    "normCanonKeys",
-    "canonical keys: rune(5) offset(5), sorted, plus a sentinel.",
-    packDecompKeys(d.canon),
-  )
-  writeNormConst(
-    b,
-    "normCanonData",
-    "canonical mappings, five hex digits per rune.",
-    packDecompData(d.canon),
-  )
-  writeNormConst(
-    b,
-    "normCompatKeys",
-    "compatibility keys: rune(5) offset(5), sorted, plus a sentinel.",
-    packDecompKeys(d.compat),
-  )
-  writeNormConst(
-    b,
-    "normCompatData",
-    "compatibility mappings, five hex digits per rune.",
-    packDecompData(d.compat),
-  )
-  writeNormConst(
-    b,
-    "normComposeTable",
-    "compose records: first(5) second(5) composite(5), sorted by (first, second).",
-    packCompose(collectComposePairs(d)),
-  )
-  b.write("// The largest codepoint any table above can hold (five hex digits).\n")
-  b.write("const normMaxRune: int = 0xFFFFF\n\n")
-  writeNormSearch(b)
+  b.write("const normTrieShift: int = ${t.shift}\n")
+  b.write("const normTrieMask: int = ${(1 << t.shift) - 1}\n")
+  b.write("const normTrieLimit: int = 0x${toHex(t.limit)}\n\n")
+  writeNormConst(b, "normStage1", "Stage 1: a 16-bit block index per block.", t.stage1)
+  writeNormConst(b, "normStage2", "Stage 2: a 16-bit record index per codepoint.", t.stage2)
+  writeNormConst(b, "normInfo", "Records: ccc, flags, canon(2), compat(2), compose(2).", recs)
+  writeNormConst(b, "normDecomp", "Full decompositions: 4-byte entries.", nb.decomp)
+  writeNormConst(b, "normCompose", "Composition lists: 6-byte entries.", nb.compose)
   writeNormLookups(b)
+  writeNormHelpers(b)
   return b.toString()
 }
 
-fn writeNormSearch(b: Builder) {
-  b.write("// The value of the `n` uppercase hex digits of `s` starting at byte `at`.\n")
-  b.write("fn normHex(s: string, at: int, n: int): int {\n")
-  b.write("  let v = 0\n")
-  b.write("  let i = at\n")
-  b.write("  // Bounded by `at + n`.\n")
-  b.write("  while (i < at + n) {\n")
-  b.write("    let c = int(s[i])\n")
-  b.write("    if (c <= int('9')) {\n")
-  b.write("      v = v * 16 + c - int('0')\n")
-  b.write("    } else {\n")
-  b.write("      v = v * 16 + c - int('A') + 10\n")
-  b.write("    }\n")
-  b.write("    i = i + 1\n")
-  b.write("  }\n")
-  b.write("  return v\n")
-  b.write("}\n\n")
-  b.write("// The index of the last `recLen`-byte record of `tbl` whose leading\n")
-  b.write("// `keyLen`-digit key is <= `key`, or -1 when every key is larger. Binary\n")
-  b.write("// search: O(log n) probes, no allocation.\n")
-  b.write("fn normFloor(tbl: string, recLen: int, keyLen: int, key: int): int {\n")
-  b.write("  let lo = 0\n")
-  b.write("  let hi = len(tbl) / recLen - 1\n")
-  b.write("  let found = -1\n")
-  b.write("  // Bounded: `hi - lo` strictly shrinks every iteration.\n")
-  b.write("  while (lo <= hi) {\n")
-  b.write("    let mid = lo + (hi - lo) / 2\n")
-  b.write("    if (normHex(tbl, mid * recLen, keyLen) <= key) {\n")
-  b.write("      found = mid\n")
-  b.write("      lo = mid + 1\n")
-  b.write("    } else {\n")
-  b.write("      hi = mid - 1\n")
-  b.write("    }\n")
-  b.write("  }\n")
-  b.write("  return found\n")
-  b.write("}\n\n")
+// The lookups `normalize.bit` runs per codepoint.
+fn writeNormLookups(b: Builder) {
+  b.write(
+    ticks(
+      `// The two big-endian bytes of @s@ at @at@.
+fn normU16(s: string, at: int): int {
+  return (int(s[at]) << 8) | int(s[at + 1])
 }
 
-fn writeNormLookups(b: Builder) {
-  b.write("// The canonical combining class of `r`; 0 for a starter.\n")
-  b.write("fn ccc(r: rune): int {\n")
-  b.write("  let i = normFloor(normCccTable, 12, 5, int(r))\n")
-  b.write("  if (i < 0 || int(r) > normHex(normCccTable, i * 12 + 5, 5)) {\n")
-  b.write("    return 0\n")
-  b.write("  }\n")
-  b.write("  return normHex(normCccTable, i * 12 + 10, 2)\n")
-  b.write("}\n\n")
-  b.write("// The mapping of `r` in the key/data table pair, or an empty slice. The\n")
-  b.write("// record after `r`'s (the sentinel at worst) bounds the mapping. The\n")
-  b.write("// sentinel's own key, `normMaxRune`, is no real mapping's: the guard keeps\n")
-  b.write("// a lookup of exactly that rune (a noncharacter) off the record past it.\n")
-  b.write("fn normDecomp(keys: string, data: string, r: rune): []rune {\n")
-  b.write("  if (int(r) >= normMaxRune) {\n")
-  b.write("    return []rune(0)\n")
-  b.write("  }\n")
-  b.write("  let i = normFloor(keys, 10, 5, int(r))\n")
-  b.write("  if (i < 0 || normHex(keys, i * 10, 5) != int(r)) {\n")
-  b.write("    return []rune(0)\n")
-  b.write("  }\n")
-  b.write("  let out: []rune = []rune(0)\n")
-  b.write("  let j = normHex(keys, i * 10 + 5, 5)\n")
-  b.write("  let end = normHex(keys, i * 10 + 15, 5)\n")
-  b.write("  // Bounded by `end`, at most 18 runes past `j` in UCD 17.0.0.\n")
-  b.write("  while (j < end) {\n")
-  b.write("    out = append(out, rune(normHex(data, j * 5, 5)))\n")
-  b.write("    j = j + 1\n")
-  b.write("  }\n")
-  b.write("  return out\n")
-  b.write("}\n\n")
-  b.write("// The single-level canonical decomposition of `r`, or an empty slice.\n")
-  b.write("fn canonicalDecomp(r: rune): []rune {\n")
-  b.write("  return normDecomp(normCanonKeys, normCanonData, r)\n")
-  b.write("}\n\n")
-  b.write("// The single-level compatibility (`<tag>`) decomposition of `r`, or an\n")
-  b.write("// empty slice.\n")
-  b.write("fn compatDecomp(r: rune): []rune {\n")
-  b.write("  return normDecomp(normCompatKeys, normCompatData, r)\n")
-  b.write("}\n\n")
-  b.write("// The primary composite of the pair `a`, `b`, or 0.\n")
-  b.write("fn compose(a: rune, b: rune): rune {\n")
-  b.write("  if (int(a) > normMaxRune || int(b) > normMaxRune) {\n")
-  b.write("    return rune(0)\n")
-  b.write("  }\n")
-  b.write("  let key = int(a) * 0x100000 + int(b)\n")
-  b.write("  let i = normFloor(normComposeTable, 15, 10, key)\n")
-  b.write("  if (i < 0 || normHex(normComposeTable, i * 15, 10) != key) {\n")
-  b.write("    return rune(0)\n")
-  b.write("  }\n")
-  b.write("  return rune(normHex(normComposeTable, i * 15 + 10, 5))\n")
-  b.write("}\n")
+// The byte offset of @cp@'s record in @normInfo@: two byte-pair loads,
+// record 0 (all zero) past the last codepoint with data.
+fn normRec(cp: int): int {
+  if (cp < 0 || cp >= normTrieLimit) {
+    return 0
+  }
+  let blk = normU16(normStage1, (cp >> normTrieShift) * 2)
+  return normU16(normStage2, ((blk << normTrieShift) | (cp & normTrieMask)) * 2) * 8
+}
+
+// The element at entry @e@ of @normDecomp@, as @ccc << 21 | cp@ with
+// bit 30 set when the codepoint is the second half of a primary composite.
+fn normElem(e: int): int {
+  let p = e * 4
+  let v = (int(normDecomp[p + 1]) << 16) | normU16(normDecomp, p + 2)
+  return (int(normDecomp[p]) << 21) | (v & 0x1FFFFF) | ((v >> 23) << 30)
+}
+
+// The length of the sequence whose header is entry @e@ of @normDecomp@.
+fn normSeqLen(e: int): int {
+  return int(normDecomp[e * 4 + 3])
+}
+
+// The canonical combining class of @r@; 0 for a starter.
+fn ccc(r: rune): int {
+  return int(normInfo[normRec(int(r))])
+}
+
+// The primary composite of the pair @a@, @b@, or 0: a scan of @a@'s
+// composition list, sorted by second codepoint.
+fn compose(a: rune, b: rune): rune {
+  let at = normU16(normInfo, normRec(int(a)) + 6)
+  if (at == 0) {
+    return rune(0)
+  }
+  let k = at + 1
+  let end = k + int(normCompose[at * 6 + 5])
+  // Bounded by @end@, the list's length.
+  while (k < end) {
+    let p = k * 6
+    let second = (int(normCompose[p]) << 16) | normU16(normCompose, p + 1)
+    if (second >= int(b)) {
+      if (second != int(b)) {
+        return rune(0)
+      }
+      return rune((int(normCompose[p + 3]) << 16) | normU16(normCompose, p + 4))
+    }
+    k = k + 1
+  }
+  return rune(0)
+}
+
+`,
+    ),
+  )
+}
+
+// Test-facing views of the decomposition data; a program that only calls
+// `normalize` never references them, so they are dead-stripped.
+fn writeNormHelpers(b: Builder) {
+  b.write(
+    ticks(
+      `// The full decomposition of @r@ at record field @field@ (2 canonical, 4
+// compatibility), or an empty slice.
+fn normSeq(r: rune, field: int): []rune {
+  let e = normU16(normInfo, normRec(int(r)) + field)
+  let out = []rune(0)
+  if (e == 0) {
+    return out
+  }
+  let i = 1
+  // Bounded by the sequence length, at most 18 runes in UCD 17.0.0.
+  while (i <= normSeqLen(e)) {
+    out = append(out, rune(normElem(e + i) & 0x1FFFFF))
+    i = i + 1
+  }
+  return out
+}
+
+// The full canonical decomposition of @r@, or an empty slice.
+fn canonicalDecomp(r: rune): []rune {
+  return normSeq(r, 2)
+}
+
+// The full compatibility decomposition of @r@ where it differs from the
+// canonical one, or an empty slice.
+fn compatDecomp(r: rune): []rune {
+  return normSeq(r, 4)
+}
+`,
+    ),
+  )
+}
+
+// `s` with every `@` turned into a backtick: the raw strings above cannot
+// hold one.
+fn ticks(s: string): string {
+  let b = Builder()
+  let i = 0
+  // Bounded by `len(s)`.
+  while (i < len(s)) {
+    if (s[i] == '@') {
+      b.writeByte(u8(0x60))
+    } else {
+      b.writeByte(s[i])
+    }
+    i = i + 1
+  }
+  return b.toString()
 }
