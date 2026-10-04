@@ -50,13 +50,15 @@ anti-automation control OWASP ASVS asks for and the throttling NIST SP 800-63B
 requires of a password verifier. See [Slow down password
 guessing](brute-force.md).
 
-## Microsoft Entra ID: single tenant only
+## Microsoft Entra ID: the tenant is checked, not assumed
 
-`Provider.Microsoft(tenant)` refuses the three multi-tenant aliases Microsoft
-documents - `common`, `organizations`, `consumers` - before making any
-request. See [Other OIDC providers](providers.md) for why: `discover()`'s
-issuer check, which every strategy in this package relies on, cannot be
-satisfied by a document served under one of those aliases.
+`Provider.Microsoft(tenant)` with a real tenant accepts only that tenant's
+issuer. With `common` or `organizations` the issuer differs per tenant, so the
+token's `tid` claim (which must be a GUID) is substituted into Microsoft's
+`{tenantid}` template and the token's `iss` must equal the result exactly; set
+`OidcOptions.allowedTenants` to accept only the tenants you serve. `consumers`
+is pinned to Microsoft's personal-account tenant. See [Other OIDC
+providers](providers.md).
 
 ## Scopes always include `openid`
 
