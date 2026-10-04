@@ -409,7 +409,7 @@ fn shareOne(): (RetryStrategy, RetryStrategy)! {
 
 fn watched(): RetryStrategy! {
   let watcher: SendLimiter = Pushback()
-  return RetryStrategy(RetryMode.Adaptive, 5, limiter = watcher)
+  return RetryStrategy(RetryMode.Adaptive, 5, limiter = watcher)?
 }
 ```
 
