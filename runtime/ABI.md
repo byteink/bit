@@ -4532,7 +4532,8 @@ truncation, both applied outside `compress`).
 ## 21c. ARM64 crypto hardware-capability detection (`runtime/cryptohw`)
 
 ```
-bit_rt_crypto_hwcaps() -> u64   // bit 0 = AES, bit 1 = PMULL, bit 2 = SHA2
+bit_rt_crypto_hwcaps() -> u64   // bit 0 = AES, bit 1 = PMULL, bit 2 = SHA2,
+                                // bit 3 = CRC32 (read by std/hash, #6678)
 ```
 
 The ARM64 mirror of §21b's x86-64 probes, and unlike them, a real
@@ -4546,10 +4547,10 @@ because each side calls something the other cannot even compile (§19's
 
 - **aarch64-linux**: bit `i` is set when `getauxval(AT_HWCAP)` (`runtime/auxv`)
   has the matching Linux `HWCAP_*` bit — `HWCAP_AES` (1<<3), `HWCAP_PMULL`
-  (1<<4), `HWCAP_SHA2` (1<<6) — set.
+  (1<<4), `HWCAP_SHA2` (1<<6), `HWCAP_CRC32` (1<<7) — set.
 - **aarch64-macos**: bit `i` is set when the matching `sysctlbyname` reads back
   1 — `hw.optional.arm.FEAT_AES`, `hw.optional.arm.FEAT_PMULL`,
-  `hw.optional.arm.FEAT_SHA256`.
+  `hw.optional.arm.FEAT_SHA256`, `hw.optional.arm.FEAT_CRC32`.
 - **x86_64-linux** (shares the `linux` archive member with aarch64-linux —
   `scripts/g2archive.sh`'s target->PLAT mapping) **and every other target**:
   always 0. An x86-64 `AT_HWCAP` value has no relationship to ARM crypto

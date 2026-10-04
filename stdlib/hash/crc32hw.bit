@@ -1,0 +1,136 @@
+// Bit standard library — hash module, CRC-32C and CRC-32 by CPU instruction.
+//
+// ARMv8 has `crc32cx` (Castagnoli) and `crc32x` (IEEE), each folding 8 bytes
+// into a running CRC-32 per instruction; x86-64 SSE4.2 has `crc32 r64`, which
+// is Castagnoli only. Both read the low 32 bits of the running state and
+// leave the reflected, pre-xorout state the table loops in crc32.bit and
+// crc32ieee.bit keep, so a caller hands the 8-byte blocks to the instruction
+// and the 0..7 byte tail to the software path with no conversion between.
+// CRC-32 IEEE on x86-64 stays on slicing-by-8.
+//
+// DETECTION, ONCE. `crc32Hw` caches which instruction this CPU has: on arm64
+// bit 3 of `bit_rt_crypto_hwcaps` (ABI.md §21c: `hw.optional.armv8_crc32` on
+// Darwin, `HWCAP_CRC32` on Linux), on x86-64 CPUID leaf 1 ECX bit 20
+// (SSE4.2). The CRC instruction is optional in ARMv8.0, so a core without it
+// takes the table path rather than faulting on the first `crc32cx`.
+// `bit_rt_port_syscalls_on_x64` is folded to the build target's answer
+// (compiler/opttarget.bit), so the untaken arch's arm is deleted.
+//
+// ENCODING PROVENANCE. No text assembler exists in this compiler (SPEC §11.6);
+// every word and byte below was assembled from the mnemonic in its comment
+// with this Mac's toolchain (`as -arch arm64`, `clang -c -arch x86_64`) and
+// read back with `objdump -d`.
+//
+// CHUNKED FOR THE COLLECTOR. A block is opaque and holds no safepoint, so one
+// call covers at most `crcHwChunk` words (64 KiB): a multi-gigabyte buffer
+// still reaches the loop's back edge, and its safepoint, every few
+// microseconds.
+
+extern fn bit_rt_crypto_hwcaps(): uint
+extern fn bit_rt_port_syscalls_on_x64(): bool
+
+const crcHwC: int = 1    // CRC-32C instruction present
+const crcHwIeee: int = 2 // CRC-32 IEEE instruction present
+const crcHwChunk: int = 8192
+
+// Sentinel -1: not yet computed. Racing initializers are harmless: every
+// thread reads the same CPU and stores the same value.
+let crcHwCache: int = -1
+
+// The cached `crcHwC`/`crcHwIeee` mask for this CPU.
+fn crc32Hw(): int {
+  if (crcHwCache >= 0) {
+    return crcHwCache
+  }
+  let caps = 0
+  if (bit_rt_port_syscalls_on_x64()) {
+    if ((cpuidLeaf1Ecx() & 0x100000) != 0) {
+      caps = crcHwC
+    }
+  } else if ((bit_rt_crypto_hwcaps() & 8) != 0) {
+    caps = crcHwC | crcHwIeee
+  }
+  crcHwCache = caps
+  return caps
+}
+
+// CPUID leaf 1, sub-leaf 0, ECX. Called only on x86-64; the arm64 arm is a
+// placeholder that `crc32Hw` never reaches.
+fn cpuidLeaf1Ecx(): u64 {
+  return asm {
+    arm64 { 0xD2800000 } // mov x0, #0
+    x64 { 0x0F, 0xA2 }   // cpuid
+    result arm64 x0 x64 rcx : u64
+    input arm64 x0 x64 rax = 1
+    input arm64 x1 x64 rcx = 0
+    clobber x64 { rbx, rdx }
+  }
+}
+
+// Folds the 8-byte blocks of `data` into the raw state `crc` with the CPU's
+// CRC-32C (`ieee` false) or CRC-32 (`ieee` true) instruction. The caller has
+// checked `crc32Hw()` for that variant; the tail `len(data) % 8` is its own.
+fn crc32HwBlocks(crc: u32, data: []byte, ieee: bool): u32 {
+  let words = len(data) / 8
+  let p = ptrOf(data)
+  while (words > 0) {
+    let k = words
+    if (k > crcHwChunk) {
+      k = crcHwChunk
+    }
+    if (ieee) {
+      crc = crc32ieeeAsm(crc, p, k)
+    } else {
+      crc = crc32cAsm(crc, p, k)
+    }
+    p = p + k * 8
+    words = words - k
+  }
+  keepAlive(data)
+  return crc
+}
+
+// `words` (> 0) 8-byte little-endian loads from `p`, each through `crc32cx`
+// (arm64) or `crc32 r64` (x86-64).
+fn crc32cAsm(crc: u32, p: *u8, words: int): u32 {
+  return asm {
+    arm64 {
+      0xF8408423, // ldr x3, [x1], #8
+      0x9AC35C00, // crc32cx w0, w0, x3
+      0xF1000442, // subs x2, x2, #1
+      0x54FFFFA1, // b.ne -12
+    }
+    x64 {
+      0xF2, 0x48, 0x0F, 0x38, 0xF1, 0x01, // crc32 rax, qword ptr [rcx]
+      0x48, 0x83, 0xC1, 0x08,             // add rcx, 8
+      0x48, 0xFF, 0xCA,                   // dec rdx
+      0x75, 0xF1,                         // jne -15
+    }
+    result arm64 x0 x64 rax : u32
+    input arm64 x0 x64 rax = crc
+    input arm64 x1 x64 rcx = p
+    input arm64 x2 x64 rdx = words
+    clobber arm64 { x3, memory }
+    clobber x64 { memory }
+  }
+}
+
+// `words` (> 0) 8-byte little-endian loads from `p`, each through `crc32x`.
+// arm64 only: x86-64 has no CRC-32 IEEE instruction, so its arm is `ud2`.
+fn crc32ieeeAsm(crc: u32, p: *u8, words: int): u32 {
+  return asm {
+    arm64 {
+      0xF8408423, // ldr x3, [x1], #8
+      0x9AC34C00, // crc32x w0, w0, x3
+      0xF1000442, // subs x2, x2, #1
+      0x54FFFFA1, // b.ne -12
+    }
+    x64 { 0x0F, 0x0B } // ud2
+    result arm64 x0 x64 rax : u32
+    input arm64 x0 x64 rax = crc
+    input arm64 x1 x64 rcx = p
+    input arm64 x2 x64 rdx = words
+    clobber arm64 { x3, memory }
+    clobber x64 { memory }
+  }
+}
