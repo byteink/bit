@@ -1,0 +1,336 @@
+// pkg/auth/verify_email.test.bit — #6933's acceptance: EmailVerification
+// send/confirm on an injected clock and an in-memory store. Single use,
+// expiry, an address changed between send and confirm, a resend revoking the
+// earlier link, `markVerified` exactly once, and construction failing for each
+// missing option.
+
+// The hand-moved clock the tokens share.
+class VeClock {
+  t: i64,
+}
+
+// The app the verification is wired to: one user table row, and the record of
+// what `deliver` and `markVerified` were called with.
+class VeApp {
+  email: string,
+  tokens: []string,
+  sentTo: []string,
+  expiries: []i64,
+  verified: []string,
+  deliverFails: bool,
+  markFails: bool,
+}
+
+fn veApp(email: string): VeApp {
+  return VeApp{
+    email = email,
+    tokens = []string{},
+    sentTo = []string{},
+    expiries = []i64{},
+    verified = []string{},
+    deliverFails = false,
+    markFails = false,
+  }
+}
+
+fn veTokens(clock: VeClock): OneTimeTokens {
+  let read: () => i64 = () => clock.t
+  return OneTimeTokens(MemoryOneTimeStore(), OneTimeOptions{ clock = read }) catch e {
+    panic("OneTimeTokens: ${e.message()}")
+  }
+}
+
+fn veOptions(app: VeApp): VerifyOptions {
+  let deliver: Deliver = (to, token, expiresAt) => {
+    app.tokens = append(app.tokens, token)
+    app.sentTo = append(app.sentTo, to)
+    app.expiries = append(app.expiries, expiresAt)
+    if (app.deliverFails) {
+      fail newError("smtp down")
+    }
+  }
+  let mark: (string, string) => ()! = (userId, email) => {
+    app.verified = append(app.verified, "${userId}:${email}")
+    if (app.markFails) {
+      fail newError("users table down")
+    }
+  }
+  let current: (string) => string! = (userId) => {
+    if (userId == "author-17") {
+      return app.email
+    }
+    return ""
+  }
+  return VerifyOptions{ deliver = deliver, markVerified = mark, currentEmail = current }
+}
+
+fn veBuild(clock: VeClock, app: VeApp): EmailVerification {
+  return EmailVerification(veTokens(clock), veOptions(app)) catch e {
+    panic("EmailVerification: ${e.message()}")
+  }
+}
+
+fn veSend(v: EmailVerification, userId: string, email: string) {
+  v.send(userId, email) catch e {
+    panic("send: ${e.message()}")
+  }
+}
+
+// The text of what `confirm` fails with, "" when it succeeds.
+fn veConfirm(v: EmailVerification, token: string): string {
+  v.confirm(token) catch e {
+    let (_, invalid) = e.(InvalidToken)
+    if (invalid) {
+      return "invalid"
+    }
+    return e.message()
+  }
+  return ""
+}
+
+test "a link confirms once and the second click fails" {
+  let app = veApp("ada@example.com")
+  let v = veBuild(VeClock{ t = 1000 }, app)
+  veSend(v, "author-17", "ada@example.com")
+  assert(veConfirm(v, app.tokens[0]) == "", "the first confirm must succeed")
+  assert(veConfirm(v, app.tokens[0]) == "invalid", "the second confirm must fail")
+  assert(
+    len(app.verified) == 1 && app.verified[0] == "author-17:ada@example.com",
+    "verified ${len(app.verified)} time(s)",
+  )
+}
+
+test "deliver gets the address, a 43 character token and the expiry" {
+  let app = veApp("ada@example.com")
+  let v = veBuild(VeClock{ t = 1000 }, app)
+  veSend(v, "author-17", "ada@example.com")
+  assert(app.sentTo[0] == "ada@example.com", "sent to ${app.sentTo[0]}")
+  assert(len(app.tokens[0]) == 43, "token length ${len(app.tokens[0])}")
+  assert(app.expiries[0] == 1000 + 86400, "expiry ${app.expiries[0]}")
+}
+
+test "an expired link fails and marks nothing" {
+  let clock = VeClock{ t = 1000 }
+  let app = veApp("ada@example.com")
+  let v = veBuild(clock, app)
+  veSend(v, "author-17", "ada@example.com")
+  clock.t = 1000 + 86400
+  assert(veConfirm(v, app.tokens[0]) == "invalid", "an expired link must fail")
+  assert(len(app.verified) == 0, "marked ${len(app.verified)} time(s)")
+}
+
+test "a link for address A fails after the user changed to B" {
+  let app = veApp("ada@example.com")
+  let v = veBuild(VeClock{ t = 0 }, app)
+  veSend(v, "author-17", "ada@example.com")
+  app.email = "ada@new.example.com"
+  assert(veConfirm(v, app.tokens[0]) == "invalid", "a link for the old address must fail")
+  assert(len(app.verified) == 0, "marked ${len(app.verified)} time(s)")
+}
+
+test "a resend invalidates the earlier link" {
+  let app = veApp("ada@example.com")
+  let v = veBuild(VeClock{ t = 0 }, app)
+  veSend(v, "author-17", "ada@example.com")
+  veSend(v, "author-17", "ada@example.com")
+  assert(len(app.tokens) == 2 && app.tokens[0] != app.tokens[1], "two different tokens")
+  assert(veConfirm(v, app.tokens[0]) == "invalid", "the first link must be dead")
+  assert(veConfirm(v, app.tokens[1]) == "", "the second link must work")
+}
+
+test "a resend for one user leaves another user's link alone" {
+  let app = veApp("ada@example.com")
+  let v = veBuild(VeClock{ t = 0 }, app)
+  veSend(v, "author-17", "ada@example.com")
+  veSend(v, "author-18", "bob@example.com")
+  veSend(v, "author-18", "bob@example.com")
+  assert(veConfirm(v, app.tokens[0]) == "", "author-17's link must still work")
+}
+
+test "markVerified runs exactly once across three confirm attempts" {
+  let app = veApp("ada@example.com")
+  let v = veBuild(VeClock{ t = 0 }, app)
+  veSend(v, "author-17", "ada@example.com")
+  let token = app.tokens[0]
+  let _ = veConfirm(v, token)
+  let _ = veConfirm(v, token)
+  let _ = veConfirm(v, token)
+  assert(len(app.verified) == 1, "markVerified ran ${len(app.verified)} time(s)")
+}
+
+test "each missing option is rejected at construction" {
+  let app = veApp("ada@example.com")
+  let full = veOptions(app)
+  let tokens = veTokens(VeClock{ t = 0 })
+  let rejected = 0
+  EmailVerification(
+    tokens,
+    VerifyOptions{ markVerified = full.markVerified, currentEmail = full.currentEmail },
+  ) catch e {
+    assert(contains(e.message(), "`deliver`"), e.message())
+    rejected = rejected + 1
+  }
+  EmailVerification(
+    tokens,
+    VerifyOptions{ deliver = full.deliver, currentEmail = full.currentEmail },
+  ) catch e {
+    assert(contains(e.message(), "`markVerified`"), e.message())
+    rejected = rejected + 1
+  }
+  EmailVerification(
+    tokens,
+    VerifyOptions{ deliver = full.deliver, markVerified = full.markVerified },
+  ) catch e {
+    assert(contains(e.message(), "`currentEmail`"), e.message())
+    rejected = rejected + 1
+  }
+  assert(rejected == 3, "${rejected} of 3 missing options rejected")
+}
+
+test "a ttl that cannot work is rejected at construction" {
+  let app = veApp("ada@example.com")
+  let tokens = veTokens(VeClock{ t = 0 })
+  let rejected = 0
+  for ttl of []i64{ 0, -5, 2_592_001 } {
+    let o = veOptions(app)
+    o.ttl = ttl
+    EmailVerification(tokens, o) catch _ {
+      rejected = rejected + 1
+    }
+  }
+  assert(rejected == 3, "${rejected} of 3 bad ttls rejected")
+}
+
+test "send refuses an empty user and an address that is not one address" {
+  let app = veApp("ada@example.com")
+  let v = veBuild(VeClock{ t = 0 }, app)
+  let bad = []string{
+    "",
+    "no-at-sign",
+    "@example.com",
+    "ada@",
+    "a@b@example.com",
+    "ada@example.com\r\nBcc: eve@example.com",
+    "ada@example.com, eve@example.com",
+    "ada @example.com",
+  }
+  let rejected = 0
+  for email of bad {
+    v.send("author-17", email) catch _ {
+      rejected = rejected + 1
+    }
+  }
+  assert(rejected == len(bad), "${rejected} of ${len(bad)} bad addresses rejected")
+  v.send("", "ada@example.com") catch _ {
+    rejected = rejected + 1
+  }
+  assert(rejected == len(bad) + 1, "an empty userId must fail")
+  assert(len(app.tokens) == 0, "deliver ran ${len(app.tokens)} time(s)")
+}
+
+test "a failed delivery leaves no live link and returns the failure" {
+  let app = veApp("ada@example.com")
+  app.deliverFails = true
+  let v = veBuild(VeClock{ t = 0 }, app)
+  let failure = ""
+  v.send("author-17", "ada@example.com") catch e {
+    failure = e.message()
+  }
+  assert(failure == "smtp down", "send returned '${failure}'")
+  assert(veConfirm(v, app.tokens[0]) == "invalid", "the unsent link must be dead")
+}
+
+test "a link from another purpose does not confirm an address" {
+  let clock = VeClock{ t = 0 }
+  let app = veApp("ada@example.com")
+  let tokens = veTokens(clock)
+  let v = EmailVerification(tokens, veOptions(app)) catch e {
+    panic("EmailVerification: ${e.message()}")
+  }
+  let reset = tokens.issue("password-reset", "author-17", 600, "ada@example.com") catch e {
+    panic("issue: ${e.message()}")
+  }
+  assert(veConfirm(v, reset) == "invalid", "a reset token must not verify an address")
+  assert(len(app.verified) == 0, "marked ${len(app.verified)} time(s)")
+}
+
+test "every reason a link is refused is the same InvalidToken" {
+  let clock = VeClock{ t = 0 }
+  let app = veApp("ada@example.com")
+  let v = veBuild(clock, app)
+  veSend(v, "author-17", "ada@example.com")
+  let changed = app.tokens[0]
+  app.email = "other@example.com"
+  let a = veConfirm(v, changed)
+  app.email = "ada@example.com"
+  veSend(v, "author-17", "ada@example.com")
+  clock.t = 90000
+  let expired = veConfirm(v, app.tokens[1])
+  let unknown = veConfirm(v, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+  let malformed = veConfirm(v, "x")
+  assert(
+    a == "invalid" && expired == a && unknown == a && malformed == a,
+    "${a}/${expired}/${unknown}/${malformed}",
+  )
+  let msg = ""
+  v.confirm("x") catch e {
+    msg = e.message()
+  }
+  assert(msg == "auth: invalid or expired token", "message '${msg}'")
+}
+
+test "a user who no longer exists cannot confirm" {
+  let app = veApp("ada@example.com")
+  let v = veBuild(VeClock{ t = 0 }, app)
+  veSend(v, "author-99", "ghost@example.com")
+  assert(veConfirm(v, app.tokens[0]) == "invalid", "currentEmail answered \"\"; the link must fail")
+  assert(len(app.verified) == 0, "marked ${len(app.verified)} time(s)")
+}
+
+test "a failing markVerified is returned and the link is spent" {
+  let app = veApp("ada@example.com")
+  app.markFails = true
+  let v = veBuild(VeClock{ t = 0 }, app)
+  veSend(v, "author-17", "ada@example.com")
+  assert(
+    veConfirm(v, app.tokens[0]) == "users table down",
+    "markVerified's failure must come back as it was",
+  )
+  assert(veConfirm(v, app.tokens[0]) == "invalid", "the link must be spent")
+  assert(len(app.verified) == 1, "markVerified ran ${len(app.verified)} time(s)")
+}
+
+test "verifyLink builds a link from an https base and refuses unsafe ones" {
+  let token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  let link = verifyLink("https://inkwell.example/confirm", token) catch e {
+    panic("verifyLink: ${e.message()}")
+  }
+  assert(link == "https://inkwell.example/confirm?token=${token}", link)
+  let local = verifyLink("http://localhost:8080/confirm", token) catch e {
+    panic("verifyLink: ${e.message()}")
+  }
+  assert(local == "http://localhost:8080/confirm?token=${token}", local)
+  let bad = []string{
+    "http://inkwell.example/confirm",
+    "ftp://inkwell.example/confirm",
+    "//inkwell.example/confirm",
+    "https://",
+    "https:///confirm",
+    "https://inkwell.example/confirm?next=/",
+    "https://inkwell.example/confirm#top",
+    "https://evil.example@inkwell.example/confirm",
+    "https://inkwell.example/con firm",
+    "https://inkwell.example/\r\nSet-Cookie: x=1",
+  }
+  let rejected = 0
+  for base of bad {
+    verifyLink(base, token) catch _ {
+      rejected = rejected + 1
+    }
+  }
+  assert(rejected == len(bad), "${rejected} of ${len(bad)} bad bases rejected")
+  verifyLink("https://inkwell.example/confirm", "a&b=c") catch _ {
+    rejected = rejected + 1
+  }
+  assert(rejected == len(bad) + 1, "a token that is not a token must be refused")
+}

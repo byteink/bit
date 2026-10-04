@@ -1,0 +1,246 @@
+// pkg/auth/verify_email.bit — email verification on the one-time token
+// primitive (onetime.bit, #6925; this file is #6933, epic #3960).
+//
+//   let verification = EmailVerification(tokens, VerifyOptions{
+//     deliver = mailTheLink,
+//     markVerified = users.markVerified,
+//     currentEmail = users.emailOf,
+//   })?
+//   verification.send("author-17", "ada@example.com")?   // at signup, and on "send it again"
+//   verification.confirm(tokenFromTheLink)?              // when the link is opened
+//
+// STANDARDS. OWASP ASVS v5 (email verification), NIST SP 800-63A section 4.2 and
+// 800-63B section 6.1.2 (out-of-band verification), and the OWASP Email
+// Validation and Verification guidance.
+//
+// ## What is guaranteed
+//
+//  - The link proves control of the mailbox it was sent to: the token carries
+//    the address, and `confirm` honours it only while that is still the
+//    address on file. Changing the address between `send` and `confirm`
+//    kills the link.
+//  - `markVerified` runs once per link. The token is consumed before it is
+//    called, so a second click, a replay and a mail scanner's prefetch cannot
+//    run it again.
+//  - `send` revokes every earlier link of the user first, so the mailbox of an
+//    address the user no longer controls holds a dead link.
+//  - Every reason `confirm` refuses a link is the same `InvalidToken`: unknown,
+//    expired, used, malformed, another purpose, or an address that changed.
+//    Nothing a client sees says whether an account or an address exists.
+//  - Tokens are never put in an error message or a log line by this file.
+//
+// ## Two sends at the same instant
+//
+// `send` is a revoke followed by an issue, two store calls with no lock around
+// them. Two simultaneous sends for one user can both survive, and the user
+// holds two live links to the same address, each expiring on its own. Neither
+// is more powerful than the other, and the next `send` revokes both.
+import { indexOf } from "std/strings"
+
+// What the token is for. Not the same string as any other flow's purpose, so a
+// password reset or a magic link can never confirm an address.
+const verifyEmailPurpose: string = "verify-email"
+
+// The longest address RFC 5321 allows in a path, and so the longest `send` takes.
+const maxAddressLen: int = 254
+
+// The options of `EmailVerification`.
+export class VerifyOptions {
+  // Sends the link to the address. Required.
+  export deliver: Deliver,
+  // Records that `email` now belongs to the user `userId` has verified, in the
+  // app's own user table. Called with the arguments `userId` and `email`.
+  // Required. Called at most once per link.
+  export markVerified: (string, string) => ()!,
+  // The address on file for `userId` right now, or "" when there is no such
+  // user. Required. A failure is the store's and is returned as it came.
+  export currentEmail: (string) => string!,
+  // How long a link lives, in seconds: one day. At most the `maxTtl` of the
+  // `OneTimeTokens` it is built on.
+  export ttl: i64 = 86400,
+}
+
+// Sends and confirms email verification links. Stateless apart from the token
+// store, so one value is shared by every request.
+export class EmailVerification {
+  tokens: OneTimeTokens
+  opts: VerifyOptions
+
+  // Fails for a missing callback or a `ttl` that cannot work, so the mistake shows when the app starts.
+  init(tokens: OneTimeTokens, opts: VerifyOptions)! {
+    if (opts.deliver == nil) {
+      fail newError("auth: EmailVerification(): `deliver` is not set — it sends the link")
+    }
+    if (opts.markVerified == nil) {
+      fail newError("auth: EmailVerification(): `markVerified` is not set — it records the address as verified")
+    }
+    if (opts.currentEmail == nil) {
+      fail newError("auth: EmailVerification(): `currentEmail` is not set — it reads the address on file")
+    }
+    if (opts.ttl < 1 || opts.ttl > tokens.opts.maxTtl) {
+      fail newError("auth: EmailVerification(): `ttl` is ${opts.ttl} second(s) — it must be between 1 and ${tokens.opts.maxTtl}")
+    }
+    this.tokens = tokens
+    this.opts = opts
+  }
+
+  // Mails a new link to `email` for the user `userId`, and kills the links sent
+  // before. Used at signup and for "send it again".
+  //
+  // Fails, loudly, for an empty `userId` or an `email` that is not one address
+  // (empty, too long, no `@`, or holding a space or control character, which
+  // is how a header gets injected into a mail). If `deliver` fails the new
+  // link is revoked too, since nobody has it, and the failure is returned.
+  //
+  // Whether the address belongs to anyone is the caller's to hide: see the
+  // chapter on resending.
+  export send(userId: string, email: string): ()! {
+    if (userId == "") {
+      fail newError("auth: EmailVerification.send(): `userId` is empty — name the user")
+    }
+    if (!verifyAddressOk(email)) {
+      fail newError("auth: EmailVerification.send(): `email` is not a single address")
+    }
+    this.tokens.revokeSubject(verifyEmailPurpose, userId)?
+    let at = this.tokens.nowSec()
+    let token = this.tokens.issue(verifyEmailPurpose, userId, this.opts.ttl, email)?
+    // `at` is read before the record's own clock read, so a message saying
+    // "valid until" is never later than the truth.
+    this.opts.deliver(email, token, at + this.opts.ttl) catch e {
+      this.dropUnsent(userId)
+      fail e
+    }
+  }
+
+  // Revokes the link `send` just made when `deliver` failed, since nobody has
+  // it. A store that cannot revoke is not worse news than the delivery failure
+  // the caller needs to see, so its error is dropped.
+  dropUnsent(userId: string) {
+    this.tokens.revokeSubject(verifyEmailPurpose, userId) catch _ {
+      return
+    }
+  }
+
+  // Consumes the link's `token`, checks that the address it carries is still
+  // the user's address on file, and calls `markVerified` once.
+  //
+  // Fails with `InvalidToken` for every reason it will not honour a link, the
+  // address having changed included. The token is consumed even then, and also
+  // when `markVerified` fails, whose error is returned as it came: the user
+  // asks for a new link. A failure of `currentEmail` is returned as it came.
+  export confirm(token: string): ()! {
+    let rec = this.tokens.redeem(token, verifyEmailPurpose)?
+    let current = this.opts.currentEmail(rec.subject)?
+    if (current == "" || !ctEq([]byte(current), []byte(rec.data))) {
+      fail InvalidToken{}
+    }
+    this.opts.markVerified(rec.subject, rec.data)?
+  }
+}
+
+// The address a confirm page lives at, with `token` as its `token` query
+// parameter: `verifyLink("https://inkwell.example/confirm", token)` is
+// `https://inkwell.example/confirm?token=...`.
+//
+// `baseUrl` is the app's own configuration, never a request's `Host` header,
+// which an attacker controls and which would put the link on their site. It
+// must be an `https://` URL with a host and no query, fragment or userinfo;
+// `http://` is accepted for `localhost`, `127.0.0.1` and `[::1]` only, for
+// development. Fails otherwise, and for a `token` that is not one
+// `OneTimeTokens.issue` makes, so nothing but 43 URL-safe characters is ever
+// appended.
+export fn verifyLink(baseUrl: string, token: string): string! {
+  if (!oneTimeWellFormed(token)) {
+    fail newError("auth: verifyLink(): `token` is not a token from OneTimeTokens.issue")
+  }
+  linkBaseOk(baseUrl)?
+  return "${baseUrl}?token=${token}"
+}
+
+// Whether `email` is one plausible address: 3 to `maxAddressLen` bytes, one
+// `@` with something on each side, and no byte that could end a mail header
+// line or start a second address.
+fn verifyAddressOk(email: string): bool {
+  if (len(email) < 3 || len(email) > maxAddressLen) {
+    return false
+  }
+  if (hasUnsafeByte(email, "<>,;\"\\")) {
+    return false
+  }
+  return countByte(email, '@') == 1 && email[0] != '@' && email[len(email) - 1] != '@'
+}
+
+// Whether `s` holds a space, a control character, DEL or any byte of `extra`.
+fn hasUnsafeByte(s: string, extra: string): bool {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] <= ' ' || s[i] == 127 || countByte(extra, s[i]) > 0) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn countByte(s: string, b: byte): int {
+  let n = 0
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == b) {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// Fails unless `base` is a URL `verifyLink` will extend; see its comment.
+fn linkBaseOk(base: string): ()! {
+  let secure = hasPrefix(base, "https://")
+  if (!secure && !hasPrefix(base, "http://")) {
+    fail newError("auth: verifyLink(): `baseUrl` must start with https://")
+  }
+  if (hasUnsafeByte(base, "?#@\\")) {
+    fail newError("auth: verifyLink(): `baseUrl` must hold no query, fragment, userinfo, space or control character")
+  }
+  let host = linkHost(linkAuthority(base, secure))
+  if (host == "") {
+    fail newError("auth: verifyLink(): `baseUrl` has no host")
+  }
+  if (!secure && !linkIsLocal(host)) {
+    fail newError("auth: verifyLink(): `baseUrl` is http:// for a host that is not local — use https://")
+  }
+}
+
+fn linkIsLocal(host: string): bool {
+  return host == "localhost" || host == "127.0.0.1" || host == "[::1]"
+}
+
+// `host[:port]` of a URL already known to start with its scheme.
+fn linkAuthority(base: string, secure: bool): string {
+  let rest = base[7:len(base)]
+  if (secure) {
+    rest = base[8:len(base)]
+  }
+  let slash = indexOf(rest, "/")
+  if (slash < 0) {
+    return rest
+  }
+  return rest[0:slash]
+}
+
+// The host part of `host[:port]`, an IPv6 literal kept in its brackets.
+fn linkHost(authority: string): string {
+  if (hasPrefix(authority, "[")) {
+    let end = indexOf(authority, "]")
+    if (end < 0) {
+      return ""
+    }
+    return authority[0:end + 1]
+  }
+  let colon = indexOf(authority, ":")
+  if (colon < 0) {
+    return authority
+  }
+  return authority[0:colon]
+}

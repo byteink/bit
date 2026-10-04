@@ -110,6 +110,12 @@ protected route that is not itself doing the authenticating just reads
   only as a SHA-256 hash, bound to a purpose, expiring, redeemed once, with a
   pluggable store and the `Deliver` function the app supplies to send them; see
   [One-time tokens for account emails](docs/account-tokens.md).
+- `EmailVerification`, `VerifyOptions`, `verifyLink` - email verification on the
+  one-time token: `send` mails a link and revokes the earlier ones, `confirm`
+  spends it once and calls your `markVerified`, refusing it when the address
+  changed or for any reason in the one `InvalidToken`; `verifyLink` builds the
+  link from a base URL the app configures; see
+  [Confirm an author's email address](docs/email-verification.md).
 - `generateRecoveryCodes`, `RecoveryOptions`, `RecoverySet`,
   `redeemRecoveryCode`, `RedeemOptions`, `RecoveryRedeem` - single-use
   recovery codes for a lost authenticator: generated from the CSPRNG, stored
