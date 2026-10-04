@@ -8,6 +8,21 @@ relationships, checked in one place and applied to database reads and writes.
 `bit add bitlang.org/pkg/authz` writes the dependency; the package is not
 released yet.
 
+## A first look
+
+Your own enum is the list of actions; one handle is built at startup:
+
+```bit
+import { Authz } from "authz"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+fn main(): ()! {
+  let authz = Authz<Action>()?
+  println("manage wildcard: ${authz.hasWildcard()}")
+}
+```
+
 ## Docs
 
-Documentation is in progress.
+The [chapters](docs/README.md) start with [Actions](docs/actions.md).
