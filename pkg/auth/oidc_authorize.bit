@@ -33,11 +33,10 @@
 // lost it entirely — the callback (#5777) would never find data for the
 // cookie it was issued.
 //
-// `scope` (OIDC Core 1.0 §3.1.2.1) is configurable (#5811): `OidcStrategy`
-// carries `scopes: []string`, the constructor defaults it to `["openid"]`
-// (today's behaviour), and `withScopes` overrides it, refusing a list
-// missing `"openid"` — see `defaultScopes`/`hasOpenidScope`/`withScopes`
-// below. `providers.bit`'s presets widen it to the standard OIDC scopes.
+// `scope` (OIDC Core 1.0 §3.1.2.1) is configurable (#5811, #6921):
+// `OidcStrategy` carries `scopes: []string`, set from `OidcOptions.scopes`
+// (providers.bit) by the constructor, which refuses a list missing "openid"
+// and defaults an empty one to `openid email profile` — see `resolveScopes`.
 //
 // `Ctx` is already bound module-wide by `strategy.bit`; `TlsConfig` by
 // `oidc_discovery.bit` (an import binds per MODULE, SPEC §17.1), so
@@ -66,27 +65,22 @@ const stateSessionKey = "auth:oidc:state"
 const nonceSessionKey = "auth:oidc:nonce"
 const verifierSessionKey = "auth:oidc:verifier"
 
-// Where an `OidcStrategy` gets its provider: `Discover(issuer, tls)` runs
-// `discover` (oidc_discovery.bit) on `issuer` and builds the `JwksCache` for
-// the `jwksUri` it reports, over the explicit, caller-supplied `TlsConfig`
-// `discover`/`JwksCache` already require — oidc_discovery.bit's file header
-// explains why this package never guesses one. `Given(config, jwks)` takes a
-// provider the caller already holds, with no network call: a `config` literal
-// and a `JwksCache` built from a parsed `Jwks` (`docs/testing.md`).
-export enum OidcSource { Discover(string, TlsConfig), Given(OidcConfig, JwksCache) }
-
 // The fields `beginAuthorization` and the token exchange/ID-token
 // verification (#5777) need to run one OIDC client against `config`: `jwks`
 // is the `JwksCache` (oidc_discovery.bit) for the SAME issuer, so the
 // callback's `verifyIdToken` never has to be handed a second, independently
 // constructed cache that could point at a different `jwksUri`. `scopes` is
 // the OIDC Core 1.0 §3.1.2.1 `scope` request parameter, space-joined by
-// `authorizeUrl` — see the constructor and `withScopes` for how it is set.
+// `authorizeUrl` — see the constructor for how it is set.
 //
-// `OidcStrategy(source, clientId, clientSecret, redirectUri)` builds one for
-// `source` (above) with `tokenFetch` left `nil` (the real network — see below)
-// and `scopes` at `["openid"]`; pass `tokenFetch = ...` to substitute a fake
-// token endpoint.
+// `OidcStrategy(provider, clientId, clientSecret, redirectUri, opts)` builds
+// one for `provider` (`Provider`, providers.bit) with every option in `opts`
+// (`OidcOptions`, providers.bit) defaulting: `tokenFetch` left `nil` (the
+// real network — see below) and `scopes` at `openid email profile`; pass
+// `OidcOptions{ tokenFetch = ... }` to substitute a fake token endpoint.
+// Every construction failure — a discovery-based provider without
+// `opts.tls`, scopes without `openid`, a Microsoft multi-tenant alias, a
+// failing discovery — is an `Error`, never a half-built strategy.
 //
 // `tokenFetch` (#6150) is `handleCallback`'s (oidc_callback.bit) seam over
 // the token-exchange POST: `nil` means the real network call, exactly like
@@ -95,7 +89,7 @@ export enum OidcSource { Discover(string, TlsConfig), Given(OidcConfig, JwksCach
 // `handleCallback` takes, so the ROUTE code — `app.get(path, (c) =>
 // handleCallback(s, c))` — is byte-for-byte identical in production and in
 // a downstream app's own test; only how `s` was built differs, the same way
-// `googleStrategy(...)` and a hand-built fake strategy already differ.
+// a discovered `Provider` and a hand-built `Provider.Endpoints` already differ.
 export class OidcStrategy {
   export config: OidcConfig
   export clientId: string
@@ -106,70 +100,35 @@ export class OidcStrategy {
   export tokenFetch: TokenFetch
 
   init(
-    source: OidcSource,
+    provider: Provider,
     clientId: string,
     clientSecret: string,
     redirectUri: string,
-    tokenFetch: TokenFetch = nil,
+    opts: OidcOptions = OidcOptions{},
   )! {
     this.clientId = clientId
     this.clientSecret = clientSecret
     this.redirectUri = redirectUri
-    this.scopes = defaultScopes()
-    this.tokenFetch = tokenFetch
-    match (source) {
-      Discover(issuer, tls) => {
-        this.config = discover(issuer, tls)?
-        this.jwks = JwksCache(this.config.jwksUri, tls)?
-      }
-      Given(config, jwks) => {
+    this.scopes = resolveScopes(opts.scopes)?
+    this.tokenFetch = opts.tokenFetch
+    match (provider) {
+      Google => this.discoverFrom(googleIssuer(), opts.tls)?
+      Microsoft(tenant) => this.discoverFrom(microsoftIssuer(tenant)?, opts.tls)?
+      Generic(issuer) => this.discoverFrom(issuer, opts.tls)?
+      Endpoints(config, jwks) => {
         this.config = config
         this.jwks = jwks
       }
     }
   }
-}
 
-// The scope list `OidcStrategy`'s constructor defaults to: `openid` alone, today's
-// behaviour before this ticket (#5811) and the OIDC Core 1.0 §3.1.2.1 floor
-// every strategy must carry (see `hasOpenidScope`). A provider preset
-// (`providers.bit`) widens this with `withScopes`; an application overrides
-// either the same way.
-fn defaultScopes(): []string {
-  return ["openid"]
-}
-
-// True if `scopes` contains `"openid"`. OIDC Core 1.0 §3.1.2.1: "Scope...
-// MUST contain the openid scope value" — every `OidcStrategy` this package
-// builds must keep it, since `beginAuthorization`'s whole flow is OpenID
-// Connect, never bare OAuth2.
-fn hasOpenidScope(scopes: []string): bool {
-  for scope of scopes {
-    if (scope == "openid") {
-      return true
-    }
-  }
-  return false
-}
-
-// Replaces `s`'s scope list with `scopes`, refusing one missing `"openid"`
-// (OIDC Core 1.0 §3.1.2.1 — see `hasOpenidScope`). The override point for
-// both a provider preset (`providers.bit`) and application code, kept within
-// the package's 5-parameter ceiling by taking the whole strategy rather than
-// its individual fields. Carries `s.tokenFetch` through unchanged — this is
-// a scope override, not a way to drop a caller's test seam.
-export fn withScopes(s: OidcStrategy, scopes: []string): OidcStrategy! {
-  if (!hasOpenidScope(scopes)) {
-    fail newError("auth: withScopes(): scopes '${join(scopes, " ")}' must include \"openid\" (OIDC Core 1.0 §3.1.2.1)")
-  }
-  return OidcStrategy{
-    config = s.config,
-    clientId = s.clientId,
-    clientSecret = s.clientSecret,
-    redirectUri = s.redirectUri,
-    jwks = s.jwks,
-    scopes = scopes,
-    tokenFetch = s.tokenFetch,
+  // Runs `discover` on `issuer` and builds the `JwksCache` for the `jwksUri`
+  // it reports, both over the explicit `TlsConfig` in `tls` — see
+  // oidc_discovery.bit's file header for why this package never guesses one.
+  discoverFrom(issuer: string, tls: Option<TlsConfig>): ()! {
+    let cfg = requireTls(tls)?
+    this.config = discover(issuer, cfg)?
+    this.jwks = JwksCache(this.config.jwksUri, cfg)?
   }
 }
 
