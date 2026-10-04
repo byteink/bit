@@ -1,0 +1,462 @@
+// tools/gens3 — renders the response deserializers of the pinned S3 model as
+// Bit source (#6622, epic #6565): `pkg/s3/gen_resp_enums_NN.bit` (one wire
+// parser per enum) and `pkg/s3/gen_resp_ops_NN.bit` (one `fill<Op>Output` per
+// operation with an output, and a `deserialize<Op>Output` for the outputs that
+// need no body parsing). The runtime they are written against is
+// pkg/s3/response.bit.
+//
+// What `fill<Op>Output(h, out)` sets, from the response `h`:
+//
+//   - `responseMetadata` (status, request id, extended id, attempts, retry delay);
+//   - every `httpHeader` member, typed: strings as they are, integers and
+//     booleans parsed (a malformed value fails naming the header), timestamps
+//     by the member's or its target's `timestampFormat` (HTTP-date when the
+//     model says none), enums through `parse<Enum>` (a value the table does
+//     not name becomes `Unknown(value)`);
+//   - `Expires` of an output as a date plus the raw text in `expiresString`
+//     (a text that is not a date leaves `expires` unset, never fails);
+//   - every `httpPrefixHeaders` member as a map, lower-cased keys, `Some` and
+//     empty when no header matched (`x-amz-meta-*` into `metadata`);
+//   - an `httpResponseCode` member;
+//   - the payload member when it is a streaming blob (`ByteStream` over
+//     `h.stream`) or a string (`h.text`).
+//
+// The seam to the XML deserializer (#6628): an output whose body is XML (a
+// structure payload, or members bound to no HTTP location) or an event stream
+// is NOT built here, the block says `body: xml` or `body: event stream`. Its
+// deserializer constructs the output from `h.text`, then calls
+// `fill<Op>Output(h, out)` for everything else. An output whose body is
+// nothing, a stream or a string also gets `deserialize<Op>Output(h)`, which
+// builds it and calls `fill`.
+//
+// A member the generator cannot read (a required header member, a list
+// header, a payload of a kind S3 has none of) is an error, so a model bump
+// that brings one stops here.
+
+import { Builder, toLower } from "std/strings"
+
+// Statement lines of one generated function; the lint ceiling is 80, and the
+// signature, the metadata line and the closing brace take the rest.
+const respMaxFnLines: int = 60
+
+// The widest line `bit fmt` keeps on one line (compiler/fmt.bit fmtMaxWidth).
+const respMaxWidth: int = 100
+
+// Where an output's body travels.
+enum RespBody {
+  None,
+  Stream,
+  Text,
+  Xml,
+  EventStream,
+}
+
+fn bodyText(k: RespBody): string {
+  return match (k) {
+    None => "none"
+    Stream => "stream"
+    Text => "text"
+    Xml => "xml (the XML deserializer builds the output, then calls fill)"
+    EventStream => "event stream (the frame decoder builds the output, then calls fill)"
+  }
+}
+
+// An output built and filled here: its body is nothing, a stream or a string.
+fn isStandalone(k: RespBody): bool {
+  return k == RespBody.None || k == RespBody.Stream || k == RespBody.Text
+}
+
+fn isBound(mem: Member): bool {
+  return mem.header != "" || mem.prefixHeaders != "" || mem.responseCode || mem.payload
+}
+
+fn payloadBody(p: Plan, u: Unit, mem: Member): RespBody! {
+  let at = "${u.shape.id}.${mem.name}"
+  let i = shapeIndex(p.m, mem.target)
+  let s = p.m.shapes[i]
+  if (s.kind == ShapeKind.Blob && s.streaming) {
+    return RespBody.Stream
+  }
+  if (s.kind == ShapeKind.String) {
+    return RespBody.Text
+  }
+  if (s.kind == ShapeKind.Union && s.streaming) {
+    return RespBody.EventStream
+  }
+  if (s.kind == ShapeKind.Structure) {
+    return RespBody.Xml
+  }
+  fail newError("${at}: a payload of this kind is not one the generator reads")
+}
+
+fn bodyKind(p: Plan, u: Unit): RespBody! {
+  let kind = RespBody.None
+  for mem of u.shape.members {
+    if (mem.payload) {
+      return payloadBody(p, u, mem)?
+    }
+    if (!isBound(mem)) {
+      kind = RespBody.Xml
+    }
+  }
+  return kind
+}
+
+fn isOptionalMember(mem: Member): bool {
+  return !mem.required && !mem.hasDefault
+}
+
+fn someOf(mem: Member, expr: string): string {
+  if (isOptionalMember(mem)) {
+    return "Option.Some(${expr})"
+  }
+  return expr
+}
+
+// The arguments of a call on one line: `a, b, c`.
+fn commaList(args: []string): string {
+  let b = Builder()
+  let i = 0
+  while (i < len(args)) {
+    if (i > 0) {
+      b.write(", ")
+    }
+    b.write(args[i])
+    i = i + 1
+  }
+  return b.toString()
+}
+
+// `  out.<field> = fn(args)<q>`, wrapped the way `bit fmt` wraps a call whose
+// line is wider than `respMaxWidth` (one argument per line).
+fn callStatement(field: string, fnName: string, args: []string, q: string): string {
+  let one = "  out.${field} = ${fnName}(h, ${commaList(args)})"
+  if (len(one) <= respMaxWidth) {
+    return one + q + "\n"
+  }
+  let b = Builder()
+  b.write("  out.${field} = ${fnName}(\n    h,\n")
+  for a of args {
+    b.write("    ${a},\n")
+  }
+  b.write("  )${q}\n")
+  return b.toString()
+}
+
+fn plainStatement(field: string, rhs: string, at: string): string! {
+  let line = "  out.${field} = ${rhs}"
+  if (len(line) > respMaxWidth) {
+    fail newError("${at}: the statement is wider than ${respMaxWidth} columns")
+  }
+  return line + "\n"
+}
+
+fn timestampReader(mem: Member, s: Shape, at: string): string! {
+  let f = mem.timestampFormat
+  if (f == "") {
+    f = s.timestampFormat
+  }
+  if (f == "" || f == "http-date") {
+    return "headerHttpDate"
+  }
+  if (f == "date-time") {
+    return "headerDateTime"
+  }
+  if (f == "epoch-seconds") {
+    return "headerEpoch"
+  }
+  fail newError("${at}: timestamp format ${f} is not one the generator reads")
+}
+
+// The statement for a member bound to a header.
+fn headerStatement(p: Plan, u: Unit, mem: Member): string! {
+  let at = "${u.shape.id}.${mem.name}"
+  if (!isOptionalMember(mem)) {
+    fail newError("${at}: a header member must be optional, a missing header would have no value")
+  }
+  let f = fieldName(mem.name)
+  let name = "\"${toLower(mem.header)}\""
+  if (isExpiresHeader(u, mem)) {
+    return "  out.${f} = headerExpires(h)\n  out.expiresString = headerText(h, ${name})\n"
+  }
+  let i = shapeIndex(p.m, mem.target)
+  let s = p.m.shapes[i]
+  return match (s.kind) {
+    String => callStatement(f, "headerText", [name], "")
+    Boolean => callStatement(f, "headerBool", [name], "?")
+    Integer => callStatement(f, "headerInt", [name], "?")
+    Long => callStatement(f, "headerInt", [name], "?")
+    Timestamp => callStatement(f, timestampReader(mem, s, at)?, [name], "?")
+    Enum => callStatement(f, "headerEnum", [name, "parse${p.names[i]}"], "")
+    _ => ""
+  }
+}
+
+// A header member's target must be one of the kinds `headerStatement` reads.
+fn checkHeaderKind(p: Plan, u: Unit, mem: Member): ()! {
+  let k = p.m.shapes[shapeIndex(p.m, mem.target)].kind
+  if (k == ShapeKind.String || k == ShapeKind.Boolean || k == ShapeKind.Integer) {
+    return
+  }
+  if (k == ShapeKind.Long || k == ShapeKind.Timestamp || k == ShapeKind.Enum) {
+    return
+  }
+  fail newError("${u.shape.id}.${mem.name}: a header of this kind is not one the generator reads")
+}
+
+// `x-amz-meta-` into a map of string to string, always present.
+fn prefixStatement(p: Plan, u: Unit, mem: Member): string! {
+  let at = "${u.shape.id}.${mem.name}"
+  let s = p.m.shapes[shapeIndex(p.m, mem.target)]
+  if (s.kind != ShapeKind.Map || len(s.members) != 2) {
+    fail newError("${at}: prefix headers must be a map")
+  }
+  for e of s.members {
+    if (p.m.shapes[shapeIndex(p.m, e.target)].kind != ShapeKind.String) {
+      fail newError("${at}: prefix headers must be a map of strings")
+    }
+  }
+  let rhs = someOf(mem, "prefixedHeaders(h, \"${toLower(mem.prefixHeaders)}\")")
+  return plainStatement(fieldName(mem.name), rhs, at)?
+}
+
+fn statusStatement(p: Plan, u: Unit, mem: Member): string! {
+  let at = "${u.shape.id}.${mem.name}"
+  let k = p.m.shapes[shapeIndex(p.m, mem.target)].kind
+  if (k != ShapeKind.Integer && k != ShapeKind.Long) {
+    fail newError("${at}: the response code member must be an integer")
+  }
+  return plainStatement(fieldName(mem.name), someOf(mem, "h.status"), at)?
+}
+
+// The statement for the payload member, "" when its body is not read here.
+fn payloadStatement(p: Plan, u: Unit, mem: Member): string! {
+  let at = "${u.shape.id}.${mem.name}"
+  let f = fieldName(mem.name)
+  return match (payloadBody(p, u, mem)?) {
+    Stream => plainStatement(f, someOf(mem, "ByteStream{ source = h.stream }"), at)?
+    Text => plainStatement(f, someOf(mem, "h.text"), at)?
+    _ => ""
+  }
+}
+
+// The statement filling `mem`, "" for a member that travels in the body.
+fn memberStatement(p: Plan, u: Unit, mem: Member): string! {
+  if (mem.payload) {
+    return payloadStatement(p, u, mem)?
+  }
+  if (mem.responseCode) {
+    return statusStatement(p, u, mem)?
+  }
+  if (mem.prefixHeaders != "") {
+    return prefixStatement(p, u, mem)?
+  }
+  if (mem.header != "") {
+    checkHeaderKind(p, u, mem)?
+    return headerStatement(p, u, mem)?
+  }
+  return ""
+}
+
+fn statements(p: Plan, u: Unit): []string! {
+  let out = []string(0)
+  for mem of u.shape.members {
+    let s = memberStatement(p, u, mem)?
+    if (s != "") {
+      out = append(out, s)
+    }
+  }
+  return out
+}
+
+// The statements cut into runs of at most `respMaxFnLines` lines, each the
+// body of one function.
+fn partitionStatements(stmts: []string): []string {
+  let parts = []string(0)
+  let cur = Builder()
+  let lines = 0
+  for s of stmts {
+    let n = countLines(s)
+    if (lines > 0 && lines + n > respMaxFnLines) {
+      parts = append(parts, cur.toString())
+      cur = Builder()
+      lines = 0
+    }
+    cur.write(s)
+    lines = lines + n
+  }
+  if (lines > 0) {
+    parts = append(parts, cur.toString())
+  }
+  return parts
+}
+
+// The output type `op` returns (renamed in place, or the derived `<Op>Output`).
+fn outputUnit(p: Plan, op: Operation): Unit! {
+  for u of p.units {
+    if (u.name == op.name + "Output") {
+      return u
+    }
+  }
+  fail newError("${op.id}: no output type ${op.name}Output in the plan")
+}
+
+// `fn name(h: ResponseHead, out: Out): ()! {`, its parameters one per line when
+// the line is wider than `respMaxWidth`, as `bit fmt` writes it.
+fn fillSignature(name: string, outType: string): string {
+  let one = "fn ${name}(h: ResponseHead, out: ${outType}): ()! {"
+  if (len(one) <= respMaxWidth) {
+    return one + "\n"
+  }
+  return "fn ${name}(\n  h: ResponseHead,\n  out: ${outType},\n): ()! {\n"
+}
+
+fn writeFill(b: Builder, u: Unit, parts: []string) {
+  if (len(parts) > 1) {
+    let i = 0
+    while (i < len(parts)) {
+      b.write(fillSignature("fill${u.name}${i + 1}", u.name))
+      b.write("${parts[i]}}\n\n")
+      i = i + 1
+    }
+  }
+  b.write(fillSignature("fill${u.name}", u.name))
+  b.write("  out.responseMetadata = responseMetadataOf(h)\n")
+  if (len(parts) == 1) {
+    b.write(parts[0])
+  }
+  if (len(parts) > 1) {
+    let i = 0
+    while (i < len(parts)) {
+      b.write("  fill${u.name}${i + 1}(h, out)?\n")
+      i = i + 1
+    }
+  }
+  b.write("}\n")
+}
+
+// What an output is built with before `fill` runs: a streaming payload is a
+// required class-typed field, which a literal must name.
+fn buildInit(p: Plan, u: Unit): string! {
+  for mem of u.shape.members {
+    if (mem.payload && payloadBody(p, u, mem)? == RespBody.Stream && !isOptionalMember(mem)) {
+      return " ${fieldName(mem.name)} = emptyStream() "
+    }
+  }
+  return ""
+}
+
+fn renderOp(p: Plan, op: Operation): string! {
+  let u = outputUnit(p, op)?
+  let body = bodyKind(p, u)?
+  let b = Builder()
+  b.write("// ${u.shape.id}: ${op.id}\n// body: ${bodyText(body)}\n")
+  writeFill(b, u, partitionStatements(statements(p, u)?))
+  if (isStandalone(body)) {
+    b.write("\nfn deserialize${u.name}(h: ResponseHead): ${u.name}! {\n")
+    b.write("  let out = ${u.name}{${buildInit(p, u)?}}\n")
+    b.write("  fill${u.name}(h, out)?\n  return out\n}\n")
+  }
+  return b.toString()
+}
+
+// A wire value the generator writes inside a string literal as it is.
+fn checkWireValue(v: string, at: string): ()! {
+  let i = 0
+  while (i < len(v)) {
+    let c = v[i]
+    if (c < ' ' || c == '"' || c == '\\' || c == '$' || c > '~') {
+      fail newError("${at}: enum value ${v} has a character the generator does not escape")
+    }
+    i = i + 1
+  }
+}
+
+// One row of a parser table, wrapped the way `bit fmt` wraps a tuple wider than
+// `respMaxWidth`.
+fn parserRow(wire: string, variant: string): string {
+  let one = "    (\"${wire}\", ${variant}),"
+  if (len(one) <= respMaxWidth) {
+    return one + "\n"
+  }
+  return "    (\n      \"${wire}\",\n      ${variant},\n    ),\n"
+}
+
+// `parse<Enum>(wire)`: the variant for a wire value, `Unknown(wire)` for the rest.
+fn renderEnumParser(p: Plan, u: Unit): string! {
+  let b = Builder()
+  b.write("// ${u.shape.id}\n")
+  b.write("fn parse${u.name}(s: string): ${u.name} {\n  let table = [\n")
+  for mem of u.shape.members {
+    checkWireValue(mem.enumValue, "${u.shape.id}.${mem.name}")?
+    b.write(parserRow(mem.enumValue, "${u.name}.${variantName(mem.name)?}"))
+  }
+  b.write("  ]\n  for (wire, v) of table {\n    if (wire == s) {\n      return v\n    }\n  }\n")
+  b.write("  return ${u.name}.Unknown(s)\n}\n")
+  return b.toString()
+}
+
+fn respFileName(kind: string, n: int): string {
+  if (n < 10) {
+    return "gen_resp_${kind}_0${n}.bit"
+  }
+  return "gen_resp_${kind}_${n}.bit"
+}
+
+fn finishRespFile(kind: string, n: int, head: string, blocks: []string): GenFile {
+  let b = Builder()
+  b.write(head)
+  let i = 0
+  while (i < len(blocks)) {
+    b.write(blocks[i])
+    if (i + 1 < len(blocks)) {
+      b.write("\n")
+    }
+    i = i + 1
+  }
+  return GenFile{ name = respFileName(kind, n), text = b.toString() }
+}
+
+// `blocks` filled greedily into `gen_resp_<kind>_NN.bit` files under the cap.
+fn packRespFiles(kind: string, head: string, blocks: []string): []GenFile {
+  let files = []GenFile(0)
+  let cur = []string(0)
+  let lines = 0
+  for block of blocks {
+    let n = countLines(block) + 1
+    if (len(cur) > 0 && lines + n > maxBlockLines) {
+      files = append(files, finishRespFile(kind, len(files) + 1, head, cur))
+      cur = []string(0)
+      lines = 0
+    }
+    cur = append(cur, block)
+    lines = lines + n
+  }
+  if (len(cur) > 0) {
+    files = append(files, finishRespFile(kind, len(files) + 1, head, cur))
+  }
+  return files
+}
+
+// Every `gen_resp_*.bit`, enum parsers first. `commit` and `sha` are the model pin.
+fn renderResp(m: Model, commit: string, sha: string): []GenFile! {
+  let p = planShapes(m)?
+  let head = headerLines("resp", commit, sha) + "\n"
+  let enums = []string(0)
+  for u of p.units {
+    if (u.shape.kind == ShapeKind.Enum) {
+      enums = append(enums, renderEnumParser(p, u)?)
+    }
+  }
+  let ops = []string(0)
+  for op of m.operations {
+    if (!isUnitOutput(op)) {
+      ops = append(ops, renderOp(p, op)?)
+    }
+  }
+  let files = packRespFiles("enums", head, enums)
+  for f of packRespFiles("ops", head, ops) {
+    files = append(files, f)
+  }
+  return files
+}
