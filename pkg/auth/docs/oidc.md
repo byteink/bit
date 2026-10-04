@@ -83,7 +83,7 @@ through. Neither `beginAuthorization` nor `handleCallback` goes through
 
 ## Choosing scopes
 
-`OidcOptions.scopes` left empty requests `openid email profile` from every
+`OidcOptions.scopes` left out requests `openid email profile` from every
 provider. Set it to replace the list outright - useful when you want less,
 or a scope the default does not request, as the route registration above
 does with `["openid", "email"]`. The constructor refuses any list missing

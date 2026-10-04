@@ -87,9 +87,6 @@ fn main(): ()! {
   put it in `inReplyTo`. Only letters, digits and the symbols RFC 5322 allows in
   an id are accepted. Empty means a fresh unique id.
 
-An omitted map is nil, so give `headers` and `tags` as a whole map, as above,
-rather than writing a key into the empty message.
-
 ## What is refused
 
 Four mistakes are the program's, not the user's, and each has its own text:

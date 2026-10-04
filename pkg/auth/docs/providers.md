@@ -139,7 +139,7 @@ leaving it out fails at construction, naming the option. `Provider.Endpoints`
 takes an `OidcConfig` and a `JwksCache` you already hold, makes no network
 call, and ignores `tls`; it is what [Testing your sign-in
 routes](testing.md) builds a fake provider from. Whichever you pick,
-`OidcOptions.scopes` left empty requests `openid email profile`; set it to
+`OidcOptions.scopes` left out requests `openid email profile`; set it to
 choose your scopes from a blank slate:
 
 ```bit
