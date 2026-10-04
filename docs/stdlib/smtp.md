@@ -34,6 +34,52 @@ fn submit(host: string, user: string, pass: string, m: Message): ()! {
 
 Port 465 is implicit TLS: `dialTls` instead, and no `startTls`.
 
+## When a send fails
+
+Every fallible call in the module fails with an `SmtpError`. A relay that
+retries has to tell "try again later" from "this will never work", and the error
+answers that without parsing its text.
+
+```bit
+import { Client, Message, SmtpError } from "std/smtp"
+
+// How `send` ended: delivered, worth another attempt, or given up on.
+enum Outcome { Sent, Retry, Rejected }
+
+// The decision, from the error alone.
+fn verdict(e: SmtpError): Outcome {
+  if (e.transient()) {
+    return Outcome.Retry
+  }
+  return Outcome.Rejected
+}
+
+fn attempt(c: Client, m: Message): Outcome {
+  c.send(m) catch e {
+    println("${e.command} failed: ${e.code} ${e.enhanced} ${e.text}")
+    return verdict(e)
+  }
+  return Outcome.Sent
+}
+```
+
+`e` is an `SmtpError` there, fields in reach, because `send` is declared
+`()!SmtpError`. A mailbox that is busy (`450 4.2.1 Mailbox busy`)
+is `Retry`; an unknown user (`550 5.1.1 No such user`) is `Rejected`, and
+sending it again draws the same answer.
+
+`transient()` is true for a 4xx reply, and for a failure with no reply at all -
+a refused connection, a reset, a timeout, a failed handshake - because those
+are the network's. It is false for a 5xx reply, an unexpected 2xx or 3xx, and
+for the calls the module refuses locally: a CR in a header value, a malformed
+address, `AUTH` on a connection that is not TLS, a command out of order. A
+local refusal has `command` equal to `"validate"`, and retrying it is only
+ever the same mistake again.
+
+`message()` gives the one-line form, `smtp: RCPT TO got 450: 4.2.1 Mailbox
+busy`, and `SmtpError` satisfies `error`, so a caller that only logs can keep
+`catch e` and `e.message()` and ignore the rest.
+
 ## What this module refuses to do
 
 Four rules are structural - enforced by the code that would otherwise break
@@ -200,7 +246,7 @@ ASCII with no space, CR, LF or NUL, at most 250 octets.
 Every address this message is delivered to, `To:` then `Cc:`, in the order
 added - the envelope `RCPT TO` list.
 
-### `Message.render(): string!`
+### `Message.render(): string!SmtpError`
 
 The complete RFC 5322 message: headers, a blank line, and the body, CRLF
 throughout, dot-stuffing NOT applied (that belongs to the transmission, not to
@@ -247,13 +293,13 @@ Setting `insecureSkipVerify` true means the connection proves nothing about who
 the peer is, and a credential sent over one is a credential given to whoever
 answered. It is for tests and pinned lab servers.
 
-### `dial(host: string, port: int): Client!`
+### `dial(host: string, port: int): Client!SmtpError`
 
 Connect to a cleartext submission port (587, or 25 for a relay) and read the
 greeting. The session is not secure yet: `startTls` makes it so, and until it
 does, `authPlain` and `authLogin` refuse to run.
 
-### `dialTls(host: string, port: int, o: Options): Client!`
+### `dialTls(host: string, port: int, o: Options): Client!SmtpError`
 
 Connect to an implicit-TLS submission port (465): the handshake happens before
 the greeting, so there is no cleartext phase and no `startTls`.
@@ -262,13 +308,13 @@ the greeting, so there is no cleartext phase and no `startTls`.
 
 One SMTP session.
 
-### `Client.ehlo(name: string): ()!`
+### `Client.ehlo(name: string): ()!SmtpError`
 
 Send `EHLO name` and record the capabilities it returns. `name` is the client's
 own domain and goes on the command line unquoted, so it must be printable ASCII
 with no spaces. Must be re-issued after `startTls`.
 
-### `Client.startTls(o: Options): ()!`
+### `Client.startTls(o: Options): ()!SmtpError`
 
 Upgrade a cleartext connection to TLS (RFC 3207). Fails when the server did not
 advertise `STARTTLS`, and fails when the server has sent bytes that would sit in
@@ -287,25 +333,25 @@ case-insensitively against the first word of each capability line, so
 Whether this connection is TLS - an implicit-TLS dial, or a completed
 `startTls`.
 
-### `Client.authPlain(user: string, pass: string): ()!`
+### `Client.authPlain(user: string, pass: string): ()!SmtpError`
 
 Authenticate with SASL PLAIN (RFC 4616). Refused, before the command is built,
 on a connection that is not TLS.
 
-### `Client.authLogin(user: string, pass: string): ()!`
+### `Client.authLogin(user: string, pass: string): ()!SmtpError`
 
 Authenticate with SASL LOGIN - username and password as two base64 challenge
 responses. Same refusal on a non-TLS connection, and it fires before the
 `AUTH LOGIN` command, so not even the username is transmitted.
 
-### `Client.send(m: Message): ()!`
+### `Client.send(m: Message): ()!SmtpError`
 
 Render, validate and send `m`: `MAIL FROM`, one `RCPT TO` per recipient, `DATA`,
 the dot-stuffed payload, and the terminating dot. The message is rendered and
 checked first, so a CR in a subject or a malformed recipient fails with
 `MAIL FROM` never sent.
 
-### `Client.quit(): ()!`
+### `Client.quit(): ()!SmtpError`
 
 End the session politely: `QUIT`, then close the socket. The socket is closed
 even when the reply is not a 221 - the alternative is leaking a descriptor over
@@ -322,3 +368,24 @@ of the module never asks whether it is talking cleartext or TLS - `startTls`
 swaps one implementation for another inside a live `Client`, and the flag that
 guards `AUTH` is written by that same swap, so there is no state for it to
 disagree with. A caller has no reason to implement it.
+
+### `SmtpError`
+
+Why a step failed, and the one type every fallible call here fails with.
+
+| Field | Meaning |
+|---|---|
+| `code` | the reply code the server answered with; 0 when no reply was involved (network, TLS, a malformed reply, a local refusal) |
+| `enhanced` | the RFC 3463 status the server sent (`5.1.1`, RFC 2034), or `""` when it sent none |
+| `text` | the server's text joined by a space with the enhanced status taken off, or the local reason when `code` is 0 |
+| `command` | the step that failed: `connect`, `greeting`, `EHLO`, `STARTTLS`, `AUTH PLAIN`, `AUTH LOGIN`, `AUTH LOGIN username`, `AUTH LOGIN password`, `MAIL FROM`, `RCPT TO`, `DATA`, `end of DATA`, `QUIT`, or `validate` for a local refusal |
+
+### `SmtpError.transient(): bool`
+
+True when sending again later can succeed: a 4xx reply, or a failure with no
+reply that is not a local `validate` refusal. See "When a send fails".
+
+### `SmtpError.message(): string`
+
+The failure as one line, in the module's wording: `smtp: <command> got <code>:
+<enhanced> <text>` for a reply, `smtp: <reason>` without one.
