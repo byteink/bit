@@ -1,0 +1,415 @@
+// tools/gens3 — renders the restXml response BODY vectors as a generated test
+// file, `pkg/s3/gen_xmldevec.test.bit` (#6628, epic #6565).
+//
+// The vectors are the httpResponseTests of smithy-aws-protocol-tests
+// (smithy-lang/smithy, commit in tools/gens3/model/restxml-body-vectors.json)
+// whose output has an XML body, filtered to what the S3 model has (the file's
+// `filter`, and every test it drops with its reason in `excluded`). The file
+// holds the output shapes of those tests as a Smithy model, every name
+// prefixed `Xv` so it cannot meet a name of the S3 model or of
+// gen_respvec.test.bit. This emitter plans that model the way emitshapes.bit
+// does and writes, into the one generated test file, its types, its enum
+// parsers and `fill` functions (emitresp.bit) and its XML deserializers
+// (emitxmlde.bit: the SAME renderers pkg/s3 is generated with), then one test
+// per vector: it builds a response head from the vector's code, headers and
+// body, runs the generated `deserialize<Op>Output`, and asserts every member
+// the vector's params name, down through lists, maps, structures and unions.
+
+import { Builder, contains, replace } from "std/strings"
+import { Json, jsonEncode, jsonParse } from "std/json"
+
+const xmlVecFile: string = "tools/gens3/model/restxml-body-vectors.json"
+const xmlVecStem: string = "gen_xmldevec_"
+
+const secondNs: int = 1000000000
+
+// What the assertions share: the plan, and a counter for the names they bind.
+class AssertCtx {
+  p: Plan,
+  n: int,
+}
+
+// One byte of a string literal: control bytes the document holds as their
+// escapes, `"` and `\\` escaped, a byte without an escape an error.
+fn literalByte(c: byte, at: string): string! {
+  if (c == '\n') {
+    return "\\n"
+  }
+  if (c == '\r') {
+    return "\\r"
+  }
+  if (c == '\t') {
+    return "\\t"
+  }
+  if (c == '"' || c == '\\') {
+    return "\\" + string([c])
+  }
+  if (c < ' ' || c == '$' || c > '~') {
+    fail newError("${at}: byte ${int(c)} has no escape in a generated string")
+  }
+  return string([c])
+}
+
+// The Bit string literal for a document or value `s`.
+fn textLiteral(s: string, at: string): string! {
+  let b = Builder()
+  b.write("\"")
+  let i = 0
+  while (i < len(s)) {
+    b.write(literalByte(s[i], at)?)
+    i = i + 1
+  }
+  b.write("\"")
+  return b.toString()
+}
+
+// `epoch` seconds as nanoseconds, from the JSON number `v`: an integer, or a
+// decimal with up to nine fraction digits, read as text so no float rounds it.
+fn epochNs(v: Json, at: string): int! {
+  let text = jsonEncode(v)
+  let dot = indexOfDot(text)
+  if (dot < 0) {
+    return needInt(v, at)? * secondNs
+  }
+  let whole = parseIntText(text[0:dot], at)?
+  let frac = text[dot + 1:len(text)]
+  if (len(frac) > 9) {
+    fail newError("${at}: ${text} has more than nine fraction digits")
+  }
+  let ns = parseIntText(frac, at)?
+  let i = len(frac)
+  while (i < 9) {
+    ns = ns * 10
+    i = i + 1
+  }
+  return whole * secondNs + ns
+}
+
+fn indexOfDot(s: string): int {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == '.') {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn parseIntText(s: string, at: string): int! {
+  let n = 0
+  let i = 0
+  if (len(s) == 0) {
+    fail newError("${at}: empty number")
+  }
+  while (i < len(s)) {
+    if (s[i] < '0' || s[i] > '9') {
+      fail newError("${at}: ${s} is not a number the vectors read")
+    }
+    n = n * 10 + int(s[i] - '0')
+    i = i + 1
+  }
+  return n
+}
+
+fn freshName(c: AssertCtx, stem: string): string {
+  c.n = c.n + 1
+  return "${stem}${c.n}"
+}
+
+// `assert(cond, "path")`, wrapped like `bit fmt` does when it is too wide.
+fn assertLine(ind: string, cond: string, path: string): string! {
+  return callLine(ind, "", "assert", [cond, textLiteral(path, path)?], "")?
+}
+
+// The condition that `access` holds the scalar `v` of the shape `i`.
+fn scalarCondition(c: AssertCtx, i: int, access: string, v: Json, at: string): string! {
+  let p = c.p
+  return match (p.m.shapes[i].kind) {
+    String => "${access} == ${textLiteral(needString(v, at)?, at)?}"
+    Integer => "${access} == ${needInt(v, at)?}"
+    Long => "${access} == ${needInt(v, at)?}"
+    Boolean => "${access} == ${needBool(v, at)?}"
+    Enum => "${access} == ${enumLiteral(p, i, needString(v, at)?, at)?}"
+    Timestamp => "${access}.ns == ${epochNs(v, at)?}"
+    _ => ""
+  }
+}
+
+fn isScalarKind(k: ShapeKind): bool {
+  return k != ShapeKind.List &&
+    k != ShapeKind.Map &&
+    k != ShapeKind.Structure &&
+    k != ShapeKind.Union
+}
+
+// Where an assertion is written: the path it names in its message, and the
+// indentation of its lines.
+class Site {
+  path: string,
+  ind: string,
+}
+
+fn below(site: Site, suffix: string): Site {
+  return Site{ path = site.path + suffix, ind = site.ind }
+}
+
+// Assertions that `access` (a value, not an `Option`) of the member `mem`'s
+// target holds the param `v`.
+fn assertValue(c: AssertCtx, mem: Member, access: string, v: Json, site: Site): string! {
+  let i = shapeIndex(c.p.m, mem.target)
+  let s = c.p.m.shapes[i]
+  if (isScalarKind(s.kind)) {
+    return assertLine(site.ind, scalarCondition(c, i, access, v, site.path)?, site.path)?
+  }
+  return match (s.kind) {
+    List => assertList(c, s, access, v, site)?
+    Map => assertMap(c, s, access, v, site)?
+    Structure => assertStruct(c, s, access, v, site)?
+    _ => assertUnion(c, s, access, v, site)?
+  }
+}
+
+fn assertList(c: AssertCtx, s: Shape, access: string, v: Json, site: Site): string! {
+  let items = needArray(v, site.path)?
+  let b = Builder()
+  b.write(assertLine(site.ind, "len(${access}) == ${len(items)}", site.path + " length")?)
+  let k = 0
+  while (k < len(items)) {
+    b.write(assertValue(c, s.members[0], "${access}[${k}]", items[k], below(site, "[${k}]"))?)
+    k = k + 1
+  }
+  return b.toString()
+}
+
+fn assertMap(c: AssertCtx, s: Shape, access: string, v: Json, site: Site): string! {
+  let entries = needObject(v, site.path)?
+  let b = Builder()
+  b.write(assertLine(site.ind, "len(${access}) == ${len(entries)}", site.path + " length")?)
+  for e of entries {
+    let key = textLiteral(e.key, site.path)?
+    b.write(assertValue(c, s.members[1], "${access}[${key}]", e.value, below(site, ".${e.key}"))?)
+  }
+  return b.toString()
+}
+
+// One member of a structure: an `Option` field is unwrapped into a binding
+// first, a failing `vecGot` naming the path when it is unset.
+fn assertField(c: AssertCtx, mem: Member, access: string, v: Json, site: Site): string! {
+  let field = "${access}.${fieldName(mem.name)}"
+  if (!isOptionalMember(mem)) {
+    return assertValue(c, mem, field, v, site)?
+  }
+  let name = freshName(c, "a")
+  let b = Builder()
+  b.write(
+    callLine(site.ind, "let ${name} = ", "vecGot", [field, textLiteral(site.path, site.path)?], "")?,
+  )
+  b.write(assertValue(c, mem, name, v, site)?)
+  return b.toString()
+}
+
+fn assertStruct(c: AssertCtx, s: Shape, access: string, v: Json, site: Site): string! {
+  let b = Builder()
+  for e of needObject(v, site.path)? {
+    let mem = shapeMember(s, e.key, site.path)?
+    b.write(assertField(c, mem, access, e.value, below(site, ".${e.key}"))?)
+  }
+  return b.toString()
+}
+
+fn shapeMember(s: Shape, name: string, at: string): Member! {
+  for mem of s.members {
+    if (mem.name == name) {
+      return mem
+    }
+  }
+  fail newError("${at}: ${s.id} has no member ${name}")
+}
+
+// A union param is an object with the one member that is set.
+fn assertUnion(c: AssertCtx, s: Shape, access: string, v: Json, site: Site): string! {
+  let entries = needObject(v, site.path)?
+  if (len(entries) != 1) {
+    fail newError("${site.path}: a union param names ${len(entries)} members, want 1")
+  }
+  let mem = shapeMember(s, entries[0].key, site.path)?
+  let name = freshName(c, "u")
+  let inner = Site{ path = "${site.path}.${mem.name}", ind = site.ind + "    " }
+  let body = assertValue(c, mem, name, entries[0].value, inner)?
+  let ind = site.ind
+  let b = Builder()
+  b.write("${ind}match (${access}) {\n${ind}  ${mem.name}(${name}) => {\n${body}${ind}  }\n")
+  b.write("${ind}  _ => panic(${textLiteral(site.path + ": not the expected variant", site.path)?})\n${ind}}\n")
+  return b.toString()
+}
+
+// The assertions for the whole output `u` from the vector's `params`.
+fn bodyAssertions(p: Plan, u: Unit, params: Json, at: string): string! {
+  let c = AssertCtx{ p = p, n = 0 }
+  return assertStruct(c, u.shape, "out", params, Site{ path = at, ind = "  " })?
+}
+
+fn bodyCaseTest(p: Plan, cs: Json, n: int, total: int): string! {
+  let id = needString(vecKey(cs, "id", "case")?, "case id")?
+  let at = "vector ${id}"
+  let opName = needString(vecKey(cs, "operation", at)?, at)?
+  let u = outputOf(p, opName)?
+  let code = needInt(vecKey(cs, "code", at)?, at)?
+  let b = Builder()
+  b.write("test \"restXml body vector ${n} of ${total}: ${id} (${opName})\" {\n")
+  b.write("  let h = responseHead(${code}, \"\")\n")
+  for hd of needArray(vecKey(cs, "headers", at)?, at)? {
+    let pair = needArray(hd, at)?
+    let line = "  vecAdd(h, ${bitString(needString(pair[0], at)?, at)?}, ${bitString(
+      needString(pair[1], at)?,
+      at,
+    )?})\n"
+    b.write(line)
+  }
+  b.write("  h.text = ${textLiteral(needString(vecKey(cs, "body", at)?, at)?, at)?}\n")
+  b.write("  let out = deserialize${u.name}(h) catch e {\n")
+  b.write("    panic(\"${id}: " + interpolation + "\")\n  }\n")
+  b.write("  assert(out.responseMetadata.httpStatusCode == ${code}, \"status\")\n")
+  b.write(bodyAssertions(p, u, vecKey(cs, "params", at)?, at)?)
+  b.write("  println(\"restXml body vector ${n} of ${total}: ${id}\")\n}\n")
+  return b.toString()
+}
+
+fn xmlVectorHeader(root: Json, commit: string, sha: string): string! {
+  let src = needKey(root, "source", "vectors")?
+  let at = needString(needKey(src, "commit", "vectors: source")?, "vectors: source commit")?
+  let dir = needString(needKey(src, "dir", "vectors: source")?, "vectors: source dir")?
+  let filter = needString(needKey(root, "filter", "vectors")?, "vectors: filter")?
+  return headerLines("xmldevec", commit, sha) +
+    "// Vectors: github.com/smithy-lang/smithy at commit ${at}, ${dir}.\n" +
+    "// Filter: ${filter}\n\n"
+}
+
+// The vector model's types, enum parsers, `fill` functions and XML
+// deserializers, as blocks. Inputs are never read, so they are not written.
+fn xmlVectorCode(p: Plan): []string! {
+  let blocks = []string(0)
+  for u of p.units {
+    if (u.role != Role.Input) {
+      blocks = append(blocks, renderUnit(p, u)?)
+    }
+  }
+  for e of enumParserBlocks(p)? {
+    blocks = append(blocks, e)
+  }
+  for o of opBlocks(p)? {
+    blocks = append(blocks, o)
+  }
+  for x of xmlBlocks(p)? {
+    blocks = append(blocks, x)
+  }
+  return blocks
+}
+
+// The most lines a generated vector file holds, under the 800-line ceiling.
+const xmlVecMaxLines: int = 780
+
+fn totalLines(blocks: []string): int {
+  let n = 0
+  for b of blocks {
+    n = n + countLines(b) + 1
+  }
+  return n
+}
+
+// `code` cut into `n` runs of about equal size, in order.
+fn splitCode(code: []string, n: int): [][]string {
+  let target = totalLines(code) / n + 1
+  let runs = [][]string(0)
+  let cur = []string(0)
+  let lines = 0
+  for block of code {
+    if (len(cur) > 0 && lines + countLines(block) > target && len(runs) + 1 < n) {
+      runs = append(runs, cur)
+      cur = []string(0)
+      lines = 0
+    }
+    cur = append(cur, block)
+    lines = lines + countLines(block) + 1
+  }
+  return append(runs, cur)
+}
+
+// The tests of file `f` of `n`: test `k` of `total` goes to file `k * n / total`.
+fn testsOfFile(tests: []string, f: int, n: int): []string {
+  let out = []string(0)
+  let k = 0
+  while (k < len(tests)) {
+    if (k * n / len(tests) == f) {
+      out = append(out, tests[k])
+    }
+    k = k + 1
+  }
+  return out
+}
+
+// One generated file: header, the imports its text needs, blocks.
+fn vectorFile(n: int, head: string, blocks: []string): GenFile {
+  let body = Builder()
+  let i = 0
+  while (i < len(blocks)) {
+    body.write(blocks[i])
+    if (i + 1 < len(blocks)) {
+      body.write("\n")
+    }
+    i = i + 1
+  }
+  let text = body.toString()
+  let b = Builder()
+  b.write(head)
+  if (contains(text, "Timestamp")) {
+    b.write("import { Timestamp } from \"std/time\"\n")
+  }
+  if (contains(text, "(e: Element)")) {
+    b.write("import { Element } from \"std/xml\"\n")
+  }
+  b.write("\n" + text)
+  let name = replace(respFileName(xmlVecStem, n), ".bit", ".test.bit")
+  return GenFile{ name = name, text = b.toString() }
+}
+
+// Every `gen_xmldevec_NN.test.bit` for the vector file text `src` and the S3
+// model pin: the vector model's code split over the files, and the tests spread
+// evenly over them so each file holds some.
+fn renderXmlVectors(src: string, commit: string, sha: string): []GenFile! {
+  let root = jsonParse(src)?
+  let p = planShapes(vectorModel(root)?)?
+  let cases = needArray(needKey(root, "cases", "vectors")?, "vectors: cases")?
+  let tests = []string(0)
+  let n = 1
+  for cs of cases {
+    tests = append(tests, bodyCaseTest(p, cs, n, len(cases))?)
+    n = n + 1
+  }
+  let code = xmlVectorCode(p)?
+  let files = (totalLines(code) + totalLines(tests)) / xmlVecMaxLines + 1
+  if (files > len(tests)) {
+    fail newError("${files} vector files for ${len(tests)} tests: a file would hold none")
+  }
+  let head = xmlVectorHeader(root, commit, sha)?
+  let runs = splitCode(code, files)
+  let out = []GenFile(0)
+  let f = 0
+  while (f < len(runs)) {
+    let all = []string(0)
+    for b of runs[f] {
+      all = append(all, b)
+    }
+    for t of testsOfFile(tests, f, len(runs)) {
+      all = append(all, t)
+    }
+    let file = vectorFile(f + 1, head, all)
+    if (countLines(file.text) > xmlVecMaxLines) {
+      fail newError("${file.name}: ${countLines(file.text)} lines, over ${xmlVecMaxLines}")
+    }
+    out = append(out, file)
+    f = f + 1
+  }
+  return out
+}
