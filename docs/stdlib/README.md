@@ -73,6 +73,7 @@ Modules are grouped by what you reach for them to do.
 | Module | Import | What it is for |
 |---|---|---|
 | [json](json.md) | `"std/json"` | JSON and JSONC parsing, encoding, and comment-preserving editing |
+| [cbor](cbor.md) | `"std/cbor"` | CBOR (RFC 8949) decoder and deterministic encoder - bounded depth, items and bytes, strict mode |
 | [csv](csv.md) | `"std/csv"` | RFC 4180 CSV parsing and formatting |
 | [xml](xml.md) | `"std/xml"` | XML 1.0 pull tokenizer (DOCTYPE refused, bounded depth and input) and a Writer that cannot emit malformed XML |
 | [uuid](uuid.md) | `"std/uuid"` | UUID v4/v5/v7, parse/format |
