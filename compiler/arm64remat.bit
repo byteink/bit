@@ -30,10 +30,192 @@
 // `constIntValue(ins)`, and this emits that same call into the same register
 // the `ldr` would have written. MOVZ/MOVN/MOVK set no flags and neither does
 // LDR, so a fused compare between a read and its branch cannot tell them apart.
+//
+// #5786: a threaded-constant parameter recomputes too, but only when the
+// allocator left it no slot; one that got a slot is loaded from it.
 fn rematSpilledConst(cx: A64Ctx, vreg: int, dst: int): bool {
+  if (rematParam(cx, vreg) && regLocOf(cx, vreg).index < 0) {
+    movImm64(cx.code, dst, cx.rematVal[vreg])
+    return true
+  }
   if (!isRematConst(cx.f, vreg, RematIsa.Arm64)) {
     return false
   }
   movImm64(cx.code, dst, constIntValue(cx.f.instrs[vreg]))
   return true
+}
+
+// #5786. A block parameter that holds ONE integer constant on every path:
+// every edge into its block passes that constant or another such parameter.
+// The front end threads every value live across a loop through each inner
+// header and exit block, so `n` in `while (i < n)` is a CYCLE of parameters
+// fed by one `const_int`, and so is #4729's hoisted multiplier. Its value is
+// that constant, so when the allocator spills it the uses recompute it --
+// what they did before any hoist -- instead of reloading a slot the
+// preheader had to store.
+//
+// Not a lowering of `isRematConst`'s one-word bar: that prices a constant
+// whose register serves one use. This prices a value the allocator has
+// already refused a register across a loop. The entry block's parameters
+// are refused: the call ABI, not an edge, defines them.
+class RematParams {
+  has: []bool,
+  val: []int,
+}
+
+// Per instruction id, which block params are such a constant and its value.
+// Only `jump`/`br` pass block arguments (`blockArgMoves`), so the scan sees
+// every definition a parameter has. An optimistic fixpoint, sound for SSA:
+// a cycle of parameters whose only outside input is V holds V. Each state
+// only falls (unseen -> one constant -> refuted), so it settles within
+// `2n + 1` sweeps; the bound is asserted rather than trusted.
+fn rematParamsOf(f: IrFunc): RematParams {
+  let n = len(f.instrs)
+  let rp = RematParams{ has = []bool(n), val = []int(n) }
+  // 0 = no input seen yet, 1 = one constant, 2 = refuted.
+  let state = []int(n)
+  // Refuted up front, not merely skipped: an entry parameter is never fed by
+  // an edge, so leaving it unseen would let a parameter it feeds ignore it.
+  rematRefuteEntry(f, state)
+  let sweeps = 0
+  while (rematSweep(f, rp, state)) {
+    sweeps = sweeps + 1
+    assert(sweeps <= 2 * n + 1)
+  }
+  let i = 0
+  while (i < n) {
+    rp.has[i] = state[i] == 1
+    i = i + 1
+  }
+  rematMarkSeeds(f, rp)
+  return rp
+}
+
+// The `const_int`s that feed a threaded parameter join its copy group
+// (`computeCopyRoots`), usually as its root, so they are marked too: a group
+// is rematerializable only when every member is (`mergeAliases`).
+fn rematMarkSeeds(f: IrFunc, rp: RematParams) {
+  for blk of f.blocks {
+    if (blk.instsLen > 0) {
+      let t = f.instrs[blk.instsStart + blk.instsLen - 1]
+      if (t.op == Op.Jump) {
+        rematSeedEdge(f, rp, t.ival, t.args)
+      } else if (t.op == Op.Br) {
+        rematSeedEdge(f, rp, t.ival, t.thenArgs)
+        rematSeedEdge(f, rp, t.ival2, t.elseArgs)
+      }
+    }
+  }
+}
+
+fn rematSeedEdge(f: IrFunc, rp: RematParams, target: int, args: []int) {
+  let k = 0
+  while (k < len(args)) {
+    let a = args[k]
+    if (rp.has[f.blocks[target].instsStart + k] && opIsIntConst(f.instrs[a].op)) {
+      rp.has[a] = true
+      rp.val[a] = constIntValue(f.instrs[a])
+    }
+    k = k + 1
+  }
+}
+
+// One pass over every edge; whether any parameter's state fell.
+fn rematSweep(f: IrFunc, rp: RematParams, state: []int): bool {
+  let changed = false
+  for blk of f.blocks {
+    if (blk.instsLen > 0) {
+      let t = f.instrs[blk.instsStart + blk.instsLen - 1]
+      if (t.op == Op.Jump) {
+        changed = rematFeedEdge(f, rp, state, t.ival, t.args) || changed
+      } else if (t.op == Op.Br) {
+        changed = rematFeedEdge(f, rp, state, t.ival, t.thenArgs) || changed
+        changed = rematFeedEdge(f, rp, state, t.ival2, t.elseArgs) || changed
+      }
+    }
+  }
+  return changed
+}
+
+fn rematRefuteEntry(f: IrFunc, state: []int) {
+  if (len(f.blocks) == 0) {
+    return
+  }
+  let e = f.blocks[0]
+  let i = e.instsStart
+  while (i < e.instsStart + e.paramCount) {
+    state[i] = 2
+    i = i + 1
+  }
+}
+
+// Meets each of `target`'s parameters with the argument this edge passes it.
+fn rematFeedEdge(f: IrFunc, rp: RematParams, state: []int, target: int, args: []int): bool {
+  assert(target >= 0 && target < len(f.blocks))
+  assert(len(args) == f.blocks[target].paramCount)
+  let changed = false
+  let k = 0
+  while (k < len(args)) {
+    let p = f.blocks[target].instsStart + k
+    let before = state[p]
+    rematMeet(f, rp, state, p, args[k])
+    changed = changed || state[p] != before
+    k = k + 1
+  }
+  return changed
+}
+
+// `p`'s state after also receiving `a`: a constant, a parameter's current
+// constant, nothing yet (an unseen parameter), or anything else -- refuted.
+fn rematMeet(f: IrFunc, rp: RematParams, state: []int, p: int, a: int) {
+  if (state[p] == 2 || a == p) {
+    return
+  }
+  let ins = f.instrs[a]
+  let v = 0
+  if (opIsIntConst(ins.op)) {
+    v = constIntValue(ins)
+  } else if (ins.op == Op.BlockParam && state[a] == 1) {
+    v = rp.val[a]
+  } else if (ins.op == Op.BlockParam && state[a] == 0) {
+    return
+  } else {
+    state[p] = 2
+    return
+  }
+  if (state[p] == 1 && rp.val[p] != v) {
+    state[p] = 2
+    return
+  }
+  state[p] = 1
+  rp.val[p] = v
+}
+
+// Marks `rp`'s parameters remat, the way `markRematIntervals` marks constants
+// and under the same class and reference re-checks.
+fn markRematParams(intervals: []LiveInterval, rp: RematParams) {
+  let i = 0
+  while (i < len(intervals)) {
+    let iv = intervals[i]
+    if (iv.regClass == RegClass.Int && !iv.isRef && rp.has[iv.vreg]) {
+      intervals[i].remat = true
+      intervals[i].rematWide = movImm64Words(rp.val[iv.vreg]) > 1
+    }
+    i = i + 1
+  }
+}
+
+// Whether `vreg` is a threaded-constant parameter (`rematParamsOf`).
+// Bounds-checked: a fabricated test context carries no table.
+fn rematParam(cx: A64Ctx, vreg: int): bool {
+  return vreg < len(cx.rematHas) && cx.rematHas[vreg]
+}
+
+// The constant a slotless spilled `vreg` holds: a threaded parameter's, else
+// the `const_int` that defines it.
+fn rematValueOf(cx: A64Ctx, vreg: int): int {
+  if (rematParam(cx, vreg)) {
+    return cx.rematVal[vreg]
+  }
+  return constIntValue(cx.f.instrs[vreg])
 }
