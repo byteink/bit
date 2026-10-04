@@ -1,0 +1,307 @@
+// compiler/classfieldread.bit — `__field(name): Option<Json>`, the allocation-free
+// read of ONE exported field by name (SPEC §14.3, #7110, epic #6984).
+//
+//     class User { export id: string, export team: string, export age: int }
+//     user.__field("team")     // Some(Json.JsonString(user.team))
+//     user.__field("nope")     // None
+//
+// Bit has no reflection, so a package that wants one attribute of an app's own
+// class (pkg/authz resolving a stored `$user.team`) could only serialize the
+// whole object through `@json`'s `toJson` and walk the tree: O(size of the
+// object) allocations per lookup, and a hidden `@json` requirement. This
+// member is the same synthesis family as `__get_<field>` (classifacegetter.bit)
+// and `__variantName` (enumvariants.bit): a flat `if (name == "k") { return
+// Some(<field>) }` chain over the class's exported fields, then `None`.
+//
+// WHEN IT EXISTS. Only in a program that declares an interface with a method
+// named `__field` (pkg/authz's `Subject`), the demand rule `__get_<field>`
+// follows: a program that never declares one gets no new node and no new IR.
+// The member is dispatched through that interface, so it needs a method-table
+// entry and cannot be pruned by reachability the way a static is.
+//
+// WHAT MAPS. Every field type with a scalar JSON shape (`classifyJsonType`,
+// classjsonfield.bit): a string, any integer (`JsonInt`), a float (`JsonFloat`),
+// a bool, a payload-free enum declared in the same module (its variant NAME as
+// a string, the way `toJson` writes it), and a slice of any of those (a
+// `Json.JsonArray`, the one case that allocates: a fresh list). Everything else
+// — a nested class, a map, an `Option<T>`, an enum from another module — is
+// `None`, never a partial value: a nested object has no flat attribute to name,
+// and `__field` never recurses into a class that did not opt in itself.
+// Only `export`ed fields are read (an unexported one is module-private, §10.5).
+// The name is the field name exactly (no `@key` rename: `@key` belongs to
+// `@json`'s wire format, which this is not).
+//
+// `Json` is the name the member is written in terms of, resolved by the
+// compiler without the user importing it (`fieldReadImportDecls`): the
+// declaring interface's module already loaded std/json, and a class module that
+// loaded after it binds the same module id.
+
+// E0311 (§14.3): a class declares a method named `__field`.
+const ecFieldReadDeclared = 311
+
+const synthFieldName = "__field"
+const fieldReadParam = "name"
+
+// The id of the std/json module the interface requiring `__field` imports
+// (`Json` lives there), or -1 when no interface in the project declares a
+// `__field` method, or its module does not import std/json.
+class FieldReadDemand {
+  jsonMod: int,
+}
+
+// True iff interface body member `sig` is a METHOD signature named `__field`
+// (a field requirement carries `main == 2`, checkifacefield.bit).
+fn isFieldReadSig(tree: Tree, source: string, sig: int): bool {
+  if (getNode(tree, sig).main == 2) {
+    return false
+  }
+  return identText(tree, source, kidsOf(tree, sig)[0]) == synthFieldName
+}
+
+fn moduleDeclaresFieldReadSig(m: SrcModule): bool {
+  for d0 of kidsOf(m.tree, m.tree.root) {
+    let d = topInterfaceDecl(m.tree, d0)
+    if (d == 0) {
+      continue
+    }
+    for sig of kidsOf(m.tree, kidsOf(m.tree, d)[2]) {
+      if (isFieldReadSig(m.tree, m.source, sig)) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+fn collectFieldReadDemand(p: Project): FieldReadDemand {
+  for m of p.mods {
+    if (!moduleDeclaresFieldReadSig(m)) {
+      continue
+    }
+    let (id, ok) = m.imports[jsonDecodeModulePath]
+    if (ok) {
+      return FieldReadDemand{ jsonMod = id }
+    }
+  }
+  return FieldReadDemand{ jsonMod = -1 }
+}
+
+// One class that owes `__field`: its name node, whether it is exported, and the
+// exported fields that map to a `Json` shape, in declaration order.
+class FieldReadClass {
+  className: int,
+  exported: bool,
+  fields: []JsonField,
+}
+
+// The JSON shape of field type `typeNode` for `__field`, or `(jkBad, 0, 0)`:
+// the kind, and for a slice its element kind and element type node. A nested
+// class, map, `Option` and slice-of-those are not readable.
+fn fieldReadShape(jx: JsonCtx, typeNode: int): (int, int, int) {
+  let (kind, elem) = classifyJsonType(jx, typeNode)
+  if (kind != jkSlice) {
+    if (simpleJsonKind(kind) && kind != jkNested) {
+      return (kind, 0, 0)
+    }
+    return (jkBad, 0, 0)
+  }
+  let (ek, _) = classifyJsonType(jx, elem)
+  if (simpleJsonKind(ek) && ek != jkNested) {
+    return (jkSlice, ek, elem)
+  }
+  return (jkBad, 0, 0)
+}
+
+// The readable exported fields of class body `body`.
+fn fieldReadFields(jx: JsonCtx, body: int): []JsonField {
+  let out = []JsonField(0)
+  for m0 of kidsOf(jx.tree, body) {
+    let (f, exported) = getterMemberField(jx.tree, m0)
+    if (f == 0 || !exported) {
+      continue
+    }
+    let fk = kidsOf(jx.tree, f)
+    let (kind, elemKind, elem) = fieldReadShape(jx, fk[1])
+    if (kind == jkBad) {
+      continue
+    }
+    let word = "\"" + identText(jx.tree, jx.source, fk[0]) + "\""
+    out = append(
+      out,
+      JsonField{
+        nameNode = fk[0], typeNode = fk[1], keyLit = 0, keyWord = word, kind = kind,
+        elemKind = elemKind, elem = elem, index = len(out), fieldNode = f,
+      },
+    )
+  }
+  return out
+}
+
+// Every non-generic top-level class of module `mid` that owes `__field`: the
+// module must have loaded AFTER std/json (its `Json` is bound by id, and a
+// module's id is greater than every id it depends on). A class that declares
+// `__field` itself is E0311 (`vReservedFieldReadName`) and skipped.
+fn collectFieldReadClasses(
+  p: Project, m: SrcModule, mid: int, demand: FieldReadDemand,
+): []FieldReadClass {
+  let out = []FieldReadClass(0)
+  if (demand.jsonMod < 0 || mid <= demand.jsonMod) {
+    return out
+  }
+  let jx = newJsonCtx(p, m)
+  for tc of topClassDecls(m.tree) {
+    let k = kidsOf(m.tree, tc.decl)
+    if (k[1] != 0 || declaredMember(m.tree, m.source, k[2], synthFieldName) != 0) {
+      continue
+    }
+    let fields = fieldReadFields(jx, k[2])
+    if (len(fields) != 0) {
+      out = append(out, FieldReadClass{ className = k[0], exported = tc.exported, fields = fields })
+    }
+  }
+  return out
+}
+
+// The words the members need spelled in the module's synthesized text.
+fn fieldReadSynthWords(tree: Tree, source: string, classes: []FieldReadClass): []string {
+  let out = []string(0)
+  if (len(classes) == 0) {
+    return out
+  }
+  out = [
+    synthFieldName, synthReceiverName, fieldReadParam, "string", "Option", "Json", "Some", "None",
+    "JsonString", "JsonInt", "JsonFloat", "JsonBool", "JsonArray", "i64", "f64", "append",
+  ]
+  if (!moduleHasLiteralImport(tree, source, jsonDecodeModulePath)) {
+    out = append(out, synthImportPathWord(jsonDecodeModulePath))
+  }
+  for c of classes {
+    for f of c.fields {
+      out = append(out, f.keyWord)
+      out = append(out, jsonLocalAcc(f.index))
+      out = append(out, jsonLocalVal(f.index))
+      for w of jsonEnumFieldWords(tree, source, f) {
+        out = append(out, w)
+      }
+    }
+  }
+  return out
+}
+
+// `Option<Json>`: a fresh node each call, a node is never shared.
+fn frOptionJson(jb: JsonBuild): int {
+  let targs = jbNode(jb, Tag.TypeArgs, [jbIdent(jb, "Json")])
+  return jbNode(jb, Tag.GenericInst, [jbIdent(jb, "Option"), targs])
+}
+
+// `return Option<Json>.Some(<v>)`.
+fn frReturnSome(jb: JsonBuild, v: int): int {
+  let ctor = jbNode(jb, Tag.Member, [frOptionJson(jb), jbIdent(jb, "Some")])
+  return jbNode(jb, Tag.ReturnStmt, [jbCall(jb, ctor, [v])])
+}
+
+// The statements of one arm: a scalar is `return Some(<value>)`; a slice builds
+// its `[]Json` first, exactly the loop `toJson` writes for a `[]T` field.
+fn frArmStmts(jb: JsonBuild, f: JsonField): []int {
+  if (f.kind != jkSlice) {
+    return [frReturnSome(jb, jbValueOf(jb, jbThisField(jb, f.nameNode), f.kind, f.typeNode))]
+  }
+  let acc = jsonLocalAcc(f.index)
+  let elem = jsonLocalVal(f.index)
+  let body = jbNode(
+    jb, Tag.Block, [jbAppendTo(jb, acc, jbValueOf(jb, jbIdent(jb, elem), f.elemKind, f.elem))],
+  )
+  let loop = jbNode(jb, Tag.ForOf, [jbIdent(jb, elem), jbThisField(jb, f.nameNode), body])
+  return [
+    jbLetSlice(jb, acc, "Json"), loop, frReturnSome(
+      jb,
+      jbJsonCtor(jb, "JsonArray", jbIdent(jb, acc)),
+    ),
+  ]
+}
+
+// `if (name == "<field>") { <arm> }`.
+fn frArm(jb: JsonBuild, f: JsonField): int {
+  jb.span = getNode(jb.tree, f.nameNode).span
+  let key = addLeaf(jb.tree, Tag.StringLit, synthSpan(jb.st, f.keyWord))
+  let cond = addNode(
+    jb.tree, Tag.Binary, jb.span, int(Kind.EqEq), [jbIdent(jb, fieldReadParam), key],
+  )
+  let block = jbNode(jb, Tag.Block, frArmStmts(jb, f))
+  return jbNode(jb, Tag.IfStmt, [cond, block, 0])
+}
+
+// `[export] (this: C) __field(name: string): Option<Json> { ... }`.
+fn synthFieldRead(tree: Tree, source: string, st: SynthText, c: FieldReadClass): int {
+  let sp = getNode(tree, c.className).span
+  let jb = JsonBuild{ tree = tree, st = st, span = sp, source = source }
+  let stmts = []int(0)
+  for f of c.fields {
+    stmts = append(stmts, frArm(jb, f))
+  }
+  jb.span = sp
+  let none = jbNode(jb, Tag.Member, [frOptionJson(jb), jbIdent(jb, "None")])
+  stmts = append(stmts, jbNode(jb, Tag.ReturnStmt, [none]))
+  let param = jbNode(jb, Tag.Param, [jbIdent(jb, fieldReadParam), jbIdent(jb, "string")])
+  let recv = addNode(tree, Tag.Receiver, sp, 0, [0, traitClassTypeRef(tree, c.className, 0)])
+  let decl = addNode(
+    tree, Tag.FuncDecl, sp, 0,
+    [
+      recv, jbIdent(jb, synthFieldName), 0, jbNode(jb, Tag.Params, [param]), frOptionJson(jb),
+      jbNode(jb, Tag.Block, stmts),
+    ],
+  )
+  if (!c.exported) {
+    return decl
+  }
+  return addNode(tree, Tag.Export, sp, 0, [decl])
+}
+
+// `import { Json } from "std/json"` unless the module binds `Json` already (its
+// own import, or `@json`'s synthesized one — `jsonImported`). A module that
+// never imported std/json gets the path bound to the id the interface's module
+// resolved (`jsonMod`), so `bindImports` finds it.
+fn fieldReadImportDecls(m: SrcModule, st: SynthText, jsonMod: int, jsonImported: bool): []int {
+  let (_, hasPath) = m.imports[jsonDecodeModulePath]
+  if (!hasPath) {
+    m.imports[jsonDecodeModulePath] = jsonMod
+  }
+  let (_, bound) = importedLocalNames(m.tree, m.source)["Json"]
+  if (bound || jsonImported) {
+    return []int(0)
+  }
+  let decl = synthImportDecl(m, st, jsonDecodeModulePath, ["Json"])
+  if (decl == 0) {
+    return []int(0)
+  }
+  return [decl]
+}
+
+// Every class's `__field`, plus the one `Json` import, for the caller to attach.
+fn injectFieldReadDecls(m: SrcModule, st: SynthText, plan: SynthPlan, jsonMod: int): []int {
+  let out = []int(0)
+  if (len(plan.fieldClasses) == 0) {
+    return out
+  }
+  for c of plan.fieldClasses {
+    out = append(out, synthFieldRead(m.tree, m.source, st, c))
+  }
+  return appendAllInts(out, fieldReadImportDecls(m, st, jsonMod, len(plan.jsonClasses) != 0))
+}
+
+// E0311 (§14.3): a class declares a method named `__field`, the name the
+// compiler reserves for the by-name field read. Reserved on EVERY class, demand
+// or not, for `__jobName`'s reason (classjobdesc.bit): a hand-written one would
+// satisfy an interface requiring `__field` by name alone.
+fn vReservedFieldReadName(tree: Tree, source: string, diags: Diagnostics) {
+  for tc of topClassDecls(tree) {
+    let own = declaredMember(tree, source, kidsOf(tree, tc.decl)[2], synthFieldName)
+    if (own != 0) {
+      report(
+        diags, ecFieldReadDeclared, getNode(tree, own).span,
+        "class '${identText(tree, source, kidsOf(tree, tc.decl)[0])}' declares '${synthFieldName}', a name the compiler reserves for the by-name field read",
+        "rename this method — '__field' is synthesized for every class in a program whose interface requires it (SPEC §14.3), and a hand-written one would satisfy that requirement by name alone",
+      )
+    }
+  }
+}
