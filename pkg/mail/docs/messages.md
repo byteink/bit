@@ -106,5 +106,5 @@ dot-atom-text: ...` or `headers["X-Post"]: the value contains a CR, LF or NUL
 ## Where to go next
 
 The package front page is [README](../README.md). Addresses are in
-[Addresses](addresses.md); the mailer that sends a `Message` arrives in the next
-chapters.
+[Addresses](addresses.md); the mailer that sends a `Message` is in
+[The Mailer](mailer.md).

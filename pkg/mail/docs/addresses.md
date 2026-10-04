@@ -104,6 +104,7 @@ fn check(field: string): string {
   parseAddress(field) catch e {
     match (e) {
       Invalid(why) => return why
+      _ => return e.message()
     }
   }
   return ""
