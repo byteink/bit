@@ -21,10 +21,18 @@
 // count up front — SigV4 needs it to sign the request anyway, and HTTP/1.1
 // needs either a declared Content-Length or chunked transfer coding to frame
 // a request body at all — plus a `BodySource` pulled repeatedly until it is
-// exhausted. There is no chunked-transfer REQUEST body here: a declared
-// Content-Length is what every S3-compatible PUT already sends, and
-// `aws-chunked` per-chunk signing (a separate protocol extension AWS layers
-// on top of ordinary chunked transfer coding) is not implemented.
+// exhausted. A declared Content-Length is what every S3-compatible PUT
+// already sends and it always wins when the length is known.
+//
+// PUT of unknown length (`requestWithChunkedBody`, #6575): the body goes out
+// `Transfer-Encoding: chunked` (RFC 9112 section 7.1), followed by an
+// optional trailer section (RFC 9112 section 7.1.2, RFC 9110 section 6.5)
+// the caller computes AFTER the last body byte has gone out — a checksum over
+// the streamed bytes, as `aws-chunked` trailer checksums need. RFC 9112
+// section 6.1 forbids a client to use chunked unless it knows the server
+// handles HTTP/1.1, so the caller states that (`ChunkedBody.peerHttp11`) and
+// the call fails before dialing when it does not. Per-chunk `aws-chunked`
+// SIGNING (a chunk-extension protocol AWS layers on top) is not implemented.
 //
 // GET (`getStreaming`): delivers the response body to a `BodySink` one
 // bounded chunk at a time instead of accumulating a `string`, for the
@@ -88,19 +96,20 @@ fn writeStreamingBody(s: byteStream, contentLength: int, source: BodySource): ()
 }
 
 // As `buildRequest` (client.bit), but ending after the header block — no
-// body appended — with `Content-Length` set to the DECLARED length rather
-// than derived from a body already in hand.
+// body appended — with `framing` (a complete "Name: value\r\n" line:
+// Content-Length for a declared length, Transfer-Encoding for chunked) in
+// place of a framing derived from a body already in hand.
 fn buildStreamingRequestHead(
   method: string,
   u: Url,
   headerBlock: string,
-  contentLength: int,
+  framing: string,
 ): string {
   let req = "${method} ${u.path} HTTP/1.1\r\n"
   req = req + "Host: ${hostHeaderValue(u)}\r\n"
   req = req + "Connection: close\r\n"
   req = req + headerBlock
-  req = req + "Content-Length: ${itoa(contentLength)}\r\n"
+  req = req + framing
   return req + "\r\n"
 }
 
@@ -131,7 +140,12 @@ export fn requestWithStreamingBody(
   if (u.h3) {
     fail newError("requestWithStreamingBody: https+h3:// is not supported")
   }
-  let head = buildStreamingRequestHead(method, u, block, contentLength)
+  let head = buildStreamingRequestHead(
+    method,
+    u,
+    block,
+    "Content-Length: ${itoa(contentLength)}\r\n",
+  )
   if (u.https) {
     let s = tlsStream{ conn = tlsDial(u.host, u.port, streamingTlsConfig())? }
     defer s.shut()
@@ -144,6 +158,193 @@ export fn requestWithStreamingBody(
   s.writeStr(head)?
   writeStreamingBody(s, contentLength, source)?
   return readResponse(s, method, defaultMaxBodyBytes)?
+}
+
+// Pulls trailer fields once the request body is complete (RFC 9112 section
+// 7.1.2): called by `requestWithChunkedBody` exactly once, after `source` has
+// returned "", so a value computed over the streamed bytes (a checksum, a
+// byte count) is final. Return `[]Header(0)` for no trailer section.
+export type TrailerSource = () => []Header!
+
+// What `requestWithChunkedBody` sends: the body `source` (pulled until it
+// returns ""), the `trailers` computed after it, and `peerHttp11`, the
+// caller's statement that the server is known to handle HTTP/1.1 (RFC 9112
+// section 6.1: from configuration, or the version of an earlier response).
+export class ChunkedBody {
+  export source: BodySource,
+  export trailers: TrailerSource,
+  export peerHttp11: bool,
+}
+
+// The widest size line a chunk of at most `streamChunkSize` bytes needs
+// ("1000\r\n"), reserved ahead of the data in `chunkFrame.buf` so the size
+// line is written in front of bytes already in place instead of the bytes
+// being shifted or concatenated behind it.
+const chunkPrefix: int = 6
+
+// size line + data + the CRLF that closes the chunk.
+const chunkFrameCap: int = chunkPrefix + streamChunkSize + 2
+
+// Header fields RFC 9110 section 6.5.1 forbids in a trailer section: framing,
+// routing, request modifiers (controls, conditionals), authentication,
+// response control data, payload processing, and the connection-specific
+// fields of section 7.6.1.
+fn forbiddenTrailerNames(): []string {
+  return [
+    "transfer-encoding", "content-length", "host", "trailer", "connection",
+    "keep-alive", "upgrade", "proxy-connection", "te", "content-encoding",
+    "content-type", "content-range", "authorization", "proxy-authorization",
+    "proxy-authenticate", "www-authenticate", "cookie", "set-cookie",
+    "cache-control", "expect", "max-forwards", "pragma", "range", "if-match",
+    "if-none-match", "if-modified-since", "if-unmodified-since", "if-range",
+    "age", "expires", "date", "location", "retry-after", "vary", "warning",
+  ]
+}
+
+// The "Name: value\r\n" block for `fields`, failing on a malformed name or
+// value (`serializeHeaders`) or on a field a trailer section may not carry.
+fn serializeTrailers(fields: []Header): string! {
+  let block = serializeHeaders(fields)?
+  let banned = forbiddenTrailerNames()
+  for h of fields {
+    let name = toLower(h.name)
+    for b of banned {
+      if (name == b) {
+        fail newError("trailer \"${h.name}\" is not allowed in a trailer section (RFC 9110 section 6.5.1)")
+      }
+    }
+  }
+  return block
+}
+
+// The count of hex digits of `n` >= 0 (1 for 0).
+fn hexDigits(n: int): int {
+  let d = 1
+  let v = n >> 4
+  while (v > 0) {
+    d = d + 1
+    v = v >> 4
+  }
+  return d
+}
+
+// The lowercase hex digit of `nib` in 0..15.
+fn hexDigit(nib: int): u8 {
+  if (nib < 10) {
+    return u8(48 + nib)
+  }
+  return u8(87 + nib)
+}
+
+// One reusable buffer holding the next chunk frame: `chunkPrefix` reserved
+// bytes, then up to `streamChunkSize` data bytes, then CRLF. Every chunk
+// reuses the same backing array, so a body of any length moves through one
+// allocation and one `writeBytes` per chunk.
+class chunkFrame {
+  buf: []byte
+  eof: bool
+
+  // Pulls `source` into the data region until it holds `streamChunkSize`
+  // bytes or `source` returns "" (`eof`). A source answering in small pieces
+  // still yields full-size chunks, never one tiny chunk per pull.
+  fill(source: BodySource): ()! {
+    this.buf = this.buf[0:chunkPrefix]
+    let have = 0
+    while (have < streamChunkSize) {
+      let room = streamChunkSize - have
+      let piece = source(room)?
+      if (len(piece) == 0) {
+        this.eof = true
+        return
+      }
+      if (len(piece) > room) {
+        fail newError("writeChunkedBody: source returned ${itoa(len(piece))} bytes, ${itoa(room)} requested")
+      }
+      this.buf = append(this.buf, piece)
+      have = have + len(piece)
+    }
+  }
+
+  // Writes the chunk-size line (RFC 9112 section 7.1: hex size, CRLF) into the
+  // reserved gap right before the data and closes the chunk with CRLF.
+  // Returns the offset the frame starts at. Needs at least one data byte: a
+  // zero-size chunk is the terminator, not a data chunk.
+  seal(): int {
+    let n = len(this.buf) - chunkPrefix
+    let digits = hexDigits(n)
+    let start = chunkPrefix - 2 - digits
+    let i = 0
+    while (i < digits) {
+      this.buf[start + i] = hexDigit((n >> (4 * (digits - 1 - i))) & 15)
+      i = i + 1
+    }
+    this.buf[chunkPrefix - 2] = '\r'
+    this.buf[chunkPrefix - 1] = '\n'
+    this.buf = append(this.buf, "\r\n")
+    return start
+  }
+}
+
+// Writes `body.source` to `s` as a chunked body (RFC 9112 section 7.1):
+// chunks of up to `streamChunkSize` bytes, the zero-size last chunk, the
+// trailer section `body.trailers` returns once the source is exhausted, and
+// the final CRLF. The last data chunk and the terminator share one write.
+fn writeChunkedBody(s: byteStream, body: ChunkedBody): ()! {
+  let f = chunkFrame{ buf = []byte(chunkPrefix, chunkFrameCap), eof = false }
+  while (!f.eof) {
+    f.fill(body.source)?
+    let start = len(f.buf)
+    if (len(f.buf) > chunkPrefix) {
+      start = f.seal()
+    }
+    if (f.eof) {
+      let block = serializeTrailers(body.trailers()?)?
+      f.buf = append(f.buf, "0\r\n")
+      f.buf = append(f.buf, block)
+      f.buf = append(f.buf, "\r\n")
+    }
+    s.writeBytes(f.buf[start:len(f.buf)])?
+  }
+}
+
+// Sends `head` and the chunked body, then reads the response — the
+// transport-independent half of `requestWithChunkedBody`.
+fn exchangeChunked(s: byteStream, method: string, head: string, body: ChunkedBody): Response! {
+  s.writeStr(head)?
+  writeChunkedBody(s, body)?
+  return readResponse(s, method, defaultMaxBodyBytes)?
+}
+
+// As `requestWithStreamingBody`, for a body whose length is not known up
+// front: it goes out `Transfer-Encoding: chunked`, then the trailer fields
+// `body.trailers` returns after the last body byte. Announce them with a
+// `Trailer` header in `headers` (RFC 9110 section 6.5.2). Fails before
+// dialing unless `body.peerHttp11` (RFC 9112 section 6.1: never chunked to
+// an HTTP/1.0 peer); when the length IS known, use `requestWithStreamingBody`,
+// which sends a Content-Length instead. `https+h3://` is not supported.
+export fn requestWithChunkedBody(
+  method: string,
+  url: string,
+  headers: []Header,
+  body: ChunkedBody,
+): Response! {
+  if (!body.peerHttp11) {
+    fail newError("requestWithChunkedBody: chunked transfer coding needs a peer known to speak HTTP/1.1 (RFC 9112 section 6.1); send a Content-Length with requestWithStreamingBody instead")
+  }
+  let block = serializeHeaders(headers)?
+  let u = parseUrl(url)?
+  if (u.h3) {
+    fail newError("requestWithChunkedBody: https+h3:// is not supported")
+  }
+  let head = buildStreamingRequestHead(method, u, block, "Transfer-Encoding: chunked\r\n")
+  if (u.https) {
+    let s = tlsStream{ conn = tlsDial(u.host, u.port, streamingTlsConfig())? }
+    defer s.shut()
+    return exchangeChunked(s, method, head, body)?
+  }
+  let s = netStream{ conn = dial(u.host, u.port)? }
+  defer s.shut()
+  return exchangeChunked(s, method, head, body)?
 }
 
 // Reads the remaining `cl - len(initial)` bytes of a Content-Length-framed

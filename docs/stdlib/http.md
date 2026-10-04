@@ -121,6 +121,63 @@ bounds the memory the *server's* declared length can force, not what this
 call buffers. Both cover `http://` and `https://` only; `https+h3://` is
 refused.
 
+### Sending a body of unknown length
+
+`requestWithStreamingBody` needs the byte count up front, and it always wins
+when the length is known: the request carries a `Content-Length`. When the
+producer cannot say how much it will write (a compressor, a live feed, an
+`aws-chunked` upload), `requestWithChunkedBody` sends the body as
+`Transfer-Encoding: chunked` (RFC 9112 section 7.1) in chunks of up to 4096
+bytes, then the zero-size last chunk, then the trailer fields, if any.
+
+Trailer fields (RFC 9110 section 6.5) are computed after the last body byte, so
+they can carry a value derived from everything sent, such as a checksum or a
+length. Announce them in a `Trailer` request header. A trailer a server must
+not act on before the body ends, such as `Content-Length`, `Host`, or
+`Authorization`, is refused (RFC 9110 section 6.5.1).
+
+```bit
+import { BodySource, ChunkedBody, Header, TrailerSource, requestWithChunkedBody } from "std/http"
+
+// A producer that hands out `data` and counts what it has handed out.
+class Feed {
+  data: string
+  pos: int
+
+  next(n: int): string! {
+    let end = this.pos + n
+    if (end > len(this.data)) {
+      end = len(this.data)
+    }
+    let out = this.data[this.pos:end]
+    this.pos = end
+    return out
+  }
+
+  // Called once the body is complete, so `pos` is the final byte count.
+  length(): []Header! {
+    return [Header{ name = "x-body-length", value = "${this.pos}" }]
+  }
+}
+
+fn upload(url: string, data: string): int! {
+  let feed = Feed{ data = data, pos = 0 }
+  let source: BodySource = feed.next
+  let trailers: TrailerSource = feed.length
+  let body = ChunkedBody{ source = source, trailers = trailers, peerHttp11 = true }
+  let announce = [Header{ name = "Trailer", value = "x-body-length" }]
+  return requestWithChunkedBody("PUT", url, announce, body)?.status
+}
+```
+
+`peerHttp11` is your statement that the server speaks HTTP/1.1 (from
+configuration, or because an earlier response said so): RFC 9112 section 6.1
+forbids sending chunked to a server that might be HTTP/1.0, so with `false`
+the call fails before it connects. Return `[]Header(0)` from the trailer
+source for a body with no trailer section. The source may answer with fewer
+bytes than asked; the writer keeps pulling until a chunk is full, so a slow
+producer still sends full-size chunks.
+
 ### Reading a body as it arrives
 
 `getStreaming` pushes a body into a callback. `Client.send` with
@@ -627,6 +684,23 @@ instead of returning it whole. `Response.body` is always `""`.
 
 Sends a request body of exactly `contentLength` bytes pulled from `source`,
 one chunk at a time, and returns the response.
+
+### `requestWithChunkedBody(method: string, url: string, headers: []Header, body: ChunkedBody): Response!`
+
+Sends a request body of unknown length as `Transfer-Encoding: chunked`, then
+the trailer fields `body.trailers` returns after the last body byte, and
+returns the response. Fails before connecting unless `body.peerHttp11` is
+true.
+
+### `ChunkedBody`
+
+`ChunkedBody{ source: BodySource, trailers: TrailerSource, peerHttp11: bool }`:
+what `requestWithChunkedBody` sends.
+
+### `TrailerSource`
+
+A function `() => []Header!` called once, after the body source has returned
+`""`; its fields form the trailer section.
 
 ### `BodySource`
 
