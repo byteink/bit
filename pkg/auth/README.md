@@ -100,7 +100,7 @@ protected route that is not itself doing the authenticating just reads
   - so `beginAuthorization`/`handleCallback` run unmodified against a fake
   provider; see [Testing your sign-in routes](docs/testing.md).
 - `Secret`, `generateSecret`, `parseSecret`, `provisioningUri`,
-  `provisioningUriWith`, `hotp`, `totp`, `verify`, `Algorithm`, `sha1` - TOTP
+  `ProvisioningOptions`, `hotp`, `totp`, `verify`, `Algorithm`, `sha1` - TOTP
   (RFC 6238) two-factor codes: enrollment, the `otpauth://` QR-code URI, and
   verifying a submitted code with a skew window and caller-owned replay
   protection.
