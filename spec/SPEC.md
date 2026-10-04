@@ -1578,13 +1578,14 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   - A class without `@table` has no `isPersisted`/`markPersisted` member -
     the ordinary E0057 every other unknown member gets.
 
-**`@table`'s generic-bound members - `__tableName`, `__fromRow`,
-`__columns`, `__values`.** A class carrying `@table` also gains, reachable
-through a type parameter bound the same way `@job`'s `__jobName`
+**`@table`'s generic-bound members - `__tableName`, `__className`,
+`__fromRow`, `__columns`, `__values`.** A class carrying `@table` also gains,
+reachable through a type parameter bound the same way `@job`'s `__jobName`
 (below) is:
 
 ```
 static __tableName(): string
+static __className(): string
 static __fromRow(rows: Rows): T!
 static __columns(): []FieldDesc
 (this: T) __values(): []Value
@@ -1597,6 +1598,9 @@ columns, or to construct or serialize one row.
 - `__tableName()` returns `@table`'s own name override when it carries one,
   else the class name in **snake_case, never pluralized**: `Person` ->
   `person`, `OrderLine` -> `order_line`.
+- `__className()` returns the class identifier exactly as declared
+  (`Article`, never `article` or an `@table("...")` override), so a name
+  keyed on the class survives a table rename.
 - `__fromRow(rows)` is `find<T>`'s own synthesized mapper (above),
   unconditionally, for every `@table` class rather than only one passed to
   `find`/`findOne`/`findOneOrFail`. `__columns()` is `tableDescriptor()`
@@ -1618,8 +1622,8 @@ columns, or to construct or serialize one row.
 - **All four are skipped together when the class declares `init`** - the same
   restriction `find<T>`'s own **E0152** places on a hand-mapped class,
   reported here as **E0179** since there is no `find<T>` call site to name.
-- A class already declaring `__tableName`, `__fromRow`, `__columns` or
-  `__values`, as a field or a method, is **E0178**, naming which.
+- A class already declaring `__tableName`, `__className`, `__fromRow`,
+  `__columns` or `__values`, as a field or a method, is **E0178**, naming which.
 
 **`find<T>`/`findOne<T>`/`findOneOrFail<T>` - mapping a query result.**
 
