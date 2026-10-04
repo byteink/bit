@@ -111,6 +111,54 @@ test for "this failure came from a transport error at all".
 busy`, and `SmtpError` satisfies `error`, so a caller that only logs can keep
 `catch e` and `e.message()` and ignore the rest.
 
+## When a server goes quiet
+
+A relay that accepts a connection and then says nothing must not hold a sender
+forever, so every step is bounded by `Options.timeout`: the connect (and, for
+`dialTls`, the TLS handshake with it), the greeting, each command with its
+reply, and a DATA payload with the reply to it. Each exchange starts a fresh
+clock; the total of a session is not capped, and a slow server that answers each
+step inside the limit is not interrupted.
+
+```bit
+import { dial, Options, Client, Message, SmtpError } from "std/smtp"
+import { Second } from "std/time"
+
+// Give a slow relay a minute per step rather than the default 30 seconds.
+fn dialPatient(host: string): Client!SmtpError {
+  return dial(host, 587, Options(timeout = 60 * Second))?
+}
+
+// A step that ran out of time fails with a message naming it, and the
+// connection is already closed.
+fn sendOnce(c: Client, m: Message): bool {
+  c.send(m) catch e {
+    return e.command == "MAIL FROM" && e.transient()
+  }
+  return true
+}
+```
+
+A step that runs out of time fails with an `SmtpError` whose `command` names it
+and whose message reads `smtp: EHLO timed out after 200ms`. It has no reply code
+and `transient()` is true, since a later attempt may meet a peer that answers.
+The connection is closed at that moment and never reused: a late answer to the
+abandoned command would otherwise be read as the answer to the next one, so any
+further call on that `Client` fails with `smtp: the connection was closed after a
+timeout; dial again`, and the next attempt dials afresh. A `timeout` that is zero
+or negative is a caller's bug and fails before anything connects, with `smtp:
+Options.timeout must be positive, got 0`.
+
+The default is 30 seconds. RFC 5321 section 4.5.3.2 tells a client to wait 5
+minutes for the greeting, `MAIL` and `RCPT`, 2 minutes for the reply to `DATA`,
+3 minutes per DATA block and 10 minutes for the reply after the final dot,
+figures meant for an unattended relay draining a queue to a distant host. A
+sender behind a request, a pool or a retry loop cannot park a worker that long
+on a silent peer, so the default is shorter than every one of them. A caller that
+relays slowly, or sends a large message over a slow link (the payload and its
+reply share one clock), raises `timeout`; passing the RFC's `10 * Minute`
+restores the longest of its figures for every step.
+
 ## What this module refuses to do
 
 Four rules are structural - enforced by the code that would otherwise break
@@ -548,7 +596,7 @@ The `env` the `Raw` was made with, as given.
 
 ## Connecting
 
-### `Options(insecureSkipVerify: bool = false, serverName: string = "", roots: TrustStore = ...)`
+### `Options(insecureSkipVerify: bool = false, serverName: string = "", roots: TrustStore = ..., timeout: int = 30 * Second)`
 
 How a TLS leg is set up. `Options()` is secure by default: verification on,
 system trust anchors, SNI taken from the dialed host. Each argument loosens or
@@ -573,21 +621,26 @@ fn viaLabServer(port: int): Client! {
 | `insecureSkipVerify` | skip chain **and** hostname verification |
 | `serverName` | SNI and the name the certificate must match; empty means the dialed host |
 | `roots` | trust anchors; empty means the OS store, bundled roots as fallback |
+| `timeout` | nanoseconds each step may take; must be positive; default 30 seconds |
 
 Setting `insecureSkipVerify` true means the connection proves nothing about who
 the peer is, and a credential sent over one is a credential given to whoever
 answered. It is for tests and pinned lab servers.
 
-### `dial(host: string, port: int): Client!SmtpError`
+### `dial(host: string, port: int, o: Options = Options()): Client!SmtpError`
 
 Connect to a cleartext submission port (587, or 25 for a relay) and read the
 greeting. The session is not secure yet: `startTls` makes it so, and until it
-does, `authPlain` and `authLogin` refuse to run.
+does, `authPlain` and `authLogin` refuse to run. The connect, the greeting and
+every later step are bounded by `o.timeout`; nothing else in `o` is read, since
+no TLS happens here. See "When a server goes quiet".
 
 ### `dialTls(host: string, port: int, o: Options): Client!SmtpError`
 
 Connect to an implicit-TLS submission port (465): the handshake happens before
-the greeting, so there is no cleartext phase and no `startTls`.
+the greeting, so there is no cleartext phase and no `startTls`. The connect and
+the handshake share one `o.timeout`; the greeting and each later step get a
+fresh one.
 
 ### `Client`
 
@@ -605,7 +658,8 @@ Upgrade a cleartext connection to TLS (RFC 3207). Fails when the server did not
 advertise `STARTTLS`, and fails when the server has sent bytes that would sit in
 the read buffer across the handshake - the plaintext command-injection shape
 (CVE-2011-0411), which is refused rather than quietly discarded. Call `ehlo`
-again afterwards.
+again afterwards. The handshake is bounded by `o.timeout`: `startTls` takes its
+own budget from the `Options` it is given, and refuses one that is not positive.
 
 ### `Client.supports(ext: string): bool`
 
@@ -649,7 +703,9 @@ Close the connection without a `QUIT`. Idempotent.
 
 ### `Stream`
 
-The transport under a session: `send`, `recv` and `shut`. It exists so the rest
+The transport under a session: `send`, `recv`, `deadline` (arm the limit every
+later `send` and `recv` obeys), `timedOut` (whether the last `recv` came back
+empty because that limit passed) and `shut`. It exists so the rest
 of the module never asks whether it is talking cleartext or TLS - `startTls`
 swaps one implementation for another inside a live `Client`, and the flag that
 guards `AUTH` is written by that same swap, so there is no state for it to
@@ -665,7 +721,7 @@ Why a step failed, and the one type every fallible call here fails with.
 | `enhanced` | the RFC 3463 status the server sent (`5.1.1`, RFC 2034), or `""` when it sent none |
 | `text` | the server's text joined by a space with the enhanced status taken off, or the local reason when `code` is 0 |
 | `cause` | the `std/net` or `std/tls` error under a transport failure, nil otherwise; a failed TLS handshake is a `std/tls` `HandshakeError` |
-| `command` | the step that failed: `connect`, `greeting`, `EHLO`, `STARTTLS`, `AUTH PLAIN`, `AUTH LOGIN`, `AUTH LOGIN username`, `AUTH LOGIN password`, `MAIL FROM`, `RCPT TO`, `DATA`, `end of DATA`, `QUIT`, or `validate` for a local refusal |
+| `command` | the step that failed (for a timeout, the step that ran out of time): `connect`, `greeting`, `EHLO`, `STARTTLS`, `AUTH PLAIN`, `AUTH LOGIN`, `AUTH LOGIN username`, `AUTH LOGIN password`, `MAIL FROM`, `RCPT TO`, `DATA`, `end of DATA`, `QUIT`, or `validate` for a local refusal |
 
 ### `SmtpError.transient(): bool`
 

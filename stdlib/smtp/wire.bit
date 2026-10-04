@@ -7,15 +7,22 @@
 // `secure` flag is set by that swap rather than tracked in parallel with it, so
 // there is no state for an AUTH guard to disagree with.
 
-import { indexOfFrom, join } from "std/strings"
+import { hasSuffix, indexOfFrom, join } from "std/strings"
 import { Conn as TcpConn } from "std/net"
 import { TlsConn } from "std/tls"
+import { monotonic, Millisecond, Second } from "std/time"
 
-// The transport under an SMTP session: exactly the three things the protocol
-// needs from a byte stream.
+// The transport under an SMTP session: exactly the things the protocol needs
+// from a byte stream. `deadline` arms the absolute monotonic nanosecond limit
+// every later `send` and `recv` is bounded by (#6856), and `timedOut` says
+// whether the `recv` just before it returned "" because that limit passed
+// rather than because the peer closed: `recv` has no error to carry the
+// difference when the transport reports a timeout as an end of stream.
 export interface Stream {
   send(s: string): ()!,
   recv(max: int): string!,
+  deadline(ns: int),
+  timedOut(): bool,
   shut(),
 }
 
@@ -25,6 +32,8 @@ class plainStream {
   c: TcpConn
   export send(s: string): ()! { this.c.write(s)? }
   export recv(max: int): string! { return this.c.read(max) }
+  export deadline(ns: int) { this.c.setDeadline(ns) }
+  export timedOut(): bool { return this.c.readTimedOut() }
   export shut() { this.c.close() }
 }
 
@@ -34,6 +43,8 @@ class tlsStream {
   c: TlsConn
   export send(s: string): ()! { this.c.write([]byte(s))? }
   export recv(max: int): string! { return string(this.c.read(max)?) }
+  export deadline(ns: int) { this.c.setDeadline(ns) }
+  export timedOut(): bool { return this.c.readTimedOut() }
   export shut() { this.c.close() }
 }
 
@@ -56,12 +67,69 @@ class Reply {
   lines: []string,
 }
 
+// The longest a session waits for one exchange when the caller does not say:
+// the greeting, one command and its reply, or one DATA payload and its reply.
+// RFC 5321 §4.5.3.2 tells a client to wait 5 minutes for the greeting, MAIL and
+// RCPT, 2 for DATA initiation, 3 per DATA block and 10 for the end-of-data
+// reply — figures set for an unattended relay that may be draining a deep
+// queue to a distant host. A sender that sits behind a request, a pool or a
+// retry loop cannot park a worker that long on a silent peer, so the default is
+// 30 seconds for every exchange and the RFC's figures are one `Options.timeout`
+// away for a caller that does relay slowly.
+const defaultTimeout: int = 30 * Second
+
+// Whether `e` is a `std/net` deadline error: "read timed out", "write timed
+// out" and "dial host:port timed out" are the only messages that end this way.
+fn isTimeout(e: error): bool {
+  return hasSuffix(e.message(), "timed out")
+}
+
 // A buffered line reader over a `Stream`. SMTP is line-framed and a `recv` cuts
 // wherever the network did, so the leftover of one reply is the beginning of
 // the next; a reader that dropped it would lose a pipelined server's greeting.
+//
+// `timeout` is the nanoseconds one exchange may take. `dead` is set when one
+// ran out: the stream is closed then and every later exchange is refused, since
+// a late reply to the abandoned command would be read as the answer to the next
+// one.
 class Wire {
   s: Stream
   buf: string
+  timeout: int
+  dead: bool
+
+  // Start the clock for one exchange: a fresh absolute deadline `timeout` from
+  // now on the live stream.
+  arm() {
+    this.s.deadline(monotonic().ns + this.timeout)
+  }
+
+  // `arm`, after refusing a stream that already timed out.
+  begin(): ()!SmtpError {
+    if (this.dead) {
+      fail localError("the connection was closed after a timeout; dial again")
+    }
+    this.arm()
+  }
+
+  // The error for `what` running past its deadline. Closes the stream, because
+  // the peer may still answer and the next command would read that answer.
+  expired(what: string, cause: error): SmtpError {
+    this.dead = true
+    this.s.shut()
+    return timeoutError(what, this.timeout / Millisecond, cause)
+  }
+
+  // Transmit `data` under the current deadline; `what` names the step in the
+  // error.
+  put(what: string, data: string): ()!SmtpError {
+    this.s.send(data) catch e {
+      if (isTimeout(e)) {
+        fail this.expired(what, e)
+      }
+      fail ioError(what, e)
+    }
+  }
 
   // The next CRLF-terminated line, without its terminator. Fails on a peer that
   // closes mid-line and on a line over `maxReplyBytes` — an unterminated stream
@@ -80,9 +148,15 @@ class Wire {
         fail protoError(what, "reply line exceeded ${maxReplyBytes} bytes")
       }
       let chunk = this.s.recv(4096) catch e {
+        if (isTimeout(e)) {
+          fail this.expired(what, e)
+        }
         fail ioError(what, e)
       }
       if (len(chunk) == 0) {
+        if (this.s.timedOut()) {
+          fail this.expired(what, nil)
+        }
         fail protoError(what, "connection closed mid-reply")
       }
       this.buf = this.buf + chunk
@@ -117,6 +191,7 @@ class Wire {
   // Send `cmd` as one CRLF-terminated line and read the reply it draws.
   // `what` names the step in any error: it is what `SmtpError.command` reports.
   command(what: string, cmd: string): Reply!SmtpError {
+    this.begin()?
     this.sendLine(what, cmd)?
     return this.readReply(what)?
   }
@@ -132,9 +207,7 @@ class Wire {
     if (len(cmd) > maxCommandBytes) {
       fail localError("command of ${len(cmd)} octets exceeds ${maxCommandBytes}")
     }
-    this.s.send(cmd + "\r\n") catch e {
-      fail ioError(what, e)
-    }
+    this.put(what, cmd + "\r\n")?
   }
 }
 
@@ -179,8 +252,10 @@ fn expect(what: string, r: Reply, want: int, alsoWant: int): ()!SmtpError {
 // the `.` line (RFC 5321 §4.5.2). Dot-stuffing is here rather than in the
 // message renderer because it is a property of the transmission, not of the
 // message: the same rendered message is byte-identical in a file and stuffed on
-// the wire.
+// the wire. The deadline armed here is for the payload AND the reply to it, which
+// the caller reads next without arming again.
 fn writeData(w: Wire, msg: string): ()!SmtpError {
+  w.begin()?
   let body = toCrlf(msg)
   let out = ""
   let at = 0
@@ -196,9 +271,7 @@ fn writeData(w: Wire, msg: string): ()!SmtpError {
       at = nl + 2
     }
   }
-  w.s.send(out + ".\r\n") catch e {
-    fail ioError("DATA", e)
-  }
+  w.put("DATA", out + ".\r\n")?
 }
 
 // One body line, with the leading `.` doubled so it cannot be read as the
