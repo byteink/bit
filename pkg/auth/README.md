@@ -77,6 +77,13 @@ protected route that is not itself doing the authenticating just reads
   list, and the accessor a protected route reads the result with.
 - `hashPassword`, `Lookup`, `LookupResult`, `PasswordStrategy` - a
   password `Strategy` over your own user lookup, Argon2id underneath.
+- `PasswordOptions`, `AuthEvent`, `AuthEventHook` - the optional second
+  argument of `PasswordStrategy`: a `LoginThrottle` to consult and an audit
+  hook told every login.
+- `LoginThrottle`, `ThrottleOptions`, `Throttled`, `ThrottleEvent`,
+  `ThrottleHook`, `ThrottleKind` - the brute-force defence: per-account and
+  per-address failure counters over `pkg/web`'s `RateStore`, backoff, lockout,
+  reset on success; see [Slow down password guessing](docs/brute-force.md).
 - `OidcStrategy`, `Provider`, `OidcOptions`, `beginAuthorization`,
   `handleCallback` - the OpenID Connect authorization-code flow with PKCE;
   `Provider` names the identity provider (`Google`, `Microsoft(tenant)`,

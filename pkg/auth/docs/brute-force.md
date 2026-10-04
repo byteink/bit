@@ -16,9 +16,66 @@ store to run.
 
 ## The simplest thing that works
 
-Build one throttle when the app starts, and call it three times around the
-password check: `check` before, `recordFailure` on a wrong password,
-`recordSuccess` on a right one.
+Build one throttle when the app starts and hand it to `PasswordStrategy` as an
+option. That is the whole change to Inkwell's login: the strategy asks the
+throttle before it looks the user up, counts every wrong password, and forgets
+the count when the right one arrives.
+
+```bit
+import { App, Config, MemoryCounter, MemoryStore } from "web"
+import {
+  Lookup,
+  LoginThrottle,
+  PasswordOptions,
+  PasswordStrategy,
+  Strategy,
+  requireAuth,
+} from "auth"
+
+fn loginStrategy(users: Lookup): PasswordStrategy! {
+  let throttle = LoginThrottle(MemoryCounter(10_000))?
+  return PasswordStrategy(users, PasswordOptions{ throttle = Option<LoginThrottle>.Some(throttle) })
+}
+
+fn build(users: Lookup): App! {
+  let app = App(Config{ secret = "change-me", sessions = MemoryStore(10_000) })
+  let strategy = loginStrategy(users)?
+  let login = app.group("/login")
+  login.use(requireAuth([]Strategy{ strategy }))
+  login.post("/", (c) => c.text("welcome"))
+  return app
+}
+```
+
+`PasswordStrategy(users)` with no second argument is what it was before:
+nothing is counted and nothing is refused. The option is the only difference.
+
+What a throttled login does:
+
+- A client the throttle has locked or is making wait gets `429 Too Many
+  Requests` with a `Retry-After` header. `requireAuth` writes both.
+- The check comes before the lookup. A refused request still pays for one
+  password hash, against a fixed dummy hash, before it is answered. Without
+  that, a refusal would be fast and a wrong password slow, and the difference
+  would tell an attacker the account is locked.
+- A wrong password and an unknown username are both a `401` with the same body
+  and headers, and both count against the account, so the account's own lockout
+  does not say whether it exists.
+- If the counter store is down the login is refused with a `500`, even for a
+  right password. A throttle that fails open is a throttle an attacker can
+  switch off.
+
+`check` fails with a `Throttled` when the client has to wait. It is an
+`HttpError`, so a route that lets it escape answers `429 Too Many Requests`.
+`requireAuth` catches it only to add the `Retry-After` header.
+
+### Wiring it by hand
+
+If you verify passwords yourself, or you are not using `PasswordStrategy`,
+call the throttle directly: `check` before, `recordFailure` on a wrong
+password, `recordSuccess` on a right one. Call `check` before you verify the
+password, so a locked account costs the attacker an attempt and costs you no
+password hash.
 
 ```bit
 import { Ctx, MemoryCounter, Res } from "web"
@@ -65,13 +122,6 @@ fn newThrottle(): LoginThrottle! {
   return LoginThrottle(MemoryCounter(10_000))?
 }
 ```
-
-`check` fails with a `Throttled` when the client has to wait. It is an
-`HttpError`, so a route that lets it escape answers `429 Too Many Requests`; the
-route above catches it only to add the `Retry-After` header.
-
-Call `check` before you verify the password. A locked account then costs the
-attacker an attempt and costs you no password hash.
 
 ## What the defaults do
 
@@ -135,7 +185,8 @@ Account names are lower-cased, so `Ada` and `ada` are one account.
 
 ## Keep an audit trail
 
-Set `onEvent` to hear every failure, lockout, refusal and reset. The hook runs on
+There are two hooks, and they tell you different things. `ThrottleOptions.onEvent`
+hears the throttle: every failure, lockout, refusal and reset. The hook runs on
 the request path, so keep it quick.
 
 ```bit
@@ -158,11 +209,32 @@ The kinds are `Failed` (a failure was recorded), `LockedOut` (that failure
 started a lockout), `Locked` and `Delayed` (the two reasons `check` refused),
 and `Cleared` (a success reset the account).
 
-`account` is the SHA-256 hash of the lower-cased name, not the name. People type
-passwords into username fields, and a log is the last place for one. The same
-hash is what the throttle puts in its store keys, so a username never reaches
-the store in the clear either. The hash is not keyed, so someone who can read
-the store can still test a guess against it.
+`PasswordOptions.onEvent` hears the login: one `AuthEvent` per attempt, with a
+`kind` of `"login.success"`, `"login.failure"` or `"login.locked"` (the
+throttle refused it), the `account`, the client `ip` and the time `at` in
+seconds. It works with or without a throttle, and `PasswordStrategy` logs
+nothing itself, so this is where your audit line comes from.
+
+```bit
+import { AuthEvent, AuthEventHook, Lookup, PasswordOptions, PasswordStrategy } from "auth"
+
+fn audit(users: Lookup, sink: (string) => ()): PasswordStrategy {
+  let hook: AuthEventHook = (e: AuthEvent) => {
+    sink("${e.kind} account=${e.account} ip=${e.ip} at=${e.at}")
+  }
+  return PasswordStrategy(users, PasswordOptions{ onEvent = hook })
+}
+```
+
+A hook cannot change a login. If it panics, the panic is caught and the login
+goes on as it would have. Keep it from holding a lock, though: a recovered panic
+does not release one.
+
+In both hooks `account` is the SHA-256 hash of the lower-cased name, not the
+name. People type passwords into username fields, and a log is the last place
+for one. The same hash is what the throttle puts in its store keys, so a
+username never reaches the store in the clear either. The hash is not keyed, so
+someone who can read the store can still test a guess against it.
 
 ## Sharp edges
 
@@ -178,10 +250,11 @@ the store can still test a guess against it.
   proxy it is the proxy, and every user would share one counter, so use
   `byForwardedIp`'s trusted-hop rule from `pkg/web` to read the real one.
   An empty address fails, since it would put everyone in one bucket.
-- **A store outage is an error, not a pass.** `check` returns the store's own
-  error, which is not a `Throttled`, so an unhandled one is a 500 and the login
-  is refused. If you would rather keep logins working through an outage, catch
-  it, log it, and carry on.
+- **A store outage is an error, not a pass.** `PasswordStrategy` refuses the
+  login with a 500 when the throttle's store fails. Called by hand, `check`
+  returns the store's own error, which is not a `Throttled`, so an unhandled
+  one is a 500 as well. If you would rather keep logins working through an
+  outage, catch it, log it, and carry on.
 
 ## Where to go next
 

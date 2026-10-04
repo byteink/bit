@@ -84,5 +84,9 @@ A wrong password and an unknown username fail with the exact same error and
 do the same amount of work, so neither timing nor the response body tells an
 attacker which one they hit.
 
+Nothing yet stops a script from guessing passwords at full speed. [Slow down
+password guessing](brute-force.md) adds the throttle with one option on
+`PasswordStrategy`.
+
 Next: [Sign in with Google](oidc.md), for a second `Strategy` beside this
 one.
