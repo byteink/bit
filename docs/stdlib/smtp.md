@@ -182,7 +182,8 @@ The body shape follows what the message carries, with no empty wrappers:
 |---|---|
 | text only | `text/plain` |
 | text + HTML | `multipart/alternative` |
-| text (+ HTML) + attachments | `multipart/mixed` |
+| text (+ HTML) + `addAlternative` parts | `multipart/alternative` |
+| text (+ HTML, alternatives) + attachments | `multipart/mixed` |
 
 ### `Address`
 
@@ -312,6 +313,40 @@ fn encodingOf(body: string): string! {
 
 Set the HTML alternative. Sent alongside the text part inside a
 `multipart/alternative`, never instead of it.
+
+### `Message.addAlternative(contentType: string, body: string)`
+
+Add a further part to the `multipart/alternative`, after the text and HTML
+parts and in call order. RFC 2046 section 5.1.4 makes the last part the
+preferred one, so a client that understands it shows it. The usual use is a
+calendar invite (RFC 6047), which Gmail and Outlook render with accept and
+decline buttons only when it is a `text/calendar` part with a `method`
+parameter next to the HTML:
+
+```bit
+import { Message, Address } from "std/smtp"
+
+fn invite(ics: string): string! {
+  let m = Message(Address{ name = "Ada", email = "ada@example.com" })
+  m.addTo(Address{ name = "", email = "team@example.net" })
+  m.setSubject("Design review")
+  m.setText("Design review, Friday at 10:00.\n")
+  m.setHtml("<p>Design review, Friday at 10:00.</p>\n")
+  m.addAlternative("text/calendar; method=REQUEST; charset=utf-8", ics)
+  return m.render()?
+}
+```
+
+The body is encoded like a text part: `7bit` when its bytes prove it safe, else
+quoted-printable or base64, whichever is smaller. A message with text and one
+alternative but no HTML is still a `multipart/alternative`.
+
+`render()` fails with `smtp: '<contentType>' is not allowed as an alternative
+part` unless `contentType` is `type/subtype` of RFC 2045 token characters,
+optionally followed by `; name=value` parameters (the value a token or a
+quoted string), with no CR, LF or NUL. `multipart/*`, `text/plain` and
+`text/html` are refused whatever their parameters, because they have their own
+setters.
 
 ### `Message.attach(a: Attachment)`
 
