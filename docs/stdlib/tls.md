@@ -97,6 +97,39 @@ fn peerSubject(host: string, port: int): string! {
 (inspecting a certificate file, say); `x509MatchHostname` there is the same
 check `dial` already runs for you against `config.serverName`.
 
+## When the handshake fails
+
+A failed handshake is a `HandshakeError`, and its `kind` tells you whether
+trying again can help. `Verification` means the server's identity was not
+proven (an untrusted or self-signed chain, a name the certificate does not
+cover, an expired certificate): the server will present the same certificate
+next time, so retrying only delays the answer. `Negotiation` means the two
+sides could not agree, or the server broke the protocol (no shared cipher, an
+alert, a malformed message): the same offer draws the same answer. `Io` means
+the network failed under the handshake (a reset, a close mid-record, a
+timeout): a later attempt can succeed.
+
+```bit
+import { dial, HandshakeError, HandshakeFailure, TlsConfig } from "std/tls"
+
+fn worthRetrying(host: string, cfg: TlsConfig): bool {
+  dial(host, 443, cfg) catch e {
+    let (h, ok) = e.(HandshakeError)
+    if (!ok) {
+      return true
+    }
+    return h.kind == HandshakeFailure.Io
+  }
+  return false
+}
+```
+
+A failure before the handshake starts (the host does not resolve, the TCP
+connect is refused) is not a `HandshakeError`: it is the plain `std/net`
+error, so the `ok` check above treats it as the network failure it is.
+`message()` of a `HandshakeError` is the text the failure always had, so code
+that only prints the error is unchanged.
+
 ## Security notes
 
 **Never set `insecureSkipVerify: true` outside a test.** It turns off both
@@ -175,6 +208,22 @@ Like `dial`, with a deadline on the whole connect-plus-handshake.
 ### `client(conn: Conn, host: string, config: TlsConfig): TlsConn!`
 
 Runs the client handshake over an already-open `std/net` connection.
+
+### `HandshakeFailure`
+
+The three ways a client handshake fails: `Verification` (the server's
+identity was not proven), `Negotiation` (no agreement, or a protocol
+violation) and `Io` (the transport failed under the handshake).
+
+### `HandshakeError`
+
+What `dial`, `dialDeadline` and `client` fail with when the handshake itself
+fails. `kind` is the `HandshakeFailure`; `message()` is the failure's text.
+See "When the handshake fails" above.
+
+### `HandshakeError.message(): string`
+
+The text of the failure, as `dial` reported it before the error was typed.
 
 ### `TlsConn`
 

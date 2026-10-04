@@ -69,12 +69,43 @@ is `Retry`; an unknown user (`550 5.1.1 No such user`) is `Rejected`, and
 sending it again draws the same answer.
 
 `transient()` is true for a 4xx reply, and for a failure with no reply at all -
-a refused connection, a reset, a timeout, a failed handshake - because those
-are the network's. It is false for a 5xx reply, an unexpected 2xx or 3xx, and
-for the calls the module refuses locally: a CR in a header value, a malformed
+a refused connection, a reset, a timeout, a handshake the network cut off -
+because those are the network's. It is false for a 5xx reply, an unexpected 2xx
+or 3xx, a TLS handshake that failed on the server's certificate or on
+negotiation, and for the calls the module refuses locally: a CR in a header value, a malformed
 address, `AUTH` on a connection that is not TLS, a command out of order. A
 local refusal has `command` equal to `"validate"`, and retrying it is only
 ever the same mistake again.
+
+A certificate the client will not accept - an untrusted or self-signed chain, a
+name the certificate does not cover, an expired one - and a handshake the two
+sides cannot agree on are permanent: the server presents the same certificate
+and the same offer next time, so a retry only delays the operator's signal. The
+reason is in `cause`, the `std/tls` error under the failure, and it is a
+`HandshakeError` whose `kind` says which:
+
+```bit
+import { Options, dialTls } from "std/smtp"
+import { HandshakeError, HandshakeFailure } from "std/tls"
+
+// Why a connection to `host` could not be made, for the operator.
+fn why(host: string): string {
+  dialTls(host, 465, Options()) catch e {
+    let (h, ok) = e.cause.(HandshakeError)
+    if (!ok) {
+      return "network: ${e.message()}"
+    }
+    if (h.kind == HandshakeFailure.Verification) {
+      return "certificate: ${e.message()}"
+    }
+    return "tls: ${e.message()}"
+  }
+  return "connected"
+}
+```
+
+`cause` is nil for a reply and for a local refusal, so the `ok` check is also the
+test for "this failure came from a transport error at all".
 
 `message()` gives the one-line form, `smtp: RCPT TO got 450: 4.2.1 Mailbox
 busy`, and `SmtpError` satisfies `error`, so a caller that only logs can keep
@@ -378,12 +409,14 @@ Why a step failed, and the one type every fallible call here fails with.
 | `code` | the reply code the server answered with; 0 when no reply was involved (network, TLS, a malformed reply, a local refusal) |
 | `enhanced` | the RFC 3463 status the server sent (`5.1.1`, RFC 2034), or `""` when it sent none |
 | `text` | the server's text joined by a space with the enhanced status taken off, or the local reason when `code` is 0 |
+| `cause` | the `std/net` or `std/tls` error under a transport failure, nil otherwise; a failed TLS handshake is a `std/tls` `HandshakeError` |
 | `command` | the step that failed: `connect`, `greeting`, `EHLO`, `STARTTLS`, `AUTH PLAIN`, `AUTH LOGIN`, `AUTH LOGIN username`, `AUTH LOGIN password`, `MAIL FROM`, `RCPT TO`, `DATA`, `end of DATA`, `QUIT`, or `validate` for a local refusal |
 
 ### `SmtpError.transient(): bool`
 
 True when sending again later can succeed: a 4xx reply, or a failure with no
-reply that is not a local `validate` refusal. See "When a send fails".
+reply that is not a local `validate` refusal and not a TLS handshake refused on
+verification or negotiation. See "When a send fails".
 
 ### `SmtpError.message(): string`
 
