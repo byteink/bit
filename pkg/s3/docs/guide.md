@@ -138,6 +138,65 @@ Each part but the last must be at least 5 MiB (S3's own minimum); call
 `client.abortMultipartUpload(key, uploadId)` instead of `completeMultipartUpload`
 to cancel and discard the parts already sent.
 
+## When a call fails
+
+A reader opens an article whose cover was never uploaded, and the page must
+show a placeholder, not an error screen. Telling "there is no such object" from
+"the bucket refused us" from "the network dropped" is the job of `S3Error`: a
+request that S3 refuses fails with one, and it carries the whole answer.
+
+```bit
+fn coverSize(client: Client, key: string): int {
+  let meta = client.head(key) catch e {
+    println("no cover: ${e.message()}")
+    return 0
+  }
+  return meta.contentLength
+}
+```
+
+For a missing object this prints
+`no cover: s3: NotFound (status 404, request id 4442587FB7D0A2F9)`. A `HEAD`
+answer has no body, so the code comes from the status alone: 404 is
+`NotFound`, 403 `AccessDenied`, 301 `PermanentRedirect`. A `GET` of a missing
+key carries a body and says `NoSuchKey` with S3's own sentence.
+
+What an `S3Error` holds, and what to do with each part:
+
+| Field | What it is |
+| ----- | ---------- |
+| `kind` | an `ErrorKind` to `match` on: `NoSuchKey`, `NoSuchBucket`, `AccessDenied`, `SlowDown`, ..., and `Unknown(code)` for a code this table does not name |
+| `code`, `message` | the service's `<Code>` and `<Message>`; `code` is empty for an error the client raised itself |
+| `status` | the HTTP status, 0 when no response arrived |
+| `requestId`, `extendedId` | `x-amz-request-id` and `x-amz-id-2`, what AWS support asks for |
+| `bucketRegion` | `x-amz-bucket-region`, where the bucket lives when the call went to the wrong region |
+| `resource` | the `<Resource>` the error names |
+| `snippet` | the first 512 bytes of the response body |
+| `retryable` | whether the SDK's retry rules would retry it: throttling and transient codes, and the statuses 429, 500, 502, 503 and 504 |
+
+```bit
+import { ErrorKind, S3Error } from "s3"
+
+fn placeholderFor(e: S3Error): string {
+  return match (e.kind) {
+    NoSuchKey => "covers/placeholder.jpg"
+    NotFound => "covers/placeholder.jpg"
+    _ => ""
+  }
+}
+```
+
+A response that is not an S3 error at all, such as the HTML page a proxy
+returns for a 502, is still an `S3Error`: kind `Unknown("")`, the status, and a
+snippet that shows the page, so the log says what answered. It is never a
+parse failure.
+
+S3 can also answer `200 OK` and then fail while it writes the body, so a
+`CopyObject`, `UploadPartCopy` or `CompleteMultipartUpload` that comes back
+with an `<Error>` document, or with nothing, is an error with status 503 and
+`retryable` set, as the AWS SDK treats it. A multipart upload is never reported
+complete on the strength of a `200` alone.
+
 ## Sharp edges
 
 - `put`/`get` hold the whole object in memory and are bounded by `std/http`'s

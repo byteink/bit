@@ -1,0 +1,361 @@
+// pkg/s3/errors.bit — what a failed call hands back: `S3Error`, and the rules
+// that turn an HTTP response into one (#6624).
+//
+// Followed, not paraphrased: @aws-sdk/client-s3 3.1146.0, aws-sdk-js-v3 commit
+// 054298b1520fc45a7017966674a5ac3aa6f32a04 (2026-10-02).
+//   - Error body: `<Error><Code>..</Code><Message>..</Message><Resource>..
+//     <RequestId>..<HostId>..</Error>` (the S3 API reference, "Error
+//     responses"). The code is `Error.Code`, else `Code`, and a 404 that names
+//     none is `NotFound` (`loadRestXmlErrorCode`, packages-internal/core/src/
+//     submodules/protocols/xml/parseXmlBody.ts).
+//   - Headers: `x-amz-request-id`, `x-amz-id-2` (`$metadata.extendedRequestId`)
+//     and `x-amz-bucket-region`, which the region redirect reads.
+//   - A 2xx that is an error (middleware-throw-200-exceptions): an empty body
+//     from CopyObject, UploadPartCopy or CompleteMultipartUpload is an
+//     `InternalError` ("S3 aborted request"), and any other 2xx whose body ends
+//     in `</Error>` is rewritten to status 503, then read as an error body.
+//     Both are retried as transient 503s. The SDK compares the last 16 bytes
+//     with `</Error>` as they are; here whitespace after the root element is
+//     skipped first, which XML allows, so a body that ends `</Error>\n` is
+//     still the error it is.
+//   - Retry: a code of the throttling or transient class, or a status of 429,
+//     500, 502, 503 or 504 (`getRetryErrorType`, service-error-classification).
+//
+// The code-to-kind mapping is `kindForCode` in gen_errors.bit, the one table;
+// nothing here names a second one. A response that is not an S3 error body (an
+// HTML 502 from a proxy) is never a parse failure: it is an `S3Error` with the
+// status and a bounded snippet, kind `Unknown("")` unless the status itself
+// says what happened.
+
+import { Response, header as httpHeader } from "std/http"
+import { hasSuffix, replace } from "std/strings"
+import { Element, parse } from "std/xml"
+
+// How much of a response body an error keeps. Bit strings are bytes, so the cut
+// backs off to a character boundary (`errCut`).
+const maxSnippet: int = 512
+
+// An `<Error>` document is a few hundred bytes. Past this a body is not one, and
+// the parser is never handed it.
+const maxErrorBody: int = 65536
+
+// How much of the snippet `message()` repeats when the body named no error.
+const maxMessageSnippet: int = 200
+
+// The status of the hidden error of a 2xx response, as the SDK rewrites it.
+const hiddenStatus: int = 503
+
+// What the body of a 2xx must end with to be an error in disguise.
+const hiddenTail: string = "</Error>"
+
+// What S3 means by a status when the response carries no code: a HEAD answer
+// has no body at all, and a proxy may strip one. Each code is looked up in the
+// error table by `kindForCode`, so a code here is a name, not a second mapping.
+// `NotFound` is the SDK's own rule for a 404; the others are the statuses the
+// S3 API reference documents for them.
+const statusCodes: []StatusCode = [
+  StatusCode(301, "PermanentRedirect"),
+  StatusCode(304, "NotModified"),
+  StatusCode(307, "TemporaryRedirect"),
+  StatusCode(403, "AccessDenied"),
+  StatusCode(404, "NotFound"),
+  StatusCode(405, "MethodNotAllowed"),
+  StatusCode(412, "PreconditionFailed"),
+  StatusCode(416, "InvalidRange"),
+  StatusCode(500, "InternalError"),
+  StatusCode(501, "NotImplemented"),
+  StatusCode(503, "ServiceUnavailable"),
+]
+
+class StatusCode {
+  status: int
+  code: string
+
+  init(status: int, code: string) {
+    this.status = status
+    this.code = code
+  }
+}
+
+// Why an S3 call failed. Match on `kind`, and read the rest to tell the story:
+//
+//   let obj = s3.getObject(...) catch e {
+//     match (e.kind) {
+//       NoSuchKey => return defaultCover()
+//       _ => fail e
+//     }
+//   }
+//
+// `code` is the wire `<Code>` ("" for an error the client raised itself, such as
+// a timeout), `status` the HTTP status (0 when no response arrived) and
+// `message` the service's own sentence. `requestId` (`x-amz-request-id`) and
+// `extendedId` (`x-amz-id-2`) are what AWS support asks for; `bucketRegion`
+// (`x-amz-bucket-region`) is where the bucket really lives when the call went to
+// the wrong region; `resource` is the `<Resource>` the error names. `snippet` is
+// the start of the response body, at most 512 bytes, so a failure that was not
+// an S3 error body still says what it was. `retryable` is the verdict the retry
+// loop acts on, and `attempts` how many requests were made, which that loop sets.
+export class S3Error {
+  export kind: ErrorKind
+  export code: string
+  export message: string
+  export status: int
+  export requestId: string
+  export extendedId: string
+  export bucketRegion: string
+  export resource: string
+  export snippet: string
+  export retryable: bool
+  export attempts: int
+
+  // One line for a log: `s3: NoSuchKey: The specified key does not exist.
+  // (status 404, request id 4442587FB7D0A2F9)`.
+  export message(): string {
+    return "s3: ${errLabel(this)}${errDetail(this)}${errTrailer(this)}"
+  }
+}
+
+// The name a client-raised kind prints as, "" for a kind that came off the wire.
+fn clientKindName(kind: ErrorKind): string {
+  return match (kind) {
+    Timeout => "Timeout"
+    Connection => "Connection"
+    Tls => "Tls"
+    ChecksumMismatch => "ChecksumMismatch"
+    Cancelled => "Cancelled"
+    Credentials => "Credentials"
+    Endpoint => "Endpoint"
+    InvalidInput(_) => "InvalidInput"
+    _ => ""
+  }
+}
+
+fn errLabel(e: S3Error): string {
+  if (e.code != "") {
+    return e.code
+  }
+  let name = clientKindName(e.kind)
+  if (name != "") {
+    return name
+  }
+  return "Unknown"
+}
+
+// The cut of `s` at `want` bytes, backed off to the start of a character so a
+// snippet is never half a UTF-8 sequence.
+fn errCut(s: string, want: int): int {
+  if (len(s) <= want) {
+    return len(s)
+  }
+  let cut = want
+  while (cut > 0 && (s[cut] & 0xC0) == 0x80) {
+    cut = cut - 1
+  }
+  return cut
+}
+
+fn errClip(s: string, want: int): string {
+  return s[0:errCut(s, want)]
+}
+
+// `: <message>`, or `: <snippet>` when the body gave none, or "".
+fn errDetail(e: S3Error): string {
+  if (e.message != "") {
+    return ": ${e.message}"
+  }
+  let text = replace(replace(errClip(e.snippet, maxMessageSnippet), "\n", " "), "\r", " ")
+  if (text != "") {
+    return ": ${text}"
+  }
+  return ""
+}
+
+// ` (status 404, request id X)`, or "" for an error with no response behind it.
+fn errTrailer(e: S3Error): string {
+  if (e.status == 0) {
+    return ""
+  }
+  if (e.requestId == "") {
+    return " (status ${e.status})"
+  }
+  return " (status ${e.status}, request id ${e.requestId})"
+}
+
+// What the SDK's retry strategy calls throttling or transient, from the table's
+// class and the status (`getRetryErrorType`).
+fn errRetryable(kind: ErrorKind, status: int): bool {
+  match (retryClassOf(kind)) {
+    Throttling => return true
+    Transient => return true
+    _ => {}
+  }
+  return status == 429 || status == 500 || status == 502 || status == 503 || status == 504
+}
+
+// An error the client raised itself, before or without a response: a timeout,
+// a refused connection, a bad argument. `code` is "" and `status` 0.
+fn clientError(kind: ErrorKind, message: string): S3Error {
+  return S3Error{
+    kind = kind,
+    code = "",
+    message = message,
+    status = 0,
+    requestId = "",
+    extendedId = "",
+    bucketRegion = "",
+    resource = "",
+    snippet = "",
+    retryable = errRetryable(kind, 0),
+    attempts = 0,
+  }
+}
+
+// --- the <Error> body ----------------------------------------------------------
+
+// The fields of an `<Error>` document, all "" when absent.
+class WireError {
+  code: string,
+  message: string,
+  resource: string,
+  requestId: string,
+  hostId: string,
+}
+
+fn errChildText(e: Element, name: string): string {
+  match (e.child(name)) {
+    Some(c) => return c.text()
+    None => return ""
+  }
+}
+
+// The element the fields live in: the root when it is `Error` or carries a
+// `Code` itself, else the `Error` under it (a wrapper such as `ErrorResponse`).
+// None when the document is not an S3 error at all (an XHTML 502 page).
+fn errorElementOf(root: Element): Option<Element> {
+  if (root.local == "Error") {
+    return Option<Element>.Some(root)
+  }
+  match (root.child("Error")) {
+    Some(inner) => return Option<Element>.Some(inner)
+    None => {}
+  }
+  match (root.child("Code")) {
+    Some(_) => return Option<Element>.Some(root)
+    None => return Option<Element>.None
+  }
+}
+
+// The fields of `body`, None when it is empty, too large, not well-formed XML,
+// or not an error document. Never fails: the caller always has the status.
+fn readWireError(body: string): Option<WireError> {
+  if (body == "" || len(body) > maxErrorBody) {
+    return Option<WireError>.None
+  }
+  let root = parse([]byte(body), 32, 64, maxErrorBody, 256) catch _ {
+    return Option<WireError>.None
+  }
+  match (errorElementOf(root)) {
+    Some(e) => {
+      return Option<WireError>.Some(
+        WireError{
+          code = errChildText(e, "Code"),
+          message = errChildText(e, "Message"),
+          resource = errChildText(e, "Resource"),
+          requestId = errChildText(e, "RequestId"),
+          hostId = errChildText(e, "HostId"),
+        },
+      )
+    }
+    None => return Option<WireError>.None
+  }
+}
+
+// The code a status means on its own, "" when it means none.
+fn statusCodeOf(status: int): string {
+  for row of statusCodes {
+    if (row.status == status) {
+      return row.code
+    }
+  }
+  return ""
+}
+
+fn firstNonEmpty(a: string, b: string): string {
+  if (a != "") {
+    return a
+  }
+  return b
+}
+
+// The `S3Error` for a response with `status`, the raw `headers` block and
+// `body`. Never fails and never panics, whatever the body is.
+fn s3ErrorOf(status: int, headers: string, body: string): S3Error {
+  let wire = WireError{ code = "", message = "", resource = "", requestId = "", hostId = "" }
+  match (readWireError(body)) {
+    Some(w) => wire = w
+    None => {}
+  }
+  let code = firstNonEmpty(wire.code, statusCodeOf(status))
+  let kind = ErrorKind.Unknown("")
+  if (code != "") {
+    kind = kindForCode(code)
+  }
+  return S3Error{
+    kind = kind,
+    code = code,
+    message = wire.message,
+    status = status,
+    requestId = firstNonEmpty(httpHeader(headers, "x-amz-request-id"), wire.requestId),
+    extendedId = firstNonEmpty(httpHeader(headers, "x-amz-id-2"), wire.hostId),
+    bucketRegion = httpHeader(headers, "x-amz-bucket-region"),
+    resource = wire.resource,
+    snippet = errClip(body, maxSnippet),
+    retryable = errRetryable(kind, status),
+    attempts = 0,
+  }
+}
+
+// The error of a response outside 2xx.
+fn errorFromResponse(res: Response): S3Error {
+  return s3ErrorOf(res.status, res.headers, res.body)
+}
+
+// --- a 2xx that is an error ------------------------------------------------------
+
+// True when `body` ends in `</Error>`, not counting the whitespace XML allows
+// after the root element.
+fn endsWithError(body: string): bool {
+  let end = len(body)
+  while (end > 0 &&
+    (body[end - 1] == ' ' || body[end - 1] == '\n' || body[end - 1] == '\r' || body[end - 1] == '\t')) {
+    end = end - 1
+  }
+  return hasSuffix(body[0:end], hiddenTail)
+}
+
+// The error a 2xx response carries, None when it is a success. S3 can start a
+// 200 and fail while writing the body, so for the operations whose output is
+// XML (never a streamed object body: the SDK's check buffers the whole body)
+// the pipeline asks every 2xx. `bodyRequired` is true for CopyObject,
+// UploadPartCopy and CompleteMultipartUpload, which never answer 2xx with an
+// empty body: that is an `InternalError` "S3 aborted request". The error is
+// reported with status 503 and `retryable`, as the SDK retries it.
+fn hiddenError(res: Response, bodyRequired: bool): Option<S3Error> {
+  if (res.status < 200 || res.status > 299) {
+    return Option<S3Error>.None
+  }
+  if (res.body == "" && bodyRequired) {
+    let e = s3ErrorOf(hiddenStatus, res.headers, "")
+    e.kind = ErrorKind.InternalError
+    e.code = "InternalError"
+    e.message = "S3 aborted request"
+    e.retryable = true
+    return Option<S3Error>.Some(e)
+  }
+  if (!endsWithError(res.body)) {
+    return Option<S3Error>.None
+  }
+  let e = s3ErrorOf(hiddenStatus, res.headers, res.body)
+  e.retryable = true
+  return Option<S3Error>.Some(e)
+}
