@@ -105,13 +105,13 @@ protected route that is not itself doing the authenticating just reads
   verifying a submitted code with a skew window and caller-owned replay
   protection.
 - `OneTimeTokens`, `OneTimeStore`, `OneTimeRecord`, `OneTimeOptions`,
-  `MemoryOneTimeStore`, `InvalidToken`, `Deliver` - the one-time token behind
+  `Live`, `MemoryOneTimeStore`, `InvalidToken`, `Deliver` - the one-time token behind
   password reset, email verification and magic links: 256 random bits stored
   only as a SHA-256 hash, bound to a purpose, expiring, redeemed once, with a
   pluggable store and the `Deliver` function the app supplies to send them; see
   [One-time tokens for account emails](docs/account-tokens.md).
 - `EmailVerification`, `VerifyOptions`, `verifyLink` - email verification on the
-  one-time token: `send` mails a link and revokes the earlier ones, `confirm`
+  one-time token: `send` mails a link and atomically revokes the earlier ones, `confirm`
   spends it once and calls your `markVerified`, refusing it when the address
   changed or for any reason in the one `InvalidToken`; `verifyLink` builds the
   link from a base URL the app configures; see

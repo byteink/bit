@@ -74,15 +74,34 @@ author asks for another. A guess that leaves the token alive would be free.
 ## A new request replaces the old one
 
 An author who clicks "send it again" has two live links, and the first is
-still in a mailbox the author may no longer control. `revokeSubject` drops
-every live token of one purpose for one subject. Call it, then `issue`:
+still in a mailbox the author may no longer control. Pass `live = Live.One` to
+`issue` and the new token becomes the only live one of its purpose for that
+subject:
+
+```bit
+import { Live, OneTimeTokens } from "auth"
+
+fn resend(tokens: OneTimeTokens, authorId: string, address: string): string! {
+  return tokens.issue("verify-email", authorId, 86400, address, live = Live.One)?
+}
+```
+
+The earlier tokens die in the same step that saves the new one, so two
+requests at the same instant, a double click or two tabs, still leave exactly
+one live link. Revoking first and issuing second would be two steps, and both
+requests could finish the revoke before either issues. The default,
+`Live.Many`, leaves earlier tokens alone, which suits a flow where several
+links may be out at once.
+
+`revokeSubject` drops every live token of one purpose for one subject without
+issuing one, for the case where the author signs out everywhere or a delivery
+failed:
 
 ```bit
 import { OneTimeTokens } from "auth"
 
-fn resend(tokens: OneTimeTokens, authorId: string, address: string): string! {
+fn forget(tokens: OneTimeTokens, authorId: string): ()! {
   tokens.revokeSubject("verify-email", authorId)?
-  return tokens.issue("verify-email", authorId, 86400, address)?
 }
 ```
 
@@ -133,11 +152,19 @@ revokes it.
 
 `MemoryOneTimeStore` forgets everything when the process restarts, which kills
 every mailed link, and it is one process. A deployment with more than one server
-needs a shared store. `OneTimeStore` is three methods, and any type that has
+needs a shared store. `OneTimeStore` is four methods, and any type that has
 them is one:
 
 - `put(hash, rec, ttl)` saves a record under the hash of the token, for `ttl`
   seconds.
+- `replace(hash, rec, ttl)` is `put` that first deletes every record with the
+  same purpose and subject as `rec`, as one atomic step. This is what makes
+  `Live.One` hold: no other call may run between the delete and the store, so
+  after any number of concurrent `replace` calls for one purpose and subject,
+  exactly one record of that pair is left. With SQL it is one transaction (or
+  one `INSERT` with the delete in a CTE); with Redis, a `MULTI` or a script. A
+  `DELETE` followed by an `INSERT` as two statements lets two senders each
+  leave a live token. If it fails, the old records stay.
 - `take(hash)` returns the record and deletes it in one atomic step, or
   `Option.None` when there is none. This is what makes a token single use. With
   SQL it is one `DELETE ... RETURNING`; with Redis, `GETDEL`. A `SELECT` followed
@@ -159,6 +186,11 @@ class CountingStore {
   export put(hash: string, rec: OneTimeRecord, ttl: i64): ()! {
     this.puts[0] = this.puts[0] + 1
     this.inner.put(hash, rec, ttl)?
+  }
+
+  export replace(hash: string, rec: OneTimeRecord, ttl: i64): ()! {
+    this.puts[0] = this.puts[0] + 1
+    this.inner.replace(hash, rec, ttl)?
   }
 
   export take(hash: string): Option<OneTimeRecord>! {

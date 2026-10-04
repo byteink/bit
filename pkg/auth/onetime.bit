@@ -41,8 +41,10 @@
 // ## A new request replaces the old one
 //
 // `revokeSubject(purpose, subject)` drops every live token of that purpose for
-// that subject. Call it before `issue` when a second reset request should
-// invalidate the first mail.
+// that subject. A flow where a new request must replace the old one passes
+// `Live.One` to `issue` instead of calling it first: the revoke and the new
+// record are then one atomic store step, so two requests at the same instant
+// leave exactly one live token, not two.
 import { Mutex } from "std/sync"
 import { isSome, unwrap } from "std/core"
 import { now, Second } from "std/time"
@@ -68,7 +70,7 @@ export class OneTimeRecord {
   export data: string,
 }
 
-// Where records live. Structural (§14.3): any type with these three methods
+// Where records live. Structural (§14.3): any type with these four methods
 // is a store, so a database or Redis table fits with no declaration.
 //
 // `hash` is the SHA-256 hex of the token, never the token. `ttl` is the
@@ -78,8 +80,18 @@ export class OneTimeRecord {
 // `take` MUST be one atomic step that reads and deletes (a `DELETE ... RETURNING`
 // or a `GETDEL`), answering `Option.None` for a record that is not there. Two
 // callers taking one hash must never both get `Some`: that is single use.
+//
+// `replace` MUST be one atomic step that deletes every record whose purpose
+// and subject equal `rec.purpose` and `rec.subject`, and stores `rec` under
+// `hash` (a transaction, a `MULTI`, a compare-and-set loop). No other call may
+// see or interleave between the delete and the store: after any number of
+// concurrent `replace` calls for one (purpose, subject), exactly one record of
+// that pair is left, the one whose step ran last. A store that does the two as
+// separate steps lets two senders each leave a live token, and breaks
+// `Live.One`. A failure leaves the old records in place.
 export interface OneTimeStore {
   put(hash: string, rec: OneTimeRecord, ttl: i64): ()!,
+  replace(hash: string, rec: OneTimeRecord, ttl: i64): ()!,
   take(hash: string): Option<OneTimeRecord>!,
   revokeSubject(purpose: string, subject: string): ()!,
 }
@@ -122,14 +134,16 @@ export class MemoryOneTimeStore {
   export put(hash: string, rec: OneTimeRecord, ttl: i64): ()! {
     this.mu.lock()
     defer this.mu.unlock()
-    let (_, present) = this.entries[hash]
-    if (!present && len(this.entries) >= this.capacity) {
-      this.sweepExpired(rec.expiresAt - ttl)
-    }
-    if (!present && len(this.entries) >= this.capacity) {
-      this.evictSoonestExpiring()
-    }
-    this.entries[hash] = rec
+    this.store(hash, rec, ttl)
+  }
+
+  // The revoke and the store under one lock hold: the atomic step
+  // `OneTimeStore.replace` demands.
+  export replace(hash: string, rec: OneTimeRecord, ttl: i64): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.dropSubject(rec.purpose, rec.subject)
+    this.store(hash, rec, ttl)
   }
 
   // Read and delete under one lock hold: the atomic step `OneTimeStore.take`
@@ -150,6 +164,23 @@ export class MemoryOneTimeStore {
   export revokeSubject(purpose: string, subject: string): ()! {
     this.mu.lock()
     defer this.mu.unlock()
+    this.dropSubject(purpose, subject)
+  }
+
+  // The lock is held by the callers; `Mutex` is not reentrant.
+  store(hash: string, rec: OneTimeRecord, ttl: i64) {
+    let (_, present) = this.entries[hash]
+    if (!present && len(this.entries) >= this.capacity) {
+      this.sweepExpired(rec.expiresAt - ttl)
+    }
+    if (!present && len(this.entries) >= this.capacity) {
+      this.evictSoonestExpiring()
+    }
+    this.entries[hash] = rec
+  }
+
+  // The lock is held by the callers.
+  dropSubject(purpose: string, subject: string) {
     let dead = []string(0)
     for (hash, rec) of this.entries {
       if (rec.purpose == purpose && rec.subject == subject) {
@@ -161,7 +192,7 @@ export class MemoryOneTimeStore {
     }
   }
 
-  // The lock is held by `put`, the only caller; `Mutex` is not reentrant.
+  // The lock is held by `store`; `Mutex` is not reentrant.
   sweepExpired(nowSec: i64) {
     let dead = []string(0)
     for (hash, rec) of this.entries {
@@ -174,7 +205,7 @@ export class MemoryOneTimeStore {
     }
   }
 
-  // The lock is held by `put`, the only caller.
+  // The lock is held by `store`.
   evictSoonestExpiring() {
     let victim = ""
     let victimAt: i64 = 0
@@ -201,6 +232,17 @@ export class OneTimeOptions {
   // that lives longer is a standing credential, and a `ttl` given in the wrong
   // unit is caught here instead of at the first audit.
   export maxTtl: i64 = 2_592_000,
+}
+
+// How many live tokens one (purpose, subject) may hold, the option of
+// `OneTimeTokens.issue`.
+export enum Live {
+  // Tokens add up; each lives until it is redeemed, revoked or expires. The
+  // default.
+  Many,
+  // The new token replaces every live one of that purpose and subject, in one
+  // atomic store step (`OneTimeStore.replace`).
+  One,
 }
 
 // Random bytes in a token: 256 bits, twice the 128 this package asks of itself
@@ -233,9 +275,20 @@ export class OneTimeTokens {
   // string returned is the only copy of the token: it goes to the user and
   // nowhere else; the store gets its hash. `data` comes back from `redeem`.
   //
+  // `live = Live.One` makes the new token the only live one of that purpose
+  // for that subject: the earlier ones die in the same atomic store step that
+  // saves this one, so concurrent calls cannot leave two. The default,
+  // `Live.Many`, leaves the earlier ones alone.
+  //
   // Fails, loudly, for an empty `purpose` or `subject`, a `ttl` that is not
   // between 1 and `maxTtl`, or a store that refuses the record.
-  export issue(purpose: string, subject: string, ttl: i64, data: string = ""): string! {
+  export issue(
+    purpose: string,
+    subject: string,
+    ttl: i64,
+    data: string = "",
+    live: Live = Live.Many,
+  ): string! {
     if (purpose == "") {
       fail newError("auth: OneTimeTokens.issue(): `purpose` is empty — name what the token is for")
     }
@@ -256,7 +309,11 @@ export class OneTimeTokens {
       expiresAt = this.nowSec() + ttl,
       data = data,
     }
-    this.store.put(oneTimeHash(token), rec, ttl)?
+    let hash = oneTimeHash(token)
+    match (live) {
+      Many => this.store.put(hash, rec, ttl)?
+      One => this.store.replace(hash, rec, ttl)?
+    }
     return token
   }
 
