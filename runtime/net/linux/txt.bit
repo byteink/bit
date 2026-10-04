@@ -1,0 +1,268 @@
+// TXT lookups for std/net's `lookupTxt` (#6882), the Linux/Darwin transport half
+// of ../txt.bit's codec. Same module as ./udp.bit, so its `netDnsOpen`/
+// `netDnsSend`/`netDnsRecv` and ./tcpdeadline.bit's socket engine are in scope.
+//
+// ONE SERVER, ONE BUDGET. `resolveBudgetMs` (std/net) promises a caller that
+// `resolve` takes at most `netDnsRetries` x `netDnsTimeoutMs` per nameserver,
+// and a caller racing a timer against `lookupTxt` is owed the same arithmetic.
+// So the UDP attempts and, when the reply is truncated, the TCP retry
+// (RFC 7766) share ONE deadline per server: `netTxtBudgetNs` from the moment
+// the server is first asked. A TC reply normally arrives at once, so the TCP
+// exchange gets nearly all of it.
+//
+// THE TCP RETRY IS IPv4 ONLY, because the runtime's TCP dial is: a truncated
+// reply from an IPv6 nameserver fails that server (the next one is tried).
+//
+// Every function here is `@nosplit` and takes one raw pointer, `work`, into the
+// managed scratch `netAbiLookupTxtW` (below) owns for the whole call, the shape
+// `netAbiResolve` (./netabi.bit) has: the allocation and the park-holding frame
+// are that wrapper's (and `netTxtConf`'s, which allocates the resolv.conf read).
+// Everything a lookup needs lives in `work` at the fixed offsets below, which is
+// what keeps each function to the five parameters the lint ceiling allows.
+
+// The per-server wall clock: the same three 2000 ms receive windows `resolve`
+// spends, as one deadline.
+const netTxtBudgetNs: int = netDnsRetries * netDnsTimeoutMs * 1000000
+
+// `work`'s layout: the TCP query (a two-byte length and at most `netMaxDnsMsg`
+// bytes) at 0; the host name; the nameserver address text the caller named, if
+// any; the dotted-quad text a TCP dial needs; the nameserver's address bytes
+// (4, or 16 for IPv6); and the TCP reply (at most 65535 bytes) last.
+const netTxtHostOff: int = 520
+const netTxtNsTextOff: int = 784
+const netTxtDialOff: int = 864
+const netTxtNsOff: int = 896
+const netTxtReplyOff: int = 1024
+const netTxtWorkBytes: int = 1024 + 65535 + 8
+// An IPv6 address in text form is at most 45 bytes.
+const netTxtMaxNsText: int = 64
+
+// UDP: up to `netDnsRetries` query/reply rounds on the connected `fd`. A lost
+// reply, a failed send, a stray datagram and a SERVFAIL each cost a round; an
+// answer, a truncation and a malformed reply end it. A hard receive error ends
+// the server.
+@nosplit fn netTxtUdp(fd: int, work: *u8, hostLen: int, out: *u8): int {
+  let gen = *netFdGenAddr(fd)
+  let attempt = 0
+  // Bounded retransmits (Power of 10).
+  while (attempt < netDnsRetries) {
+    attempt = attempt + 1
+    if (netDnsSend(fd, work + netTxtHostOff, hostLen, netTypeTxt)) {
+      let got = netDnsRecv(fd, gen)
+      if (got == 0 - 1) {
+        return netTxtTransient
+      }
+      if (got >= 0) {
+        let r = netParseTxt(dnsBytes() + netMaxDnsMsg, got, netDnsId, out)
+        if (r != netTxtTransient) {
+          return r
+        }
+      }
+    }
+  }
+  return netTxtTransient
+}
+
+// Exactly `want` bytes into `buf`, or false on end of stream, error or the
+// deadline. `got` rises by at least one per iteration and `want` is at most 65535.
+@nosplit fn netTxtReadFull(fd: int, buf: *u8, want: int, deadline: int): bool {
+  let got = 0
+  while (got < want) {
+    let n = netReadSockDeadline(fd, buf + got, want - got, deadline)
+    if (n <= 0) {
+      return false
+    }
+    got = got + n
+  }
+  return true
+}
+
+// One framed exchange (RFC 7766 section 8: a two-byte length before each
+// message) on the connected `fd`: the query is `work[0..qn)` and the reply is
+// read into `work + netTxtReplyOff`.
+@nosplit fn netTxtTcpAsk(fd: int, work: *u8, qn: int, out: *u8, deadline: int): int {
+  let reply = work + netTxtReplyOff
+  if (netWriteSockDeadline(fd, work, qn, deadline) != qn) {
+    return netTxtTransient
+  }
+  if (!netTxtReadFull(fd, reply, 2, deadline)) {
+    return netTxtTransient
+  }
+  let mlen = netReadU16Be(reply, 0)
+  if (mlen < 12) {
+    return netTxtMalformed
+  }
+  if (!netTxtReadFull(fd, reply, mlen, deadline)) {
+    return netTxtTransient
+  }
+  let r = netParseTxt(reply, mlen, netDnsId, out)
+  if (r == netTxtTruncated) {
+    return netTxtTransient
+  }
+  return r
+}
+
+// The TCP retry to the IPv4 nameserver in `work` at `netTxtNsOff`, bounded by
+// `deadline`.
+@nosplit fn netTxtTcp(work: *u8, hostLen: int, port: int, out: *u8, deadline: int): int {
+  let host = work + netTxtHostOff
+  let qlen = netBuildQuery(work + 2, netMaxDnsMsg, host, hostLen, netDnsId)
+  if (qlen < 0) {
+    return netTxtTransient
+  }
+  netWriteU16Be(work + 2, qlen - 4, netTypeTxt)
+  netWriteU16Be(work, 0, qlen)
+  let dial = work + netTxtDialOff
+  let dialLen = netFormatOctets(work + netTxtNsOff, dial)
+  let fd = netDialTcpDeadline(dial, dialLen, port, deadline)
+  if (fd < 0) {
+    return netTxtTransient
+  }
+  let r = netTxtTcpAsk(fd, work, qlen + 2, out, deadline)
+  netClose(fd)
+  return r
+}
+
+// Asks the nameserver in `work` at `netTxtNsOff` (4 bytes, or 16 when `v6`): UDP
+// first, TCP when the reply says it was truncated. Returns the bytes written to
+// `out`, `netTxtMalformed`, or `netTxtTransient` for every other failure,
+// including a truncation that cannot be retried (IPv6).
+@nosplit fn netTxtServer(work: *u8, hostLen: int, v6: bool, port: int, out: *u8): int {
+  let deadline = netClockNowNs() + netTxtBudgetNs
+  let fd = netDnsOpen(work + netTxtHostOff, hostLen, work + netTxtNsOff, port, v6)
+  if (fd < 0) {
+    return netTxtTransient
+  }
+  let r = netTxtUdp(fd, work, hostLen, out)
+  netClose(fd)
+  if (r != netTxtTruncated) {
+    return r
+  }
+  if (v6) {
+    return netTxtTransient
+  }
+  return netTxtTcp(work, hostLen, port, out, deadline)
+}
+
+// The seam: the nameserver is the address text the caller put in `work` at
+// `netTxtNsTextOff` (IPv4 or IPv6) and `port` is its port (a test stub cannot
+// bind 53), the way `netResolveHost`'s `ns`/`port` are parameters (./udp.bit).
+@nosplit fn netTxtFixed(work: *u8, hostLen: int, nsLen: int, port: int, out: *u8): int {
+  if (port < 1 || port > 65535) {
+    return netTxtTransient
+  }
+  let text = work + netTxtNsTextOff
+  if (netParseIpv4(text, nsLen, work + netTxtNsOff)) {
+    return netTxtServer(work, hostLen, false, port, out)
+  }
+  if (netParseIpv6(text, nsLen, work + netTxtNsOff)) {
+    return netTxtServer(work, hostLen, true, port, out)
+  }
+  return netTxtTransient
+}
+
+// Every nameserver in /etc/resolv.conf, in order, as `netAbiResolve` walks them
+// (./netabi.bit). The first answer wins, NXDOMAIN included; a malformed reply is
+// remembered so that if no server answers, the failure names it.
+fn netTxtConf(work: *u8, hostLen: int, out: *u8): int {
+  let confBuf = []i64(scratchWords(resolvConfMax))
+  let confPtr = u8At(int(ptrOf(confBuf)))
+  let confLen = readResolvConf(confPtr, resolvConfMax)
+  if (confLen <= 0) {
+    return netTxtTransient
+  }
+  let addrLenBuf = []i64(1)
+  let addrLenPtr = ptrOf(addrLenBuf)
+  let failure = netTxtTransient
+  let at = 0
+  // `netNextNameserver` returns a position strictly past where it started, so
+  // `at` rises and the walk ends within `confLen`.
+  while (at >= 0) {
+    at = netNextNameserver(confPtr, confLen, at, work + netTxtNsOff, addrLenPtr)
+    if (at < 0) {
+      return failure
+    }
+    let r = netTxtServer(work, hostLen, *addrLenPtr == 16, 53, out)
+    if (r >= 0) {
+      return r
+    }
+    if (r == netTxtMalformed) {
+      failure = r
+    }
+  }
+  return failure
+}
+
+// True when the arguments of `netAbiLookupTxtW` describe a lookup this runtime
+// will run: a host of 1..255 bytes, a nameserver text of at most 64, and the
+// buffers present.
+@nosplit fn netTxtArgsOk(inWords: int, hostLen: int, nsLen: int, outWords: int): bool {
+  if (inWords == 0 || outWords == 0) {
+    return false
+  }
+  if (hostLen <= 0 || hostLen > netAbiMaxHost) {
+    return false
+  }
+  return nsLen >= 0 && nsLen <= netTxtMaxNsText
+}
+
+// Copies the caller's `host` and nameserver text (`src[0..hostLen)` then
+// `src[hostLen..hostLen+nsLen)`) into `work`, so every later park holds only the
+// wrapper's managed scratch. Bounded by the two length limits.
+@nosplit fn netTxtLoad(work: *u8, src: *u8, hostLen: int, nsLen: int) {
+  let i = 0
+  while (i < hostLen) {
+    putU8(work, netTxtHostOff + i, getU8(src, i))
+    i = i + 1
+  }
+  i = 0
+  while (i < nsLen) {
+    putU8(work, netTxtNsTextOff + i, getU8(src, hostLen + i))
+    i = i + 1
+  }
+}
+
+// `bit_rt_net_lookup_txt_w`: the TXT records of the host `inWords[0..hostLen)` as the
+// entries ../txt.bit describes, written to the caller's own `outWords` buffer of
+// `netTxtOutMax` bytes. Returns the bytes written (0 when the name has no TXT
+// record, NXDOMAIN included), -1 on any failure, -2 for a malformed reply.
+//
+// `nsLen == 0` means the system resolver's nameservers; otherwise
+// `inWords[hostLen..hostLen+nsLen)` is one nameserver's address text and `port` is its
+// port. `inWords` and `outWords` cross as packed `[]byte` backings (ABI.md section 2) that
+// the caller holds live with `keepAlive`, as `bit_rt_net_read_deadline_w`
+// documents.
+export @symbol("bit_rt_net_lookup_txt_w") fn netAbiLookupTxtW(
+  inWords: int,
+  hostLen: int,
+  nsLen: int,
+  port: int,
+  outWords: int,
+): int {
+  if (!netTxtArgsOk(inWords, hostLen, nsLen, outWords)) {
+    return 0 - 1
+  }
+  // MANAGED scratch (#1668), held across every park below.
+  let scratch = []i64(scratchWords(netTxtWorkBytes))
+  let work = u8At(int(ptrOf(scratch)))
+  netTxtLoad(work, u8At(inWords), hostLen, nsLen)
+  let out = u8At(outWords)
+  let r = 0
+  if (nsLen > 0) {
+    r = netTxtFixed(work, hostLen, nsLen, port, out)
+  } else {
+    r = netTxtConf(work, hostLen, out)
+  }
+  if (r == netTxtMalformed) {
+    return r
+  }
+  return netTxtFailureCode(r)
+}
+
+// Every failure but a malformed reply reads as -1 to the caller.
+@nosplit fn netTxtFailureCode(r: int): int {
+  if (r < 0) {
+    return 0 - 1
+  }
+  return r
+}

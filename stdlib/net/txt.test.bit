@@ -1,0 +1,308 @@
+// stdlib/net/txt.test.bit — `lookupTxt` (#6882), against a fake DNS server on
+// 127.0.0.1 (its own file: net.test.bit is at the 800-line ceiling).
+//
+// `lookupTxtVia` is the unexported seam: the same call `lookupTxt` makes with the
+// resolver pointed at one nameserver, because port 53 cannot be bound without
+// root. The fake answers on a UDP socket and, for the truncation test, on a TCP
+// listener bound to the SAME port number (the two port spaces are separate).
+// `monotonic`/`since` come from net.test.bit's `std/time` import (imports are
+// module-scoped).
+
+const txtName: string = "sel._domainkey.example.com"
+
+// A growing DNS message. A class, so every `add` grows the one buffer its caller
+// holds (an `append` on a parameter would not reach the caller).
+class Msg {
+  bytes: []byte
+
+  add(v: int) {
+    this.bytes = append(this.bytes, byte(v))
+  }
+
+  add16(v: int) {
+    this.add(v / 256)
+    this.add(v % 256)
+  }
+
+  addStr(s: string) {
+    let i = 0
+    while (i < len(s)) {
+      this.add(int(s[i]))
+      i = i + 1
+    }
+  }
+
+  text(): string {
+    return string(this.bytes)
+  }
+}
+
+fn newMsg(): Msg {
+  let b: []byte = []
+  return Msg{ bytes = b }
+}
+
+// A response header echoing `q`'s id and question, with `an` answers to follow.
+fn replyHead(q: string, flags: int, an: int): Msg {
+  let m = newMsg()
+  m.add(int(q[0]))
+  m.add(int(q[1]))
+  m.add16(flags)
+  m.add16(1)
+  m.add16(an)
+  m.add16(0)
+  m.add16(0)
+  m.addStr(q[12:len(q)])
+  return m
+}
+
+// TXT RDATA: each part as a character-string (a length byte, then the bytes).
+fn txtRdata(parts: []string): string {
+  let m = newMsg()
+  let i = 0
+  while (i < len(parts)) {
+    m.add(len(parts[i]))
+    m.addStr(parts[i])
+    i = i + 1
+  }
+  return m.text()
+}
+
+// Appends one TXT answer record to `m`, its owner name the two bytes `name0
+// name1` (a pointer, normally 0xC0 0x0C: the question's name), IN, TTL 60.
+fn addTxtRecord(m: Msg, name0: int, name1: int, rdata: string) {
+  m.add(name0)
+  m.add(name1)
+  m.add16(16)
+  m.add16(1)
+  m.add16(0)
+  m.add16(60)
+  m.add16(len(rdata))
+  m.addStr(rdata)
+}
+
+// 700 bytes that cannot be mistaken for each other if reordered or cut.
+fn bigTxt(): string {
+  let m = newMsg()
+  let i = 0
+  while (i < 700) {
+    m.add(97 + i % 26)
+    i = i + 1
+  }
+  return m.text()
+}
+
+// The answer to query `q` for `mode`: 0 one record of two character-strings,
+// 1 TC set with no records, 2 NXDOMAIN, 3 NOERROR with no answer, 4 a record
+// whose owner name is a pointer to itself, 5 a character-string running past
+// its RDATA, 6 SERVFAIL, 7 two records.
+fn answerFor(q: string, mode: int): string {
+  if (mode == 1) {
+    return replyHead(q, 33152 + 512, 0).text()
+  }
+  if (mode == 2) {
+    return replyHead(q, 33152 + 3, 0).text()
+  }
+  if (mode == 3) {
+    return replyHead(q, 33152, 0).text()
+  }
+  if (mode == 6) {
+    return replyHead(q, 33152 + 2, 0).text()
+  }
+  if (mode == 4) {
+    // The record starts right after the question: its name is a pointer to
+    // that very offset, so following it never ends.
+    let m = replyHead(q, 33152, 1)
+    addTxtRecord(m, 192 + len(q) / 256, len(q) % 256, txtRdata(["x"]))
+    return m.text()
+  }
+  if (mode == 5) {
+    // A character-string claiming 9 bytes inside a 4-byte RDATA.
+    let m = replyHead(q, 33152, 1)
+    addTxtRecord(m, 192, 12, "\tabc")
+    return m.text()
+  }
+  if (mode == 7) {
+    let m = replyHead(q, 33152, 2)
+    addTxtRecord(m, 192, 12, txtRdata(["first"]))
+    addTxtRecord(m, 192, 12, txtRdata(["sec", "ond", ""]))
+    return m.text()
+  }
+  let m = replyHead(q, 33152, 1)
+  addTxtRecord(m, 192, 12, txtRdata(["v=DKIM1; k=rsa; ", "p=ABCD"]))
+  return m.text()
+}
+
+// The TCP half of mode 1: one framed query in, one framed answer out, carrying
+// the 700-byte record as three character-strings (255 + 255 + 190).
+fn serveTcp(l: Listener) {
+  let a = l.accept() catch _ {
+    return
+  }
+  let want = 2
+  let buf = ""
+  let guard = 0
+  while (len(buf) < want && guard < 1000) {
+    guard = guard + 1
+    let part = a.read(1024)
+    if (len(part) == 0) {
+      a.close()
+      return
+    }
+    buf = buf + part
+    if (len(buf) >= 2) {
+      want = 2 + int(buf[0]) * 256 + int(buf[1])
+    }
+  }
+  let q = buf[2:len(buf)]
+  let big = bigTxt()
+  let msg = replyHead(q, 33152, 1)
+  addTxtRecord(msg, 192, 12, txtRdata([big[0:255], big[255:510], big[510:700]]))
+  let framed = newMsg()
+  framed.add16(len(msg.bytes))
+  framed.addStr(msg.text())
+  a.write(framed.text()) catch _ {
+    a.close()
+    return
+  }
+  a.close()
+}
+
+// Answers `rounds` datagrams with `mode`'s reply, then closes. Mode 1 follows
+// its UDP reply with the TCP exchange.
+fn serve(s: UdpSocket, l: Listener, mode: int, rounds: int) {
+  let i = 0
+  while (i < rounds) {
+    i = i + 1
+    let d = s.recv(512) catch _ {
+      break
+    }
+    s.send(d.host, d.port, answerFor(d.data, mode)) catch _ {
+      break
+    }
+    if (mode == 1) {
+      serveTcp(l)
+    }
+  }
+  s.close()
+  l.close()
+}
+
+// Binds the fake and starts it; returns its port, or -1 after reporting why not.
+fn startFake(mode: int, rounds: int): int {
+  let s = udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind: ${e.message()}")
+    return -1
+  }
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return -1
+  }
+  // Every mode gets a listener so `serve`'s signature is one shape; only mode 1
+  // ever accepts on it.
+  let l = listen("127.0.0.1", port) catch e {
+    assert(false, "listen: ${e.message()}")
+    return -1
+  }
+  spawn serve(s, l, mode, rounds)
+  return port
+}
+
+// The message `lookupTxtVia` fails with against a fake in `mode`, or "" when it
+// unexpectedly succeeds.
+fn failureOf(mode: int, rounds: int): string {
+  let port = startFake(mode, rounds)
+  if (port < 0) {
+    return "no fake"
+  }
+  let start = monotonic()
+  let got = lookupTxtVia(txtName, "127.0.0.1", port) catch e {
+    // The hang guard: a parser that follows a looping pointer forever must fail
+    // this test, not stall the suite. Generous; a real failure takes well under
+    // a second.
+    assert(since(start) < 5000000000, "lookupTxt took ${since(start) / 1000000}ms to fail")
+    return e.message()
+  }
+  assert(false, "lookupTxt succeeded with ${len(got)} entries, want a failure")
+  return ""
+}
+
+test "lookupTxt joins the character-strings of one record into one entry" {
+  let port = startFake(0, 1)
+  assert(port > 0, "no fake server")
+  let got = lookupTxtVia(txtName, "127.0.0.1", port) catch e {
+    assert(false, "lookupTxt: ${e.message()}")
+    return
+  }
+  assert(len(got) == 1, "got ${len(got)} entries, want 1")
+  assert(got[0] == "v=DKIM1; k=rsa; p=ABCD", "got '${got[0]}'")
+}
+
+test "lookupTxt returns one entry per record, an empty character-string included" {
+  let port = startFake(7, 1)
+  assert(port > 0, "no fake server")
+  let got = lookupTxtVia(txtName, "127.0.0.1", port) catch e {
+    assert(false, "lookupTxt: ${e.message()}")
+    return
+  }
+  assert(len(got) == 2, "got ${len(got)} entries, want 2")
+  assert(got[0] == "first" && got[1] == "second", "got '${got[0]}' and '${got[1]}'")
+}
+
+test "lookupTxt retries a truncated reply over TCP and returns the 700-byte record whole" {
+  let port = startFake(1, 1)
+  assert(port > 0, "no fake server")
+  let got = lookupTxtVia(txtName, "127.0.0.1", port) catch e {
+    assert(false, "lookupTxt: ${e.message()}")
+    return
+  }
+  assert(len(got) == 1, "got ${len(got)} entries, want 1")
+  assert(len(got[0]) == 700, "entry is ${len(got[0])} bytes, want 700")
+  assert(got[0] == bigTxt(), "the 700 bytes differ from what the server sent")
+}
+
+test "lookupTxt returns an empty list for NXDOMAIN" {
+  let port = startFake(2, 1)
+  assert(port > 0, "no fake server")
+  let got = lookupTxtVia(txtName, "127.0.0.1", port) catch e {
+    assert(false, "lookupTxt: ${e.message()}")
+    return
+  }
+  assert(len(got) == 0, "got ${len(got)} entries for NXDOMAIN, want 0")
+}
+
+test "lookupTxt returns an empty list for NOERROR with no TXT record" {
+  let port = startFake(3, 1)
+  assert(port > 0, "no fake server")
+  let got = lookupTxtVia(txtName, "127.0.0.1", port) catch e {
+    assert(false, "lookupTxt: ${e.message()}")
+    return
+  }
+  assert(len(got) == 0, "got ${len(got)} entries for an empty answer, want 0")
+}
+
+test "lookupTxt fails 'malformed reply' on a compression pointer that loops" {
+  let msg = failureOf(4, 1)
+  assert(msg == "lookupTxt ${txtName}: malformed reply", "failed with '${msg}'")
+}
+
+test "lookupTxt fails 'malformed reply' on a character-string past its RDATA" {
+  let msg = failureOf(5, 1)
+  assert(msg == "lookupTxt ${txtName}: malformed reply", "failed with '${msg}'")
+}
+
+test "lookupTxt fails on SERVFAIL after its retransmits" {
+  let msg = failureOf(6, 3)
+  assert(
+    msg == "lookupTxt ${txtName}: no answer (timeout or server failure)",
+    "failed with '${msg}'",
+  )
+}
+
+test "lookupTxt rejects an empty name without asking anyone" {
+  let got = lookupTxt("") catch e {
+    assert(e.message() == "lookupTxt : invalid name", "failed with '${e.message()}'")
+    return
+  }
+  assert(false, "lookupTxt of an empty name returned ${len(got)} entries")
+}
