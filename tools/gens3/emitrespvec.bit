@@ -1,0 +1,245 @@
+// tools/gens3 — renders the restXml response vectors as a generated test file,
+// `pkg/s3/gen_respvec.test.bit` (#6622, epic #6565).
+//
+// The vectors are the httpResponseTests of smithy-aws-protocol-tests
+// (smithy-lang/smithy, commit in tools/gens3/model/restxml-response-vectors.json)
+// that bind a status, headers, prefix headers or a payload, filtered to what the
+// S3 model has (the file's `filter`, and every test it drops with its reason in
+// `excluded`). The file holds the output shapes of those tests as a Smithy
+// model. This emitter runs emitresp.bit's renderer over that model's shapes to
+// get the classes' names and writes, into the one generated test file, the
+// vector model's shapes (emitshapes.bit), its enum parsers and deserializers
+// (emitresp.bit: the SAME renderers pkg/s3 is generated with), and one test per
+// vector: it builds a response head from the vector's code, headers and body,
+// runs the generated `deserialize<Op>Output`, and asserts every member the
+// vector's params name and that every other header member stayed unset.
+
+import { Builder } from "std/strings"
+import { Json, JsonEntry, jsonEncode, jsonGet, jsonParse } from "std/json"
+
+const respVecFile: string = "tools/gens3/model/restxml-response-vectors.json"
+const respVecTestName: string = "gen_respvec.test.bit"
+
+// What a generated test interpolates: the generator's own string cannot hold it
+// as one literal.
+const interpolation: string = "$" + "{e.message()}"
+
+// The Bit string literal for `s`; a byte the generator does not escape is an error.
+fn bitString(s: string, at: string): string! {
+  let b = Builder()
+  b.write("\"")
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == '"' || c == '\\') {
+      b.write("\\")
+    }
+    if (c < ' ' || c == '$' || c > '~') {
+      fail newError("${at}: byte ${int(c)} has no escape in a generated string")
+    }
+    b.writeByte(c)
+    i = i + 1
+  }
+  b.write("\"")
+  return b.toString()
+}
+
+fn vecKey(j: Json, key: string, at: string): Json! {
+  return needKey(j, key, at)?
+}
+
+// The `vecSome`/`vecStamp`/`vecMap` line asserting that member `mem` of the
+// output holds the param value `v`.
+fn expectation(p: Plan, mem: Member, v: Json, at: string): string! {
+  let f = fieldName(mem.name)
+  let i = shapeIndex(p.m, mem.target)
+  let s = p.m.shapes[i]
+  if (s.kind == ShapeKind.Map) {
+    return mapExpectation(f, v, at)?
+  }
+  if (s.kind == ShapeKind.Timestamp) {
+    return "  vecStamp(out.${f}, ${needInt(v, at)?}, \"${f}\")\n"
+  }
+  let lit = match (s.kind) {
+    String => bitString(needString(v, at)?, at)?
+    Integer => "${needInt(v, at)?}"
+    Long => "${needInt(v, at)?}"
+    Boolean => "${needBool(v, at)?}"
+    Enum => enumLiteral(p, i, needString(v, at)?, at)?
+    _ => ""
+  }
+  if (lit == "") {
+    fail newError("${at}: a param of this kind is not one the vectors read")
+  }
+  return "  vecSome(out.${f}, ${lit}, \"${f}\")\n"
+}
+
+fn enumLiteral(p: Plan, i: int, wire: string, at: string): string! {
+  for mem of p.m.shapes[i].members {
+    if (mem.enumValue == wire) {
+      return "${p.names[i]}.${variantName(mem.name)?}"
+    }
+  }
+  fail newError("${at}: ${wire} is not a value of ${p.names[i]}")
+}
+
+fn mapExpectation(f: string, v: Json, at: string): string! {
+  let keys = []string(0)
+  let values = []string(0)
+  for e of needObject(v, at)? {
+    keys = append(keys, bitString(e.key, at)?)
+    values = append(values, bitString(needString(e.value, at)?, at)?)
+  }
+  return "  vecMap(out.${f}, ${bracketList(keys)}, ${bracketList(values)}, \"${f}\")\n"
+}
+
+fn bracketList(items: []string): string {
+  let b = Builder()
+  b.write("[")
+  let i = 0
+  while (i < len(items)) {
+    if (i > 0) {
+      b.write(", ")
+    }
+    b.write(items[i])
+    i = i + 1
+  }
+  b.write("]")
+  return b.toString()
+}
+
+// The member of `u` named `name`.
+fn memberNamed(u: Unit, name: string, at: string): Member! {
+  for mem of u.shape.members {
+    if (mem.name == name) {
+      return mem
+    }
+  }
+  fail newError("${at}: ${u.shape.id} has no member ${name}")
+}
+
+// The param `name` of the case, None when the case does not name it.
+fn paramOf(params: Json, name: string): Option<Json> {
+  return jsonGet(params, name)
+}
+
+// Assertions for every member of the output the vector's `params` name, and
+// that every other header member is unset.
+fn assertions(p: Plan, u: Unit, params: Json, at: string): string! {
+  let b = Builder()
+  for e of needObject(params, at)? {
+    let mem = memberNamed(u, e.key, at)?
+    b.write(expectation(p, mem, e.value, "${at}.${e.key}")?)
+  }
+  for mem of u.shape.members {
+    let unnamed = match (paramOf(params, mem.name)) {
+      Some(_) => false
+      None => true
+    }
+    if (unnamed && mem.header != "") {
+      b.write("  vecNone(out.${fieldName(mem.name)}, \"${fieldName(mem.name)}\")\n")
+    }
+  }
+  return b.toString()
+}
+
+fn caseTest(p: Plan, c: Json, n: int, total: int): string! {
+  let id = needString(vecKey(c, "id", "case")?, "case id")?
+  let at = "vector ${id}"
+  let opName = needString(vecKey(c, "operation", at)?, at)?
+  let u = outputOf(p, opName)?
+  let b = Builder()
+  b.write("test \"restXml response vector ${n} of ${total}: ${id} (${opName})\" {\n")
+  b.write("  let h = responseHead(${needInt(vecKey(c, "code", at)?, at)?}, \"\")\n")
+  for hd of needArray(vecKey(c, "headers", at)?, at)? {
+    let pair = needArray(hd, at)?
+    b.write(
+      "  vecAdd(h, ${bitString(needString(pair[0], at)?, at)?}, ${bitString(
+        needString(pair[1], at)?,
+        at,
+      )?})\n",
+    )
+  }
+  let body = needString(vecKey(c, "body", at)?, at)?
+  if (body != "") {
+    b.write("  h.text = ${bitString(body, at)?}\n")
+  }
+  b.write("  let out = deserialize${u.name}(h) catch e {\n")
+  b.write("    panic(\"${id}: " + interpolation + "\")\n  }\n")
+  b.write("  assert(out.responseMetadata.httpStatusCode == ${needInt(vecKey(c, "code", at)?, at)?}, \"status\")\n")
+  b.write(assertions(p, u, vecKey(c, "params", at)?, at)?)
+  b.write("  println(\"restXml response vector ${n} of ${total}: ${id}\")\n}\n")
+  return b.toString()
+}
+
+fn outputOf(p: Plan, opShortName: string): Unit! {
+  for u of p.units {
+    if (u.name == opShortName + "Output") {
+      return u
+    }
+  }
+  fail newError("vector operation ${opShortName}: no output type in the vector model")
+}
+
+// The vector model, loaded from the JSON file's `model` member.
+fn vectorModel(root: Json): Model! {
+  return loadModel(jsonEncode(needKey(root, "model", "vectors")?))?
+}
+
+fn vectorHeader(root: Json, commit: string, sha: string): string! {
+  let src = needKey(root, "source", "vectors")?
+  let at = needString(needKey(src, "commit", "vectors: source")?, "vectors: source commit")?
+  let dir = needString(needKey(src, "dir", "vectors: source")?, "vectors: source dir")?
+  let filter = needString(needKey(root, "filter", "vectors")?, "vectors: filter")?
+  return headerLines("respvec", commit, sha) +
+    "// Vectors: github.com/smithy-lang/smithy at commit ${at}, ${dir}.\n" +
+    "// Filter: ${filter}\n\n"
+}
+
+// The vector model's types, enum parsers and deserializers, as blocks.
+fn vectorCode(p: Plan): []string! {
+  let blocks = []string(0)
+  for u of p.units {
+    blocks = append(blocks, renderUnit(p, u)?)
+  }
+  for e of enumParserBlocks(p)? {
+    blocks = append(blocks, e)
+  }
+  for o of opBlocks(p)? {
+    blocks = append(blocks, o)
+  }
+  return blocks
+}
+
+fn vectorUsesTimestamp(p: Plan): bool {
+  for u of p.units {
+    if (unitUsesTimestamp(p, u)) {
+      return true
+    }
+  }
+  return false
+}
+
+// `gen_respvec.test.bit` for the vector file text `src` and the S3 model pin.
+fn renderRespVectors(src: string, commit: string, sha: string): GenFile! {
+  let root = jsonParse(src)?
+  let p = planShapes(vectorModel(root)?)?
+  let cases = needArray(needKey(root, "cases", "vectors")?, "vectors: cases")?
+  let b = Builder()
+  b.write(vectorHeader(root, commit, sha)?)
+  if (vectorUsesTimestamp(p)) {
+    b.write("import { Timestamp } from \"std/time\"\n\n")
+  }
+  for block of vectorCode(p)? {
+    b.write(block + "\n")
+  }
+  let n = 1
+  for c of cases {
+    b.write(caseTest(p, c, n, len(cases))?)
+    if (n < len(cases)) {
+      b.write("\n")
+    }
+    n = n + 1
+  }
+  return GenFile{ name = respVecTestName, text = b.toString() }
+}
