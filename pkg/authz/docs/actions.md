@@ -48,10 +48,34 @@ Names are case-sensitive. A policy that says `"publish"` is refused, and the
 error names what it saw and lists every valid action, so the typo is caught
 when the policy is saved.
 
+## Reading a stored name back
+
+`parseAction` goes the other way: it turns the stored `"Publish"` back into
+`Action.Publish`. An unknown name fails with the same `InvalidPolicy`, so a
+typo in storage is refused instead of matching some other action.
+
+```bit
+import { parseAction } from "authz"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+fn main(): ()! {
+  let a = parseAction<Action>("Publish")?
+  println("${a == Action.Publish}")
+  let _ = parseAction<Action>("publish") catch e {
+    println(e.message())
+    return
+  }
+}
+```
+
+This prints `true`, then `invalid policy: unknown action 'publish'; valid
+actions: Manage, Read, Create, Update, Delete, Publish`.
+
 ## Writing your own generic code
 
 `ActionEnum` is the bound for any function generic over an action enum. The
-compiler writes its two members for every enum whose variants carry no data;
+compiler writes its three members for every enum whose variants carry no data;
 you never implement them.
 
 ```bit
