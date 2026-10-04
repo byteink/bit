@@ -518,6 +518,46 @@ bb0():
   postcheck "7058 post-opt: a function is missing" "$pre_o" "$pre_t" "$post_o" "${post_ok%%
 func c*}" 1
 
+  # --- 6990-interface-field-presyntax and 6997-where-in-key-presyntax (diags) ---
+  # dg <code> <msg> <line> <col> <src> -- one `--dump-diags` error record.
+  dg() {
+    printf 'error[%s]: %s\n --> m.bit:%s:%s\n  |\n%s |%s\n  |\n' "$1" "$2" "$3" "$4" "$3" "$5"
+  }
+  f1=$(dg E0021 "expected '(', found ':'" 5 5 "   id: string,")
+  f2=$(dg E0021 "expected an identifier, found ':'" 5 5 "   id: string,")
+  f3=$(dg E0021 "expected an identifier, found '}'" 6 1 " }")
+  eof=$(dg E0021 "expected '}', found end of file" 7 1 " ")
+  in1=$(dg E0021 "expected an expression, found kw_in" 21 20 "   let c = { age: { in: [18] } }")
+  # An interface field the oracle cannot parse, tree clean / tree cut at EOF.
+  expect "interface field, whole file" "$f1
+$f2
+$f3" "" diags 6990-interface-field-presyntax
+  expect "interface field, truncated file" "$f1
+$f2
+$f3
+$eof" "$eof" diags 6990-interface-field-presyntax
+  # Near misses: a real tree error, a first record that is not `ident:`, a
+  # caret off the colon, and a non-parse oracle record all stay red.
+  expect "interface field, tree reports a real error" "$f1
+$f2" "$(dg E0301 "no field" 5 3 "   id: string,")" diags ""
+  expect "interface field, first record is not the colon" "$f2
+$f1" "" diags ""
+  expect "interface field, caret off the colon" "$(dg E0021 "expected '(', found ':'" 5 4 "   id: string,")" "" diags ""
+  expect "interface field, quoted line is not ident:" "$(dg E0021 "expected '(', found ':'" 5 7 "   a.b: string,")" "" diags ""
+  expect "interface field, oracle also has a checker error" "$f1
+$(dg E0301 "no field" 9 3 "   x")" "" diags ""
+  # `in:` as an object-literal key: oracle-only records are exactly the
+  # keyword error on an `in:`, the rest equal the tree's.
+  expect "where in-key, whole file" "$in1
+$in1" "" diags 6997-where-in-key-presyntax
+  expect "where in-key, truncated file" "$in1
+$eof" "$eof" diags 6997-where-in-key-presyntax
+  expect "where in-key, oracle has an extra record" "$in1
+$f3" "" diags ""
+  expect "where in-key, tree reports a different record" "$in1
+$eof" "$f3" diags ""
+  expect "where in-key, caret not on in:" "$(dg E0021 "expected an expression, found kw_in" 21 21 "   let c = { age: { in: [18] } }")" "" diags ""
+
   # An unrelated divergence of any shape stays unexplained on every kind.
   oracle_unrelated='%1 = sub %2, %3'
   bit2_unrelated='%1 = sub %2, %3
