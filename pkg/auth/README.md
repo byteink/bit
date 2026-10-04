@@ -116,6 +116,12 @@ protected route that is not itself doing the authenticating just reads
   changed or for any reason in the one `InvalidToken`; `verifyLink` builds the
   link from a base URL the app configures; see
   [Confirm an author's email address](docs/email-verification.md).
+- `MagicLinkStrategy`, `MagicLinkOptions`, `MagicLinkUser`, `MagicLinkErrorHook` -
+  passwordless login by a mailed link, a `Strategy` on the one-time token:
+  `request` mails a link that replaces the earlier ones and answers the same
+  for every address, `authenticate` spends it once, refuses another browser's
+  copy, and regenerates the session id; optionally throttled with a
+  `LoginThrottle`; see [Sign in with a link in an email](docs/magic-link.md).
 - `generateRecoveryCodes`, `RecoveryOptions`, `RecoverySet`,
   `redeemRecoveryCode`, `RedeemOptions`, `RecoveryRedeem` - single-use
   recovery codes for a lost authenticator: generated from the CSPRNG, stored
