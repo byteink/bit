@@ -64,7 +64,7 @@ fn attempt(c: Client, m: Message): Outcome {
 ```
 
 `e` is an `SmtpError` there, fields in reach, because `send` is declared
-`()!SmtpError`. A mailbox that is busy (`450 4.2.1 Mailbox busy`)
+`Delivery!SmtpError`. A mailbox that is busy (`450 4.2.1 Mailbox busy`)
 is `Retry`; an unknown user (`550 5.1.1 No such user`) is `Rejected`, and
 sending it again draws the same answer.
 
@@ -110,6 +110,33 @@ test for "this failure came from a transport error at all".
 `message()` gives the one-line form, `smtp: RCPT TO got 450: 4.2.1 Mailbox
 busy`, and `SmtpError` satisfies `error`, so a caller that only logs can keep
 `catch e` and `e.message()` and ignore the rest.
+
+## When some recipients are refused
+
+A message with three recipients and one mistyped address should reach the other
+two. `send` returns a `Delivery` that says which were taken and which were not:
+
+```bit
+import { Client, Delivery, Message, SmtpError } from "std/smtp"
+
+// Send `m`, and list the recipients to try again or to tell the author about.
+fn sendAndReport(c: Client, m: Message): ()!SmtpError {
+  let d = c.send(m)?
+  println("queued as ${d.queueId}: ${len(d.accepted)} delivered")
+  let i = 0
+  while (i < len(d.rejected)) {
+    let r = d.rejected[i]
+    println("${r.address}: ${r.error.code} ${r.error.enhanced} ${r.error.text}")
+    i = i + 1
+  }
+}
+```
+
+A recipient in `rejected` did not get the message, and sending the message
+again to everyone would deliver it twice to the others: send it again to the
+`rejected` addresses whose `error.transient()` is true, and only those. When
+every recipient is refused there is no `Delivery`; `send` fails with an
+`SmtpError` as in "When a send fails".
 
 ## When a server goes quiet
 
@@ -739,13 +766,43 @@ status=401 scope=https://mail.google.com/: Username and Password not accepted`.
 text. An `AUTH` command line may be up to 12288 octets (RFC 4954 section 4), so
 an Exchange Online token of over 1500 characters goes out in one line.
 
-### `Client.send(m: Sendable): ()!SmtpError`
+### `Client.send(m: Sendable): Delivery!SmtpError`
 
 Render and send `m`, a `Message` or a [`Raw`](#raw-env-envelope-data-string):
 `MAIL FROM`, one `RCPT TO` per envelope recipient, `DATA`, the dot-stuffed
 payload, and the terminating dot. The message and the envelope are checked
 first, so a CR in a subject, a malformed address or an over-long line fails with
 `MAIL FROM` never sent.
+
+Every recipient is offered. One the server refuses is recorded in the
+[`Delivery`](#delivery), and the rest still get the message (RFC 5321 section
+3.3: `DATA` proceeds when at least one `RCPT TO` was accepted). When the server
+refuses all of them, no `DATA` is sent: the call sends `RSET` and fails with the
+last refusal, whose `text` ends with `(refused: ` and every refused address.
+
+A refused `MAIL FROM` or `DATA` also sends `RSET` before failing, so the same
+`Client` can send the next message. Nothing is reset after a failure with no
+reply (the connection broke or timed out), after a `421` (the server is closing
+the channel), or after the reply to the payload, which ends the transaction
+whatever it says: a `451` there leaves the session ready for the next `send`.
+
+### `Delivery`
+
+What `send` did with the recipients of one message. It is returned only when at
+least one was accepted.
+
+| Field | Meaning |
+|---|---|
+| `accepted` | the recipients the server took, in envelope order |
+| `rejected` | the recipients it refused, in envelope order, as `Rejection`s |
+| `queueId` | the server's reply to the end of `DATA` with its code taken off, such as `2.0.0 Ok: queued as 4Bx1` |
+
+### `Rejection`
+
+One recipient the server refused: `address`, and `error`, the `SmtpError` with
+the reply's `code`, `enhanced` status and `text`, and `command` `RCPT TO`.
+`error.transient()` tells a mailbox that is busy (4xx) from one that does not
+exist (5xx).
 
 ### `Client.quit(): ()!SmtpError`
 

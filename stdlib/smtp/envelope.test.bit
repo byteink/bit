@@ -230,3 +230,182 @@ test "a rendered Message sent as Raw under another envelope keeps its bytes" {
     "recipient leaked",
   )
 }
+
+// A greeted client on a fake that answers `replies` after the EHLO reply, and
+// the channel its transcript arrives on. Panics when the session cannot be set
+// up: every caller is about what happens after.
+fn fakeClient(replies: []string): (Client, chan<string>) {
+  let (port, log) = startFake(append([ehloPlain()], ...replies)) catch e {
+    panic("startFake: ${e.message()}")
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    panic("dial: ${e.message()}")
+  }
+  c.ehlo("client.example.com") catch e {
+    panic("ehlo: ${e.message()}")
+  }
+  return (c, log)
+}
+
+// The error `c.send(r)` fails with. Panics when the send succeeds: every
+// caller scripts a refusal.
+fn refusal(c: Client, r: Raw): SmtpError {
+  c.send(r) catch e {
+    return e
+  }
+  panic("send succeeded against a server scripted to refuse")
+}
+
+// Three recipients for the partial-acceptance tests.
+fn threeRecipients(): Raw {
+  return Raw(
+    Envelope{ from = "me@x.com", to = ["a@x.com", "bad@x.com", "c@x.com"] },
+    rawMessage(),
+  )
+}
+
+test "two of three recipients accepted: DATA goes out and the refusal is reported" {
+  let (c, log) = fakeClient(
+    [
+      "250 OK\r\n", "250 OK\r\n", "550 5.1.1 No such user\r\n", "250 OK\r\n", "354 Go\r\n",
+      "250 2.0.0 Ok: queued as 4Bx1\r\n", "221 Bye\r\n",
+    ],
+  )
+  let d = c.send(threeRecipients()) catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  c.quit() catch e {
+    assert(false, "quit: ${e.message()}")
+  }
+  assert(len(d.accepted) == 2, "${len(d.accepted)} accepted")
+  assert(
+    d.accepted[0] == "a@x.com" && d.accepted[1] == "c@x.com",
+    "accepted = ${d.accepted[0]}, ${d.accepted[1]}",
+  )
+  assert(len(d.rejected) == 1, "${len(d.rejected)} rejected")
+  let r = d.rejected[0]
+  assert(r.address == "bad@x.com", "rejected address = ${r.address}")
+  assert(r.error.code == 550 && r.error.enhanced == "5.1.1", "rejection = ${r.error.message()}")
+  assert(
+    r.error.text == "No such user" && r.error.command == "RCPT TO",
+    "rejection = ${r.error.message()}",
+  )
+  assert(!r.error.transient(), "a 550 must not be transient")
+  assert(d.queueId == "2.0.0 Ok: queued as 4Bx1", "queueId = '${d.queueId}'")
+  let sent = <- log
+  assert(contains(sent, "RCPT TO:<bad@x.com>\r\nRCPT TO:<c@x.com>\r\nDATA\r\n"), "wire: '${sent}'")
+  assert(!contains(sent, "RSET"), "a partly accepted message must not be reset")
+}
+
+test "a 4xx rejection is recorded as transient and the other recipients still get the message" {
+  let (c, log) = fakeClient(
+    [
+      "250 OK\r\n",
+      "451 4.2.1 Mailbox busy\r\n",
+      "250 OK\r\n",
+      "354 Go\r\n",
+      "250 Queued\r\n",
+      "221 Bye\r\n",
+    ],
+  )
+  let d = c.send(Raw(Envelope{ from = "me@x.com", to = ["a@x.com", "b@x.com"] }, rawMessage())) catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  c.quit() catch _ {}
+  let _ = <- log
+  assert(len(d.accepted) == 1 && d.accepted[0] == "b@x.com", "accepted = ${len(d.accepted)}")
+  assert(
+    len(d.rejected) == 1 && d.rejected[0].error.transient(),
+    "a 451 must be a transient rejection",
+  )
+  assert(d.rejected[0].error.enhanced == "4.2.1", "enhanced = '${d.rejected[0].error.enhanced}'")
+}
+
+test "every recipient refused: RSET, no DATA, and the error names each address" {
+  let (c, log) = fakeClient(
+    [
+      "250 OK\r\n", "550 5.1.1 No such user\r\n", "550 5.1.1 No such user\r\n",
+      "550 5.7.1 Relay denied\r\n", "250 OK\r\n", "221 Bye\r\n",
+    ],
+  )
+  let err = refusal(c, threeRecipients())
+  assert(err.command == "RCPT TO" && err.code == 550, "error = ${err.message()}")
+  assert(err.enhanced == "5.7.1", "the last refusal's status: '${err.enhanced}'")
+  assert(
+    err.text == "Relay denied (refused: a@x.com, bad@x.com, c@x.com)",
+    "text = '${err.text}'",
+  )
+  assert(!err.transient(), "all permanent refusals must not be transient")
+  c.quit() catch e {
+    assert(false, "the session is not usable after RSET: ${e.message()}")
+  }
+  let sent = <- log
+  assert(!contains(sent, "DATA"), "DATA was sent to a server that took no recipient: '${sent}'")
+  assert(contains(sent, "RCPT TO:<c@x.com>\r\nRSET\r\nQUIT\r\n"), "wire: '${sent}'")
+}
+
+test "a refused MAIL FROM resets the session and the next send on it succeeds" {
+  let (c, log) = fakeClient(
+    [
+      "550 5.7.1 Sender refused\r\n", "250 OK\r\n", "250 OK\r\n", "250 OK\r\n", "354 Go\r\n",
+      "250 Queued\r\n", "221 Bye\r\n",
+    ],
+  )
+  let raw = Raw(Envelope{ from = "me@x.com", to = ["a@x.com"] }, rawMessage())
+  let err = refusal(c, raw)
+  assert(err.command == "MAIL FROM" && err.code == 550, "error = ${err.message()}")
+  let _ = c.send(raw) catch e {
+    assert(false, "second send: ${e.message()}")
+    return
+  }
+  c.quit() catch _ {}
+  let sent = <- log
+  assert(
+    contains(sent, "MAIL FROM:<me@x.com>\r\nRSET\r\nMAIL FROM:<me@x.com>\r\n"),
+    "wire: '${sent}'",
+  )
+}
+
+test "a refused DATA resets the session" {
+  let (c, log) = fakeClient(
+    ["250 OK\r\n", "250 OK\r\n", "554 5.3.4 Not accepting mail\r\n", "250 OK\r\n", "221 Bye\r\n"],
+  )
+  let err = refusal(c, Raw(Envelope{ from = "me@x.com", to = ["a@x.com"] }, rawMessage()))
+  assert(err.command == "DATA" && err.code == 554, "error = ${err.message()}")
+  c.quit() catch _ {}
+  let sent = <- log
+  assert(contains(sent, "DATA\r\nRSET\r\nQUIT\r\n"), "wire: '${sent}'")
+}
+
+test "a 451 at the end of DATA is transient and the same client sends again" {
+  let (c, log) = fakeClient(
+    [
+      "250 OK\r\n", "250 OK\r\n", "354 Go\r\n", "451 4.3.0 Try later\r\n", "250 OK\r\n", "250 OK\r\n",
+      "354 Go\r\n", "250 2.0.0 Ok: queued as 9\r\n", "221 Bye\r\n",
+    ],
+  )
+  let raw = Raw(Envelope{ from = "me@x.com", to = ["a@x.com"] }, rawMessage())
+  let err = refusal(c, raw)
+  assert(err.command == "end of DATA" && err.code == 451, "error = ${err.message()}")
+  assert(err.transient(), "a 451 after DATA must be transient")
+  let d = c.send(raw) catch e {
+    assert(false, "second send: ${e.message()}")
+    return
+  }
+  assert(d.queueId == "2.0.0 Ok: queued as 9", "queueId = '${d.queueId}'")
+  c.quit() catch _ {}
+  let sent = <- log
+  assert(!contains(sent, "RSET"), "the reply to the payload ends the transaction: '${sent}'")
+}
+
+test "a 421 at RCPT TO fails at once, with its reply and no RSET" {
+  let (c, log) = fakeClient(["250 OK\r\n", "421 4.3.2 Shutting down\r\n"])
+  let err = refusal(c, threeRecipients())
+  c.close()
+  assert(err.code == 421 && err.command == "RCPT TO", "error = ${err.message()}")
+  assert(err.transient(), "a 421 must be transient")
+  let sent = <- log
+  assert(!contains(sent, "RSET") && !contains(sent, "bad@x.com"), "wire: '${sent}'")
+}
