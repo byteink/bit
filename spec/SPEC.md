@@ -1944,8 +1944,9 @@ class SendWelcome { userId: i64 }
 
 ```
 interface_decl = "interface" IDENT [ generic_params ] "{" [ member_sig { ( ";" | "," ) member_sig } [ ";" | "," ] ] "}" .
-member_sig     = method_sig | static_method_sig .
+member_sig     = method_sig | static_method_sig | field_sig .
 method_sig     = IDENT signature .
+field_sig      = IDENT ":" type .                        (* §14.3 *)
 static_method_sig = "static" IDENT signature .           (* §10.4.1 *)
 enum_decl      = "enum" IDENT [ generic_params ] "{" [ enum_member { ( ";" | "," ) enum_member } [ ";" | "," ] ] "}" .
 enum_member    = enum_variant | method_decl .            (* method_decl, §10.4 *)
@@ -1953,8 +1954,22 @@ enum_variant   = IDENT [ "(" type { "," type } ")" ] .   (* optional payload; §
 ```
 
 Interfaces are **structural** (§14.3): a type satisfies an interface if it has all
-the interface's methods with matching signatures. There is no `implements`
-clause. Interface values are references (§13.3); the zero value is `nil`.
+the interface's methods with matching signatures and all its field
+requirements. There is no `implements` clause. Interface values are
+references (§13.3); the zero value is `nil`.
+
+A `field_sig` is a **field requirement**: a class satisfies it with a field
+of that name and the identical type (§14.3). Through an interface value the
+field is read like a class field (`s.id`) and is read-only: writing it is
+`E0114`, the same code as a `readonly` class field (§10.5). An interface may
+mix field requirements and method signatures.
+
+```
+interface Subject {
+  id: string,
+  roles: []string,
+}
+```
 
 A `static_method_sig` (§10.4.1) is a **static requirement**: a class
 satisfies it structurally, the same way it satisfies an ordinary
@@ -4764,7 +4779,25 @@ Method sets:
   interface exactly as its underlying class would. An enum type's method set
   is, likewise, the methods declared in its body (§14.7) - a payload-carrying
   variant name is never a method name (§9), so the two never collide.
-- Interfaces may not declare fields; only method signatures.
+- A **field requirement** `name: T` (§10.6) is satisfied by a field of the
+  class named `name` whose type is identical to `T` (§14.1: an `int` field
+  does not satisfy `id: string`, and an alias is transparent). An `export`ed
+  field satisfies it from any module; a field without `export` satisfies it
+  only for an interface declared in the class's own module, since an
+  unexported field is module-private (§10.5). A class with no such field, with
+  a field of another type or with an unexported field from another module
+  does not satisfy the interface, and E0041 names the field. Reading `v.name`
+  through an interface value `v` yields the class's field. The requirement is
+  **read-only**: `v.name = x`, `v.name += x` and `v.name++` are E0114. A field
+  requirement is not part of the interface's method set.
+- The compiler implements a field requirement with a hidden getter method
+  `__get_<name>` on each class that has a field of that name, so the
+  `__` prefix rule applies (§10.5): a class declaring a method whose name
+  begins `__get_` is **E0310**. The getter is emitted only in a program that
+  declares an interface with a field requirement of that name, is dispatched
+  like any interface method, is not listed by `bit doc` or completion, and
+  does not exist for a field no interface requires. Fields of a generic class
+  satisfy a requirement of the instantiated type.
 - `S` must be a **class or enum** type (or another interface, or `nil`). An
   interface value *is* the receiver's object pointer - there is no boxed
   scalar - so only a type that is already a reference (§13.3) can sit behind
