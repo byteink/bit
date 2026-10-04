@@ -641,6 +641,65 @@ $f3" "" diags ""
 $eof" "$f3" diags ""
   expect "where in-key, caret not on in:" "$(dg E0021 "expected an expression, found kw_in" 21 21 "   let c = { age: { in: [18] } }")" "" diags ""
 
+  # --- 5786-licm-wide-const-placement: where a wide constant sits (iropt) ---
+  # The oracle keeps the constant in the loop body; the tree threads it round
+  # the loop as a parameter from a hoisted definition, and the `band` over it
+  # hoists with it (the whole is the oracle with its constant moved).
+  licm_oracle='func f(%0: i64, %1: i64) i64 {
+bb0(%0: i64, %1: i64):
+  %2 = const_int i64 0
+  jump bb1(%2)
+bb1(%3: i64):
+  %4 = const_int i64 4294967295
+  %5 = band i64 %1, %4
+  %6 = add i64 %3, %5
+  %7 = icmp_slt bool %6, %0
+  br %7, bb2(), bb3()
+bb2():
+  %9 = const_int i64 1
+  %10 = add i64 %3, %9
+  jump bb1(%10)
+bb3():
+  ret %6
+}'
+  licm_tree='func f(%0: i64, %1: i64) i64 {
+bb0(%0: i64, %1: i64):
+  %2 = const_int i64 0
+  %3 = const_int i64 4294967295
+  %4 = band i64 %1, %3
+  jump bb1(%2, %4)
+bb1(%5: i64, %6: i64):
+  %7 = add i64 %5, %6
+  %8 = icmp_slt bool %7, %0
+  br %8, bb2(), bb3()
+bb2():
+  %10 = const_int i64 1
+  %11 = add i64 %5, %10
+  jump bb1(%11, %6)
+bb3():
+  ret %7
+}'
+  expect "5786 const and its band hoisted (iropt)" "$licm_oracle" "$licm_tree" iropt 5786-licm-wide-const-placement
+  expect "5786 const un-hoisted, the other way (iropt)" "$licm_tree" "$licm_oracle" iropt 5786-licm-wide-const-placement
+  expect "5786 is post-opt only" "$licm_oracle" "$licm_tree" ir ""
+  expect "5786 nothing differs" "$licm_oracle" "$licm_oracle" iropt ""
+  refuse "5786 hoisted constant changed" "$licm_oracle" "$licm_tree" "${licm_tree/4294967295/4294967294}" iropt
+  refuse "5786 band became bor" "$licm_oracle" "$licm_tree" "${licm_tree/band i64/bor i64}" iropt
+  refuse "5786 the band reads another value" "$licm_oracle" "$licm_tree" "${licm_tree/band i64 %1, %3/band i64 %0, %3}" iropt
+  refuse "5786 the loop adds the wrong parameter" "$licm_oracle" "$licm_tree" "${licm_tree/add i64 %5, %6/add i64 %6, %5}" iropt
+  refuse "5786 the back edge hands another value" "$licm_oracle" "$licm_tree" "${licm_tree/jump bb1(%11, %6)/jump bb1(%11, %2)}" iropt
+  refuse "5786 an unrelated line changed too" "$licm_oracle" "$licm_tree" "${licm_tree/icmp_slt/icmp_sgt}" iropt
+  # A plain add the tree hoists reads no wide constant: not a placement.
+  expect "5786 an op over no wide constant hoisted" "${licm_oracle//4294967295/7}" "${licm_tree//4294967295/7}" iropt ""
+  # Wideness is movImm64's rule: one halfword (65536 is `movz #1, lsl #16`) or
+  # its complement (-65537 is `movn #1, lsl #16`) is one instruction; 65537 and
+  # -65538 are two.
+  expect "5786 65537 is wide" "${licm_oracle//4294967295/65537}" "${licm_tree//4294967295/65537}" iropt 5786-licm-wide-const-placement
+  expect "5786 65536 is not wide" "${licm_oracle//4294967295/65536}" "${licm_tree//4294967295/65536}" iropt ""
+  expect "5786 -65538 is wide" "${licm_oracle//4294967295/-65538}" "${licm_tree//4294967295/-65538}" iropt 5786-licm-wide-const-placement
+  expect "5786 -65537 is not wide" "${licm_oracle//4294967295/-65537}" "${licm_tree//4294967295/-65537}" iropt ""
+  expect "5786 a 64-bit constant is wide" "${licm_oracle//4294967295/7378697629483820647}" "${licm_tree//4294967295/7378697629483820647}" iropt 5786-licm-wide-const-placement
+
   # An unrelated divergence of any shape stays unexplained on every kind.
   oracle_unrelated='%1 = sub %2, %3'
   bit2_unrelated='%1 = sub %2, %3

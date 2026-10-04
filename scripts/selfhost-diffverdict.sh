@@ -26,6 +26,9 @@
 #   MISSING  the oracle rejects, selfhost accepts  — the #1470 shape. A hole in
 #            the selfhost checker, and the dangerous one: it admits a program
 #            the language does not define, which then miscompiles silently.
+#   EXPLAINED a MISSING cell named in MISSING_DECLARED below: a construct the
+#            tree accepts ON PURPOSE and the pinned stage0 predates. Counted on
+#            its own, never as MISSING, and the list empties itself (RETIRED).
 #   FALSEPOS selfhost rejects, the oracle accepts  — selfhost refusing valid code.
 #   (Both are reported; either being non-zero fails the script.)
 #
@@ -72,8 +75,24 @@ diffrequire diffverdict "$ORACLE" "$BIT2"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/bitverdict.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
-match=0 missing=0 falsepos=0 timeout=0 n=0
-missing_list="" falsepos_list="" timeout_list=""
+match=0 missing=0 falsepos=0 timeout=0 explained=0 n=0
+missing_list="" falsepos_list="" timeout_list="" hit_declared=""
+
+# MISSING CELLS DECLARED AGAINST THE PINNED ORACLE. One line per cell:
+# `<exact cell label> #<ticket>`. A cell listed here that the oracle rejects and
+# selfhost accepts is a construct the tree admits deliberately and the pinned
+# stage0 predates, so it scores EXPLAINED, not MISSING. The key is the whole
+# label, so a neighbouring cell (`string(x) where x: i64`, say) is still a
+# MISSING if it diverges. A listed cell that no longer diverges that way fails
+# the run as RETIRED, so the list empties itself at the next stage0 repin. Same
+# contract as FALSEPOS_DECLARED in scripts/selfhost-diffcheck.sh (#7109).
+MISSING_DECLARED="
+string(x) where x: i32 #7101
+"
+declared_ticket() {
+  printf '%s\n' "$MISSING_DECLARED" | awk -v k="$1" '
+    NF && substr($0, 1, length($0) - length($NF) - 1) == k { print $NF }'
+}
 
 # The alarm is a HANG guard, not a performance budget. These cells are tiny
 # synthesized programs — measured worst legitimate case over the real corpus is
@@ -124,6 +143,10 @@ cell() {
   if [ "$sv" = "$bv" ]; then
     match=$((match + 1))
     [ "$VERBOSE" = 1 ] && printf '  MATCH    (%s%s) %s\n' "$sv" "$bv" "$label"
+  elif [ "$sv" = "R" ] && [ -n "$(declared_ticket "$label")" ]; then
+    explained=$((explained + 1))
+    hit_declared="${hit_declared}${label}
+"
   elif [ "$sv" = "R" ]; then
     missing=$((missing + 1))
     missing_list="${missing_list}    seed=R bit=A  ${label}
@@ -312,7 +335,23 @@ echo "verdict differential over $n generated constructs"
 echo "  MATCH    $match"
 echo "  MISSING  $missing   (seed rejects, selfhost accepts)"
 echo "  FALSEPOS $falsepos   (selfhost rejects, seed accepts)"
+echo "  EXPLAINED $explained   (declared in MISSING_DECLARED)"
 echo "  TIMEOUT  $timeout   (never decided, NOT compared)"
+
+# Every declared cell must have scored EXPLAINED this run; one that did not is
+# stale and counts as a MISSING so the run goes red until its line is deleted.
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  key=${line% \#*}
+  if printf '%s' "$hit_declared" | grep -Fxq -- "$key"; then
+    echo "  $key -> explained by declared construct (${line##* })"
+  else
+    echo "RETIRED: '$key' is no longer a declared MISSING cell; delete its MISSING_DECLARED line" >&2
+    missing=$((missing + 1))
+  fi
+done <<DECLARED_END
+$MISSING_DECLARED
+DECLARED_END
 
 if [ "$missing" -ne 0 ]; then
   printf '\nMISSING — selfhost admits what the seed refuses:\n%s' "$missing_list"

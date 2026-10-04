@@ -10,13 +10,18 @@
 # explainSwitchPostOpt/switchPostOptOk for the post-opt row. The identities
 # and the files they explain are documented in selfhost-ir-signatures.sh under
 # "Declared signatures"; both retire at the first repin after 0.36.0. Also here,
-# for the same ceiling: byteRange (#6558, an oracle-side rewrite, not a walk)
-# and explainTableSynthTypes (#6988, the `types` row).
+# for the same ceiling: byteRange (#6558, an oracle-side rewrite, not a walk),
+# explainTableSynthTypes (#6988, the `types` row) and licmWalk (#5786, the
+# host-dependent `iropt` identity; licmHostNames says which hosts list it).
 #
 # Both walk the oracle dump and the tree dump in lockstep under ONE oracle-to-
 # tree %id bijection per function (`same`, the #6730 walker's machinery), so a
 # wrong operand, opcode or type on any unchanged line fails, and a hunk may
 # only be exactly the shape its signature names.
+licmHostNames() {
+  case "$(uname -m)" in arm64|aarch64) printf '%s\n' "5786-licm-wide-const-placement" ;; esac
+}
+
 irWalkAwk() {
   IR_WALK_AWK='
 # ptrsLit -- `ptrs=[%N, ..]` lists the byte offsets of a box pointer
@@ -256,6 +261,253 @@ function byteRange(    i, n) {
   n = 0
   for (i = 1; i < nA; i++) { n += byteRangeAt(i) }
   return n
+}
+# 5786-licm-wide-const-placement (#5786, `iropt`, arm64 hosts only). #5786 gives
+# the LICM constant hoist the target: on arm64 a wide `const_int` (more than one
+# instruction by movImm64, compiler/arm64.bit) is hoisted out of the body of an
+# outer loop (the 0.36.0 oracle refuses any loop that holds a loop), a divisor
+# stays in its body (the oracle hoists it), and an op over a hoisted constant
+# hoists with it. `--dump-ir` lowers for the host, so the dumps differ only
+# where the host is arm64 and licmHostNames lists the name there only. The
+# pre-opt dumps agree. Files: _tests_/cases/decimal_collections,
+# decimal_compound_assign, decimal_corpus, decimal_to_int_roundtrip,
+# run_decimal_words, run_map_swar_scan, run_strings_builder_bulk_write,
+# stdlib/crypto/asn1, stdlib/crypto/bigint and stdlib/decimal/decimal.bit.
+# The identity (licmWalk): licmNorm reads each function of both dumps with its
+# wide `const_int` lines, its add/sub/mul/band/bor/bxor/shl/lshr/ashr lines
+# that have such a constant among their operands (transitively), and every
+# block parameter that all its edges hand one such value (an optimistic
+# fixpoint; the entry block is refuted) removed, along with the arguments that
+# fed them, and each use printed as the literal `@K(T:V)` or `@E(op T x, y)`
+# (an operand that is a parameter copying one value is read as that value).
+# The two reads must then agree line for line under ONE %id bijection per
+# function while the raw dumps differ. A different constant, operand, opcode
+# or type, a narrow constant moved, and any hoist of an op that reads no wide
+# constant (a header word, a plain add) leaves a line one side has alone, and
+# fails. Retires at the first repin after 0.36.0.
+#
+# decDec/divMod/wideVal decide wideness on the decimal text, so a 64-bit value
+# loses nothing to awk doubles.
+function decDec(s,    i, d, tail) {
+  tail = ""
+  for (i = length(s); i > 0; i--) {
+    d = substr(s, i, 1)
+    if (d != "0") { s = substr(s, 1, i - 1) (d - 1) tail; sub(/^0+/, "", s); return s == "" ? "0" : s }
+    tail = tail "9"
+  }
+  return "0"
+}
+# divMod -- the decimal string s modulo 65536; its quotient is left in dq.
+function divMod(s,    i, r, q, d) {
+  q = ""; r = 0
+  for (i = 1; i <= length(s); i++) { d = r * 10 + substr(s, i, 1); q = q int(d / 65536); r = d % 65536 }
+  sub(/^0+/, "", q); dq = (q == "" ? "0" : q)
+  return r
+}
+# wideVal -- 1 when movImm64 spends more than one instruction on the decimal
+# value v: 4 halfwords, the fewer of the zero ones and the all-ones ones are
+# free, and 0 and -1 take one. A value that does not fit 64 bits is 0.
+function wideVal(v,    neg, k, r, z, o) {
+  neg = (substr(v, 1, 1) == "-"); if (neg) { v = substr(v, 2) }
+  sub(/^0+/, "", v)
+  if (v == "" || (neg && v == "1")) { return 0 }
+  if (neg) { v = decDec(v) }
+  z = 0; o = 0
+  for (k = 0; k < 4; k++) { r = divMod(v); v = dq; if (neg) { r = 65535 - r } if (r == 0) { z++ } if (r == 65535) { o++ } }
+  if (v != "0") { return 0 }
+  return ((o > z ? 4 - o : 4 - z) > 1) ? 1 : 0
+}
+function licmClear() {
+  split("", lkCK); split("", lkNP); split("", lkPT); split("", lkPK); split("", lkPB); split("", lkPI); split("", lkBN)
+  split("", lkET); split("", lkEN); split("", lkEA); split("", lkInN); split("", lkIn)
+  split("", lkOPN); split("", lkOPA); split("", lkOPB); split("", lkMemo)
+  lkE = 0; lkNB = 0
+}
+# licmParams -- the parameter texts `%N: T` of a block header line into prm[1..n]
+# (a type may hold ", ", so the split is on `, %`).
+function licmParams(l, prm,    inner, n, i) {
+  inner = substr(l, index(l, "(") + 1); sub(/\):$/, "", inner)
+  if (inner == "") { return 0 }
+  n = split(inner, prm, ", %")
+  for (i = 2; i <= n; i++) { prm[i] = "%" prm[i] }
+  return n
+}
+function licmHeaderAt(l,    prm, b, n, i, id) {
+  b = substr(l, 1, index(l, "(") - 1); n = licmParams(l, prm)
+  lkBN[++lkNB] = b; lkNP[b] = n
+  for (i = 1; i <= n; i++) {
+    id = substr(prm[i], 1, index(prm[i], ":") - 1)
+    lkPT[b, i] = substr(prm[i], index(prm[i], ": ") + 2); lkPB[id] = b; lkPI[id] = i; lkPK[b, i] = "TOP"
+  }
+}
+function licmEdgesAt(l,    t, nm, inner, n, a, i, e) {
+  while (match(l, /bb[0-9]+\([^)]*\)/)) {
+    t = substr(l, RSTART, RLENGTH); l = substr(l, RSTART + RLENGTH)
+    nm = substr(t, 1, index(t, "(") - 1); inner = substr(t, index(t, "(") + 1); sub(/\)$/, "", inner)
+    n = (inner == "") ? 0 : split(inner, a, ", ")
+    e = ++lkE; lkET[e] = nm; lkEN[e] = n
+    for (i = 1; i <= n; i++) { lkEA[e, i] = a[i] }
+    lkIn[nm, ++lkInN[nm]] = e
+  }
+}
+# licmOpAt -- records `%d = OP T %a, %b` for the integer ops a loop hoist moves
+# (add, sub, mul and the bitwise and shift family); none of them can trap.
+function licmOpAt(l,    p) {
+  if (l !~ /^  %[0-9]+ = (add|sub|mul|band|bor|bxor|shl|lshr|ashr) [A-Za-z0-9_]+ %[0-9]+, %[0-9]+$/) { return }
+  split(l, p, " "); sub(/,$/, "", p[5])
+  lkOPN[p[1]] = p[3] " " p[4]; lkOPA[p[1]] = p[5]; lkOPB[p[1]] = p[6]
+}
+# licmCollect -- the wide constants, ops, block headers and edges of lines s..e
+# of L. 0 when a line names a block target outside a `jump` or `br`.
+function licmCollect(L, s, e,    k, l) {
+  for (k = s; k <= e; k++) {
+    l = L[k]
+    if (index(l, "\"") > 0) { continue }
+    if (l ~ /^bb[0-9]+\(.*\):$/) { licmHeaderAt(l); continue }
+    if (l ~ /^  (jump bb|br %)/) { licmEdgesAt(l); continue }
+    if (l ~ /bb[0-9]+\(/) { return 0 }
+    if (constOf(l) != "" && wideVal(cV)) { lkCK[idOf(l)] = cT ":" cV; continue }
+    licmOpAt(l)
+  }
+  return 1
+}
+# licmVal -- what operand a stands for: `@K(T:V)` for a wide constant, `@E(op T
+# x, y)` for an op with such a value among its operands (the constants and the
+# values they were combined with are all there is to it), the value of a
+# parameter every edge hands one value (a constant, or the one value it
+# copies), "TOP" while that is undecided, and the id itself otherwise.
+function licmVal(a,    v, x, y) {
+  if (a in lkCK) { return "@K(" lkCK[a] ")" }
+  if (a in lkPB) { v = lkPK[lkPB[a], lkPI[a]]; return v == "NONE" ? a : v }
+  if (!(a in lkOPN)) { return a }
+  if (a in lkMemo) { return lkMemo[a] }
+  x = licmVal(lkOPA[a]); y = licmVal(lkOPB[a])
+  if (x == "TOP" || y == "TOP") { return "TOP" }
+  v = (x ~ /^@/ || y ~ /^@/) ? "@E(" lkOPN[a] " " x ", " y ")" : a
+  lkMemo[a] = v
+  return v
+}
+# licmMeet -- the value parameter k of block b holds on every edge into it:
+# a licmVal text, "TOP" (no edge decided yet) or "NONE".
+function licmMeet(b, k,    v, i, e, ak, t) {
+  v = "TOP"
+  for (i = 1; i <= lkInN[b]; i++) {
+    e = lkIn[b, i]
+    if (k > lkEN[e]) { return "NONE" }
+    ak = licmVal(lkEA[e, k])
+    if (ak == "TOP") { continue }
+    if (v != "TOP" && v != ak) { return "NONE" }
+    v = ak
+  }
+  if (v ~ /^@K[(]/) {
+    t = substr(v, 4, index(v, ":") - 4)
+    if (t != lkPT[b, k]) { return "NONE" }
+  }
+  return v
+}
+# licmSolve -- the optimistic fixpoint over every parameter (those of a block
+# no edge reaches, the entry block, are NONE from the start), then once more
+# with the parameters nothing decided (a cycle that only feeds itself) NONE.
+function licmSolve(    round, ch, guard, i, b, k, v, tot) {
+  for (i = 1; i <= lkNB; i++) {
+    b = lkBN[i]; tot += lkNP[b]
+    for (k = 1; k <= lkNP[b] && lkInN[b] == 0; k++) { lkPK[b, k] = "NONE" }
+  }
+  for (round = 1; round <= 2; round++) {
+    ch = 1; guard = 0
+    while (ch && guard++ <= 3 * tot + 3) {
+      ch = 0; split("", lkMemo)
+      for (i = 1; i <= lkNB; i++) {
+        b = lkBN[i]
+        for (k = 1; k <= lkNP[b]; k++) {
+          v = licmMeet(b, k)
+          if (v == lkPK[b, k]) { continue }
+          if (lkPK[b, k] != "TOP") { v = "NONE" }
+          if (v != lkPK[b, k]) { lkPK[b, k] = v; ch = 1 }
+        }
+      }
+    }
+    for (i = 1; i <= lkNB; i++) {
+      b = lkBN[i]
+      for (k = 1; k <= lkNP[b]; k++) { if (lkPK[b, k] == "TOP") { lkPK[b, k] = "NONE" } }
+    }
+  }
+  split("", lkMemo)
+}
+function licmIsK(b, k) { return ((b, k) in lkPK) && lkPK[b, k] ~ /^@/ }
+function licmHeader(l,    prm, n, i, out, b) {
+  n = licmParams(l, prm); out = ""; b = substr(l, 1, index(l, "(") - 1)
+  for (i = 1; i <= n; i++) { if (!licmIsK(b, i)) { out = out (out == "" ? "" : ", ") prm[i] } }
+  return b "(" out "):"
+}
+function licmEdges(l,    out, t, nm, inner, n, a, i, keep) {
+  out = ""
+  while (match(l, /bb[0-9]+\([^)]*\)/)) {
+    t = substr(l, RSTART, RLENGTH); out = out substr(l, 1, RSTART - 1); l = substr(l, RSTART + RLENGTH)
+    nm = substr(t, 1, index(t, "(") - 1); inner = substr(t, index(t, "(") + 1); sub(/\)$/, "", inner)
+    n = (inner == "") ? 0 : split(inner, a, ", "); keep = ""
+    for (i = 1; i <= n; i++) { if (!licmIsK(nm, i)) { keep = keep (keep == "" ? "" : ", ") a[i] } }
+    out = out nm "(" keep ")"
+  }
+  return out l
+}
+# licmSubst -- every operand that is a wide constant, an op over one, or a
+# parameter that only ever holds one printed as its licmVal text.
+function licmSubst(s,    out, t, r) {
+  out = ""
+  while (match(s, /%[0-9]+/)) {
+    t = substr(s, RSTART, RLENGTH); r = (t in lkPB) ? (licmIsK(lkPB[t], lkPI[t]) ? lkPK[lkPB[t], lkPI[t]] : t) : licmVal(t)
+    out = out substr(s, 1, RSTART - 1) (r ~ /^@/ ? r : t)
+    s = substr(s, RSTART + RLENGTH)
+  }
+  return out s
+}
+# licmNorm -- L[1..n] with, per function, the wide `const_int` lines, the ops
+# over them and the block parameters (and the jump/br arguments feeding them)
+# that only ever hold one of those removed, every use read as its licmVal
+# text. The new line count, or -1 when a function is not in the shape
+# licmCollect reads.
+function licmNorm(L, n,    s, e, k, l, d) {
+  lkN = 0; split("", lkOut); s = 1
+  while (s <= n) {
+    e = s
+    while (e < n && L[e + 1] !~ /^func /) { e++ }
+    licmClear()
+    if (!licmCollect(L, s, e)) { return -1 }
+    licmSolve()
+    for (k = s; k <= e; k++) {
+      l = L[k]
+      if (index(l, "\"") == 0) {
+        d = idOf(l)
+        if (d != "" && ((d in lkCK) || ((d in lkOPN) && licmVal(d) ~ /^@/))) { continue }
+        if (l ~ /^bb[0-9]+\(.*\):$/) { l = licmHeader(l) } else if (l ~ /^  (jump bb|br %)/) { l = licmEdges(l) }
+        l = licmSubst(l)
+      }
+      lkOut[++lkN] = l
+    }
+    s = e + 1
+  }
+  split("", L)
+  for (k = 1; k <= lkN; k++) { L[k] = lkOut[k] }
+  return lkN
+}
+# licmWalk -- the dumps differ, and agree under one %id bijection per function
+# once licmNorm has read both. Leaves linesA/linesB as it found them.
+function licmWalk(    k, sA, sB, na, nb, ok, i, differ) {
+  split("", svA); split("", svB); sA = nA; sB = nB; differ = (nA != nB)
+  for (k = 1; k <= nA; k++) { svA[k] = linesA[k] }
+  for (k = 1; k <= nB; k++) { svB[k] = linesB[k]; if (k <= nA && svB[k] != svA[k]) { differ = 1 } }
+  na = licmNorm(linesA, nA); nb = (na < 0) ? -1 : licmNorm(linesB, nB)
+  ok = (na >= 0 && na == nb && differ)
+  nA = na; nB = nb; fnStart = 0; reset()
+  for (i = 1; ok && i <= na; i++) {
+    if (linesA[i] ~ /^func / && i != fnStart) { reset(); fnStart = i }
+    ok = same(linesA[i], linesB[i])
+  }
+  split("", linesA); split("", linesB); nA = sA; nB = sB
+  for (k = 1; k <= nA; k++) { linesA[k] = svA[k] }
+  for (k = 1; k <= nB; k++) { linesB[k] = svB[k] }
+  return ok
 }
 '
 }

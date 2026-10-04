@@ -322,14 +322,13 @@
 # 6988-table-class-name-synth-shift (`types`). #6988 adds `__className` to the
 # synthesized @table text, so `cols` and `__row` sit 12 columns later than in the
 # 0.36.0 oracle (13 @table cases under _tests_/cases). The identity is
-# explainTableSynthTypes (ir-signatures-walk.sh). Retires at the first repin
-# after 0.36.0.
+# explainTableSynthTypes (ir-signatures-walk.sh). Retires at the first repin after 0.36.0.
 #
-# The input protocol is the text the awk body reads: the oracle's dump, a line
-# `@@@BIT2@@@`, then the tree's dump, with the kind and the corpus file as
-# `-v` variables. A new entry must satisfy the rules in the header: an exact
-# identity, derived from FULL dumps (the oracle's from `sh scripts/stage0.sh`,
-# the tree's from `bit-out/bin/bit`), never an excerpt.
+# 5786-licm-wide-const-placement (`iropt`, arm64 hosts only): see licmWalk (ir-signatures-walk.sh).
+#
+# The input protocol is the text the awk body reads: the oracle's dump, a line `@@@BIT2@@@`, then
+# the tree's dump, with the kind and the corpus file as `-v` variables. A new entry follows the
+# header's rules: an exact identity derived from FULL dumps (oracle `sh scripts/stage0.sh`, tree `bit-out/bin/bit`).
 #
 # shellcheck source=scripts/ir-signatures-walk.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-walk.sh"
@@ -619,6 +618,7 @@ explainMismatch() {
       ptrsLit("%", "#")
       if (nilWalk()) { print "6982-error-path-nil"; exit 0 }
       if (kind == "ir" && rangeWalk()) { print "7058-switch-case-range"; exit 0 }
+      if (kind == "iropt" && licmWalk()) { print "5786-licm-wide-const-placement"; exit 0 }
       ptrsLit("#", "%")
       moveTramp()
       canonK(linesA, nA, "A"); canonK(linesB, nB, "B")
@@ -792,8 +792,8 @@ declaredSignatureNames() {
     types) printf '%s\n' "6988-table-class-name-synth-shift"; return ;;
     diags) printf '%s\n' "6990-interface-field-presyntax" "6997-where-in-key-presyntax"; return ;;
     ir) printf '%s\n' "6558-string-from-byte-range" "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6982-error-path-nil" "7058-switch-case-range"; return ;;
-    iropt) printf '%s\n' "6558-string-from-byte-range" "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6982-error-path-nil" "7058-switch-case-range-opt"; return ;;
+    iropt) printf '%s\n' "6558-string-from-byte-range" "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6982-error-path-nil" "7058-switch-case-range-opt"; licmHostNames; return ;;
     safepoints) printf '%s\n' "6847-test-module-functions"; return ;;
   esac
-  printf '%s\n' "6558-string-from-byte-range" "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6847-test-module-functions" "6982-error-path-nil" "7058-switch-case-range" "7058-switch-case-range-opt" "6990-interface-field-presyntax" "6997-where-in-key-presyntax" "6988-table-class-name-synth-shift"
+  printf '%s\n' "6558-string-from-byte-range" "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6847-test-module-functions" "6982-error-path-nil" "7058-switch-case-range" "7058-switch-case-range-opt" "6990-interface-field-presyntax" "6997-where-in-key-presyntax" "6988-table-class-name-synth-shift" "5786-licm-wide-const-placement"
 }
