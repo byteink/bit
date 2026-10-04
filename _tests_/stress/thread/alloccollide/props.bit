@@ -1,0 +1,141 @@
+// Shared core for #7139's alloc-cache home-collision proof, run once per
+// platform by `../../gcalloccollidedarwin` and `../../gcalloccollidelinux`,
+// the shape `../allocmigrate` uses.
+//
+// WHAT THIS PROVES. A thread's alloc-cache entry
+// (`../../../../runtime/gc/gcalloccache.bit`) is the first one it claimed among
+// the `acProbes` from its HOME, a fold of its token's bits 4..21. Two OS
+// threads whose tokens agree on those bits share a home, and the one that
+// claims second holds the entry after it. #5997 answered only the home entry
+// without a call, so that thread took `allocCacheProbe` on every allocation it
+// ever made (#7139, measured on hl-master by #7130). This program builds that
+// collision on purpose and asserts the second thread's steady state never
+// reaches the probe.
+//
+// THE COLLISION IS MADE, NOT WAITED FOR. Real tokens collide only when two
+// threads' mappings land a multiple of 4 MiB apart, which is an accident of
+// layout. So the child thread, before it allocates anything, claims its own
+// home for a RIVAL token: its own token with bit 40 flipped, which the fold
+// cannot see. The child's own first allocation then finds its home held and
+// claims the next entry, exactly as a real second thread would.
+//
+// `acSlow` COUNTS THE PROBE. `allocCacheWalk`, the only way an allocation
+// reaches `allocCacheProbe`, adds one to the bound entry's private `acSlow`
+// word each time it falls through to it. `first` is that count after the
+// child's first allocation (1: the claim) and `steady` after `CHILD_N` more
+// (still 1). With #5997's home-only answer, `steady` reads `1 + CHILD_N`.
+//
+// A RAW OS THREAD, `@nosplit` LOOP: a fresh token that has allocated nothing
+// yet, so its home is free for the rival, and no safepoint between its
+// allocations, so they all run on that one token (`../allocmigrate` has the
+// full argument for both).
+import { wordAt, gcThreadToken, gcAllocCacheClaimFor, gcAllocCacheSlowHits } from "../../../../runtime/gc"
+import { gcBindMemory, gcInit, gcConfigure, gcAlloc, gcArmAllocCache, gcWords } from "../../../../runtime/gc"
+import { heapInit, heapWords } from "../../../../runtime/alloc"
+import { spinUnlocked } from "../../../../runtime"
+import { threadJoin, threadJoinDone } from "../../../../runtime/thread"
+
+const ARENA_WORDS: int = 65536
+const INDEX_WORDS: int = 4096
+const META_WORDS: int = 7
+const MARK_STACK: int = 64
+const MIN_TRIGGER: int = 1048576 // 1 MiB: far above this program's whole heap
+const GROWTH_PCT: int = 200
+const BODY_SIZE: int = 16
+const CHILD_N: int = 64
+const JOIN_NS: int = 10000000000 // 10s
+
+// Bit 40 is above every bit the home fold reads (4..21).
+const RIVAL_BIT: int = 1099511627776
+
+let sharedG: [1]i64
+let sharedMeta: [1]i64
+let doneWord: [1]i32
+// [0] the rival's claim, [1] the child's own token, [2] `first`, [3] `steady`
+let childOut: [4]i64
+
+@nosplit fn allocN(g: *i64, metaAddr: int, n: int) {
+  let i = 0
+  while (i < n) { // bounded: `n` iterations (1 or CHILD_N)
+    let _ = gcAlloc(g, metaAddr)
+    i = i + 1
+  }
+}
+
+@nosplit fn collideChild(arg: *byte): *byte {
+  let g = wordAt(int(sharedG[0]))
+  let metaAddr = int(sharedMeta[0])
+  let me = gcThreadToken()
+  childOut[0] = i64(gcAllocCacheClaimFor(g, me ^ RIVAL_BIT))
+  childOut[1] = i64(me)
+  allocN(g, metaAddr, 1)
+  childOut[2] = i64(gcAllocCacheSlowHits(me))
+  allocN(g, metaAddr, CHILD_N)
+  childOut[3] = i64(gcAllocCacheSlowHits(me))
+  atomicStore(ptrOf(doneWord), i32(0))
+  return nil
+}
+
+export fn collideChildEntry(): *byte {
+  return entryOf(collideChild)
+}
+
+export class CollideResult {
+  export started: bool,
+  export joined: bool,
+  export released: bool,
+  export rival: bool,
+  export first: int,
+  export steady: int,
+}
+
+export fn collideRun(
+  startFn: (*byte, *byte, *i32) => int,
+  releaseFn: (int) => bool,
+  sleepFn: (int) => (),
+  monoFn: () => int,
+): CollideResult {
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let listLock = []i32(1)
+  let state = []i64(gcWords)
+  let meta = []i64(META_WORDS)
+  let metaAddr = int(ptrOf(meta))
+  meta[0] = BODY_SIZE
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  atomicStore(ptrOf(heapLock), spinUnlocked)
+  atomicStore(ptrOf(listLock), spinUnlocked)
+  let g = ptrOf(state)
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  let ok = gcInit(g, int(hp), int(ptrOf(heapLock)), int(ptrOf(listLock)), metaAddr, MARK_STACK)
+  let res = CollideResult{
+    started = false,
+    joined = false,
+    released = false,
+    rival = false,
+    first = -1,
+    steady = -1,
+  }
+  if (!ok) {
+    return res
+  }
+  gcConfigure(g, true, false, MIN_TRIGGER, GROWTH_PCT, false)
+  gcArmAllocCache()
+  sharedG[0] = i64(int(g))
+  sharedMeta[0] = i64(metaAddr)
+  let z: *byte = nil
+  let handle = startFn(collideChildEntry(), z, ptrOf(doneWord))
+  res.started = handle != 0
+  if (!res.started) {
+    return res
+  }
+  res.joined = threadJoin(ptrOf(doneWord), JOIN_NS, sleepFn, monoFn) == threadJoinDone
+  res.released = releaseFn(int(handle))
+  res.rival = childOut[0] != 0 && childOut[1] != 0
+  res.first = int(childOut[2])
+  res.steady = int(childOut[3])
+  return res
+}

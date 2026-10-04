@@ -84,29 +84,46 @@
 const acEntries = 64
 
 // Words per entry, and the same figure in bytes. 64 words = 512 bytes = eight
-// whole cache lines, so no two threads' entries share one. The entry uses 44 of
-// them (3 header words, one head per class, 4 accounting words), so even a
-// table base that is only 8-byte aligned leaves 20 dead words between one
-// entry's last live word and
-// the next entry's first — false sharing is impossible without depending on the
-// block's alignment.
+// whole cache lines, so no two threads' entries share one. The entry uses 45 of
+// them: 4 header words, which only a claim, a rebind or a walk's fall to the
+// probe writes, then 8 dead words, then one head per class and 4 accounting
+// words. Even a table base that is only 8-byte aligned leaves 11 dead words
+// between one entry's last live word and the next entry's first — false
+// sharing is impossible without depending on the block's alignment.
 const acEntryWords = 64
 const acEntryBytes = 512
 
+// THE HEADER SITS 8 WORDS CLEAR OF EVERY WORD THE OWNER WRITES PER ALLOCATION
+// (#7139), on both sides and across the boundary into the next entry, so the
+// 64-byte line holding `acOwner` and `acHeap` holds no such word whatever the
+// table's alignment. Other threads read those two words: `allocCacheWalk`
+// walks past entries it does not own when another thread holds its home.
+// With the heads from word 3, `acOwner` shared a line with the heads of the
+// five smallest classes, so a thread whose home another held took a coherence
+// miss on its own fast path whenever that thread popped one. `acOwner` stays
+// word 0: AArch64's `ldar` takes no offset, so any other word would cost the
+// home hit an `add`.
 const acOwner = 0 // `gcThreadToken()` of the owning OS thread, 0 when free
 const acHeap = 1  // `*(g + gcHeapAddr)` these slots were taken from, 0 when none
 const acLock = 2  // `*(g + gcHeapLockAddr)` for that heap, so a drain can lock it
-const acHeads = 3 // `acHeads + idx`: head of class `idx`'s cached chain
+
+// #7139: how many times `allocCacheWalk` fell through to `allocCacheProbe` for
+// the thread this entry binds: once per claim and once per heap rebind, never
+// in the steady state. `gcAllocCacheSlowHits` reads it for
+// `_tests_/stress/thread/alloccollide`.
+const acSlow = 3
+
+const acHeads = 12 // `acHeads + idx`: head of class `idx`'s cached chain
 
 // #5472: bytes this thread may still allocate before it must read the SHARED
-// collection trigger again. `acHeads + allocNumClasses` = 3 + 37 = 40, the
+// collection trigger again. `acHeads + allocNumClasses` = 12 + 37 = 49, the
 // first word past the class heads and still inside the same 512-byte entry, so
 // it is private to the owning OS thread by exactly the argument the heads are
 // (see `acOwner`) and shares no line with another thread's.
-const acBudget = 40
+const acBudget = 49
 
 // #5709: bytes this thread has popped out of its own cache and not yet added to
-// the SHARED `heapLiveWord`. Word 41, so private by exactly the argument
+// the SHARED `heapLiveWord`. Word 50, so private by exactly the argument
 // `acBudget` above is and inside the same 512-byte entry.
 //
 // WHAT IS OWED IS BOUNDED BY THE BUDGET, not by the cache's capacity, and that
@@ -119,15 +136,17 @@ const acBudget = 40
 // Under `BIT_GC=stress` `gcTriggerBudget` answers 0, so the flush runs on every
 // allocation and the shared word is never behind at all — which is the state
 // every stress oracle that reads `gcLiveBytes` was written against.
-const acLive = 41
+const acLive = 50
 
 // #5821: objects this thread has allocated and not yet added to the SHARED
-// `gcNumObjectsIdx`, and the collector block (`g`) they are owed to. Words 42
-// and 43, private by the argument `acBudget` gives. `acGc` exists because the
+// `gcNumObjectsIdx`, and the collector block (`g`) they are owed to. Words 51
+// and 52, private by the argument `acBudget` gives. `acGc` exists because the
 // count lives in `g` and the drain (`allocCacheDrainInto`) is reached with no
-// `g` in hand; it is bound beside `acHeap` and cleared beside it.
-const acObjs = 42
-const acGc = 43
+// `g` in hand; it is bound beside `acHeap` and cleared beside it. It stays
+// past the heads, as before #7139, so every displacement that reaches it keeps
+// its x86-64 encoding and no instruction after it moves.
+const acObjs = 51
+const acGc = 52
 
 // Classes a thread caches: every class of at most `acMaxBytes / 2` bytes, so a
 // cached class always yields at least two slots per refill. Above that an
@@ -157,8 +176,9 @@ const acMaxBytes = 4096
 const acSpanBytes = allocSpanBytes
 const acMaxChain = allocSpanBytes / 8
 
-// Probes before giving up and using the lock. Linear, so a collision costs the
-// colliding thread one extra load per allocation and nothing else.
+// Probes before giving up and using the lock. Linear, so a thread whose home
+// another thread holds pays `allocCacheWalk`'s call and one load per entry it
+// walks past (#7139).
 const acProbes = 4
 
 // The table itself. `acEntries * acEntryWords`; an array length must be a
@@ -235,11 +255,18 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
 //
 // THE STEADY STATE IS ANSWERED HERE WITH NO CALL (#5997): the home entry is
 // this thread's and is bound to `g`'s heap, which is exactly the case in which
-// `allocCacheFor` stores nothing and returns `addr`. Every other case takes
-// `allocCacheProbe`, which starts again at probe 0, so the answer is the one
-// the loop alone gives. The call it removes cost a 6-push frame and 28 x86-64
-// instructions per allocation, and holding the token live across it cost three
-// stack reloads in the hash.
+// `allocCacheFor` stores nothing and returns `addr`. The call it removes cost a
+// 6-push frame and 28 x86-64 instructions per allocation, and holding the
+// token live across it cost three stack reloads in the hash.
+//
+// A THREAD WHOSE HOME ANOTHER THREAD HOLDS TAKES `allocCacheWalk` (#7139,
+// ./walkcache.bit, which says why it lives there), and that is an accident of
+// layout, not of load: worker tokens sit a multiple of 256 KiB apart, so two
+// share a home when their mappings land a multiple of 4 MiB apart, about one
+// process start in 16 for two workers (#7130). The walk stays out of line ON
+// PURPOSE: written inline, its loop took two more callee-saved registers, and
+// their pushes and pops landed on the home hit that answers every other
+// thread.
 @nosplit fn allocCacheEntry(g: *i64): int {
   if (worldBlockAddr() == 0) {
     return 0
@@ -248,18 +275,23 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
   if (token == 0) {
     return 0
   }
-  // Thread pointers differ in their middle bits (per-thread TLS blocks are page
-  // multiples apart), so the low bits alone would pile every thread into a
-  // handful of entries. XOR-folding three shifted copies mixes bits 4..21 down
-  // into the index; a multiplicative mix is not available here because an i64
-  // multiply of an address overflows, which traps in a debug build (§11.1).
-  let home = ((token >> 4) ^ (token >> 10) ^ (token >> 16)) & (acEntries - 1)
+  let home = allocCacheHome(token)
   let addr = int(ptrOf(allocCacheBlock)) + home * acEntryBytes
   let e = wordAt(addr)
   if (atomicLoad(e + acOwner) == token && *(e + acHeap) == *(g + gcHeapAddr)) {
     return addr
   }
-  return allocCacheProbe(g, token, home)
+  return allocCacheWalk(g, token, home)
+}
+
+// The entry `token` probes first. Thread pointers differ in their middle bits
+// (per-thread TLS blocks are page multiples apart), so the low bits alone would
+// pile every thread into a handful of entries. XOR-folding three shifted copies
+// mixes bits 4..21 down into the index; a multiplicative mix is not available
+// here because an i64 multiply of an address overflows, which traps in a debug
+// build (§11.1).
+@nosplit fn allocCacheHome(token: int): int {
+  return ((token >> 4) ^ (token >> 10) ^ (token >> 16)) & (acEntries - 1)
 }
 
 // `allocCacheEntry`'s probe: this thread's entry among the `acProbes` from
