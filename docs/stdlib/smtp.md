@@ -126,7 +126,7 @@ import { Second } from "std/time"
 
 // Give a slow relay a minute per step rather than the default 30 seconds.
 fn dialPatient(host: string): Client!SmtpError {
-  return dial(host, 587, Options(timeout = 60 * Second))
+  return dial(host, 587, Options(timeout = 60 * Second))?
 }
 
 // A step that ran out of time fails with a message naming it, and the
