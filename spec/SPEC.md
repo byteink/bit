@@ -3745,6 +3745,9 @@ i32(x)            // numeric conversion (explicit; no implicit narrowing)
 f64(n)            // int -> float
 string(b)         // []byte -> string (copy)
 []byte(s)         // string -> []byte (copy)
+string(r)         // rune -> string (UTF-8 encoding)
+string(rs)        // []rune -> string (UTF-8 encoding)
+[]rune(s)         // string -> []rune (UTF-8 decoding)
 []int(n)          // allocate a length-n zeroed slice
 []int(n, m)       // length n, capacity m
 map<string,int>() // empty map
@@ -3755,9 +3758,20 @@ int(tag)          // C-like enum -> its integer tag
 ```
 
 `string(b)` and `[]byte(s)` copy bytes verbatim: a `[]byte` is the raw byte
-view of a string and round-trips through it. The rune-oriented conversions
-(`string(rune)`, `string([]rune)`, `[]rune(s)`) require UTF-8 encode/decode and
-are deferred until rune iteration lands (§21).
+view of a string and round-trips through it.
+
+The rune conversions are UTF-8 and follow Go. `string(r)` is the encoding of
+the rune `r` (`rune` is `i32`; an untyped rune literal such as `'a'` also
+converts, an untyped integer such as `65` does not, and no other integer type
+converts to `string`). `string(rs)` concatenates the encoding of each element of
+a `[]rune`. A value that is not a Unicode scalar value (negative, a surrogate
+U+D800..U+DFFF, or above U+10FFFF) encodes as U+FFFD, the replacement character.
+`[]rune(s)` decodes `s` into one element per code point. Each invalid byte
+sequence (a byte that is not a lead byte, a truncated or mis-continued sequence,
+an overlong form, an encoded surrogate, a value above U+10FFFF) yields U+FFFD
+and consumes ONE byte, the rule `std/strings`' `decodeRune` states. So
+`string([]rune(s))` equals `s` exactly when `s` is valid UTF-8. Each conversion
+allocates its result once, sized exactly.
 
 Numeric conversions are always explicit. There are **no** implicit numeric
 conversions between distinct numeric types (including `i32`→`i64`); this is a
@@ -6829,9 +6843,10 @@ Intentionally **not** in v0.1, to keep the surface minimal:
   (`Mutex`, `RWMutex`, `WaitGroup`, `Once`) is no longer reserved - see §13.7.
 - Nominal newtypes (all `type` aliases are transparent in v0.1).
 - Thread handles / structured concurrency for `spawn`.
-- UTF-8 rune conversions (`string(rune)`, `string([]rune)`, `[]rune(s)`) and
-  rune iteration (`for r of s`); byte-level `string`/`[]byte` conversion (§12.9)
-  and byte indexing (§12.6) are available now.
+- Rune iteration over a string (`for r of s`); the UTF-8 rune conversions
+  (`string(rune)`, `string([]rune)`, `[]rune(s)`, §12.9), byte-level
+  `string`/`[]byte` conversion (§12.9) and byte indexing (§12.6) are available
+  now.
 - Re-slicing a fixed-size array `[N]T` (arrays are not yet constructible as
   values); `[]T` and `string` re-slicing (§12.6) are available now.
 

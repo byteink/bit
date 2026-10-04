@@ -496,3 +496,198 @@ export @nosplit @symbol("bit_rt_string_from_byte_range") fn rtStringFromByteRang
   copyBytes(strBytes(out), buf + off + lo, n)
   return out
 }
+
+// ---- UTF-8 rune conversions (SPEC §12.9, #7101) ----------------------------
+//
+// `string(r)`, `string([]rune)` and `[]rune(s)`, with Go's semantics: an
+// invalid scalar (negative, a surrogate U+D800..U+DFFF, above U+10FFFF) encodes
+// as U+FFFD, and an invalid byte sequence decodes to U+FFFD and advances ONE
+// byte — the rule `std/strings`' `decodeRune` states, so `[]rune(s)` and
+// `runes(s)` agree element for element. Each entry point sizes its result with
+// a first pass and allocates exactly once (a `[]rune` result is the header plus
+// its one buffer).
+
+// The scalar `w` names, as the encoder sees it. `w` is the low 32 bits of a
+// register holding an `i32` (the caller may have sign- or zero-extended it), so
+// a negative `rune` arrives as 0x80000000+ and fails the range test with every
+// value above U+10FFFF.
+@nosplit fn runeScalar(w: int): int {
+  let r = w & 0xFFFFFFFF
+  if (r > 0x10FFFF || (r >= 0xD800 && r <= 0xDFFF)) {
+    return 0xFFFD
+  }
+  return r
+}
+
+// Bytes in the UTF-8 encoding of the valid scalar `r`.
+@nosplit fn runeEncLen(r: int): int {
+  if (r < 0x80) {
+    return 1
+  }
+  if (r < 0x800) {
+    return 2
+  }
+  if (r < 0x10000) {
+    return 3
+  }
+  return 4
+}
+
+// Writes the UTF-8 encoding of the valid scalar `r` at `dst`; returns the
+// address just past it.
+@nosplit fn runePut(dst: int, r: int): int {
+  let n = runeEncLen(r)
+  if (n == 1) {
+    storeByte(dst, r)
+    return dst + 1
+  }
+  if (n == 2) {
+    storeByte(dst, 0xC0 | (r >> 6))
+  } else if (n == 3) {
+    storeByte(dst, 0xE0 | (r >> 12))
+  } else {
+    storeByte(dst, 0xF0 | (r >> 18))
+  }
+  let j = 1
+  while (j < n) {
+    storeByte(dst + j, 0x80 | ((r >> (6 * (n - 1 - j))) & 0x3F))
+    j = j + 1
+  }
+  return dst + n
+}
+
+// The sequence width a lead byte announces, 0 for a byte that is not one. C0 and
+// C1 (always overlong) and F5.. (always above U+10FFFF) are rejected here.
+@nosplit fn utf8Want(b0: int): int {
+  if (b0 >= 0xC2 && b0 <= 0xDF) {
+    return 2
+  }
+  if (b0 >= 0xE0 && b0 <= 0xEF) {
+    return 3
+  }
+  if (b0 >= 0xF0 && b0 <= 0xF4) {
+    return 4
+  }
+  return 0
+}
+
+// Whether `cp`, decoded from a `want`-byte sequence, is a scalar value that
+// needed that many bytes: no overlong form, no surrogate, nothing above U+10FFFF.
+@nosplit fn utf8ScalarOk(cp: int, want: int): bool {
+  let least = 0x10000
+  if (want == 2) {
+    least = 0x80
+  } else if (want == 3) {
+    least = 0x800
+  }
+  if (cp < least || cp > 0x10FFFF) {
+    return false
+  }
+  return cp < 0xD800 || cp > 0xDFFF
+}
+
+// One decode step over the `n` bytes at `p`, starting at byte `i`: the code
+// point in the low 32 bits and the bytes consumed above them. Malformed input
+// (a non-lead byte, a truncated or bad-continuation sequence, an overlong form,
+// a surrogate, a value above U+10FFFF) is U+FFFD with width 1. Never reads at or
+// past `p + n`.
+@nosplit fn utf8Decode(p: int, i: int, n: int): int {
+  let bad = 0xFFFD | (1 << 32)
+  let b0 = loadByte(p + i)
+  if (b0 < 0x80) {
+    return b0 | (1 << 32)
+  }
+  let want = utf8Want(b0)
+  if (want == 0 || i + want > n) {
+    return bad
+  }
+  let cp = b0 & (0x7F >> want)
+  let j = 1
+  while (j < want) {
+    let b = loadByte(p + i + j)
+    if ((b & 0xC0) != 0x80) {
+      return bad
+    }
+    cp = (cp << 6) | (b & 0x3F)
+    j = j + 1
+  }
+  if (!utf8ScalarOk(cp, want)) {
+    return bad
+  }
+  return cp | (want << 32)
+}
+
+// `bit_rt_string_from_rune` (ABI.md §2): `string(r)` for a `rune` — its UTF-8
+// encoding, U+FFFD for an invalid scalar. One allocation, exactly the encoding's
+// bytes.
+export @nosplit @symbol("bit_rt_string_from_rune") fn rtStringFromRune(w: int): int {
+  let r = runeScalar(w)
+  let out = allocString(runeEncLen(r))
+  if (out == 0) {
+    return 0
+  }
+  let _ = runePut(strBytes(out), r)
+  return out
+}
+
+// `bit_rt_string_from_runes` (ABI.md §2): `string(rs)` for a `[]rune` — each
+// element's encoding, in order, with `rtStringFromRune`'s replacement rule. The
+// first pass sums the encoded sizes so the one `allocString` is exact. A null
+// `rs` converts to `""`. `buf` is read before the allocation, the one point that
+// can collect, as `rtStringFromBytes` does.
+export @nosplit @symbol("bit_rt_string_from_runes") fn rtStringFromRunes(h: int): int {
+  if (h == 0) {
+    return allocString(0)
+  }
+  let n = loadWord(h + slcLen)
+  let base = loadWord(h + slcBuf) + loadWord(h + slcOff) * 8
+  let total = 0
+  let i = 0
+  while (i < n) {
+    total = total + runeEncLen(runeScalar(loadWord(base + i * 8)))
+    i = i + 1
+  }
+  let out = allocString(total)
+  if (out == 0) {
+    return 0
+  }
+  let dst = strBytes(out)
+  i = 0
+  while (i < n) {
+    dst = runePut(dst, runeScalar(loadWord(base + i * 8)))
+    i = i + 1
+  }
+  return out
+}
+
+// Code points in the `n` bytes at `p`, counted by `utf8Decode`'s own steps.
+@nosplit fn utf8Count(p: int, n: int): int {
+  let i = 0
+  let count = 0
+  while (i < n) {
+    i = i + (utf8Decode(p, i, n) >> 32)
+    count = count + 1
+  }
+  return count
+}
+
+// `bit_rt_runes_from_string` (ABI.md §2): `[]rune(s)` — a fresh `[]i32` (one
+// word per element, `elemSize` 8 like every non-`u8` slice) holding `s`'s code
+// points. The count pass sizes the buffer exactly; `s`'s bytes are re-read from
+// `s` after `rtSliceNew`, which can collect.
+export @nosplit @symbol("bit_rt_runes_from_string") fn rtRunesFromString(s: int): int {
+  let n = strSize(s)
+  let count = utf8Count(strBytes(s), n)
+  let h = rtSliceNew(count, count, 0, 8)
+  let buf = loadWord(h + slcBuf)
+  let p = strBytes(s)
+  let i = 0
+  let k = 0
+  while (i < n) {
+    let d = utf8Decode(p, i, n)
+    storeWord(buf + k * 8, d & 0xFFFFFFFF)
+    i = i + (d >> 32)
+    k = k + 1
+  }
+  return h
+}

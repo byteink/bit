@@ -13,10 +13,13 @@
 // descriptor is the ref-field offsets) followed by a `field_set` per field, in
 // the literal's source order. ponytail: class bodies only — []T/[N]T/map<K,V>
 // composites and inline-array fields land next.
-// Whether `[]E(...)` is the `[]byte(s)` CONVERSION rather than a sized
-// allocation: exactly one argument, of type `string`, AND the slice's element
-// is byte-sized (`byte`/`u8`, prim index 4). A string literal defaults through
-// `untyped_string`, so the argument's type is defaulted before the test.
+// Which string-to-slice conversion `[]E(...)` is, as the `rt_call` that lowers
+// it, or "" when it is a sized allocation: exactly one argument, of type
+// `string`, AND an element that fixes the conversion — a byte (`byte`/`u8`, prim
+// index 4) is `[]byte(s)` -> `bytes_from_string`, a `rune` (`i32`, prim index 2)
+// is `[]rune(s)` -> `runes_from_string` (§12.9, #7101). A string literal
+// defaults through `untyped_string`, so the argument's type is defaulted before
+// the test.
 //
 // #4137: this used to admit any single-`string`-arg slice literal, with no
 // check on `elemTy` at all — mirroring only half of the checker's own
@@ -29,32 +32,56 @@
 // `[]i64`, reading past the allocation for any index beyond 0. With the elem
 // check added, that case now falls through to `lowerSliceAllocLenArg`, which
 // already `fcFail`s on a non-integer length argument.
-fn isBytesConversion(fc: FnCtx, elemTy: int, args: []int, arg0: int): bool {
-  if (len(args) != 1) {
-    return false
-  }
-  if (elemTy == 0 ||
-    fc.c.ctx.types[elemTy].kind != TypeKind.Prim ||
-    fc.c.ctx.types[elemTy].prim != 4) {
-    return false
+fn stringToSliceRt(fc: FnCtx, elemTy: int, args: []int, arg0: int): string {
+  if (len(args) != 1 || elemTy == 0 || fc.c.ctx.types[elemTy].kind != TypeKind.Prim) {
+    return ""
   }
   let a0ty = defaultType(fc.c, nodeType(fc, arg0))
-  return fc.c.ctx.types[a0ty].kind == TypeKind.Prim && fc.c.ctx.types[a0ty].prim == 11
+  if (fc.c.ctx.types[a0ty].kind != TypeKind.Prim || fc.c.ctx.types[a0ty].prim != 11) {
+    return ""
+  }
+  let ep = fc.c.ctx.types[elemTy].prim
+  if (ep == 4) {
+    return "bytes_from_string"
+  }
+  if (ep == 2) {
+    return "runes_from_string"
+  }
+  return ""
 }
 
-// `[]byte(s)` -> `rt_call bytes_from_string(s)`. Split out of `lowerSliceAlloc`
-// with its predicate above so that function stays inside E0204's complexity
-// ceiling (spec/LINT.md §max-complexity = 10); it was already over at 12 before
-// #3648 added its empty-slice arm.
-fn lowerBytesFromString(fc: FnCtx, sliceTy: int, arg0: int): int {
+// `[]byte(s)` -> `rt_call bytes_from_string(s)`, `[]rune(s)` -> `rt_call
+// runes_from_string(s)`. Split out of `lowerSliceAlloc` with its predicate above
+// so that function stays inside E0204's complexity ceiling (spec/LINT.md
+// §max-complexity = 10); it was already over at 12 before #3648 added its
+// empty-slice arm.
+fn lowerSliceFromString(fc: FnCtx, sliceTy: int, arg0: int, rt: string): int {
   let sv = lowerExprH(fc, arg0, primType(fc.c.ctx, 11))
   if (fc.failed) {
     return 0
   }
   let bs = mkInstr(Op.RtCall, sliceTy)
-  bs.name = "bytes_from_string"
+  bs.name = rt
   bs.args = [sv]
   return emitRtCall(fc, bs)
+}
+
+// `string(x)` for a non-string `x` (§12.9): `string([]byte)` is
+// `string_from_bytes`; `string([]rune)` is `string_from_runes` and `string(rune)`
+// is `string_from_rune`, both UTF-8 (#7101) — one runtime call each, the result
+// being the only allocation. The checker rejects every other source (E0053).
+fn lowerStringConvert(fc: FnCtx, src: int, srcTy: int, dstTy: int): int {
+  let st = fc.c.ctx.types[srcTy]
+  let ins = mkInstr(Op.RtCall, dstTy)
+  ins.name = "string_from_rune"
+  if (st.kind == TypeKind.Slice) {
+    ins.name = "string_from_bytes"
+    if (st.elem == primType(fc.c.ctx, 2)) {
+      ins.name = "string_from_runes"
+    }
+  }
+  ins.args = [src]
+  return emitRtCall(fc, ins)
 }
 
 // Unwraps a call argument's `Arg` wrapper node to the underlying expression,
@@ -75,7 +102,7 @@ fn unwrapSliceAllocArg(fc: FnCtx, node: int): int {
 // so lowering cannot trust that check ran either: a non-integer argument
 // (e.g. another slice's own SSA result) would otherwise be handed straight to
 // `slice_new` as a raw i64 length, reading that value's address as a length
-// (#4104). By the time this is called, `isBytesConversion` above has already
+// (#4104). By the time this is called, `stringToSliceRt` above has already
 // ruled out the one legal non-integer case (a single §12.9 `[]byte(s)`
 // string argument), so a plain integer check is exact here. Split out of
 // `lowerSliceAlloc` to keep it under E0204's complexity ceiling (#4133).
@@ -119,8 +146,9 @@ fn lowerSliceAlloc(fc: FnCtx, node: int): int {
     return 0
   }
   let arg0 = unwrapSliceAllocArg(fc, args[0])
-  if (isBytesConversion(fc, elemTy, args, arg0)) {
-    return lowerBytesFromString(fc, sliceTy, arg0)
+  let convRt = stringToSliceRt(fc, elemTy, args, arg0)
+  if (convRt != "") {
+    return lowerSliceFromString(fc, sliceTy, arg0, convRt)
   }
   let nV = lowerSliceAllocLenArg(fc, arg0, "length")
   if (fc.failed) {
