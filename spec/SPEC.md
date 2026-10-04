@@ -6839,9 +6839,10 @@ field         = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" c
 method_decl   = [ "export" ] IDENT [ generic_params ] signature block .
 static_method_decl = [ "export" ] "static" IDENT [ generic_params ] signature block .
 interface_decl= "interface" IDENT [ generic_params ] "{" [ member_sig { fsep member_sig } [ fsep ] ] "}" .
-member_sig    = method_sig | static_method_sig .
+member_sig    = method_sig | static_method_sig | field_sig .
 method_sig    = IDENT signature .
 static_method_sig = "static" IDENT signature .
+field_sig     = IDENT ":" type .
 fsep          = ";" | "," .
 trait_decl    = "trait" IDENT "{" { trait_member } "}" .
 trait_member  = use_stmt | trait_method | trait_field .
