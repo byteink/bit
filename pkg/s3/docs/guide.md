@@ -507,6 +507,38 @@ fn pieceChecksum(pieces: []string): string! {
 }
 ```
 
+A `Trailer` plan sends the body aws-chunked: `awsChunked` takes the plan, the
+request's headers, the declared length and a `BodySource`, and returns the
+headers to send, the exact length of the encoded body and the source that
+yields it. Every chunk is exactly `awsChunkSize` (8192) bytes except the last,
+whatever size the source reads come in, so S3 accepts it and no more than one
+chunk is ever in memory. The length is enforced: a source that ends early or has
+a byte more than declared fails the read instead of sending a body S3 rejects.
+
+```bit
+import { awsChunked, Body, ChecksumAlgorithm, ChunkedBody, planChecksum, Checksums } from "s3"
+import { SigHeader } from "aws"
+import { BodySource } from "std/http"
+
+fn encodeUpload(length: int, source: BodySource): ChunkedBody! {
+  let none = Option<ChecksumAlgorithm>.None
+  let headers = [SigHeader{ name = "host", value = "bucket.s3.example.com" }]
+  let plan = planChecksum(
+    "PutObject",
+    Checksums.WhenSupported,
+    none,
+    headers,
+    Body.Stream(source, Option<int>.Some(length)),
+  )?
+  let body = awsChunked(plan, headers, length, source)?
+  println("content-length ${body.contentLength}")
+  for h of body.headers {
+    println("${h.name}: ${h.value}")
+  }
+  return body
+}
+```
+
 ## Sharp edges
 
 - `put`/`get` hold the whole object in memory and are bounded by `std/http`'s

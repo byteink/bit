@@ -1,0 +1,329 @@
+// pkg/s3/chunked.bit — the aws-chunked encoder (#6585, epic #6565): a request body
+// sent as `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, the one aws-chunked mode the AWS
+// SDK for JavaScript v3 produces (its `getAwsChunkedEncodingStream`), reimplemented
+// from its behaviour. It carries the body of a `ChecksumPlacement.Trailer` plan
+// (checksum.bit): the checksum is calculated while the body goes out and follows the
+// last chunk.
+//
+// On the wire, with `L` the chunk length in lowercase hex and `<name>` the plan's
+// header (`x-amz-checksum-crc32`):
+//
+//   <L>\r\n<bytes>\r\n    ... one per chunk
+//   0\r\n
+//   <name>:<base64 checksum>\r\n
+//   \r\n
+//
+// S3 refuses a non-final chunk under 8 KiB, which the SDK avoids by buffering
+// small reads up to `requestStreamBufferSize` (`createBufferedReadable`). Here
+// every chunk is exactly `awsChunkSize` bytes except the last, whatever size the
+// source reads come in: a source that answers 100 bytes at a time is gathered into
+// one 8192-byte chunk before it is sent, a source that answers 1 MiB is cut.
+//
+// The encoder is a pull source (`BodySource`, std/http) and never holds more than
+// one chunk. The decoded length is declared up front, because S3 needs it
+// (`x-amz-decoded-content-length`), and it is enforced exactly: a source that ends
+// early, or has a byte more than declared, fails the pull instead of sending a body
+// S3 would reject or silently truncate.
+
+import { streamingUnsignedTrailer } from "aws"
+import { Builder, split, toLower, trim } from "std/strings"
+
+// The size of every chunk but the last: S3's minimum for a non-final chunk.
+export const awsChunkSize: int = 8192
+
+const contentEncodingHeader: string = "content-encoding"
+const contentLengthHeader: string = "content-length"
+const decodedLengthHeader: string = "x-amz-decoded-content-length"
+const payloadHashHeader: string = "x-amz-content-sha256"
+const awsChunkedCoding: string = "aws-chunked"
+
+// An encoded request body: the `headers` the request carries, the exact
+// `contentLength` of the encoded bytes (the Content-Length of the request, or its
+// weight in a signature) and the `source` that yields them.
+export class ChunkedBody {
+  export headers: []SigHeader,
+  export contentLength: int,
+  export source: BodySource,
+}
+
+// Where the encoder is: sending chunks, finished, or stopped by an error.
+enum Phase {
+  Data,
+  Done,
+  Failed,
+}
+
+// The number of hex digits of `n` (`n >= 0`; zero takes one).
+fn hexDigits(n: int): int {
+  let digits = 1
+  let rest = n >> 4
+  while (rest > 0) {
+    digits = digits + 1
+    rest = rest >> 4
+  }
+  return digits
+}
+
+// `n` (`n >= 0`) in lowercase hex, the chunk length of the encoding.
+fn hexOf(n: int): string {
+  let digits = hexDigits(n)
+  let out: []byte = []byte(digits)
+  let rest = n
+  let i = digits
+  while (i > 0) {
+    i = i - 1
+    let d = rest & 15
+    if (d < 10) {
+      out[i] = byte(48 + d)
+    } else {
+      out[i] = byte(87 + d)
+    }
+    rest = rest >> 4
+  }
+  return string(out)
+}
+
+// The bytes of a chunk of `n` data bytes on the wire: length line, data, CRLF.
+fn chunkWireLength(n: int): int {
+  return hexDigits(n) + 2 + n + 2
+}
+
+// The bytes of the final chunk and the trailer: `0\r\n`, the trailer line and the
+// closing CRLF. `valueLen` is the length of the base64 checksum.
+fn trailerWireLength(nameLen: int, valueLen: int): int {
+  return 3 + nameLen + 1 + valueLen + 2 + 2
+}
+
+// The length of the base64 (padded) encoding of `n` bytes.
+fn base64Length(n: int): int {
+  return (n + 2) / 3 * 4
+}
+
+// The exact length of the encoding of `decoded` data bytes in chunks of `size`,
+// with a trailer named `nameLen` bytes long and a digest of `digestSize` bytes.
+fn encodedLength(decoded: int, size: int, nameLen: int, digestSize: int): int {
+  let full = decoded / size
+  let rest = decoded % size
+  let total = full * chunkWireLength(size)
+  if (rest > 0) {
+    total = total + chunkWireLength(rest)
+  }
+  return total + trailerWireLength(nameLen, base64Length(digestSize))
+}
+
+// The pull state of one encoding. `out[pos:]` is what has been encoded and not
+// yet handed to the caller; a new chunk is only built when it is empty.
+class Encoder {
+  source: BodySource
+  decoded: int
+  size: int
+  hash: Hash
+  trailer: string
+  seen: int
+  out: string
+  pos: int
+  phase: Phase
+  failure: string
+
+  init(source: BodySource, decoded: int, size: int, hash: Hash, trailer: string) {
+    this.source = source
+    this.decoded = decoded
+    this.size = size
+    this.hash = hash
+    this.trailer = trailer
+    this.seen = 0
+    this.out = ""
+    this.pos = 0
+    this.phase = Phase.Data
+    this.failure = ""
+  }
+
+  // Up to `n` bytes of the encoding; "" only when it is complete. After an error
+  // every pull fails with it.
+  export pull(n: int): string! {
+    if (this.phase == Phase.Failed) {
+      fail invalidInput(this.failure)
+    }
+    while (this.pos >= len(this.out)) {
+      if (this.phase == Phase.Done) {
+        return ""
+      }
+      this.next() catch e {
+        this.phase = Phase.Failed
+        this.failure = e.message()
+        fail e
+      }
+    }
+    let end = this.pos + n
+    if (end > len(this.out)) {
+      end = len(this.out)
+    }
+    let piece = this.out[this.pos:end]
+    this.pos = end
+    return piece
+  }
+
+  // Builds the next piece of the encoding: a chunk, or the end of the body.
+  next(): ()! {
+    if (this.seen == this.decoded) {
+      this.finish()?
+      return
+    }
+    this.chunk()?
+  }
+
+  // The end: the source must have nothing left, then the zero chunk and the
+  // trailer with the checksum of everything sent.
+  finish(): ()! {
+    let extra = this.source(1)?
+    if (len(extra) != 0) {
+      fail invalidInput("aws-chunked body: the source has more than the ${this.decoded} bytes declared")
+    }
+    this.out = "0\r\n" + this.trailer + ":" + checksumValue(this.hash) + "\r\n\r\n"
+    this.pos = 0
+    this.phase = Phase.Done
+  }
+
+  // One chunk: `size` bytes, or what is left of the body, gathered from as many
+  // reads as the source needs. Never asks the source for more than the chunk
+  // still lacks, so a read cannot cross a chunk boundary.
+  chunk(): ()! {
+    let want = this.decoded - this.seen
+    if (want > this.size) {
+      want = this.size
+    }
+    let b = Builder()
+    b.write(hexOf(want))
+    b.write("\r\n")
+    let got = 0
+    while (got < want) {
+      got = got + this.gather(b, got, want - got)?
+    }
+    b.write("\r\n")
+    this.seen = this.seen + want
+    this.out = b.toString()
+    this.pos = 0
+  }
+
+  // One read of at most `max` bytes into the chunk `b`, which already holds `have`
+  // bytes of data; the bytes it got.
+  gather(b: Builder, have: int, max: int): int! {
+    let part = this.source(max)?
+    if (len(part) == 0) {
+      fail invalidInput("aws-chunked body: the source ended after ${this.seen + have} of the ${this.decoded} bytes declared")
+    }
+    if (len(part) > max) {
+      fail invalidInput("aws-chunked body: the source returned ${len(part)} bytes when asked for ${max}")
+    }
+    this.hash.write([]byte(part))
+    b.write(part)
+    return len(part)
+  }
+}
+
+// The encoding of `decoded` bytes pulled from `source`, in chunks of `size`, with
+// the checksum of `h` in a trailer named `trailer`. The core of `awsChunked`, with
+// the chunk size and the hasher open so the SDK's own vectors (chunks of 5 bytes, a
+// fixed checksum) can drive it.
+fn chunkedSource(
+  source: BodySource,
+  decoded: int,
+  size: int,
+  h: Hash,
+  trailer: string,
+): BodySource {
+  let enc = Encoder(source, decoded, size, h, trailer)
+  return (n) => {
+    return enc.pull(n)?
+  }
+}
+
+// `headers` with `name` set to `value`, replacing any header of that name in any
+// case.
+fn withHeader(headers: []SigHeader, name: string, value: string): []SigHeader {
+  let out = withoutHeader(headers, name)
+  return append(out, SigHeader{ name = name, value = value })
+}
+
+// `headers` without the header `name`, in any case.
+fn withoutHeader(headers: []SigHeader, name: string): []SigHeader {
+  let out = []SigHeader(0)
+  for h of headers {
+    if (toLower(h.name) != name) {
+      out = append(out, h)
+    }
+  }
+  return out
+}
+
+// The value of the header `name` in `headers`, "" when there is none.
+fn headerValue(headers: []SigHeader, name: string): string {
+  for h of headers {
+    if (toLower(h.name) == name) {
+      return h.value
+    }
+  }
+  return ""
+}
+
+// The content-encoding of the encoded request: `aws-chunked` after whatever
+// coding the caller already named, as the SDK appends it. A body the caller says
+// is aws-chunked already is a mistake, not something to encode twice.
+fn contentEncoding(headers: []SigHeader): string!S3Error {
+  let have = headerValue(headers, contentEncodingHeader)
+  if (have == "") {
+    return awsChunkedCoding
+  }
+  for coding of split(have, ",") {
+    if (toLower(trim(coding, " \t")) == awsChunkedCoding) {
+      fail invalidInput("content-encoding already names aws-chunked: the body is not encoded twice")
+    }
+  }
+  return have + "," + awsChunkedCoding
+}
+
+// The request headers of an aws-chunked request: `headers` with `plan`'s
+// checksum headers (`x-amz-sdk-checksum-algorithm`, `x-amz-trailer`),
+// `content-encoding` carrying `aws-chunked`, `x-amz-decoded-content-length`, the
+// payload hash marker `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, and no `content-length`
+// (the encoded length is `ChunkedBody.contentLength`).
+fn chunkedHeaders(plan: ChecksumPlan, headers: []SigHeader, decoded: int): []SigHeader!S3Error {
+  let out = withHeader(headers, contentEncodingHeader, contentEncoding(headers)?)
+  out = withoutHeader(out, contentLengthHeader)
+  out = withHeader(out, decodedLengthHeader, "${decoded}")
+  out = withHeader(out, payloadHashHeader, streamingUnsignedTrailer)
+  for h of checksumHeaders(plan, Body.Empty)? {
+    out = withHeader(out, h.name, h.value)
+  }
+  return out
+}
+
+// The aws-chunked encoding of a request body of `decodedLength` bytes pulled from
+// `source`, for a request that has `headers` and a `Trailer` checksum plan
+// (`planChecksum`, checksum.bit). Returns the headers to send and the encoded
+// body with its exact length; the caller sends the body and does not hash it or
+// frame it any other way.
+//
+// Fails with an `InvalidInput` error, before the source is touched, when the plan
+// is not a `Trailer` plan, `decodedLength` is negative or the caller's
+// `content-encoding` already names aws-chunked. A source that is shorter or longer
+// than `decodedLength` fails the pull that finds out.
+export fn awsChunked(
+  plan: ChecksumPlan,
+  headers: []SigHeader,
+  decodedLength: int,
+  source: BodySource,
+): ChunkedBody!S3Error {
+  if (plan.placement != ChecksumPlacement.Trailer) {
+    fail invalidInput("aws-chunked needs a checksum plan with a trailer")
+  }
+  if (decodedLength < 0) {
+    fail invalidInput("aws-chunked body: negative length ${decodedLength}")
+  }
+  let h = checksumHasher(plan.algorithm)?
+  return ChunkedBody{
+    headers = chunkedHeaders(plan, headers, decodedLength)?,
+    contentLength = encodedLength(decodedLength, awsChunkSize, len(plan.header), h.size()),
+    source = chunkedSource(source, decodedLength, awsChunkSize, h, plan.header),
+  }
+}

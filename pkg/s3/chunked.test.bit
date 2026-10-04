@@ -1,0 +1,494 @@
+// pkg/s3/chunked.test.bit — #6585. chunked.bit's encoding, byte for byte.
+//
+// Vectors, from the AWS SDK for JavaScript v3 at smithy-typescript 5d104567b718,
+// packages/core/src/submodules/serde/util-stream:
+//
+//   getAwsChunkedEncodingStream.spec.ts (Node) and .browser.spec.ts, ported:
+//     "computes checksum and adds it to the end event"   5\r\nHello\r\n5\r\nWorld\r\n0\r\n<name>:<value>\r\n\r\n
+//     "does not emit chunks of zero length"              0\r\n<name>:<value>\r\n\r\n
+//     "forwards a source error ..."                      the source's error fails the pull
+//     "honors backpressure ..."                          nothing is read without demand
+//   createBufferedReadable.spec.ts: the buffer joins small reads into chunks of the
+//     minimum size, the last one smaller; and no byte is lost or reordered.
+//
+// Not ported, and why: the five "skips checksum computation" cases and "surfaces a
+// post-end digest rejection". The first encode a body with no checksum, which the
+// SDK ends with `0\r\n` and no closing CRLF; this encoder only carries a
+// `Trailer` plan, and `planChecksum` never sends an unchecksummed body aws-chunked.
+// The digest here is synchronous, so it cannot be rejected after the end; an
+// algorithm this client cannot calculate is an `InvalidInput` error before the first
+// byte (`checksumHasher`, tested in checksum.test.bit).
+//
+// The SDK's specs have no 66560-byte body. The fixture here is this file's own: 66560
+// bytes (8 chunks of 8192 and one of 1024) of every byte value, its CRC-32 computed
+// outside this repository with CPython's zlib, and its expected encoding written
+// out below from literal chunk headers, not from the encoder's own helpers.
+
+import { decodeBase64 } from "std/crypto"
+import { Builder, indexOf, repeat } from "std/strings"
+
+const mockName: string = "mockChecksumLocationName"
+const mockValue: string = "mockChecksum"
+
+// CRC-32 of `fixture()` in base64, computed with zlib.crc32 over the same bytes.
+const fixtureCrc32: string = "/1S2Uw=="
+
+// A `Hash` whose digest is whatever base64 text it is given, the SDK spec's
+// mocked base64Encoder and streamHasher in one: it records what it was fed.
+class MockHash {
+  value: string
+  fed: int
+
+  init(value: string) {
+    this.value = value
+    this.fed = 0
+  }
+
+  export write(data: []byte) {
+    this.fed = this.fed + len(data)
+  }
+
+  export sum(): []byte {
+    return decodeBase64(this.value) catch e {
+      panic("mock digest: ${e.message()}")
+    }
+  }
+
+  export reset() {
+    this.fed = 0
+  }
+
+  export size(): int {
+    return 9
+  }
+
+  export blockSize(): int {
+    return 1
+  }
+}
+
+// 66560 bytes, every byte value among them, nothing periodic below 65536.
+fn fixture(): string {
+  let out: []byte = []byte(66560)
+  let i = 0
+  while (i < 66560) {
+    out[i] = byte((i * 7 + i / 256) % 256)
+    i = i + 1
+  }
+  return string(out)
+}
+
+// A source that answers at most `step` bytes per read, in order, "" at the end.
+fn readsOf(data: string, step: int): BodySource {
+  let pos = 0
+  return (n) => {
+    let take = n
+    if (take > step) {
+      take = step
+    }
+    if (take > len(data) - pos) {
+      take = len(data) - pos
+    }
+    let piece = data[pos:pos + take]
+    pos = pos + take
+    return piece
+  }
+}
+
+// A source that answers the given parts, one per read, whatever is asked.
+fn partsOf(parts: []string): BodySource {
+  let i = 0
+  return (n) => {
+    if (i >= len(parts)) {
+      return ""
+    }
+    i = i + 1
+    return parts[i - 1]
+  }
+}
+
+// Every byte `src` yields when pulled `n` at a time.
+fn drain(src: BodySource, n: int): string {
+  let out = Builder()
+  while (true) {
+    let piece = src(n) catch e {
+      panic("pull: ${e.message()}")
+    }
+    if (len(piece) == 0) {
+      return out.toString()
+    }
+    assert(len(piece) <= n, "a pull of ${n} returned ${len(piece)}")
+    out.write(piece)
+  }
+}
+
+// The message of the error `src` fails with when pulled `n` at a time, "" when it
+// never fails.
+fn pullFailure(src: BodySource, n: int): string {
+  while (true) {
+    let piece = src(n) catch e {
+      return e.message()
+    }
+    if (len(piece) == 0) {
+      return ""
+    }
+  }
+}
+
+fn mockEncoding(data: string, parts: BodySource, size: int): BodySource {
+  return chunkedSource(parts, len(data), size, MockHash(mockValue), mockName)
+}
+
+// The encoding of `data` in chunks of `size`, written from literal chunk headers
+// by the caller's list of chunk lengths and their hex.
+fn expectedChunks(data: string, lens: []int, hexes: []string, trailer: string): string {
+  let out = ""
+  let at = 0
+  let i = 0
+  while (i < len(lens)) {
+    out = out + hexes[i] + "\r\n" + data[at:at + lens[i]] + "\r\n"
+    at = at + lens[i]
+    i = i + 1
+  }
+  return out + "0\r\n" + trailer + "\r\n\r\n"
+}
+
+// The chunk lengths of an aws-chunked `wire` body, parsed with no help from the
+// encoder: hex length, CRLF, that many bytes, CRLF, until the zero chunk; and the
+// trailer line after it.
+fn parseChunks(wire: string): []int {
+  let lens = []int(0)
+  let at = 0
+  while (true) {
+    let eol = indexOf(wire[at:], "\r\n")
+    assert(eol > 0, "no chunk header at ${at}")
+    let n = parseHex(wire[at:at + eol])
+    at = at + eol + 2
+    if (n == 0) {
+      return lens
+    }
+    assert(wire[at + n:at + n + 2] == "\r\n", "chunk of ${n} at ${at} is not closed by CRLF")
+    lens = append(lens, n)
+    at = at + n + 2
+  }
+}
+
+fn parseHex(s: string): int {
+  let n = 0
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c >= '0' && c <= '9') {
+      n = n * 16 + int(c - '0')
+    } else {
+      assert(c >= 'a' && c <= 'f', "not lowercase hex: ${s}")
+      n = n * 16 + int(c - 'a') + 10
+    }
+    i = i + 1
+  }
+  return n
+}
+
+fn fixtureWire(data: string): string {
+  let lens = [8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 1024]
+  let hexes = ["2000", "2000", "2000", "2000", "2000", "2000", "2000", "2000", "400"]
+  return expectedChunks(data, lens, hexes, "x-amz-checksum-crc32:${fixtureCrc32}")
+}
+
+fn crcPlan(): ChecksumPlan {
+  let none = Option<ChecksumAlgorithm>.None
+  return planChecksum(
+    "PutObject",
+    Checksums.WhenSupported,
+    none,
+    []SigHeader(0),
+    Body.Stream(partsOf([""]), Option<int>.Some(1)),
+  ) catch e {
+    panic("plan: ${e.message()}")
+  }
+}
+
+fn encodeWith(plan: ChecksumPlan, headers: []SigHeader, data: string, step: int): ChunkedBody {
+  return awsChunked(plan, headers, len(data), readsOf(data, step)) catch e {
+    panic("awsChunked: ${e.message()}")
+  }
+}
+
+fn headerOf(headers: []SigHeader, name: string): string {
+  for h of headers {
+    if (h.name == name) {
+      return h.value
+    }
+  }
+  return "<none>"
+}
+
+test "the SDK vector: Hello and World, a checksum trailer" {
+  let enc = mockEncoding("HelloWorld", partsOf(["Hello", "World"]), 5)
+  let want = "5\r\nHello\r\n5\r\nWorld\r\n0\r\nmockChecksumLocationName:mockChecksum\r\n\r\n"
+  assert(drain(enc, 4096) == want, "Hello/World encoding differs")
+}
+
+test "the SDK vector: zero-length source gives only the final chunk" {
+  let enc = mockEncoding("", partsOf(["", "", "", ""]), 8192)
+  assert(
+    drain(enc, 4096) == "0\r\nmockChecksumLocationName:mockChecksum\r\n\r\n",
+    "empty body encoding differs",
+  )
+}
+
+test "the SDK vector: a source error fails the pull, and every pull after it" {
+  let n = 0
+  let source: BodySource = (want) => {
+    n = n + 1
+    if (n == 1) {
+      return "partial"
+    }
+    fail invalidInput("source failed")
+  }
+  let enc = chunkedSource(source, 20, 20, MockHash(mockValue), mockName)
+  let msg = pullFailure(enc, 4096)
+  assert(indexOf(msg, "source failed") >= 0, "message = ${msg}")
+  let again = pullFailure(enc, 4096)
+  assert(indexOf(again, "source failed") >= 0, "second pull message = ${again}")
+}
+
+test "the SDK vector: nothing is read from the source without demand" {
+  let reads = 0
+  let asked = 0
+  let source: BodySource = (n) => {
+    reads = reads + 1
+    asked = asked + n
+    return repeat("x", n)
+  }
+  let enc = chunkedSource(source, 512 * 65536, awsChunkSize, MockHash(mockValue), mockName)
+  assert(reads == 0, "the source was read before the first pull")
+  let first = enc(100) catch e {
+    panic("pull: ${e.message()}")
+  }
+  assert(len(first) == 100, "first pull = ${len(first)}")
+  assert(asked <= awsChunkSize, "one pull asked the source for ${asked} bytes, more than one chunk")
+}
+
+test "66560-byte fixture is byte-identical to the expected encoding" {
+  let data = fixture()
+  assert(len(data) == 66560, "fixture length")
+  let want = fixtureWire(data)
+  let enc = encodeWith(crcPlan(), []SigHeader(0), data, 1048576)
+  let got = drain(enc.source, 4096)
+  assert(got == want, "fixture encoding differs: ${len(got)} bytes, want ${len(want)}")
+  assert(enc.contentLength == len(want), "contentLength ${enc.contentLength}, want ${len(want)}")
+}
+
+test "the encoding does not depend on the size of the source reads or of the pulls" {
+  let data = fixture()[0:20000]
+  let want = drain(encodeWith(crcPlan(), []SigHeader(0), data, 100000).source, 65536)
+  assert(len(parseChunks(want)) == 3, "20000 bytes are three chunks")
+  let steps = [100, 4096, 8191, 8192, 8193, 20000]
+  let i = 0
+  while (i < len(steps)) {
+    let got = drain(encodeWith(crcPlan(), []SigHeader(0), data, steps[i]).source, 4096)
+    assert(got == want, "reads of ${steps[i]} change the encoding")
+    i = i + 1
+  }
+  let pulls = [100, 8192, 100000]
+  i = 0
+  while (i < len(pulls)) {
+    let got = drain(encodeWith(crcPlan(), []SigHeader(0), data, 100).source, pulls[i])
+    assert(got == want, "pulls of ${pulls[i]} change the encoding")
+    i = i + 1
+  }
+}
+
+test "a source emitting 100-byte reads yields chunks of exactly 8192 bytes except the last" {
+  let data = fixture()
+  let wire = drain(encodeWith(crcPlan(), []SigHeader(0), data, 100).source, 4096)
+  let lens = parseChunks(wire)
+  assert(len(lens) == 9, "chunks = ${len(lens)}")
+  let i = 0
+  while (i < 8) {
+    assert(lens[i] == 8192, "chunk ${i} is ${lens[i]} bytes")
+    i = i + 1
+  }
+  assert(lens[8] == 1024, "last chunk is ${lens[8]} bytes")
+}
+
+test "chunk boundaries: 1, 8191, 8192, 8193, 16384 and 16385 bytes" {
+  let cases = [1, 8191, 8192, 8193, 16384, 16385]
+  let want = [[1], [8191], [8192], [8192, 1], [8192, 8192], [8192, 8192, 1]]
+  let i = 0
+  while (i < len(cases)) {
+    let data = repeat("z", cases[i])
+    let enc = encodeWith(crcPlan(), []SigHeader(0), data, 100)
+    let wire = drain(enc.source, 4096)
+    let lens = parseChunks(wire)
+    assert(len(lens) == len(want[i]), "${cases[i]} bytes: ${len(lens)} chunks")
+    let j = 0
+    while (j < len(lens)) {
+      assert(lens[j] == want[i][j], "${cases[i]} bytes: chunk ${j} is ${lens[j]}")
+      j = j + 1
+    }
+    assert(
+      enc.contentLength == len(wire),
+      "${cases[i]} bytes: contentLength ${enc.contentLength}, wire ${len(wire)}",
+    )
+    i = i + 1
+  }
+}
+
+test "a 0-byte body is only the final chunk, with the checksum of nothing" {
+  let enc = encodeWith(crcPlan(), []SigHeader(0), "", 100)
+  let wire = drain(enc.source, 4096)
+  assert(wire == "0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n", "wire = ${wire}")
+  assert(enc.contentLength == len(wire), "contentLength ${enc.contentLength}")
+}
+
+test "the trailer carries the checksum of the decoded bytes under every algorithm" {
+  let data = fixture()[0:20000]
+  let algs = [
+    ChecksumAlgorithm.Crc32,
+    ChecksumAlgorithm.Crc32c,
+    ChecksumAlgorithm.Crc64nvme,
+    ChecksumAlgorithm.Sha1,
+    ChecksumAlgorithm.Sha256,
+    ChecksumAlgorithm.Sha512,
+    ChecksumAlgorithm.Md5,
+    ChecksumAlgorithm.Xxhash64,
+    ChecksumAlgorithm.Xxhash3,
+    ChecksumAlgorithm.Xxhash128,
+  ]
+  let ai = 0
+  while (ai < len(algs)) {
+    let alg = algs[ai]
+    ai = ai + 1
+    let plan = planChecksum(
+      "PutObject",
+      Checksums.WhenSupported,
+      Option<ChecksumAlgorithm>.Some(alg),
+      []SigHeader(0),
+      Body.Stream(partsOf([""]), Option<int>.Some(1)),
+    ) catch e {
+      panic("plan: ${e.message()}")
+    }
+    let enc = encodeWith(plan, []SigHeader(0), data, 777)
+    let wire = drain(enc.source, 4096)
+    let value = checksumOf(alg, []byte(data)) catch e {
+      panic("checksumOf: ${e.message()}")
+    }
+    let tail = "0\r\n${plan.header}:${value}\r\n\r\n"
+    assert(wire[len(wire) - len(tail):] == tail, "${plan.algorithmId}: trailer differs")
+    assert(
+      enc.contentLength == len(wire),
+      "${plan.algorithmId}: contentLength ${enc.contentLength}, wire ${len(wire)}",
+    )
+  }
+}
+
+test "a source shorter than the declared length fails, naming both lengths" {
+  let enc = chunkedSource(readsOf("abc", 100), 10, awsChunkSize, MockHash(mockValue), mockName)
+  let msg = pullFailure(enc, 4096)
+  assert(indexOf(msg, "ended after 3 of the 10 bytes declared") >= 0, "message = ${msg}")
+}
+
+test "a source longer than the declared length fails at the end" {
+  let enc = chunkedSource(readsOf("abcdef", 100), 5, awsChunkSize, MockHash(mockValue), mockName)
+  let msg = pullFailure(enc, 4096)
+  assert(indexOf(msg, "more than the 5 bytes declared") >= 0, "message = ${msg}")
+}
+
+test "a source that returns more than it was asked for fails" {
+  let source: BodySource = (n) => {
+    return repeat("y", n + 1)
+  }
+  let enc = chunkedSource(source, 10, awsChunkSize, MockHash(mockValue), mockName)
+  let msg = pullFailure(enc, 4096)
+  assert(indexOf(msg, "when asked for") >= 0, "message = ${msg}")
+}
+
+test "the bytes a failed encoding already built are not the end of the body" {
+  let enc = chunkedSource(readsOf("abc", 100), 10, awsChunkSize, MockHash(mockValue), mockName)
+  let first = pullFailure(enc, 4096)
+  assert(first != "", "the short source did not fail")
+  let second = enc(4096) catch _ {
+    return
+  }
+  assert(false, "a pull after a failure returned '${second}' instead of failing")
+}
+
+test "the headers of an aws-chunked request" {
+  let given = [
+    SigHeader{ name = "host", value = "b.s3.example.com" },
+    SigHeader{ name = "Content-Length", value = "66560" },
+    SigHeader{ name = "Content-Encoding", value = "gzip" },
+    SigHeader{ name = "x-amz-content-sha256", value = "UNSIGNED-PAYLOAD" },
+  ]
+  let enc = encodeWith(crcPlan(), given, fixture(), 4096)
+  let h = enc.headers
+  assert(
+    headerOf(h, "content-encoding") == "gzip,aws-chunked",
+    "content-encoding = ${headerOf(h, "content-encoding")}",
+  )
+  assert(headerOf(h, "x-amz-decoded-content-length") == "66560", "decoded length")
+  assert(
+    headerOf(h, "x-amz-content-sha256") == "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+    "payload hash marker",
+  )
+  assert(headerOf(h, "x-amz-trailer") == "x-amz-checksum-crc32", "x-amz-trailer")
+  assert(headerOf(h, "x-amz-sdk-checksum-algorithm") == "CRC32", "algorithm header")
+  assert(headerOf(h, "host") == "b.s3.example.com", "host kept")
+  assert(headerOf(h, "content-length") == "<none>", "content-length kept")
+  assert(headerOf(h, "Content-Length") == "<none>", "Content-Length kept")
+  assert(headerOf(h, "Content-Encoding") == "<none>", "Content-Encoding duplicated")
+  assert(len(h) == 6, "headers = ${len(h)}")
+}
+
+test "without a content-encoding the request names only aws-chunked" {
+  let enc = encodeWith(crcPlan(), []SigHeader(0), "abc", 4096)
+  assert(headerOf(enc.headers, "content-encoding") == "aws-chunked", "content-encoding")
+  assert(headerOf(enc.headers, "x-amz-decoded-content-length") == "3", "decoded length")
+}
+
+fn awsChunkedMessage(plan: ChecksumPlan, headers: []SigHeader, length: int): string {
+  awsChunked(plan, headers, length, readsOf("", 1)) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+test "a plan with no trailer, a negative length or a double encoding is refused up front" {
+  let header = planChecksum(
+    "PutObject",
+    Checksums.WhenSupported,
+    Option<ChecksumAlgorithm>.None,
+    []SigHeader(0),
+    Body.Text("x"),
+  ) catch e {
+    panic("plan: ${e.message()}")
+  }
+  let m1 = awsChunkedMessage(header, []SigHeader(0), 1)
+  assert(indexOf(m1, "needs a checksum plan with a trailer") >= 0, "header plan: ${m1}")
+  let m2 = awsChunkedMessage(crcPlan(), []SigHeader(0), -1)
+  assert(indexOf(m2, "negative length") >= 0, "negative: ${m2}")
+  let twice = [SigHeader{ name = "Content-Encoding", value = "gzip, AWS-Chunked" }]
+  let m3 = awsChunkedMessage(crcPlan(), twice, 1)
+  assert(indexOf(m3, "already names aws-chunked") >= 0, "double: ${m3}")
+}
+
+test "chunk lengths are lowercase hex" {
+  assert(hexOf(0) == "0", "0")
+  assert(hexOf(9) == "9", "9")
+  assert(hexOf(10) == "a", "10")
+  assert(hexOf(255) == "ff", "255")
+  assert(hexOf(8192) == "2000", "8192")
+  assert(hexOf(66560) == "10400", "66560")
+  assert(hexOf(4294967296) == "100000000", "2^32")
+}
+
+test "reads and pulls of one byte give the same encoding as any other" {
+  let data = fixture()[0:300]
+  let want = drain(encodeWith(crcPlan(), []SigHeader(0), data, 100000).source, 65536)
+  let one = drain(encodeWith(crcPlan(), []SigHeader(0), data, 1).source, 1)
+  assert(one == want, "one-byte reads and pulls change the encoding")
+  let odd = drain(encodeWith(crcPlan(), []SigHeader(0), data, 7).source, 3)
+  assert(odd == want, "reads of 7 and pulls of 3 change the encoding")
+}
