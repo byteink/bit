@@ -2,8 +2,8 @@
 
 "If I have an `Article`, whether I just built it or it came back from a
 query, saving it should just work" - that's the whole shape of this page.
-`insert` for a new row, `update` for one you already have, and no manual
-row mapper or `map<string, Value>` in between.
+`save` for either, `insert` for a new row, `update` for one you already
+have, and no manual row mapper or `map<string, Value>` in between.
 
 ## Insert and update
 
@@ -36,6 +36,26 @@ from the `INSERT` column list and reads it back from what the database
 generated. `update` takes the whole row and writes every column back by
 its primary key; there is no separate "patch just this field" call - build
 the value you want, then `update` it.
+
+## Save: insert or update, whichever the row needs
+
+```bit
+fn saveDraft(db: Db, article: Article): Article! {
+  return db.table<Article>().save(article)?
+}
+```
+
+`save` is for the code that holds an `Article` and does not care whether it
+is new. When `id` is `0` (nothing has assigned one yet) it is an `insert`
+and returns the row the database wrote, `id` filled in. Any other `id` and it
+is an `update`, and you get back the `article` you passed. A composite key
+(more than one `@id` field) counts as set only when every part is non-zero.
+
+It costs exactly one statement either way - no `select` first to find out
+whether the row exists - and the errors are `insert`'s and `update`'s own: a
+non-zero `id` whose row is gone fails the same way `update` does (see
+"The sharp edge" below). Inside `db.tx`, `tx.table<Article>().save(article)?`
+does the same on the transaction's connection.
 
 ## Deleting
 
