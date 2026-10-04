@@ -114,32 +114,43 @@ Storing a `Status` in a database column, a config file or a JSON document
 means writing its variant as text, and reading it back means knowing which
 texts are valid. Bit has no reflection, so without help every enum would
 need its own hand-written `match` returning each name. Every enum whose
-variants all carry no payload gets two members from the compiler instead:
+variants all carry no payload gets three members from the compiler instead:
 
 ```bit
 enum Status { Draft, Published, Archived }
 
 fn main() {
   let s = Status.Published
-  println(s.__variantName())              // Published
-  println(Status.__variants().join(", ")) // Draft, Published, Archived
+  println(s.__variantName())                     // Published
+  println(Status.__variants().join(", "))        // Draft, Published, Archived
+  println(Status.__variantAt(2).__variantName()) // Archived
 }
 ```
 
 `__variantName(): string` is an instance method that returns the variant's
 identifier exactly as written. `static __variants(): []string` lists every
 variant name in declaration order, and needs no value of the enum.
+`static __variantAt(i: int): Status` goes the other way: it returns the
+variant at index `i` of that same order, so a name found in `__variants()`
+becomes a value again. An index outside `0..N-1` panics with a message naming
+the enum and the index.
 
-A function generic over any such enum binds both through an interface, and
-reads the names off the type parameter:
+A function generic over any such enum binds them through an interface, and
+reads the names off the type parameter, or builds a value from one (`T(i)` is
+not allowed through a type parameter, so `__variantAt` is the way in):
 
 ```bit
 interface Named {
   static __variants(): []string,
+  static __variantAt(i: int): Self,
   __variantName(): string,
 }
 
 enum Status { Draft, Published, Archived }
+
+fn pick<T: Named>(i: int): T {
+  return T.__variantAt(i)
+}
 
 fn isValid<T: Named>(text: string): bool {
   for name of T.__variants() {
@@ -157,24 +168,26 @@ fn label<T: Named>(v: T): string {
 fn main() {
   println("${isValid<Status>("Draft")} ${isValid<Status>("Deleted")}")
   println(label(Status.Archived))
+  println(label(pick<Status>(0)))
 }
 ```
 
 The names are the stored form, so reordering the enum's variants changes
-`__variants()` but never what `__variantName()` returns for a given
-variant.
+`__variants()` and which variant `__variantAt(i)` returns for a given `i`, but
+never what `__variantName()` returns for a given variant.
 
 A few edges:
 
 - An enum with any payload variant (`Circle(f64)`), a generic enum and an
-  enum with no variants get neither member; calling one is the ordinary
+  enum with no variants get none of the members; calling one is the ordinary
   "no field or method" error (E0057).
-- Declaring a member named `__variantName` or `__variants` in an enum that
-  would get them is **E0189**, naming the enum and the member. The names are
-  reserved so a hand-written one can never hide the synthesized one from a
-  generic bound.
-- `__variantName` is a comparison chain, linear in the number of variants.
-  Call `__variants()` once and keep the slice when you need it in a loop.
+- Declaring a member named `__variantName`, `__variants` or `__variantAt` in an
+  enum that would get them is **E0189**, naming the enum and the member. The
+  names are reserved so a hand-written one can never hide the synthesized one
+  from a generic bound.
+- `__variantName` and `__variantAt` are comparison chains, linear in the
+  number of variants. Call `__variants()` once and keep the slice when you
+  need it in a loop.
 
 ## Next
 

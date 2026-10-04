@@ -5033,17 +5033,21 @@ enum Ticket {
   does - a value of that enum type is then storable wherever the interface
   is expected, dispatched dynamically like any other interface value.
 - Every enum whose variants all carry no payload (a **C-like** enum, §14.6)
-  that is not generic and has at least one variant has two compiler-synthesized
-  members, so a program can turn a value into its variant name, and list the
-  names, with no reflection: an instance method `__variantName(): string`
-  returning the variant's identifier as written, and `static __variants():
-  []string` returning every variant name in declaration order. They are called
-  `v.__variantName()` and `E.__variants()`, and satisfy an interface
-  requirement of the same signature through a type parameter bound
-  (§10.4.1). An enum with any payload variant, a generic enum and an enum with
-  no variant have neither, so a call is the ordinary E0057. Declaring a member
-  named `__variantName` or `__variants` in an enum that would get them is
-  **E0189**, naming the enum and the member.
+  that is not generic and has at least one variant has three compiler-synthesized
+  members, so a program can turn a value into its variant name, list the
+  names, and turn an index back into a value, with no reflection: an instance
+  method `__variantName(): string` returning the variant's identifier as
+  written, `static __variants(): []string` returning every variant name in
+  declaration order, and `static __variantAt(i: int): E` returning the variant
+  at index `i` of that same order. An `i` outside `0..N-1` for an enum of `N`
+  variants panics with a message naming the enum and the index. They are called
+  `v.__variantName()`, `E.__variants()` and `E.__variantAt(i)`, and satisfy an
+  interface requirement of the same signature (`__variantAt` as `static
+  __variantAt(i: int): Self`) through a type parameter bound (§10.4.1). An
+  enum with any payload variant, a generic enum and an enum with no variant
+  have none of them, so a call is the ordinary E0057. Declaring a member named
+  `__variantName`, `__variants` or `__variantAt` in an enum that would get them
+  is **E0189**, naming the enum and the member.
 - Enum values are consumed by `match` (§13.8), which is exhaustive over the
   variants and binds a variant's payload in its arm. Enums are not ordered.
   Equality is §14.6: a C-like enum compares by tag, a payload-carrying enum
