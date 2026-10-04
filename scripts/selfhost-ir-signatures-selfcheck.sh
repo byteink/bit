@@ -518,6 +518,86 @@ bb0():
   postcheck "7058 post-opt: a function is missing" "$pre_o" "$pre_t" "$post_o" "${post_ok%%
 func c*}" 1
 
+  # --- 6558-string-from-byte-range: slice_slice + string_from_bytes become one call ---
+  # Two sites, a block parameter and a literal that names a %id: the ids after
+  # each pair move down by one in the tree, the literal text does not.
+  br_oracle='func f(%0: []u8, %1: i64, %2: i64) string {
+bb0(%0: []u8, %1: i64, %2: i64):
+  %3 = rt_call slice_slice(%0, %1, %2) []u8
+  %4 = rt_call string_from_bytes(%3) string
+  %5 = const_string "%7"
+  %6 = rt_call slice_slice(%0, %2, %1) []u8
+  %7 = rt_call string_from_bytes(%6) string
+  %8 = rt_call string_concat2(%4, %7) string
+  jump bb1(%8)
+bb1(%9: string):
+  ret %9
+}'
+  br_tree='func f(%0: []u8, %1: i64, %2: i64) string {
+bb0(%0: []u8, %1: i64, %2: i64):
+  %3 = rt_call string_from_byte_range(%0, %1, %2) string
+  %4 = const_string "%7"
+  %5 = rt_call string_from_byte_range(%0, %2, %1) string
+  %6 = rt_call string_concat2(%3, %5) string
+  jump bb1(%6)
+bb1(%7: string):
+  ret %7
+}'
+  for kind in ir iropt; do
+    expect "6558 two sites ($kind)" "$br_oracle" "$br_tree" "$kind" 6558-string-from-byte-range
+    refuse "6558 bounds swapped ($kind)" "$br_oracle" "$br_tree" "${br_tree/string_from_byte_range(%0, %1, %2)/string_from_byte_range(%0, %2, %1)}" "$kind"
+    refuse "6558 result type changed ($kind)" "$br_oracle" "$br_tree" "${br_tree/  %3 = rt_call string_from_byte_range(%0, %1, %2) string/  %3 = rt_call string_from_byte_range(%0, %1, %2) []u8}" "$kind"
+    refuse "6558 a later id not shifted ($kind)" "$br_oracle" "$br_tree" "${br_tree/jump bb1(%6)/jump bb1(%8)}" "$kind"
+    refuse "6558 a literal changed ($kind)" "$br_oracle" "$br_tree" "${br_tree/\"%7\"/\"%6\"}" "$kind"
+    refuse "6558 another line changed too ($kind)" "$br_oracle" "$br_tree" "${br_tree/  ret %7/  ret %6}" "$kind"
+    refuse "6558 only one site collapsed ($kind)" "$br_oracle" "$br_tree" "${br_tree/  %5 = rt_call string_from_byte_range(%0, %2, %1) string/  %5 = rt_call slice_slice(%0, %2, %1) []u8}" "$kind"
+    used_oracle="${br_oracle/  %5 = const_string \"%7\"/  %5 = slice_len %3}"
+    if [ "$used_oracle" = "$br_oracle" ]; then echo "FAIL: 6558 header used again ($kind): the oracle mutation did not apply"; fail=1; fi
+    expect "6558 the slice header is used again ($kind)" "$used_oracle" "${br_tree/  %4 = const_string \"%7\"/  %4 = slice_len %3}" "$kind" ""
+    apart_oracle="${br_oracle/  %4 = rt_call string_from_bytes(%3) string/  %9 = const_int i64 0
+  %4 = rt_call string_from_bytes(%3) string}"
+    if [ "$apart_oracle" = "$br_oracle" ]; then echo "FAIL: 6558 pair apart ($kind): the oracle mutation did not apply"; fail=1; fi
+    expect "6558 the pair is not adjacent ($kind)" "$apart_oracle" "$br_tree" "$kind" ""
+    other_oracle="${br_oracle/string_from_bytes(%3)/string_from_bytes(%0)}"
+    if [ "$other_oracle" = "$br_oracle" ]; then echo "FAIL: 6558 other slice ($kind): the oracle mutation did not apply"; fail=1; fi
+    expect "6558 string_from_bytes of another slice ($kind)" "$other_oracle" "$br_tree" "$kind" ""
+  done
+  # On top of a #6730 hunk the walk stays that signature's, and a wrong operand
+  # in the collapsed call still fails it.
+  brc_oracle="${call_oracle/  ret %2/  %3 = rt_call slice_slice(%0, %0, %0) []u8
+  %4 = rt_call string_from_bytes(%3) string
+  ret %2}"
+  brc_tree="${call_tree/  ret %6/  %7 = rt_call string_from_byte_range(%0, %0, %0) string
+  ret %6}"
+  if [ "$brc_oracle" = "$call_oracle" ] || [ "$brc_tree" = "$call_tree" ]; then echo "FAIL: 6558 with 6730: the mutation did not apply"; fail=1; fi
+  expect "6558 beside a fallible enum call" "$brc_oracle" "$brc_tree" ir 6730-fallible-enum-words
+  refuse "6558 beside a fallible enum call, bounds changed" "$brc_oracle" "$brc_tree" "${brc_tree/string_from_byte_range(%0, %0, %0)/string_from_byte_range(%0, %0, %1)}" ir
+  expect "6558 is not a types signature" "$br_oracle" "$br_tree" types ""
+
+  # --- 6988-table-class-name-synth-shift: `cols` and `__row` 12 columns later (types) ---
+  ty_oracle='1:7: len(s): i64
+214:272: cols: []string
+214:295: __row: Author
+220:3: x: i64'
+  ty_tree='1:7: len(s): i64
+214:284: cols: []string
+214:307: __row: Author
+220:3: x: i64'
+  expect "6988 cols and __row shifted" "$ty_oracle" "$ty_tree" types 6988-table-class-name-synth-shift
+  refuse "6988 shifted by 11" "$ty_oracle" "$ty_tree" "${ty_tree/214:284: cols/214:283: cols}" types
+  refuse "6988 shifted by 13" "$ty_oracle" "$ty_tree" "${ty_tree/214:307: __row/214:308: __row}" types
+  refuse "6988 shifted the wrong way" "$ty_oracle" "$ty_tree" "${ty_tree/214:284: cols/214:260: cols}" types
+  refuse "6988 on another line" "$ty_oracle" "$ty_tree" "${ty_tree/214:284: cols/215:284: cols}" types
+  refuse "6988 member type changed" "$ty_oracle" "$ty_tree" "${ty_tree/__row: Author/__row: Post}" types
+  refuse "6988 member name changed" "$ty_oracle" "$ty_tree" "${ty_tree/214:284: cols: \[\]string/214:284: colz: []string}" types
+  refuse "6988 another member shifted too" "$ty_oracle" "$ty_tree" "${ty_tree/220:3: x/220:15: x}" types
+  refuse "6988 another member changed too" "$ty_oracle" "$ty_tree" "${ty_tree/x: i64/x: string}" types
+  refuse "6988 a member added" "$ty_oracle" "$ty_tree" "$ty_tree
+221:3: y: i64" types
+  expect "6988 a shifted member that is not synthesized" '1:7: len(s): i64' '1:19: len(s): i64' types ""
+  expect "6988 nothing shifted" "$ty_oracle" "$ty_oracle" types ""
+  expect "6988 is not an ir signature" "$ty_oracle" "$ty_tree" ir ""
+
   # --- 6990-interface-field-presyntax and 6997-where-in-key-presyntax (diags) ---
   # dg <code> <msg> <line> <col> <src> -- one `--dump-diags` error record.
   dg() {

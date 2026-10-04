@@ -9,7 +9,9 @@
 # from there, and nilWalk/rangeWalk from its END block), and
 # explainSwitchPostOpt/switchPostOptOk for the post-opt row. The identities
 # and the files they explain are documented in selfhost-ir-signatures.sh under
-# "Declared signatures"; both retire at the first repin after 0.36.0.
+# "Declared signatures"; both retire at the first repin after 0.36.0. Also here,
+# for the same ceiling: byteRange (#6558, an oracle-side rewrite, not a walk)
+# and explainTableSynthTypes (#6988, the `types` row).
 #
 # Both walk the oracle dump and the tree dump in lockstep under ONE oracle-to-
 # tree %id bijection per function (`same`, the #6730 walker's machinery), so a
@@ -200,6 +202,61 @@ function rangeWalk(    i, j, n, e) {
   }
   return n > 0 ? 1 : 0
 }
+# byteRange (#6558, `ir` and `iropt`) -- the 6558-string-from-byte-range
+# identity, declared in selfhost-ir-signatures.sh. #6558 lowers `string(b[lo:hi])`
+# to ONE `%t = rt_call string_from_byte_range(%b, %lo, %hi) string`; the 0.36.0
+# oracle emits `%s = rt_call slice_slice(%b, %lo, %hi) []u8`, then `%t =
+# rt_call string_from_bytes(%s) string` on the next line. byteRange rewrites the
+# ORACLE dump so each such adjacent pair, and only such a pair (%s named by no
+# other line of its function, %t = %s + 1), becomes the one call, and renumbers
+# every later %id of that function down by one (%t becomes %s), as the tree
+# numbers them. It
+# touches no other line and never the tree dump, so whatever remains must still
+# agree with the tree under every other check. Returns the number of pairs.
+# idUses -- the lines of oracle function [s, e] naming id x.
+function idUses(x, s, e,    k, n) {
+  n = 0
+  for (k = s; k <= e; k++) { if (match(linesA[k], x "([^0-9]|$)")) { n++ } }
+  return n
+}
+# shiftIds -- every %N of s with N > d printed as %(N - 1).
+function shiftIds(s, d,    out, t) {
+  out = ""
+  while (match(s, /%[0-9]+/)) {
+    t = substr(s, RSTART + 1, RLENGTH - 1) + 0
+    out = out substr(s, 1, RSTART - 1) "%" (t > d ? t - 1 : t)
+    s = substr(s, RSTART + RLENGTH)
+  }
+  return out s
+}
+# shiftLine -- shiftIds of a line; a line holding a string literal keeps its
+# text and only the id its `const_string` defines moves.
+function shiftLine(s, d,    n) {
+  if (index(s, "\"") == 0) { return shiftIds(s, d) }
+  if (!match(s, /^  %[0-9]+ = const_string "/)) { return s }
+  n = index(s, " = ")
+  return shiftIds(substr(s, 1, n - 1), d) substr(s, n)
+}
+# byteRangeAt -- collapse the pair at A[i], A[i + 1] when it is the shape above.
+function byteRangeAt(i,    a, t, args, s, e, k) {
+  if (linesA[i] !~ /^  %[0-9]+ = rt_call slice_slice\(%[0-9]+, %[0-9]+, %[0-9]+\) \[\]u8$/) { return 0 }
+  a = idOf(linesA[i]); t = idOf(linesA[i + 1])
+  if (t != "%" (substr(a, 2) + 1) || linesA[i + 1] != "  " t " = rt_call string_from_bytes(" a ") string") { return 0 }
+  for (s = i; s > 1 && linesA[s] !~ /^func /; s--) { }
+  for (e = i; e < nA && linesA[e + 1] !~ /^func /; e++) { }
+  if (idUses(a, s, e) != 2) { return 0 }
+  args = substr(linesA[i], index(linesA[i], "slice_slice(") + 12)
+  linesA[i] = "  " a " = rt_call string_from_byte_range(" substr(args, 1, index(args, ")") - 1) ") string"
+  for (k = i + 1; k < nA; k++) { linesA[k] = linesA[k + 1] }
+  delete linesA[nA]; nA--; e--
+  for (k = s; k <= e; k++) { linesA[k] = shiftLine(linesA[k], substr(a, 2) + 0) }
+  return 1
+}
+function byteRange(    i, n) {
+  n = 0
+  for (i = 1; i < nA; i++) { n += byteRangeAt(i) }
+  return n
+}
 '
 }
 
@@ -255,4 +312,36 @@ explainSwitchPostOpt() {
   [ "$(explainMismatch "$pre_o" "$pre_b" ir "$1")" = "7058-switch-case-range" ] || return 1
   switchPostOptOk "$pre_o" "$pre_b" "$2" "$3" || return 1
   printf '%s\n' "7058-switch-case-range-opt"
+}
+
+# explainTableSynthTypes <oracle_types> <tree_types> -- the
+# 6988-table-class-name-synth-shift signature over two `--dump-types` texts.
+# Prints its name and returns 0 when the dumps differ ONLY in the column of
+# synthesized @table members; else prints nothing, returns 1. #6988 adds the
+# word `__className` to the text the compiler synthesizes for an @table class,
+# ahead of `cols` and `__row`, so each of those members moves right by the
+# length of the word and its separating space (12). Identity: the dumps have
+# the same number of lines, at least one line differs, and every line that
+# differs is `L:C: cols: []string` or `L:C: __row: T` in the oracle and the
+# same text on the same line L at column C + 12 in the tree. A different name,
+# type, line or shift, or any other line that differs, fails it.
+explainTableSynthTypes() {
+  awk '
+    FNR == 1 { fi++ }
+    fi == 1 { a[++na] = $0; next }
+    { b[++nb] = $0 }
+    function tail(s) { sub(/^[0-9]+:[0-9]+: /, "", s); return s }
+    function pos(s, p,    t) { split(s, t, ":"); return t[p] + 0 }
+    END {
+      if (na != nb) { exit 1 }
+      for (i = 1; i <= na; i++) {
+        if (a[i] == b[i]) { continue }
+        if (a[i] !~ /^[0-9]+:[0-9]+: (cols: \[\]string|__row: [A-Za-z_][A-Za-z0-9_]*)$/) { exit 1 }
+        if (tail(a[i]) != tail(b[i]) || pos(a[i], 1) != pos(b[i], 1) || pos(b[i], 2) - pos(a[i], 2) != length("__className") + 1) { exit 1 }
+        n++
+      }
+      if (n == 0) { exit 1 }
+      print "6988-table-class-name-synth-shift"; exit 0
+    }
+  ' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
 }

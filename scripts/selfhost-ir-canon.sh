@@ -18,7 +18,9 @@
 # normalization. Source with `. scripts/selfhost-ir-canon.sh`, then call
 # canon_ir_ids on a string variable (not a stream, to keep call sites simple).
 canon_ir_ids() {
-  awk '
+  # LC_ALL=C: a dump can hold bytes that are not valid UTF-8 (a string literal);
+  # awk in a UTF-8 locale dies on them with `towc: multibyte conversion failure` (#6716).
+  LC_ALL=C awk '
     {
       line = $0
       out = ""
