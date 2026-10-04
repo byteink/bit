@@ -6,49 +6,93 @@
 // leave the reflected, pre-xorout state the table loops in crc32.bit and
 // crc32ieee.bit keep, so a caller hands the 8-byte blocks to the instruction
 // and the 0..7 byte tail to the software path with no conversion between.
-// CRC-32 IEEE on x86-64 stays on slicing-by-8.
 //
-// DETECTION, ONCE. `crc32Hw` caches which instruction this CPU has: on arm64
-// bit 3 of `bit_rt_crypto_hwcaps` (ABI.md §21c: `hw.optional.armv8_crc32` on
-// Darwin, `HWCAP_CRC32` on Linux), on x86-64 CPUID leaf 1 ECX bit 20
-// (SSE4.2). The CRC instruction is optional in ARMv8.0, so a core without it
-// takes the table path rather than faulting on the first `crc32cx`.
-// `bit_rt_port_syscalls_on_x64` is folded to the build target's answer
-// (compiler/opttarget.bit), so the untaken arch's arm is deleted.
+// THREE STREAMS. A CRC instruction waits on its own previous result (three
+// cycles on Apple M-series and Raptor Lake, one issued per cycle), so a single
+// chain runs at a third of the unit. `crc32c3Asm`/`crc32ieee3Asm` split each
+// 3 KiB block into three 1 KiB lanes with independent states A, B, C, then
+// join them: the state after the block is A*x^16384 + B*x^8192 + C mod P.
+// A carry-less multiply by K = x^(8n-33) mod P (bit-reflected) followed by
+// one CRC instruction from a zero state computes S*x^(8n) mod P for a 32-bit
+// state S, because the instruction multiplies its 64-bit operand by x^32 and
+// the reflected product sits one bit high, x^33 together. The join needs
+// `pmull` (arm64) or `pclmulqdq` (x86-64), so it is gated on that too.
+//
+// CRC-32 IEEE ON x86-64 has no instruction: with PCLMULQDQ it folds 64 bytes
+// per step into four 128-bit accumulators (`crc32ieeeFoldAsm`, the scheme of
+// Intel's "Fast CRC Computation for Generic Polynomials Using PCLMULQDQ"),
+// otherwise it stays on slicing-by-8.
+//
+// DETECTION, ONCE. `crc32Hw` caches what this CPU has: on arm64 bits 3 (CRC32)
+// and 1 (PMULL) of `bit_rt_crypto_hwcaps` (ABI.md §21c: `hw.optional.armv8_crc32`
+// on Darwin, `HWCAP_CRC32` on Linux), on x86-64 CPUID leaf 1 ECX bits 20
+// (SSE4.2) and 1 (PCLMULQDQ). The CRC instruction is optional in ARMv8.0, so a
+// core without it takes the table path rather than faulting on the first
+// `crc32cx`. `bit_rt_port_syscalls_on_x64` is folded to the build target's
+// answer (compiler/opttarget.bit), so the untaken arch's arm is deleted.
 //
 // ENCODING PROVENANCE. No text assembler exists in this compiler (SPEC §11.6);
 // every word and byte below was assembled from the mnemonic in its comment
 // with this Mac's toolchain (`as -arch arm64`, `clang -c -arch x86_64`) and
-// read back with `objdump -d`.
+// read back with `objdump -d`. The x64 payloads hold no `E8` byte and no `FF`
+// with a ModRM reg field of 2 or 3, so SPEC §11.6's call decoder reads none
+// of them as a call.
+//
+// VECTOR REGISTERS. `clobber` has no spelling for them, so the blocks that use
+// them (v0..v3 on arm64, xmm0..xmm7 on x64, all caller-saved) also name a
+// caller-saved integer register: that makes the block a clobber point, which
+// keeps every live value, a float included, out of the caller-saved file.
 //
 // CHUNKED FOR THE COLLECTOR. A block is opaque and holds no safepoint, so one
 // call covers at most `crcHwChunk` words (64 KiB): a multi-gigabyte buffer
 // still reaches the loop's back edge, and its safepoint, every few
 // microseconds.
+//
+// The join and fold constants are x^k mod P, checked against the polynomial
+// by crc32.test.bit and crc32ieee.test.bit.
 
 extern fn bit_rt_crypto_hwcaps(): uint
 extern fn bit_rt_port_syscalls_on_x64(): bool
 
-const crcHwC: int = 1    // CRC-32C instruction present
-const crcHwIeee: int = 2 // CRC-32 IEEE instruction present
+const crcHwC: int = 1     // CRC-32C instruction present
+const crcHwIeee: int = 2  // CRC-32 IEEE instruction present
+const crcHwClmul: int = 4 // carry-less multiply present (PMULL, PCLMULQDQ)
+const crcHwFold: int = 8  // x86-64 CRC-32 IEEE by PCLMULQDQ folding
 const crcHwChunk: int = 8192
+// Words per three-lane block: three lanes of 128 words. The 0x400/0x800 lane
+// offsets and the join constants in the asm blocks are fixed to it.
+const crcHw3Words: int = 384
+// Three-lane blocks per call: 21 * 384 = 8064 words, inside `crcHwChunk`.
+const crcHw3Max: int = 21
+// 64-byte blocks per fold call: 64 KiB.
+const crcFoldMax: int = 1024
 
 // Sentinel -1: not yet computed. Racing initializers are harmless: every
 // thread reads the same CPU and stores the same value.
 let crcHwCache: int = -1
 
-// The cached `crcHwC`/`crcHwIeee` mask for this CPU.
+// The cached `crcHw*` mask for this CPU.
 fn crc32Hw(): int {
   if (crcHwCache >= 0) {
     return crcHwCache
   }
   let caps = 0
   if (bit_rt_port_syscalls_on_x64()) {
-    if ((cpuidLeaf1Ecx() & 0x100000) != 0) {
+    let ecx = cpuidLeaf1Ecx()
+    if ((ecx & 0x100000) != 0) {
       caps = crcHwC
     }
-  } else if ((bit_rt_crypto_hwcaps() & 8) != 0) {
-    caps = crcHwC | crcHwIeee
+    if ((ecx & 2) != 0) {
+      caps = caps | crcHwClmul | crcHwFold
+    }
+  } else {
+    let hw = bit_rt_crypto_hwcaps()
+    if ((hw & 8) != 0) {
+      caps = crcHwC | crcHwIeee
+    }
+    if ((hw & 2) != 0) {
+      caps = caps | crcHwClmul
+    }
   }
   crcHwCache = caps
   return caps
@@ -68,11 +112,44 @@ fn cpuidLeaf1Ecx(): u64 {
 }
 
 // Folds the 8-byte blocks of `data` into the raw state `crc` with the CPU's
-// CRC-32C (`ieee` false) or CRC-32 (`ieee` true) instruction. The caller has
-// checked `crc32Hw()` for that variant; the tail `len(data) % 8` is its own.
+// CRC-32C (`ieee` false) or CRC-32 (`ieee` true) instruction: whole three-lane
+// blocks first when the join is available, the rest one stream. The caller
+// has checked `crc32Hw()` for that variant; the tail `len(data) % 8` is its
+// own.
 fn crc32HwBlocks(crc: u32, data: []byte, ieee: bool): u32 {
   let words = len(data) / 8
   let p = ptrOf(data)
+  if ((crc32Hw() & crcHwClmul) != 0) {
+    let blocks = words / crcHw3Words
+    crc = crc32Hw3(crc, p, blocks, ieee)
+    p = p + blocks * crcHw3Words * 8
+    words = words - blocks * crcHw3Words
+  }
+  crc = crc32Hw1(crc, p, words, ieee)
+  keepAlive(data)
+  return crc
+}
+
+// `blocks` three-lane blocks from `p`, `crcHw3Max` per asm call.
+fn crc32Hw3(crc: u32, p: *u8, blocks: int, ieee: bool): u32 {
+  while (blocks > 0) {
+    let k = blocks
+    if (k > crcHw3Max) {
+      k = crcHw3Max
+    }
+    if (ieee) {
+      crc = crc32ieee3Asm(crc, p, k)
+    } else {
+      crc = crc32c3Asm(crc, p, k)
+    }
+    p = p + k * crcHw3Words * 8
+    blocks = blocks - k
+  }
+  return crc
+}
+
+// `words` 8-byte blocks from `p` in one stream, `crcHwChunk` per asm call.
+fn crc32Hw1(crc: u32, p: *u8, words: int, ieee: bool): u32 {
   while (words > 0) {
     let k = words
     if (k > crcHwChunk) {
@@ -85,6 +162,25 @@ fn crc32HwBlocks(crc: u32, data: []byte, ieee: bool): u32 {
     }
     p = p + k * 8
     words = words - k
+  }
+  return crc
+}
+
+// Folds the 64-byte blocks of `data` into the raw CRC-32 IEEE state `crc` by
+// PCLMULQDQ; the tail `len(data) % 64` is the caller's. x86-64 only: the
+// caller has checked `crcHwFold`. Each call leaves a 64-bit remainder whose
+// CRC from a zero state is the new state.
+fn crc32ieeeFold(crc: u32, data: []byte): u32 {
+  let blocks = len(data) / 64
+  let p = ptrOf(data)
+  while (blocks > 0) {
+    let k = blocks
+    if (k > crcFoldMax) {
+      k = crcFoldMax
+    }
+    crc = crc32ieeeWord(0, crc32ieeeFoldAsm(crc, p, k))
+    p = p + k * 64
+    blocks = blocks - k
   }
   keepAlive(data)
   return crc
@@ -132,5 +228,223 @@ fn crc32ieeeAsm(crc: u32, p: *u8, words: int): u32 {
     input arm64 x2 x64 rdx = words
     clobber arm64 { x3, memory }
     clobber x64 { memory }
+  }
+}
+
+// `blocks` (> 0) three-lane blocks from `p` through `crc32cx` (arm64) or
+// `crc32 r64` (x86-64). Lane A carries `crc`, B and C start from zero; each
+// block ends with the join, A by K = x^16351 and B by K = x^8159 (mod P,
+// bit-reflected: 0xA51B6135, 0x170076FA).
+fn crc32c3Asm(crc: u32, p: *u8, blocks: int): u32 {
+  return asm {
+    arm64 {
+      0x528C26A9, // mov w9, #0x6135
+      0x72B4A369, // movk w9, #0xa51b, lsl #16
+      0x9E670122, // fmov d2, x9
+      0x528EDF49, // mov w9, #0x76fa
+      0x72A2E009, // movk w9, #0x1700, lsl #16
+      0x9E670123, // fmov d3, x9
+      0x52800007, // mov w7, #0x0
+      0x52800008, // mov w8, #0x0
+      0xD2801005, // mov x5, #0x80
+      0xF9420023, // ldr x3, [x1, #0x400]
+      0xF9440024, // ldr x4, [x1, #0x800]
+      0xF8408426, // ldr x6, [x1], #0x8
+      0x9AC65C00, // crc32cx w0, w0, x6
+      0x9AC35CE7, // crc32cx w7, w7, x3
+      0x9AC45D08, // crc32cx w8, w8, x4
+      0xF10004A5, // subs x5, x5, #0x1
+      0x54FFFF21, // b.ne -28
+      0x9E670000, // fmov d0, x0
+      0x9E6700E1, // fmov d1, x7
+      0x0EE2E000, // pmull v0.1q, v0.1d, v2.1d
+      0x0EE3E021, // pmull v1.1q, v1.1d, v3.1d
+      0x9E660000, // fmov x0, d0
+      0x9E660027, // fmov x7, d1
+      0x9AC05FE0, // crc32cx w0, wzr, x0
+      0x9AC75FE7, // crc32cx w7, wzr, x7
+      0x4A070000, // eor w0, w0, w7
+      0x4A080000, // eor w0, w0, w8
+      0x91200021, // add x1, x1, #0x800
+      0xF1000442, // subs x2, x2, #0x1
+      0x54FFFD21, // b.ne -92
+    }
+    x64 {
+      0x41, 0xBB, 0x35, 0x61, 0x1B, 0xA5,                         // mov r11d, 0xa51b6135
+      0x66, 0x49, 0x0F, 0x6E, 0xD3,                               // movq xmm2, r11
+      0x41, 0xBB, 0xFA, 0x76, 0x00, 0x17,                         // mov r11d, 0x170076fa
+      0x66, 0x49, 0x0F, 0x6E, 0xDB,                               // movq xmm3, r11
+      0x45, 0x31, 0xC0,                                           // xor r8d, r8d
+      0x45, 0x31, 0xC9,                                           // xor r9d, r9d
+      0x41, 0xBA, 0x80, 0x00, 0x00, 0x00,                         // mov r10d, 0x80
+      0xF2, 0x48, 0x0F, 0x38, 0xF1, 0x01,                         // crc32 rax, qword ptr [rcx]
+      0xF2, 0x4C, 0x0F, 0x38, 0xF1, 0x81, 0x00, 0x04, 0x00, 0x00, // crc32 r8, qword ptr [rcx + 0x400]
+      0xF2, 0x4C, 0x0F, 0x38, 0xF1, 0x89, 0x00, 0x08, 0x00, 0x00, // crc32 r9, qword ptr [rcx + 0x800]
+      0x48, 0x83, 0xC1, 0x08,                                     // add rcx, 0x8
+      0x49, 0xFF, 0xCA,                                           // dec r10
+      0x75, 0xDD,                                                 // jne -35
+      0x66, 0x48, 0x0F, 0x6E, 0xC0,                               // movq xmm0, rax
+      0x66, 0x49, 0x0F, 0x6E, 0xC8,                               // movq xmm1, r8
+      0x66, 0x0F, 0x3A, 0x44, 0xC2, 0x00,                         // pclmulqdq xmm0, xmm2, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xCB, 0x00,                         // pclmulqdq xmm1, xmm3, 0x0
+      0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+      0x66, 0x49, 0x0F, 0x7E, 0xC8,                               // movq r8, xmm1
+      0xF2, 0x4C, 0x0F, 0x38, 0xF1, 0xD0,                         // crc32 r10, rax
+      0x45, 0x31, 0xDB,                                           // xor r11d, r11d
+      0xF2, 0x4D, 0x0F, 0x38, 0xF1, 0xD8,                         // crc32 r11, r8
+      0x44, 0x89, 0xC8,                                           // mov eax, r9d
+      0x44, 0x31, 0xD0,                                           // xor eax, r10d
+      0x44, 0x31, 0xD8,                                           // xor eax, r11d
+      0x48, 0x81, 0xC1, 0x00, 0x08, 0x00, 0x00,                   // add rcx, 0x800
+      0x48, 0xFF, 0xCA,                                           // dec rdx
+      0x75, 0x8D,                                                 // jne -115
+    }
+    result arm64 x0 x64 rax : u32
+    input arm64 x0 x64 rax = crc
+    input arm64 x1 x64 rcx = p
+    input arm64 x2 x64 rdx = blocks
+    clobber arm64 { x3, x4, x5, x6, x7, x8, x9, memory }
+    clobber x64 { r8, r9, r10, r11, memory }
+  }
+}
+
+// `blocks` (> 0) three-lane blocks from `p` through `crc32x`, joined as in
+// `crc32c3Asm` with the CRC-32 IEEE constants x^16351 and x^8159 mod P
+// (0x7B4AA8B7, 0xBBF2F6D6). arm64 only: its x64 arm is `ud2`.
+fn crc32ieee3Asm(crc: u32, p: *u8, blocks: int): u32 {
+  return asm {
+    arm64 {
+      0x529516E9, // mov w9, #0xa8b7
+      0x72AF6949, // movk w9, #0x7b4a, lsl #16
+      0x9E670122, // fmov d2, x9
+      0x529EDAC9, // mov w9, #0xf6d6
+      0x72B77E49, // movk w9, #0xbbf2, lsl #16
+      0x9E670123, // fmov d3, x9
+      0x52800007, // mov w7, #0x0
+      0x52800008, // mov w8, #0x0
+      0xD2801005, // mov x5, #0x80
+      0xF9420023, // ldr x3, [x1, #0x400]
+      0xF9440024, // ldr x4, [x1, #0x800]
+      0xF8408426, // ldr x6, [x1], #0x8
+      0x9AC64C00, // crc32x w0, w0, x6
+      0x9AC34CE7, // crc32x w7, w7, x3
+      0x9AC44D08, // crc32x w8, w8, x4
+      0xF10004A5, // subs x5, x5, #0x1
+      0x54FFFF21, // b.ne -28
+      0x9E670000, // fmov d0, x0
+      0x9E6700E1, // fmov d1, x7
+      0x0EE2E000, // pmull v0.1q, v0.1d, v2.1d
+      0x0EE3E021, // pmull v1.1q, v1.1d, v3.1d
+      0x9E660000, // fmov x0, d0
+      0x9E660027, // fmov x7, d1
+      0x9AC04FE0, // crc32x w0, wzr, x0
+      0x9AC74FE7, // crc32x w7, wzr, x7
+      0x4A070000, // eor w0, w0, w7
+      0x4A080000, // eor w0, w0, w8
+      0x91200021, // add x1, x1, #0x800
+      0xF1000442, // subs x2, x2, #0x1
+      0x54FFFD21, // b.ne -92
+    }
+    x64 { 0x0F, 0x0B } // ud2
+    result arm64 x0 x64 rax : u32
+    input arm64 x0 x64 rax = crc
+    input arm64 x1 x64 rcx = p
+    input arm64 x2 x64 rdx = blocks
+    clobber arm64 { x3, x4, x5, x6, x7, x8, x9, memory }
+    clobber x64 { r8, r9, r10, r11, memory }
+  }
+}
+
+// `blocks` (> 0) 64-byte blocks from `p` folded into four 128-bit
+// accumulators with `crc` xored into the first, then down to one, then to the
+// 64-bit remainder M returned in rax, so that the CRC of M's 8 bytes from a
+// zero state is the new state. Fold constants are x^k mod P, bit-reflected and
+// shifted left one: by 512 bits x^544 and x^480, by 128 bits x^160 and x^96,
+// and the last 64 bits x^96 and x^64. x86-64 only: the arm64 arm is `udf #0`.
+fn crc32ieeeFoldAsm(crc: u32, p: *u8, blocks: int): u64 {
+  return asm {
+    arm64 { 0x00000000 } // udf #0
+    x64 {
+      0xF3, 0x0F, 0x6F, 0x01,                                     // movdqu xmm0, [rcx]
+      0xF3, 0x0F, 0x6F, 0x49, 0x10,                               // movdqu xmm1, [rcx + 0x10]
+      0xF3, 0x0F, 0x6F, 0x51, 0x20,                               // movdqu xmm2, [rcx + 0x20]
+      0xF3, 0x0F, 0x6F, 0x59, 0x30,                               // movdqu xmm3, [rcx + 0x30]
+      0x66, 0x0F, 0x6E, 0xE0,                                     // movd xmm4, eax
+      0x66, 0x0F, 0xEF, 0xC4,                                     // pxor xmm0, xmm4
+      0x48, 0x83, 0xC1, 0x40,                                     // add rcx, 0x40
+      0x49, 0xB8, 0xD4, 0x2B, 0x44, 0x54, 0x01, 0x00, 0x00, 0x00, // mov r8, 0x154442bd4
+      0x66, 0x49, 0x0F, 0x6E, 0xE0,                               // movq xmm4, r8
+      0x49, 0xB9, 0x96, 0x15, 0xE4, 0xC6, 0x01, 0x00, 0x00, 0x00, // mov r9, 0x1c6e41596
+      0x66, 0x49, 0x0F, 0x6E, 0xE9,                               // movq xmm5, r9
+      0x66, 0x0F, 0x6C, 0xE5,                                     // punpcklqdq xmm4, xmm5
+      0x48, 0xFF, 0xCA,                                           // dec rdx
+      0x74, 0x7C,                                                 // je +124
+      0x66, 0x0F, 0x6F, 0xF8,                                     // movdqa xmm7, xmm0
+      0x66, 0x0F, 0x3A, 0x44, 0xC4, 0x00,                         // pclmulqdq xmm0, xmm4, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
+      0xF3, 0x0F, 0x6F, 0x31,                                     // movdqu xmm6, [rcx]
+      0x66, 0x0F, 0xEF, 0xC7,                                     // pxor xmm0, xmm7
+      0x66, 0x0F, 0xEF, 0xC6,                                     // pxor xmm0, xmm6
+      0x66, 0x0F, 0x6F, 0xF9,                                     // movdqa xmm7, xmm1
+      0x66, 0x0F, 0x3A, 0x44, 0xCC, 0x00,                         // pclmulqdq xmm1, xmm4, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
+      0xF3, 0x0F, 0x6F, 0x71, 0x10,                               // movdqu xmm6, [rcx + 0x10]
+      0x66, 0x0F, 0xEF, 0xCF,                                     // pxor xmm1, xmm7
+      0x66, 0x0F, 0xEF, 0xCE,                                     // pxor xmm1, xmm6
+      0x66, 0x0F, 0x6F, 0xFA,                                     // movdqa xmm7, xmm2
+      0x66, 0x0F, 0x3A, 0x44, 0xD4, 0x00,                         // pclmulqdq xmm2, xmm4, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
+      0xF3, 0x0F, 0x6F, 0x71, 0x20,                               // movdqu xmm6, [rcx + 0x20]
+      0x66, 0x0F, 0xEF, 0xD7,                                     // pxor xmm2, xmm7
+      0x66, 0x0F, 0xEF, 0xD6,                                     // pxor xmm2, xmm6
+      0x66, 0x0F, 0x6F, 0xFB,                                     // movdqa xmm7, xmm3
+      0x66, 0x0F, 0x3A, 0x44, 0xDC, 0x00,                         // pclmulqdq xmm3, xmm4, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
+      0xF3, 0x0F, 0x6F, 0x71, 0x30,                               // movdqu xmm6, [rcx + 0x30]
+      0x66, 0x0F, 0xEF, 0xDF,                                     // pxor xmm3, xmm7
+      0x66, 0x0F, 0xEF, 0xDE,                                     // pxor xmm3, xmm6
+      0x48, 0x83, 0xC1, 0x40,                                     // add rcx, 0x40
+      0x48, 0xFF, 0xCA,                                           // dec rdx
+      0x75, 0x84,                                                 // jne -124
+      0x49, 0xB8, 0xD0, 0x97, 0x19, 0x75, 0x01, 0x00, 0x00, 0x00, // mov r8, 0x1751997d0
+      0x66, 0x49, 0x0F, 0x6E, 0xE0,                               // movq xmm4, r8
+      0x49, 0xB9, 0x9E, 0x00, 0xAA, 0xCC, 0x00, 0x00, 0x00, 0x00, // mov r9, 0xccaa009e
+      0x66, 0x49, 0x0F, 0x6E, 0xE9,                               // movq xmm5, r9
+      0x66, 0x0F, 0x6C, 0xE5,                                     // punpcklqdq xmm4, xmm5
+      0x66, 0x0F, 0x6F, 0xF8,                                     // movdqa xmm7, xmm0
+      0x66, 0x0F, 0x3A, 0x44, 0xC4, 0x00,                         // pclmulqdq xmm0, xmm4, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
+      0x66, 0x0F, 0xEF, 0xC7,                                     // pxor xmm0, xmm7
+      0x66, 0x0F, 0xEF, 0xC1,                                     // pxor xmm0, xmm1
+      0x66, 0x0F, 0x6F, 0xF8,                                     // movdqa xmm7, xmm0
+      0x66, 0x0F, 0x3A, 0x44, 0xC4, 0x00,                         // pclmulqdq xmm0, xmm4, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
+      0x66, 0x0F, 0xEF, 0xC7,                                     // pxor xmm0, xmm7
+      0x66, 0x0F, 0xEF, 0xC2,                                     // pxor xmm0, xmm2
+      0x66, 0x0F, 0x6F, 0xF8,                                     // movdqa xmm7, xmm0
+      0x66, 0x0F, 0x3A, 0x44, 0xC4, 0x00,                         // pclmulqdq xmm0, xmm4, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
+      0x66, 0x0F, 0xEF, 0xC7,                                     // pxor xmm0, xmm7
+      0x66, 0x0F, 0xEF, 0xC3,                                     // pxor xmm0, xmm3
+      0x66, 0x48, 0x0F, 0x7E, 0xC2,                               // movq rdx, xmm0
+      0x66, 0x0F, 0x73, 0xD8, 0x08,                               // psrldq xmm0, 0x8
+      0x89, 0xD0,                                                 // mov eax, edx
+      0x48, 0xC1, 0xEA, 0x20,                                     // shr rdx, 0x20
+      0x66, 0x48, 0x0F, 0x6E, 0xC8,                               // movq xmm1, rax
+      0x66, 0x48, 0x0F, 0x6E, 0xD2,                               // movq xmm2, rdx
+      0x66, 0x0F, 0x3A, 0x44, 0xCC, 0x10,                         // pclmulqdq xmm1, xmm4, 0x10
+      0x49, 0xB8, 0x24, 0x61, 0xCD, 0x63, 0x01, 0x00, 0x00, 0x00, // mov r8, 0x163cd6124
+      0x66, 0x49, 0x0F, 0x6E, 0xD8,                               // movq xmm3, r8
+      0x66, 0x0F, 0x3A, 0x44, 0xD3, 0x00,                         // pclmulqdq xmm2, xmm3, 0x0
+      0x66, 0x0F, 0xEF, 0xC1,                                     // pxor xmm0, xmm1
+      0x66, 0x0F, 0xEF, 0xC2,                                     // pxor xmm0, xmm2
+      0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+    }
+    result arm64 x0 x64 rax : u64
+    input arm64 x0 x64 rax = crc
+    input arm64 x1 x64 rcx = p
+    input arm64 x2 x64 rdx = blocks
+    clobber arm64 { x3, memory }
+    clobber x64 { r8, r9, memory }
   }
 }
