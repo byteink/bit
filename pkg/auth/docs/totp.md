@@ -16,9 +16,9 @@ codes:
 ```bit
 import { generateSecret, provisioningUri } from "auth"
 
-fn enrollTwoFactor(userEmail: string): (string, string) {
+fn enrollTwoFactor(userEmail: string): (string, string)! {
   let secret = generateSecret()
-  let uri = provisioningUri(secret, "Inkwell", userEmail)
+  let uri = provisioningUri(secret, "Inkwell", userEmail)?
   return (secret.base32(), uri)
 }
 ```
@@ -241,11 +241,30 @@ fn eightDigitCode(secretBase32: string, unixSeconds: int): string! {
 }
 ```
 
-`provisioningUriWith` takes the matching `digits`/`period` for the QR
-code - but most authenticator apps ignore those fields and always assume
-6 digits/30 seconds, so a non-default `Algorithm` will not work with a
-generic authenticator app in practice; it exists for server-to-server TOTP,
-not for a user's phone.
+The QR code advertises the same `digits`/`period` through the optional
+last argument of `provisioningUri`, a `ProvisioningOptions`:
+
+```bit
+import { ProvisioningOptions, generateSecret, provisioningUri } from "auth"
+
+fn eightDigitUri(userEmail: string): string! {
+  let secret = generateSecret()
+  return provisioningUri(
+    secret,
+    "Inkwell",
+    userEmail,
+    ProvisioningOptions{ digits = 8, period = 30 },
+  )?
+}
+```
+
+`ProvisioningOptions{}` is 6 digits and 30 seconds, the default. `digits`
+outside 6..8 or a `period` of 0 or less is a mistake in your code, so the
+call fails with an error instead of printing a URI no app can use. Most
+authenticator apps ignore those fields and always assume 6 digits/30
+seconds, so a non-default `Algorithm` will not work with a generic
+authenticator app in practice; it exists for server-to-server TOTP, not for
+a user's phone.
 
 ## Sharp edges
 
