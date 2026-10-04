@@ -1753,14 +1753,14 @@ argument (#6280).**
 **`pkg/orm`'s `Repo<T>` - a compile-time check on the primary key.**
 
 - `pkg/orm/db.bit` declares `db.table<T: Tabled>(): Repo<T>` -
-  `Repo<T>.find`/`update`/`delete` (`pkg/orm/repo.bit`) each need exactly one
-  primary-key column: `T`'s own `@id` field, or its default (this section's
-  own "a field named `id` is the primary key by default" rule) - the same
-  key `find`/`delete` bind their argument against and `update` writes its
-  `WHERE` by.
+  `Repo<T>.find`/`delete` (`pkg/orm/repo.bit`) need exactly one primary-key
+  column: `T`'s own `@id` field, or its default (this section's own "a field
+  named `id` is the primary key by default" rule); `update` writes its
+  `WHERE` from every `@id` column, so it accepts a composite key too.
 - **A `T` with no single primary key - zero, or a composite key of more than
-  one `@id` field - at a `Repo<T>.find`/`update`/`delete` call site is
-  E0180**, naming `T`, whenever `T` is concrete at that call - reached
+  one `@id` field - at a `Repo<T>.find`/`delete` call site, or with no
+  primary key at all at a `Repo<T>.update` call site, is E0180**, naming `T`,
+  whenever `T` is concrete at that call - reached
   through `db.table<T>()`'s own resolved instantiation, never a syntactic
   type argument at the `find`/`update`/`delete` call itself (unlike E0163
   above, this check follows the receiver's own type through a local
