@@ -12,7 +12,7 @@ one directory per case with the request (`request.txt`), the signing context
 and signed request for the header flavour (`header-*.txt`) and the query
 flavour (`query-*.txt`).
 
-`pkg/s3/sigv4suite.test.bit` runs every case's `header-*` files through
+`pkg/aws/sigv4suite.test.bit` runs every case's `header-*` files through
 `signV4` (#6582). The `query-*` files are consumed by the presign signer
 (#6610).
 

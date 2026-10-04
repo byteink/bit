@@ -49,7 +49,10 @@ addresses objects path-style (`${endpoint}/${bucket}/${key}`), which every
 target it is built for accepts - AWS S3, Cloudflare R2, MinIO, Backblaze B2,
 DigitalOcean Spaces, and Google Cloud Storage's XML API. Requests are signed
 with AWS Signature Version 4 automatically; nothing about the credential or
-the signing shows up in the calls above.
+the signing shows up in the calls above. The signing, the credential types and
+the shared config profiles live in [`pkg/aws`](../../aws/docs/README.md), which
+this package depends on; a program that builds its own `AwsCredential` or reads
+a profile imports them from `"aws"`, not from `"s3"`.
 
 ## Checking and removing an object
 
@@ -439,12 +442,12 @@ import {
   ChecksumPlacement,
   ChecksumPlan,
   Checksums,
-  SigHeader,
   checksumHeaders,
   checksumOf,
   parseChecksums,
   planChecksum,
 } from "s3"
+import { SigHeader } from "aws"
 
 fn describePlan(plan: ChecksumPlan): string {
   return match (plan.placement) {
@@ -525,5 +528,5 @@ for an interface of your own with this package behind one implementation -
 
 ## Specification
 
-SigV4 signing follows AWS's "Signature Version 4 signing process"; this
-package's own conformance is checked against AWS's published test suite.
+SigV4 signing follows AWS's "Signature Version 4 signing process"; its
+conformance is checked against AWS's published test suite in `pkg/aws`.
