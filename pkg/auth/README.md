@@ -110,6 +110,11 @@ protected route that is not itself doing the authenticating just reads
   only as a SHA-256 hash, bound to a purpose, expiring, redeemed once, with a
   pluggable store and the `Deliver` function the app supplies to send them; see
   [One-time tokens for account emails](docs/account-tokens.md).
+- `generateRecoveryCodes`, `RecoveryOptions`, `RecoverySet`,
+  `redeemRecoveryCode`, `RedeemOptions`, `RecoveryRedeem` - single-use
+  recovery codes for a lost authenticator: generated from the CSPRNG, stored
+  as Argon2id hashes, redeemed at the cost of one hash, optionally throttled
+  with a `LoginThrottle`, and replaced wholesale by regenerating.
 
 Every one of these is used in a full example in [`docs/`](docs/README.md),
 along with the security properties this package enforces (PKCE, constant-time
