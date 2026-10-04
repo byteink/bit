@@ -85,50 +85,45 @@ const acEntries = 64
 
 // Words per entry, and the same figure in bytes. 64 words = 512 bytes = eight
 // whole cache lines, so no two threads' entries share one. The entry uses 45 of
-// them: 5 header words, which only a claim or a rebind writes, then 8 dead
-// words, then one head per class and 3 accounting words, which its owner
-// writes on every allocation. Even a table base that is only 8-byte aligned
-// leaves 11 dead words between one entry's last live word and the next
-// entry's first — false sharing is impossible without depending on the
-// block's alignment.
+// them: 4 header words, which only a claim, a rebind or a walk's fall to the
+// probe writes, then 8 dead words, then one head per class and 4 accounting
+// words. Even a table base that is only 8-byte aligned leaves 11 dead words
+// between one entry's last live word and the next entry's first — false
+// sharing is impossible without depending on the block's alignment.
 const acEntryWords = 64
 const acEntryBytes = 512
 
 // THE HEADER SITS 8 WORDS CLEAR OF EVERY WORD THE OWNER WRITES PER ALLOCATION
 // (#7139), on both sides and across the boundary into the next entry, so the
 // 64-byte line holding `acOwner` and `acHeap` holds no such word whatever the
-// table's alignment. Other threads read those two words: `allocCacheEntry`
+// table's alignment. Other threads read those two words: `allocCacheWalk`
 // walks past entries it does not own when another thread holds its home.
 // With the heads from word 3, `acOwner` shared a line with the heads of the
 // five smallest classes, so a thread whose home another held took a coherence
-// miss on its own fast path whenever that thread popped one. `acOwner` stays word 0: AArch64's
-// `ldar` takes no offset, so any other word would cost the home hit an `add`.
+// miss on its own fast path whenever that thread popped one. `acOwner` stays
+// word 0: AArch64's `ldar` takes no offset, so any other word would cost the
+// home hit an `add`.
 const acOwner = 0 // `gcThreadToken()` of the owning OS thread, 0 when free
 const acHeap = 1  // `*(g + gcHeapAddr)` these slots were taken from, 0 when none
 const acLock = 2  // `*(g + gcHeapLockAddr)` for that heap, so a drain can lock it
 
-// #5821: the collector block (`g`) `acObjs` is owed to. It exists because the
-// count lives in `g` and the drain (`allocCacheDrainInto`) is reached with no
-// `g` in hand; it is bound beside `acHeap` and cleared beside it.
-const acGc = 3
-
-// #7139: how many times `allocCacheFor` bound this entry, which only
-// `allocCacheProbe` does: once per claim and once per heap rebind, never in
-// the steady state. `gcAllocCacheSlowHits` reads it for
+// #7139: how many times `allocCacheWalk` fell through to `allocCacheProbe` for
+// the thread this entry binds: once per claim and once per heap rebind, never
+// in the steady state. `gcAllocCacheSlowHits` reads it for
 // `_tests_/stress/thread/alloccollide`.
-const acSlow = 4
+const acSlow = 3
 
-const acHeads = 13 // `acHeads + idx`: head of class `idx`'s cached chain
+const acHeads = 12 // `acHeads + idx`: head of class `idx`'s cached chain
 
 // #5472: bytes this thread may still allocate before it must read the SHARED
-// collection trigger again. `acHeads + allocNumClasses` = 13 + 37 = 50, the
+// collection trigger again. `acHeads + allocNumClasses` = 12 + 37 = 49, the
 // first word past the class heads and still inside the same 512-byte entry, so
 // it is private to the owning OS thread by exactly the argument the heads are
 // (see `acOwner`) and shares no line with another thread's.
-const acBudget = 50
+const acBudget = 49
 
 // #5709: bytes this thread has popped out of its own cache and not yet added to
-// the SHARED `heapLiveWord`. Word 51, so private by exactly the argument
+// the SHARED `heapLiveWord`. Word 50, so private by exactly the argument
 // `acBudget` above is and inside the same 512-byte entry.
 //
 // WHAT IS OWED IS BOUNDED BY THE BUDGET, not by the cache's capacity, and that
@@ -141,12 +136,17 @@ const acBudget = 50
 // Under `BIT_GC=stress` `gcTriggerBudget` answers 0, so the flush runs on every
 // allocation and the shared word is never behind at all — which is the state
 // every stress oracle that reads `gcLiveBytes` was written against.
-const acLive = 51
+const acLive = 50
 
 // #5821: objects this thread has allocated and not yet added to the SHARED
-// `gcNumObjectsIdx`, owed to `acGc`. Word 52, private by the argument
-// `acBudget` gives.
-const acObjs = 52
+// `gcNumObjectsIdx`, and the collector block (`g`) they are owed to. Words 51
+// and 52, private by the argument `acBudget` gives. `acGc` exists because the
+// count lives in `g` and the drain (`allocCacheDrainInto`) is reached with no
+// `g` in hand; it is bound beside `acHeap` and cleared beside it. It stays
+// past the heads, as before #7139, so every displacement that reaches it keeps
+// its x86-64 encoding and no instruction after it moves.
+const acObjs = 51
+const acGc = 52
 
 // Classes a thread caches: every class of at most `acMaxBytes / 2` bytes, so a
 // cached class always yields at least two slots per refill. Above that an
@@ -184,31 +184,6 @@ const acProbes = 4
 // The table itself. `acEntries * acEntryWords`; an array length must be a
 // literal, so the two cannot be written as one.
 let allocCacheBlock: [4096]i64
-
-// The `acSlow` count of `token`'s entry, or -1 when it holds none. For
-// `_tests_/stress/thread/alloccollide`, which proves a thread whose home another
-// thread holds never takes `allocCacheProbe` once its entry is bound.
-export @nosplit fn gcAllocCacheSlowHits(token: int): int {
-  let home = allocCacheHome(token)
-  let i = 0
-  // Bounded: exactly `acProbes` iterations.
-  while (i < acProbes) {
-    let idx = (home + i) & (acEntries - 1)
-    let e = wordAt(int(ptrOf(allocCacheBlock)) + idx * acEntryBytes)
-    if (atomicLoad(e + acOwner) == token) {
-      return *(e + acSlow)
-    }
-    i = i + 1
-  }
-  return -1
-}
-
-// Claim or find `token`'s entry for `g`'s heap, exactly as the thread whose
-// token it is would. The hook that lets one thread take another's home
-// (`_tests_/stress/thread/alloccollide`).
-export @nosplit fn gcAllocCacheClaimFor(g: *i64, token: int): int {
-  return allocCacheProbe(g, token, allocCacheHome(token))
-}
 
 // Nonzero once the heap lock has been found HELD by another thread, which is
 // the only condition this cache exists for and the only one in which it pays.
@@ -284,13 +259,14 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
 // 6-push frame and 28 x86-64 instructions per allocation, and holding the
 // token live across it cost three stack reloads in the hash.
 //
-// A THREAD WHOSE HOME ANOTHER THREAD HOLDS TAKES `allocCacheWalk` (#7139), and
-// that is an accident of layout, not of load: worker tokens sit a multiple of
-// 256 KiB apart, so two share a home when their mappings land a multiple of
-// 4 MiB apart, about one process start in 16 for two workers (#7130). The walk
-// stays out of line ON PURPOSE: written inline, its loop took two more
-// callee-saved registers, and their pushes and pops landed on the home hit
-// that answers every other thread.
+// A THREAD WHOSE HOME ANOTHER THREAD HOLDS TAKES `allocCacheWalk` (#7139,
+// ./walkcache.bit, which says why it lives there), and that is an accident of
+// layout, not of load: worker tokens sit a multiple of 256 KiB apart, so two
+// share a home when their mappings land a multiple of 4 MiB apart, about one
+// process start in 16 for two workers (#7130). The walk stays out of line ON
+// PURPOSE: written inline, its loop took two more callee-saved registers, and
+// their pushes and pops landed on the home hit that answers every other
+// thread.
 @nosplit fn allocCacheEntry(g: *i64): int {
   if (worldBlockAddr() == 0) {
     return 0
@@ -316,29 +292,6 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
 // build (§11.1).
 @nosplit fn allocCacheHome(token: int): int {
   return ((token >> 4) ^ (token >> 10) ^ (token >> 16)) & (acEntries - 1)
-}
-
-// `allocCacheEntry` past the home entry: this thread's entry among the other
-// `acProbes - 1` when it is bound to `g`'s heap, else `allocCacheProbe`, which
-// starts again at probe 0, so the answer is the one its loop alone gives. AN
-// ENTRY IS NEVER RELEASED, so the positions before this thread's own stay
-// owned by other threads and the walk always reaches it: the claim walked the
-// same positions in the same order. Before #7139 such a thread took
-// `allocCacheProbe` and, from it, `allocCacheFor` on every allocation; this is
-// one call with no exchange and no store.
-@nosplit fn allocCacheWalk(g: *i64, token: int, home: int): int {
-  let base = int(ptrOf(allocCacheBlock))
-  let i = 1
-  // Bounded: `acProbes - 1` iterations.
-  while (i < acProbes) {
-    let addr = base + ((home + i) & (acEntries - 1)) * acEntryBytes
-    let e = wordAt(addr)
-    if (atomicLoad(e + acOwner) == token && *(e + acHeap) == *(g + gcHeapAddr)) {
-      return addr
-    }
-    i = i + 1
-  }
-  return allocCacheProbe(g, token, home)
 }
 
 // `allocCacheEntry`'s probe: this thread's entry among the `acProbes` from
@@ -370,7 +323,6 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
 // out of a DIFFERENT one, which is what `_tests_/stress` programs do when they
 // tear one heap down and stand the next one up on the same thread.
 @nosplit fn allocCacheFor(e: *i64, g: *i64, addr: int): int {
-  *(e + acSlow) = *(e + acSlow) + 1
   let heapAddr = *(g + gcHeapAddr)
   if (*(e + acHeap) != heapAddr) {
     allocCacheDrainInto(e, *(e + acHeap), *(e + acLock))
