@@ -1,0 +1,117 @@
+// Retaking a worker that is blocked in the kernel (#7128), Go's sysmon `retake`
+// for this scheduler. A task that blocks its worker's OS thread in a bracketed
+// syscall (`gcSyscallBegin` / `gcBlockingBegin`: a file read, `waitpid`, a
+// blocking DNS call) leaves that worker's ring and next-run slot with nobody to
+// run them. At one worker that is the whole process: two tasks spawned just
+// before a 500 ms `waitpid` started 500 ms late. `schedGrowObserveLocal`'s
+// streak could not help, because it needs `growStreakThreshold` tasks queued at
+// spawn time and 1-3 stranded tasks never get there.
+//
+// THE POLICY. The monitor thread calls `rootRetakeScan` (`../root/retake.bit`)
+// once per tick. That function reads, per worker, whether the collector's
+// registry shows the worker's thread in a syscall or blocked bracket, and hands
+// the answer here as a bit mask. A worker counts as blocked when the mask has
+// its bit AND it has a task in flight (`startTick`, `./preempt.bit`): an idle
+// worker parks under `gcBlockingBegin` too, and is not stuck. It must stay
+// blocked for `retakeTicks` consecutive ticks, so a short syscall never earns a
+// thread, and its ring or next-run slot must be non-empty. The global queue
+// counts only when EVERY started worker is blocked, because otherwise a running
+// peer will pop it. A parked peer is woken instead of growing: that is the
+// reuse-before-start rule, no thread churn.
+//
+// WHAT IT DOES NOT DO ITSELF. It starts no thread: it latches `scGrowStreak` to
+// the threshold, the same word the backlog observers use, and returns the number
+// of retake-eligible workers. The caller then runs the existing grow recipe
+// (`schedGrowArm` / `threadStart` / `schedGrowCommit`), so the `schedMaxWorkers`
+// refusal, the `scStopping` refusal and the `scRegLock` serialisation are the
+// same code a worker-driven grow uses.
+//
+// `BIT_WORKERS`, like GOMAXPROCS, bounds RUNNING workers: a worker blocked in a
+// bracketed syscall does not count against it. The caller passes
+// `ceiling + eligible` to `schedGrowArm`, so an explicit `BIT_WORKERS=1` still
+// refuses to grow past one RUNNING worker, and a second blocked worker earns a
+// third thread only when two are blocked. The pool never shrinks, so when the
+// blocked worker returns its thread keeps running: the pool is then larger than
+// the ceiling until the process exits (ABI.md section 9).
+//
+// COST. Nothing on the spawn or dispatch path changes. Per monitor tick (2 ms,
+// and only while a task is in flight; the monitor parks otherwise) this is one
+// pass over the started workers, at most `preemptSlots` = 32, each costing one
+// load of its `startTick` and one of its age cell, plus the root-side mask pass
+// (one load of the worker's slot word and one of its registry state).
+
+// Consecutive monitor ticks a worker must be seen blocked before it is retaken.
+// Three samples 2 ms apart mean at least 4 ms in the kernel and at most 6 ms:
+// two would let a loop of sub-millisecond reads that happens to be sampled
+// inside the bracket twice in a row earn a thread, three makes that a rarity.
+export const retakeTicks: i64 = 3
+
+// How many consecutive ticks worker `w` has been seen blocked with a task in
+// flight; 0 when it was not seen blocked on the last tick. Written only by the
+// monitor thread.
+let blockedAge: [32]i64
+
+// Update every worker's age from `mask` (bit `w` set: worker `w`'s thread is
+// inside a syscall or blocked bracket) and return how many are at or past
+// `retakeTicks`.
+@nosplit fn retakeAges(s: *i64, mask: int): int {
+  let n = atomicLoad(s + scNWorkers)
+  if (n > preemptSlots) {
+    n = preemptSlots
+  }
+  let aged = 0
+  let w = 0
+  while (w < n) {
+    let age = ptrOf(blockedAge) + w
+    if (((mask >> w) & 1) == 0 || atomicLoad(slotAddr(ptrOf(startTick), w)) == 0) {
+      *age = 0
+    } else {
+      *age = *age + 1
+      if (*age >= retakeTicks) {
+        aged = aged + 1
+      }
+    }
+    w = w + 1
+  }
+  return aged
+}
+
+// Whether some retake-eligible worker has work behind it: its ring or next-run
+// slot, or the global queue when every started worker is eligible.
+@nosplit fn retakeStranded(s: *i64, aged: int): bool {
+  let n = atomicLoad(s + scNWorkers)
+  if (n > preemptSlots) {
+    n = preemptSlots
+  }
+  if (aged >= n && gqNonEmpty(s + scGlobal)) {
+    return true
+  }
+  let w = 0
+  while (w < n) {
+    let wk = schedWorkerAt(s, w)
+    if (*(ptrOf(blockedAge) + w) >= retakeTicks &&
+      (dqDepthOrZero(wk + wkDeque) > 0 || rnNonEmpty(wk))) {
+      return true
+    }
+    w = w + 1
+  }
+  return false
+}
+
+// The monitor thread's per-tick retake decision. Returns 0 when nothing should
+// be started; otherwise the number of retake-eligible workers, with
+// `scGrowStreak` latched so `schedGrowArm` will accept the attempt.
+export @nosplit @symbol("bit_rt_port_sched_retake_scan") fn schedRetakeScan(
+  s: *i64,
+  mask: int,
+): int {
+  let aged = retakeAges(s, mask)
+  if (aged == 0 || !retakeStranded(s, aged)) {
+    return 0
+  }
+  if (schedWakeParkedPeer(s)) {
+    return 0
+  }
+  atomicStore(s + scGrowStreak, growStreakThreshold)
+  return aged
+}

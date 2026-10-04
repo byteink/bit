@@ -2463,12 +2463,25 @@ calls `boot`, and exits the process with `boot`'s returned code.
    existed before multi-worker support landed, and exists so a suspected
    concurrency failure can be bisected against it without a rebuild. An
    explicit `BIT_WORKERS` is ALSO a hard ceiling on growth, so `BIT_WORKERS=1`
-   now keeps the pool at exactly one worker for the life of the run rather
-   than merely starting it there — the earlier behaviour (growth ignoring
+   now keeps the pool at exactly one RUNNING worker rather than merely
+   starting it there — the earlier behaviour (growth ignoring
    which count started the pool) is no longer accurate for an explicit
    setting. The implicit default (no
    `BIT_WORKERS` set at all) is unchanged: it still starts at 1 and grows
    under sustained backlog exactly as before.
+
+   **`BIT_WORKERS` bounds RUNNING workers, like Go's GOMAXPROCS (#7128).** A
+   worker whose task is inside a `bit_rt_gc_syscall_begin` /
+   `bit_rt_gc_blocking_begin` bracket (a file read, `waitpid`, a blocking
+   DNS call) does not count against it: the monitor thread starts one more
+   worker for the work queued behind it (see "Retaking a blocked worker"
+   under Preemption below), so at `BIT_WORKERS=1` a 500 ms `waitpid` no longer
+   stalls every other task. The pool never shrinks, so once the blocked
+   worker returns its thread keeps running tasks beside the replacement:
+   after a retake the pool is larger than the ceiling for the rest of the
+   process, by at most the number of workers that were blocked at the same
+   time. Linux and darwin; Windows does not grow its pool (#4326), so a
+   blocked worker there still strands its queue.
 3. Spawn `main_fn` (§10) as the first green thread.
 4. Poll (bounded exponential backoff) until that task reports done, then shut
    the scheduler down, tear down the collector, and return the task's exit
@@ -2604,6 +2617,30 @@ call point keeps running regardless of `requested`'s value.
 constant, read from no environment variable. The only worker-related
 environment knob is `BIT_WORKERS`, above; nothing else in the environment
 controls worker count or preemption.
+
+**Retaking a blocked worker (#7128; darwin and linux).** A task that blocks
+its worker's OS thread inside a `bit_rt_gc_syscall_begin` /
+`bit_rt_gc_blocking_begin` bracket leaves that worker's ring and next-run slot
+with nobody to run them; at one worker that is the whole process. After each
+`sysmonTick`, `sysmonRun` calls `rootRetakeScan` (`runtime/root/retake.bit`),
+which reads each worker's registry state (the slot the worker recorded in
+`wkSlot` at entry) and hands a mask to `schedRetakeScan`
+(`runtime/sched/retake.bit`). A worker counts when the mask has its bit, it has
+a task in flight (`startTick`; an idle worker parks under `gcBlockingBegin`
+too), and it has been seen so on `retakeTicks` (3) consecutive ticks, i.e. 4 to
+6 ms. If such a worker has a non-empty ring or next-run slot, or every started
+worker is blocked and the global queue is non-empty, then a parked peer is
+woken if there is one; otherwise `scGrowStreak` is latched and the monitor
+thread runs the same `schedGrowArm` / `threadStart` / `schedGrowCommit`
+recipe a worker uses (`tryGrowPoolAt`), with the explicit `BIT_WORKERS`
+ceiling widened by the number of blocked workers. `schedMaxWorkers` and
+`scStopping` refuse as ever, and no thread is created while a parked worker
+exists. Measured on darwin arm64 at 23af4e0ca: stranded tasks start 7.1-7.6 ms after spawn
+at the default pool and at `BIT_WORKERS=1` (500 ms before). A syscall that
+is not bracketed is not seen: the collector would already be waiting on that
+thread. The spawn and dispatch paths are unchanged; the monitor's extra work is
+one pass over the started workers per tick (at most 32), and the monitor still
+parks when no task is in flight.
 
 ### Spawn
 
@@ -3760,8 +3797,11 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
 **These calls block their worker's OS thread for the syscall's duration, and
 that is not a netpoller gap.** POSIX has no non-blocking read of a regular file:
 `epoll`/`kqueue` always report one as ready. The netpoller (§11) exists for
-sockets and pipes. A file read therefore stalls one worker, never the process —
-other green threads on other workers keep running.
+sockets and pipes. A file read therefore stalls one worker: other green threads on other
+workers keep running, and the tasks queued behind it on its own worker are
+retaken within a few milliseconds by a new worker started from the monitor
+thread (§9, "Retaking a blocked worker", #7128). On Windows, whose pool does
+not grow, they wait for the read.
 
 ---
 
