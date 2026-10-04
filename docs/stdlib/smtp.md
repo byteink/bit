@@ -184,6 +184,8 @@ The body shape follows what the message carries, with no empty wrappers:
 | text + HTML | `multipart/alternative` |
 | text (+ HTML) + `addAlternative` parts | `multipart/alternative` |
 | text (+ HTML, alternatives) + attachments | `multipart/mixed` |
+| text + HTML + `addInline` parts | `multipart/alternative` holding `text/plain` and a `multipart/related` of the HTML and the inline parts |
+| the same + attachments | `multipart/mixed` wrapping that `multipart/alternative`, then the attachments |
 
 ### `Address`
 
@@ -347,6 +349,39 @@ optionally followed by `; name=value` parameters (the value a token or a
 quoted string), with no CR, LF or NUL. `multipart/*`, `text/plain` and
 `text/html` are refused whatever their parameters, because they have their own
 setters.
+
+### `Message.addInline(a: Attachment, contentId: string)`
+
+Add `a` as an inline part the HTML body refers to by `Content-ID`: a logo in a
+receipt, shown in the message instead of listed as a file. The HTML says
+`<img src="cid:logo@inkwell">` (RFC 2392) and the part carries
+`Content-ID: <logo@inkwell>`; the HTML and its inline parts travel in a
+`multipart/related` (RFC 2387) whose first part is the HTML, nested in the
+`multipart/alternative` beside the text part. Extra `addAlternative` parts
+still come last, and attachments still wrap everything in `multipart/mixed`.
+
+```bit
+import { Message, Attachment, Address } from "std/smtp"
+
+fn receipt(logo: []byte): string! {
+  let m = Message(Address{ name = "Inkwell", email = "shop@example.com" })
+  m.addTo(Address{ name = "", email = "customer@example.net" })
+  m.setSubject("Your receipt")
+  m.setText("Thank you for your order.\n")
+  m.setHtml("<img src=\"cid:logo@inkwell\"><p>Thank you for your order.</p>\n")
+  m.addInline(Attachment("logo.png", "image/png", logo), "logo@inkwell")
+  return m.render()?
+}
+```
+
+`contentId` is the bare id, without angle brackets. The part is base64 with
+`Content-Disposition: inline` and the same filename encoding as an attachment.
+`render()` fails with `smtp: '<contentId>' is not a valid Content-ID` unless
+`contentId` is a dot-atom, or two dot-atoms joined by one `@`, of at most 250
+ASCII octets with no CR, LF, NUL or space; with `smtp: duplicate Content-ID
+'<contentId>'` when two inline parts share one (compared byte for byte); and
+with `smtp: an inline part needs an HTML body` when the message has no HTML,
+since nothing could refer to the part.
 
 ### `Message.attach(a: Attachment)`
 
