@@ -165,11 +165,6 @@ fn bceParamIndex(f: IrFunc, b: int, v: int): int {
   return v - blk.instsStart
 }
 
-fn bceIsOne(known: []ConstVal, v: int): bool {
-  let kv = known[v]
-  return kv.known && !kv.isFloat && !kv.isBool && kv.ival == 1
-}
-
 fn bceIsNonNegConst(known: []ConstVal, v: int): bool {
   let kv = known[v]
   return kv.known && !kv.isFloat && !kv.isBool && kv.ival >= 0
@@ -319,7 +314,8 @@ fn bceResolve(lp: BceLoop, v0: int): int {
   return v
 }
 
-// True iff `a` is `%iv + 1` or `1 + %iv`.
+// The constant `a` adds to `%iv`, or -1: `a` is `%iv + c` or `c + %iv` for a
+// non-negative integer constant `c`.
 //
 // BOTH SIDES ARE RESOLVED, and without that this pass fires on almost nothing.
 // `lowerWhile` closes a loop through a separate increment block carrying its
@@ -329,19 +325,64 @@ fn bceResolve(lp: BceLoop, v0: int): int {
 // resolve was added: `appendDuring` in run_while_index_bce.bit kept its bounds
 // test for exactly this reason, with the header, the limit and the index all
 // otherwise matching.
-fn bceIsStepByOne(lp: BceLoop, a: int): bool {
+fn bceAddend(lp: BceLoop, a: int): int {
   let ins = lp.f.instrs[bceResolve(lp, a)]
   if (ins.op != Op.Add) {
-    return false
+    return -1
   }
   if (bceResolve(lp, ins.lhs) == lp.iv) {
-    return bceIsOne(lp.known, ins.rhs)
+    return bceNonNegInt(lp.known, ins.rhs)
   }
   if (bceResolve(lp, ins.rhs) == lp.iv) {
-    return bceIsOne(lp.known, ins.lhs)
+    return bceNonNegInt(lp.known, ins.lhs)
   }
-  return false
+  return -1
 }
+
+fn bceNonNegInt(known: []ConstVal, v: int): int {
+  if (!bceIsNonNegConst(known, v)) {
+    return -1
+  }
+  return known[v].ival
+}
+
+// True iff `a` is `%iv + d` with `1 <= d <= off + 1`: the step. With `off = 0`
+// that is `d = 1`, the original rule. `a` may also be a join param every edge
+// of which passes a step, `bceStepDepth` joins deep: an `if`/`else` choosing
+// between two strides meets in one (#6840, headerEndIn's `+2`/`+1`/`+4`). A
+// join off the `F` side is refused; any other `!viaF` join has only `!viaF`
+// predecessors, so each edge's add is this iteration's, as for a direct edge.
+fn bceIsStep(lp: BceLoop, a: int, depth: int): bool {
+  let d = bceAddend(lp, a)
+  if (d >= 1) {
+    return d <= lp.off + 1
+  }
+  let r = bceResolve(lp, a)
+  let k = bceParamSlot(lp, r)
+  if (depth == 0 || k < 0) {
+    return false
+  }
+  let q = lp.owner[r]
+  if (q == lp.h || lp.viaF[q] || bcePredCount(lp.pm, q) == 0) {
+    return false
+  }
+  return bceJoinSteps(lp, q, k, depth - 1)
+}
+
+// True iff every edge into join `q` passes a step to its param slot `k`.
+fn bceJoinSteps(lp: BceLoop, q: int, k: int, depth: int): bool {
+  let e = lp.pm.start[q]
+  while (e < lp.pm.start[q + 1]) {
+    let x = bceEdgeArg(lp, q, e, k)
+    if (x < 0 || !bceIsStep(lp, x, depth)) {
+      return false
+    }
+    e = e + 1
+  }
+  return true
+}
+
+const bceStepDepth: int = 4
 
 // One candidate loop, bundled so the walks below stay inside the parameter
 // limit — the same reason `LicmCtx` exists. `viaF` is per-header, so this is
@@ -355,28 +396,31 @@ class BceLoop {
   h: int,
   k: int,
   iv: int,
+  off: int,
   visits: []int,
 }
 
 // One predecessor edge into `h`: 0 refuses the header, 1 accepts the edge as a
-// base case, 2 accepts it as a step or an unchanged pass-through.
+// base case, 2 as an unchanged pass-through, 3 as a step.
 fn bceClassifyEdge(lp: BceLoop, p: int): int {
   let args = licmEdgeArgs(lp.f, p, lp.h)
   if (len(args) != lp.f.blocks[lp.h].paramCount) {
     return 0
   }
   let a = args[lp.k]
-  if (bceIsNonNegConst(lp.known, a)) {
+  if (bceIsNonNegConst(lp.known, a) && lp.known[a].ival <= bceMaxInt - lp.off) {
     return 1
   }
   if (bceResolve(lp, a) == lp.iv) {
     return 2
   }
-  if (!lp.viaF[p] && bceIsStepByOne(lp, a)) {
-    return 2
+  if (!lp.viaF[p] && bceIsStep(lp, a, bceStepDepth)) {
+    return 3
   }
   return 0
 }
+
+const bceMaxInt: int = 9223372036854775807
 
 // True iff `h`'s param `k` is provably non-negative on every entry. Refuses a
 // header with no predecessors at all, and one with no constant base case.
@@ -421,13 +465,27 @@ fn bceMarkBlock(lp: BceLoop, b: int, iv: int, lim: int) {
   let end = blk.instsStart + blk.instsLen
   while (idx < end) {
     let ins = lp.f.instrs[idx]
-    if (ins.op == Op.ICmpUlt && !lp.known[idx].known && bceResolve(lp, ins.lhs) == iv) {
+    if (ins.op == Op.ICmpUlt && !lp.known[idx].known && bceIsWindowIndex(lp, ins.lhs, iv)) {
       if (bceLimitCovers(lp.known, lim, bceResolve(lp, ins.rhs))) {
         lp.known[idx] = boolConst(true)
       }
     }
     idx = idx + 1
   }
+}
+
+// True iff `x` is `%iv` itself or, under a header testing `%iv + off`, `%iv + j`
+// with `1 <= j <= off`. `0 <= %iv` and `%iv + off < lim` without a wrap give
+// `0 <= %iv + j < lim`; the add cannot wrap either, since `%iv + off` did not.
+fn bceIsWindowIndex(lp: BceLoop, x: int, iv: int): bool {
+  if (bceResolve(lp, x) == iv) {
+    return true
+  }
+  if (lp.off == 0) {
+    return false
+  }
+  let j = bceAddend(lp, x)
+  return j >= 1 && j <= lp.off
 }
 
 // Whether the header's `iv < lim` already decides `iv <u rhs`: the same value,
@@ -486,19 +544,16 @@ fn bcePredCount(pm: PredMap, b: int): int {
 
 // One candidate header. Marks nothing unless every refusal above passes.
 fn bceProveHeader(fc: BceFn, h: int) {
-  let ctx = fc.ctx
-  let f = fc.f
-  let known = fc.known
-  let ci = bceHeaderTest(ctx, f, h)
+  let ci = bceHeaderTest(fc.ctx, fc.f, h)
   if (ci < 0) {
     return
   }
-  let cmp = f.instrs[ci]
-  let k = bceParamIndex(f, h, cmp.lhs)
-  if (k < 0) {
+  let cmp = fc.f.instrs[ci]
+  let iv = bceHeaderIv(fc.f, h, cmp.lhs)
+  if (iv < 0) {
     return
   }
-  let term = f.instrs[bceTerminator(f, h)]
+  let term = fc.f.instrs[bceTerminator(fc.f, h)]
   // #5896: MARKING's soundness needs `T` reachable only through `h`'s true
   // edge. `lowerWhile` always gives it one predecessor; refuse the header
   // outright rather than trust that, so a future lowering change that ever
@@ -507,14 +562,118 @@ fn bceProveHeader(fc: BceFn, h: int) {
     return
   }
   let lp = BceLoop{
-    f = f, known = known, pm = fc.pm, owner = fc.owner, h = h, k = k, iv = cmp.lhs,
-    viaF = bceReachAvoiding(f, term.ival2, h, term.ival),
+    f = fc.f, known = fc.known, pm = fc.pm, owner = fc.owner, h = h,
+    k = bceParamIndex(fc.f, h, iv), iv = iv, off = 0,
+    viaF = bceReachAvoiding(fc.f, term.ival2, h, term.ival),
     visits = [0],
   }
-  if (!bceIndexNonNegative(lp)) {
-    return
+  if (bceWindowSound(lp, cmp, term.ival)) {
+    bceMarkProven(lp, cmp.rhs)
   }
-  bceMarkProven(lp, cmp.rhs)
+}
+
+// The header param the test reads: `v` itself, or the param under `v = %p + c`
+// or `c + %p`; -1 otherwise. `bceWindowSound` checks the constant.
+fn bceHeaderIv(f: IrFunc, h: int, v: int): int {
+  if (bceParamIndex(f, h, v) >= 0) {
+    return v
+  }
+  let ins = f.instrs[v]
+  if (ins.op != Op.Add) {
+    return -1
+  }
+  if (bceParamIndex(f, h, ins.lhs) >= 0) {
+    return ins.lhs
+  }
+  if (bceParamIndex(f, h, ins.rhs) >= 0) {
+    return ins.rhs
+  }
+  return -1
+}
+
+// THE WINDOW (#6840): a header testing `%iv + off < %L` proves `%iv + j <u %L`
+// for `0 <= j <= off`. Sets `lp.off` and answers whether the induction holds.
+//
+// `0 <= %iv` alone is not enough once `off > 0`: `%iv + off` can WRAP and
+// still pass the signed test (`%L = maxInt`, `%iv = maxInt - 2`, `+ 3` reads
+// minInt). So the invariant is `0 <= %iv <= B` with `B + off <= maxInt`:
+//
+//   - a base constant `c` needs `c <= maxInt - off`;
+//   - a step `+ d` from a `!viaF` block needs `1 <= d <= off + 1`, so
+//     `%iv + d <= %iv + off + 1 <= %L`;
+//   - and `%L` itself needs `%L <= maxInt - off` (`bceLimitBounded`).
+//
+// `off = 0` keeps the original rule exactly: only `+ 1` steps, any base.
+fn bceWindowSound(lp: BceLoop, cmp: IrInstr, t: int): bool {
+  if (cmp.lhs != lp.iv) {
+    lp.off = bceAddend(lp, cmp.lhs)
+  }
+  if (lp.off < 0 || lp.off > bceMaxOffset) {
+    return false
+  }
+  if (!bceIndexNonNegative(lp)) {
+    return false
+  }
+  return lp.off == 0 || bceLimitBounded(lp, cmp.rhs, t)
+}
+
+// The widest window accepted. A length counts the elements of an object in the
+// address space, so it is below 2^57 on every target; `2^57 + 4096` is far from
+// maxInt, and the cap keeps that margin obvious.
+const bceMaxOffset: int = 4096
+
+// Whether the header's `%L` is at most `maxInt - off` on every iteration that
+// steps: an integer constant that is, or a LENGTH. `emitBoundsCheck`
+// (loweraccess.bit) sets `bval` on its compare because its `rhs` is the length
+// of the object being indexed; a marked compare reading `%L` in a block `x` that every
+// step passes through puts a real length in `%L` on each iteration that steps.
+// The same instance as the header's test: the root is not re-executed between
+// the test and `x` (THE SELF EDGE above). Unmarked `icmp_ult`s also come from
+// unsigned compares and decimal lowering, which bound nothing.
+fn bceLimitBounded(lp: BceLoop, lim: int, t: int): bool {
+  let rl = bceResolve(lp, lim)
+  if (bceIsIntConst(lp.known[rl])) {
+    return lp.known[rl].ival <= bceMaxInt - lp.off
+  }
+  let b = 0
+  while (b < len(lp.f.blocks)) {
+    if (b != lp.h && !lp.viaF[b] && bceHasLengthCheck(lp, b, rl) && bceStepsBehind(lp, t, b)) {
+      return true
+    }
+    b = b + 1
+  }
+  return false
+}
+
+// True iff block `b` holds a bounds compare marked by `emitBoundsCheck` whose
+// limit resolves to `rl`.
+fn bceHasLengthCheck(lp: BceLoop, b: int, rl: int): bool {
+  let blk = lp.f.blocks[b]
+  let idx = blk.instsStart + blk.paramCount
+  while (idx < blk.instsStart + blk.instsLen) {
+    let ins = lp.f.instrs[idx]
+    if (ins.op == Op.ICmpUlt && ins.bval && bceResolve(lp, ins.rhs) == rl) {
+      return true
+    }
+    idx = idx + 1
+  }
+  return false
+}
+
+// True iff no step edge into `h` leaves a block reachable from `T` without
+// passing through `x`: every iteration that steps runs `x`. `T` has one
+// predecessor (`bceProveHeader`), so the walk from `T` sees every such path.
+fn bceStepsBehind(lp: BceLoop, t: int, x: int): bool {
+  let open = bceReachAvoiding(lp.f, t, x, lp.h)
+  let e = lp.pm.start[lp.h]
+  while (e < lp.pm.start[lp.h + 1]) {
+    let p = lp.pm.list[e]
+    if (open[p] && bceClassifyEdge(lp, p) == 3) {
+      return false
+    }
+    e = e + 1
+  }
+  return true
 }
 
 // Seeds `known` with every bounds compare a dominating signed loop test has
@@ -556,111 +715,4 @@ fn bceHasCandidate(ctx: TypeContext, f: IrFunc): bool {
     h = h + 1
   }
   return false
-}
-
-// #5896, in-Bit self-check (ircheck.bit's and x64dispatchcheck.bit's
-// pattern): `lowerWhile` never gives a true-entry block two predecessors, so
-// Bit source cannot produce this shape — the fixture is IR ints, built by
-// hand.
-//
-// One header `h` (block 1): `br icmp_slt(%iv, %lim), T, F`. `T` (block 2)
-// carries the guarded `icmp_ult(%iv, %lim)` and is also the back edge (it
-// loops to `h`), so it is a real loop body, not a dead block. `F` (block 3)
-// jumps to `P` (block 4), and `P` jumps into `T` too: `T`'s real
-// predecessors are `h`'s true edge AND `P`, entered from the FALSE side — a
-// path through `P` never made the test hold.
-fn bceMultiPredTrueEntryFunc(ctx: TypeContext, i64t: int, boolT: int): IrFunc {
-  let seed = mkInstr(Op.ConstInt, i64t) // 0: iv seed, 0
-  seed.ival = 0
-  let lim = mkInstr(Op.ConstInt, i64t) // 1: lim, 100
-  lim.ival = 100
-  let toHeader = mkInstr(Op.Jump, ctx.voidId) // 2: b0 -> h, passes iv=0
-  toHeader.ival = 1
-  toHeader.args = [0]
-
-  let iv = mkInstr(Op.BlockParam, i64t) // 3: h's only param
-  let test = mkInstr(Op.ICmpSlt, boolT) // 4: icmp_slt(iv, lim)
-  test.lhs = 3
-  test.rhs = 1
-  let br = mkInstr(Op.Br, ctx.voidId) // 5: br test, T=2, F=3
-  br.lhs = 4
-  br.ival = 2
-  br.ival2 = 3
-
-  let one = mkInstr(Op.ConstInt, i64t) // 6: step constant, 1
-  one.ival = 1
-  let check = mkInstr(Op.ICmpUlt, boolT) // 7: the guarded check
-  check.lhs = 3
-  check.rhs = 1
-  let step = mkInstr(Op.Add, i64t) // 8: iv + 1
-  step.lhs = 3
-  step.rhs = 6
-  let backEdge = mkInstr(Op.Jump, ctx.voidId) // 9: T -> h, passes iv+1
-  backEdge.ival = 1
-  backEdge.args = [8]
-
-  let toP = mkInstr(Op.Jump, ctx.voidId) // 10: F -> P
-  toP.ival = 4
-  let toT = mkInstr(Op.Jump, ctx.voidId) // 11: P -> T, T's SECOND predecessor
-  toT.ival = 2
-
-  return IrFunc{
-    name = "multiPredTrueEntry", paramTypes = []int(0), result = i64t,
-    blocks = [
-      IrBlock{ instsStart = 0, paramCount = 0, instsLen = 3 },
-      IrBlock{ instsStart = 3, paramCount = 1, instsLen = 3 },
-      IrBlock{ instsStart = 6, paramCount = 0, instsLen = 4 },
-      IrBlock{ instsStart = 10, paramCount = 0, instsLen = 1 },
-      IrBlock{ instsStart = 11, paramCount = 0, instsLen = 1 },
-    ],
-    instrs = [seed, lim, toHeader, iv, test, br, one, check, step, backEdge, toP, toT],
-    isFallible = false,
-  }
-}
-
-// Every value id unknown except the base-case seed (0, at id 0) and the
-// step's `+1` constant (at id 6) — the two `bceIsNonNegConst`/`bceIsOne`
-// need to accept the header's non-negativity proof at all. Fresh each call:
-// `proveInductionBounds` mutates its `known` argument in place.
-fn bceMultiPredTrueEntryKnown(): []ConstVal {
-  return [
-    intConst(0), noConst(), noConst(), noConst(), noConst(), noConst(),
-    intConst(1), noConst(), noConst(), noConst(), noConst(), noConst(),
-  ]
-}
-
-// The guard, wired in: through the real entry point, `T`'s second
-// predecessor (`P`, reached from `F`) refuses the header and the check at
-// block 2 (id 7) stays live.
-//
-// THE MUTATION, without a second selfhost build: `bceMarkProven` is exactly
-// what `bceProveHeader` calls the instruction after the guard above; calling
-// it directly on the same `lp`, skipping straight past where the guard would
-// sit, reproduces "the guard deleted" using the real function, not a
-// reimplementation. `bceIndexNonNegative(lp)` is asserted true first so the
-// only thing that can be suppressing the mark is the guard being bypassed,
-// not some other refusal.
-fn checkBceRefusesTrueEntryWithTwoPredecessors() {
-  let ctx = newTypeContext()
-  let i64t = primType(ctx, 3)
-  let boolT = primType(ctx, 10)
-  let f = bceMultiPredTrueEntryFunc(ctx, i64t, boolT)
-
-  let known = bceMultiPredTrueEntryKnown()
-  proveInductionBounds(ctx, f, known)
-  assert(!known[7].known, "T has two predecessors: the icmp_ult must stay")
-
-  let known2 = bceMultiPredTrueEntryKnown()
-  let term = f.instrs[bceTerminator(f, 1)]
-  let lp = BceLoop{
-    f = f, known = known2, pm = licmPredMap(f), owner = licmOwners(f),
-    h = 1, k = 0, iv = 3, viaF = bceReachAvoiding(f, term.ival2, 1, term.ival),
-    visits = [0],
-  }
-  assert(bceIndexNonNegative(lp), "fixture must still admit the base+step induction proof")
-  bceMarkProven(lp, 1)
-  assert(
-    known2[7].known,
-    "without the guard, T's second predecessor is invisible and the check is lost",
-  )
 }
