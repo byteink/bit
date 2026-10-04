@@ -385,6 +385,11 @@ one field would let a receiver read either, so there is only one.
 Every address this message is delivered to, `To:`, then `Cc:`, then `Bcc:`, in
 the order added - the envelope `RCPT TO` list. `Reply-To:` is not in it.
 
+### `Message.envelope(): Envelope`
+
+The envelope this message is sent under: `from` is the sender's address, `to` is
+`recipients()` as addr-specs. `Client.send` calls it for you.
+
 ### `Message.render(): string!SmtpError`
 
 The complete RFC 5322 message: headers, a blank line, and the body, CRLF
@@ -399,6 +404,69 @@ and a receiving provider counts a message without them against it. Fails on a
 header value carrying a CR, LF or NUL, on a malformed envelope address, on an
 illegal explicit boundary or Message-ID, or if any line would exceed the octet
 limit.
+
+## The envelope and pre-rendered mail
+
+`MAIL FROM` and `RCPT TO` are not the message's headers, and sometimes they must
+differ. A bounce address that encodes the notification it belongs to (VERP) is
+not the `From`; a staging server that redirects every mail to one inbox
+delivers to an address no header names; and a message signed with DKIM must be
+sent as the exact bytes that were signed, so whoever signed it cannot hand
+`send` a `Message` to render again.
+
+`send` takes a `Sendable` for all three: something that renders to a complete
+message and says which envelope to use. A `Message` is one and derives its
+envelope; a `Raw` is the other and carries both from you.
+
+```bit
+import { Client, Raw, Envelope, SmtpError } from "std/smtp"
+
+// Send an already rendered (and signed) Inkwell notification. Replies to the
+// notification bounce to an address that says which one it was, so the bounce
+// handler can find it; the headers inside `signed` still say
+// `From: noreply@inkwell.dev`.
+fn sendNotification(c: Client, id: int, to: string, signed: string): ()!SmtpError {
+  let e = Envelope{ from = "bounce+${id}@inkwell.dev", to = [to] }
+  c.send(Raw(e, signed))?
+}
+```
+
+An empty `from` sends `MAIL FROM:<>`, the null reverse-path a bounce itself
+uses so that it is never bounced back.
+
+The bytes go out as they are, apart from DATA dot-stuffing, which the server
+removes. Bytes that are not a well-formed message are refused, never repaired,
+because a repair would change a body a signature already covers:
+
+| The data has | Refused as |
+|---|---|
+| a bare LF or a bare CR | line N does not end in CRLF |
+| a NUL | line N contains a NUL byte |
+| a line of 998 octets or more | line N is too long |
+| no blank line between header and body | no blank line |
+| a last line without CRLF | line N does not end in CRLF |
+
+Every address in the envelope goes through the same check as the addresses of a
+`Message`, so one carrying a CR, LF or space is refused, and an envelope with no
+recipient is refused. All of it happens before `MAIL FROM`, so a refusal sends
+nothing after `EHLO`. A `Bcc` recipient is just another entry in `to`: it never
+appears in the bytes.
+
+### `Envelope`
+
+`from: string` is the `MAIL FROM` addr-spec, `""` for the null reverse-path;
+`to: []string` is every `RCPT TO` addr-spec, at least one.
+
+### `Sendable`
+
+What `Client.send` takes: `render(): string!SmtpError`, the complete message,
+and `envelope(): Envelope`. `Message` and `Raw` both satisfy it; implementing it
+is for a caller with its own message type.
+
+### `Raw(env: Envelope, data: string)`
+
+Pre-rendered `data` and the `env` to deliver it under. `render()` validates
+`data` as in the table above and returns it unchanged.
 
 ## Connecting
 
@@ -483,11 +551,12 @@ Authenticate with SASL LOGIN - username and password as two base64 challenge
 responses. Same refusal on a non-TLS connection, and it fires before the
 `AUTH LOGIN` command, so not even the username is transmitted.
 
-### `Client.send(m: Message): ()!SmtpError`
+### `Client.send(m: Sendable): ()!SmtpError`
 
-Render, validate and send `m`: `MAIL FROM`, one `RCPT TO` per recipient, `DATA`,
-the dot-stuffed payload, and the terminating dot. The message is rendered and
-checked first, so a CR in a subject or a malformed recipient fails with
+Render and send `m`, a `Message` or a [`Raw`](#raw-env-envelope-data-string):
+`MAIL FROM`, one `RCPT TO` per envelope recipient, `DATA`, the dot-stuffed
+payload, and the terminating dot. The message and the envelope are checked
+first, so a CR in a subject, a malformed address or an over-long line fails with
 `MAIL FROM` never sent.
 
 ### `Client.quit(): ()!SmtpError`
