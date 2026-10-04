@@ -1,17 +1,383 @@
-// pkg/redis/set.bit — `r.sset(key)`: the unordered-set handle. Epic
-// #6013, #6028: SCAFFOLD ONLY, no commands wired yet (`SADD, SREM, SMEMBERS, SISMEMBER`, a
-// follow-up ticket) — this file exists so later family tickets touch only
-// their own file, never `client.bit`. `cmd.bit`'s header is the template:
-// one `Cmd<T>` factory per command, called from a method here.
+// pkg/redis/set.bit - `r.sset(key)`: every Redis set command, `SADD`
+// through `SSCAN`. Epic #6013, #6028, #6032. Follows `cmd.bit`'s HOW-TO
+// header and `counter.bit`'s reference shape: one `Cmd<T>` factory per
+// command, an immediate method on `Set`, a queued method on `SetBatch`.
+//
+// `Set` HOLDS `client: Client`, NOT `runner: Runner` - the same deliberate
+// deviation `hash.bit`'s header explains: `client.bit`'s `sset` accessor
+// still builds `Set{ client = this, key = key }` (#6028's scaffold) and a
+// family ticket may not edit that shared file. `Client.runCmd<T>` is the
+// identical run-now, retry-read-onlys behaviour `Runner.runCmd`'s pool
+// branch wraps. Net effect: `r.sset(key)` works exactly like the spine;
+// `tx.read.sset(key)` does not exist yet (reported on #6032).
+//
+// ONE METHOD PER COMMAND, ONE OPTION PER VARIANT. The multi-key reads
+// (`inter`, `union`, `diff`) and their `*Store` forms take the OTHER keys
+// as strings and treat the handle's own key as the first source, so
+// `a.diff("b")` is `SDIFF a b` - the order that matters for a difference.
+// `pop` and `random` always send their count (`SPOP key count`), so the
+// reply is always a list; a count of 1 is the single-member form. A
+// negative `random` count allows repeats, as `SRANDMEMBER` itself does.
+//
+// SET REPLIES DECODE FROM BOTH WIRE SHAPES. RESP3 (the `HELLO 3` default,
+// `tx.bit`'s header) answers `SMEMBERS`, `SINTER`, `SUNION`, `SDIFF` and
+// `SPOP key count` with a `Reply.Set`; RESP2 with a `Reply.Array`.
+// `asSetMembers` accepts either, so no caller ever sees the difference.
+//
+// `SSCAN` HAS NO `SetBatch` METHOD for the reason `hash.bit`'s header gives
+// for `HSCAN`: a cursor is several round trips, never one `Future`.
+//
+// ALLOCATION: every variadic wire form below is built into ONE `[]string`
+// sized up front (`ssetFill`), never grown by `append`, so a command costs its
+// argument slice plus the reply and nothing else.
+
 export class Set {
-  client: Client,
-  key: string,
+  client: Client
+  key: string
+
+  export add(...members: string): i64!RedisError {
+    return this.client.runCmd(ssetAddCmd(this.key, members))?
+  }
+  export remove(...members: string): i64!RedisError {
+    return this.client.runCmd(ssetRemoveCmd(this.key, members))?
+  }
+  export has(member: string): bool!RedisError {
+    return this.client.runCmd(ssetHasCmd(this.key, member))?
+  }
+  export hasMany(...members: string): []bool!RedisError {
+    return this.client.runCmd(ssetHasManyCmd(this.key, members))?
+  }
+  export members(): []string!RedisError { return this.client.runCmd(ssetMembersCmd(this.key))? }
+  export len(): i64!RedisError { return this.client.runCmd(ssetLenCmd(this.key))? }
+  export pop(count: int = 1): []string!RedisError {
+    return this.client.runCmd(ssetPopCmd(this.key, count))?
+  }
+  export random(count: int = 1): []string!RedisError {
+    return this.client.runCmd(ssetRandomCmd(this.key, count))?
+  }
+  export move(dest: string, member: string): bool!RedisError {
+    return this.client.runCmd(ssetMoveCmd(this.key, dest, member))?
+  }
+  export inter(...others: string): []string!RedisError {
+    return this.client.runCmd(ssetCombineCmd("SINTER", this.key, others))?
+  }
+  export union(...others: string): []string!RedisError {
+    return this.client.runCmd(ssetCombineCmd("SUNION", this.key, others))?
+  }
+  export diff(...others: string): []string!RedisError {
+    return this.client.runCmd(ssetCombineCmd("SDIFF", this.key, others))?
+  }
+  export interStore(dest: string, ...others: string): i64!RedisError {
+    return this.client.runCmd(ssetStoreCmd("SINTERSTORE", dest, this.key, others))?
+  }
+  export unionStore(dest: string, ...others: string): i64!RedisError {
+    return this.client.runCmd(ssetStoreCmd("SUNIONSTORE", dest, this.key, others))?
+  }
+  export diffStore(dest: string, ...others: string): i64!RedisError {
+    return this.client.runCmd(ssetStoreCmd("SDIFFSTORE", dest, this.key, others))?
+  }
+  // `limit` 0 means no limit, as `SINTERCARD`'s own default does.
+  export interCard(others: []string, limit: int = 0): i64!RedisError {
+    return this.client.runCmd(ssetInterCardCmd(this.key, others, limit))?
+  }
+  // Lazily follows `SSCAN`'s cursor - see `SetScanIterator` below.
+  export scan(pattern: string = "", count: int = 0): SetScanIterator {
+    return SetScanIterator{
+      client = this.client,
+      key = this.key,
+      pattern = pattern,
+      count = count,
+      cursor = "0",
+      page = []string(0),
+      started = false,
+    }
+  }
 }
 
-// The queued view `Pipeline.sset`/`Tx.sset` both return — `cmd.bit`'s
-// `Batch` is the ONE client-side queue the two executors share, so this
-// is the ONLY queued view Set needs (`cmd.bit`'s header, point 2).
+// The queued view `Pipeline.sset`/`Tx.sset` both return - `cmd.bit`'s
+// `Batch` is the ONE client-side queue the two executors share, so this is
+// the ONLY queued view Set needs (`cmd.bit`'s header, point 2).
 export class SetBatch {
-  batch: Batch,
-  key: string,
+  batch: Batch
+  key: string
+
+  export add(...members: string): Future<i64> {
+    return this.batch.queue(ssetAddCmd(this.key, members))
+  }
+  export remove(...members: string): Future<i64> {
+    return this.batch.queue(ssetRemoveCmd(this.key, members))
+  }
+  export has(member: string): Future<bool> { return this.batch.queue(ssetHasCmd(this.key, member)) }
+  export hasMany(...members: string): Future<[]bool> {
+    return this.batch.queue(ssetHasManyCmd(this.key, members))
+  }
+  export members(): Future<[]string> { return this.batch.queue(ssetMembersCmd(this.key)) }
+  export len(): Future<i64> { return this.batch.queue(ssetLenCmd(this.key)) }
+  export pop(count: int = 1): Future<[]string> {
+    return this.batch.queue(ssetPopCmd(this.key, count))
+  }
+  export random(count: int = 1): Future<[]string> {
+    return this.batch.queue(ssetRandomCmd(this.key, count))
+  }
+  export move(dest: string, member: string): Future<bool> {
+    return this.batch.queue(ssetMoveCmd(this.key, dest, member))
+  }
+  export inter(...others: string): Future<[]string> {
+    return this.batch.queue(ssetCombineCmd("SINTER", this.key, others))
+  }
+  export union(...others: string): Future<[]string> {
+    return this.batch.queue(ssetCombineCmd("SUNION", this.key, others))
+  }
+  export diff(...others: string): Future<[]string> {
+    return this.batch.queue(ssetCombineCmd("SDIFF", this.key, others))
+  }
+  export interStore(dest: string, ...others: string): Future<i64> {
+    return this.batch.queue(ssetStoreCmd("SINTERSTORE", dest, this.key, others))
+  }
+  export unionStore(dest: string, ...others: string): Future<i64> {
+    return this.batch.queue(ssetStoreCmd("SUNIONSTORE", dest, this.key, others))
+  }
+  export diffStore(dest: string, ...others: string): Future<i64> {
+    return this.batch.queue(ssetStoreCmd("SDIFFSTORE", dest, this.key, others))
+  }
+  export interCard(others: []string, limit: int = 0): Future<i64> {
+    return this.batch.queue(ssetInterCardCmd(this.key, others, limit))
+  }
+}
+
+// Lazily follows `SSCAN`'s cursor, one page at a time, yielding members -
+// `Set.scan()` above. `next(): Option<T>` carries no failure channel
+// (docs/development/iterator-trait.md), so a failed page fetch panics
+// rather than silently ending the iteration, exactly as `HashScanIterator`.
+export class SetScanIterator {
+  client: Client
+  key: string
+  pattern: string
+  count: int
+  cursor: string
+  page: []string
+  started: bool
+
+  export next(): Option<string> {
+    while (len(this.page) == 0 && (!this.started || this.cursor != "0")) {
+      this.fetch()
+    }
+    if (len(this.page) == 0) {
+      return Option.None
+    }
+    let member = this.page[0]
+    this.page = this.page[1:len(this.page)]
+    return Option.Some(member)
+  }
+
+  fetch() {
+    this.started = true
+    let (cursor, members) = this.client.runCmd(
+      ssetScanCmd(this.key, this.cursor, this.pattern, this.count),
+    ) catch e {
+      panic("redis: SSCAN ${this.key}: ${e.message()}")
+    }
+    this.cursor = cursor
+    this.page = members
+  }
+}
+
+// Copies `rest` into `out` from index `at` on - the one loop every wire form
+// below shares. `out` is sized by the caller, so no `append` ever regrows it.
+fn ssetFill(out: []string, at: int, rest: []string) {
+  let i = 0
+  while (i < len(rest)) {
+    out[at + i] = rest[i]
+    i = i + 1
+  }
+}
+
+// `CMD key member [member ...]`: `SADD`, `SREM`, `SMISMEMBER`, and the
+// multi-key reads (`SINTER`, ...) whose tail is other keys, not members.
+fn ssetKeyArgs(cmd: string, key: string, rest: []string): []string {
+  let out = []string(2 + len(rest))
+  out[0] = cmd
+  out[1] = key
+  ssetFill(out, 2, rest)
+  return out
+}
+
+// `CMD dest key [key ...]` - the `*STORE` forms.
+fn ssetStoreArgs(cmd: string, dest: string, key: string, others: []string): []string {
+  let out = []string(3 + len(others))
+  out[0] = cmd
+  out[1] = dest
+  out[2] = key
+  ssetFill(out, 3, others)
+  return out
+}
+
+fn ssetAddCmd(key: string, members: []string): Cmd<i64> {
+  return Cmd<i64>{
+    args = ssetKeyArgs("SADD", key, members),
+    decode = (r) => asInt(r, "SADD"),
+    readOnly = false,
+  }
+}
+
+fn ssetRemoveCmd(key: string, members: []string): Cmd<i64> {
+  return Cmd<i64>{
+    args = ssetKeyArgs("SREM", key, members),
+    decode = (r) => asInt(r, "SREM"),
+    readOnly = false,
+  }
+}
+
+fn ssetHasCmd(key: string, member: string): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["SISMEMBER", key, member],
+    decode = (r) => asBool(r, "SISMEMBER"),
+    readOnly = true,
+  }
+}
+
+fn ssetHasManyCmd(key: string, members: []string): Cmd<[]bool> {
+  return Cmd<[]bool>{
+    args = ssetKeyArgs("SMISMEMBER", key, members),
+    decode = (r) => asSetBools(r, "SMISMEMBER"),
+    readOnly = true,
+  }
+}
+
+fn ssetMembersCmd(key: string): Cmd<[]string> {
+  return Cmd<[]string>{
+    args = ["SMEMBERS", key],
+    decode = (r) => asSetMembers(r, "SMEMBERS"),
+    readOnly = true,
+  }
+}
+
+fn ssetLenCmd(key: string): Cmd<i64> {
+  return Cmd<i64>{ args = ["SCARD", key], decode = (r) => asInt(r, "SCARD"), readOnly = true }
+}
+
+fn ssetPopCmd(key: string, count: int): Cmd<[]string> {
+  return Cmd<[]string>{
+    args = ["SPOP", key, "${count}"],
+    decode = (r) => asSetMembers(r, "SPOP"),
+    readOnly = false,
+  }
+}
+
+fn ssetRandomCmd(key: string, count: int): Cmd<[]string> {
+  return Cmd<[]string>{
+    args = ["SRANDMEMBER", key, "${count}"],
+    decode = (r) => asSetMembers(r, "SRANDMEMBER"),
+    readOnly = true,
+  }
+}
+
+fn ssetMoveCmd(key: string, dest: string, member: string): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["SMOVE", key, dest, member],
+    decode = (r) => asBool(r, "SMOVE"),
+    readOnly = false,
+  }
+}
+
+fn ssetCombineCmd(cmd: string, key: string, others: []string): Cmd<[]string> {
+  return Cmd<[]string>{
+    args = ssetKeyArgs(cmd, key, others),
+    decode = (r) => asSetMembers(r, cmd),
+    readOnly = true,
+  }
+}
+
+fn ssetStoreCmd(cmd: string, dest: string, key: string, others: []string): Cmd<i64> {
+  return Cmd<i64>{
+    args = ssetStoreArgs(cmd, dest, key, others),
+    decode = (r) => asInt(r, cmd),
+    readOnly = false,
+  }
+}
+
+// `SINTERCARD numkeys key [key ...] [LIMIT limit]` - `numkeys` counts the
+// handle's own key plus `others`.
+fn ssetInterCardArgs(key: string, others: []string, limit: int): []string {
+  let tail = 0
+  if (limit > 0) {
+    tail = 2
+  }
+  let out = []string(3 + len(others) + tail)
+  out[0] = "SINTERCARD"
+  out[1] = "${len(others) + 1}"
+  out[2] = key
+  ssetFill(out, 3, others)
+  if (limit > 0) {
+    out[len(out) - 2] = "LIMIT"
+    out[len(out) - 1] = "${limit}"
+  }
+  return out
+}
+
+fn ssetInterCardCmd(key: string, others: []string, limit: int): Cmd<i64> {
+  return Cmd<i64>{
+    args = ssetInterCardArgs(key, others, limit),
+    decode = (r) => asInt(r, "SINTERCARD"),
+    readOnly = true,
+  }
+}
+
+fn ssetScanArgs(key: string, cursor: string, pattern: string, count: int): []string {
+  let args = ["SSCAN", key, cursor]
+  if (pattern != "") {
+    args = append(args, "MATCH")
+    args = append(args, pattern)
+  }
+  if (count > 0) {
+    args = append(args, "COUNT")
+    args = append(args, "${count}")
+  }
+  return args
+}
+
+// `asHashScanPage` (hash.bit) decodes the identical `[cursor, [items...]]`
+// page `HSCAN` and `SSCAN` both reply with; only the command name in an
+// error differs.
+fn ssetScanCmd(key: string, cursor: string, pattern: string, count: int): Cmd<(string, []string)> {
+  return Cmd<(string, []string)>{
+    args = ssetScanArgs(key, cursor, pattern, count),
+    decode = (r) => asHashScanPage(r, "SSCAN"),
+    readOnly = true,
+  }
+}
+
+// A set-of-strings reply: `Reply.Set` (RESP3) or `Reply.Array` (RESP2),
+// both as `[]string`. A null array is the empty list.
+fn asSetMembers(r: Reply, cmd: string): []string!RedisError {
+  match (r) {
+    Set(items) => return stringsFromReplies(items, cmd)?
+    Array(items) => return stringsFromOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// `SMISMEMBER`'s one 0/1 (`Int`) or `Bool` per member, in the order asked.
+fn asSetBools(r: Reply, cmd: string): []bool!RedisError {
+  match (r) {
+    Array(items) => return setBoolsFromOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn setBoolsFromOpt(items: Option<[]Reply>, cmd: string): []bool!RedisError {
+  match (items) {
+    Some(list) => return setBoolsFromList(list, cmd)?
+    None => return []bool(0)
+  }
+}
+
+fn setBoolsFromList(list: []Reply, cmd: string): []bool!RedisError {
+  let out = []bool(len(list))
+  let i = 0
+  while (i < len(list)) {
+    out[i] = asBool(list[i], cmd)?
+    i = i + 1
+  }
+  return out
 }
