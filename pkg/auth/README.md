@@ -77,16 +77,17 @@ protected route that is not itself doing the authenticating just reads
   list, and the accessor a protected route reads the result with.
 - `hashPassword`, `Lookup`, `LookupResult`, `PasswordStrategy` - a
   password `Strategy` over your own user lookup, Argon2id underneath.
-- `OidcStrategy`, `OidcSource`, `withScopes`, `beginAuthorization`,
-  `handleCallback` - the OpenID Connect authorization-code flow with PKCE.
-- `googleStrategy`, `microsoftStrategy`, `genericOidcStrategy` - provider
-  presets over `OidcStrategy`'s constructor.
+- `OidcStrategy`, `Provider`, `OidcOptions`, `beginAuthorization`,
+  `handleCallback` - the OpenID Connect authorization-code flow with PKCE;
+  `Provider` names the identity provider (`Google`, `Microsoft(tenant)`,
+  `Generic(issuer)`, `Endpoints(config, jwks)`) and `OidcOptions` carries the
+  scopes, the `TlsConfig` and the token-exchange seam.
 - `OidcConfig`, `discover`, `JwksCache`, `JwksSource`, `verifyIdToken` - the
   discovery document and key set `OidcStrategy` is built from, and the ID
   token verifier, for a client that already holds a token and skips the
   redirect flow.
-- `HttpFetch`, `TokenFetch`, `JwksSource.Parsed`, `OidcSource.Given`, `OidcStrategy.tokenFetch`
-  - the seam for testing your own callback route: `tokenFetch` on a strategy
+- `HttpFetch`, `TokenFetch`, `JwksSource.Parsed`, `Provider.Endpoints`, `OidcOptions.tokenFetch`
+  - the seam for testing your own callback route: `tokenFetch` in the options of a strategy
   you build is `handleCallback`'s fake token-exchange endpoint, and
   `JwksSource.Parsed` wraps an already-parsed `Jwks` with no network call
   - so `beginAuthorization`/`handleCallback` run unmodified against a fake
