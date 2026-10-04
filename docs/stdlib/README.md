@@ -78,6 +78,7 @@ Modules are grouped by what you reach for them to do.
 | [xml](xml.md) | `"std/xml"` | XML 1.0 pull tokenizer (DOCTYPE refused, bounded depth and input) and a Writer that cannot emit malformed XML |
 | [uuid](uuid.md) | `"std/uuid"` | UUID v4/v5/v7, parse/format |
 | [sql](sql.md) | `"std/sql"` | The database driver contract - interface, registry, no driver |
+| [where](where.md) | `"std/where"` | The data a typed condition becomes: comparisons joined with and, or, not |
 
 ### Concurrency
 
