@@ -4,7 +4,7 @@
 // module-wide imports (SPEC §19) already declared by message.test.bit /
 // http.bit; nothing is imported here.
 
-// A write-only fake: captures every `writeStr` call as a separate chunk
+// A write-only fake: captures every `writeStr` and `writeBytes` call as a separate chunk
 // rather than concatenating them, so a test can assert on HOW MANY writes
 // happened (proving `writeStreamingBody` never builds one big string) as
 // well as on the bytes themselves.
@@ -15,8 +15,10 @@ class capturingStream {
     this.chunks = append(this.chunks, data)
   }
 
+  // `string(b)` copies, so a frame buffer the writer reuses for the next
+  // chunk cannot rewrite what was captured.
   writeBytes(b: []byte): ()! {
-    fail newError("capturingStream: unexpected writeBytes of ${itoa(len(b))} bytes")
+    this.chunks = append(this.chunks, string(b))
   }
 
   readUp(n: int): string! {
@@ -191,4 +193,444 @@ test "readResponseStreaming returns an empty Response.body and delivers the body
   assert(res.body == "", "Response.body was ${itoa(len(res.body))} bytes, not streamed")
   assert(joinParts(sink) == body, "sink did not receive the full body")
   assert(len(sink.parts) > 1, "delivered in a single chunk, not streamed")
+}
+
+// ---- chunked request bodies (#6575) ----
+
+const alphabet: string = "abcdefghijklmnopqrstuvwxyz"
+
+// The `n` bytes of the repeating alphabet starting at stream offset `pos`:
+// both ends of a wire test derive their bytes from this, so neither side holds
+// the whole body.
+fn patternAt(pos: int, n: int): string {
+  let off = pos % 26
+  return repeat(alphabet, (off + n) / 26 + 1)[off:off + n]
+}
+
+// A `BodySource` over the first `size` bytes of the alphabet pattern, at most
+// `step` bytes per pull (a small `step` models a slow producer).
+fn patternSource(size: int, step: int): BodySource {
+  let pos = 0
+  return (n) => {
+    let k = size - pos
+    if (k > n) {
+      k = n
+    }
+    if (k > step) {
+      k = step
+    }
+    let out = patternAt(pos, k)
+    pos = pos + k
+    return out
+  }
+}
+
+fn fixedTrailer(name: string, value: string): TrailerSource {
+  return () => {
+    return [Header{ name = name, value = value }]
+  }
+}
+
+test "writeChunkedBody sends a zero-length body as the last chunk alone" {
+  let c = newCapture()
+  writeChunkedBody(c, patternSource(0, 4096), Option.None) catch e {
+    assert(false, "writeChunkedBody: ${e.message()}")
+    return
+  }
+  assert(joinChunks(c) == "0\r\n\r\n", "wire = '${joinChunks(c)}'")
+}
+
+test "writeChunkedBody sends one chunk, the last chunk and the trailer in a single write" {
+  let c = newCapture()
+  writeChunkedBody(c, patternSource(5, 4096), Option.Some(fixedTrailer("x-n", "5"))) catch e {
+    assert(false, "writeChunkedBody: ${e.message()}")
+    return
+  }
+  let want = chunk("5", "abcde") + "0\r\nx-n: 5\r\n\r\n"
+  assert(joinChunks(c) == want, "wire = '${joinChunks(c)}'")
+  assert(len(c.chunks) == 1, "writes = ${itoa(len(c.chunks))}")
+}
+
+test "writeChunkedBody spells chunk sizes in hex across digit-count boundaries" {
+  let sizes = [1, 15, 16, 255, 256, 4095, 4096]
+  let hexes = ["1", "f", "10", "ff", "100", "fff", "1000"]
+  let i = 0
+  while (i < len(sizes)) {
+    let c = newCapture()
+    writeChunkedBody(c, patternSource(sizes[i], 4096), Option.None) catch e {
+      assert(false, "size ${itoa(sizes[i])}: ${e.message()}")
+      return
+    }
+    let want = chunk(hexes[i], patternAt(0, sizes[i])) + "0\r\n\r\n"
+    assert(joinChunks(c) == want, "size ${itoa(sizes[i])}: wire = '${joinChunks(c)}'")
+    i = i + 1
+  }
+}
+
+test "writeChunkedBody splits 8191, 8192 and 8193 bytes at 4096 with no empty chunk" {
+  let sizes = [8191, 8192, 8193]
+  let layout = [[4096, 4095], [4096, 4096], [4096, 4096, 1]]
+  let hexes = [["1000", "fff"], ["1000", "1000"], ["1000", "1000", "1"]]
+  let writes = [2, 3, 3]
+  let i = 0
+  while (i < len(sizes)) {
+    let c = newCapture()
+    writeChunkedBody(c, patternSource(sizes[i], 4096), Option.None) catch e {
+      assert(false, "size ${itoa(sizes[i])}: ${e.message()}")
+      return
+    }
+    let want = ""
+    let at = 0
+    let k = 0
+    while (k < len(layout[i])) {
+      want = want + chunk(hexes[i][k], patternAt(at, layout[i][k]))
+      at = at + layout[i][k]
+      k = k + 1
+    }
+    want = want + "0\r\n\r\n"
+    assert(joinChunks(c) == want, "size ${itoa(sizes[i])}: wire differs")
+    // A short last chunk shares its write with the terminator; a full one only
+    // learns the source is exhausted on the next pull, so the terminator is a
+    // write of its own (8192 ends on a full chunk; 8191 and 8193 end on a short one).
+    assert(len(c.chunks) == writes[i], "size ${itoa(sizes[i])}: writes = ${itoa(len(c.chunks))}")
+    i = i + 1
+  }
+}
+
+test "writeChunkedBody fills full-size chunks from a source that answers one byte at a time" {
+  let c = newCapture()
+  writeChunkedBody(c, patternSource(5000, 1), Option.None) catch e {
+    assert(false, "writeChunkedBody: ${e.message()}")
+    return
+  }
+  let want = chunk("1000", patternAt(0, 4096)) + chunk("388", patternAt(4096, 904)) + "0\r\n\r\n"
+  assert(joinChunks(c) == want, "a byte-at-a-time source did not coalesce into full chunks")
+}
+
+test "writeChunkedBody asks for the trailer only after the source is exhausted" {
+  let c = newCapture()
+  let ended = false
+  let inner = patternSource(10, 4096)
+  let source: BodySource = (n) => {
+    let out = inner(n)?
+    if (len(out) == 0) {
+      ended = true
+    }
+    return out
+  }
+  let trailers: TrailerSource = () => {
+    assert(ended, "trailers called before the source returned empty")
+    return [Header{ name = "x-end", value = "1" }]
+  }
+  writeChunkedBody(c, source, Option.Some(trailers)) catch e {
+    assert(false, "writeChunkedBody: ${e.message()}")
+    return
+  }
+  assert(
+    joinChunks(c) == chunk("a", "abcdefghij") + "0\r\nx-end: 1\r\n\r\n",
+    "wire = '${joinChunks(c)}'",
+  )
+}
+
+test "writeChunkedBody refuses trailer fields RFC 9110 section 6.5.1 forbids and malformed ones" {
+  let bad = [
+    Header{ name = "Content-Length", value = "5" },
+    Header{ name = "Transfer-Encoding", value = "chunked" },
+    Header{ name = "Host", value = "x" },
+    Header{ name = "Content-Type", value = "text/plain" },
+    Header{ name = "Authorization", value = "Bearer t" },
+    Header{ name = "Trailer", value = "x" },
+    Header{ name = "x-ok", value = "a\r\nInjected: 1" },
+    Header{ name = "bad name", value = "v" },
+  ]
+  for h of bad {
+    let c = newCapture()
+    let trailers: TrailerSource = () => {
+      return [h]
+    }
+    writeChunkedBody(c, patternSource(3, 4096), Option.Some(trailers)) catch e {
+      assert(len(e.message()) > 0, "empty message for '${h.name}'")
+      assert(indexOf(joinChunks(c), "0\r\n") < 0, "terminator written despite refusing '${h.name}'")
+      continue
+    }
+    assert(false, "trailer '${h.name}' was accepted")
+  }
+}
+
+test "writeChunkedBody fails when the source returns more than it was asked for" {
+  let c = newCapture()
+  let source: BodySource = (n) => {
+    return repeat("y", n + 1)
+  }
+  writeChunkedBody(c, source, Option.None) catch e {
+    assert(indexOf(e.message(), "requested") >= 0, "message = '${e.message()}'")
+    return
+  }
+  assert(false, "writeChunkedBody accepted a source that overshot")
+}
+
+test "writeChunkedBody stops at a source error without sending the last chunk" {
+  let c = newCapture()
+  let source: BodySource = (n) => {
+    fail newError("disk gone")
+  }
+  writeChunkedBody(c, source, Option.None) catch e {
+    assert(e.message() == "disk gone", "message = '${e.message()}'")
+    assert(len(c.chunks) == 0, "wrote ${itoa(len(c.chunks))} times after a source error")
+    return
+  }
+  assert(false, "writeChunkedBody swallowed a source error")
+}
+
+test "requestWithStreamingBody refuses trailers on a body with a declared length before dialing" {
+  let body = StreamBody{
+    source = patternSource(3, 4096),
+    length = Option.Some(3),
+    trailers = Option.Some(fixedTrailer("x-n", "3")),
+  }
+  // Port 1 refuses connections: an attempt to dial would fail with a
+  // connection error instead of the framing refusal asserted here.
+  requestWithStreamingBody("PUT", "http://127.0.0.1:1/x", []Header(0), body) catch e {
+    assert(indexOf(e.message(), "trailers need chunked framing") >= 0, "message = '${e.message()}'")
+    return
+  }
+  assert(false, "trailers were accepted beside a Content-Length")
+}
+
+test "requestWithStreamingBody refuses a negative declared length before dialing" {
+  let body = StreamBody{ source = patternSource(3, 4096), length = Option.Some(-1) }
+  requestWithStreamingBody("PUT", "http://127.0.0.1:1/x", []Header(0), body) catch e {
+    assert(indexOf(e.message(), "negative body length") >= 0, "message = '${e.message()}'")
+    return
+  }
+  assert(false, "a negative length was accepted")
+}
+
+// What the in-process server saw of one request.
+class wireReport {
+  err: string,
+  head: string,
+  total: int,
+  chunks: int,
+  maxChunk: int,
+  trailers: string,
+}
+
+// Reads one chunk's data and its closing CRLF off `s`, checking the bytes
+// against the pattern at their stream offset; `size` is the chunk-size line's
+// value.
+fn wireChunk(s: byteStream, rep: wireReport, size: int): ()! {
+  let got = 0
+  while (got < size) {
+    let piece = s.readUp(size - got)?
+    if (len(piece) == 0) {
+      fail newError("connection closed inside a chunk")
+    }
+    if (piece != patternAt(rep.total + got, len(piece))) {
+      fail newError("body differs near offset ${itoa(rep.total + got)}")
+    }
+    got = got + len(piece)
+  }
+  rep.total = rep.total + size
+  rep.chunks = rep.chunks + 1
+  if (size > rep.maxChunk) {
+    rep.maxChunk = size
+  }
+  let end = readLineBounded(s, 2, "chunk end")?
+  if (end != "") {
+    fail newError("chunk not closed by a bare CRLF")
+  }
+}
+
+// Reads the chunked body of a request off `s` strictly: a hex size line,
+// exactly that many bytes equal to the pattern at their offset, a bare CRLF,
+// until the zero-size chunk, then the trailer lines up to the blank line.
+fn wireBody(s: byteStream, rep: wireReport): ()! {
+  while (true) {
+    let line = readLineBounded(s, 16, "chunk size line")?
+    let size = hexToInt(line)
+    if (size < 0 || size > 4096) {
+      fail newError("bad chunk size line '${line}'")
+    }
+    if (size == 0) {
+      break
+    }
+    wireChunk(s, rep, size)?
+  }
+  while (true) {
+    let line = readLineBounded(s, 256, "trailer field")?
+    if (line == "") {
+      return
+    }
+    rep.trailers = rep.trailers + line + "\n"
+  }
+}
+
+fn wireRequest(s: byteStream, rep: wireReport): ()! {
+  let (head, rest) = readUntil(s, "", "\r\n\r\n")?
+  s.unread(rest)
+  rep.head = head
+  wireBody(s, rep)?
+}
+
+fn chunkWireServe(l: Listener, out: chan<wireReport>) {
+  let rep = wireReport{ err = "", head = "", total = 0, chunks = 0, maxChunk = 0, trailers = "" }
+  let c = l.accept() catch e {
+    rep.err = "accept: ${e.message()}"
+    out <- rep
+    return
+  }
+  let s = netStream{ conn = c }
+  wireRequest(s, rep) catch e {
+    rep.err = e.message()
+  }
+  s.writeStr("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok") catch _ {
+    rep.err = rep.err + " (response write failed)"
+  }
+  s.shut()
+  out <- rep
+}
+
+fn wireRoundTrip(size: int) {
+  let l = listen("127.0.0.1", 0) catch e {
+    assert(false, "listen: ${e.message()}")
+    return
+  }
+  let port = l.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let out = chan<wireReport>(1)
+  spawn chunkWireServe(l, out)
+  let sent = 0
+  let inner = patternSource(size, 4096)
+  let source: BodySource = (n) => {
+    let piece = inner(n)?
+    sent = sent + len(piece)
+    return piece
+  }
+  let trailers: TrailerSource = () => {
+    return [Header{ name = "x-body-length", value = itoa(sent) }]
+  }
+  let announce = [Header{ name = "Trailer", value = "x-body-length" }]
+  let body = StreamBody{ source = source, trailers = Option.Some(trailers) }
+  let res = requestWithStreamingBody("PUT", "http://127.0.0.1:${port}/x", announce, body) catch e {
+    l.close()
+    assert(false, "size ${itoa(size)}: ${e.message()}")
+    return
+  }
+  let rep = <- out
+  l.close()
+  assert(rep.err == "", "size ${itoa(size)}: server: ${rep.err}")
+  assert(
+    res.status == 200 && res.body == "ok",
+    "size ${itoa(size)}: status ${itoa(res.status)} body '${res.body}'",
+  )
+  let low = toLower(rep.head)
+  assert(indexOf(rep.head, "PUT /x HTTP/1.1\r\n") == 0, "head = '${rep.head}'")
+  assert(indexOf(low, "transfer-encoding: chunked") >= 0, "no chunked framing: '${rep.head}'")
+  assert(indexOf(low, "content-length") < 0, "Content-Length sent with chunked: '${rep.head}'")
+  assert(indexOf(rep.head, "Trailer: x-body-length") >= 0, "trailer not announced: '${rep.head}'")
+  assert(rep.total == size, "size ${itoa(size)}: server read ${itoa(rep.total)} bytes")
+  assert(rep.chunks == (size + 4095) / 4096, "size ${itoa(size)}: ${itoa(rep.chunks)} chunks")
+  assert(rep.maxChunk <= 4096, "a chunk of ${itoa(rep.maxChunk)} bytes")
+  assert(rep.trailers == "x-body-length: ${itoa(size)}\n", "trailers = '${rep.trailers}'")
+}
+
+test "an in-process server receives a 0-byte chunked body and its trailer exactly" {
+  wireRoundTrip(0)
+}
+
+test "an in-process server receives a 1-byte chunked body and its trailer exactly" {
+  wireRoundTrip(1)
+}
+
+test "an in-process server receives an 8191-byte chunked body and its trailer exactly" {
+  wireRoundTrip(8191)
+}
+
+test "an in-process server receives an 8192-byte chunked body and its trailer exactly" {
+  wireRoundTrip(8192)
+}
+
+test "an in-process server receives a 10 MiB chunked body and its trailer exactly" {
+  wireRoundTrip(10485760)
+}
+
+test "an unknown-length body with no trailers goes out chunked with an empty trailer section" {
+  let l = listen("127.0.0.1", 0) catch e {
+    assert(false, "listen: ${e.message()}")
+    return
+  }
+  let port = l.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let out = chan<wireReport>(1)
+  spawn chunkWireServe(l, out)
+  let body = StreamBody{ source = patternSource(5000, 4096) }
+  let res = requestWithStreamingBody("PUT", "http://127.0.0.1:${port}/x", []Header(0), body) catch e {
+    l.close()
+    assert(false, "requestWithStreamingBody: ${e.message()}")
+    return
+  }
+  let rep = <- out
+  l.close()
+  assert(rep.err == "", "server: ${rep.err}")
+  assert(res.status == 200, "status ${itoa(res.status)}")
+  assert(
+    rep.total == 5000 && rep.chunks == 2,
+    "total ${itoa(rep.total)}, chunks ${itoa(rep.chunks)}",
+  )
+  assert(rep.trailers == "", "trailers = '${rep.trailers}'")
+  assert(indexOf(toLower(rep.head), "transfer-encoding: chunked") >= 0, "head = '${rep.head}'")
+}
+
+test "requestWithStreamingBody keeps a Content-Length and sends no chunked framing" {
+  let l = listen("127.0.0.1", 0) catch e {
+    assert(false, "listen: ${e.message()}")
+    return
+  }
+  let port = l.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let out = chan<string>(1)
+  spawn clHeadServe(l, out)
+  let body = StreamBody{ source = patternSource(5, 4096), length = Option.Some(5) }
+  requestWithStreamingBody("PUT", "http://127.0.0.1:${port}/x", []Header(0), body) catch e {
+    l.close()
+    assert(false, "requestWithStreamingBody: ${e.message()}")
+    return
+  }
+  let got = <- out
+  l.close()
+  let low = toLower(got)
+  assert(indexOf(low, "content-length: 5\r\n") >= 0, "head = '${got}'")
+  assert(indexOf(low, "transfer-encoding") < 0, "chunked sent beside a known length: '${got}'")
+  assert(got[len(got) - 5:len(got)] == "abcde", "body = '${got}'")
+}
+
+// Reads the head and the 5-byte body of a Content-Length request and hands
+// back the raw bytes.
+fn clHeadServe(l: Listener, out: chan<string>) {
+  let c = l.accept() catch _ {
+    out <- "accept failed"
+    return
+  }
+  let raw = ""
+  while (len(raw) < 5 || indexOf(raw, "\r\n\r\n") < 0 || len(raw) < indexOf(raw, "\r\n\r\n") + 9) {
+    let piece = c.read(4096)
+    if (len(piece) == 0) {
+      break
+    }
+    raw = raw + piece
+  }
+  c.write("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch _ {
+    out <- raw
+    c.close()
+    return
+  }
+  c.close()
+  out <- raw
 }

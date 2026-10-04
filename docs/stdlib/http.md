@@ -76,7 +76,7 @@ memory; raise or lower that with a `Client` (below), or use the streaming
 functions for a multi-gigabyte upload or download:
 
 ```bit
-import { BodySource, BodySink, Header, getStreaming, requestWithStreamingBody } from "std/http"
+import { BodySource, BodySink, Header, StreamBody, getStreaming, requestWithStreamingBody } from "std/http"
 import { repeat } from "std/strings"
 
 // A body of `left` zero bytes, handed out one chunk at a time.
@@ -105,7 +105,8 @@ class Counter {
 fn roundTrip(url: string, size: int): int! {
   let zeros = Zeros{ left = size }
   let source: BodySource = zeros.next
-  requestWithStreamingBody("PUT", url, []Header(0), size, source)?
+  let body = StreamBody{ source = source, length = Option.Some(size) }
+  requestWithStreamingBody("PUT", url, []Header(0), body)?
   let counter = Counter{ total = 0 }
   let sink: BodySink = counter.take
   getStreaming(url, []Header(0), sink, size)?
@@ -113,13 +114,74 @@ fn roundTrip(url: string, size: int): int! {
 }
 ```
 
-`requestWithStreamingBody` sends a request body of exactly `contentLength`
-bytes pulled from a `BodySource` (`(int) => string!`, `""` at the end).
+`requestWithStreamingBody` sends a request body of exactly `length`
+bytes (a `Content-Length` request) pulled from a `BodySource` (`(int) => string!`, `""` at the end).
 `getStreaming` hands a response body to a `BodySink` (`(string) => ()!`) one
 chunk at a time and always returns `Response.body == ""`; its `maxBodyBytes`
 bounds the memory the *server's* declared length can force, not what this
 call buffers. Both cover `http://` and `https://` only; `https+h3://` is
 refused.
+
+### Sending a body of unknown length
+
+When the producer cannot say how much it will write (a compressor, a live
+feed, an `aws-chunked` upload), leave `length` out of the `StreamBody`. The
+same `requestWithStreamingBody` call then sends the body as
+`Transfer-Encoding: chunked` (RFC 9112 section 7.1) in chunks of up to 4096
+bytes, the zero-size last chunk, and the trailer fields, if any. A declared
+`length` always wins: that request carries a `Content-Length` and no chunked
+framing.
+
+Trailer fields (RFC 9110 section 6.5) are computed after the last body byte, so
+they can carry a value derived from everything sent, such as a checksum or a
+length. Announce them in a `Trailer` request header. Fields a trailer section
+may not carry (`Content-Length`, `Host`, `Authorization`, `Content-Type` and
+the rest of RFC 9110 section 6.5.1) are refused. Trailers need chunked
+framing, so a body with both `length` and `trailers` is refused before
+anything is sent.
+
+```bit
+import { BodySource, Header, StreamBody, TrailerSource, requestWithStreamingBody } from "std/http"
+
+// A producer that hands out `data` and counts what it has handed out.
+class Feed {
+  data: string
+  pos: int
+
+  next(n: int): string! {
+    let end = this.pos + n
+    if (end > len(this.data)) {
+      end = len(this.data)
+    }
+    let out = this.data[this.pos:end]
+    this.pos = end
+    return out
+  }
+
+  // Called once the body is complete, so `pos` is the final byte count.
+  length(): []Header! {
+    return [Header{ name = "x-body-length", value = "${this.pos}" }]
+  }
+}
+
+fn upload(url: string, data: string): int! {
+  let feed = Feed{ data = data, pos = 0 }
+  let source: BodySource = feed.next
+  let trailers: TrailerSource = feed.length
+  let body = StreamBody{ source = source, trailers = Option.Some(trailers) }
+  let announce = [Header{ name = "Trailer", value = "x-body-length" }]
+  return requestWithStreamingBody("PUT", url, announce, body)?.status
+}
+```
+
+Chunked is the default for an unknown length, as in Go's `net/http`, curl and
+undici. RFC 9112 section 6.1 lets a client rely on what it knows about the
+server from configuration or an earlier response. This call dials a fresh
+connection each time and keeps no record of an earlier response's HTTP
+version, so it never refuses a chunked request on those grounds; a server
+that cannot read chunked requests needs a `length`. The source may answer with
+fewer bytes than asked; the writer keeps pulling until a chunk is full, so a
+slow producer still sends full-size chunks.
 
 ### Reading a body as it arrives
 
@@ -623,10 +685,23 @@ As `request`, with an explicit TLS configuration. Fails if `url` is not
 Fetches `url`, delivering the response body to `sink` in bounded chunks
 instead of returning it whole. `Response.body` is always `""`.
 
-### `requestWithStreamingBody(method: string, url: string, headers: []Header, contentLength: int, source: BodySource): Response!`
+### `requestWithStreamingBody(method: string, url: string, headers: []Header, body: StreamBody): Response!`
 
-Sends a request body of exactly `contentLength` bytes pulled from `source`,
-one chunk at a time, and returns the response.
+Sends a request body pulled from `body.source` one chunk at a time and
+returns the response: `Content-Length` framing when `body.length` is set,
+`Transfer-Encoding: chunked` with the optional `body.trailers` when it is not.
+
+### `StreamBody`
+
+`StreamBody{ source: BodySource, length: Option<int>, trailers: Option<TrailerSource> }`:
+the request body for `requestWithStreamingBody`. `length = Option.Some(n)`
+declares exactly `n` bytes; leaving it out means unknown length. `trailers`
+is only valid without a `length`.
+
+### `TrailerSource`
+
+A function `() => []Header!` called once, after the body source has returned
+`""`; its fields form the trailer section.
 
 ### `BodySource`
 
