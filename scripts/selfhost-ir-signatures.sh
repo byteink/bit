@@ -347,7 +347,7 @@ explainMismatch() {
     explainTableSynthTypes "$1" "$2"
     return
   fi
-  awk -v kind="$3" -v file="${4:-}" "${IR_WALK_AWK}"'
+  LC_ALL=C awk -v kind="$3" -v file="${4:-}" "${IR_WALK_AWK}"'
     # canonT -- rewrite every `$t<N>` of arr[1..n] to `$c<idx>` in first-
     # appearance order, the same canonicalization scripts/selfhost-ir-canon.sh
     # applies, so interning-order numbering never hides an identity.

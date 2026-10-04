@@ -562,6 +562,9 @@ bb1(%7: string):
     if [ "$other_oracle" = "$br_oracle" ]; then echo "FAIL: 6558 other slice ($kind): the oracle mutation did not apply"; fail=1; fi
     expect "6558 string_from_bytes of another slice ($kind)" "$other_oracle" "$br_tree" "$kind" ""
   done
+  # A literal holding a byte that is not UTF-8 must not stop the awk (#6716).
+  bad=$(printf '\300A')
+  expect "6558 a non-UTF-8 byte in a literal" "${br_oracle/\"%7\"/\"$bad\"}" "${br_tree/\"%7\"/\"$bad\"}" ir 6558-string-from-byte-range
   # On top of a #6730 hunk the walk stays that signature's, and a wrong operand
   # in the collapsed call still fails it.
   brc_oracle="${call_oracle/  ret %2/  %3 = rt_call slice_slice(%0, %0, %0) []u8
