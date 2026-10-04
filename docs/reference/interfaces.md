@@ -20,8 +20,9 @@ interface Store {
 }
 ```
 
-`Store` lists two method signatures and nothing else: no fields, no bodies.
-Anything with both methods, with matching parameter and return types, can
+`Store` lists two method signatures and nothing else: no bodies, and no
+fields yet ([Requiring a field](#requiring-a-field) adds those). Anything
+with both methods, with matching parameter and return types, can
 stand in for a `Store`. There is no `implements Store` to write; Bit checks
 this where a value is used as a `Store`, not where the class is declared:
 
@@ -56,6 +57,70 @@ fn main() {
 `Store` by having a `save` and a `load` with the right signatures. A future
 `PostgresStore` would satisfy the same interface the same way, and callers
 would not need to change at all.
+
+## Requiring a field
+
+A `Store` that audits writes needs to know who is writing. Asking every
+caller for a `userId(): string` method means each user type grows a
+one-line getter. When the information is already a field, the interface
+can ask for the field:
+
+```bit
+class Draft {
+  export title: string,
+}
+
+interface Editor {
+  id: string,
+  roles: []string,
+}
+
+class Author {
+  export id: string,
+  export roles: []string,
+  export drafts: []Draft,
+}
+
+fn audit(by: Editor, action: string) {
+  println("${by.id} (${len(by.roles)} roles) ${action}")
+}
+
+fn main() {
+  let ana = Author{ id = "ana", roles = ["writer"], drafts = []Draft(0) }
+  audit(ana, "saved a draft")
+}
+```
+
+`id: string` is a field requirement. `Author` satisfies it the same way it
+satisfies a method: by having a field with that name and the identical type,
+with nothing to declare. `audit` reads `by.id` and `by.roles` like fields of
+a class. An interface can mix fields and methods in one declaration.
+
+Three rules decide whether a class qualifies:
+
+- The type must match exactly. An `id: i64` field does not satisfy
+  `id: string`.
+- The field has to be visible. An `export`ed field satisfies the requirement
+  from any module. A field without `export` satisfies it only for an
+  interface declared in the same module, since it is private to that module
+  and the interface would otherwise hand its value to every other one.
+- A method named `id()` is not a field named `id`.
+
+When a class fails, the error names the field:
+
+```bit ignore
+class Row {
+  export id: i64,
+}
+
+fn demo() {
+  let by: Editor = Row{ id = 1 } // error[E0041]: ... 'Row.id' is i64, but 'Editor' needs id: string
+}
+```
+
+The requirement is read-only through the interface. Writing `by.id = "x"`,
+`by.id += "x"` or `by.id++` is `E0114`, the same error a `readonly` class
+field gives. Assign on the concrete value (`ana.id = "x"`) instead.
 
 ## The built-in `error` interface
 
