@@ -1,0 +1,323 @@
+// pkg/auth/magiclink.bit — passwordless login by a mailed link, a `Strategy`
+// (strategy.bit) on the one-time token primitive (onetime.bit, #6925; this file
+// is #6934, epic #3960). Built the way email verification (verify_email.bit,
+// #6933) is, so the two read alike.
+//
+//   let login = MagicLinkStrategy(tokens, MagicLinkOptions{ lookup = users.byEmail, deliver = mailTheLink })?
+//   login.request(c, "ada@example.com")?    // POST /magic: mails a link, answers the same for anyone
+//   let who = login.authenticate(c)?        // POST /magic/redeem: the page's button; starts the session
+//
+// STANDARDS. OWASP ASVS v5 (out-of-band authenticators), NIST SP 800-63B
+// section 5.1.3 (out-of-band: single use, short lived), and the OWASP
+// Authentication Cheat Sheet.
+//
+// ## What is guaranteed
+//
+//  - Only the newest link works. `request` issues with `Live.One`, so the
+//    earlier links die in the same atomic store step that saves the new one,
+//    even when two requests run at the same instant.
+//  - A link works once and for ten minutes (`ttl`). The token is consumed
+//    before anything else is checked, so a replay, a second click and a
+//    refused attempt cannot be tried again.
+//  - `request` gives the same answer for an address that has an account and one
+//    that has none: the same result, the same session write, the same one
+//    atomic store step, and no delivery failure ever reaches the caller (it
+//    would say "this address exists"). For an unknown address the store step
+//    is on a decoy record no link can reach and `deliver` is not called. What
+//    `deliver` costs is the app's to even out: have it queue the mail rather
+//    than send it inline, as the chapter says.
+//  - `authenticate` refuses every bad link with the same `unauthorized()`:
+//    unknown, expired, used, malformed, another purpose, another browser, a
+//    user that was deleted since.
+//  - A login regenerates the session id (`Session.regenerate()`), the CONTRACT
+//    in strategy.bit: a session id planted before the login is dead after it.
+//
+// ## Prefetch
+//
+// Mail scanners and link previewers open every link in a mail with a GET.
+// `authenticate` is not the page behind the link: the link opens a page with a
+// button, and the button's POST calls `authenticate`, so a scanner cannot spend
+// the token. The chapter shows the page.
+//
+// ## Binding the link to the browser
+//
+// With `bindToBrowser` (the default) `request` stores a random value in the
+// session of the browser that asked and in the token; `authenticate` refuses a
+// link whose value is not the one in the session it arrives with. An attacker
+// who plants a link of their own in a victim's browser (login CSRF) or a link
+// forwarded to another person is refused. The cost: a link opened on another
+// device, or in a mail app's own browser, is refused too, and is spent; the
+// user asks for another from the browser they will use. Turn it off for an app
+// whose users read mail on one device and sign in on another.
+//
+// ## The throttle
+//
+// With `MagicLinkOptions.throttle` set, `request` is asked before it works and
+// counts every request against the address and the caller (a request is an
+// attempt, whether or not the address has an account, so a refusal looks the
+// same for both), and `authenticate` counts every refused link against the
+// caller's address and clears the count on a success. Pass a `LoginThrottle` of
+// its own: the address counter of a shared one is also fed by every other
+// login. A refusal is the throttle's `Throttled` (429).
+//
+// The `std/crypto` and `std/runtime` imports repeat ones other files of this
+// module make: an identical import binds the same symbol (SPEC §17.1).
+import { badRequest } from "web"
+import { randomBytes, encodeHex } from "std/crypto"
+import { runRecovering } from "std/runtime"
+
+// What a link is for. Not any other flow's purpose, so a reset or a
+// verification token cannot log anyone in.
+const magicPurpose: string = "magic-link"
+
+// The purpose and subject of the record an unknown address gets instead of a
+// link, so `request` does the same store step for every address. Nobody holds
+// its token, and one record is all there ever is.
+const decoyPurpose: string = "magic-link-decoy"
+const decoySubject: string = "decoy"
+
+// The session key the browser binding lives under.
+const magicSessionKey: string = "auth:magic-link"
+
+// Hex characters in the binding value: 16 random bytes.
+const binderLen: int = 32
+
+// The user a link signs in: the id and claims of the `Identity` `authenticate`
+// returns.
+export class MagicLinkUser {
+  export id: string,
+  export claims: Json,
+}
+
+// Told when `deliver` fails. `request` revokes the link nobody received, and
+// cannot return the failure (see this file's header), so this is how the app
+// hears of it: log it. The error may name the address; the token is never in
+// it. Whatever the hook does, `request` goes on, and a panic in it is caught.
+export type MagicLinkErrorHook = (error) => ()
+
+// The options of `MagicLinkStrategy`.
+export class MagicLinkOptions {
+  // Finds the user an address belongs to, `None` when there is none. Required.
+  // Called with the address `request` was given, and again at `authenticate`
+  // with that same address, so a user deleted since is refused.
+  export lookup: (string) => Option<MagicLinkUser>,
+  // Sends the link to the address. Required. Give it a queue, not an inline
+  // mail send, so a known address does not answer slower than an unknown one.
+  export deliver: Deliver,
+  // How long a link lives, in seconds: ten minutes. At most the `maxTtl` of the
+  // `OneTimeTokens` it is built on.
+  export ttl: i64 = 600,
+  // Refuse a link opened in a different browser than the one that asked; see
+  // this file's header for what that buys and costs.
+  export bindToBrowser: bool = true,
+  // The `LoginThrottle` to consult and feed (`None`: no throttle).
+  export throttle: Option<LoginThrottle>,
+  // Told when `deliver` fails (`nil`: nobody).
+  export onDeliveryError: MagicLinkErrorHook,
+}
+
+// The JSON body `authenticate` reads: `{"token": "..."}`.
+@json class MagicBody {
+  token: string,
+}
+
+// A `Strategy` that signs a user in with a link mailed to their address.
+// Stateless apart from the token store, so one value is shared by every
+// request.
+export class MagicLinkStrategy {
+  tokens: OneTimeTokens
+  opts: MagicLinkOptions
+
+  // Fails for a missing callback or a `ttl` that cannot work, so the mistake
+  // shows when the app starts.
+  init(tokens: OneTimeTokens, opts: MagicLinkOptions)! {
+    if (opts.lookup == nil) {
+      fail newError("auth: MagicLinkStrategy(): `lookup` is not set — it finds the user an address belongs to")
+    }
+    if (opts.deliver == nil) {
+      fail newError("auth: MagicLinkStrategy(): `deliver` is not set — it sends the link")
+    }
+    if (opts.ttl < 1 || opts.ttl > tokens.opts.maxTtl) {
+      fail newError("auth: MagicLinkStrategy(): `ttl` is ${opts.ttl} second(s) — it must be between 1 and ${tokens.opts.maxTtl}")
+    }
+    this.tokens = tokens
+    this.opts = opts
+  }
+
+  export name(): string {
+    return "magic-link"
+  }
+
+  // Mails a login link to `identifier` (the address) when it has an account,
+  // and kills the links sent before. Answers the same either way; see this
+  // file's header. Fails with a 400 for a string that is not one address, with
+  // the throttle's `Throttled` (429) when it refuses, and with a store's own
+  // failure, which happens for known and unknown addresses alike. A failed
+  // delivery is not a failure here: the link is revoked and the hook told.
+  export request(c: Ctx, identifier: string): ()! {
+    if (!verifyAddressOk(identifier)) {
+      fail badRequest("not an email address")
+    }
+    let ip = c.peer()
+    let account = "magic-link:request:${identifier}"
+    this.admit(account, ip)?
+    this.count(account, ip)?
+    let binder = encodeHex(randomBytes(binderLen / 2))
+    if (this.opts.bindToBrowser) {
+      c.session()?.set(magicSessionKey, binder)
+    }
+    let lookup = this.opts.lookup
+    let found = lookup(identifier)
+    if (!isSome(found)) {
+      this.decoy(binder)?
+      return
+    }
+    this.send(unwrap(found), identifier, binder)?
+  }
+
+  // Reads `{"token": "..."}` from the body, redeems it, checks the browser and
+  // the user, and returns the user's `Identity` after regenerating the session
+  // id (`Session.regenerate()`, pkg/web/session.bit — session fixation).
+  //
+  // Every refusal is `unauthorized()` (401). A store failure, and a throttle
+  // that cannot be asked, are returned as they came (500); a throttle that
+  // refuses is its `Throttled` (429).
+  export authenticate(c: Ctx): Identity! {
+    let body = c.body<MagicBody>()?
+    let ip = c.peer()
+    let account = "magic-link:redeem:${ip}"
+    this.admit(account, ip)?
+    let user = this.redeemUser(c, body.token) catch e {
+      let (_, refused) = e.(InvalidToken)
+      if (!refused) {
+        fail e
+      }
+      this.count(account, ip)?
+      fail unauthorized()
+    }
+    this.forgive(account)?
+    let session = c.session()?
+    session.delete(magicSessionKey)
+    session.regenerate()?
+    return Identity{ id = user.id, claims = user.claims }
+  }
+
+  // The link for `user`, replacing the earlier ones, handed to `deliver`. A
+  // failed delivery revokes the link, nobody has it, and goes to the hook.
+  send(user: MagicLinkUser, identifier: string, binder: string): ()! {
+    let at = this.tokens.nowSec()
+    let token = this.tokens.issue(
+      magicPurpose,
+      user.id,
+      this.opts.ttl,
+      binder + identifier,
+      live = Live.One,
+    )?
+    // `at` is read before the record's own clock read, so a message saying
+    // "valid until" is never later than the truth.
+    let deliver = this.opts.deliver
+    deliver(identifier, token, at + this.opts.ttl) catch e {
+      this.dropUnsent(user.id)
+      this.report(e)
+    }
+  }
+
+  // What an unknown address gets in place of `send`: the same issue, one
+  // atomic store step, of a token nobody is given.
+  decoy(binder: string): ()! {
+    let _ = this.tokens.issue(decoyPurpose, decoySubject, this.opts.ttl, binder, live = Live.One)?
+  }
+
+  // A store that cannot revoke is not worse news than the delivery failure the
+  // hook is about to hear, so its error is dropped.
+  dropUnsent(userId: string) {
+    this.tokens.revokeSubject(magicPurpose, userId) catch _ {
+      return
+    }
+  }
+
+  // Hands the hook the delivery failure; whatever it does, `request` goes on.
+  report(e: error) {
+    let hook = this.opts.onDeliveryError
+    if (hook == nil) {
+      return
+    }
+    let (_, _) = runRecovering(() => {
+      hook(e)
+    })
+  }
+
+  // The user a token signs in, consuming it: `InvalidToken` for every reason it
+  // will not, a store failure as it came.
+  redeemUser(c: Ctx, token: string): MagicLinkUser! {
+    let rec = this.tokens.redeem(token, magicPurpose)?
+    if (len(rec.data) <= binderLen) {
+      fail InvalidToken{}
+    }
+    this.checkBrowser(c, rec.data[0:binderLen])?
+    let lookup = this.opts.lookup
+    let found = lookup(rec.data[binderLen:len(rec.data)])
+    if (!isSome(found) || unwrap(found).id != rec.subject) {
+      fail InvalidToken{}
+    }
+    return unwrap(found)
+  }
+
+  // With `bindToBrowser`, fails with `InvalidToken` unless this browser's
+  // session holds the value the token was issued with.
+  checkBrowser(c: Ctx, binder: string): ()! {
+    if (!this.opts.bindToBrowser) {
+      return
+    }
+    let mine = c.session()?.get(magicSessionKey)
+    if (mine == "" || !ctEq([]byte(mine), []byte(binder))) {
+      fail InvalidToken{}
+    }
+  }
+
+  // The throttle's say before any work; a refusal is its `Throttled`.
+  admit(account: string, ip: string): ()! {
+    match (this.opts.throttle) {
+      None => return
+      Some(t) => {
+        t.check(account, ip) catch e {
+          let (_, locked) = e.(Throttled)
+          if (!locked) {
+            fail magicThrottleDown(e)
+          }
+          fail e
+        }
+      }
+    }
+  }
+
+  // Counts one attempt against the account and the address.
+  count(account: string, ip: string): ()! {
+    match (this.opts.throttle) {
+      None => return
+      Some(t) => {
+        t.recordFailure(account, ip) catch e {
+          fail magicThrottleDown(e)
+        }
+      }
+    }
+  }
+
+  // Clears the account's count after a link was honoured.
+  forgive(account: string): ()! {
+    match (this.opts.throttle) {
+      None => return
+      Some(t) => {
+        t.recordSuccess(account) catch e {
+          fail magicThrottleDown(e)
+        }
+      }
+    }
+  }
+}
+
+// The request refused because the throttle's store failed: not a `Throttled`,
+// so the client sees a 500 and the cause stays in the server's log.
+fn magicThrottleDown(e: error): error {
+  return newError("auth: MagicLinkStrategy: the login throttle failed, refusing the request: ${e.message()}")
+}
