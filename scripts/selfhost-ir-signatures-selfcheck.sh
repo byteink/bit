@@ -245,7 +245,7 @@ bb3():
 }'
   expect "6840 one check dropped (iropt)" "$bce_oracle" "$bce_tree" iropt 6840-bce-window-guard
   expect "6840 is post-opt only" "$bce_oracle" "$bce_tree" ir ""
-  refuse "6840 the load changed too (iropt)" "$bce_oracle" "$bce_tree" "${bce_tree/index_get %0\[%1\] u8/index_get %0\[%2\] u8}" iropt
+  refuse "6840 an opcode changed too (iropt)" "$bce_oracle" "$bce_tree" "${bce_tree/len i64/cap i64}" iropt
   refuse "6840 a second line dropped (iropt)" "$bce_oracle" "$bce_tree" "${bce_tree/  %2 = len i64 %0
 /}" iropt
   expect "6840 nothing dropped" "$bce_oracle" "$bce_oracle" iropt ""
