@@ -1,0 +1,645 @@
+// Bit standard library — xml module, XML Signature (XML-DSig) verification.
+//
+// `verifySignature(doc, key)` checks the enveloped signature of one element
+// (https://www.w3.org/TR/xmldsig-core1/: §3.1 Reference processing, §4 Signature
+// and SignedInfo, §6.4 RSA PKCS#1 v1.5; RFC 4051 / RFC 6931 for rsa-sha256 and
+// ecdsa-sha256 with the raw `r || s` signature value) and returns the element
+// that was verified. XML signature wrapping (XSW, "On Breaking SAML", USENIX
+// Security 2012) works because the signature checks one element while the
+// application reads another one, found by ID or by name afterwards. So this
+// function never answers "yes"; it answers with `SignedElement.element`, the
+// element whose canonical bytes were digested, and the caller reads that and
+// nothing in `doc`.
+//
+// A document is accepted only when every one of these holds, each a failure
+// naming the rule:
+//
+//   - The key is the caller's (`DsigKey`, from metadata it trusts). `KeyInfo`
+//     is never read, so a document cannot bring its own key.
+//   - There is exactly one `ds:Signature` in the whole of `doc`, and exactly
+//     one `Reference` in it, `URI="#id"`. The element that holds the signature
+//     is the signed element, and its `ID`, `Id` or `id` attribute is `id`.
+//   - No `ID`, `Id`, `id` or `xml:id` value occurs twice anywhere in `doc`.
+//   - The signed element is `doc` itself, or, with `expectRoot`, the one
+//     element in `doc` with that name; a second element of that name is a
+//     failure, which is what a wrapping attack has to add.
+//   - Transforms are exactly enveloped-signature, then Exclusive C14N 1.0; the
+//     canonicalization method is Exclusive C14N 1.0 (no comments variant, no
+//     inclusive Canonical XML, no XPath, XSLT or decryption transform); the
+//     digest is SHA-256 (SHA-1 only with `allowSha1`); the signature method is
+//     rsa-sha256 with an RSA key of 2048 bits or more, or ecdsa-sha256 with a
+//     P-256 key, and it must match the key's kind. The hash comes from the
+//     URI, never from the key.
+//   - `Signature` holds `SignedInfo`, `SignatureValue` and an optional
+//     `KeyInfo` and nothing else (no `Object`), with only white space between
+//     them and no comment or processing instruction inside; the structure is
+//     read by one rule, so two readers cannot disagree about it.
+//   - The document is within `maxElements`, `maxDepth` and `maxSignatureBytes`.
+//
+// The digest is over the signed element with the Signature child cut out
+// (the enveloped-signature transform), canonicalized by `canonicalizeExclusive`
+// and compared with `ctEq`. `SignedInfo` is then canonicalized the same way and
+// the signature verified over it. The element returned is that same copy, so
+// what the caller reads is, byte for byte, what was digested.
+
+import {
+  RsaPublicKey,
+  EcdsaPublicKey,
+  EcdsaSignature,
+  HashAlg,
+  Sha1,
+  Sha256,
+  digest,
+  ctEq,
+  decodeBase64,
+  bigintFromBytes,
+  bigintBitLen,
+  nistecP256,
+  nistecIsOnCurve,
+  rsaVerifyPkcs1v15,
+  rsaDigestInfoSha256,
+  ecdsaVerify,
+} from "std/crypto"
+
+const dsigNs: string = "http://www.w3.org/2000/09/xmldsig#"
+const dsigExcNs: string = "http://www.w3.org/2001/10/xml-exc-c14n#"
+const dsigEnveloped: string = "http://www.w3.org/2000/09/xmldsig#enveloped-signature"
+const dsigRsaSha256: string = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
+const dsigEcdsaSha256: string = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"
+const dsigSha256: string = "http://www.w3.org/2001/04/xmlenc#sha256"
+const dsigSha1: string = "http://www.w3.org/2000/09/xmldsig#sha1"
+const dsigXmlNs: string = "http://www.w3.org/XML/1998/namespace"
+const dsigMinRsaBits: int = 2048
+
+// The key a signature is checked with: supplied by the caller (from IdP
+// metadata, say), never taken from the document.
+export enum DsigKey {
+  Rsa(RsaPublicKey),
+  Ecdsa(EcdsaPublicKey),
+}
+
+// What `verifySignature` accepts beyond its fixed rules.
+export class DsigOptions {
+  // The one element the signature must cover, `{namespace-uri}local`, or a
+  // bare `local` for an element in no namespace. "" (the default): the signed
+  // element is `doc` itself. Otherwise it may sit anywhere in `doc`, and no
+  // other element of that name may exist there. A string and not an Option
+  // because a class field default must be a compile-time constant.
+  export expectRoot: string = "",
+  // Accept a SHA-1 `DigestMethod`. The signature method is never SHA-1.
+  export allowSha1: bool = false,
+  // Limits on `doc`: elements in all, nesting depth, and the decoded size of
+  // `SignatureValue` and `DigestValue`.
+  export maxElements: int = 100000,
+  export maxDepth: int = 256,
+  export maxSignatureBytes: int = 1024,
+}
+
+// The element a signature covered, the signature itself cut out. `element`
+// is the one to read: a lookup of `id` (or of anything else) in the document
+// can be redirected by whoever built the document.
+export class SignedElement {
+  export element: Element,
+  export id: string,
+}
+
+// Verifies the enveloped signature in `doc` with `key`. See the file comment
+// for what is checked; fails, with the rule that broke, on anything else.
+export fn verifySignature(
+  doc: Element,
+  key: DsigKey,
+  opts: DsigOptions = DsigOptions{},
+): SignedElement! {
+  let want = dsigWant(opts)?
+  let scan = dsigScanDoc(doc, want, opts)?
+  let sig = dsigOne(scan)?
+  let info = dsigSignature(sig, opts)?
+  let target = scan.parent
+  if (!dsigHasId(target, info.refId)) {
+    fail newError("xml-dsig: Reference URI '#${info.refId}' is not the ID of the element holding the signature")
+  }
+  dsigPlace(scan, want)?
+  let signed = dsigStrip(target, scan.sigAt)
+  let bytes = canonicalizeExclusive(signed, C14nOptions{ inclusivePrefixes = info.refIncl })?
+  if (!ctEq(dsigHash(info.digestAlg, bytes), info.digest)) {
+    fail newError("xml-dsig: the digest of the signed element does not match DigestValue")
+  }
+  let si = canonicalizeExclusive(info.signedInfo, C14nOptions{ inclusivePrefixes = info.c14nIncl })?
+  dsigCheckValue(key, info.sigAlg, si, info.sigValue)?
+  return SignedElement{ element = signed, id = info.refId }
+}
+
+// ---------------------------------------------------------------------------
+// The document: one walk for limits, IDs, the Signature and `expectRoot`.
+// ---------------------------------------------------------------------------
+
+// `expectRoot` split into (has, namespace URI, local name).
+class dsigName {
+  has: bool,
+  space: string,
+  local: string,
+}
+
+fn dsigWant(opts: DsigOptions): dsigName! {
+  if (opts.maxElements < 1 || opts.maxDepth < 1 || opts.maxSignatureBytes < 1) {
+    fail newError("xml-dsig: maxElements, maxDepth and maxSignatureBytes must be at least 1")
+  }
+  let s = opts.expectRoot
+  if (s == "") {
+    return dsigName{ has = false, space = "", local = "" }
+  }
+  if (s[0] != '{') {
+    return dsigName{ has = true, space = "", local = s }
+  }
+  let end = 1
+  while (end < len(s) && s[end] != '}') {
+    end = end + 1
+  }
+  if (end >= len(s) - 1) {
+    fail newError("xml-dsig: expectRoot '${s}' must be {namespace-uri}local or local")
+  }
+  return dsigName{ has = true, space = s[1:end], local = s[end + 1:len(s)] }
+}
+
+class dsigScan {
+  want: dsigName
+  maxElements: int
+  maxDepth: int
+  ids: map<string, bool>
+  count: int
+  named: int
+  sigs: int
+  sig: Element
+  parent: Element
+  sigAt: int
+  atRoot: bool
+  els: []Element
+  next: []int
+
+  // Visits every element of `doc` once, on a stack of its own.
+  run(doc: Element): ()! {
+    this.enter(doc)?
+    while (len(this.els) > 0) {
+      let k = len(this.els) - 1
+      let e = this.els[k]
+      let i = this.next[k]
+      if (i >= len(e.nodes)) {
+        this.els = this.els[0:k]
+        this.next = this.next[0:k]
+        continue
+      }
+      this.next[k] = i + 1
+      match (e.nodes[i]) {
+        Elem(c) => {
+          this.noteSignature(c, e, i)
+          this.enter(c)?
+        }
+        Text(_) => {}
+      }
+    }
+  }
+
+  noteSignature(c: Element, parent: Element, at: int) {
+    if (!dsigIs(c, "Signature")) {
+      return
+    }
+    this.sigs = this.sigs + 1
+    this.sig = c
+    this.parent = parent
+    this.sigAt = at
+    this.atRoot = len(this.els) == 1
+  }
+
+  enter(e: Element): ()! {
+    this.count = this.count + 1
+    if (this.count > this.maxElements) {
+      fail newError("xml-dsig: more than ${this.maxElements} elements")
+    }
+    if (len(this.els) >= this.maxDepth) {
+      fail newError("xml-dsig: nesting deeper than ${this.maxDepth}")
+    }
+    this.noteIds(e)?
+    if (this.want.has && e.local == this.want.local && e.space == this.want.space) {
+      this.named = this.named + 1
+    }
+    this.els = append(this.els, e)
+    this.next = append(this.next, 0)
+  }
+
+  // Fails on a second occurrence of any ID value, whichever of the four ID
+  // attributes carries it.
+  noteIds(e: Element): ()! {
+    let i = 0
+    while (i < len(e.attrs)) {
+      let a = e.attrs[i]
+      let (_, local, _) = xmlSplitName(a.name)
+      if (!xmlIsDecl(a.name) && dsigIsIdAttr(local, e.attrSpaces[i]) && a.value != "") {
+        let (_, dup) = this.ids[a.value]
+        if (dup) {
+          fail newError("xml-dsig: duplicate ID '${a.value}'")
+        }
+        this.ids[a.value] = true
+      }
+      i = i + 1
+    }
+  }
+}
+
+fn dsigIsIdAttr(local: string, space: string): bool {
+  if (space == "") {
+    return local == "ID" || local == "Id" || local == "id"
+  }
+  return space == dsigXmlNs && local == "id"
+}
+
+fn dsigScanDoc(doc: Element, want: dsigName, opts: DsigOptions): dsigScan! {
+  let scan = dsigScan{
+    want = want,
+    maxElements = opts.maxElements,
+    maxDepth = opts.maxDepth,
+    ids = map<string, bool>(),
+    count = 0,
+    named = 0,
+    sigs = 0,
+    sig = doc,
+    parent = doc,
+    sigAt = 0,
+    atRoot = false,
+    els = []Element(0),
+    next = []int(0),
+  }
+  scan.run(doc)?
+  return scan
+}
+
+// The Signature, when there is exactly one.
+fn dsigOne(scan: dsigScan): Element! {
+  if (scan.sigs == 0) {
+    fail newError("xml-dsig: no ds:Signature element")
+  }
+  if (scan.sigs > 1) {
+    fail newError("xml-dsig: ${scan.sigs} ds:Signature elements; exactly one is accepted")
+  }
+  return scan.sig
+}
+
+// Whether the element holding the signature is the one the caller expects:
+// `doc` itself, or the only element named `expectRoot`.
+fn dsigPlace(scan: dsigScan, want: dsigName): ()! {
+  if (!want.has) {
+    if (!scan.atRoot) {
+      fail newError("xml-dsig: the signed element is not the root of the document")
+    }
+    return
+  }
+  let p = scan.parent
+  if (p.local != want.local || p.space != want.space) {
+    fail newError("xml-dsig: the signed element is <${p.local}>, not the expected root <${want.local}>")
+  }
+  if (scan.named != 1) {
+    fail newError("xml-dsig: ${scan.named} elements are named <${want.local}>; exactly one is accepted")
+  }
+}
+
+// Whether `e` carries `id` in an ID attribute.
+fn dsigHasId(e: Element, id: string): bool {
+  let i = 0
+  while (i < len(e.attrs)) {
+    let (_, local, _) = xmlSplitName(e.attrs[i].name)
+    if (!xmlIsDecl(e.attrs[i].name) &&
+      dsigIsIdAttr(local, e.attrSpaces[i]) &&
+      e.attrs[i].value == id) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// A copy of `s` without its child `nodes[at]` (the enveloped-signature
+// transform). Comments and processing instructions after the cut move up one
+// place with the nodes they were counted against.
+fn dsigStrip(s: Element, at: int): Element {
+  let nodes = []Node(0)
+  let i = 0
+  while (i < len(s.nodes)) {
+    if (i != at) {
+      nodes = append(nodes, s.nodes[i])
+    }
+    i = i + 1
+  }
+  let misc = []xmlMisc(0)
+  i = 0
+  while (i < len(s.misc)) {
+    let m = s.misc[i]
+    let pos = m.at
+    if (pos > at) {
+      pos = pos - 1
+    }
+    misc = append(
+      misc,
+      xmlMisc{ pi = m.pi, target = m.target, text = m.text, at = pos, off = m.off },
+    )
+    i = i + 1
+  }
+  return Element{
+    name = s.name,
+    local = s.local,
+    space = s.space,
+    attrs = s.attrs,
+    nodes = nodes,
+    attrSpaces = s.attrSpaces,
+    parent = s.parent,
+    misc = misc,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The Signature element.
+// ---------------------------------------------------------------------------
+
+class dsigInfo {
+  c14nIncl: []string,
+  sigAlg: string,
+  signedInfo: Element,
+  sigValue: []byte,
+  refId: string,
+  digestAlg: string,
+  digest: []byte,
+  refIncl: []string,
+}
+
+class dsigRef {
+  id: string,
+  digestAlg: string,
+  digest: []byte,
+  incl: []string,
+}
+
+fn dsigSignature(sig: Element, opts: DsigOptions): dsigInfo! {
+  let kids = dsigKids(sig, "Signature")?
+  dsigShape(kids, ["SignedInfo", "SignatureValue"], "KeyInfo", "Signature")?
+  let si = kids[0]
+  let sk = dsigKids(si, "SignedInfo")?
+  dsigShape(sk, ["CanonicalizationMethod", "SignatureMethod", "Reference"], "", "SignedInfo")?
+  if (dsigAlg(sk[0])? != dsigExcNs) {
+    fail newError("xml-dsig: canonicalization method '${dsigAlg(sk[0])?}' is not allowed; only Exclusive C14N 1.0")
+  }
+  let c14nIncl = dsigIncl(sk[0], "CanonicalizationMethod")?
+  dsigNoKids(sk[1], "SignatureMethod")?
+  let ref = dsigReference(sk[2], opts)?
+  return dsigInfo{
+    c14nIncl = c14nIncl,
+    sigAlg = dsigAlg(sk[1])?,
+    signedInfo = si,
+    sigValue = dsigDecode(
+      dsigText(kids[1], "SignatureValue")?,
+      opts.maxSignatureBytes,
+      "SignatureValue",
+    )?,
+    refId = ref.id,
+    digestAlg = ref.digestAlg,
+    digest = ref.digest,
+    refIncl = ref.incl,
+  }
+}
+
+fn dsigReference(ref: Element, opts: DsigOptions): dsigRef! {
+  let u = ""
+  match (ref.attr("URI")) {
+    Some(v) => u = v
+    None => fail newError("xml-dsig: Reference has no URI")
+  }
+  if (len(u) < 2 || u[0] != '#') {
+    fail newError("xml-dsig: Reference URI '${u}' is not a same-document #ID reference")
+  }
+  let kids = dsigKids(ref, "Reference")?
+  dsigShape(kids, ["Transforms", "DigestMethod", "DigestValue"], "", "Reference")?
+  let incl = dsigTransforms(kids[0])?
+  dsigNoKids(kids[1], "DigestMethod")?
+  let alg = dsigAlg(kids[1])?
+  let n = dsigDigestSize(alg, opts.allowSha1)?
+  let dv = dsigDecode(dsigText(kids[2], "DigestValue")?, opts.maxSignatureBytes, "DigestValue")?
+  if (len(dv) != n) {
+    fail newError("xml-dsig: DigestValue is ${len(dv)} bytes, want ${n}")
+  }
+  return dsigRef{ id = u[1:len(u)], digestAlg = alg, digest = dv, incl = incl }
+}
+
+fn dsigDigestSize(alg: string, allowSha1: bool): int! {
+  if (alg == dsigSha256) {
+    return 32
+  }
+  if (alg == dsigSha1 && allowSha1) {
+    return 20
+  }
+  fail newError("xml-dsig: digest method '${alg}' is not allowed")
+}
+
+fn dsigHash(alg: string, data: []byte): []byte {
+  if (alg == dsigSha1) {
+    return digest(Sha1(), data)
+  }
+  return digest(Sha256(), data)
+}
+
+// The InclusiveNamespaces prefixes of the Exclusive C14N transform, after
+// checking the transforms are exactly the two the profile allows.
+fn dsigTransforms(tr: Element): []string! {
+  let kids = dsigKids(tr, "Transforms")?
+  let algs = []string(0)
+  let i = 0
+  while (i < len(kids)) {
+    if (!dsigIs(kids[i], "Transform")) {
+      fail newError("xml-dsig: Transforms holds <${kids[i].local}>")
+    }
+    let alg = dsigAlg(kids[i])?
+    if (alg != dsigEnveloped && alg != dsigExcNs) {
+      fail newError("xml-dsig: transform '${alg}' is not allowed")
+    }
+    algs = append(algs, alg)
+    i = i + 1
+  }
+  if (len(algs) != 2 || algs[0] != dsigEnveloped || algs[1] != dsigExcNs) {
+    fail newError("xml-dsig: Transforms must be exactly enveloped-signature, then Exclusive C14N")
+  }
+  dsigNoKids(kids[0], "Transform")?
+  return dsigIncl(kids[1], "Transform")?
+}
+
+// The PrefixList of an InclusiveNamespaces child of `e`, split on white space;
+// `e` may have no other child.
+fn dsigIncl(e: Element, what: string): []string! {
+  let kids = dsigKids(e, what)?
+  let out = []string(0)
+  if (len(kids) == 0) {
+    return out
+  }
+  if (len(kids) > 1 || kids[0].local != "InclusiveNamespaces" || kids[0].space != dsigExcNs) {
+    fail newError("xml-dsig: ${what} may only hold <InclusiveNamespaces>")
+  }
+  dsigNoKids(kids[0], "InclusiveNamespaces")?
+  match (kids[0].attr("PrefixList")) {
+    None => return out
+    Some(list) => return dsigWords(list)
+  }
+}
+
+fn dsigWords(s: string): []string {
+  let out = []string(0)
+  let from = 0
+  let i = 0
+  while (i <= len(s)) {
+    if (i == len(s) || dsigSpace(s[i])) {
+      if (i > from) {
+        out = append(out, s[from:i])
+      }
+      from = i + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn dsigSpace(b: byte): bool {
+  return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+fn dsigIs(e: Element, local: string): bool {
+  return e.space == dsigNs && e.local == local
+}
+
+fn dsigAlg(e: Element): string! {
+  match (e.attr("Algorithm")) {
+    Some(a) => return a
+    None => fail newError("xml-dsig: <${e.local}> has no Algorithm")
+  }
+}
+
+// The child elements of `e`. Fails for text other than white space, and for a
+// comment or processing instruction, so that a structural element reads the
+// same in every reader.
+fn dsigKids(e: Element, what: string): []Element! {
+  if (len(e.misc) > 0) {
+    fail newError("xml-dsig: ${what} holds a comment or processing instruction")
+  }
+  let out = []Element(0)
+  let i = 0
+  while (i < len(e.nodes)) {
+    match (e.nodes[i]) {
+      Elem(c) => out = append(out, c)
+      Text(s) => {
+        if (len(dsigWords(s)) > 0) {
+          fail newError("xml-dsig: ${what} holds text between its elements")
+        }
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn dsigNoKids(e: Element, what: string): ()! {
+  if (len(dsigKids(e, what)?) > 0) {
+    fail newError("xml-dsig: <${what}> may not hold elements")
+  }
+}
+
+// The text of an element that holds only text.
+fn dsigText(e: Element, what: string): string! {
+  if (len(e.misc) > 0) {
+    fail newError("xml-dsig: ${what} holds a comment or processing instruction")
+  }
+  let i = 0
+  while (i < len(e.nodes)) {
+    match (e.nodes[i]) {
+      Elem(_) => fail newError("xml-dsig: <${what}> may not hold elements")
+      Text(_) => {}
+    }
+    i = i + 1
+  }
+  return e.text()
+}
+
+// Base64 of `text` without its white space, at most `max` bytes decoded.
+fn dsigDecode(text: string, max: int, what: string): []byte! {
+  let clean = []byte(0)
+  let i = 0
+  while (i < len(text)) {
+    if (!dsigSpace(text[i])) {
+      clean = append(clean, text[i])
+    }
+    i = i + 1
+  }
+  if (len(clean) > max / 3 * 4 + 4) {
+    fail newError("xml-dsig: ${what} is longer than ${max} bytes")
+  }
+  return decodeBase64(string(clean)) catch err {
+    fail newError("xml-dsig: ${what} is not base64: ${err.message()}")
+  }
+}
+
+// `parts` in order, then `optional` once at most; nothing else.
+fn dsigShape(kids: []Element, parts: []string, optional: string, what: string): ()! {
+  let i = 0
+  while (i < len(parts)) {
+    if (i >= len(kids)) {
+      fail newError("xml-dsig: ${what} has no <${parts[i]}>")
+    }
+    if (!dsigIs(kids[i], parts[i])) {
+      fail newError("xml-dsig: ${what} has <${kids[i].local}> where <${parts[i]}> belongs")
+    }
+    i = i + 1
+  }
+  let at = len(parts)
+  if (at < len(kids) && optional != "" && dsigIs(kids[at], optional)) {
+    at = at + 1
+  }
+  if (at < len(kids)) {
+    fail newError("xml-dsig: ${what} has an unexpected <${kids[at].local}>")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The signature value.
+// ---------------------------------------------------------------------------
+
+fn dsigCheckValue(key: DsigKey, alg: string, signedInfo: []byte, value: []byte): ()! {
+  if (alg != dsigRsaSha256 && alg != dsigEcdsaSha256) {
+    fail newError("xml-dsig: signature method '${alg}' is not allowed")
+  }
+  match (key) {
+    Rsa(k) => dsigCheckRsa(k, alg, signedInfo, value)?
+    Ecdsa(k) => dsigCheckEcdsa(k, alg, signedInfo, value)?
+  }
+}
+
+fn dsigCheckRsa(k: RsaPublicKey, alg: string, signedInfo: []byte, value: []byte): ()! {
+  if (alg != dsigRsaSha256) {
+    fail newError("xml-dsig: signature method '${alg}' does not match an RSA key")
+  }
+  if (bigintBitLen(k.n) < dsigMinRsaBits) {
+    fail newError("xml-dsig: RSA key is ${bigintBitLen(k.n)} bits, at least ${dsigMinRsaBits} are required")
+  }
+  if (!rsaVerifyPkcs1v15(k, HashAlg.Sha256, rsaDigestInfoSha256(), signedInfo, value)) {
+    fail newError("xml-dsig: the signature value does not verify")
+  }
+}
+
+// ecdsa-sha256 over P-256: the value is `r || s`, 32 bytes each (RFC 6931
+// §2.3.6), not DER.
+fn dsigCheckEcdsa(k: EcdsaPublicKey, alg: string, signedInfo: []byte, value: []byte): ()! {
+  if (alg != dsigEcdsaSha256) {
+    fail newError("xml-dsig: signature method '${alg}' does not match an ECDSA key")
+  }
+  if (!nistecIsOnCurve(nistecP256(), k.q)) {
+    fail newError("xml-dsig: ecdsa-sha256 needs a P-256 key")
+  }
+  if (len(value) != 64) {
+    fail newError("xml-dsig: ECDSA signature value is ${len(value)} bytes, want 64 (r || s)")
+  }
+  let sig = EcdsaSignature{ r = bigintFromBytes(value[0:32]), s = bigintFromBytes(value[32:64]) }
+  if (!ecdsaVerify(k, digest(Sha256(), signedInfo), sig)) {
+    fail newError("xml-dsig: the signature value does not verify")
+  }
+}

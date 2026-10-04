@@ -521,6 +521,110 @@ element is skipped there, and a name that cannot be a prefix is an error.
 - This is the exclusive algorithm only. Inclusive Canonical XML writes every
   namespace in scope, and is not offered.
 
+## Verifying a signed assertion
+
+Canonical bytes are half of a signature check. Inkwell's sign-in comes back
+as a SAML response, and the attack to fear is signature wrapping: the
+signature is valid over one element, and the application reads another one.
+An attacker keeps the provider's signed assertion, puts it somewhere the
+verifier will find it, and writes their own assertion where the application
+looks. Every step passes, and the wrong person is signed in.
+`verifySignature` closes that by what it returns. It does not say "valid"; it
+gives you the element whose bytes were verified, and you read that and never
+look anything up in the document again.
+
+```bit
+import { parse, verifySignature, DsigKey, DsigOptions, SignedElement } from "std/xml"
+import { RsaPublicKey } from "std/crypto"
+
+// The email of the user the identity provider signed in, from the assertion
+// the provider's signature covers. `idp` comes from the provider's metadata.
+fn signedInUser(body: []byte, idp: RsaPublicKey): string! {
+  let doc = parse(body)?
+  let opts = DsigOptions{ expectRoot = "{urn:oasis:names:tc:SAML:2.0:assertion}Assertion" }
+  let signed: SignedElement = verifySignature(doc, DsigKey.Rsa(idp), opts)?
+  match (signed.element.child("Subject")) {
+    Some(s) => {
+      match (s.child("NameID")) {
+        Some(n) => return n.text()
+        None => fail newError("assertion ${signed.id} has no NameID")
+      }
+    }
+    None => fail newError("assertion ${signed.id} has no Subject")
+  }
+}
+```
+
+The key is yours. `DsigKey.Rsa` or `DsigKey.Ecdsa` is the provider's public
+key from metadata you trust, and the `KeyInfo` in the document is never read:
+a document cannot bring the key that verifies it. RSA keys under 2048 bits and
+ECDSA keys that are not P-256 are refused.
+
+`expectRoot` names the element the signature must cover, as
+`{namespace-uri}local` (or a bare `local` for no namespace). Leave it empty
+and the signed element must be `doc` itself, which is how a signed `Response`
+is checked. With a name, the signed element may sit anywhere in `doc`, but it
+must be the only element with that name: the second `Assertion` that a
+wrapping attack has to add is a failure, not something to pick between. A
+response that really carries several assertions is checked one assertion at a
+time, by passing each `Assertion` element as `doc`.
+
+Everything else in the signature profile is fixed, and anything outside it
+fails with the rule that was broken:
+
+- Exactly one `ds:Signature` in `doc`, and one `Reference` in it,
+  `URI="#id"`. The element holding the signature is the signed element, and
+  its `ID`, `Id` or `id` attribute is that `id`. No ID value occurs twice
+  anywhere in `doc` (`ID`, `Id`, `id` and `xml:id` all count).
+- Transforms are the enveloped-signature transform, then Exclusive C14N 1.0,
+  and nothing else: no XPath, no XSLT, no decryption transform. The
+  canonicalization method is Exclusive C14N 1.0, not the inclusive form and
+  not `#WithComments`.
+- The digest is SHA-256, compared in constant time; SHA-1 only with
+  `DsigOptions.allowSha1`, for a provider that has not moved yet. The signature
+  method is `rsa-sha256` or `ecdsa-sha256` and must match the kind of key; a
+  SHA-1 signature method is never accepted. An ECDSA value is `r || s`, 32
+  bytes each, not DER.
+- `Signature` holds `SignedInfo`, `SignatureValue` and an optional `KeyInfo`.
+  No `Object`, no text between them, no comment or processing instruction
+  inside.
+- A document within `maxElements` (100000), `maxDepth` (256) and
+  `maxSignatureBytes` (1024) in `DsigOptions`.
+
+```bit
+import { parse, verifySignature, DsigKey, DsigOptions } from "std/xml"
+import { EcdsaPublicKey } from "std/crypto"
+
+// A provider still on SHA-1 digests, signing with an ECDSA key, and a body that
+// must stay small.
+fn legacyProvider(body: []byte, idp: EcdsaPublicKey): string! {
+  let opts = DsigOptions{
+    allowSha1 = true,
+    maxElements = 5000,
+    maxDepth = 64,
+    maxSignatureBytes = 128,
+  }
+  let signed = verifySignature(parse(body)?, DsigKey.Ecdsa(idp), opts)?
+  return signed.id
+}
+```
+
+### Sharp edges
+
+- Read `SignedElement.element`, never `doc`. It is a copy of the signed element
+  with the `Signature` child cut out (the enveloped-signature transform), and
+  canonicalizing it gives the digested bytes. A lookup in `doc` by ID or name
+  can be redirected by whoever built `doc`; this cannot.
+- `Element.text()` joins the text of an element and skips comments. The
+  signature covers the text with the comments removed, so a value your
+  application reads from `element` is the one that was signed; `parse` still
+  keeps the comment, which is why `Signature` itself refuses any.
+- The verifier checks a signature, not a policy. Issuer, audience,
+  `NotOnOrAfter`, replay and the `Destination` are yours to check on
+  `element`.
+- A failure says which rule broke and is for your log. Do not send it to the
+  client.
+
 ## Where to go next
 
 [std/json](json.md) is the sibling data format; [std/strings](strings.md)
@@ -655,3 +759,31 @@ an `Element` that `parse` returned.
 `[]string` of prefixes (`#default` for the default namespace) whose declarations
 in scope are written on every element; empty by default. `withComments` is a
 `bool`, false by default, that keeps comments.
+
+### `verifySignature`
+
+`verifySignature(doc: Element, key: DsigKey, opts: DsigOptions =
+DsigOptions{}): SignedElement!` verifies the enveloped XML signature in `doc`
+and returns the signed element. Fails with the rule that broke for anything
+outside the profile in "Verifying a signed assertion", for a digest that does
+not match and for a signature that does not verify. Never reads `KeyInfo`.
+
+### `DsigKey`
+
+`enum DsigKey { Rsa(RsaPublicKey), Ecdsa(EcdsaPublicKey) }`, the caller's
+public key. `Rsa` is for `rsa-sha256` with a modulus of 2048 bits or more,
+`Ecdsa` for `ecdsa-sha256` with a P-256 key.
+
+### `DsigOptions`
+
+`DsigOptions{ expectRoot, allowSha1, maxElements, maxDepth, maxSignatureBytes
+}`. `expectRoot` is `{namespace-uri}local` or a bare `local`, `""` by default,
+meaning the signed element is `doc`. `allowSha1` accepts a SHA-1 digest method,
+false by default. `maxElements` is 100000, `maxDepth` 256 and
+`maxSignatureBytes` 1024 by default.
+
+### `SignedElement`
+
+`SignedElement{ element, id }`: `element` is the signed element with its
+`Signature` child removed, and `id` the ID the `Reference` named. Read
+`element`; do not look `id` up in the document again.
