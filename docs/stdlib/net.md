@@ -359,6 +359,39 @@ fn connectByName(host: string, port: int): Conn! {
 }
 ```
 
+### `lookupTxt(name: string): []string!`
+
+The TXT records of `name`: one entry per record, with the record's
+character-strings joined in order and nothing between them (RFC 7208 section
+3.3 and RFC 6376 section 3.6.2.2 both read a TXT value that way), as the raw
+bytes the server sent. A name with no TXT record, NXDOMAIN included, gives an
+empty list rather than an error. A timeout, a SERVFAIL and a malformed reply
+fail, the last as `lookupTxt <name>: malformed reply`; a trailing dot on `name`
+is accepted.
+
+It asks the way `resolve` does: each nameserver in `/etc/resolv.conf` in turn,
+each for at most the per-server share of `resolveBudgetMs`. A reply that does
+not fit in a UDP datagram comes back truncated, and the lookup repeats the
+query over TCP to the same server inside that same budget (RFC 7766), which a
+2048-bit DKIM key needs. The TCP retry reaches IPv4 nameservers only; a
+truncated reply from an IPv6 nameserver fails that server and the next is tried.
+On Windows the runtime has no TXT lookup and the call fails with
+`lookupTxt <name>: not supported on this platform`.
+
+A mailer checks the key it published against the key it signs with:
+
+```bit
+import { lookupTxt } from "std/net"
+
+fn publishedKey(selector: string, domain: string): string! {
+  let records = lookupTxt("${selector}._domainkey.${domain}")?
+  if (len(records) == 0) {
+    fail newError("no DKIM record for ${selector} at ${domain}")
+  }
+  return records[0]
+}
+```
+
 ### `resolveBudgetMs(): int`
 
 The longest `resolve` can take on this machine, in milliseconds: each

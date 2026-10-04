@@ -1,0 +1,229 @@
+// DNS TXT replies (#6882): the platform-free half of `lookupTxt`. Same module
+// as ./net.bit, so `byteAt`/`putByte`/`netReadU16Be` are in scope unchanged.
+//
+// The wire format is RFC 1035 §3.3.14 (TXT-DATA is one or more
+// <character-string>, each a length byte then that many bytes); a server that
+// must carry more than 512 bytes sets TC (RFC 1035 §4.2.1) and the client asks
+// again over TCP (RFC 7766, the transport half is per provider). A consumer
+// wants ONE value per record: RFC 7208 §3.3 and RFC 6376 §3.6.2.2 both say the
+// character-strings of one RR are concatenated with nothing between them.
+//
+// OUTPUT LAYOUT. `netParseTxt` writes one entry per TXT RR, in answer order:
+// a two-byte big-endian length, then that many bytes (the concatenation). A
+// record's concatenation is shorter than its RDATA, which is inside the
+// message, so the output never outgrows the message it was parsed from; the
+// capacity checks below hold regardless (`netTxtOutMax`).
+
+// QTYPE for TXT (RFC 1035 §3.2.2).
+export const netTypeTxt: int = 16
+
+// The size of the buffer `netParseTxt` writes to, and so of the one a caller
+// provides: a TCP reply is at most 65535 bytes, the entries written from it are
+// never longer, and the last entry's own two-byte length is added.
+export const netTxtOutMax: int = 65537
+
+// What `netParseTxt` reports besides a byte count (>= 0). Distinct values, all
+// negative, so one return carries both an answer and its failure class.
+//
+// A reply that is not an answer to this query (another id, QR clear) or whose
+// RCODE is neither NOERROR nor NXDOMAIN (SERVFAIL, REFUSED, ...): the caller
+// retransmits.
+export const netTxtTransient: int = 0 - 1
+// A reply whose structure is wrong: a name or record running past the message,
+// a compression pointer that does not terminate, a record with no
+// character-strings. Never retried.
+export const netTxtMalformed: int = 0 - 2
+// TC was set: the answer is incomplete and must be asked for over TCP.
+export const netTxtTruncated: int = 0 - 3
+
+// A name is at most 127 labels (RFC 1035 §2.3.4's 255 octets), and a compression
+// pointer is followed at most this many times; the step bound below is the sum
+// plus slack, so a name cannot be walked for longer however the bytes lie.
+const netNameMaxHops: int = 64
+const netNameMaxSteps: int = 256
+
+// The label length byte's top two bits: 00 a label, 11 a pointer, 01 and 10
+// reserved (RFC 1035 §4.1.4, RFC 6891 §3.3).
+const netLabelKindShift: int = 64
+
+// `end` once a name has recorded where it finishes in the record, else `at`.
+@nosplit fn netFirstEnd(end: int, at: int): int {
+  if (end < 0) {
+    return at
+  }
+  return end
+}
+
+// The offset a compression pointer at `msg[i]` names, or -1 when its second
+// byte is not in the message.
+@nosplit fn netNamePointer(msg: *u8, msgLen: int, i: int): int {
+  if (i + 1 >= msgLen) {
+    return 0 - 1
+  }
+  return byteAt(msg, i) % netLabelKindShift * 256 + byteAt(msg, i + 1)
+}
+
+// The offset just past the name at `msg[off]`, FOLLOWING compression pointers to
+// prove the name terminates, or -1 when it does not: a label or pointer off the
+// end of the message, a reserved label type, more than `netNameMaxHops` pointers
+// (a loop), or more steps than a legal name has. The offset returned is where the
+// name ends in the RECORD, i.e. just past its first pointer when it has one.
+//
+// Unlike `netSkipName` (./net.bit), which only needs the length for an A answer
+// and skips a pointer without following it, this one is what makes a looping
+// pointer a malformed reply rather than an accepted one.
+export @symbol("bit_rt_port_net_name_end") @nosplit fn netNameEnd(
+  msg: *u8,
+  msgLen: int,
+  off: int,
+): int {
+  let i = off
+  let end = 0 - 1
+  let hops = 0
+  let steps = 0
+  // Bounded by `netNameMaxSteps`: every iteration is one label or one hop.
+  while (steps < netNameMaxSteps) {
+    steps = steps + 1
+    if (i < 0 || i >= msgLen) {
+      return 0 - 1
+    }
+    let b = byteAt(msg, i)
+    if (b == 0) {
+      return netFirstEnd(end, i + 1)
+    }
+    if (b / netLabelKindShift == 3) {
+      hops = hops + 1
+      if (hops > netNameMaxHops) {
+        return 0 - 1
+      }
+      end = netFirstEnd(end, i + 2)
+      i = netNamePointer(msg, msgLen, i)
+    } else if (b / netLabelKindShift != 0 || i + 1 + b > msgLen) {
+      return 0 - 1
+    } else {
+      i = i + 1 + b
+    }
+  }
+  return 0 - 1
+}
+
+// Appends the TXT RDATA at `msg[off..off+rdlen)` to `out[at..)` as one entry
+// (two-byte length, then the concatenated character-strings). Returns the new
+// end of `out`, or -1 for an empty RDATA, a character-string running past
+// RDATA, or an entry that does not fit in `netTxtOutMax`.
+@nosplit fn netTxtAppend(msg: *u8, off: int, rdlen: int, out: *u8, at: int): int {
+  // The concatenation is shorter than RDATA (each string spends a length byte),
+  // so reserving `rdlen` up front bounds every write below.
+  if (rdlen == 0 || at + 2 + rdlen > netTxtOutMax) {
+    return 0 - 1
+  }
+  let w = at + 2
+  let p = off
+  let end = off + rdlen
+  // `p` strictly increases (each string consumes at least its length byte).
+  while (p < end) {
+    let n = byteAt(msg, p)
+    if (p + 1 + n > end) {
+      return 0 - 1
+    }
+    let k = 0
+    while (k < n) {
+      putByte(out, w + k, byteAt(msg, p + 1 + k))
+      k = k + 1
+    }
+    w = w + n
+    p = p + 1 + n
+  }
+  netWriteU16Be(out, at, w - at - 2)
+  return w
+}
+
+// Skips the `qd` question entries starting at 12, returning where the answers
+// begin or -1 when the section does not fit.
+@nosplit fn netTxtSkipQuestions(msg: *u8, msgLen: int, qd: int): int {
+  let off = 12
+  let q = 0
+  while (q < qd) {
+    off = netNameEnd(msg, msgLen, off)
+    if (off < 0 || off + 4 > msgLen) {
+      return 0 - 1
+    }
+    // QTYPE + QCLASS.
+    off = off + 4
+    q = q + 1
+  }
+  return off
+}
+
+// Walks the `an` answer records from `off`, appending every TXT one to `out`.
+// Returns the output length, or `netTxtMalformed`.
+@nosplit fn netTxtAnswers(msg: *u8, msgLen: int, an: int, start: int, out: *u8): int {
+  let off = start
+  let at = 0
+  let a = 0
+  while (a < an) {
+    off = netNameEnd(msg, msgLen, off)
+    // TYPE(2) CLASS(2) TTL(4) RDLENGTH(2): present before any is read.
+    if (off < 0 || off + 10 > msgLen) {
+      return netTxtMalformed
+    }
+    let rtype = netReadU16Be(msg, off)
+    let rdlen = netReadU16Be(msg, off + 8)
+    off = off + 10
+    if (off + rdlen > msgLen) {
+      return netTxtMalformed
+    }
+    if (rtype == netTypeTxt) {
+      at = netTxtAppend(msg, off, rdlen, out, at)
+      if (at < 0) {
+        return netTxtMalformed
+      }
+    }
+    off = off + rdlen
+    a = a + 1
+  }
+  return at
+}
+
+// Parses the DNS response `msg[0..msgLen)` to a TXT query with id `wantId`,
+// writing the entries described at the top of this file to `out[0..netTxtOutMax)`.
+// Returns the bytes written (0 for NXDOMAIN, and for NOERROR with no TXT
+// record), or one of `netTxtTransient`, `netTxtMalformed`, `netTxtTruncated`.
+// Every read of `msg` is bounded by `msgLen` and every write of `out` by
+// `netTxtOutMax`.
+export @symbol("bit_rt_port_net_parse_txt") @nosplit fn netParseTxt(
+  msg: *u8,
+  msgLen: int,
+  wantId: int,
+  out: *u8,
+): int {
+  // The header reads below are the only ones not individually bounded.
+  if (msgLen < 12) {
+    return netTxtMalformed
+  }
+  if (netReadU16Be(msg, 0) != wantId) {
+    return netTxtTransient
+  }
+  let flags = netReadU16Be(msg, 2)
+  // QR (bit 15): a query echoed back is not an answer.
+  if (flags / 32768 == 0) {
+    return netTxtTransient
+  }
+  // TC (bit 9): the records after the header are not to be trusted.
+  if (flags / 512 % 2 == 1) {
+    return netTxtTruncated
+  }
+  let rcode = flags % 16
+  // NXDOMAIN (3) is an answer: the name has no records.
+  if (rcode == 3) {
+    return 0
+  }
+  if (rcode != 0) {
+    return netTxtTransient
+  }
+  let off = netTxtSkipQuestions(msg, msgLen, netReadU16Be(msg, 4))
+  if (off < 0) {
+    return netTxtMalformed
+  }
+  return netTxtAnswers(msg, msgLen, netReadU16Be(msg, 6), off, out)
+}
