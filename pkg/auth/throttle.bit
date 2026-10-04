@@ -1,0 +1,360 @@
+// pkg/auth/throttle.bit — LoginThrottle: the brute-force and credential-stuffing
+// defence for a password login (#6923, epic #3960).
+//
+//   let throttle = LoginThrottle(MemoryCounter(10_000))?
+//   throttle.check(username, c.peer())?        // 429 + Retry-After when refused
+//   ... verify the password ...
+//   throttle.recordFailure(username, c.peer())?   // wrong password
+//   throttle.recordSuccess(username)?             // right password
+//
+// This file is the core only: the counters, the backoff and the lockout. Making
+// `PasswordStrategy` call it is a separate step (#6927) and is meant to be one
+// option on that strategy, so nothing here knows about `Ctx` or a request.
+//
+// STANDARDS. OWASP ASVS v5 (V2 Authentication: anti-automation controls
+// against credential stuffing and brute force) and NIST SP 800-63B (the
+// throttling requirement for failed authentication attempts: a verifier
+// "SHALL implement a rate-limiting mechanism" and may allow no more than 100
+// consecutive failures per account). The default of 5 failures per account in
+// 15 minutes is well inside that ceiling.
+//
+// ## One store, and it is pkg/web's
+//
+// The counters live behind `RateStore` (pkg/web/ratelimit.bit): `incr(key, ttl)`
+// and `count(key)`. That is exactly what this needs, so `MemoryCounter` and any
+// Redis-backed counter work unchanged and there is no second store interface
+// for an app to implement. The interface has no delete and no remaining-ttl, and
+// two things below are shaped by that:
+//
+//  - RESET ON SUCCESS cannot delete the failure counter, so the counter's key
+//    carries a generation number (a second counter) and a success bumps the
+//    generation. The old counter is orphaned and expires by itself.
+//  - RETRY-AFTER cannot ask the store how long a key has left, so it is the
+//    full delay or lockout. It is exact right after the failure that caused it
+//    and an upper bound afterwards: a client that waits that long is admitted.
+//
+// ## What is counted, and what is not
+//
+// Every account string is counted, whether or not such a user exists. The
+// counter never asks the `Lookup` anything, so a refused request looks the same
+// for a real account and an invented one: there is no way to enumerate users by
+// who gets throttled (ASVS V2 and the OWASP Authentication Cheat Sheet).
+//
+// Account and IP counters are separate and a refusal by either refuses the
+// attempt. A success resets the ACCOUNT counter only: if it reset the IP
+// counter, an attacker holding one valid login could launder a stuffing run by
+// interleaving it. The IP counter has no backoff, only the lockout, because an
+// address is often a whole office behind one NAT.
+//
+// ## Keys
+//
+// An account is lower-cased and hashed with SHA-256 before it becomes part of a
+// store key, and an address is hashed the same way, so a username (which is as
+// often a mistyped password) never reaches the store in the clear, in a Redis
+// MONITOR, or in a key dump. The hash is not keyed: someone who can read the
+// store can still test a guessed username against it.
+//
+// The account failure counter is also scoped to a window index (`now / window`)
+// so the generation counter that resets it can never outlive or undercut it. A
+// window boundary gives an attacker nothing: reaching the limit starts a lockout
+// that does not depend on the window.
+//
+// ## Failure policy
+//
+// A store failure is returned, not swallowed. `check` failing on a store error
+// means the login is refused with a 500 (fail closed); the caller that prefers
+// availability catches it and logs. That choice belongs to the app, not to a
+// default here.
+//
+// `now`, `Second`, `digest`, `encodeHex` and `Sha256` are already bound
+// module-wide by oidc_callback.bit, oidc_discovery.bit and oidc_authorize.bit
+// — an import binds per MODULE, so re-importing any of them here is E0042.
+import { RateStore } from "web"
+import { toLower } from "std/strings"
+
+// The audit event kinds. `Failed` is every recorded failure, `Delayed` and
+// `Locked` are the two reasons `check` refuses, `LockedOut` is the failure that
+// started a lockout, `Cleared` is a success resetting the account.
+export enum ThrottleKind {
+  Failed
+  Delayed
+  Locked
+  LockedOut
+  Cleared
+
+  // The kind's name, for a log line.
+  export show(): string {
+    match (this) {
+      Failed => return "Failed"
+      Delayed => return "Delayed"
+      Locked => return "Locked"
+      LockedOut => return "LockedOut"
+      Cleared => return "Cleared"
+    }
+  }
+}
+
+// What an audit hook is told. `account` is the account's HASH, never the name
+// typed into the form: a username field regularly holds a password, and an
+// audit log is the last place for one. Join it to your own records by hashing
+// the same way, or log the request's own identifier beside it.
+export class ThrottleEvent {
+  export kind: ThrottleKind,
+  // The hashed account the event concerns.
+  export account: string,
+  // The client address, as passed to `check` / `recordFailure`.
+  export ip: string,
+  // The account's failure count in the current window, 0 when it does not apply.
+  export failures: i64 = 0,
+  // Seconds the client was told to wait, 0 when it does not apply.
+  export retryAfter: i64 = 0,
+}
+
+// Called synchronously, on the request path, for every event. It cannot fail
+// and must be quick: a hook that blocks slows every login.
+export type ThrottleHook = (ThrottleEvent) => ()
+
+// The thresholds. Every field has a default, so `LoginThrottle(store)` is the
+// 5-per-account, 20-per-address, 15-minute policy; all times are in seconds.
+export class ThrottleOptions {
+  // Failures one account may rack up inside `window` before it is locked.
+  export accountFailures: int = 5,
+  // Failures one address may rack up inside `window` before it is locked.
+  export ipFailures: int = 20,
+  // How long a failure counts against its account or address.
+  export window: i64 = 900,
+  // The wait after an account's first failure; it doubles with each next one.
+  export baseDelay: i64 = 1,
+  // The ceiling the doubling stops at.
+  export maxDelay: i64 = 900,
+  // How long a locked account or address is refused.
+  export lockout: i64 = 900,
+  // Audit hook; the zero value, `nil`, means none.
+  export onEvent: ThrottleHook,
+}
+
+// The refusal `check` fails with. It is an `HttpError` (pkg/web/errors.bit), so
+// an unhandled one is already a 429 with this message, and it carries the wait
+// so the route can send `Retry-After`: `let (t, ok) = e.(Throttled)`.
+//
+// The message is the same for every cause and for every account, real or not.
+export class Throttled {
+  // Seconds the client should wait; the value for the `Retry-After` header.
+  export retryAfter: i64
+
+  export message(): string {
+    return "Too Many Requests"
+  }
+
+  export status(): int {
+    return 429
+  }
+}
+
+// Seconds since the epoch. Module-private, so a test can move time without
+// sleeping; `LoginThrottle()` uses the real clock.
+type ThrottleClock = () => i64
+
+fn wallSeconds(): i64 {
+  return now().ns / Second
+}
+
+// The per-account and per-address brute-force throttle.
+export class LoginThrottle {
+  store: RateStore
+  opts: ThrottleOptions
+  clock: ThrottleClock
+
+  // Fails for a policy that cannot work, naming the field, so a typo is caught
+  // when the app starts and not when the first attacker arrives.
+  init(store: RateStore, opts: ThrottleOptions = ThrottleOptions{})! {
+    checkThrottleOptions(store, opts)?
+    this.store = store
+    this.opts = opts
+    this.clock = wallSeconds
+  }
+
+  // Refuses a client the throttle has locked or is making wait, with a
+  // `Throttled` carrying the seconds to wait. Call it BEFORE verifying the
+  // password, so a locked account costs the attacker an attempt and the server
+  // no Argon2 run.
+  export check(account: string, ip: string): ()! {
+    checkIp(ip, "check")?
+    let a = throttleHash("acct", toLower(account))
+    let i = throttleHash("ip", ip)
+    if (this.live(throttleKey("lock", "ip", i, ""))?) {
+      this.refuse(ThrottleKind.Locked, a, ip, 0, this.opts.lockout)?
+    }
+    if (this.live(throttleKey("lock", "acct", a, ""))?) {
+      this.refuse(ThrottleKind.Locked, a, ip, 0, this.opts.lockout)?
+    }
+    if (this.live(throttleKey("wait", "acct", a, ""))?) {
+      let n = this.accountFailures(a)?
+      this.refuse(ThrottleKind.Delayed, a, ip, n, throttleDelay(this.opts, n))?
+    }
+  }
+
+  // Counts one failed attempt against the account and the address. Starts the
+  // account's backoff, or its lockout when this failure reaches the limit, and
+  // the address's lockout likewise.
+  export recordFailure(account: string, ip: string): ()! {
+    checkIp(ip, "recordFailure")?
+    let a = throttleHash("acct", toLower(account))
+    let i = throttleHash("ip", ip)
+    let n = this.failAccount(a, ip)?
+    this.failIp(i, a, ip)?
+    this.emit(ThrottleKind.Failed, a, ip, n, 0)
+  }
+
+  // Forgets the account's failures after a correct password. The address is
+  // left alone on purpose (see the file header).
+  export recordSuccess(account: string): ()! {
+    let a = throttleHash("acct", toLower(account))
+    let gen = throttleKey("gen", "acct", a, "${this.index()}")
+    this.store.incr(gen, this.opts.window)?
+    this.emit(ThrottleKind.Cleared, a, "", 0, 0)
+  }
+
+  // The window the account counters are in now.
+  index(): i64 {
+    let clock = this.clock
+    return clock() / this.opts.window
+  }
+
+  // Whether a presence key (a lock or a wait) is set.
+  live(key: string): bool! {
+    return this.store.count(key)? > 0
+  }
+
+  // The account's failure counter key in this window and generation.
+  accountCounter(a: string): string! {
+    let idx = "${this.index()}"
+    let gen = this.store.count(throttleKey("gen", "acct", a, idx))?
+    return throttleKey("fail", "acct", a, "${idx}|${gen}")
+  }
+
+  // The account's failures in the current window and generation.
+  accountFailures(a: string): i64! {
+    return this.store.count(this.accountCounter(a)?)?
+  }
+
+  // One failure for the account: a lockout at the limit, else a backoff wait.
+  // Returns the count.
+  failAccount(a: string, ip: string): i64! {
+    let n = this.store.incr(this.accountCounter(a)?, this.opts.window)?
+    if (n >= this.opts.accountFailures) {
+      this.lockOut("acct", a, a, ip, n)?
+      return n
+    }
+    let d = throttleDelay(this.opts, n)
+    this.store.incr(throttleKey("wait", "acct", a, ""), d)?
+    return n
+  }
+
+  // One failure for the address: a lockout at the limit.
+  failIp(i: string, a: string, ip: string): ()! {
+    let m = this.store.incr(throttleKey("fail", "ip", i, ""), this.opts.window)?
+    if (m >= this.opts.ipFailures) {
+      this.lockOut("ip", i, a, ip, m)?
+    }
+  }
+
+  // Sets the lock for `who` (`acct` or `ip`); only the call that creates it
+  // is an event, the later ones find it set and leave its ttl alone.
+  lockOut(who: string, h: string, a: string, ip: string, n: i64): ()! {
+    let made = this.store.incr(throttleKey("lock", who, h, ""), this.opts.lockout)?
+    if (made == 1) {
+      this.emit(ThrottleKind.LockedOut, a, ip, n, this.opts.lockout)
+    }
+  }
+
+  // Reports the refusal to the hook and fails with it.
+  refuse(kind: ThrottleKind, a: string, ip: string, n: i64, wait: i64): ()! {
+    this.emit(kind, a, ip, n, wait)
+    fail Throttled{ retryAfter = wait }
+  }
+
+  emit(kind: ThrottleKind, a: string, ip: string, n: i64, wait: i64) {
+    let hook = this.opts.onEvent
+    if (hook == nil) {
+      return
+    }
+    hook(ThrottleEvent{ kind = kind, account = a, ip = ip, failures = n, retryAfter = wait })
+  }
+}
+
+// `LoginThrottle` on a caller-supplied clock. Module-private, for the window
+// and expiry tests that cannot be written against the wall clock.
+fn throttleAt(store: RateStore, opts: ThrottleOptions, clock: ThrottleClock): LoginThrottle! {
+  let t = LoginThrottle(store, opts)?
+  t.clock = clock
+  return t
+}
+
+// The wait after the `failures`-th failure: `min(maxDelay, baseDelay * 2^(failures-1))`.
+// Doubles until it reaches the ceiling, so it is bounded by 63 steps and cannot
+// overflow however large `failures` or `maxDelay` is.
+fn throttleDelay(o: ThrottleOptions, failures: i64): i64 {
+  let d = o.baseDelay
+  let step: i64 = 1
+  while (step < failures && d < o.maxDelay) {
+    if (d > o.maxDelay / 2) {
+      return o.maxDelay
+    }
+    d = d * 2
+    step = step + 1
+  }
+  if (d > o.maxDelay) {
+    return o.maxDelay
+  }
+  return d
+}
+
+// `kind|who|hash|suffix`, in a namespace of its own so the app's other
+// counters in the same store cannot collide with these.
+fn throttleKey(kind: string, who: string, h: string, suffix: string): string {
+  return "auth.throttle|${kind}|${who}|${h}|${suffix}"
+}
+
+// SHA-256 of the input, in hex, domain-separated by `who` so an account named
+// like an address cannot share its counter.
+fn throttleHash(who: string, id: string): string {
+  return encodeHex(digest(Sha256(), []byte("${who}:${id}")))
+}
+
+// An empty address would put every client into one bucket, and one attacker
+// would lock them all out.
+fn checkIp(ip: string, method: string): ()! {
+  if (ip == "") {
+    fail newError("auth: LoginThrottle.${method}(): ip is empty — pass the client address (for example `c.peer()`); an empty one would put every client in one bucket")
+  }
+}
+
+// The six ways a policy is unusable, each naming the field.
+fn checkThrottleOptions(store: RateStore, o: ThrottleOptions): ()! {
+  if (store == nil) {
+    fail newError("auth: LoginThrottle(): no counter store — pass one, for example `LoginThrottle(MemoryCounter(10_000))`")
+  }
+  if (o.accountFailures <= 0) {
+    fail newError("auth: LoginThrottle(): `accountFailures` is ${o.accountFailures} — at least 1 failure must be allowed")
+  }
+  if (o.ipFailures <= 0) {
+    fail newError("auth: LoginThrottle(): `ipFailures` is ${o.ipFailures} — at least 1 failure must be allowed")
+  }
+  checkThrottleTimes(o)?
+}
+
+fn checkThrottleTimes(o: ThrottleOptions): ()! {
+  if (o.window <= 0) {
+    fail newError("auth: LoginThrottle(): `window` is ${o.window} second(s) — it must be at least 1")
+  }
+  if (o.baseDelay <= 0) {
+    fail newError("auth: LoginThrottle(): `baseDelay` is ${o.baseDelay} second(s) — it must be at least 1")
+  }
+  if (o.maxDelay < o.baseDelay) {
+    fail newError("auth: LoginThrottle(): `maxDelay` ${o.maxDelay} is below `baseDelay` ${o.baseDelay}")
+  }
+  if (o.lockout <= 0) {
+    fail newError("auth: LoginThrottle(): `lockout` is ${o.lockout} second(s) — it must be at least 1")
+  }
+}

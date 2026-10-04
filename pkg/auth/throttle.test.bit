@@ -1,0 +1,399 @@
+// pkg/auth/throttle.test.bit — #6923's acceptance: LoginThrottle's failure
+// counters, backoff, lockout, reset-on-success and key hygiene, driven against a
+// recording in-memory `RateStore` whose clock a test moves by hand (no sleeps),
+// plus one run over pkg/web's own `MemoryCounter` to prove it fits unchanged.
+//
+// `contains` is already bound module-wide by oidc_discovery.test.bit; `now`,
+// `Second` and the hashing names by the sources — re-importing any is E0042.
+// `MemoryCounter` is new to the module.
+import { HttpError, MemoryCounter } from "web"
+
+// The hand-moved clock the store and the throttle share.
+class FakeClock {
+  t: i64,
+}
+
+// A `RateStore` with `ttl` counted from creation, as the interface demands,
+// that remembers every key it was asked to write and can be told to fail.
+class FakeStore {
+  vals: map<string, i64>
+  expires: map<string, i64>
+  written: []string
+  clock: FakeClock
+  broken: bool
+
+  export incr(key: string, ttl: i64): i64! {
+    if (this.broken) {
+      fail newError("store down")
+    }
+    this.written = append(this.written, key)
+    if (this.count(key)? > 0) {
+      this.vals[key] = this.vals[key] + 1
+      return this.vals[key]
+    }
+    this.vals[key] = 1
+    this.expires[key] = this.clock.t + ttl
+    return 1
+  }
+
+  export count(key: string): i64! {
+    if (this.broken) {
+      fail newError("store down")
+    }
+    let (v, ok) = this.vals[key]
+    if (!ok || this.expires[key] <= this.clock.t) {
+      return 0
+    }
+    return v
+  }
+}
+
+fn fakeStore(clock: FakeClock): FakeStore {
+  return FakeStore{
+    vals = map<string, i64>(),
+    expires = map<string, i64>(),
+    written = []string{},
+    clock = clock,
+    broken = false,
+  }
+}
+
+// A throttle over `s` on `clock`, `o` being the policy.
+fn throttleOn(s: FakeStore, clock: FakeClock, o: ThrottleOptions): LoginThrottle {
+  let tick: ThrottleClock = () => clock.t
+  return throttleAt(s, o, tick) catch e {
+    panic("throttleAt: ${e.message()}")
+  }
+}
+
+fn freshClock(): FakeClock {
+  return FakeClock{ t = 1_000_000 }
+}
+
+// `LoginThrottle` over a fresh store and clock with the default policy.
+fn defaultThrottle(clock: FakeClock): LoginThrottle {
+  return throttleOn(fakeStore(clock), clock, ThrottleOptions{})
+}
+
+fn fail1(t: LoginThrottle, account: string, ip: string) {
+  t.recordFailure(account, ip) catch e {
+    panic("recordFailure: ${e.message()}")
+  }
+}
+
+// Seconds `check` tells the client to wait, 0 when it admits the attempt.
+fn waitFor(t: LoginThrottle, account: string, ip: string): i64 {
+  t.check(account, ip) catch e {
+    let (th, ok) = e.(Throttled)
+    assert(ok, "check failed with something other than Throttled: ${e.message()}")
+    return th.retryAfter
+  }
+  return 0
+}
+
+// What `check` fails with, `message` and `retryAfter` joined, "" when admitted.
+fn refusalText(t: LoginThrottle, account: string, ip: string): string {
+  t.check(account, ip) catch e {
+    let (th, ok) = e.(Throttled)
+    assert(ok, "not a Throttled: ${e.message()}")
+    return "${e.message()}/${th.retryAfter}"
+  }
+  return ""
+}
+
+// Whether `LoginThrottle(store, o)` is refused at construction.
+fn rejects(o: ThrottleOptions): bool {
+  let clock = freshClock()
+  LoginThrottle(fakeStore(clock), o) catch _ {
+    return true
+  }
+  return false
+}
+
+// The kinds an audit hook saw, in order, as one string.
+class Seen {
+  kinds: []string,
+  accounts: []string,
+}
+
+fn recorder(seen: Seen): ThrottleHook {
+  let h: ThrottleHook = (e) => {
+    seen.kinds = append(seen.kinds, e.kind.show())
+    seen.accounts = append(seen.accounts, e.account)
+  }
+  return h
+}
+
+test "5 failures lock the account: the 6th check is refused with Retry-After" {
+  let clock = freshClock()
+  let t = defaultThrottle(clock)
+  let i = 0
+  while (i < 5) {
+    assert(waitFor(t, "ada", "10.0.0.1") == 0, "attempt ${i + 1} must be admitted")
+    fail1(t, "ada", "10.0.0.1")
+    clock.t = clock.t + 20
+    i = i + 1
+  }
+  let wait = waitFor(t, "ada", "10.0.0.1")
+  assert(wait == 900, "the lockout must say 900 seconds, got ${wait}")
+}
+
+test "backoff delay sequence is 1, 2, 4, 8 after failures 1..4" {
+  let clock = freshClock()
+  let t = defaultThrottle(clock)
+  let want = []i64{ 1, 2, 4, 8 }
+  let k = 0
+  while (k < 4) {
+    fail1(t, "ada", "10.0.0.1")
+    let got = waitFor(t, "ada", "10.0.0.1")
+    assert(got == want[k], "after failure ${k + 1} want ${want[k]}, got ${got}")
+    clock.t = clock.t + want[k]
+    assert(waitFor(t, "ada", "10.0.0.1") == 0, "the wait of ${want[k]}s must have passed")
+    k = k + 1
+  }
+}
+
+test "backoff stops doubling at maxDelay" {
+  let clock = freshClock()
+  let o = ThrottleOptions{ accountFailures = 10, baseDelay = 1, maxDelay = 5 }
+  let t = throttleOn(fakeStore(clock), clock, o)
+  let want = []i64{ 1, 2, 4, 5, 5 }
+  let k = 0
+  while (k < 5) {
+    fail1(t, "ada", "10.0.0.1")
+    let got = waitFor(t, "ada", "10.0.0.1")
+    assert(got == want[k], "after failure ${k + 1} want ${want[k]}, got ${got}")
+    clock.t = clock.t + 5
+    k = k + 1
+  }
+}
+
+test "the delay formula cannot overflow however many failures or however large maxDelay" {
+  let o = ThrottleOptions{ baseDelay = 1, maxDelay = 9_000_000_000_000_000_000 }
+  assert(throttleDelay(o, 1) == 1, "failure 1 waits baseDelay")
+  assert(throttleDelay(o, 11) == 1024, "failure 11 waits 2^10")
+  assert(
+    throttleDelay(o, 1_000_000) == 9_000_000_000_000_000_000,
+    "a huge failure count must clamp to maxDelay, got ${throttleDelay(o, 1_000_000)}",
+  )
+}
+
+test "window expiry clears the account counter" {
+  let clock = freshClock()
+  let t = defaultThrottle(clock)
+  let k = 0
+  while (k < 4) {
+    fail1(t, "ada", "10.0.0.1")
+    clock.t = clock.t + 10
+    k = k + 1
+  }
+  clock.t = clock.t + 900
+  while (k < 8) {
+    assert(waitFor(t, "ada", "10.0.0.1") == 0, "attempt ${k} after the window must be admitted")
+    fail1(t, "ada", "10.0.0.1")
+    clock.t = clock.t + 10
+    k = k + 1
+  }
+  assert(waitFor(t, "ada", "10.0.0.1") == 0, "4 failures in a fresh window must not lock")
+}
+
+test "a lockout ends after lockout seconds" {
+  let clock = freshClock()
+  let o = ThrottleOptions{ accountFailures = 2, lockout = 60, window = 600 }
+  let t = throttleOn(fakeStore(clock), clock, o)
+  fail1(t, "ada", "10.0.0.1")
+  clock.t = clock.t + 1
+  fail1(t, "ada", "10.0.0.1")
+  assert(waitFor(t, "ada", "10.0.0.1") == 60, "locked for the lockout")
+  clock.t = clock.t + 59
+  assert(waitFor(t, "ada", "10.0.0.1") == 60, "still locked 59s in")
+  clock.t = clock.t + 1
+  assert(waitFor(t, "ada", "10.0.0.1") == 0, "free at 60s")
+}
+
+test "success resets the account counter" {
+  let clock = freshClock()
+  let t = defaultThrottle(clock)
+  let k = 0
+  while (k < 4) {
+    fail1(t, "ada", "10.0.0.1")
+    clock.t = clock.t + 10
+    k = k + 1
+  }
+  t.recordSuccess("ada") catch e {
+    panic("recordSuccess: ${e.message()}")
+  }
+  k = 0
+  while (k < 4) {
+    fail1(t, "ada", "10.0.0.1")
+    clock.t = clock.t + 10
+    k = k + 1
+  }
+  assert(waitFor(t, "ada", "10.0.0.1") == 0, "4+4 failures with a success between must not lock")
+  fail1(t, "ada", "10.0.0.1")
+  assert(waitFor(t, "ada", "10.0.0.1") == 900, "the 5th failure after the reset locks")
+}
+
+test "success leaves the IP counter alone" {
+  let clock = freshClock()
+  let o = ThrottleOptions{ ipFailures = 6 }
+  let t = throttleOn(fakeStore(clock), clock, o)
+  let k = 0
+  while (k < 3) {
+    fail1(t, "mallory${k}", "10.0.0.9")
+    k = k + 1
+  }
+  t.recordSuccess("mallory0") catch e {
+    panic("recordSuccess: ${e.message()}")
+  }
+  while (k < 6) {
+    fail1(t, "mallory${k}", "10.0.0.9")
+    k = k + 1
+  }
+  assert(
+    waitFor(t, "fresh", "10.0.0.9") == 900,
+    "6 failures from one address lock it despite a success",
+  )
+  assert(waitFor(t, "fresh", "10.0.0.10") == 0, "another address is unaffected")
+}
+
+test "an address lock refuses every account from it" {
+  let clock = freshClock()
+  let o = ThrottleOptions{ ipFailures = 3 }
+  let t = throttleOn(fakeStore(clock), clock, o)
+  fail1(t, "a", "10.0.0.9")
+  fail1(t, "b", "10.0.0.9")
+  fail1(t, "c", "10.0.0.9")
+  assert(
+    waitFor(t, "never-seen", "10.0.0.9") == 900,
+    "a brand new account from a locked address is refused",
+  )
+}
+
+test "6 invalid ThrottleOptions are rejected at construction" {
+  assert(rejects(ThrottleOptions{ accountFailures = 0 }), "accountFailures 0")
+  assert(rejects(ThrottleOptions{ ipFailures = -1 }), "ipFailures -1")
+  assert(rejects(ThrottleOptions{ window = 0 }), "window 0")
+  assert(rejects(ThrottleOptions{ baseDelay = 0 }), "baseDelay 0")
+  assert(rejects(ThrottleOptions{ baseDelay = 10, maxDelay = 5 }), "maxDelay below baseDelay")
+  assert(rejects(ThrottleOptions{ lockout = 0 }), "lockout 0")
+  assert(!rejects(ThrottleOptions{}), "the defaults must construct")
+}
+
+test "a nil store is rejected at construction" {
+  let none: RateStore = nil
+  LoginThrottle(none) catch e {
+    assert(
+      contains(e.message(), "no counter store"),
+      "message must say what is missing: ${e.message()}",
+    )
+    return
+  }
+  assert(false, "LoginThrottle(nil) must fail")
+}
+
+test "no key written to the store contains the raw username or address" {
+  let clock = freshClock()
+  let s = fakeStore(clock)
+  let t = throttleOn(s, clock, ThrottleOptions{})
+  fail1(t, "Ada.Lovelace@Example.com", "203.0.113.77")
+  t.recordSuccess("Ada.Lovelace@Example.com") catch e {
+    panic("recordSuccess: ${e.message()}")
+  }
+  let _ = waitFor(t, "Ada.Lovelace@Example.com", "203.0.113.77")
+  assert(len(s.written) >= 4, "the run must have written keys, wrote ${len(s.written)}")
+  let leaks = 0
+  for k of s.written {
+    if (contains(toLower(k), "lovelace") || contains(k, "203.0.113.77")) {
+      leaks = leaks + 1
+    }
+  }
+  assert(leaks == 0, "${leaks} of ${len(s.written)} keys contain the raw username or address")
+}
+
+test "usernames differing only in case share one counter" {
+  let clock = freshClock()
+  let o = ThrottleOptions{ accountFailures = 3 }
+  let t = throttleOn(fakeStore(clock), clock, o)
+  fail1(t, "Ada", "10.0.0.1")
+  fail1(t, "ADA", "10.0.0.2")
+  fail1(t, "ada", "10.0.0.3")
+  assert(waitFor(t, "aDa", "10.0.0.4") == 900, "three spellings are one account")
+}
+
+test "a refusal is identical for an account that exists and one that never did" {
+  let clock = freshClock()
+  let o = ThrottleOptions{ accountFailures = 2 }
+  let t = throttleOn(fakeStore(clock), clock, o)
+  fail1(t, "real", "10.0.0.1")
+  fail1(t, "real", "10.0.0.1")
+  fail1(t, "ghost", "10.0.0.2")
+  fail1(t, "ghost", "10.0.0.2")
+  let a = refusalText(t, "real", "10.0.0.3")
+  let b = refusalText(t, "ghost", "10.0.0.4")
+  assert(a == b && a != "", "refusals differ: '${a}' vs '${b}'")
+}
+
+test "Throttled is a 429 HttpError" {
+  let th = Throttled{ retryAfter = 7 }
+  let h: HttpError = th
+  assert(h.status() == 429, "want 429, got ${h.status()}")
+  assert(h.message() == "Too Many Requests", "got '${h.message()}'")
+}
+
+test "the audit hook sees failures, the lockout, the refusal and the reset, never the raw name" {
+  let clock = freshClock()
+  let seen = Seen{ kinds = []string{}, accounts = []string{} }
+  let o = ThrottleOptions{ accountFailures = 2, onEvent = recorder(seen) }
+  let t = throttleOn(fakeStore(clock), clock, o)
+  fail1(t, "ada", "10.0.0.1")
+  clock.t = clock.t + 5
+  fail1(t, "ada", "10.0.0.1")
+  let _ = waitFor(t, "ada", "10.0.0.1")
+  clock.t = clock.t + 2000
+  t.recordSuccess("ada") catch e {
+    panic("recordSuccess: ${e.message()}")
+  }
+  let got = join(seen.kinds, ",")
+  assert(got == "Failed,LockedOut,Failed,Locked,Cleared", "events: ${got}")
+  for a of seen.accounts {
+    assert(a != "ada" && len(a) == 64, "the hook must get the account hash, got '${a}'")
+  }
+}
+
+test "a store failure is returned, not mistaken for a refusal" {
+  let clock = freshClock()
+  let s = fakeStore(clock)
+  let t = throttleOn(s, clock, ThrottleOptions{})
+  s.broken = true
+  t.check("ada", "10.0.0.1") catch e {
+    let (_, isThrottled) = e.(Throttled)
+    assert(!isThrottled, "a store outage must not look like a lockout")
+    assert(contains(e.message(), "store down"), "got '${e.message()}'")
+    return
+  }
+  assert(false, "check must fail when the store does")
+}
+
+test "an empty address is refused as a developer mistake" {
+  let clock = freshClock()
+  let t = defaultThrottle(clock)
+  t.check("ada", "") catch e {
+    assert(contains(e.message(), "ip is empty"), "got '${e.message()}'")
+    return
+  }
+  assert(false, "an empty ip must fail")
+}
+
+test "MemoryCounter works unchanged as the store" {
+  let t = LoginThrottle(MemoryCounter(1000), ThrottleOptions{ accountFailures = 3 }) catch e {
+    panic("LoginThrottle: ${e.message()}")
+  }
+  let k = 0
+  while (k < 3) {
+    fail1(t, "ada", "10.0.0.1")
+    k = k + 1
+  }
+  assert(waitFor(t, "ada", "10.0.0.1") == 900, "3 failures over MemoryCounter lock the account")
+  assert(waitFor(t, "grace", "10.0.0.2") == 0, "an unrelated account is admitted")
+}
