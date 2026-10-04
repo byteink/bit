@@ -1,0 +1,642 @@
+// pkg/s3/retry.test.bit — #6586. The standard retry strategy.
+//
+// Classification vectors are the SDK's own lists, copied from
+// smithy-typescript commit 5d104567b7180c8a4055eb2f04c91854026a01c2,
+// packages/core/src/submodules/retry/service-error-classification/constants.ts
+// (THROTTLING_ERROR_CODES, TRANSIENT_ERROR_CODES, TRANSIENT_ERROR_STATUS_CODES,
+// NODEJS_TIMEOUT_ERROR_CODES, NODEJS_NETWORK_ERROR_CODES, CLOCK_SKEW_ERROR_CODES)
+// and the rules of service-error-classification.ts there; the retry decision,
+// quota and backoff are util-retry/StandardRetryStrategy.ts and
+// DefaultRetryBackoffStrategy.ts, the headers middleware-retry/retryMiddleware.ts,
+// the hint middleware-retry/parseRetryAfterHeader.ts (and its spec) in the same
+// commit. @aws-sdk/client-s3 3.1146.0 is aws-sdk-js-v3 054298b1520f.
+
+import { Response } from "std/http"
+import { Rand } from "std/rand"
+import { contains } from "std/strings"
+import { Millisecond, Second } from "std/time"
+
+// The six lists of constants.ts, one entry per code.
+const sdkThrottling: []string = [
+  "BandwidthLimitExceeded",
+  "EC2ThrottledException",
+  "LimitExceededException",
+  "PriorRequestNotComplete",
+  "ProvisionedThroughputExceededException",
+  "RequestLimitExceeded",
+  "RequestThrottled",
+  "RequestThrottledException",
+  "SlowDown",
+  "ThrottledException",
+  "Throttling",
+  "ThrottlingException",
+  "TooManyRequestsException",
+  "TransactionInProgressException",
+]
+
+const sdkTransient: []string = ["TimeoutError", "RequestTimeout", "RequestTimeoutException"]
+const sdkTransientStatus: []int = [500, 502, 503, 504]
+const sdkNodeTimeout: []string = ["ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT"]
+const sdkNodeNetwork: []string = ["EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN"]
+const sdkClockSkew: []string = [
+  "AccessDeniedException",
+  "AuthFailure",
+  "InvalidSignatureException",
+  "RequestExpired",
+  "RequestInTheFuture",
+  "RequestTimeTooSkewed",
+  "SignatureDoesNotMatch",
+]
+
+fn errOf(code: string, status: int): S3Error {
+  return s3ErrorOf(status, "", "<Error><Code>${code}</Code><Message>m</Message></Error>")
+}
+
+fn failure(status: int): S3Error {
+  return errOf("InternalError", status)
+}
+
+// A strategy whose draw, clock and sleep are the test's.
+fn fixed(maxAttempts: int, draw: f64): RetryStrategy {
+  let s = RetryStrategy(RetryMode.Standard, maxAttempts) catch _ {
+    panic("strategy")
+  }
+  s.random = () => draw
+  s.clock = () => 1000 * Second
+  return s
+}
+
+fn emptySource(n: int): string! {
+  return ""
+}
+
+fn isRetry(d: RetryDecision): bool {
+  match (d) {
+    Retry(_) => return true
+    Stop(_) => return false
+  }
+}
+
+fn delayOf(d: RetryDecision): int {
+  match (d) {
+    Retry(n) => return n
+    Stop(_) => return -1
+  }
+}
+
+fn stopsWith(d: RetryDecision, why: StopReason): bool {
+  match (d) {
+    Retry(_) => return false
+    Stop(r) => return r == why
+  }
+}
+
+// --- classification ------------------------------------------------------------
+
+test "every code and status of the SDK lists classifies as the SDK does" {
+  let total = 0
+  let ok = 0
+  for c of sdkThrottling {
+    total = total + 1
+    if (classifyCodeStatus(c, 0) == RetryErrorType.Throttling &&
+      classifyError(errOf(c, 400)) == RetryErrorType.Throttling) {
+      ok = ok + 1
+    }
+  }
+  for c of sdkTransient {
+    total = total + 1
+    if (classifyCodeStatus(c, 0) == RetryErrorType.Transient &&
+      classifyError(errOf(c, 400)) == RetryErrorType.Transient) {
+      ok = ok + 1
+    }
+  }
+  for c of sdkNodeTimeout {
+    total = total + 1
+    if (classifyCodeStatus(c, 0) == RetryErrorType.Transient &&
+      classifyError(errOf(c, 400)) == RetryErrorType.Transient) {
+      ok = ok + 1
+    }
+  }
+  for c of sdkNodeNetwork {
+    total = total + 1
+    if (classifyCodeStatus(c, 0) == RetryErrorType.Transient &&
+      classifyError(errOf(c, 400)) == RetryErrorType.Transient) {
+      ok = ok + 1
+    }
+  }
+  for st of sdkTransientStatus {
+    total = total + 1
+    if (classifyCodeStatus("", st) == RetryErrorType.Transient &&
+      classifyError(errOf("SomethingNew", st)) == RetryErrorType.Transient) {
+      ok = ok + 1
+    }
+  }
+  for c of sdkClockSkew {
+    total = total + 1
+    if (isClockSkewCode(c) &&
+      classifyError(errOf(c, 403)) == RetryErrorType.Client &&
+      classifyError(errOf(c, 403), true) == RetryErrorType.Transient) {
+      ok = ok + 1
+    }
+  }
+  println("retry classification vectors: ${ok} of ${total}")
+  assert(total == 14 + 3 + 4 + 4 + 4 + 7, "vector count ${total}")
+  assert(ok == total, "${ok} of ${total} classify as the SDK does")
+}
+
+test "the code lists are exactly the SDK's, not a superset" {
+  let sdk: []string = []
+  for lst of [sdkThrottling, sdkTransient, sdkNodeTimeout, sdkNodeNetwork, sdkClockSkew] {
+    for c of lst {
+      sdk = append(sdk, c)
+    }
+  }
+  let found = 0
+  for c of sdk {
+    if (isThrottlingCode(c) || isTransientCode(c) || isClockSkewCode(c)) {
+      found = found + 1
+    }
+  }
+  assert(found == len(sdk), "${found} of ${len(sdk)} listed")
+  for c of ["NoSuchKey", "AccessDenied", "NoSuchBucket", "BadDigest", "", "slowdown", "SLOWDOWN"] {
+    assert(!isThrottlingCode(c) && !isTransientCode(c), "${c} is not in the lists")
+  }
+  for c of ["NoSuchKey", "ThrottlingException", ""] {
+    assert(!isClockSkewCode(c), "${c} is not a clock skew code")
+  }
+}
+
+test "a 429 is throttling and the other statuses classify as the SDK's" {
+  assert(classifyCodeStatus("", 429) == RetryErrorType.Throttling, "429")
+  for st of [501, 505, 507, 599] {
+    assert(
+      classifyCodeStatus("", st) == RetryErrorType.Server,
+      "${st} is a server error, not retried",
+    )
+    assert(!isTransientStatus(st), "${st}")
+  }
+  for st of [0, 200, 301, 400, 403, 404, 409, 412, 416, 499] {
+    assert(classifyCodeStatus("", st) == RetryErrorType.Client, "${st}")
+  }
+  assert(classifyError(errOf("NoSuchKey", 404)) == RetryErrorType.Client, "NoSuchKey")
+  assert(classifyError(errOf("AccessDenied", 403)) == RetryErrorType.Client, "AccessDenied")
+  assert(classifyError(errOf("Whatever", 501)) == RetryErrorType.Server, "501")
+}
+
+test "throttling outranks transient and the S3 table agrees with the lists" {
+  assert(classifyError(errOf("SlowDown", 503)) == RetryErrorType.Throttling, "SlowDown at 503")
+  assert(classifyError(errOf("InternalError", 500)) == RetryErrorType.Transient, "InternalError")
+  assert(
+    classifyError(errOf("ServiceUnavailable", 503)) == RetryErrorType.Transient,
+    "ServiceUnavailable",
+  )
+  assert(classifyError(errOf("RequestTimeout", 400)) == RetryErrorType.Transient, "RequestTimeout")
+  assert(
+    classifyError(errOf("Whatever", 429)) == RetryErrorType.Throttling,
+    "429 with an unknown code",
+  )
+}
+
+test "client-raised errors, the retryable flag and a stale signature" {
+  let timeout = clientError(ErrorKind.Timeout, "read timed out")
+  assert(classifyError(timeout) == RetryErrorType.Transient, "timeout")
+  let conn = clientError(ErrorKind.Connection, "refused")
+  assert(classifyError(conn) == RetryErrorType.Transient, "connection")
+  let tls = clientError(ErrorKind.Tls, "bad certificate")
+  assert(classifyError(tls) == RetryErrorType.Client, "tls")
+  let cancelled = clientError(ErrorKind.Cancelled, "cancelled")
+  cancelled.retryable = true
+  assert(classifyError(cancelled) == RetryErrorType.Client, "a cancelled call is never retried")
+  let flagged = errOf("Whatever", 400)
+  flagged.retryable = true
+  assert(classifyError(flagged) == RetryErrorType.Transient, "the retryable verdict is honoured")
+  let stale = s3ErrorOf(
+    403,
+    "",
+    "<Error><Code>InvalidSignatureException</Code><Message>Signature expired: 20261004T000000Z is now earlier than 20261004T000500Z</Message></Error>",
+  )
+  assert(classifyError(stale) == RetryErrorType.Transient, "Signature expired")
+  assert(
+    classifyError(errOf("InvalidSignatureException", 403)) == RetryErrorType.Client,
+    "other signature errors",
+  )
+}
+
+test "a 200 that carries an error is retried as the transient 503 it is" {
+  let res = Response{
+    status = 200,
+    contentType = "",
+    headers = "",
+    body = "<Error><Code>InternalError</Code><Message>try again</Message></Error>",
+  }
+  match (hiddenError(res, false)) {
+    Some(e) => assert(classifyError(e) == RetryErrorType.Transient, "hidden error")
+    None => assert(false, "no hidden error")
+  }
+}
+
+fn notANumber(): f64 {
+  let zero = 0.0
+  return zero / zero
+}
+
+fn infinity(): f64 {
+  let zero = 0.0
+  return 1.0 / zero
+}
+
+// --- backoff -------------------------------------------------------------------------
+
+// The bound spelled out independently of `backoffBound`: min(20 s, base * 2^n).
+fn boundBy(base: int, n: int): int {
+  let b = base
+  let i = 0
+  while (i < n) {
+    b = b * 2
+    i = i + 1
+    if (b >= 20 * Second) {
+      return 20 * Second
+    }
+  }
+  return b
+}
+
+test "backoff bound is min(20 s, 100 ms * 2^n), 500 ms based when throttled" {
+  assert(backoffBound(false, 0) == 100 * Millisecond, "n=0")
+  assert(backoffBound(false, 1) == 200 * Millisecond, "n=1")
+  assert(backoffBound(false, 7) == 12800 * Millisecond, "n=7")
+  assert(backoffBound(false, 8) == 20 * Second, "n=8 is capped")
+  assert(backoffBound(false, 1000000) == 20 * Second, "a huge n does not overflow")
+  assert(backoffBound(true, 0) == 500 * Millisecond, "throttling n=0")
+  assert(backoffBound(true, 5) == 16 * Second, "throttling n=5")
+  assert(backoffBound(true, 6) == 20 * Second, "throttling n=6 is capped")
+  for n of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 20, 61, 62, 63, 64, 200] {
+    assert(backoffBound(false, n) == boundBy(100 * Millisecond, n), "bound ${n}")
+    assert(backoffBound(true, n) == boundBy(500 * Millisecond, n), "throttling bound ${n}")
+  }
+}
+
+test "1000 sampled delays per attempt stay within [0, min(20 s, 100 ms * 2^n)]" {
+  let rng = Rand(20261004)
+  let s = fixed(100, 0.0)
+  s.random = () => rng.f64()
+  let checked = 0
+  let n = 0
+  while (n < 12) {
+    let low = 20 * Second
+    let high = 0
+    let i = 0
+    while (i < 1000) {
+      let call = s.begin()
+      call.retries = n
+      let d = call.delayFor(false, Option<int>.None)
+      let bound = boundBy(100 * Millisecond, n)
+      assert(d >= 0 && d <= bound, "n=${n}: ${d} outside [0, ${bound}]")
+      if (d < low) {
+        low = d
+      }
+      if (d > high) {
+        high = d
+      }
+      checked = checked + 1
+      i = i + 1
+    }
+    // The draws fill the range: a source stuck at one value would pass the
+    // bounds above and fail here.
+    let bound = boundBy(100 * Millisecond, n)
+    assert(low < bound / 10, "n=${n}: lowest ${low} of bound ${bound}")
+    assert(high > bound - bound / 10, "n=${n}: highest ${high} of bound ${bound}")
+    n = n + 1
+  }
+  println("retry delays checked: ${checked}")
+  assert(checked == 12000, "12 attempts of 1000 draws")
+}
+
+test "the extremes of the draw are 0 and the bound" {
+  let lo = fixed(10, 0.0).begin()
+  assert(lo.delayFor(false, Option<int>.None) == 0, "draw 0")
+  let hi = fixed(10, 1.0).begin()
+  assert(hi.delayFor(false, Option<int>.None) == 100 * Millisecond, "draw 1 is the bound")
+}
+
+test "a generator outside [0, 1] or NaN cannot break the bounds" {
+  for r of [-5.0, -0.0001, 1.0001, 7.0, infinity(), notANumber()] {
+    let call = fixed(10, r).begin()
+    call.retries = 3
+    let d = call.delayFor(false, Option<int>.None)
+    assert(d >= 0 && d <= 800 * Millisecond, "draw ${r} gave ${d}")
+  }
+}
+
+test "each retry waits on its own n and a throttled one on the 500 ms base" {
+  let s = fixed(10, 1.0)
+  let call = s.begin()
+  let want = [100, 200, 400, 800]
+  for w of want {
+    let d = delayOf(call.decide(failure(503)))
+    assert(d == w * Millisecond, "wait ${d}, want ${w} ms")
+  }
+  let t = fixed(10, 1.0).begin()
+  assert(delayOf(t.decide(errOf("SlowDown", 503))) == 500 * Millisecond, "throttled n=0")
+  assert(delayOf(t.decide(errOf("SlowDown", 503))) == 1000 * Millisecond, "throttled n=1")
+}
+
+test "pause hands the delay to the injected sleeper, and totalDelay sums them" {
+  let slept: []int = []
+  let s = fixed(10, 1.0)
+  s.sleeper = (d: int) => {
+    slept = append(slept, d)
+  }
+  let call = s.begin()
+  let i = 0
+  while (i < 3) {
+    call.pause(delayOf(call.decide(failure(500))))
+    i = i + 1
+  }
+  assert(len(slept) == 3, "slept ${len(slept)} times")
+  assert(
+    slept[0] == 100 * Millisecond && slept[2] == 400 * Millisecond,
+    "waits ${slept[0]}..${slept[2]}",
+  )
+  assert(call.totalDelay == 700 * Millisecond, "total ${call.totalDelay}")
+}
+
+// --- the retry-after hint -------------------------------------------------------------
+
+const hintNow: int = 1000000 * Second
+
+fn hintMs(headers: string): int {
+  match (retryAfterHint(headers, hintNow)) {
+    Some(at) => return (at - hintNow) / Millisecond
+    None => return -1
+  }
+}
+
+test "retry-after hint forms are read as the SDK reads them" {
+  assert(hintMs("Retry-After: 120\r\n") == 120000, "plain seconds")
+  assert(hintMs("retry-after: 1.5\r\n") == 1500, "fractional seconds")
+  assert(hintMs("x-amz-retry-after: 5000\r\n") == 5000, "milliseconds")
+  assert(hintMs("retry-after: 10\r\nx-amz-retry-after: 9999\r\n") == 10000, "retry-after first")
+  assert(hintMs("Content-Type: text/xml\r\n") == -1, "no hint")
+  assert(hintMs("") == -1, "empty block")
+  assert(hintMs("retry-after: not-a-number\r\n") == -1, "words")
+  assert(hintMs("retry-after: Invalid Date GMT\r\n") == -1, "an unreadable date")
+  assert(hintMs("x-amz-retry-after: abc\r\n") == -1, "x-amz words")
+  assert(hintMs("retry-after: 12 seconds\r\n") == -1, "units")
+  assert(hintMs("retry-after: -4\r\n") == -1, "negative seconds")
+  assert(hintMs("retry-after: 99999999999999999999\r\n") > 0, "a huge value does not overflow")
+}
+
+test "retry-after as an HTTP date, a date with seconds, and an RFC 3339 date" {
+  // 2015-10-21T07:28:00Z is 1445412480 s after the epoch.
+  let at = 1445412480 * Second
+  let date = "Wed, 21 Oct 2015 07:28:00 GMT"
+  match (retryAfterHint("Retry-After: ${date}\r\n", at - 60 * Second)) {
+    Some(t) => assert(t == at, "date ${t}")
+    None => assert(false, "date not read")
+  }
+  match (retryAfterHint("Retry-After: ${date}, 45\r\n", at - 60 * Second)) {
+    Some(t) => assert(t == at - 15 * Second, "the seconds win: ${t}")
+    None => assert(false, "date with seconds not read")
+  }
+  match (retryAfterHint("Retry-After: 2015-10-21T07:28:00Z\r\n", at - 30 * Second)) {
+    Some(t) => assert(t == at, "rfc3339 ${t}")
+    None => assert(false, "rfc3339 not read")
+  }
+  match (retryAfterHint("Retry-After: 2015-10-21T07:28:00Z\r\n", at + 30 * Second)) {
+    Some(_) => assert(false, "an RFC 3339 date in the past is no hint")
+    None => {}
+  }
+}
+
+test "a hint lifts the wait to the hint but at most 5 s above the draw" {
+  let s = fixed(10, 0.0)
+  let now = 1000 * Second
+  let call = s.begin()
+  assert(
+    call.delayFor(false, Option<int>.Some(now + 3 * Second)) == 3 * Second,
+    "hint inside the slack",
+  )
+  assert(
+    call.delayFor(false, Option<int>.Some(now + 600 * Second)) == 5 * Second,
+    "hint capped at draw + 5 s",
+  )
+  assert(call.delayFor(false, Option<int>.Some(now - 10 * Second)) == 0, "a hint in the past")
+  let late = fixed(10, 1.0).begin()
+  assert(
+    late.delayFor(false, Option<int>.Some(now + 50 * Millisecond)) == 100 * Millisecond,
+    "hint under the draw",
+  )
+  assert(
+    late.delayFor(false, Option<int>.Some(now + 600 * Second)) == 5100 * Millisecond,
+    "capped at 100 ms + 5 s",
+  )
+}
+
+// --- attempts, headers, bodies ------------------------------------------------------------
+
+test "three attempts by default: two retries, then the error is returned" {
+  let s = RetryStrategy() catch _ {
+    panic("default strategy")
+  }
+  assert(s.maxAttempts == 3, "default ${s.maxAttempts}")
+  assert(s.mode == RetryMode.Standard, "mode")
+  s.random = () => 0.0
+  let call = s.begin()
+  let e = failure(503)
+  assert(isRetry(call.decide(e)), "after attempt 1")
+  assert(call.attempt() == 2, "attempt 2")
+  assert(isRetry(call.decide(e)), "after attempt 2")
+  assert(call.attempt() == 3, "attempt 3")
+  assert(stopsWith(call.decide(e), StopReason.AttemptsExhausted), "after attempt 3")
+  assert(e.attempts == 3, "attempts recorded: ${e.attempts}")
+}
+
+test "maxAttempts 1 never retries and a count below 1 is refused" {
+  let call = fixed(1, 0.0).begin()
+  assert(stopsWith(call.decide(failure(503)), StopReason.AttemptsExhausted), "one attempt")
+  for bad of [0, -1, -100] {
+    let why = refusal(bad)
+    assert(contains(why, "maxAttempts must be at least 1"), "${bad}: '${why}'")
+  }
+  assert(refusal(1) == "" && refusal(10) == "", "valid counts are accepted")
+}
+
+// The reason `RetryStrategy` refuses `maxAttempts`, "" when it accepts it.
+fn refusal(maxAttempts: int): string {
+  let s = RetryStrategy(RetryMode.Standard, maxAttempts) catch e {
+    return e.message()
+  }
+  assert(s.maxAttempts == maxAttempts, "kept")
+  return ""
+}
+
+test "a client error is not retried and costs nothing" {
+  let s = fixed(5, 0.0)
+  let call = s.begin()
+  assert(stopsWith(call.decide(errOf("NoSuchKey", 404)), StopReason.NotRetryable), "NoSuchKey")
+  assert(stopsWith(call.decide(errOf("Whatever", 501)), StopReason.NotRetryable), "501")
+  assert(s.tokens() == 500, "tokens ${s.tokens()}")
+}
+
+test "headers: one id for every attempt, attempt=N; max=M on each" {
+  let s = fixed(3, 0.0)
+  s.newId = () => "11111111-2222-4333-8444-555555555555"
+  let call = s.begin()
+  assert(call.id == "11111111-2222-4333-8444-555555555555", "id")
+  let want = ["attempt=1; max=3", "attempt=2; max=3", "attempt=3; max=3"]
+  for w of want {
+    let hs = call.headers()
+    assert(len(hs) == 2, "two headers")
+    assert(hs[0].name == "amz-sdk-invocation-id" && hs[0].value == call.id, "invocation id header")
+    assert(
+      hs[1].name == "amz-sdk-request" && hs[1].value == w,
+      "request header ${hs[1].value}, want ${w}",
+    )
+    call.decide(failure(503))
+  }
+}
+
+test "every call gets its own invocation id, a version 4 UUID" {
+  let s = fixed(3, 0.0)
+  let seen: []string = []
+  let i = 0
+  while (i < 50) {
+    let id = s.begin().id
+    assert(len(id) == 36 && id[14] == '4', "id ${id}")
+    for old of seen {
+      assert(old != id, "repeated id ${id}")
+    }
+    seen = append(seen, id)
+    i = i + 1
+  }
+  assert(s.begin().id != s.begin().id, "two calls, one strategy")
+}
+
+test "a body that can be read once is never retried" {
+  let s = fixed(5, 0.0)
+  let call = s.begin()
+  let stream = Body.Stream(emptySource, Option<int>.None)
+  assert(!isReplayable(stream), "stream")
+  assert(isReplayable(Body.Empty), "empty")
+  assert(isReplayable(Body.Text("x")), "text")
+  assert(isReplayable(Body.Bytes([1, 2])), "bytes")
+  assert(isReplayable(Body.File("/tmp/x")), "file")
+  let d = call.decide(failure(503), isReplayable(stream))
+  assert(stopsWith(d, StopReason.NotReplayable), "stream body")
+  assert(s.tokens() == 500, "no tokens spent")
+  assert(isRetry(call.decide(failure(503), isReplayable(Body.Text("x")))), "a text body is retried")
+}
+
+test "a clock-skew error is retried once the clock was corrected, not before" {
+  let s = fixed(5, 0.0)
+  let call = s.begin()
+  let e = errOf("RequestTimeTooSkewed", 403)
+  assert(stopsWith(call.decide(e), StopReason.NotRetryable), "uncorrected")
+  assert(isRetry(call.decide(e, true, true)), "corrected")
+}
+
+// --- the quota -------------------------------------------------------------------------------
+
+test "exhausting the 500-token quota stops retrying" {
+  let s = fixed(1000, 0.0)
+  assert(s.tokens() == 500, "starts at 500")
+  let retries = 0
+  let call = s.begin()
+  while (isRetry(call.decide(failure(503)))) {
+    retries = retries + 1
+    assert(retries <= 50, "more than 50 retries")
+  }
+  assert(retries == 50, "500 tokens pay for 50 transient retries at 10, got ${retries}")
+  assert(s.tokens() == 0, "tokens ${s.tokens()}")
+  assert(stopsWith(call.decide(failure(503)), StopReason.QuotaExhausted), "still refused")
+  // The quota belongs to the strategy: another call sees it empty.
+  let other = s.begin()
+  assert(stopsWith(other.decide(failure(500)), StopReason.QuotaExhausted), "a second call")
+  println("quota exhausted after ${retries} retries")
+}
+
+test "a throttled retry costs 5 and a transient one 10" {
+  let s = fixed(1000, 0.0)
+  let call = s.begin()
+  call.decide(errOf("SlowDown", 503))
+  assert(s.tokens() == 495, "throttled ${s.tokens()}")
+  call.decide(failure(503))
+  assert(s.tokens() == 485, "transient ${s.tokens()}")
+  let retries = 2
+  while (isRetry(call.decide(errOf("SlowDown", 503)))) {
+    retries = retries + 1
+  }
+  assert(s.tokens() < 5, "left ${s.tokens()}")
+  // 485 tokens left after the first two, 5 each: 97 more.
+  assert(retries == 1 + 1 + 97, "retries ${retries}")
+}
+
+test "a call that fails and then succeeds refunds the last retry's cost" {
+  let s = fixed(10, 0.0)
+  let call = s.begin()
+  call.decide(failure(503))
+  call.decide(errOf("SlowDown", 503))
+  assert(s.tokens() == 485, "after two retries ${s.tokens()}")
+  call.succeeded()
+  assert(s.tokens() == 490, "refunded the last retry's cost (5): ${s.tokens()}")
+  let t = fixed(10, 0.0)
+  let c = t.begin()
+  c.decide(failure(503))
+  c.succeeded()
+  assert(t.tokens() == 500, "a transient retry refunds 10: ${t.tokens()}")
+}
+
+test "a call that needed no retry refunds 1, and the quota never passes 500" {
+  let s = fixed(10, 0.0)
+  s.begin().succeeded()
+  assert(s.tokens() == 500, "full stays full: ${s.tokens()}")
+  let c = s.begin()
+  c.decide(failure(503))
+  assert(s.tokens() == 490, "spent")
+  s.begin().succeeded()
+  assert(s.tokens() == 491, "one token back: ${s.tokens()}")
+  let big = s.begin()
+  big.cost = 1000
+  big.succeeded()
+  assert(s.tokens() == 500, "capped: ${s.tokens()}")
+}
+
+test "a refused retry spends nothing and the quota refills with successes" {
+  let s = fixed(1000, 0.0)
+  s.quota = 7
+  let call = s.begin()
+  assert(stopsWith(call.decide(failure(503)), StopReason.QuotaExhausted), "7 < 10")
+  assert(s.tokens() == 7, "untouched")
+  assert(isRetry(call.decide(errOf("SlowDown", 503))), "7 >= 5")
+  assert(s.tokens() == 2, "paid 5")
+}
+
+// One task: fail a call until the strategy stops it, report the retries it got.
+fn retryUntilStopped(s: RetryStrategy, out: chan<int>) {
+  let call = s.begin()
+  let n = 0
+  while (isRetry(call.decide(failure(503)))) {
+    n = n + 1
+  }
+  out <- n
+}
+
+test "tasks sharing a strategy never overdraw the quota" {
+  let s = fixed(100000, 0.0)
+  let tasks = 40
+  let out = chan<int>(tasks)
+  let i = 0
+  while (i < tasks) {
+    spawn retryUntilStopped(s, out)
+    i = i + 1
+  }
+  let total = 0
+  let j = 0
+  while (j < tasks) {
+    total = total + <- out
+    j = j + 1
+  }
+  assert(total == 50, "500 tokens paid ${total} retries at 10 each")
+  assert(s.tokens() == 0, "tokens ${s.tokens()}")
+}

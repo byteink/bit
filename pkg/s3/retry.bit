@@ -1,0 +1,590 @@
+// pkg/s3/retry.bit — the standard retry strategy: which failures are worth
+// another request, how long to wait, and how many retries a client may spend
+// across every call it makes (#6586).
+//
+// Followed, not paraphrased: smithy-typescript commit
+// 5d104567b7180c8a4055eb2f04c91854026a01c2 (2026-09-30), packages/core/src/
+// submodules/retry/ (`service-error-classification`, `util-retry`,
+// `middleware-retry`), the code behind @smithy/util-retry that
+// @aws-sdk/client-s3 3.1146.0 (aws-sdk-js-v3 054298b1520f) runs.
+//   - A call is attempted `maxAttempts` times at most (default 3, counting the
+//     first). Only a throttling or transient failure is retried; the other 5xx
+//     and every client error are not.
+//   - The wait before retry n (0-based) is a full-jitter draw: a uniform value
+//     in [0, min(20 s, base * 2^n)], base 100 ms, or 500 ms after a throttling
+//     failure. A `Retry-After` or `x-amz-retry-after` hint raises the wait to
+//     the hint, but never more than 5 s above the draw.
+//   - One quota bucket of 500 tokens belongs to the strategy, so it is shared
+//     by every call the client makes. A retry spends 5 tokens, 10 after a
+//     transient failure; the quota is refilled by the cost of the last retry
+//     when the call succeeds, by 1 when it succeeded at once, never above 500.
+//     When the bucket cannot pay, the failure is returned: a service that is
+//     down is not hammered by every caller at once.
+//   - `amz-sdk-invocation-id` is one UUID per call, the same on every attempt;
+//     `amz-sdk-request: attempt=N; max=M` says which attempt this is.
+//   - A request body that can be read once (a `Stream`) is never retried.
+//
+// The error model is `S3Error` (errors.bit) and its table (`retryClassOf` in
+// gen_errors.bit); the lists below only add the codes a response can carry that
+// the table does not name, so a code the SDK knows is classified as the SDK does.
+
+import { Header, header as httpHeader } from "std/http"
+import { float64 } from "std/rand"
+import { Mutex } from "std/sync"
+import { contains, hasSuffix, lastIndexOf, parseFloat as parseDecimal } from "std/strings"
+import { Millisecond, Second, Timestamp, now, parseHttpDate, parseRfc3339, sleep } from "std/time"
+import { format, uuidV4 } from "std/uuid"
+
+// Attempts a call makes by default, the first included (`DEFAULT_MAX_ATTEMPTS`).
+const defaultMaxAttempts: int = 3
+
+// The wait is drawn up to `base * 2^n`: 100 ms, and 500 ms after throttling
+// (`DEFAULT_RETRY_DELAY_BASE`, `THROTTLING_RETRY_DELAY_BASE`).
+const delayBase: int = 100 * Millisecond
+const throttlingDelayBase: int = 500 * Millisecond
+
+// No wait is longer than this (`MAXIMUM_RETRY_DELAY`).
+const maxDelay: int = 20 * Second
+
+// How far above its own draw a server hint may push the wait.
+const hintSlack: int = 5 * Second
+
+// A hint further away than this many seconds is treated as this far; it only
+// keeps the conversion to nanoseconds from overflowing.
+const maxHintSeconds: f64 = 1000000000.0
+
+// The quota: capacity, what a retry costs, what one after a transient failure
+// costs (`TIMEOUT_RETRY_COST`), and what a call that needed no retry refunds.
+const quotaCapacity: int = 500
+const retryCost: int = 5
+const transientCost: int = 10
+const noRetryRefund: int = 1
+
+const invocationIdHeader: string = "amz-sdk-invocation-id"
+const requestHeader: string = "amz-sdk-request"
+
+// `THROTTLING_ERROR_CODES`.
+const throttlingCodes: []string = [
+  "BandwidthLimitExceeded",
+  "EC2ThrottledException",
+  "LimitExceededException",
+  "PriorRequestNotComplete",
+  "ProvisionedThroughputExceededException",
+  "RequestLimitExceeded",
+  "RequestThrottled",
+  "RequestThrottledException",
+  "SlowDown",
+  "ThrottledException",
+  "Throttling",
+  "ThrottlingException",
+  "TooManyRequestsException",
+  "TransactionInProgressException",
+]
+
+// `TRANSIENT_ERROR_CODES`, then `NODEJS_TIMEOUT_ERROR_CODES` and
+// `NODEJS_NETWORK_ERROR_CODES`: the system error names a transport reports
+// when it timed out or could not reach the host.
+const transientCodes: []string = [
+  "TimeoutError",
+  "RequestTimeout",
+  "RequestTimeoutException",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EPIPE",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+]
+
+// `CLOCK_SKEW_ERROR_CODES`: the codes a server answers with when client and
+// server disagree about the time.
+const clockSkewCodes: []string = [
+  "AccessDeniedException",
+  "AuthFailure",
+  "InvalidSignatureException",
+  "RequestExpired",
+  "RequestInTheFuture",
+  "RequestTimeTooSkewed",
+  "SignatureDoesNotMatch",
+]
+
+// The text that makes an `InvalidSignatureException` a transient failure.
+const signatureExpired: string = "Signature expired"
+
+fn retryInList(xs: []string, s: string): bool {
+  for x of xs {
+    if (x == s) {
+      return true
+    }
+  }
+  return false
+}
+
+// --- classification -------------------------------------------------------------
+
+// What a failure is, as far as retrying goes (`RetryErrorType`). Only
+// `Throttling` and `Transient` are retried; `Server` is any other 5xx.
+export enum RetryErrorType {
+  Throttling,
+  Transient,
+  Server,
+  Client,
+}
+
+// True for a throttling code (`THROTTLING_ERROR_CODES`).
+fn isThrottlingCode(code: string): bool {
+  return retryInList(throttlingCodes, code)
+}
+
+// True for a code that names a timeout or an unreachable host
+// (`TRANSIENT_ERROR_CODES`, `NODEJS_TIMEOUT_ERROR_CODES`,
+// `NODEJS_NETWORK_ERROR_CODES`).
+fn isTransientCode(code: string): bool {
+  return retryInList(transientCodes, code)
+}
+
+// True for a code that says client and server clocks disagree
+// (`CLOCK_SKEW_ERROR_CODES`). Such an error is retried only once the client has
+// moved its clock (`skewCorrected` in `Invocation.decide`): the same request
+// signed with the same wrong time would fail the same way.
+fn isClockSkewCode(code: string): bool {
+  return retryInList(clockSkewCodes, code)
+}
+
+// True for a status that means "try again" (`TRANSIENT_ERROR_STATUS_CODES`).
+fn isTransientStatus(status: int): bool {
+  return status == 500 || status == 502 || status == 503 || status == 504
+}
+
+// The class of an error from its code and status alone.
+fn classifyCodeStatus(code: string, status: int): RetryErrorType {
+  if (status == 429 || isThrottlingCode(code)) {
+    return RetryErrorType.Throttling
+  }
+  if (isTransientCode(code) || isTransientStatus(status)) {
+    return RetryErrorType.Transient
+  }
+  if (status >= 500 && status <= 599) {
+    return RetryErrorType.Server
+  }
+  return RetryErrorType.Client
+}
+
+fn isSignatureExpired(e: S3Error): bool {
+  return e.code == "InvalidSignatureException" && contains(e.message, signatureExpired)
+}
+
+// Whether the error itself says it may be retried: the table's class, the
+// `retryable` verdict the response rules gave it, a signature the clock made
+// stale, or a clock the client has just corrected.
+fn markedTransient(e: S3Error, skewCorrected: bool): bool {
+  if (skewCorrected || e.retryable || isSignatureExpired(e)) {
+    return true
+  }
+  return retryClassOf(e.kind) == RetryClass.Transient
+}
+
+// How the retry strategy sees `e` (`getRetryErrorType`). `skewCorrected` is
+// true when the response that carried `e` made the client move its clock.
+// A cancelled call is never retried, whatever else the error says.
+export fn classifyError(e: S3Error, skewCorrected: bool = false): RetryErrorType {
+  if (e.kind == ErrorKind.Cancelled) {
+    return RetryErrorType.Client
+  }
+  let byWire = classifyCodeStatus(e.code, e.status)
+  if (byWire == RetryErrorType.Throttling || retryClassOf(e.kind) == RetryClass.Throttling) {
+    return RetryErrorType.Throttling
+  }
+  if (byWire == RetryErrorType.Transient || markedTransient(e, skewCorrected)) {
+    return RetryErrorType.Transient
+  }
+  return byWire
+}
+
+// True when the strategy retries this class.
+fn retried(t: RetryErrorType): bool {
+  return t == RetryErrorType.Throttling || t == RetryErrorType.Transient
+}
+
+// --- the retry-after hint -------------------------------------------------------
+
+fn retryDigits(s: string): bool {
+  if (s == "") {
+    return false
+  }
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] < '0' || s[i] > '9') {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `12` or `12.5`, the only plain numbers `Retry-After` is read as.
+fn retryDecimal(s: string): bool {
+  let dot = lastIndexOf(s, ".")
+  if (dot < 0) {
+    return retryDigits(s)
+  }
+  return retryDigits(s[0:dot]) && retryDigits(s[dot + 1:len(s)])
+}
+
+fn retryNumber(s: string): Option<f64> {
+  let v = parseDecimal(s) catch _ {
+    return Option<f64>.None
+  }
+  return Option<f64>.Some(v)
+}
+
+fn retryClamp(v: f64): f64 {
+  if (v > maxHintSeconds) {
+    return maxHintSeconds
+  }
+  return v
+}
+
+// The instant a `Retry-After` value names, in unix nanoseconds, from `now`.
+// The forms are the ones `parseRetryAfterHeader` takes: an HTTP date ending in
+// GMT, a date followed by `, <seconds>` (the seconds win), plain seconds, and
+// an RFC 3339 date that is not in the past.
+fn retryAfterValueAt(v: string, nowNs: int): Option<int> {
+  if (hasSuffix(v, "GMT")) {
+    let t = parseHttpDate(v, Timestamp{ ns = nowNs }) catch _ {
+      return Option<int>.None
+    }
+    return Option<int>.Some(t.ns)
+  }
+  let comma = lastIndexOf(v, " GMT, ")
+  if (comma >= 0 && retryDecimal(v[comma + 6:len(v)])) {
+    return retrySecondsAt(v[comma + 6:len(v)], nowNs)
+  }
+  if (retryDecimal(v)) {
+    return retrySecondsAt(v, nowNs)
+  }
+  let t = parseRfc3339(v) catch _ {
+    return Option<int>.None
+  }
+  if (t.ns < nowNs) {
+    return Option<int>.None
+  }
+  return Option<int>.Some(t.ns)
+}
+
+fn retrySecondsAt(s: string, nowNs: int): Option<int> {
+  match (retryNumber(s)) {
+    Some(v) => return Option<int>.Some(nowNs + int(retryClamp(v) * f64(Second)))
+    None => return Option<int>.None
+  }
+}
+
+// The instant `x-amz-retry-after` names: its value is milliseconds from now.
+fn retryAmzAt(v: string, nowNs: int): Option<int> {
+  match (retryNumber(v)) {
+    Some(ms) => {
+      if (ms < 0.0) {
+        return Option<int>.Some(nowNs)
+      }
+      return Option<int>.Some(nowNs + int(retryClamp(ms / 1000.0) * f64(Second)))
+    }
+    None => return Option<int>.None
+  }
+}
+
+// When the server says to come back, as unix nanoseconds, from the raw
+// `headers` block of a failed response read at `nowNs`; None when it says
+// nothing or says it in a form that cannot be read. `Retry-After` is looked at
+// before `x-amz-retry-after`, and an unreadable `Retry-After` is no hint at all,
+// as in `parseRetryAfterHeader`.
+export fn retryAfterHint(headers: string, nowNs: int): Option<int> {
+  let v = httpHeader(headers, "retry-after")
+  if (v != "") {
+    return retryAfterValueAt(v, nowNs)
+  }
+  let ms = httpHeader(headers, "x-amz-retry-after")
+  if (ms != "") {
+    return retryAmzAt(ms, nowNs)
+  }
+  return Option<int>.None
+}
+
+// --- backoff ----------------------------------------------------------------------
+
+// The longest the wait before retry `n` (0-based) can be: `min(20 s, base *
+// 2^n)`. Doubled step by step so a large `n` cannot overflow.
+fn backoffBound(throttling: bool, n: int): int {
+  let bound = delayBase
+  if (throttling) {
+    bound = throttlingDelayBase
+  }
+  let i = 0
+  while (i < n && bound < maxDelay) {
+    bound = bound * 2
+    i = i + 1
+  }
+  if (bound > maxDelay) {
+    return maxDelay
+  }
+  return bound
+}
+
+// A draw from [0, 1] whatever the source returned: a generator that strays
+// outside the range, or answers NaN, cannot make a wait negative or unbounded.
+fn retryUnit(r: f64): f64 {
+  if (!(r >= 0.0)) {
+    return 0.0
+  }
+  if (r > 1.0) {
+    return 1.0
+  }
+  return r
+}
+
+// The wait the server's hint asks for, kept between the draw and the draw plus
+// five seconds (`StandardRetryStrategy`).
+fn retryWithHint(drawn: int, hint: Option<int>, nowNs: int): int {
+  match (hint) {
+    Some(at) => {
+      let wait = at - nowNs
+      if (wait > drawn + hintSlack) {
+        wait = drawn + hintSlack
+      }
+      if (wait < drawn) {
+        return drawn
+      }
+      return wait
+    }
+    None => return drawn
+  }
+}
+
+// --- the strategy -------------------------------------------------------------------
+
+// How a client retries. `Standard` is the only mode today; the adaptive mode
+// (client-side rate limiting) is another variant of this type (#6587).
+export enum RetryMode {
+  Standard,
+}
+
+// Why a call stopped being retried.
+export enum StopReason {
+  // The error is not one a retry fixes.
+  NotRetryable,
+  // The request body can be read once, so it cannot be sent again.
+  NotReplayable,
+  // `maxAttempts` requests have been made.
+  AttemptsExhausted,
+  // The quota cannot pay for another retry.
+  QuotaExhausted,
+}
+
+// What to do about a failed attempt: `Retry(delay)` after `delay` nanoseconds,
+// or `Stop(reason)` and hand the error back.
+export enum RetryDecision {
+  Retry(int),
+  Stop(StopReason),
+}
+
+fn retryInvocationId(): string {
+  return format(uuidV4())
+}
+
+fn retryRandom(): f64 {
+  return float64()
+}
+
+fn retryWallNs(): int {
+  return now().ns
+}
+
+// The retry policy of a client, and the quota every call of the client draws on.
+// Safe to share between tasks.
+//
+//   let strategy = RetryStrategy(RetryMode.Standard, 5)!
+//   let call = strategy.begin()
+//   while (true) {
+//     let res = send(call.headers())
+//     if (res.ok()) {
+//       call.succeeded()
+//       break
+//     }
+//     match (call.decide(errorFromResponse(res), isReplayable(body))) {
+//       Retry(delay) => call.pause(delay)
+//       Stop(_) => fail error
+//     }
+//   }
+export class RetryStrategy {
+  export mode: RetryMode
+  export maxAttempts: int
+  // The draw for the jitter, in [0, 1). Replaced in tests.
+  random: () => f64
+  // Wall clock in unix nanoseconds, read to turn a retry hint into a wait.
+  // Replaced in tests.
+  clock: () => int
+  // Parks the caller for this many nanoseconds. Replaced in tests.
+  sleeper: (int) => ()
+  newId: () => string
+  mu: Mutex
+  quota: int
+
+  // Fails when `maxAttempts` is not at least 1: a count of zero would never
+  // send the request.
+  init(mode: RetryMode = RetryMode.Standard, maxAttempts: int = defaultMaxAttempts)! {
+    if (maxAttempts < 1) {
+      fail newError("s3: retry: maxAttempts must be at least 1, got ${maxAttempts}")
+    }
+    this.mode = mode
+    this.maxAttempts = maxAttempts
+    this.random = retryRandom
+    this.clock = retryWallNs
+    this.sleeper = sleep
+    this.newId = retryInvocationId
+    this.mu = Mutex()
+    this.quota = quotaCapacity
+  }
+
+  // Tokens left in the quota.
+  export tokens(): int {
+    this.mu.lock()
+    let n = this.quota
+    this.mu.unlock()
+    return n
+  }
+
+  // Starts one call: a fresh invocation id, no retries spent.
+  export begin(): Invocation {
+    return Invocation{
+      strategy = this,
+      id = this.newId(),
+      retries = 0,
+      cost = 0,
+      totalDelay = 0,
+    }
+  }
+
+  // Takes `cost` tokens, or none when there are fewer.
+  take(cost: int): bool {
+    this.mu.lock()
+    let ok = this.quota >= cost
+    if (ok) {
+      this.quota = this.quota - cost
+    }
+    this.mu.unlock()
+    return ok
+  }
+
+  // Puts `n` tokens back, never above the capacity.
+  refill(n: int) {
+    this.mu.lock()
+    this.quota = this.quota + n
+    if (this.quota > quotaCapacity) {
+      this.quota = quotaCapacity
+    }
+    this.mu.unlock()
+  }
+}
+
+// One call to the service, from its first attempt to its last. Not shared
+// between tasks: one task runs one call.
+export class Invocation {
+  strategy: RetryStrategy
+  // The value of `amz-sdk-invocation-id`, the same on every attempt.
+  export id: string
+  retries: int
+  // What the latest retry cost, 0 before the first.
+  cost: int
+  // Nanoseconds waited so far, summed over the retries.
+  export totalDelay: int
+
+  // The attempt about to be made, from 1.
+  export attempt(): int {
+    return this.retries + 1
+  }
+
+  // The value of `amz-sdk-request` for the attempt about to be made.
+  export requestValue(): string {
+    return "attempt=${this.attempt()}; max=${this.strategy.maxAttempts}"
+  }
+
+  // The two headers every attempt carries.
+  export headers(): []Header {
+    return [
+      Header{ name = invocationIdHeader, value = this.id },
+      Header{ name = requestHeader, value = this.requestValue() },
+    ]
+  }
+
+  // Decides what to do about the failed attempt `e`, and records the answer in
+  // `e.attempts`. `replayable` is false when the request body cannot be sent
+  // again (`isReplayable`). `skewCorrected` is true when the response that
+  // carried `e` made the client move its clock. `hint` is the server's
+  // `retryAfterHint`. A `Retry` has already taken its tokens from the quota.
+  export decide(
+    e: S3Error,
+    replayable: bool = true,
+    skewCorrected: bool = false,
+    hint: Option<int> = Option<int>.None,
+  ): RetryDecision {
+    e.attempts = this.attempt()
+    if (!replayable) {
+      return RetryDecision.Stop(StopReason.NotReplayable)
+    }
+    let t = classifyError(e, skewCorrected)
+    if (!retried(t)) {
+      return RetryDecision.Stop(StopReason.NotRetryable)
+    }
+    if (this.attempt() >= this.strategy.maxAttempts) {
+      return RetryDecision.Stop(StopReason.AttemptsExhausted)
+    }
+    let cost = retryCost
+    if (t == RetryErrorType.Transient) {
+      cost = transientCost
+    }
+    if (!this.strategy.take(cost)) {
+      return RetryDecision.Stop(StopReason.QuotaExhausted)
+    }
+    let delay = this.delayFor(t == RetryErrorType.Throttling, hint)
+    this.retries = this.retries + 1
+    this.cost = cost
+    this.totalDelay = this.totalDelay + delay
+    return RetryDecision.Retry(delay)
+  }
+
+  // The wait before the next retry: a full-jitter draw, lifted by the hint.
+  delayFor(throttling: bool, hint: Option<int>): int {
+    let bound = backoffBound(throttling, this.retries)
+    let drawn = int(retryUnit(this.strategy.random()) * f64(bound))
+    if (drawn > bound) {
+      drawn = bound
+    }
+    return retryWithHint(drawn, hint, this.strategy.clock())
+  }
+
+  // Waits `delay` nanoseconds.
+  export pause(delay: int) {
+    this.strategy.sleeper(delay)
+  }
+
+  // Records that the call succeeded: the quota gets back what the last retry
+  // cost, or one token when no retry was needed.
+  export succeeded() {
+    if (this.cost > 0) {
+      this.strategy.refill(this.cost)
+      return
+    }
+    this.strategy.refill(noRetryRefund)
+  }
+}
+
+// Whether a request with this body can be sent again after a failure.
+// `Text`, `Bytes`, `File` and `Empty` can be read from the start every time; a
+// `Stream` is pulled once and is gone.
+export fn isReplayable(body: Body): bool {
+  return match (body) {
+    Stream(_, _) => false
+    _ => true
+  }
+}

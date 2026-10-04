@@ -197,6 +197,92 @@ with an `<Error>` document, or with nothing, is an error with status 503 and
 `retryable` set, as the AWS SDK treats it. A multipart upload is never reported
 complete on the strength of a `200` alone.
 
+## Retrying a failed call
+
+On the night Inkwell re-uploads ten thousand covers, S3 starts answering
+`SlowDown`. Retrying at once makes it worse, and retrying forever lets one
+slow service hold every worker. `RetryStrategy` is the policy that settles
+both, the one the AWS SDK for JavaScript v3 calls its standard mode: a
+throttling or transient failure is retried after a random wait, and a client
+that has already retried a lot stops retrying.
+
+```bit
+import { Body, Invocation, RetryDecision, RetryErrorType, RetryMode, RetryStrategy, StopReason, classifyError, isReplayable, retryAfterHint } from "s3"
+
+fn nightlyStrategy(): RetryStrategy! {
+  return RetryStrategy(RetryMode.Standard, 5)?
+}
+
+fn uploadCover(strategy: RetryStrategy, body: Body, send: (Invocation) => Option<S3Error>): string {
+  let call = strategy.begin()
+  let outcome = ""
+  while (outcome == "") {
+    match (send(call)) {
+      None => {
+        call.succeeded()
+        outcome = "stored after ${call.attempt()} of ${strategy.maxAttempts} attempts (call ${call.id})"
+      }
+      Some(e) => {
+        match (call.decide(e, isReplayable(body))) {
+          Retry(delay) => call.pause(delay)
+          Stop(why) => outcome = "gave up (${describe(why)}): ${e.message()}"
+        }
+      }
+    }
+  }
+  return outcome
+}
+
+fn describe(why: StopReason): string {
+  return match (why) {
+    NotRetryable => "not a retryable error"
+    NotReplayable => "the body cannot be sent twice"
+    AttemptsExhausted => "out of attempts"
+    QuotaExhausted => "the retry quota is spent"
+  }
+}
+```
+
+`strategy.begin()` starts one call and returns an `Invocation`. Every attempt
+of the call sends `call.headers()`: `amz-sdk-invocation-id`, one UUID for the
+whole call (`call.id`), so S3's logs tie the attempts together, and
+`amz-sdk-request: attempt=2; max=5` (`call.requestValue()`), which says which
+attempt this is. After a failed attempt, `call.decide(e, replayable)` answers
+`Retry(delay)`, with the wait in nanoseconds, or `Stop(why)`. A `Retry` has
+already taken its price from the quota; `call.pause(delay)` waits it, and
+`call.totalDelay` adds up the waits.
+
+The rules `decide` follows:
+
+| Rule | Value |
+| ---- | ----- |
+| attempts | `maxAttempts`, 3 by default, the first included; below 1 is refused when the strategy is built |
+| what is retried | throttling (`SlowDown`, `ThrottlingException`, status 429, ...) and transient (`InternalError`, `RequestTimeout`, 500, 502, 503 and 504, a refused connection or a timeout); not the other 5xx, not a client error, never a cancelled call |
+| the wait | a random time between 0 and `min(20 s, 100 ms * 2^n)` before retry `n`, counted from 0; 500 ms in place of 100 ms after throttling |
+| the server's hint | `retryAfterHint(headers, nowNs)` reads `Retry-After` and `x-amz-retry-after`; the wait is raised to the hint, but never more than 5 s above the random draw |
+| the quota | 500 tokens per strategy, shared by every call that uses it; a retry costs 5, 10 after a transient failure; a success gives back the cost of its last retry, or 1 if it needed none; at zero, errors are returned |
+| a body read once | `isReplayable(body)` is false for a `Stream`, and `decide` then never retries |
+
+`classifyError(e)` is the verdict for one error, as a `RetryErrorType`:
+
+```bit
+fn worthWaiting(e: S3Error): bool {
+  return match (classifyError(e)) {
+    Throttling => true
+    Transient => true
+    Server => false
+    Client => false
+  }
+}
+```
+
+An error that says the client's clock is wrong (`RequestTimeTooSkewed`) is a
+`Client` error until the client has moved its clock; pass `skewCorrected =
+true` to `classifyError` or `decide` for the response that made it do so, and
+the same error is retried. `strategy.tokens()` reads what is left in the quota;
+a strategy that sits at 0 for long is talking to a service that is down, and
+its callers see the first error at once instead of waiting on retries.
+
 ## Sharp edges
 
 - `put`/`get` hold the whole object in memory and are bounded by `std/http`'s
