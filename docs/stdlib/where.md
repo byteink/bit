@@ -98,10 +98,94 @@ absence. `nil` on any other field is the same E0302. The literal is only a
 condition because a `Where<Article>` is expected where it is written; with
 another expected type it is an ordinary map and `authorId` would be a variable.
 
-The operator forms (`{ age: { gte: 18 } }`), the `and`, `or` and `not` keys and
-`related(...)` values are reported as E0303 until they are supported. A program
-that contains a condition literal type-checks but is not yet built: lowering it
-to the clauses above is the next step.
+## Operators on a field
+
+Equality is the common case; the rest is an object in place of the value. The
+front page of Inkwell shows articles that are published or featured and have at
+least 100 views, and a moderator's page shows one author's popular articles
+below 10000 views:
+
+```bit
+import { Where } from "std/where"
+
+class Article {
+  id: i64,
+  authorId: i64,
+  status: string,
+  views: i64,
+  editor: Option<string>,
+}
+
+fn pages(authorId: i64) {
+  let frontPage: Where<Article> = { status: { in: ["published", "featured"] }, views: { gte: 100 } }
+  let byAuthor: Where<Article> = { authorId: { eq: authorId }, views: { gte: 100, lt: 10000 } }
+}
+```
+
+The operators are `eq`, `ne`, `in`, `lt`, `lte`, `gt` and `gte`, written without
+a `$` because a Bit literal is typed: a key in the literal is a field, a key in a
+field's object is an operator, and the set of operators is closed. Several
+operators on one field are all required (`gte: 100, lt: 10000` is a range). The
+operand has the field's type, an `Option` field also takes its payload type, and
+`in` takes a list of that type; an empty list is allowed and matches nothing.
+
+`lt`, `lte`, `gt` and `gte` need a field that has an order: integers, floats,
+`decimal`, `string` and the `std/time` types (or an `Option` of one). On a
+`bool`, an enum, an `Option<bool>` or a `[]byte` they are E0302, naming the
+operator and the field's type. A name that is not one of the seven is E0301 and
+the message lists them:
+
+```text
+error[E0302]: operator 'gt' needs an ordered field, but field "active" of Article is 'bool'
+error[E0301]: unknown operator "gtee" on field "age" of Article
+              the operators are eq, ne, in, lt, lte, gt, gte
+```
+
+## Combining conditions in a literal
+
+The keys `and`, `or` and `not` combine whole conditions. `and` and `or` take a
+list, `not` takes one, and each is a condition on the same article, so it is
+checked by the same rules and may nest:
+
+```bit
+import { Where } from "std/where"
+
+class Article {
+  id: i64,
+  authorId: i64,
+  status: string,
+}
+
+fn visibleTo(userId: i64) {
+  let visible: Where<Article> = {
+    or: [{ status: "published" }, { authorId: userId }],
+    not: { status: "archived" },
+  }
+}
+```
+
+An article is visible when it is published or yours, and it is not archived. If
+`Article` has a field called `or`, `and` or `not`, that key means the field, and
+the combinator is spelled with the constructors (`Where<Article>(join = Join.Or,
+children = [a, b])`); the error for a list given to such a field says so.
+
+## Testing a relationship
+
+`related("editor")` as a field's value tests a relationship instead of a value:
+the object matches when the field's target is related to the subject as
+`editor`. It comes from `pkg/authz`, which evaluates it, and the checker only
+requires the field to be a relation: a class-typed field, one marked
+`@belongsTo`, `@hasOne`, `@hasMany` or `@manyToMany`, the foreign key a
+`@belongsTo` names, or `id`. On any other field it is E0302, and an argument
+that is not one string literal is E0303.
+
+```text
+{ folder: related("editor") }       folder is a Folder: accepted
+{ title: related("editor") }        E0302: title is 'string', not a relation
+```
+
+A program that contains a condition literal type-checks but is not yet built:
+lowering it to the clauses above is the next step.
 
 ## Or, nested and negated
 
