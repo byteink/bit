@@ -40,6 +40,16 @@ on every privilege change, not only at login, is what the OWASP Session
 Management Cheat Sheet recommends, and every login path in this package
 follows it - there is no path that stores an `Identity` without it.
 
+## Password guessing is throttled, if you ask
+
+`PasswordStrategy` alone does not slow an attacker down. `LoginThrottle` counts
+failures per account and per client address, backs off exponentially, locks an
+account or address that keeps failing, and answers the same way for a real
+account and an invented one, so it cannot be used to find usernames. This is the
+anti-automation control OWASP ASVS asks for and the throttling NIST SP 800-63B
+requires of a password verifier. See [Slow down password
+guessing](brute-force.md).
+
 ## Microsoft Entra ID: single tenant only
 
 `microsoftStrategy` refuses the three multi-tenant aliases Microsoft
