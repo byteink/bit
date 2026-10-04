@@ -311,6 +311,20 @@
 # RETIRED audit, so removing these two at the repin is by hand.
 # Retires at the first repin after 0.36.0.
 #
+# 6558-string-from-byte-range (`ir`, `iropt`). #6558 lowers `string(b[lo:hi])` to
+# ONE `rt_call string_from_byte_range(b, lo, hi) string`; the 0.36.0 oracle emits
+# `rt_call slice_slice(b, lo, hi) []u8` then `rt_call string_from_bytes(s)
+# string`. Files: _tests_/cases/{ir,run}_string_of_byte_reslice*, _tests_/imports/
+# tlsapi/main.bit, stdlib/{fs/secure/secure,net/net,time/extend}.bit. The identity
+# is byteRange (ir-signatures-walk.sh); a file that also carries a #6730 or #6847
+# difference is explained under that name. Retires at the first repin after 0.36.0.
+#
+# 6988-table-class-name-synth-shift (`types`). #6988 adds `__className` to the
+# synthesized @table text, so `cols` and `__row` sit 12 columns later than in the
+# 0.36.0 oracle (13 @table cases under _tests_/cases). The identity is
+# explainTableSynthTypes (ir-signatures-walk.sh). Retires at the first repin
+# after 0.36.0.
+#
 # The input protocol is the text the awk body reads: the oracle's dump, a line
 # `@@@BIT2@@@`, then the tree's dump, with the kind and the corpus file as
 # `-v` variables. A new entry must satisfy the rules in the header: an exact
@@ -329,7 +343,11 @@ explainMismatch() {
     explainDiagsPresyntax "$1" "$2"
     return
   fi
-  awk -v kind="$3" -v file="${4:-}" "${IR_WALK_AWK}"'
+  if [ "$3" = types ]; then
+    explainTableSynthTypes "$1" "$2"
+    return
+  fi
+  LC_ALL=C awk -v kind="$3" -v file="${4:-}" "${IR_WALK_AWK}"'
     # canonT -- rewrite every `$t<N>` of arr[1..n] to `$c<idx>` in first-
     # appearance order, the same canonicalization scripts/selfhost-ir-canon.sh
     # applies, so interning-order numbering never hides an identity.
@@ -590,6 +608,8 @@ explainMismatch() {
     END {
       if (kind != "ir" && kind != "iropt") { exit 1 }
       canonT(linesA, nA); canonT(linesB, nB)
+      ptrsLit("%", "#"); nbr = byteRange(); ptrsLit("#", "%")
+      if (nbr > 0 && nA == nB && sameText()) { print "6558-string-from-byte-range"; exit 0 }
       if (enumWords()) {
         print "6730-fallible-enum-words"; exit 0
       }
@@ -768,11 +788,12 @@ explainTestFunctions() {
 declaredSignatureNames() {
   local kind=${1:-}
   case "$kind" in
-    ast|fmt|tokens|types) return ;;
+    ast|fmt|tokens) return ;;
+    types) printf '%s\n' "6988-table-class-name-synth-shift"; return ;;
     diags) printf '%s\n' "6990-interface-field-presyntax" "6997-where-in-key-presyntax"; return ;;
-    ir) printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6982-error-path-nil" "7058-switch-case-range"; return ;;
-    iropt) printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6982-error-path-nil" "7058-switch-case-range-opt"; return ;;
+    ir) printf '%s\n' "6558-string-from-byte-range" "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6982-error-path-nil" "7058-switch-case-range"; return ;;
+    iropt) printf '%s\n' "6558-string-from-byte-range" "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6982-error-path-nil" "7058-switch-case-range-opt"; return ;;
     safepoints) printf '%s\n' "6847-test-module-functions"; return ;;
   esac
-  printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6847-test-module-functions" "6982-error-path-nil" "7058-switch-case-range" "7058-switch-case-range-opt" "6990-interface-field-presyntax" "6997-where-in-key-presyntax"
+  printf '%s\n' "6558-string-from-byte-range" "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6847-test-module-functions" "6982-error-path-nil" "7058-switch-case-range" "7058-switch-case-range-opt" "6990-interface-field-presyntax" "6997-where-in-key-presyntax" "6988-table-class-name-synth-shift"
 }
