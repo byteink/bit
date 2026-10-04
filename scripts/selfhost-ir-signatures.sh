@@ -307,6 +307,7 @@
 #
 # shellcheck source=scripts/ir-signatures-walk.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-walk.sh"
+irWalkAwk
 
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
