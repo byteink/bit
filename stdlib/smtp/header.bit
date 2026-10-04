@@ -233,3 +233,194 @@ fn checkAddress(kind: string, email: string): ()! {
   }
   checkDomain(email[at + 1:])?
 }
+
+// Parameters on a MIME header (`Content-Disposition: attachment; filename=...`,
+// `Content-Type: ...; name=...`). A parameter value is a quoted-string or an
+// RFC 2231 extended value, never an RFC 2047 word (RFC 2047 §5): `renderHeader`
+// would turn a non-ASCII value into encoded words and take the whole header
+// down with it, and an unescaped `"` in a quoted-string closes it and lets the
+// rest of the caller's filename set parameters of its own. `encodeParam` is the
+// one place a parameter value becomes bytes.
+
+// The longest `name="value"` that stays a plain quoted-string. Longer, or not
+// plain printable ASCII, and the value goes out as an RFC 2231 extended value.
+const paramPlainMax: int = 70
+
+// The longest line of a folded parameter, leading space and trailing `;`
+// included: one under `foldTarget`.
+const paramLineMax: int = 77
+
+const hexDigits: string = "0123456789ABCDEF"
+
+// Whether every byte of `v` is printable US-ASCII (32..126), the only bytes a
+// quoted-string carries. Narrower than `isPrintableAscii`: a tab is legal in a
+// header value but not worth keeping in a file name.
+fn isQuotable(v: string): bool {
+  let i = 0
+  while (i < len(v)) {
+    if (v[i] < u8(32) || v[i] > u8(126)) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `v` with a backslash in front of every `"` and `\` (RFC 5322 quoted-pair).
+// `v` must be `isQuotable`.
+fn quoteEscape(v: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(v)) {
+    if (v[i] == u8(34) || v[i] == u8(92)) {
+      out = out + "\\"
+    }
+    out = out + v[i:i + 1]
+    i = i + 1
+  }
+  return out
+}
+
+// The end of the UTF-8 sequence that starts at `at`: always past `at`, so a
+// loop over it terminates.
+fn runeEnd(v: string, at: int): int {
+  let end = at + 1
+  while (end < len(v) && v[end] >= u8(128) && v[end] < u8(192)) {
+    end = end + 1
+  }
+  return end
+}
+
+// Whether `c` is an RFC 2231 attribute-char: it may stand in an extended value
+// without a percent escape.
+fn isAttrChar(c: u8): bool {
+  let alnum = (c >= u8(48) && c <= u8(57)) ||
+    (c >= u8(65) && c <= u8(90)) ||
+    (c >= u8(97) && c <= u8(122))
+  if (alnum) {
+    return true
+  }
+  let marks = "!#$&+-.^_`|~"
+  let i = 0
+  while (i < len(marks)) {
+    if (marks[i] == c) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// `v` percent-encoded byte by byte, every byte that is not an attribute-char
+// as `%XX` in upper case.
+fn percentEncode(v: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(v)) {
+    if (isAttrChar(v[i])) {
+      out = out + v[i:i + 1]
+    } else {
+      let n = int(v[i])
+      out = out + "%" + hexDigits[n / 16:n / 16 + 1] + hexDigits[n % 16:n % 16 + 1]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The fallback a client without RFC 2231 reads: printable ASCII kept, every
+// other rune one `?`, cut to `max` bytes. A cut keeps a short extension, which
+// is the part a mail client picks an icon and a handler from.
+fn asciiFallback(v: string, max: int): string {
+  let out = ""
+  let i = 0
+  while (i < len(v)) {
+    let end = runeEnd(v, i)
+    if (end == i + 1 && v[i] >= u8(32) && v[i] <= u8(126)) {
+      out = out + v[i:end]
+    } else {
+      out = out + "?"
+    }
+    i = end
+  }
+  if (len(out) <= max) {
+    return out
+  }
+  let dot = lastIndexOf(out, ".")
+  let ext = ""
+  if (dot > 0 && len(out) - dot <= 8) {
+    ext = out[dot:]
+  }
+  return out[0:max - len(ext)] + ext
+}
+
+// The label of continuation `n` of parameter `name`: the first one names the
+// charset (RFC 2231 §4.1), the rest only the index.
+fn segmentLabel(name: string, n: int): string {
+  if (n == 0) {
+    return "${name}*0*=utf-8''"
+  }
+  return "${name}*${n}*="
+}
+
+// `name` as an RFC 2231 extended value of `value`: `name*=utf-8''<encoded>`
+// when that fits one line, else `name*0*=`, `name*1*=`, ... one per line with
+// no line over `paramLineMax`. A segment is cut between runes, never inside one.
+fn extendedParam(name: string, value: string): string {
+  let whole = percentEncode(value)
+  let single = "${name}*=utf-8''"
+  if (len(single) + len(whole) <= paramLineMax - 1) {
+    return single + whole
+  }
+  let out = ""
+  let cur = ""
+  let n = 0
+  let i = 0
+  while (i < len(value)) {
+    let end = runeEnd(value, i)
+    let tok = percentEncode(value[i:end])
+    let label = segmentLabel(name, n)
+    if (len(label) + len(cur) + len(tok) > paramLineMax - 2) {
+      out = out + label + cur + ";\r\n "
+      n = n + 1
+      cur = ""
+    }
+    cur = cur + tok
+    i = end
+  }
+  return out + segmentLabel(name, n) + cur
+}
+
+// One header parameter: `name="value"` when `value` is plain printable ASCII
+// and short, with `"` and `\` escaped; otherwise a quoted ASCII fallback
+// followed by the RFC 2231 extended form, the two joined by `;` and a fold so
+// every line is short. The text carries its own folds, so it is not a header
+// value to hand `renderHeader`: place it with `renderParamHeader`. A CR, LF or
+// NUL in `value` is the caller's to reject first (`checkHeaderValue`); here it
+// would only be percent-encoded.
+fn encodeParam(name: string, value: string): string {
+  if (isQuotable(value)) {
+    let plain = "${name}=\"${quoteEscape(value)}\""
+    if (len(plain) <= paramPlainMax) {
+      return plain
+    }
+  }
+  let fallback = quoteEscape(asciiFallback(value, (foldTarget - len(name) - 6) / 2))
+  return "${name}=\"${fallback}\";\r\n ${extendedParam(name, value)}"
+}
+
+// The header `name: lead; <params>` where `params` is `encodeParam` output
+// (`lead` being `attachment`, or a media type). The parameters stay on the
+// opening line when its first line fits, else start on a folded line of their
+// own. CRLF-terminated.
+fn renderParamHeader(name: string, lead: string, params: string): string {
+  let first = len(params)
+  let nl = indexOf(params, "\r\n")
+  if (nl >= 0) {
+    first = nl
+  }
+  if (len(name) + 2 + len(lead) + 2 + first < foldTarget) {
+    return "${name}: ${lead}; ${params}\r\n"
+  }
+  return "${name}: ${lead};\r\n ${params}\r\n"
+}

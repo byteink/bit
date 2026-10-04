@@ -111,6 +111,25 @@ A file to attach: `filename`, `contentType` (empty means
 base64 - an attachment is opaque bytes, and choosing an encoding from a sample
 of them is how a binary file arrives corrupted.
 
+The file name reaches the receiver in the `filename` parameter of
+`Content-Disposition` and the `name` parameter of the part's `Content-Type`
+(Outlook reads that one), and it is written so that it can only ever be a file
+name:
+
+- A plain printable ASCII name is a quoted string, with `"` and `\` escaped
+  by a backslash. `a"; x="y.pdf` arrives as one parameter, not as the
+  parameter `x`.
+- Anything else - a non-ASCII name, or one too long for a line - is an
+  RFC 2231 extended value, `filename*=utf-8''r%C3%A9sum%C3%A9.pdf`, split into
+  `filename*0*=`, `filename*1*=` continuations so no line passes 77 octets.
+  Mail clients that predate RFC 2231 read the quoted ASCII fallback written
+  just before it (`filename="r?sum?.pdf"`: one `?` per non-ASCII rune, cut
+  short with its extension kept).
+- A name is never an RFC 2047 encoded word: a header parameter may not hold
+  one, and clients show it as garbage.
+- A CR, LF or NUL in the name is still rejected by `Message.render`, never
+  encoded.
+
 ### `Message(sender: Address)`
 
 One outgoing mail, built from its sender with no recipients, subject or body.
