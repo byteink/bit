@@ -344,7 +344,8 @@ An `Element` has the qualified `name` as written (`s3:Key`), its `local` part
 (`Key`), the namespace URI `space` the name resolves to (`""` for none), its
 `attrs` as written, and its `nodes`: the content in document order, each a
 `Node` that is either `Node.Elem(Element)` or `Node.Text(string)`. Comments
-and processing instructions are not in the tree, and a CDATA section is text.
+and processing instructions are not in `nodes` (an element keeps them on the
+side, for `canonicalizeExclusive` below), and a CDATA section is text.
 Adjacent text and CDATA are one `Node.Text`. White space between elements is
 kept, because only you know whether it matters; `child` and `children` skip
 it, and `text()` is the join of an element's own text nodes, so for
@@ -425,6 +426,100 @@ the same namespace and local name fail with `DuplicateAttribute` even under
 different prefixes. `xmlns` is never bound, `xml` only to its own namespace,
 and no prefix to an empty one; those fail with `BadAttribute`. The `XmlError`
 offset is the start of the tag that broke the rule.
+
+## Canonicalizing an element for a signature
+
+Inkwell accepts sign-in assertions from an identity provider as SAML: an XML
+document whose `Assertion` element carries an XML signature. The signature is
+not over the bytes you received. The provider's proxy may have re-indented the
+envelope, added a namespace declaration, or turned `<a/>` into `<a></a>`, and
+the signature still has to verify. So both sides first rewrite the signed
+element into one canonical byte string, and sign or check a digest of that.
+The rewrite is Exclusive XML Canonicalization 1.0, and a verifier that differs
+from the signer by one byte rejects a good assertion or, worse, accepts a bad
+one. `canonicalizeExclusive` is that rewrite.
+
+```bit
+import { parse, Element, C14nOptions, canonicalizeExclusive } from "std/xml"
+
+fn signedBytes(doc: []byte): string! {
+  let root = parse(doc)?
+  match (root.child("Assertion")) {
+    Some(a) => return string(canonicalizeExclusive(a, C14nOptions{})?)
+    None => fail newError("no Assertion element")
+  }
+}
+```
+
+For `<Response xmlns:saml="urn:a" xmlns:xs="urn:x"><saml:Assertion ID="_1"
+xmlns:saml="urn:a">  <saml:Subject/></saml:Assertion></Response>`, `signedBytes`
+is `<saml:Assertion xmlns:saml="urn:a" ID="_1">  <saml:Subject></saml:Subject></saml:Assertion>`.
+The element is written standalone, as it would be wherever it sits in its
+document: `xmlns:xs` is not there, because nothing in the assertion uses it.
+Cut out of its envelope and signed alone, the assertion gives the same bytes,
+and that is what "exclusive" buys.
+
+The rules, in the order a verifier trips over them:
+
+- A namespace declaration is written on an element only if that element or one
+  of its attributes uses the prefix (the default namespace counts for an element
+  with no prefix, never for an attribute), and only if the output does not
+  already bind that prefix to that URI. A declaration nothing uses disappears;
+  a prefix redeclared to the same URI further down is not repeated; one
+  redeclared to a different URI is written again, and `xmlns=""` is written
+  where an element in no namespace sits under one in a namespace.
+- Declarations come first, the default one first and the rest by prefix, then
+  the attributes by namespace URI and then local name, an attribute in no
+  namespace first. The order is by bytes, which is code point order, and not by
+  prefix: `b:attr` can come before `a:attr`.
+- Every element is a start tag and an end tag, there is no XML declaration, and
+  white space is never added or removed.
+- Attribute values are written in double quotes with `&amp;` `&lt;` `&quot;`
+  `&#x9;` `&#xA;` `&#xD;` escaped; text has `&amp;` `&lt;` `&gt;` and `&#xD;`.
+  Nothing else is touched. CDATA sections and character references come out as
+  the characters they stand for, and a CR LF in the source is one LF.
+- `xml:lang` and `xml:space` are written where they are and never copied from
+  an ancestor.
+- Processing instructions are kept (`<?pi data?>`). Comments are dropped,
+  unless `withComments` is set.
+
+Two things in a signature profile change the result, and both are options.
+`C14nOptions.withComments` is the `#WithComments` variant of the algorithm.
+`C14nOptions.inclusivePrefixes` is the `PrefixList` of the `InclusiveNamespaces`
+element: namespaces your signature profile wants written whether or not they
+are used, because a value inside the document (a QName in text, an XPath in an
+attribute) depends on them.
+
+```bit
+import { parse, C14nOptions, canonicalizeExclusive } from "std/xml"
+
+fn withPayloadPrefixes(doc: []byte): string! {
+  let root = parse(doc)?
+  let opts = C14nOptions{
+    inclusivePrefixes = ["xs", "#default"],
+    withComments = true,
+  }
+  return string(canonicalizeExclusive(root, opts)?)
+}
+```
+
+`#default` is the default namespace. A prefix that is not in scope on an
+element is skipped there, and a name that cannot be a prefix is an error.
+
+### Sharp edges
+
+- Only the element is written. A comment or processing instruction before or
+  after the root of the document is not inside any element, and `parse` drops
+  it, so a signature profile that covers the whole document (an enveloped
+  signature over `""`) has to be handled with the element in hand.
+- A relative namespace URI (`xmlns:a="../x"`) fails: Canonical XML 1.0 requires
+  an implementation to refuse it, because its meaning would depend on a base
+  URI the canonical form does not carry.
+- `parse` refuses a `DOCTYPE`, so a document that needs a DTD to canonicalize
+  (default attributes, entities, ID-typed attribute normalization) never
+  reaches this function.
+- This is the exclusive algorithm only. Inclusive Canonical XML writes every
+  namespace in scope, and is not offered.
 
 ## Where to go next
 
@@ -545,3 +640,18 @@ out.
 `attr(name: string, space: string = ""): Option<string>` is the value of the
 attribute with local name `name` in namespace `space`; the empty `space` means
 no namespace.
+
+### `canonicalizeExclusive`
+
+`canonicalizeExclusive(root: Element, opts: C14nOptions = C14nOptions{}):
+[]byte!` is `root` and its content in Exclusive XML Canonicalization 1.0 form,
+as UTF-8. Fails for a relative namespace URI in the subtree and for an
+`inclusivePrefixes` entry that is not `#default` or a prefix. Never panics on
+an `Element` that `parse` returned.
+
+### `C14nOptions`
+
+`C14nOptions{ inclusivePrefixes, withComments }`: `inclusivePrefixes` is a
+`[]string` of prefixes (`#default` for the default namespace) whose declarations
+in scope are written on every element; empty by default. `withComments` is a
+`bool`, false by default, that keeps comments.

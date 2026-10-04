@@ -1,0 +1,515 @@
+// Bit standard library — xml module, Exclusive XML Canonicalization 1.0.
+//
+// `canonicalizeExclusive(e)` writes an element and everything under it as the
+// bytes W3C Exclusive XML Canonicalization (https://www.w3.org/TR/xml-exc-c14n/,
+// built on Canonical XML 1.0, https://www.w3.org/TR/xml-c14n/) defines: the
+// form an XML signature is computed over. `e` is the apex of a document subset,
+// so the output is the same wherever `e` sits in its document.
+//
+// The rules, each one a place two implementations can differ by a byte:
+//
+//   - A namespace declaration is written on an element only when the element
+//     or one of its attributes uses the prefix (the default namespace counts
+//     for an element without a prefix, never for an attribute), or the prefix
+//     is in `inclusivePrefixes`, and only when the nearest ancestor written
+//     before it does not already carry the same binding. Declarations an
+//     element carries but does not use are gone.
+//   - Declarations come first, the default one first, then by prefix; then the
+//     attributes by namespace URI and then local name, a name with no
+//     namespace sorting first. Both compare bytes, which is code point order.
+//   - Attribute values are written in double quotes with `&amp;`, `&lt;`,
+//     `&quot;`, `&#x9;`, `&#xA;` and `&#xD;` escaped, text with `&amp;`, `&lt;`,
+//     `&gt;` and `&#xD;`. Nothing else is touched, so `>` in a value, a
+//     non-ASCII character and an apostrophe go through as written. The tree
+//     holds decoded characters, so a character reference and a CDATA section
+//     come out as the character they stand for.
+//   - Every element is a start tag and an end tag, `<a></a>` for `<a/>`; no XML
+//     declaration, no DOCTYPE (the parser refuses one), no white space added.
+//   - Processing instructions are kept. Comments are kept only when
+//     `withComments` is set (the `#WithComments` algorithm).
+//   - `xml:*` attributes are written where they are and never inherited from an
+//     ancestor, and `xml` is never declared; that is what makes the form
+//     exclusive.
+//
+// Only what is inside `e` is written: a comment or processing instruction
+// before or after the root element of the document is not part of any element.
+// The walk uses a stack of its own, not the call stack, and every pass is over
+// an element's nodes and attributes once, so time is linear in the subtree
+// (plus a sort of each element's attributes) and a hostile document can only
+// cost memory proportional to what `parse` already held.
+
+import { sortInPlace } from "std/sort"
+
+// What `canonicalizeExclusive` writes.
+export class C14nOptions {
+  // The InclusiveNamespaces PrefixList: prefixes whose declarations in scope
+  // are written on every element even where nothing uses them, the way
+  // Canonical XML 1.0 writes all of them. `"#default"` is the default
+  // namespace. A prefix that is not in scope on an element is skipped there.
+  export inclusivePrefixes: []string,
+  // Keep comments (`xml-exc-c14n#WithComments`) instead of dropping them.
+  export withComments: bool = false,
+}
+
+// The canonical form of `root` and its content, as UTF-8 bytes. Fails (a
+// message, not an `XmlError`) for an `inclusivePrefixes` entry that is not
+// `#default` or a prefix (empty, with a colon, or `xmlns`), and for a relative
+// namespace URI in the subtree (§2.1 of Canonical XML 1.0 requires a failure).
+export fn canonicalizeExclusive(root: Element, opts: C14nOptions = C14nOptions{}): []byte! {
+  let inc = xmlInclusive(opts.inclusivePrefixes)?
+  let c = xmlC14n{
+    withComments = opts.withComments,
+    inc = inc,
+    out = []byte(0),
+    rendered = xmlNsMap(),
+    scope = xmlNsMap(),
+    els = []Element(0),
+    next = []int(0),
+    miscAt = []int(0),
+    renderedMark = []int(0),
+    scopeMark = []int(0),
+  }
+  c.seed(root)
+  c.enter(root)?
+  c.run()?
+  return c.out
+}
+
+// `prefixes` with `#default` as "" and every entry checked.
+fn xmlInclusive(prefixes: []string): []string! {
+  let out = []string(0)
+  let i = 0
+  while (i < len(prefixes)) {
+    let p = prefixes[i]
+    if (p == "#default") {
+      p = ""
+    } else if (!xmlIsPrefix(p)) {
+      fail newError("xml: '${p}' is not a prefix; write #default for the default namespace")
+    }
+    out = append(out, p)
+    i = i + 1
+  }
+  return out
+}
+
+// Whether `p` can be a namespace prefix: an NCName other than `xmlns`. Bytes of
+// a multi-byte character are 0x80 or more and pass, as in the tokenizer.
+fn xmlIsPrefix(p: string): bool {
+  if (p == "" || p == "xmlns") {
+    return false
+  }
+  let i = 0
+  while (i < len(p)) {
+    let b = p[i]
+    if (b < 0x80 && (b == ':' || !xmlNameChar(b) || (i == 0 && !xmlNameStart(b)))) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// A prefix to URI table that can be rolled back to an earlier state: `set`
+// remembers what it overwrote, `restore(mark)` puts it back. A closed element
+// gives its declarations back in time proportional to what it declared, not to
+// everything in scope.
+class xmlNsMap {
+  m: map<string, string>
+  keys: []string
+  olds: []string
+  had: []bool
+
+  init() {
+    this.m = map<string, string>()
+    this.keys = []string(0)
+    this.olds = []string(0)
+    this.had = []bool(0)
+  }
+
+  mark(): int {
+    return len(this.keys)
+  }
+
+  set(prefix: string, uri: string) {
+    let (old, ok) = this.m[prefix]
+    this.keys = append(this.keys, prefix)
+    this.olds = append(this.olds, old)
+    this.had = append(this.had, ok)
+    this.m[prefix] = uri
+  }
+
+  restore(mark: int) {
+    while (len(this.keys) > mark) {
+      let i = len(this.keys) - 1
+      if (this.had[i]) {
+        this.m[this.keys[i]] = this.olds[i]
+      } else {
+        delete(this.m, this.keys[i])
+      }
+      this.keys = this.keys[0:i]
+      this.olds = this.olds[0:i]
+      this.had = this.had[0:i]
+    }
+  }
+}
+
+// A namespace declaration an element may owe: the prefix ("" for the default)
+// and the URI it resolves to on that element.
+class xmlNsUse {
+  prefix: string,
+  uri: string,
+}
+
+// One attribute to write, ranked by (`space`, `local`); `at` indexes `attrs`.
+class xmlAttrKey {
+  space: string,
+  local: string,
+  at: int,
+}
+
+fn xmlNsUseLess(a: xmlNsUse, b: xmlNsUse): bool {
+  return a.prefix < b.prefix
+}
+
+fn xmlAttrKeyLess(a: xmlAttrKey, b: xmlAttrKey): bool {
+  if (a.space != b.space) {
+    return a.space < b.space
+  }
+  return a.local < b.local
+}
+
+// The state of one canonicalization. `els[k]` is the k-th open element, `next[k]`
+// the index of its next node and `miscAt[k]` of its next comment or PI; the two
+// marks undo the declarations that element wrote (`rendered`, which prefix is
+// bound to what in the output) and the ones it carried (`scope`, kept only
+// when `inc` is not empty, to find what an inclusive prefix is bound to).
+class xmlC14n {
+  withComments: bool
+  inc: []string
+  out: []byte
+  rendered: xmlNsMap
+  scope: xmlNsMap
+  els: []Element
+  next: []int
+  miscAt: []int
+  renderedMark: []int
+  scopeMark: []int
+
+  // Puts the declarations in scope above `root` into `scope`, the nearest one
+  // winning, so an inclusive prefix is found where `root` inherits it.
+  seed(root: Element) {
+    if (len(this.inc) == 0) {
+      return
+    }
+    let up = root.parent
+    while (true) {
+      match (up) {
+        None => return
+        Some(a) => {
+          this.declared(a, false)
+          up = a.parent
+        }
+      }
+    }
+  }
+
+  // Binds the prefixes `e` declares in `scope`; `over` lets them replace what
+  // is there (an inner element), otherwise a prefix already bound stays.
+  declared(e: Element, over: bool) {
+    let i = 0
+    while (i < len(e.attrs)) {
+      if (xmlIsDecl(e.attrs[i].name)) {
+        let p = xmlDeclPrefix(e.attrs[i].name)
+        let (_, ok) = this.scope.m[p]
+        if (over || !ok) {
+          this.scope.set(p, e.attrs[i].value)
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  // Pops `els` until the stack is empty: for each element its nodes in order,
+  // its comments and PIs between them, then its end tag.
+  run(): ()! {
+    while (len(this.els) > 0) {
+      let k = len(this.els) - 1
+      let e = this.els[k]
+      let i = this.next[k]
+      if (i >= len(e.nodes)) {
+        this.leave(e, k)
+        continue
+      }
+      this.next[k] = i + 1
+      match (e.nodes[i]) {
+        Elem(c) => {
+          this.misc(e, k, i)
+          this.enter(c)?
+        }
+        Text(s) => this.text(e, k, i, s)
+      }
+    }
+  }
+
+  // The text node `s` (`e.nodes[i]`), cut at each comment or PI that came
+  // inside it.
+  text(e: Element, k: int, i: int, s: string) {
+    let from = 0
+    while (this.miscAt[k] < len(e.misc) && e.misc[this.miscAt[k]].at == i) {
+      let m = e.misc[this.miscAt[k]]
+      let cut = m.off
+      if (cut > len(s)) {
+        cut = len(s)
+      }
+      if (cut < from) {
+        cut = from
+      }
+      this.out = xmlC14nEscape(this.out, s[from:cut], false)
+      this.write(m)
+      this.miscAt[k] = this.miscAt[k] + 1
+      from = cut
+    }
+    this.out = xmlC14nEscape(this.out, s[from:len(s)], false)
+  }
+
+  // Writes the comments and PIs of `e` that precede node `i`; `len(e.nodes)`
+  // for all that are left.
+  misc(e: Element, k: int, i: int) {
+    while (this.miscAt[k] < len(e.misc) && e.misc[this.miscAt[k]].at <= i) {
+      this.write(e.misc[this.miscAt[k]])
+      this.miscAt[k] = this.miscAt[k] + 1
+    }
+  }
+
+  write(m: xmlMisc) {
+    if (m.pi) {
+      this.out = append(this.out, "<?")
+      this.out = append(this.out, m.target)
+      if (m.text != "") {
+        this.out = append(this.out, " ")
+        this.out = append(this.out, m.text)
+      }
+      this.out = append(this.out, "?>")
+      return
+    }
+    if (this.withComments) {
+      this.out = append(this.out, "<!--")
+      this.out = append(this.out, m.text)
+      this.out = append(this.out, "-->")
+    }
+  }
+
+  leave(e: Element, k: int) {
+    this.misc(e, k, len(e.nodes))
+    this.out = append(this.out, "</")
+    this.out = append(this.out, e.name)
+    this.out = append(this.out, ">")
+    this.rendered.restore(this.renderedMark[k])
+    this.scope.restore(this.scopeMark[k])
+    this.els = this.els[0:k]
+    this.next = this.next[0:k]
+    this.miscAt = this.miscAt[0:k]
+    this.renderedMark = this.renderedMark[0:k]
+    this.scopeMark = this.scopeMark[0:k]
+  }
+
+  // Opens `e`: pushes it and writes its start tag. Fails for a namespace URI in
+  // `e`'s declarations that is relative (Canonical XML 1.0 §2.1).
+  enter(e: Element): ()! {
+    this.absolute(e)?
+    this.els = append(this.els, e)
+    this.next = append(this.next, 0)
+    this.miscAt = append(this.miscAt, 0)
+    this.renderedMark = append(this.renderedMark, this.rendered.mark())
+    this.scopeMark = append(this.scopeMark, this.scope.mark())
+    if (len(this.inc) > 0) {
+      this.declared(e, true)
+    }
+    this.out = append(this.out, "<")
+    this.out = append(this.out, e.name)
+    this.namespaces(e)?
+    this.attributes(e)
+    this.out = append(this.out, ">")
+  }
+
+  // Fails unless every namespace `e` declares is empty (an undeclaration) or an
+  // absolute URI.
+  absolute(e: Element): ()! {
+    let i = 0
+    while (i < len(e.attrs)) {
+      if (xmlIsDecl(e.attrs[i].name) && !xmlAbsolute(e.attrs[i].value)) {
+        fail newError("xml: namespace '${e.attrs[i].value}' is a relative URI, which canonicalization refuses")
+      }
+      i = i + 1
+    }
+  }
+
+  // The declarations `e` owes, sorted by prefix, each unless the output
+  // already binds that prefix to that URI.
+  namespaces(e: Element): ()! {
+    let uses = this.uses(e)
+    sortInPlace(uses, xmlNsUseLess)
+    let i = 0
+    while (i < len(uses)) {
+      if (this.owed(uses[i])) {
+        if (!xmlAbsolute(uses[i].uri)) {
+          fail newError("xml: namespace '${uses[i].uri}' is a relative URI, which canonicalization refuses")
+        }
+        this.rendered.set(uses[i].prefix, uses[i].uri)
+        this.out = append(this.out, " xmlns")
+        if (uses[i].prefix != "") {
+          this.out = append(this.out, ":")
+          this.out = append(this.out, uses[i].prefix)
+        }
+        this.out = append(this.out, "=\"")
+        this.out = xmlC14nEscape(this.out, uses[i].uri, true)
+        this.out = append(this.out, "\"")
+      }
+      i = i + 1
+    }
+  }
+
+  // Not yet bound in the output: a prefix with no binding there is bound to "",
+  // which only the default namespace can be.
+  owed(u: xmlNsUse): bool {
+    let (cur, ok) = this.rendered.m[u.prefix]
+    if (ok) {
+      return cur != u.uri
+    }
+    return u.prefix != "" || u.uri != ""
+  }
+
+  // Every prefix `e` visibly uses or is told to keep, with its URI there.
+  uses(e: Element): []xmlNsUse {
+    let out = []xmlNsUse(0)
+    let (prefix, _, _) = xmlSplitName(e.name)
+    if (prefix != "xml") {
+      out = append(out, xmlNsUse{ prefix = prefix, uri = e.space })
+    }
+    let i = 0
+    while (i < len(e.attrs)) {
+      let (p, _, _) = xmlSplitName(e.attrs[i].name)
+      if (p != "" && p != "xml" && !xmlIsDecl(e.attrs[i].name)) {
+        out = append(out, xmlNsUse{ prefix = p, uri = e.attrSpaces[i] })
+      }
+      i = i + 1
+    }
+    i = 0
+    while (i < len(this.inc)) {
+      let (uri, ok) = this.scope.m[this.inc[i]]
+      if (ok && this.inc[i] != "xml") {
+        out = append(out, xmlNsUse{ prefix = this.inc[i], uri = uri })
+      }
+      i = i + 1
+    }
+    return out
+  }
+
+  // The attributes that are not declarations, by (namespace URI, local name).
+  attributes(e: Element) {
+    let keys = []xmlAttrKey(0)
+    let i = 0
+    while (i < len(e.attrs)) {
+      if (!xmlIsDecl(e.attrs[i].name)) {
+        let (_, local, _) = xmlSplitName(e.attrs[i].name)
+        keys = append(keys, xmlAttrKey{ space = e.attrSpaces[i], local = local, at = i })
+      }
+      i = i + 1
+    }
+    sortInPlace(keys, xmlAttrKeyLess)
+    i = 0
+    while (i < len(keys)) {
+      let a = e.attrs[keys[i].at]
+      this.out = append(this.out, " ")
+      this.out = append(this.out, a.name)
+      this.out = append(this.out, "=\"")
+      this.out = xmlC14nEscape(this.out, a.value, true)
+      this.out = append(this.out, "\"")
+      i = i + 1
+    }
+  }
+}
+
+// Whether `uri` is "" (no namespace) or starts with a scheme: a letter, then
+// letters, digits, `+`, `-` or `.`, then `:` (RFC 3986 §3.1).
+fn xmlAbsolute(uri: string): bool {
+  if (uri == "") {
+    return true
+  }
+  let i = 0
+  while (i < len(uri)) {
+    if (uri[i] == ':') {
+      return i > 0
+    }
+    if (!xmlSchemeByte(uri[i], i == 0)) {
+      return false
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether `b` may be byte `i` of a URI scheme; `first` is `i == 0`.
+fn xmlSchemeByte(b: byte, first: bool): bool {
+  if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')) {
+    return true
+  }
+  return !first && ((b >= '0' && b <= '9') || b == '+' || b == '-' || b == '.')
+}
+
+// The prefix an `xmlns` or `xmlns:p` attribute declares ("" for `xmlns`).
+fn xmlDeclPrefix(name: string): string {
+  if (name == "xmlns") {
+    return ""
+  }
+  return name[6:len(name)]
+}
+
+// The replacement Canonical XML 1.0 §2.3 gives byte `b`, or "" for none: in
+// text `&` `<` `>` and CR, in an attribute value `&` `<` `"`, tab, LF and CR.
+fn xmlC14nEscapeOf(b: byte, attr: bool): string {
+  if (b == '&') {
+    return "&amp;"
+  }
+  if (b == '<') {
+    return "&lt;"
+  }
+  if (b == '\r') {
+    return "&#xD;"
+  }
+  if (!attr) {
+    if (b == '>') {
+      return "&gt;"
+    }
+    return ""
+  }
+  if (b == '"') {
+    return "&quot;"
+  }
+  if (b == '\t') {
+    return "&#x9;"
+  }
+  if (b == '\n') {
+    return "&#xA;"
+  }
+  return ""
+}
+
+// `out` with `s` appended and escaped for text, or for an attribute value when
+// `attr` is set. Every byte of a multi-byte sequence is 0x80 or more, so it is
+// copied through whole.
+fn xmlC14nEscape(out: []byte, s: string, attr: bool): []byte {
+  let from = 0
+  let i = 0
+  while (i < len(s)) {
+    let rep = xmlC14nEscapeOf(s[i], attr)
+    if (rep != "") {
+      out = append(out, s[from:i])
+      out = append(out, rep)
+      from = i + 1
+    }
+    i = i + 1
+  }
+  out = append(out, s[from:len(s)])
+  return out
+}
