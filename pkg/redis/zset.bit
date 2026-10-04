@@ -70,22 +70,15 @@
 // `+inf`/`-inf` explicitly for outgoing command args regardless of
 // protocol, since Redis parses those unconditionally on the way in.
 //
-// BLOCKING COMMANDS NEED A DEADLINE THE SHARED `Runner`/`Cmd<T>` HAS NO
-// HOOK FOR (list ticket #6031's own note, repeated here since it applies
-// identically): `BZPOPMIN`/`BZPOPMAX`/`BZMPOP` must not trip the pooled
-// connection's fixed `commandTimeout` while genuinely waiting up to their
-// OWN `timeout` argument. `Client.withConn<T>` (already exported,
-// `client.bit`) hands a caller the raw leased connection, so the four
-// blocking methods below bypass `this.client.runCmd` and call
-// `writeCommand`/`readOneReply` (`conn.bit`, module-visible, unexported)
-// directly with `timeout + commandTimeout` as the wire deadline — no
-// shared-file edit needed, since the per-call override lives entirely in
-// THIS file. `timeoutNs <= 0` ("block forever") explicitly clears the
-// connection's deadline first (`conn.setDeadline(0)`, `stdlib/net`'s own
-// "the zero value blocks like read, at most one hour" convention) rather
-// than relying on `writeCommand`'s own `timeoutNs > 0` guard, which leaves
-// whatever deadline a PRIOR command set in place instead of clearing it.
-// Queuing a blocking command through `ZsetBatch` still shares one `Cmd<T>`
+// A BLOCKING COMMAND NEVER LEASES A POOL CONNECTION (#7147).
+// `BZPOPMIN`/`BZPOPMAX`/`BZMPOP` must neither trip the pooled connection's
+// fixed `commandTimeout` while waiting up to their OWN `timeout` argument,
+// nor hold a pooled connection for the whole wait (N blocked pops would leave
+// a pool of N nothing for `get`/`set`). The four blocking methods below run
+// on `runBlocking` (`cmd.bit`; `list.bit`'s header has the cost and deadline
+// rules): a connection dialed for the call and closed after it, read deadline
+// `timeout + commandTimeout`, none for `timeoutNs <= 0` ("block forever").
+// Queuing a blocking command through `ZsetBatch` shares one `Cmd<T>`
 // factory with its immediate method (`cmd.bit`'s header, point 2) — queuing
 // does no I/O, so it has no deadline problem of its own — but running that
 // queued command still means `Pipeline.exec()`/`tx.bit`'s per-attempt wire
@@ -270,47 +263,15 @@ fn rankRangeBounds(n: i64): (string, string) {
   return "0", "${n - 1}"
 }
 
-// The wire timeout for a blocking call: `0` ("block forever", this file's
-// header) or `blockTimeoutNs + cmdTimeoutNs` — the block's own budget plus
-// the connection's normal per-command allowance, so the socket-level
-// deadline can never fire before Redis's own `timeout` argument would.
-fn blockWireTimeout(blockTimeoutNs: int, cmdTimeoutNs: int): int {
-  if (blockTimeoutNs <= 0) {
-    return 0
-  }
-  return blockTimeoutNs + cmdTimeoutNs
-}
-
-// The blocking-command timeout argument: Redis wants seconds, fractional
-// when sub-second, `"0"` for "forever" — the exact convention this file's
-// own `timeoutNs <= 0` already follows, so a caller's `0` means the same
-// thing on both sides of the wire.
+// The blocking-command timeout argument: `"0"` for "forever" (`timeoutNs <=
+// 0`, the convention this file's header names), else `cmd.bit`'s
+// `blockSeconds` - whole milliseconds, a positive sub-millisecond timeout
+// sent as 1ms so it is never read as "forever".
 fn blockTimeoutArg(timeoutNs: int): string {
   if (timeoutNs <= 0) {
     return "0"
   }
-  return "${f64(timeoutNs) / f64(Second)}"
-}
-
-// Runs one blocking `Cmd<T>` immediately, over a connection leased just for
-// this call (`Client.withConn`), with the extended deadline this file's
-// header describes — `blockTimeoutNs <= 0` clears any deadline a PRIOR
-// command left on this connection before writing, rather than trusting
-// `writeCommand`'s own `timeoutNs > 0` guard to do it (it does not: it
-// only ever SETS a deadline, never clears a stale one).
-fn runBlockingCmd<T>(
-  conn: redisConn,
-  cmd: Cmd<T>,
-  blockTimeoutNs: int,
-  cmdTimeoutNs: int,
-): T!RedisError {
-  let wireTimeout = blockWireTimeout(blockTimeoutNs, cmdTimeoutNs)
-  if (blockTimeoutNs <= 0) {
-    conn.setDeadline(0)
-  }
-  writeCommand(conn, cmd.args, wireTimeout)?
-  let r = readOneReply(conn, wireTimeout)?
-  return cmd.decode(r)?
+  return blockSeconds(timeoutNs)
 }
 
 // The immediate handle: `r.zset(key)` (pool-backed). This file's header
@@ -432,34 +393,26 @@ export class Zset {
     return this.client.runCmd(popMaxManyCmd(this.key, count))?
   }
 
-  // This file's header: bypasses `runCmd` for the extended per-call
-  // deadline a blocking command needs.
+  // This file's header: runs on a dedicated connection (`runBlocking`,
+  // `cmd.bit`), never a pooled one.
   export blockPopMin(timeoutNs: int): Option<Scored>!RedisError {
     let cmd = blockPopMinCmd(this.key, timeoutNs)
-    return this.client.withConn<Option<Scored>>((conn) => {
-      return runBlockingCmd<Option<Scored>>(conn, cmd, timeoutNs, this.client.opts.commandTimeout)?
-    })?
+    return runBlocking<Option<Scored>>(this.client, cmd, timeoutNs)?
   }
 
   export blockPopMax(timeoutNs: int): Option<Scored>!RedisError {
     let cmd = blockPopMaxCmd(this.key, timeoutNs)
-    return this.client.withConn<Option<Scored>>((conn) => {
-      return runBlockingCmd<Option<Scored>>(conn, cmd, timeoutNs, this.client.opts.commandTimeout)?
-    })?
+    return runBlocking<Option<Scored>>(this.client, cmd, timeoutNs)?
   }
 
   export blockPopMinMany(count: i64, timeoutNs: int): []Scored!RedisError {
     let cmd = blockPopMinManyCmd(this.key, count, timeoutNs)
-    return this.client.withConn<[]Scored>((conn) => {
-      return runBlockingCmd<[]Scored>(conn, cmd, timeoutNs, this.client.opts.commandTimeout)?
-    })?
+    return runBlocking<[]Scored>(this.client, cmd, timeoutNs)?
   }
 
   export blockPopMaxMany(count: i64, timeoutNs: int): []Scored!RedisError {
     let cmd = blockPopMaxManyCmd(this.key, count, timeoutNs)
-    return this.client.withConn<[]Scored>((conn) => {
-      return runBlockingCmd<[]Scored>(conn, cmd, timeoutNs, this.client.opts.commandTimeout)?
-    })?
+    return runBlocking<[]Scored>(this.client, cmd, timeoutNs)?
   }
 
   export union(otherKeys: []string, weights: []f64, aggregate: Aggregate): []Scored!RedisError {
