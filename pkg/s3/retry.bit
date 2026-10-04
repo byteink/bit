@@ -23,6 +23,10 @@
 //   - `amz-sdk-invocation-id` is one UUID per call, the same on every attempt;
 //     `amz-sdk-request: attempt=N; max=M` says which attempt this is.
 //   - A request body that can be read once (a `Stream`) is never retried.
+//   - `RetryMode.Adaptive` adds the client-side rate limiter of adaptive.bit
+//     (#6587): the limiter hears every failed attempt before the decision and
+//     every success; a call waits for a send token when it begins and before
+//     each retry's backoff sleep.
 //
 // The error model is `S3Error` (errors.bit) and its table (`retryClassOf` in
 // gen_errors.bit); the lists below only add the codes a response can carry that
@@ -363,10 +367,14 @@ fn retryWithHint(drawn: int, hint: Option<int>, nowNs: int): int {
 
 // --- the strategy -------------------------------------------------------------------
 
-// How a client retries. `Standard` is the only mode today; the adaptive mode
-// (client-side rate limiting) is another variant of this type (#6587).
+// How a client retries. `Standard` retries as described above. `Adaptive` is
+// `Standard` plus a client-side rate limiter (`RateLimiter`, adaptive.bit,
+// #6587): once the service has answered with a throttling error, every attempt
+// first waits for a send token, and each outcome moves the sending rate, so the
+// client slows down before the service has to tell it again.
 export enum RetryMode {
   Standard,
+  Adaptive,
 }
 
 // Why a call stopped being retried.
@@ -416,6 +424,8 @@ fn retryWallNs(): int {
 //       Stop(_) => fail error
 //     }
 //   }
+//
+// In `Adaptive` mode `begin()` and `pause()` may wait for a send token.
 export class RetryStrategy {
   export mode: RetryMode
   export maxAttempts: int
@@ -429,9 +439,13 @@ export class RetryStrategy {
   newId: () => string
   mu: Mutex
   quota: int
+  // The send-rate limiter; read only in `Adaptive` mode, so `Standard` never
+  // waits for it.
+  export limiter: RateLimiter
 
   // Fails when `maxAttempts` is not at least 1: a count of zero would never
-  // send the request.
+  // send the request. `limiter` starts with the SDK's constants; assign
+  // `RateLimiter(...)` to it before the first call to change them.
   init(mode: RetryMode = RetryMode.Standard, maxAttempts: int = defaultMaxAttempts)! {
     if (maxAttempts < 1) {
       fail newError("s3: retry: maxAttempts must be at least 1, got ${maxAttempts}")
@@ -444,6 +458,12 @@ export class RetryStrategy {
     this.newId = retryInvocationId
     this.mu = Mutex()
     this.quota = quotaCapacity
+    this.limiter = RateLimiter()?
+  }
+
+  // True when attempts are paced by the rate limiter.
+  adaptive(): bool {
+    return this.mode == RetryMode.Adaptive
   }
 
   // Tokens left in the quota.
@@ -454,8 +474,12 @@ export class RetryStrategy {
     return n
   }
 
-  // Starts one call: a fresh invocation id, no retries spent.
+  // Starts one call: a fresh invocation id, no retries spent. In `Adaptive`
+  // mode it first waits for the call's send token.
   export begin(): Invocation {
+    if (this.adaptive()) {
+      this.limiter.getSendToken()
+    }
     return Invocation{
       strategy = this,
       id = this.newId(),
@@ -533,6 +557,9 @@ export class Invocation {
       return RetryDecision.Stop(StopReason.NotReplayable)
     }
     let t = classifyError(e, skewCorrected)
+    if (this.strategy.adaptive()) {
+      this.strategy.limiter.updateClientSendingRate(t == RetryErrorType.Throttling)
+    }
     if (!retried(t)) {
       return RetryDecision.Stop(StopReason.NotRetryable)
     }
@@ -563,14 +590,21 @@ export class Invocation {
     return retryWithHint(drawn, hint, this.strategy.clock())
   }
 
-  // Waits `delay` nanoseconds.
+  // Waits `delay` nanoseconds; in `Adaptive` mode, after the retry's send token.
   export pause(delay: int) {
+    if (this.strategy.adaptive()) {
+      this.strategy.limiter.getSendToken()
+    }
     this.strategy.sleeper(delay)
   }
 
   // Records that the call succeeded: the quota gets back what the last retry
   // cost, or one token when no retry was needed.
+  // In `Adaptive` mode the success also moves the sending rate up the curve.
   export succeeded() {
+    if (this.strategy.adaptive()) {
+      this.strategy.limiter.updateClientSendingRate(false)
+    }
     if (this.cost > 0) {
       this.strategy.refill(this.cost)
       return

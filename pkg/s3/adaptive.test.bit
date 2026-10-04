@@ -1,0 +1,587 @@
+// pkg/s3/adaptive.test.bit — #6587. The adaptive retry mode: the CUBIC rate
+// limiter and its place in `RetryStrategy`.
+//
+// Vectors are the SDK's own, copied from smithy-typescript commit
+// 5d104567b7180c8a4055eb2f04c91854026a01c2, packages/core/src/submodules/retry/
+// util-retry/DefaultRateLimiter.spec.ts: the `getSendToken` delays, the
+// `cubicSuccess` and `cubicThrottle` tables, the 17-row `updateClientSendingRate`
+// sequence and the three "acquireTokenBucket re-checks after sleep" cases. The
+// wiring cases follow AdaptiveRetryStrategy.spec.ts in the same directory (the
+// limiter is told before the retry decision, a send token is taken after it, a
+// success tells the limiter) and middleware-retry/retryMiddleware.ts (a body
+// that cannot be replayed never reaches the strategy). The spec's clock is
+// `Date.now()` in milliseconds; here a fake nanosecond clock reads the same
+// instants. @aws-sdk/client-s3 3.1146.0 is aws-sdk-js-v3 054298b1520f.
+//
+// `precise` is checked against `parseFloat(x.toFixed(8))` run in Node on the
+// values listed in `preciseVectors`.
+
+import { contains } from "std/strings"
+import { Millisecond, Second } from "std/time"
+
+// 1e-9, the tolerance the vectors are held to.
+const adTol: f64 = 0.000000001
+
+// Sleeps in the order they happened.
+class AdLog {
+  items: []string,
+}
+
+// The clock a test moves by hand.
+class AdTick {
+  ns: int,
+}
+
+fn adAt(ms: int): AdTick {
+  return AdTick{ ns = ms * Millisecond }
+}
+
+fn adAbs(x: f64): f64 {
+  if (x < 0.0) {
+    return -x
+  }
+  return x
+}
+
+fn adNear(got: f64, want: f64): bool {
+  return adAbs(got - want) <= adTol
+}
+
+// A limiter built at time 0 on `tick`, as the spec builds one with `Date.now()`
+// mocked to 0.
+fn adLimiter(tick: AdTick): RateLimiter {
+  return RateLimiter(clock = () => tick.ns) catch _ {
+    panic("limiter")
+  }
+}
+
+// `parseFloat(x.toFixed(6))`, for rows the spec states to 6 decimals.
+fn adSix(x: f64): f64 {
+  return f64(int(x * 1000000.0 + 0.5)) / 1000000.0
+}
+
+// ms, expected delay in ms (the number the spec passes to setTimeout).
+const delayVectors: [][]f64 = [
+  [500.0, 892.8571428571428],
+  [1000.0, 1785.7142857142856],
+  [2000.0, 2000.0],
+]
+
+test "getSendToken delays: 3 of 3 as the SDK's setTimeout arguments" {
+  let ok = 0
+  for v of delayVectors {
+    let tick = adAt(0)
+    let lim = adLimiter(tick)
+    tick.ns = int(v[0]) * Millisecond
+    lim.updateClientSendingRate(true)
+    let waitMs = lim.tryTake(1.0)
+    if (adNear(waitMs, v[1])) {
+      ok = ok + 1
+    }
+  }
+  println("getSendToken delays: ${ok} of ${len(delayVectors)}")
+  assert(ok == len(delayVectors), "delays ${ok} of ${len(delayVectors)}")
+}
+
+test "getSendToken sleeps the delay in whole nanoseconds, rounded up" {
+  let tick = adAt(0)
+  let lim = adLimiter(tick)
+  let slept: []int = []
+  lim.sleeper = (ns: int) => {
+    slept = append(slept, ns)
+    tick.ns = tick.ns + ns
+  }
+  tick.ns = 500 * Millisecond
+  lim.updateClientSendingRate(true)
+  lim.getSendToken()
+  assert(len(slept) == 1, "one sleep, got ${len(slept)}")
+  // 892.8571428571428 ms is 892857142.857 ns.
+  assert(slept[0] == 892857143, "slept ${slept[0]} ns")
+}
+
+// timestamp (s), the SDK's calculatedRate.
+const successVectors: [][]f64 = [
+  [5.0, 7.0],
+  [6.0, 9.64893601],
+  [7.0, 10.00003085],
+  [8.0, 10.45328452],
+  [9.0, 13.40869703],
+  [10.0, 21.26626836],
+  [11.0, 36.42599853],
+]
+
+test "cubicSuccess: 7 of 7 as the SDK's table" {
+  let ok = 0
+  for v of successVectors {
+    let tick = adAt(0)
+    let lim = adLimiter(tick)
+    lim.lastMaxRate = 10.0
+    lim.lastThrottleTime = 5.0
+    let got = lim.calculate(v[0], false)
+    if (adNear(got, v[1])) {
+      ok = ok + 1
+    }
+  }
+  println("cubicSuccess: ${ok} of ${len(successVectors)}")
+  assert(ok == len(successVectors), "cubicSuccess ${ok} of ${len(successVectors)}")
+}
+
+const throttleVectors: [][]f64 = [
+  [5.0, 0.112],
+  [6.0, 0.09333333],
+  [7.0, 0.08],
+  [8.0, 0.07],
+  [9.0, 0.06222222],
+]
+
+test "cubicThrottle: 5 of 5 as the SDK's table" {
+  let ok = 0
+  for v of throttleVectors {
+    let tick = adAt(0)
+    let lim = adLimiter(tick)
+    lim.lastMaxRate = 10.0
+    lim.lastThrottleTime = 5.0
+    let got = lim.calculate(v[0], true)
+    if (adNear(got, v[1])) {
+      ok = ok + 1
+    }
+  }
+  println("cubicThrottle: ${ok} of ${len(throttleVectors)}")
+  assert(ok == len(throttleVectors), "cubicThrottle ${ok} of ${len(throttleVectors)}")
+}
+
+// throttled, ms, measuredTxRate, fillRate (to 6 decimals).
+const sequence: [][]f64 = [
+  [0.0, 200.0, 0.0, 0.5],
+  [0.0, 400.0, 0.0, 0.5],
+  [0.0, 600.0, 4.8, 0.5],
+  [0.0, 800.0, 4.8, 0.5],
+  [0.0, 1000.0, 4.16, 0.5],
+  [0.0, 1200.0, 4.16, 0.6912],
+  [0.0, 1400.0, 4.16, 1.0976],
+  [0.0, 1600.0, 5.632, 1.6384],
+  [0.0, 1800.0, 5.632, 2.3328],
+  [1.0, 2000.0, 4.3264, 3.02848],
+  [0.0, 2200.0, 4.3264, 3.486639],
+  [0.0, 2400.0, 4.3264, 3.821874],
+  [0.0, 2600.0, 5.66528, 4.053386],
+  [0.0, 2800.0, 5.66528, 4.200373],
+  [0.0, 3000.0, 4.333056, 4.282037],
+  [1.0, 3200.0, 4.333056, 2.997426],
+  [0.0, 3400.0, 4.333056, 3.452226],
+]
+
+test "updateClientSendingRate: 17 of 17 steps of the SDK's sequence" {
+  let tick = adAt(0)
+  let lim = adLimiter(tick)
+  let ok = 0
+  for row of sequence {
+    tick.ns = int(row[1]) * Millisecond
+    lim.updateClientSendingRate(row[0] == 1.0)
+    if (adNear(lim.measuredTxRate, row[2]) && adNear(adSix(lim.fillRate), row[3])) {
+      ok = ok + 1
+    }
+  }
+  println("updateClientSendingRate: ${ok} of ${len(sequence)}")
+  assert(ok == len(sequence), "sequence ${ok} of ${len(sequence)}")
+}
+
+// x, parseFloat(x.toFixed(8)) from Node: exact binary ties, values whose text
+// ends in 5, a spread of rates, and magnitudes where 1e-8 steps are finer than
+// the doubles themselves.
+const preciseVectors: [][]f64 = [
+  [0.001953125, 0.00195313],
+  [0.005859375, 0.00585938],
+  [0.009765625, 0.00976563],
+  [0.013671875, 0.01367188],
+  [0.017578125, 0.01757813],
+  [0.021484375, 0.02148438],
+  [0.025390625, 0.02539063],
+  [0.248046875, 0.24804688],
+  [0.251953125, 0.25195313],
+  [1.001953125, 1.00195313],
+  [2.001953125, 2.00195313],
+  [1.005, 1.005],
+  [0.123456785, 0.12345678],
+  [1.000000005, 1.0],
+  [0.0000000025, 0.0],
+  [0.000000005, 0.00000001],
+  [0.00000001, 0.00000001],
+  [0.000000015, 0.00000001],
+  [0.5, 0.5],
+  [7.0, 7.0],
+  [10.45328452, 10.45328452],
+  [36.425998525, 36.42599852],
+  [13.103080969303846, 13.10308097],
+  [6.096286773681641, 6.09628677],
+  [12.649669647216797, 12.64966965],
+  [19.917621612548828, 19.91762161],
+  [13.589229583740234, 13.58922958],
+  [13.462467193603516, 13.46246719],
+  [3.453960418701172, 3.45396042],
+  [17.66344130039215, 17.6634413],
+  [14.145476818084717, 14.14547682],
+  [16.5506911277771, 16.55069113],
+  [14.788386821746826, 14.78838682],
+  [6.7548346519470215, 6.75483465],
+  [15.87792158126831, 15.87792158],
+  [3.8442015647888184, 3.84420156],
+  [57987.15651035309, 57987.15651035],
+  [23376.20258331299, 23376.20258331],
+  [20894.840359687805, 20894.84035969],
+  [78757.3516368866, 78757.35163689],
+  [40000000.87130642, 40000000.87130642],
+  [60000000.00000001, 60000000.00000001],
+  [89000000.84398746, 89000000.84398746],
+  [91000000.11133862, 91000000.11133862],
+  [123456789.12345679, 123456789.12345679],
+  [4503599627.370496, 4503599627.370496],
+  [-0.001953125, -0.00195313],
+  [-0.000000015, -0.00000001],
+  [-1.005, -1.005],
+  [-36.425998525, -36.42599852],
+]
+
+test "precise rounds as toFixed(8) does: every vector exact" {
+  let ok = 0
+  for v of preciseVectors {
+    let got = precise(v[0])
+    if (got == v[1]) {
+      ok = ok + 1
+    } else {
+      println("precise(${v[0]}) = ${got}, want ${v[1]}")
+    }
+  }
+  println("precise vectors: ${ok} of ${len(preciseVectors)}")
+  assert(ok == len(preciseVectors), "precise ${ok} of ${len(preciseVectors)}")
+  assert(precise(0.0) == 0.0, "zero")
+  let nan = precise(0.0 / 0.0)
+  assert(nan != nan, "NaN stays NaN")
+}
+
+test "nothing is limited before the first throttling answer" {
+  let tick = adAt(0)
+  let lim = adLimiter(tick)
+  let sleeps = 0
+  lim.sleeper = (ns: int) => {
+    sleeps = sleeps + 1
+    tick.ns = tick.ns + ns
+  }
+  let i = 0
+  while (i < 50) {
+    tick.ns = tick.ns + 20 * Millisecond
+    lim.updateClientSendingRate(false)
+    lim.getSendToken()
+    i = i + 1
+  }
+  assert(!lim.active(), "still off after 50 successes")
+  assert(sleeps == 0, "no waits, got ${sleeps}")
+  tick.ns = tick.ns + 20 * Millisecond
+  lim.updateClientSendingRate(true)
+  assert(lim.active(), "on after a throttling answer")
+}
+
+test "the fill rate never drops below 0.5 and the bucket keeps one token of room" {
+  let tick = adAt(0)
+  let lim = adLimiter(tick)
+  let i = 0
+  let low = 1000.0
+  while (i < 200) {
+    tick.ns = tick.ns + 10 * Millisecond
+    lim.updateClientSendingRate(true)
+    if (lim.fillRate < low) {
+      low = lim.fillRate
+    }
+    assert(lim.maxCapacity >= 1.0, "capacity ${lim.maxCapacity}")
+    assert(lim.availableTokens <= lim.maxCapacity, "tokens above capacity")
+    i = i + 1
+  }
+  assert(low == 0.5, "floor reached and held: ${low}")
+}
+
+test "acquire never leaves a negative balance after a sleep" {
+  let tick = adAt(0)
+  let lim = adLimiter(tick)
+  tick.ns = 1000 * Millisecond
+  lim.updateClientSendingRate(true)
+  lim.availableTokens = 0.1
+  lim.fillRate = 10.0
+  lim.lastTimestamp = 1.0
+  lim.sleeper = (ns: int) => {
+    tick.ns = tick.ns + 200 * Millisecond
+  }
+  lim.getSendToken()
+  assert(lim.availableTokens >= 0.0, "tokens ${lim.availableTokens}")
+}
+
+test "acquire loops when the fill rate falls during the sleep" {
+  let tick = adAt(0)
+  let lim = adLimiter(tick)
+  tick.ns = 1000 * Millisecond
+  lim.updateClientSendingRate(true)
+  lim.availableTokens = 0.0
+  lim.fillRate = 10.0
+  lim.maxCapacity = 10.0
+  lim.lastTimestamp = 1.0
+  let calls = 0
+  lim.sleeper = (ns: int) => {
+    calls = calls + 1
+    tick.ns = tick.ns + 50 * Millisecond
+    if (calls == 1) {
+      lim.fillRate = 0.5
+      lim.maxCapacity = 1.0
+    }
+  }
+  lim.getSendToken()
+  assert(calls > 1, "one sleep was not enough, got ${calls}")
+  assert(lim.availableTokens >= 0.0, "tokens ${lim.availableTokens}")
+}
+
+test "acquire refills once after its sleep and takes the token" {
+  let tick = adAt(0)
+  let lim = adLimiter(tick)
+  tick.ns = 1000 * Millisecond
+  lim.updateClientSendingRate(true)
+  lim.availableTokens = 0.0
+  lim.fillRate = 2.0
+  lim.maxCapacity = 2.0
+  lim.lastTimestamp = 1.0
+  let slept: []int = []
+  lim.sleeper = (ns: int) => {
+    slept = append(slept, ns)
+    tick.ns = tick.ns + 600 * Millisecond
+  }
+  lim.getSendToken()
+  assert(len(slept) == 1, "one sleep, got ${len(slept)}")
+  assert(slept[0] == 500 * Millisecond, "half a second for one token at 2 a second: ${slept[0]}")
+  assert(adNear(lim.availableTokens, 0.2), "1.2 earned, 1 taken: ${lim.availableTokens}")
+}
+
+test "a clock that steps back earns no tokens" {
+  let tick = adAt(0)
+  let lim = adLimiter(tick)
+  tick.ns = 5000 * Millisecond
+  lim.updateClientSendingRate(true)
+  lim.availableTokens = 0.5
+  lim.fillRate = 2.0
+  lim.lastTimestamp = 5.0
+  tick.ns = 4000 * Millisecond
+  lim.refill(4.0)
+  assert(lim.availableTokens == 0.5, "tokens ${lim.availableTokens}")
+}
+
+fn adRefused(
+  beta: f64,
+  minCapacity: f64,
+  minFillRate: f64,
+  scaleConstant: f64,
+  smooth: f64,
+): string {
+  RateLimiter(RateLimiterOptions(beta, minCapacity, minFillRate, scaleConstant, smooth)) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+test "refused options: 9 of 9 name the option, and the defaults are accepted" {
+  let nan = 0.0 / 0.0
+  let cases: []string = [
+    adRefused(0.0, 1.0, 0.5, 0.4, 0.8),
+    adRefused(1.0, 1.0, 0.5, 0.4, 0.8),
+    adRefused(nan, 1.0, 0.5, 0.4, 0.8),
+    adRefused(0.7, 0.5, 0.5, 0.4, 0.8),
+    adRefused(0.7, 1.0, 0.0, 0.4, 0.8),
+    adRefused(0.7, 1.0, 0.5, 0.0, 0.8),
+    adRefused(0.7, 1.0, 0.5, 0.4, 0.0),
+    adRefused(0.7, 1.0, 0.5, 0.4, 1.5),
+    adRefused(0.7, 1.0, -1.0, 0.4, 0.8),
+  ]
+  let names: []string = [
+    "beta",
+    "beta",
+    "beta",
+    "minCapacity",
+    "minFillRate",
+    "scaleConstant",
+    "smooth",
+    "smooth",
+    "minFillRate",
+  ]
+  let ok = 0
+  let i = 0
+  while (i < len(cases)) {
+    if (contains(cases[i], names[i])) {
+      ok = ok + 1
+    }
+    i = i + 1
+  }
+  println("refused options: ${ok} of ${len(cases)}")
+  assert(ok == len(cases), "refused ${ok} of ${len(cases)}")
+  assert(adRefused(0.7, 1.0, 0.5, 0.4, 0.8) == "", "the SDK's defaults")
+  assert(adRefused(0.5, 2.0, 0.25, 0.2, 1.0) == "", "other valid values")
+}
+
+// --- in the strategy ----------------------------------------------------------
+
+// An adaptive strategy whose limiter runs on `tick`, with every sleep logged in
+// `log` ("token" for the limiter's wait, "delay" for the retry's).
+fn adStrategy(tick: AdTick, maxAttempts: int, log: AdLog): RetryStrategy {
+  let lim = adLimiter(tick)
+  let s = RetryStrategy(RetryMode.Adaptive, maxAttempts) catch _ {
+    panic("strategy")
+  }
+  s.limiter = lim
+  s.random = () => 0.0
+  s.clock = () => 1000 * Second
+  s.sleeper = (ns: int) => {
+    log.items = append(log.items, "delay")
+  }
+  lim.sleeper = (ns: int) => {
+    log.items = append(log.items, "token")
+    tick.ns = tick.ns + ns
+  }
+  return s
+}
+
+test "adaptive mode is a RetryMode of the one strategy, standard never touches the limiter" {
+  let tick = adAt(0)
+  let lim = adLimiter(tick)
+  let s = RetryStrategy(RetryMode.Standard, 5) catch _ {
+    panic("strategy")
+  }
+  s.limiter = lim
+  s.sleeper = (ns: int) => {}
+  let call = s.begin()
+  tick.ns = 500 * Millisecond
+  call.decide(errOf("SlowDown", 503))
+  call.pause(1)
+  call.succeeded()
+  assert(!lim.active(), "standard mode left the limiter off")
+  assert(lim.measuredTxRate == 0.0, "and unmeasured")
+  assert(s.mode == RetryMode.Standard, "mode")
+  let a = RetryStrategy(RetryMode.Adaptive) catch _ {
+    panic("strategy")
+  }
+  assert(a.mode == RetryMode.Adaptive, "mode")
+  assert(a.maxAttempts == 3, "default attempts")
+}
+
+test "a throttled failure switches the limiter on before the decision and the retry waits for a token first" {
+  let tick = adAt(0)
+  let log = AdLog{ items = [] }
+  let s = adStrategy(tick, 5, log)
+  let call = s.begin()
+  tick.ns = 500 * Millisecond
+  let step = call.decide(errOf("SlowDown", 503))
+  assert(isRetry(step), "throttling is retried")
+  assert(s.limiter.active(), "limiter on")
+  assert(adNear(s.limiter.rate(), 1.12), "rate ${s.limiter.rate()}")
+  call.pause(delayOf(step))
+  assert(
+    len(log.items) == 2 && log.items[0] == "token" && log.items[1] == "delay",
+    "order of ${len(log.items)} sleeps",
+  )
+}
+
+test "the limiter hears every failed attempt, even the one that ends the call" {
+  let tick = adAt(0)
+  let log = AdLog{ items = [] }
+  let s = adStrategy(tick, 2, log)
+  let call = s.begin()
+  tick.ns = 500 * Millisecond
+  assert(isRetry(call.decide(errOf("SlowDown", 503))), "first retry")
+  tick.ns = 700 * Millisecond
+  let before = s.limiter.requestCount + s.limiter.measuredTxRate
+  assert(
+    stopsWith(call.decide(errOf("SlowDown", 503)), StopReason.AttemptsExhausted),
+    "attempts spent",
+  )
+  assert(
+    s.limiter.requestCount + s.limiter.measuredTxRate != before,
+    "the last failure was counted",
+  )
+  let t2 = adAt(0)
+  let s2 = adStrategy(t2, 5, log)
+  let c2 = s2.begin()
+  t2.ns = 500 * Millisecond
+  c2.decide(errOf("AccessDenied", 403))
+  assert(!s2.limiter.active(), "a client error is not throttling")
+  assert(s2.limiter.requestCount + s2.limiter.measuredTxRate > 0.0, "but it is an attempt")
+}
+
+test "a body that cannot be replayed never reaches the limiter" {
+  let tick = adAt(0)
+  let log = AdLog{ items = [] }
+  let s = adStrategy(tick, 5, log)
+  let call = s.begin()
+  tick.ns = 500 * Millisecond
+  assert(stopsWith(call.decide(errOf("SlowDown", 503), false), StopReason.NotReplayable), "refused")
+  assert(!s.limiter.active(), "limiter untouched")
+  assert(s.limiter.requestCount == 0.0, "no attempt counted")
+}
+
+test "a success moves the rate up the curve and begin takes a token once throttled" {
+  let tick = adAt(0)
+  let log = AdLog{ items = [] }
+  let s = adStrategy(tick, 5, log)
+  let first = s.begin()
+  assert(len(log.items) == 0, "off: begin does not wait")
+  tick.ns = 500 * Millisecond
+  first.decide(errOf("SlowDown", 503))
+  let atThrottle = s.limiter.rate()
+  tick.ns = 4000 * Millisecond
+  first.succeeded()
+  // Measured: 2 requests in the 4 s since the start, smoothed to 0.54857143;
+  // the climb is capped at twice that.
+  assert(adNear(atThrottle, 1.12), "at the throttle ${atThrottle}")
+  assert(adNear(s.limiter.rate(), 1.09714286), "after the success ${s.limiter.rate()}")
+  assert(adNear(s.limiter.lastMaxRate, 1.6), "the throttle's rate is kept")
+  let second = s.begin()
+  assert(second.attempt() == 1, "a fresh call")
+  s.limiter.availableTokens = 0.0
+  s.limiter.lastTimestamp = f64(tick.ns) / f64(Second)
+  let third = s.begin()
+  assert(
+    len(log.items) == 1 && log.items[0] == "token",
+    "begin waited for its token: ${len(log.items)} sleeps",
+  )
+  assert(third.attempt() == 1, "fresh")
+}
+
+// One task: take send tokens.
+fn adHammer(lim: RateLimiter, rounds: int, done: chan<int>) {
+  let i = 0
+  while (i < rounds) {
+    lim.getSendToken()
+    i = i + 1
+  }
+  done <- rounds
+}
+
+test "tasks sharing a starved limiter all get their tokens and never overdraw" {
+  let lim = RateLimiter() catch _ {
+    panic("limiter")
+  }
+  lim.updateClientSendingRate(true)
+  lim.fillRate = 4000.0
+  lim.maxCapacity = 4000.0
+  lim.availableTokens = 0.0
+  let tasks = 8
+  let done = chan<int>(tasks)
+  let i = 0
+  while (i < tasks) {
+    spawn adHammer(lim, 25, done)
+    i = i + 1
+  }
+  let total = 0
+  let j = 0
+  while (j < tasks) {
+    total = total + <- done
+    j = j + 1
+  }
+  assert(total == 200, "tokens taken ${total}")
+  assert(
+    lim.availableTokens >= 0.0 && lim.availableTokens <= lim.maxCapacity,
+    "tokens ${lim.availableTokens}",
+  )
+}
