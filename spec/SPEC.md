@@ -6027,8 +6027,10 @@ except via `return`/`fail`.
   `T`. `?` is only legal inside a fallible function.
 - **Operand must be fallible:** `expr`'s own type must be a fallible `T!E`. `?`
   applied to a non-fallible operand is a compile error naming the operand's
-  type, distinct from the enclosing-function requirement above - one rejects
-  the context `?` appears in, the other rejects what it is applied to.
+  type (**E0116**), distinct from the enclosing-function requirement above - one
+  rejects the context `?` appears in, the other rejects what it is applied to.
+  `catch` has the same rule (**E0188**, both forms below, in every position):
+  its handler could never run, so it is an error to write one.
 - **Handle:** the `catch` expression consumes a fallible value locally:
 
 ```
