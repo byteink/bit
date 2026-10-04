@@ -1,0 +1,355 @@
+// pkg/mail/render.bit — turns a `Message` into what std/smtp sends: the RFC
+// 5322 bytes and the envelope, checked as a whole before any byte leaves.
+//
+// Every refusal is `MailError.Invalid` naming the field (`to[1]`, `from`,
+// `headers["X-Run"]`) and why. Four of them are developer mistakes, not bad
+// user input, and each says so in its own words: no From, no recipient, no
+// body, no subject.
+//
+// Rules this file adds on top of std/smtp's renderer:
+//   * Message-ID is `<id@from-domain>` when `Message.id` is set (RFC 5322
+//     §3.6.4: both sides dot-atom-text), else std/smtp's generated one.
+//   * `In-Reply-To` and `References` carry msg-ids (RFC 5322 §3.6.4), the
+//     references deduplicated with their order kept.
+//   * `Auto-Submitted: auto-generated` (RFC 3834 §5) unless the caller set it.
+//   * Custom headers are written sorted by name, case-insensitively.
+//   * `Bcc` recipients are in the envelope and in no header; `tags` are in
+//     neither.
+
+import { Address as SmtpAddress, Envelope, Message as SmtpMessage } from "std/smtp"
+import { hasPrefix, hasSuffix, indexOf, join, lastIndexOf, toLower, trimSpace } from "std/strings"
+import { keys } from "std/seq"
+import { sorted } from "std/sort"
+
+// The longest header name std/smtp's `setHeader` takes, in octets.
+const maxNameOctets: int = 76
+
+// What the Mailer fills in when a message leaves a field empty.
+class Defaults {
+  from: string,
+  replyTo: []string,
+}
+
+// A message ready to hand to `Raw`: the bytes, the envelope, and the
+// Message-ID as written in the header, angle brackets included.
+class Rendered {
+  envelope: Envelope,
+  data: string,
+  messageId: string,
+}
+
+// One extra header field before it is written.
+class Field {
+  name: string,
+  value: string,
+}
+
+// The `Invalid` for `field` and `why`.
+fn fieldError(field: string, why: string): MailError {
+  return MailError.Invalid("${field}: ${why}")
+}
+
+// `parseAddress` with its refusal prefixed by `field`.
+fn parseField(field: string, s: string): Address!MailError {
+  return parseAddress(s) catch e {
+    match (e) {
+      Invalid(why) => fail fieldError(field, why)
+    }
+  }
+}
+
+// Every element of `list`, parsed, a failure naming `field[index]`.
+fn parseFields(field: string, list: []string): []Address!MailError {
+  let out: []Address = []
+  let i = 0
+  while (i < len(list)) {
+    out = append(out, parseField("${field}[${i}]", list[i])?)
+    i = i + 1
+  }
+  return out
+}
+
+// The four developer mistakes, before anything is parsed.
+fn checkComplete(m: Message, d: Defaults): ()!MailError {
+  if (m.from == "" && d.from == "") {
+    fail MailError.Invalid("Message.from is empty and Options.from is not set")
+  }
+  if (len(m.to) + len(m.cc) + len(m.bcc) == 0) {
+    fail MailError.Invalid("Message has no recipient: set to, cc or bcc")
+  }
+  if (m.text == "" && m.html == "") {
+    fail MailError.Invalid("Message has no body: set text or html")
+  }
+  if (trimSpace(m.subject) == "") {
+    fail MailError.Invalid("Message.subject is empty")
+  }
+}
+
+// Why `s` is not dot-atom-text in printable ASCII, or "". The byte check comes
+// first because `dotAtomFault` quotes the offending byte.
+fn idFault(s: string): string {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] <= space || s[i] >= u8(127)) {
+      return "it must be printable ASCII with no space"
+    }
+    i = i + 1
+  }
+  return dotAtomFault(s)
+}
+
+// `left@right` as a bare msg-id, or the reason it is not one.
+fn msgIdFault(id: string): string {
+  let at = indexOf(id, "@")
+  if (at < 0 || at != lastIndexOf(id, "@")) {
+    return "it must be left@right with exactly one @"
+  }
+  let left = idFault(id[0:at])
+  if (left != "") {
+    return "the part before the @: ${left}"
+  }
+  let right = idFault(id[at + 1:])
+  if (right != "") {
+    return "the part after the @: ${right}"
+  }
+  return ""
+}
+
+// The msg-id of `s` as it is written in a header, `<left@right>`. Angle
+// brackets around it are optional in the input.
+fn msgId(field: string, s: string): string!MailError {
+  let bare = trimSpace(s)
+  if (hasPrefix(bare, "<") && hasSuffix(bare, ">")) {
+    bare = bare[1:len(bare) - 1]
+  }
+  let why = msgIdFault(bare)
+  if (why != "") {
+    fail fieldError(field, "${echoInput(s)} is not a Message-ID: ${why}")
+  }
+  return "<${bare}>"
+}
+
+// `References`: the thread so far, then `replyId` (the checked `In-Reply-To`,
+// "" when there is none), each once, in order.
+fn referenceIds(m: Message, replyId: string): []string!MailError {
+  let out: []string = []
+  let i = 0
+  while (i < len(m.references)) {
+    out = appendNew(out, msgId("references[${i}]", m.references[i])?)
+    i = i + 1
+  }
+  if (replyId != "") {
+    out = appendNew(out, replyId)
+  }
+  return out
+}
+
+// `list` with `s` last, unless it is already there.
+fn appendNew(list: []string, s: string): []string {
+  let out: []string = []
+  for x of list {
+    if (x == s) {
+      return list
+    }
+    out = append(out, x)
+  }
+  return append(out, s)
+}
+
+// The part of `email` after its last `@`.
+fn domainOf(email: string): string {
+  return email[lastIndexOf(email, "@") + 1:]
+}
+
+// Sets the Message-ID `<id@domain>` when `Message.id` is set; otherwise
+// std/smtp makes one.
+fn applyId(sm: SmtpMessage, m: Message, from: Address): ()!MailError {
+  if (m.id == "") {
+    return
+  }
+  let why = idFault(m.id)
+  if (why != "") {
+    fail fieldError("id", "${echoInput(m.id)} is not dot-atom-text: ${why}")
+  }
+  let domain = domainOf(from.email)
+  let dwhy = idFault(domain)
+  if (dwhy != "") {
+    fail fieldError(
+      "id",
+      "the From domain ${echoInput(domain)} cannot be the right side of a Message-ID: ${dwhy}",
+    )
+  }
+  sm.setMessageId("${m.id}@${domain}")
+}
+
+// Why `name` cannot be a header name, or "".
+fn nameFault(name: string): string {
+  if (len(name) == 0 || len(name) > maxNameOctets) {
+    return "a header name is 1 to ${maxNameOctets} octets"
+  }
+  let i = 0
+  while (i < len(name)) {
+    if (name[i] < u8(33) || name[i] > u8(126) || name[i] == u8(58)) {
+      return "a header name is printable ASCII without ':'"
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+// Whether `v` holds a CR, LF or NUL.
+fn hasLineByte(v: string): bool {
+  let i = 0
+  while (i < len(v)) {
+    if (v[i] == u8(13) || v[i] == u8(10) || v[i] == u8(0)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The caller's headers as checked fields.
+fn customFields(m: Message): []Field!MailError {
+  let out: []Field = []
+  for name of keys(m.headers) {
+    let field = "headers[${echoInput(name)}]"
+    let why = nameFault(name)
+    if (why != "") {
+      fail fieldError(field, why)
+    }
+    if (hasLineByte(m.headers[name])) {
+      fail fieldError(field, "the value contains a CR, LF or NUL (header injection)")
+    }
+    out = append(out, Field{ name = name, value = m.headers[name] })
+  }
+  return out
+}
+
+// Every header std/smtp is to write besides its own: the caller's, the
+// threading pair, and the RFC 3834 marker.
+fn extraFields(m: Message): []Field!MailError {
+  let out = customFields(m)?
+  let replyId = ""
+  if (m.inReplyTo != "") {
+    replyId = msgId("inReplyTo", m.inReplyTo)?
+    out = append(out, Field{ name = "In-Reply-To", value = replyId })
+  }
+  let refs = referenceIds(m, replyId)?
+  if (len(refs) > 0) {
+    out = append(out, Field{ name = "References", value = join(refs, " ") })
+  }
+  if (!hasField(out, "auto-submitted")) {
+    out = append(out, Field{ name = "Auto-Submitted", value = "auto-generated" })
+  }
+  return out
+}
+
+// Whether a field named `lower` (already lowercase) is in `fields`.
+fn hasField(fields: []Field, lower: string): bool {
+  for f of fields {
+    if (toLower(f.name) == lower) {
+      return true
+    }
+  }
+  return false
+}
+
+// `fields` sorted by name, case-insensitively, a name set twice refused.
+fn sortFields(fields: []Field): []Field!MailError {
+  let out = sorted(fields, (a, b) => toLower(a.name) < toLower(b.name))
+  let i = 1
+  while (i < len(out)) {
+    if (toLower(out[i].name) == toLower(out[i - 1].name)) {
+      fail fieldError(
+        "headers[${echoInput(out[i].name)}]",
+        "set twice; header names are case-insensitive, and In-Reply-To and References also come from Message.inReplyTo and Message.references",
+      )
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Hands every extra header to `sm` in sorted order.
+fn applyHeaders(sm: SmtpMessage, m: Message): ()!MailError {
+  for f of sortFields(extraFields(m)?)? {
+    sm.setHeader(f.name, f.value)
+  }
+}
+
+// Adds the parsed `to`, `cc`, `bcc` and `replyTo` addresses to `sm`.
+fn applyRecipients(sm: SmtpMessage, m: Message, d: Defaults): ()!MailError {
+  for a of parseFields("to", m.to)? {
+    sm.addTo(SmtpAddress{ name = a.name, email = a.email })
+  }
+  for a of parseFields("cc", m.cc)? {
+    sm.addCc(SmtpAddress{ name = a.name, email = a.email })
+  }
+  for a of parseFields("bcc", m.bcc)? {
+    sm.addBcc(SmtpAddress{ name = a.name, email = a.email })
+  }
+  let reply = m.replyTo
+  if (len(reply) == 0) {
+    reply = d.replyTo
+  }
+  for a of parseFields("replyTo", reply)? {
+    sm.addReplyTo(SmtpAddress{ name = a.name, email = a.email })
+  }
+}
+
+// The envelope recipients of `sm`: To, Cc, Bcc, each address once, compared
+// case-insensitively.
+fn envelopeTo(sm: SmtpMessage): []string {
+  let out: []string = []
+  let seen = map<string, bool>()
+  for a of sm.recipients() {
+    let key = toLower(a.email)
+    if (!seen[key]) {
+      seen[key] = true
+      out = append(out, a.email)
+    }
+  }
+  return out
+}
+
+// The Message-ID header of `data` as written, `<...>`.
+fn messageIdOf(data: string): string {
+  let start = indexOf(data, "\r\nMessage-ID: ")
+  if (start < 0) {
+    return ""
+  }
+  let rest = data[start + 14:]
+  return rest[0:indexOf(rest, "\r\n")]
+}
+
+// The sender: `Message.from`, else the mailer's default.
+fn fromAddress(m: Message, d: Defaults): Address!MailError {
+  if (m.from != "") {
+    return parseField("from", m.from)?
+  }
+  return parseField("Options.from", d.from)?
+}
+
+// Renders `m` for sending. `d` supplies the From and Reply-To `m` leaves
+// empty. Fails with `MailError.Invalid` before anything is built when `m` is
+// incomplete or any value is unacceptable.
+fn renderMessage(m: Message, d: Defaults): Rendered!MailError {
+  checkComplete(m, d)?
+  let from = fromAddress(m, d)?
+  let sm = SmtpMessage(SmtpAddress{ name = from.name, email = from.email })
+  applyRecipients(sm, m, d)?
+  sm.setSubject(m.subject)
+  sm.setText(m.text)
+  sm.setHtml(m.html)
+  applyId(sm, m, from)?
+  applyHeaders(sm, m)?
+  let data = sm.render() catch e {
+    fail MailError.Invalid(e.text)
+  }
+  return Rendered{
+    envelope = Envelope{ from = from.email, to = envelopeTo(sm) },
+    data = data,
+    messageId = messageIdOf(data),
+  }
+}
