@@ -1,0 +1,452 @@
+// pkg/s3/checksum.bit — request checksums (#6619, epic #6565): which checksum a
+// request carries, where it goes, and the hashers that compute it. It is the
+// request half of the AWS SDK for JavaScript v3's flexible-checksums middleware,
+// reimplemented from its behaviour.
+//
+// The decision (`planChecksum`), in the SDK's order:
+//
+//   1. Only an operation with the `httpChecksum` trait and a `ChecksumAlgorithm`
+//      member can carry one (`checksumOperations`, gen_checksum_ops.bit, generated
+//      by tools/gens3 from the model). Any other operation is left alone.
+//   2. A request that already has an `x-amz-checksum-*` header is left alone: the
+//      caller supplied a value and it goes out as is.
+//   3. The algorithm is the caller's `ChecksumAlgorithm` when set. Otherwise it
+//      is CRC32, when the client is `WhenSupported` or the operation requires a
+//      checksum; under `WhenRequired` an optional checksum is not sent.
+//   4. A body the client holds in memory (`Empty`, `Text`, `Bytes`) is hashed
+//      whole and the value goes in a header. A body read from a file or a stream
+//      is hashed as it is sent and the value goes in a trailer of the
+//      aws-chunked encoding (`ChecksumPlacement.Trailer`).
+//
+// The header is `x-amz-checksum-<algorithm>`, MD5 included, as the model and the
+// S3 documentation name it. Alongside it goes `x-amz-sdk-checksum-algorithm`.
+
+import { encodeBase64, Hash, Md5, Sha1, Sha256, Sha512 } from "std/crypto"
+import { crc32cUpdate, crc32Update, crc64nvmeUpdate, Xxh3, Xxh3x128, Xxhash64 } from "std/hash"
+import { hasPrefix, indexOf, split, toLower } from "std/strings"
+
+// The header that names the algorithm of a request checksum.
+const sdkAlgorithmHeader: string = "x-amz-sdk-checksum-algorithm"
+
+// The header that announces a trailer of the aws-chunked encoding.
+const trailerHeader: string = "x-amz-trailer"
+
+// Every request header whose name starts with this carries a checksum value.
+const checksumHeaderPrefix: string = "x-amz-checksum-"
+
+// When the client calculates a request checksum, the SDK's
+// `requestChecksumCalculation`. `WhenSupported` (the default) sends one with
+// every operation that can carry one; `WhenRequired` only with the operations
+// that require one, and with the others when the caller names an algorithm.
+export enum Checksums {
+  WhenSupported,
+  WhenRequired,
+}
+
+// The mode named by `text`, as `AWS_REQUEST_CHECKSUM_CALCULATION` and the
+// `request_checksum_calculation` profile key spell it: `WHEN_SUPPORTED` or
+// `WHEN_REQUIRED`, in any case. Anything else is an `InvalidInput` error, so a
+// typo in the environment fails at startup and does not silently pick a mode.
+export fn parseChecksums(text: string): Checksums!S3Error {
+  let t = toLower(text)
+  if (t == "when_supported") {
+    return Checksums.WhenSupported
+  }
+  if (t == "when_required") {
+    return Checksums.WhenRequired
+  }
+  fail invalidInput("request checksum calculation ${text}: want WHEN_SUPPORTED or WHEN_REQUIRED")
+}
+
+// The algorithms in the order of the model's enum documentation, with the name
+// each has on the wire.
+const checksumIds: []string = [
+  "CRC32",
+  "CRC32C",
+  "CRC64NVME",
+  "SHA1",
+  "SHA256",
+  "SHA512",
+  "MD5",
+  "XXHASH64",
+  "XXHASH3",
+  "XXHASH128",
+]
+
+fn checksumAlgorithms(): []ChecksumAlgorithm {
+  return [
+    ChecksumAlgorithm.Crc32,
+    ChecksumAlgorithm.Crc32c,
+    ChecksumAlgorithm.Crc64nvme,
+    ChecksumAlgorithm.Sha1,
+    ChecksumAlgorithm.Sha256,
+    ChecksumAlgorithm.Sha512,
+    ChecksumAlgorithm.Md5,
+    ChecksumAlgorithm.Xxhash64,
+    ChecksumAlgorithm.Xxhash3,
+    ChecksumAlgorithm.Xxhash128,
+  ]
+}
+
+// The wire name of `alg` (`CRC32`, `XXHASH3`, ...). An `Unknown` algorithm, one
+// the model did not have when this client was generated, is an error: it cannot
+// be calculated.
+fn checksumAlgorithmId(alg: ChecksumAlgorithm): string!S3Error {
+  let all = checksumAlgorithms()
+  let i = 0
+  while (i < len(all)) {
+    if (all[i] == alg) {
+      return checksumIds[i]
+    }
+    i = i + 1
+  }
+  fail invalidInput("checksum algorithm is not supported by this client")
+}
+
+// `value` as `n` big-endian bytes, the byte order of every checksum on the wire.
+fn bigEndian(value: u64, n: int): []byte {
+  let out: []byte = []byte(n)
+  let i = 0
+  while (i < n) {
+    out[i] = byte(value >> u64(8 * (n - 1 - i)))
+    i = i + 1
+  }
+  return out
+}
+
+// CRC-32, CRC-32C and CRC-64/NVME as a streaming `Hash`: the running value, its
+// digest the value in big-endian bytes.
+class CrcHash {
+  alg: ChecksumAlgorithm
+  crc: u64
+
+  init(alg: ChecksumAlgorithm) {
+    this.alg = alg
+    this.crc = 0
+  }
+
+  export write(data: []byte) {
+    match (this.alg) {
+      Crc32 => this.crc = u64(crc32Update(u32(this.crc), data))
+      Crc32c => this.crc = u64(crc32cUpdate(u32(this.crc), data))
+      _ => this.crc = crc64nvmeUpdate(this.crc, data)
+    }
+  }
+
+  export sum(): []byte {
+    return bigEndian(this.crc, this.size())
+  }
+
+  export reset() {
+    this.crc = 0
+  }
+
+  export size(): int {
+    match (this.alg) {
+      Crc64nvme => return 8
+      _ => return 4
+    }
+  }
+
+  export blockSize(): int {
+    return 1
+  }
+}
+
+// XXH64 as a streaming `Hash`; its digest is the canonical big-endian form.
+class Xxh64Hash {
+  h: Xxhash64
+
+  init() {
+    this.h = Xxhash64()
+  }
+
+  export write(data: []byte) {
+    this.h.update(data)
+  }
+
+  export sum(): []byte {
+    return bigEndian(this.h.digest(), 8)
+  }
+
+  export reset() {
+    this.h.reset()
+  }
+
+  export size(): int {
+    return 8
+  }
+
+  export blockSize(): int {
+    return 1
+  }
+}
+
+// XXH3 (64-bit) as a streaming `Hash`; its digest is the canonical big-endian form.
+class Xxh3Hash {
+  h: Xxh3
+
+  init() {
+    this.h = Xxh3()
+  }
+
+  export write(data: []byte) {
+    this.h.update(data)
+  }
+
+  export sum(): []byte {
+    return bigEndian(this.h.digest(), 8)
+  }
+
+  export reset() {
+    this.h.reset()
+  }
+
+  export size(): int {
+    return 8
+  }
+
+  export blockSize(): int {
+    return 1
+  }
+}
+
+// XXH3 (128-bit) as a streaming `Hash`; its digest is the 16 canonical bytes.
+class Xxh128Hash {
+  h: Xxh3x128
+
+  init() {
+    this.h = Xxh3x128()
+  }
+
+  export write(data: []byte) {
+    this.h.update(data)
+  }
+
+  export sum(): []byte {
+    return this.h.digest().bytes()
+  }
+
+  export reset() {
+    this.h.reset()
+  }
+
+  export size(): int {
+    return 16
+  }
+
+  export blockSize(): int {
+    return 1
+  }
+}
+
+// The hasher of an algorithm the digest packages provide.
+fn digestHasher(alg: ChecksumAlgorithm): Hash!S3Error {
+  match (alg) {
+    Sha1 => return Sha1()
+    Sha256 => return Sha256()
+    Sha512 => return Sha512()
+    Md5 => return Md5()
+    _ => fail invalidInput("checksum algorithm is not supported by this client")
+  }
+}
+
+// A fresh streaming hasher for `alg`: feed it the bytes of the body in order with
+// `write`, in chunks of any size, and read the checksum with `checksumValue`.
+// This is what the aws-chunked encoder drives while it sends a body, so the
+// checksum is ready for the trailer as the last chunk goes out. An `Unknown`
+// algorithm is an `InvalidInput` error.
+export fn checksumHasher(alg: ChecksumAlgorithm): Hash!S3Error {
+  match (alg) {
+    Crc32 => return CrcHash(alg)
+    Crc32c => return CrcHash(alg)
+    Crc64nvme => return CrcHash(alg)
+    Xxhash64 => return Xxh64Hash()
+    Xxhash3 => return Xxh3Hash()
+    Xxhash128 => return Xxh128Hash()
+    _ => return digestHasher(alg)?
+  }
+}
+
+// The checksum of everything `h` has been fed, as S3 sends it: the digest in
+// base64. It does not reset `h`.
+export fn checksumValue(h: Hash): string {
+  return encodeBase64(h.sum())
+}
+
+// The checksum of `data` under `alg`, as S3 sends it. The one-shot form of
+// `checksumHasher` and `checksumValue`.
+export fn checksumOf(alg: ChecksumAlgorithm, data: []byte): string!S3Error {
+  let h = checksumHasher(alg)?
+  h.write(data)
+  return checksumValue(h)
+}
+
+// What one operation does with a request checksum, from its row of
+// `checksumOperations`: whether it can carry one and whether it must.
+class ChecksumRule {
+  carries: bool,
+  required: bool,
+}
+
+// The rule of operation `op`; an operation with no row carries no checksum.
+fn checksumRule(op: string): ChecksumRule {
+  let prefix = op + "|"
+  for row of checksumOperations {
+    if (hasPrefix(row, prefix)) {
+      let flags = split(row, "|")[1]
+      return ChecksumRule{ carries = indexOf(flags, "A") >= 0, required = indexOf(flags, "R") >= 0 }
+    }
+  }
+  return ChecksumRule{ carries = false, required = false }
+}
+
+// Where the checksum of a request goes.
+//
+//   Skip     no checksum is added to the request.
+//   Header   the checksum of the whole body, calculated before sending, is in a
+//            header (`checksumHeaders`).
+//   Trailer  the body is sent aws-chunked and the checksum, calculated as the body
+//            goes out, follows the last chunk.
+export enum ChecksumPlacement {
+  Skip,
+  Header,
+  Trailer,
+}
+
+// The checksum of one request: `placement` says where it goes, `algorithm` how it
+// is calculated, `header` the name of the header or trailer that carries it
+// (`x-amz-checksum-crc32`) and `algorithmId` the value of
+// `x-amz-sdk-checksum-algorithm` (`CRC32`). For a `Skip` plan `algorithm` is
+// `Crc32` and the two strings are empty: do not read them.
+export class ChecksumPlan {
+  export placement: ChecksumPlacement,
+  export algorithm: ChecksumAlgorithm,
+  export header: string,
+  export algorithmId: string,
+}
+
+fn skipPlan(): ChecksumPlan {
+  return ChecksumPlan{
+    placement = ChecksumPlacement.Skip,
+    algorithm = ChecksumAlgorithm.Crc32,
+    header = "",
+    algorithmId = "",
+  }
+}
+
+// Whether a header already carries a checksum value, in any case.
+fn hasChecksumHeader(headers: []SigHeader): bool {
+  for h of headers {
+    if (hasPrefix(toLower(h.name), checksumHeaderPrefix)) {
+      return true
+    }
+  }
+  return false
+}
+
+// The algorithm to calculate, or None for no checksum: the caller's when set, else
+// CRC32 when the mode asks for every supported checksum or the operation needs one.
+fn chosenAlgorithm(
+  rule: ChecksumRule,
+  mode: Checksums,
+  requested: Option<ChecksumAlgorithm>,
+): Option<ChecksumAlgorithm> {
+  match (requested) {
+    Some(_) => return requested
+    None => {}
+  }
+  if (rule.required || mode == Checksums.WhenSupported) {
+    return Option<ChecksumAlgorithm>.Some(ChecksumAlgorithm.Crc32)
+  }
+  return Option<ChecksumAlgorithm>.None
+}
+
+// Where the checksum of `body` goes. A body of unknown length cannot go out
+// aws-chunked, which S3 refuses without `x-amz-decoded-content-length`, so it is
+// an error here, before anything is sent.
+fn placementFor(body: Body): ChecksumPlacement!S3Error {
+  match (body) {
+    Empty => return ChecksumPlacement.Header
+    Text(_) => return ChecksumPlacement.Header
+    Bytes(_) => return ChecksumPlacement.Header
+    File(_) => return ChecksumPlacement.Trailer
+    Stream(_, length) => return streamPlacement(length)?
+  }
+}
+
+fn streamPlacement(length: Option<int>): ChecksumPlacement!S3Error {
+  match (length) {
+    Some(_) => return ChecksumPlacement.Trailer
+    None => fail invalidInput("a request checksum needs the length of the body: give the stream a length, or set requestChecksumCalculation to WhenRequired")
+  }
+}
+
+// The plan for `alg` over `body`.
+fn planFor(alg: ChecksumAlgorithm, body: Body): ChecksumPlan!S3Error {
+  let id = checksumAlgorithmId(alg)?
+  return ChecksumPlan{
+    placement = placementFor(body)?,
+    algorithm = alg,
+    header = checksumHeaderPrefix + toLower(id),
+    algorithmId = id,
+  }
+}
+
+// The checksum plan of one request of operation `op` (`PutObject`, `DeleteObjects`,
+// ...) under the client's `mode`, the caller's `ChecksumAlgorithm` (`requested`),
+// the headers the request already has and its `body`. The rules are in this
+// file's header. A caller mistake, an algorithm this client cannot calculate or a
+// stream of unknown length that would need a checksum, is an `InvalidInput` error.
+export fn planChecksum(
+  op: string,
+  mode: Checksums,
+  requested: Option<ChecksumAlgorithm>,
+  headers: []SigHeader,
+  body: Body,
+): ChecksumPlan!S3Error {
+  let rule = checksumRule(op)
+  if (!rule.carries || hasChecksumHeader(headers)) {
+    return skipPlan()
+  }
+  match (chosenAlgorithm(rule, mode, requested)) {
+    Some(alg) => return planFor(alg, body)?
+    None => return skipPlan()
+  }
+}
+
+// The bytes of a body the client holds in memory.
+fn heldBytes(body: Body): []byte!S3Error {
+  match (body) {
+    Empty => return []byte(0)
+    Text(s) => return []byte(s)
+    Bytes(b) => return b
+    _ => fail invalidInput("a streamed body is hashed as it is sent, not up front")
+  }
+}
+
+// The request headers `plan` adds to a request with `body`, the same body the plan
+// was made for.
+//
+// A `Header` plan hashes the body now: `x-amz-sdk-checksum-algorithm` and
+// `x-amz-checksum-<algorithm>`. A `Trailer` plan hashes nothing yet: it adds
+// `x-amz-sdk-checksum-algorithm` and `x-amz-trailer` naming the trailer; the
+// aws-chunked encoder owns the rest of that path (the encoding headers, the
+// decoded length, the payload hash marker, the chunks and the trailer line).
+// A `Skip` plan adds nothing.
+export fn checksumHeaders(plan: ChecksumPlan, body: Body): []SigHeader!S3Error {
+  match (plan.placement) {
+    Skip => return []SigHeader(0)
+    Trailer => return [
+      SigHeader{ name = sdkAlgorithmHeader, value = plan.algorithmId },
+      SigHeader{ name = trailerHeader, value = plan.header },
+    ]
+    Header => {
+      let bytes = heldBytes(body)?
+      return [
+        SigHeader{ name = sdkAlgorithmHeader, value = plan.algorithmId },
+        SigHeader{ name = plan.header, value = checksumOf(plan.algorithm, bytes)? },
+      ]
+    }
+  }
+}

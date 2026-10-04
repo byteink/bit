@@ -305,6 +305,91 @@ the same error is retried. `strategy.tokens()` reads what is left in the quota;
 a strategy that sits at 0 for long is talking to a service that is down, and
 its callers see the first error at once instead of waiting on retries.
 
+## Checking a cover arrived intact
+
+A cover that is damaged on the way to the bucket is worse than one that never
+arrived: it is stored, served and noticed by a reader. S3 can catch it when
+the request carries a checksum of the body, because S3 calculates its own and
+refuses the upload when the two differ. The AWS SDK sends one by default, and
+so does this package: CRC32 unless the caller names another algorithm.
+
+`planChecksum` is the decision for one request. It takes the operation, the
+client's mode, the algorithm the caller asked for (if any), the headers the
+request already has and the body, and answers with a `ChecksumPlan`.
+`checksumHeaders` turns a plan into the headers to add.
+
+```bit
+import {
+  Body,
+  ChecksumAlgorithm,
+  ChecksumPlacement,
+  ChecksumPlan,
+  Checksums,
+  SigHeader,
+  checksumHeaders,
+  checksumOf,
+  parseChecksums,
+  planChecksum,
+} from "s3"
+
+fn describePlan(plan: ChecksumPlan): string {
+  return match (plan.placement) {
+    Skip => "no checksum"
+    Header => "${plan.header} before sending"
+    Trailer => "${plan.header} after the last chunk"
+  }
+}
+
+fn checksumReport(): ()! {
+  let mode = parseChecksums("WHEN_SUPPORTED")?
+  let cover = Body.Bytes([]byte("cover bytes"))
+  let none = Option<ChecksumAlgorithm>.None
+  let plan = planChecksum("PutObject", mode, none, []SigHeader(0), cover)?
+  println(describePlan(plan))
+  for h of checksumHeaders(plan, cover)? {
+    println("${h.name}: ${h.value}")
+  }
+  println(checksumOf(ChecksumAlgorithm.Sha256, []byte("cover bytes"))?)
+  return
+}
+```
+
+The rules `planChecksum` follows, which are the AWS SDK's:
+
+| Case | Result |
+| ---- | ------ |
+| the operation has no `ChecksumAlgorithm` member | no checksum |
+| the request already has an `x-amz-checksum-*` header | left alone, the value goes out as given |
+| the caller named an algorithm | that algorithm, in either mode |
+| `Checksums.WhenSupported`, the default | CRC32 for every operation that can carry a checksum |
+| `Checksums.WhenRequired` | CRC32 only for the operations that require one, such as `DeleteObjects` and `PutBucketPolicy` |
+| a body in memory (`Empty`, `Text`, `Bytes`) | `ChecksumPlacement.Header`: `x-amz-checksum-crc32` |
+| a file or a stream with a known length | `ChecksumPlacement.Trailer`: sent aws-chunked, the checksum after the last chunk |
+| a stream of unknown length | an `InvalidInput` error, because S3 needs the decoded length to read aws-chunked |
+
+The mode is `parseChecksums` of `AWS_REQUEST_CHECKSUM_CALCULATION` or the
+`request_checksum_calculation` profile key, `WHEN_SUPPORTED` or
+`WHEN_REQUIRED` in any case; any other text is refused, so a typo fails at
+startup. The ten algorithms are the ones S3 names: `CRC32`, `CRC32C`,
+`CRC64NVME`, `SHA1`, `SHA256`, `SHA512`, `MD5`, `XXHASH64`, `XXHASH3` and
+`XXHASH128`, each sent as `x-amz-checksum-` and its lower-case name.
+
+A body that is sent in pieces is hashed in pieces. `checksumHasher` gives a
+streaming hasher for an algorithm: write the bytes in order, in chunks of any
+size, and `checksumValue` reads the base64 value S3 expects.
+
+```bit
+import { ChecksumAlgorithm, checksumHasher, checksumValue } from "s3"
+
+fn pieceChecksum(pieces: []string): string! {
+  let h = checksumHasher(ChecksumAlgorithm.Crc32c)?
+  for piece of pieces {
+    h.write([]byte(piece))
+  }
+  return checksumValue(h)
+}
+```
+
 ## Sharp edges
 
 - `put`/`get` hold the whole object in memory and are bounded by `std/http`'s
