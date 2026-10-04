@@ -2004,14 +2004,31 @@ symbol together).
 
 Read once at startup by `configFromEnv`. Knobs tune policy, never correctness.
 
-| Variable            | Default | Effect                                             |
-|---------------------|---------|----------------------------------------------------|
-| `BIT_GC`            | on      | `off`/`0` disables collection; `stress` collects at every safepoint |
-| `BIT_GC_MIN_KB`     | 4096    | Min live KiB before the first/next collection      |
-| `BIT_GC_GROWTH_PCT` | 200     | Heap growth percent between collections (>= 100)   |
-| `BIT_GC_MARKSTACK`  | 8192    | Mark worklist capacity in entries (> 0)            |
-| `BIT_GC_STATS`      | off     | `1`/`on` prints one summary line to stderr at exit  |
-| `BIT_GC_ALLOCCACHE` | off     | `1`/`on` arms the per-OS-thread slot cache at boot instead of on first lock contention |
+| Variable            | Default | Valid values                                       | Effect                                             |
+|---------------------|---------|----------------------------------------------------|----------------------------------------------------|
+| `BIT_GC`            | on      | `on`, `1`, `off`, `0`, `stress`                    | `off`/`0` disables collection; `stress` collects at every safepoint |
+| `BIT_GC_MIN_KB`     | 4096    | integer 0 to 1073741824                            | Min live KiB before the first/next collection      |
+| `BIT_GC_GROWTH_PCT` | 200     | integer 101 to 1000000 (`> 100`)                   | Heap growth percent between collections            |
+| `BIT_GC_MARKSTACK`  | 65536   | integer 1 to 16777216                              | Mark worklist capacity in entries                  |
+| `BIT_GC_STATS`      | off     | `1`, `on`, `0`, `off`                              | `1`/`on` prints one summary line to stderr at exit |
+| `BIT_GC_ALLOCCACHE` | off     | `1`, `on`, `0`, `off`                              | `1`/`on` arms the per-OS-thread slot cache at boot instead of on first lock contention |
+| `BIT_WORKERS`       | 1       | integer 1 to 32                                    | Boot worker thread count (§9 step 2)               |
+| `BIT_VDSO`          | on      | `1`, `on`, `0`, `off`                              | `0`/`off` keeps the Linux clock on the raw syscall |
+
+**A set value outside its valid values is fatal, never clamped and never
+ignored** (#6060). At startup, before the first allocation-bearing boot step,
+the runtime writes one line to stderr and exits with status 64 (`EX_USAGE`):
+
+```text
+bit: invalid BIT_GC_GROWTH_PCT="100", valid: an integer from 101 to 1000000
+```
+
+An empty value (`BIT_GC_GROWTH_PCT=`) reads as unset. The growth percent must be
+strictly above 100: at exactly 100 the next collection trigger equals the live
+size, so the heap is never allowed to grow and every allocation would collect
+(a 1.2 MB `pkg/yaml` parse ran 3.3T instructions at `100` against 2.2G at the
+default). Validation lives in `gcEnvCheckAll` (`runtime/root/rootconfig.bit`),
+reached from the first environment read of every platform's `boot`.
 
 `BIT_GC_ALLOCCACHE` is the one row that is NOT `configFromEnv`'s: it names this
 port's own allocator (`runtime/gc/gcheap.bit`), it selects which of two paths a

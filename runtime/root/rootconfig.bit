@@ -17,7 +17,7 @@
 //   BIT_GC=off|0            disable automatic collection  (enabled = false)
 //   BIT_GC=stress           collect at every safepoint    (stress  = true)
 //   BIT_GC_MIN_KB=<n>       min live KiB before collection (min_trigger = n*1024)
-//   BIT_GC_GROWTH_PCT=<n>   heap growth percent, >= 100    (growth_pct)
+//   BIT_GC_GROWTH_PCT=<n>   heap growth percent, > 100     (growth_pct)
 //   BIT_GC_MARKSTACK=<n>    mark worklist entries, > 0     (mark_stack_len)
 //   BIT_GC_STATS=1|on       one line per collection        (verbose = true)
 //
@@ -26,6 +26,13 @@
 //
 //   BIT_GC_ALLOCCACHE=1|on  arm the per-thread slot cache at boot
 //                           (`../gc/gcalloccache.bit`) instead of on first contention
+//
+// A SET VALUE OUTSIDE ITS RANGE IS FATAL (#6060): `gcEnvCheckAll` below runs once
+// at boot, before the first allocation-bearing step, and ends the process with one
+// stderr line naming the variable, the value and the valid range. A knob is never
+// silently clamped, and never silently ignored: `BIT_GC_GROWTH_PCT=100` used to be
+// accepted and made every allocation collect (3.3T instructions on a 1.2 MB yaml
+// parse). An EMPTY value reads as unset, the shell's `VAR= cmd` idiom.
 //
 // EACH PARSE IS OVER A DEFAULT, not over `runtime/gc/`'s `Config{}`: the same
 // layering `configFromEnv` does over `Config{}`. None of the three defaults
@@ -97,6 +104,9 @@ fn gcCstrEq(vp: int, lit: string): bool {
   return loadByte(vp + n) == 0
 }
 
+// Ceiling of `gcCstrUsize`: 2^40, far above every knob's own range below.
+const gcEnvUsizeMax: int = 1099511627776
+
 // Parse the NUL-terminated decimal at `vp` as a non-negative integer, or -1 when
 // it is empty or holds a non-digit — `configFromEnv`'s `std.fmt.parseInt(usize,
 // v, 10) catch null`, whose failure the caller reads as "no override". Only ASCII
@@ -117,6 +127,9 @@ fn gcCstrUsize(vp: int): int {
       return -1
     }
     acc = acc * 10 + (c - 48)
+    if (acc > gcEnvUsizeMax) {
+      return -1
+    }
     i = i + 1
   }
   return -1
@@ -173,16 +186,18 @@ fn gcCstrUsize(vp: int): int {
   return kb * 1024
 }
 
-// `configFromEnv`'s `BIT_GC_GROWTH_PCT`: overrides only when parsed AND >= 100
-// (`if (g >= 100)`), so the heap is always allowed to grow between collections; a
-// smaller value, a parse failure, or unset keeps the default.
+// `configFromEnv`'s `BIT_GC_GROWTH_PCT`: overrides only when parsed AND > 100, so
+// the heap is always allowed to grow between collections. At exactly 100 the next
+// trigger equals the live size, so the collector would run again on the next
+// allocation, forever (#6060). `gcEnvCheckAll` has already refused every other value,
+// so the `<= 100` arm here is defence in depth, not the policy.
 @symbol("bit_rt_port_root_gc_env_growth_pct") fn gcEnvGrowthPct(def: int): int {
   let vp = gcEnvValuePtr("BIT_GC_GROWTH_PCT")
   if (vp < 0) {
     return def
   }
   let g = gcCstrUsize(vp)
-  if (g < 100) {
+  if (g <= 100) {
     return def
   }
   return g
@@ -288,6 +303,137 @@ export @symbol("bit_rt_port_root_env_vdso") fn rootEnvVdso(): bool {
   return !gcCstrEq(vp, "0") && !gcCstrEq(vp, "off")
 }
 
+// ---------------------------------------------------------------------------
+// Validation (#6060): a set value outside its range ends the process
+// ---------------------------------------------------------------------------
+//
+// The line is assembled in module state (`gcEnvErrBuf`) and written in ONE call,
+// allocating nothing, the shape `../<os>/bootstats.bit` documents for the
+// `BIT_GC_STATS` line: this runs before the first allocation-bearing boot step.
+// `bit_rt_os_exit` is declared here as `./backtrace.bit` declares the write door
+// next to it — every platform provider pins both, and only one is ever linked.
+extern fn bit_rt_os_exit(code: int)
+
+// 64 = EX_USAGE, the sysexits.h code for a bad command-line or environment
+// value; 70 (EX_SOFTWARE) stays the heap and scheduler setup failures.
+const gcEnvExitCode: int = 64
+const gcEnvErrCap: int = 320
+// Longest slice of the offending value echoed back, so a 128 KiB value cannot
+// overflow the line buffer.
+const gcEnvValueEcho: int = 64
+let gcEnvErrBuf: [40]i64
+
+// Append the bytes of `s` at `pos`; returns the new position. BOUNDED by `len(s)`
+// and `gcEnvErrCap`.
+fn gcEnvAppend(buf: int, pos: int, s: string): int {
+  let n = len(s)
+  let j = 0
+  while (j < n && pos < gcEnvErrCap) {
+    storeByte(buf + pos, int(s[j]))
+    pos = pos + 1
+    j = j + 1
+  }
+  return pos
+}
+
+// Append the NUL-terminated value at `vp`, at most `gcEnvValueEcho` bytes, a byte
+// outside printable ASCII shown as `?` so the report stays one clean line.
+fn gcEnvAppendCstr(buf: int, pos: int, vp: int): int {
+  let j = 0
+  while (j < gcEnvValueEcho && pos < gcEnvErrCap) {
+    let c = loadByte(vp + j)
+    if (c == 0) {
+      return pos
+    }
+    if (c < 32 || c > 126) {
+      c = 63
+    }
+    storeByte(buf + pos, c)
+    pos = pos + 1
+    j = j + 1
+  }
+  return pos
+}
+
+// Print `bit: invalid NAME="value", valid: <want>` to stderr and exit
+// `gcEnvExitCode`. `want` is the human range, e.g. "an integer from 101 to 1000000".
+fn gcEnvFail(name: string, vp: int, want: string) {
+  let buf = int(ptrOf(gcEnvErrBuf))
+  let pos = gcEnvAppend(buf, 0, "bit: invalid ")
+  pos = gcEnvAppend(buf, pos, name)
+  pos = gcEnvAppend(buf, pos, "=\"")
+  pos = gcEnvAppendCstr(buf, pos, vp)
+  pos = gcEnvAppend(buf, pos, "\", valid: ")
+  pos = gcEnvAppend(buf, pos, want)
+  pos = gcEnvAppend(buf, pos, "\n")
+  bit_rt_port_root_io_write_all(2, buf, pos)
+  bit_rt_os_exit(gcEnvExitCode)
+}
+
+// Pointer to the value of `name` when it is set AND non-empty, else -1: an empty
+// value reads as unset, as every reader above already treats it.
+fn gcEnvSet(name: string): int {
+  let vp = gcEnvValuePtr(name)
+  if (vp < 0 || loadByte(vp) == 0) {
+    return -1
+  }
+  return vp
+}
+
+// A decimal knob: fatal unless `lo <= value <= hi`. A non-digit parses as -1,
+// below every `lo`, so it is refused with the same line.
+fn gcEnvCheckInt(name: string, lo: int, hi: int, want: string) {
+  let vp = gcEnvSet(name)
+  if (vp < 0) {
+    return
+  }
+  let n = gcCstrUsize(vp)
+  if (n < lo || n > hi) {
+    gcEnvFail(name, vp, want)
+  }
+}
+
+// An on/off knob (`BIT_GC_STATS`, `BIT_GC_ALLOCCACHE`, `BIT_VDSO`): `1`, `on`,
+// `0` or `off`; anything else, a typo such as `yes`, is fatal.
+fn gcEnvCheckFlag(name: string) {
+  let vp = gcEnvSet(name)
+  if (vp < 0) {
+    return
+  }
+  if (gcCstrEq(vp, "1") || gcCstrEq(vp, "on") || gcCstrEq(vp, "0") || gcCstrEq(vp, "off")) {
+    return
+  }
+  gcEnvFail(name, vp, "1, on, 0 or off")
+}
+
+// `BIT_GC`: `on`, `1`, `off`, `0` or `stress`.
+fn gcEnvCheckMode() {
+  let vp = gcEnvSet("BIT_GC")
+  if (vp < 0) {
+    return
+  }
+  if (gcCstrEq(vp, "stress") || gcCstrEq(vp, "on") || gcCstrEq(vp, "1")) {
+    return
+  }
+  if (gcCstrEq(vp, "off") || gcCstrEq(vp, "0")) {
+    return
+  }
+  gcEnvFail("BIT_GC", vp, "on, off, 1, 0 or stress")
+}
+
+// Every runtime environment knob, once, at boot. The ranges are ABI.md §7's.
+// Pinned for the reason the readers above are: its caller is spliced into `boot`.
+@symbol("bit_rt_port_root_gc_env_check") fn gcEnvCheckAll() {
+  gcEnvCheckMode()
+  gcEnvCheckInt("BIT_GC_MIN_KB", 0, 1073741824, "an integer from 0 to 1073741824")
+  gcEnvCheckInt("BIT_GC_GROWTH_PCT", 101, 1000000, "an integer from 101 to 1000000")
+  gcEnvCheckInt("BIT_GC_MARKSTACK", 1, 16777216, "an integer from 1 to 16777216")
+  gcEnvCheckInt("BIT_WORKERS", 1, schedMaxWorkers, "an integer from 1 to 32")
+  gcEnvCheckFlag("BIT_GC_STATS")
+  gcEnvCheckFlag("BIT_GC_ALLOCCACHE")
+  gcEnvCheckFlag("BIT_VDSO")
+}
+
 // `Gc.init(&g_heap, configFromEnv(environ))`, the config half: parse the four
 // `rootConfigure` knobs over the defaults `boot` supplies and apply them through
 // the existing `rootConfigure` (which keeps the "values handed in" contract). One
@@ -327,7 +473,13 @@ export @symbol("bit_rt_port_root_env_verbose") fn rootEnvVerbose(def: bool): boo
 // The `BIT_GC_MARKSTACK` half, split out because the mark worklist is sized at
 // `gcInit` (`rootInit`), before `rootConfigure` runs. Pinned port-internal for the
 // same cross-module reason as `rootConfigureFromEnv`.
+//
+// THIS IS ALSO THE ONE VALIDATION POINT (#6060): it is the first environment read
+// of every platform's `boot` (`rootInit(rootEnvMarkStack(...))`, step 2), so
+// `gcEnvCheckAll` refusing a bad knob here precedes every use of every knob, and
+// the three boot files need no new line.
 export @symbol("bit_rt_port_root_env_mark_stack") fn rootEnvMarkStack(def: int): int {
+  gcEnvCheckAll()
   return gcEnvMarkStack(def)
 }
 
