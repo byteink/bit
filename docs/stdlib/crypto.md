@@ -18,6 +18,7 @@ who wrote it, or generating an id nobody can guess.
 | Generate an unguessable id or token | `randomBytes` |
 | Fingerprint content to detect changes | `Sha256` + `digest` |
 | Compare two secrets (a token, a MAC) | `ctEq`, never `==` |
+| Check a passkey's public key and signature | `parseCoseKey` / `coseVerify` (see [Check a passkey signature](#check-a-passkey-signature)) |
 
 ## Hash a password
 
@@ -121,6 +122,77 @@ fn verifyExport(seed: []byte, article: string, sig: []byte): bool {
 Ed25519 is the default: fast, small keys and signatures, and no parameters to
 get wrong. `ecdsaSign`/`ecdsaVerify` (NIST curves) and the RSA-PKCS1v15/PSS
 functions exist for interop with systems that require them.
+
+## Check a passkey signature
+
+When an Inkwell author signs in with a passkey, the browser hands the server
+a public key once, at registration, and a signature on every sign-in after
+it. The public key arrives as a COSE_Key: a CBOR map whose small integer keys
+name the key type, the algorithm and the curve. `parseCoseKey` turns those
+bytes into a `CoseKey` you can store and verify with, and `coseVerify` checks
+one signature.
+
+```bit
+import { CoseKey, coseAlg, coseVerify, parseCoseKey } from "std/crypto"
+
+// At registration: keep only a key this server can verify. ES256 (-7) is
+// what most authenticators make; this server also takes ES384, EdDSA, RS256
+// and PS256, and parseCoseKey has already refused everything else.
+fn registerKey(credentialPublicKey: []byte): CoseKey! {
+  let key = parseCoseKey(credentialPublicKey)?
+  println("registered a key for alg ${coseAlg(key)}")
+  return key
+}
+
+// At sign-in: the signature covers the authenticator data followed by the
+// SHA-256 of the client data. WebAuthn sends ECDSA signatures in DER.
+fn signedIn(key: CoseKey, authData: []byte, clientDataHash: []byte, sig: []byte): bool {
+  let signed = []byte(0)
+  for b of authData {
+    signed = append(signed, b)
+  }
+  for b of clientDataHash {
+    signed = append(signed, b)
+  }
+  return coseVerify(key, coseAlg(key), signed, sig) catch _ {
+    return false
+  }
+}
+```
+
+`parseCoseKey` does all its checking up front, so a key that parses is a key
+that verifies. It accepts these and nothing else:
+
+| Key type | Curve | `alg` |
+| --- | --- | --- |
+| EC2 (`kty` 2) | P-256 (`crv` 1) | -7 ES256 |
+| EC2 (`kty` 2) | P-384 (`crv` 2) | -35 ES384 |
+| OKP (`kty` 1) | Ed25519 (`crv` 6) | -8 EdDSA |
+| RSA (`kty` 3) | modulus 2048 to 8192 bits | -257 RS256 or -37 PS256 |
+
+Anything else fails with an error that names what it found: `cose:
+unsupported kty 4`, `cose: unsupported alg -36`, `cose: alg -35 does not fit
+EC2 crv 1`. So do a coordinate of the wrong length, a point that is not on
+the curve, an Ed25519 key that is not a point, a modulus under 2048 bits, an
+RSA exponent that is even or under 17 bits, a missing `alg` (WebAuthn
+requires it, and an RSA key is ambiguous without it), a label that appears
+twice, and a key whose `key_ops` does not allow verify.
+
+A key that carries a private parameter is refused too. A server that stored
+one would be holding a secret by accident, and a credential public key never
+has one.
+
+`coseVerify` takes the `alg` you expect and refuses one that is not the
+key's, so a signature made for one algorithm cannot be checked under another.
+A signature that does not verify, or is not even well formed, is `false`, not
+an error. ECDSA signatures are DER, as WebAuthn sends them; RFC 9053 puts raw
+`r || s` on the wire in other COSE uses, and that form has to go through
+`EcdsaSignature` and `ecdsaSignatureToDer` first.
+
+The bytes may be in any valid CBOR encoding, not only the canonical one
+authenticators write. They must be exactly one key: an attested credential
+carries extension data after the key, so split it off first with
+`decodePrefix` from [std/cbor](/std/cbor).
 
 ## Generate random tokens
 
@@ -959,6 +1031,31 @@ The DigestInfo prefix PKCS#1 v1.5 signing needs to identify SHA-384 as the hash 
 
 The DigestInfo prefix PKCS#1 v1.5 signing needs to identify SHA-512 as the hash used.
 
+### `CoseKey`
+
+A verify key read from a COSE_Key: `Ec2(EcdsaPublicKey)` for a P-256 or P-384
+key, `Okp([]byte)` for the 32-byte Ed25519 public key, and `Rsa(RsaPublicKey,
+int)` for an RSA key with its alg (-257 or -37).
+
+### `parseCoseKey(data: []byte): CoseKey!`
+
+Decodes one COSE_Key map (RFC 9052 section 7) into a `CoseKey`. Fails on
+CBOR that is truncated, malformed or followed by more bytes, on an unsupported
+`kty`, `alg` or `crv`, an `alg` that does not fit the key type, a missing or
+repeated label, a coordinate of the wrong length, a point off the curve, an
+RSA modulus outside 2048 to 8192 bits, and any private parameter.
+
+### `coseAlg(key: CoseKey): int`
+
+The key's COSE algorithm number (-7, -35, -8, -37 or -257), for matching
+against the algorithms a WebAuthn credential was asked for.
+
+### `coseVerify(key: CoseKey, alg: int, message: []byte, signature: []byte): bool!`
+
+Whether `signature` is valid for `message` under `key`. `alg` must be the
+key's own. Fails on an unsupported `alg` or one the key does not carry; a bad
+signature is `false`. ECDSA signatures are DER.
+
 ### `X25519Keypair`
 
 An X25519 key exchange keypair: its private scalar and public point.
@@ -1532,6 +1629,7 @@ Whether SHA-2 hardware instructions are available on this host.
 ## Specification
 
 RFC 9106 (Argon2), RFC 7914 (scrypt), RFC 8018 (PBKDF2), RFC 5869 (HKDF), RFC
-8439 (ChaCha20-Poly1305), RFC 8032 (Ed25519), RFC 7468 (PEM), RFC 5280
+8439 (ChaCha20-Poly1305), RFC 8032 (Ed25519), RFC 9052 and RFC 9053 (COSE
+keys), RFC 7468 (PEM), RFC 5280
 (X.509), FIPS 203 (ML-KEM), and FIPS 204 (ML-DSA) are the standards this
 module implements.

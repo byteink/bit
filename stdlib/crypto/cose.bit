@@ -1,0 +1,390 @@
+// Bit standard library — crypto module, COSE public keys (RFC 9052 section 7,
+// RFC 9053 section 2 and 7, RFC 8230 for RSA).
+//
+// A WebAuthn credential's public key is a COSE_Key: a CBOR map keyed by small
+// integers. `parseCoseKey` decodes one with `std/cbor` and turns it into a
+// verify key built on this module's own `ecdsa.bit`, `ed25519.bit` and `rsa.bit`,
+// so a key that parses is a key that can verify; `coseVerify` then checks one
+// signature. Every input is hostile, so everything is checked at parse time:
+//
+//   EC2  kty 2, crv 1 P-256, alg -7  ES256
+//        kty 2, crv 2 P-384, alg -35 ES384
+//   OKP  kty 1, crv 6 Ed25519, alg -8 EdDSA
+//   RSA  kty 3, alg -257 RS256 or alg -37 PS256, modulus 2048 to 8192 bits
+//
+// and nothing else. An unknown kty, alg or crv, an alg that does not fit the key
+// type, a coordinate of the wrong length, a point off the curve, an Ed25519 point
+// that does not decode, a modulus under 2048 bits, a missing or repeated label,
+// and any private parameter are errors that name what was found. An alg label is
+// required, because WebAuthn requires it and an RSA key is ambiguous without it.
+// Every private free function here is prefixed `cose`.
+
+import { Cbor, CborEntry, DecodeOptions, decode } from "std/cbor"
+
+// A verify key read from a COSE_Key. `Rsa` carries its alg (-257 or -37): the
+// modulus alone does not say which padding the key is for.
+export enum CoseKey {
+  Ec2(EcdsaPublicKey),
+  Okp([]byte),
+  Rsa(RsaPublicKey, int),
+}
+
+// COSE_Key labels (RFC 9052 table 3, RFC 9053 tables 18 to 20, RFC 8230).
+const coseLabelKty: int = 1
+const coseLabelOps: int = 4
+const coseLabelAlg: int = 3
+const coseLabelCrv: int = -1
+const coseLabelX: int = -2
+const coseLabelY: int = -3
+const coseLabelD: int = -4
+const coseLabelN: int = -1
+const coseLabelE: int = -2
+const coseKeyOpVerify: uint = 2
+
+const coseKtyOkp: int = 1
+const coseKtyEc2: int = 2
+const coseKtyRsa: int = 3
+
+const coseAlgEs256: int = -7
+const coseAlgEs384: int = -35
+const coseAlgEdDsa: int = -8
+const coseAlgPs256: int = -37
+const coseAlgRs256: int = -257
+
+const coseRsaMinBits: int = 2048
+const coseRsaMaxBits: int = 8192
+const coseRsaMaxExpBits: int = 64
+const coseRsaMinExpBits: int = 17
+
+// The integer-labelled entries of one map, in wire order.
+class CoseMap {
+  labels: []int,
+  vals: []Cbor,
+}
+
+// The key's algorithm: -7 ES256, -35 ES384, -8 EdDSA, -37 PS256 or -257 RS256,
+// for matching against a WebAuthn credential's `pubKeyCredParams`.
+export fn coseAlg(key: CoseKey): int {
+  match (key) {
+    Ec2(k) => {
+      if (k.curve.size == 32) {
+        return coseAlgEs256
+      }
+      return coseAlgEs384
+    }
+    Okp(_) => return coseAlgEdDsa
+    Rsa(_, alg) => return alg
+  }
+}
+
+// The key in `data`, which must be exactly one COSE_Key map (a credential public
+// key followed by extension data is split first with `decodePrefix` from
+// `std/cbor`). Any CTAP2 or looser CBOR encoding is accepted; the decode is
+// bounded. Fails with an error naming the offending label, kty, alg or crv.
+export fn parseCoseKey(data: []byte): CoseKey! {
+  let opts = DecodeOptions{ maxDepth = 2, maxItems = 64, maxBytes = 4096 }
+  let v = decode(data, opts)?
+  match (v) {
+    Map(entries) => return coseFromMap(coseCollect(entries)?)?
+    _ => fail newError("cose: key is not a CBOR map")
+  }
+}
+
+// Whether `signature` is a valid signature of `message` under `key`, made with
+// `alg`, which must be the key's own (`coseAlg`). ES256 and ES384 take the DER
+// form WebAuthn uses (RFC 9053 puts the raw `r || s` on the wire; convert it with
+// `ecdsaSignatureToDer`), RSA signs with a SHA-256 salt of 32 bytes for PS256. A
+// signature that does not verify, including a malformed one, is `false`; an `alg`
+// that is unsupported or is not the key's is an error.
+export fn coseVerify(key: CoseKey, alg: int, message: []byte, signature: []byte): bool! {
+  if (!coseKnownAlg(alg)) {
+    fail newError("cose: unsupported alg ${alg}")
+  }
+  if (alg != coseAlg(key)) {
+    fail newError("cose: alg ${alg} does not match the key, which is for alg ${coseAlg(key)}")
+  }
+  match (key) {
+    Ec2(pub) => return coseVerifyEc(pub, message, signature)
+    Okp(x) => return ed25519Verify(x, message, signature)
+    Rsa(pub, a) => return coseVerifyRsa(pub, a, message, signature)
+  }
+}
+
+fn coseVerifyEc(pub: EcdsaPublicKey, message: []byte, signature: []byte): bool {
+  let sig = ecdsaSignatureFromDer(signature) catch _ {
+    return false
+  }
+  let h = HashAlg.Sha256
+  if (pub.curve.size == 48) {
+    h = HashAlg.Sha384
+  }
+  return ecdsaVerify(pub, digest(h.make(), message), sig)
+}
+
+fn coseVerifyRsa(pub: RsaPublicKey, alg: int, message: []byte, signature: []byte): bool {
+  if (alg == coseAlgPs256) {
+    return rsaVerifyPss(pub, HashAlg.Sha256, message, signature, 32)
+  }
+  return rsaVerifyPkcs1v15(pub, HashAlg.Sha256, rsaDigestInfoSha256(), message, signature)
+}
+
+fn coseKnownAlg(alg: int): bool {
+  return alg == coseAlgEs256 ||
+    alg == coseAlgEs384 ||
+    alg == coseAlgEdDsa ||
+    alg == coseAlgPs256 ||
+    alg == coseAlgRs256
+}
+
+// ---------------------------------------------------------------------------
+// The map
+// ---------------------------------------------------------------------------
+
+// The integer label of a map key, if it has one. A text or huge label belongs
+// to some other specification and is ignored, as RFC 9052 section 7.1 allows.
+fn coseLabel(k: Cbor): Option<int> {
+  match (k) {
+    Uint(n) => {
+      if (n < 1000000) {
+        return Option.Some(int(n))
+      }
+      return Option.None
+    }
+    Negative(n) => {
+      if (n < 1000000) {
+        return Option.Some(-1 - int(n))
+      }
+      return Option.None
+    }
+    _ => return Option.None
+  }
+}
+
+fn coseIndex(m: CoseMap, label: int): int {
+  let i = 0
+  while (i < len(m.labels)) {
+    if (m.labels[i] == label) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The integer-labelled entries of `entries`; a label that appears twice is an
+// error, since two decoders could pick different ones.
+fn coseCollect(entries: []CborEntry): CoseMap! {
+  let m = CoseMap{ labels = []int(0), vals = []Cbor(0) }
+  for e of entries {
+    match (coseLabel(e.key)) {
+      Some(label) => {
+        if (coseIndex(m, label) >= 0) {
+          fail newError("cose: label ${label} appears twice")
+        }
+        m.labels = append(m.labels, label)
+        m.vals = append(m.vals, e.value)
+      }
+      None => {}
+    }
+  }
+  return m
+}
+
+fn coseGet(m: CoseMap, label: int, what: string): Cbor! {
+  let i = coseIndex(m, label)
+  if (i < 0) {
+    fail newError("cose: missing label ${label} (${what})")
+  }
+  return m.vals[i]
+}
+
+// A required integer label.
+fn coseInt(m: CoseMap, label: int, what: string): int! {
+  match (coseGet(m, label, what)?) {
+    Uint(n) => {
+      if (n < 1000000) {
+        return int(n)
+      }
+    }
+    Negative(n) => {
+      if (n < 1000000) {
+        return -1 - int(n)
+      }
+    }
+    _ => {}
+  }
+  fail newError("cose: label ${label} (${what}) is not a small integer")
+}
+
+// A required byte string of exactly `want` bytes, or of any non-zero length when
+// `want` is 0.
+fn coseBytes(m: CoseMap, label: int, what: string, want: int): []byte! {
+  match (coseGet(m, label, what)?) {
+    Bytes(b) => {
+      if (want == 0 && len(b) > 0) {
+        return b
+      }
+      if (len(b) == want) {
+        return b
+      }
+      fail newError("cose: ${what} is ${len(b)} bytes, want ${want}")
+    }
+    _ => fail newError("cose: label ${label} (${what}) is not a byte string")
+  }
+}
+
+fn coseOpsAllowVerify(ops: []Cbor): bool {
+  for op of ops {
+    match (op) {
+      Uint(n) => {
+        if (n == coseKeyOpVerify) {
+          return true
+        }
+      }
+      Text(s) => {
+        if (s == "verify") {
+          return true
+        }
+      }
+      _ => {}
+    }
+  }
+  return false
+}
+
+// A key that lists its operations must list verify (2 or "verify").
+fn coseCheckOps(m: CoseMap): ()! {
+  let i = coseIndex(m, coseLabelOps)
+  if (i < 0) {
+    return
+  }
+  match (m.vals[i]) {
+    Array(ops) => {
+      if (coseOpsAllowVerify(ops)) {
+        return
+      }
+    }
+    _ => {}
+  }
+  fail newError("cose: key_ops (label 4) does not allow verify")
+}
+
+// Fails when any of `labels` is present: a private key parameter has no place in
+// a verify key, and a server that stored one would be holding a secret by accident.
+fn coseNoPrivate(m: CoseMap, labels: []int): ()! {
+  for label of labels {
+    if (coseIndex(m, label) >= 0) {
+      fail newError("cose: private key parameter at label ${label} present; public keys only")
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The key types
+// ---------------------------------------------------------------------------
+
+fn coseFromMap(m: CoseMap): CoseKey! {
+  let kty = coseInt(m, coseLabelKty, "kty")?
+  if (kty != coseKtyEc2 && kty != coseKtyOkp && kty != coseKtyRsa) {
+    fail newError("cose: unsupported kty ${kty}")
+  }
+  let alg = coseInt(m, coseLabelAlg, "alg")?
+  if (!coseKnownAlg(alg)) {
+    fail newError("cose: unsupported alg ${alg}")
+  }
+  coseCheckOps(m)?
+  if (kty == coseKtyEc2) {
+    return coseEc2(m, alg)?
+  }
+  if (kty == coseKtyOkp) {
+    return coseOkp(m, alg)?
+  }
+  return coseRsa(m, alg)?
+}
+
+// The curve and the one alg that goes with it for an EC2 `crv`.
+fn coseCurve(crv: int): Curve! {
+  if (crv == 1) {
+    return nistecP256()
+  }
+  if (crv == 2) {
+    return nistecP384()
+  }
+  fail newError("cose: unsupported EC2 crv ${crv}")
+}
+
+// The SEC 1 point of an EC2 key: uncompressed from a byte string `y`, compressed
+// from a boolean `y` (RFC 9053 section 7.1.1: true is the odd root).
+fn coseEc2Point(m: CoseMap, size: int): []byte! {
+  let x = coseBytes(m, coseLabelX, "x", size)?
+  match (coseGet(m, coseLabelY, "y")?) {
+    Bytes(y) => {
+      if (len(y) != size) {
+        fail newError("cose: y is ${len(y)} bytes, want ${size}")
+      }
+      return rsaConcat(rsaConcat([0x04], x), y)
+    }
+    Bool(odd) => {
+      if (odd) {
+        return rsaConcat([0x03], x)
+      }
+      return rsaConcat([0x02], x)
+    }
+    _ => fail newError("cose: label -3 (y) is neither a byte string nor a boolean")
+  }
+}
+
+fn coseEc2(m: CoseMap, alg: int): CoseKey! {
+  let crv = coseInt(m, coseLabelCrv, "crv")?
+  let curve = coseCurve(crv)?
+  let want = coseAlgEs256
+  if (crv == 2) {
+    want = coseAlgEs384
+  }
+  if (alg != want) {
+    fail newError("cose: alg ${alg} does not fit EC2 crv ${crv}, which is for alg ${want}")
+  }
+  coseNoPrivate(m, [coseLabelD])?
+  let pub = ecdsaPublicKey(curve, coseEc2Point(m, curve.size)?)?
+  return CoseKey.Ec2(pub)
+}
+
+fn coseOkp(m: CoseMap, alg: int): CoseKey! {
+  let crv = coseInt(m, coseLabelCrv, "crv")?
+  if (crv != 6) {
+    fail newError("cose: unsupported OKP crv ${crv}")
+  }
+  if (alg != coseAlgEdDsa) {
+    fail newError("cose: alg ${alg} does not fit OKP crv 6 (Ed25519), which is for alg -8")
+  }
+  coseNoPrivate(m, [coseLabelD])?
+  let x = coseBytes(m, coseLabelX, "x", 32)?
+  ed25519Decode(x) catch _ {
+    fail newError("cose: OKP x is not a valid Ed25519 point")
+  }
+  return CoseKey.Okp(x)
+}
+
+fn coseRsa(m: CoseMap, alg: int): CoseKey! {
+  if (alg != coseAlgRs256 && alg != coseAlgPs256) {
+    fail newError("cose: alg ${alg} does not fit RSA, which is for alg -257 or -37")
+  }
+  // d, p, q, dP, dQ, qInv, other, r_i, d_i, t_i (RFC 8230 section 4).
+  coseNoPrivate(m, [-3, -4, -5, -6, -7, -8, -9, -10, -11, -12])?
+  let nb = coseBytes(m, coseLabelN, "n", 0)?
+  let eb = coseBytes(m, coseLabelE, "e", 0)?
+  let n = bigintFromBytes(nb)
+  let e = bigintFromBytes(eb)
+  let nbits = bigintBitLen(n)
+  if (nbits < coseRsaMinBits || nbits > coseRsaMaxBits) {
+    fail newError("cose: RSA modulus is ${nbits} bits, want ${coseRsaMinBits} to ${coseRsaMaxBits}")
+  }
+  if (nb[len(nb) - 1] % 2 == 0) {
+    fail newError("cose: RSA modulus is even")
+  }
+  let ebits = bigintBitLen(e)
+  if (ebits < coseRsaMinExpBits || ebits > coseRsaMaxExpBits || eb[len(eb) - 1] % 2 == 0) {
+    fail newError("cose: RSA exponent must be odd and 17 to 64 bits, got ${ebits} bits")
+  }
+  return CoseKey.Rsa(RsaPublicKey{ n = n, e = e }, alg)
+}
