@@ -14,6 +14,7 @@ The chapters below, in reading order.
 | [One-time tokens for account emails](account-tokens.md) | The token behind password reset, email verification and magic links: hashed at rest, single use, expiring, one purpose each. |
 | [Confirm an author's email address](email-verification.md) | Email verification on one-time tokens: send a link at signup, confirm it once, resend without revealing which addresses exist, and what happens when the address changes. |
 | [Sign in with a link in an email](magic-link.md) | Passwordless login on one-time tokens: ask for a link, open it in the same browser, only the newest works, the same answer for every address, and a page that mail scanners cannot spend. |
+| [Bearer tokens for an API](bearer-tokens.md) | Sign in once, call the JSON API with a JWT access token: a pinned algorithm, audience and issuer checks, key rotation without logging anyone out, clock skew, and the 401 a client should get. |
 | [Security model](security.md) | What this package checks for you, and the one thing it cannot: your token exchange TLS roots. |
 
 For install and the exported surface, see [`pkg/auth/README.md`](../README.md).

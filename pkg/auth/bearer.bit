@@ -1,0 +1,394 @@
+// pkg/auth/bearer.bit — JWT bearer access tokens (#6947): `AccessTokens`
+// issues and verifies them, `BearerStrategy` puts the verifier behind
+// `requireAuth`.
+//
+// The profile is RFC 9068 on RFC 7519, hardened as RFC 8725 asks:
+//
+//   - The algorithm is PINNED (`TokenOptions.algorithm`, RFC 8725 section
+//     3.1). The token's own `alg` header is read only to be compared with the
+//     pinned name and refused on any difference, `none` included; it never
+//     chooses a key or a code path. The verification keys are typed
+//     (`VerifyKey`, std/jwt), so a public RSA key cannot reach the HMAC path
+//     (the RS256 to HS256 confusion), and the constructor refuses a key whose
+//     algorithm is not the pinned one.
+//   - `typ` must be `at+jwt` (RFC 9068 section 4), so an OpenID Connect ID
+//     token or any other JWT signed by the same key is refused as an access
+//     token (RFC 8725 section 3.11).
+//   - `iss` and `aud` are checked against the options, never optional
+//     (RFC 8725 sections 3.8 and 3.9). `exp`, `iat`, `sub` and `jti` must be
+//     present: std/jwt treats an absent `exp` as "never expires", which an
+//     access token must not.
+//   - The signing key is chosen by `kid`: the verification set holds every
+//     key still accepted, so a retired key keeps verifying its tokens until
+//     it is removed from `KeySet.verify`.
+//
+// STATELESS: `BearerStrategy.authenticate` reads the `Authorization` header,
+// verifies, and returns the `Identity`. It creates and regenerates no
+// session, so the CONTRACT note on `Strategy` (strategy.bit) does not apply
+// to it: a bearer request carries its credential on every call, there is no
+// login step for a fixated session id to survive. (`requireAuth` still stores
+// the `Identity` on the request's session, as it does for every strategy.)
+//
+// `Json`, `JsonEntry`, `jsonGet`, `jsonParse`, `jsonAsString`, `jsonAsArray`,
+// `isSome`, `unwrap`, `ClaimsOptions`, `Jwks`, `VerifyKey`, `verifyToken`,
+// `jwksFindByKid`, `decodeBase64Url`, `randomBytes`, `encodeHex`, `now`,
+// `Second`, `split`, `equalFold` and `Ctx` are already bound
+// module-wide by sibling files (an import binds per MODULE, SPEC section
+// 17.1); re-importing any of them here is E0042.
+import { Jwk, SigningKey, signAlgName, signTyped, verifyAlgName } from "std/jwt"
+import { jsonAsInt, jsonAsObject } from "std/json"
+
+// RFC 9068 section 2.1: the `typ` header of a JWT access token. The
+// `application/at+jwt` spelling is accepted too (RFC 9068 section 4).
+const accessTokenType = "at+jwt"
+const accessTokenTypeFull = "application/at+jwt"
+
+// RFC 7518 section 3.2: an HMAC key shorter than its hash output weakens the
+// MAC, so HS256 keys must carry at least 32 bytes.
+const minHmacKeyBytes = 32
+
+// `WWW-Authenticate` values (RFC 6750 section 3): with no credential at all
+// the challenge carries no error code; with a credential that failed, it is
+// `invalid_token`.
+const challengeNoCredential = "Bearer"
+const challengeInvalidToken = "Bearer error=\"invalid_token\""
+
+// The claims `issue` writes itself. A caller's extra claims may not use
+// these names, so the token's subject, lifetime and audience cannot be
+// overridden through the free-form `claims` argument.
+fn reservedClaims(): []string {
+  return []string{ "iss", "sub", "aud", "exp", "iat", "nbf", "jti", "scope" }
+}
+
+// The keys an `AccessTokens` signs and verifies with.
+export class KeySet {
+  // The key new tokens are signed with.
+  export signing: SigningKey,
+  // The `kid` written into every token's header. Required, and one of the
+  // `verify` entries, so every token this issuer signs can be verified.
+  export signingKid: string,
+  // Every key still accepted: the signing key's public half plus keys that
+  // are retired but whose tokens have not yet expired. Take a key out once
+  // its last token has expired.
+  export verify: []Jwk,
+}
+
+// What an `AccessTokens` issues and accepts.
+export class TokenOptions {
+  // `iss` of every token, and the only issuer accepted. Required.
+  export issuer: string,
+  // `aud` of every token, and the only audience accepted. Required.
+  export audience: string,
+  // Seconds a token lives: fifteen minutes. Must be above zero.
+  export ttl: i64 = 900,
+  // Seconds of clock difference tolerated on `exp`, `nbf` and `iat`: a
+  // minute. Zero is allowed, below zero is not.
+  export skew: i64 = 60,
+  // The one JOSE `alg` name tokens are signed and accepted with, for example
+  // `"HS256"`. Required, and equal to the algorithm of every key in the
+  // `KeySet`: the constructor fails when they differ.
+  export algorithm: string,
+  // Seconds since the epoch. The zero value, `nil`, is the wall clock; a test
+  // passes its own and moves it by hand.
+  export clock: () => i64,
+}
+
+// The Error raised when a verification key set or options cannot work.
+fn badConfig(what: string): error {
+  return newError("auth: AccessTokens(): ${what}")
+}
+
+fn checkOptions(opts: TokenOptions): ()! {
+  if (opts.issuer == "") {
+    fail badConfig("`issuer` is not set")
+  }
+  if (opts.audience == "") {
+    fail badConfig("`audience` is not set")
+  }
+  if (opts.ttl <= 0) {
+    fail badConfig("`ttl` must be above zero, got ${opts.ttl}")
+  }
+  if (opts.skew < 0) {
+    fail badConfig("`skew` must not be negative, got ${opts.skew}")
+  }
+  if (opts.algorithm == "") {
+    fail badConfig("`algorithm` is not set")
+  }
+}
+
+// Whether `key` is an HMAC secret shorter than `minHmacKeyBytes`.
+fn weakSigning(key: SigningKey): bool {
+  match (key) {
+    Hs256Key(secret) => return len(secret) < minHmacKeyBytes
+    Rs256Key(_) => return false
+    Es256Key(_) => return false
+    Ed25519Key(_) => return false
+  }
+}
+
+fn weakVerify(key: VerifyKey): bool {
+  match (key) {
+    Hs256Key(secret) => return len(secret) < minHmacKeyBytes
+    Rs256Key(_) => return false
+    Es256Key(_) => return false
+    Ed25519Key(_) => return false
+  }
+}
+
+// Every verification key: the pinned algorithm, a strong enough secret, a
+// `kid`. Returns whether `signingKid` is among them.
+fn checkVerifyKeys(keys: KeySet, algorithm: string): ()! {
+  if (len(keys.verify) == 0) {
+    fail badConfig("`KeySet.verify` is empty")
+  }
+  let listed = false
+  for jwk of keys.verify {
+    if (jwk.kid == "") {
+      fail badConfig("a verification key has no `kid`")
+    }
+    if (verifyAlgName(jwk.key) != algorithm) {
+      fail badConfig("verification key '${jwk.kid}' is ${verifyAlgName(jwk.key)}, not the pinned ${algorithm}")
+    }
+    if (weakVerify(jwk.key)) {
+      fail badConfig("verification key '${jwk.kid}' is an HMAC secret shorter than ${minHmacKeyBytes} bytes")
+    }
+    if (jwk.kid == keys.signingKid) {
+      listed = true
+    }
+  }
+  if (!listed) {
+    fail badConfig("`signingKid` '${keys.signingKid}' is not in `KeySet.verify`")
+  }
+}
+
+fn checkKeys(keys: KeySet, algorithm: string): ()! {
+  if (keys.signingKid == "") {
+    fail badConfig("`signingKid` is not set")
+  }
+  if (signAlgName(keys.signing) != algorithm) {
+    fail badConfig("the signing key is ${signAlgName(keys.signing)}, not the pinned ${algorithm}")
+  }
+  if (weakSigning(keys.signing)) {
+    fail badConfig("the signing key is an HMAC secret shorter than ${minHmacKeyBytes} bytes")
+  }
+  checkVerifyKeys(keys, algorithm)?
+}
+
+// The string member `name` of the JOSE header or payload `j`, or `""` when it
+// is absent or not a string.
+fn memberString(j: Json, name: string): string {
+  let v = jsonGet(j, name)
+  if (!isSome(v)) {
+    return ""
+  }
+  let s = jsonAsString(unwrap(v))
+  if (!isSome(s)) {
+    return ""
+  }
+  return unwrap(s)
+}
+
+// The JOSE header of `token`, decoded and parsed, before any signature check:
+// the header is the only way to learn `kid`. Nothing here chooses behaviour;
+// `checkHeader` and the key lookup only ever refuse.
+fn decodeHeader(token: string): Json! {
+  let parts = split(token, ".")
+  if (len(parts) != 3) {
+    fail newError("auth: bearer: malformed token, expected 3 segments")
+  }
+  let raw = decodeBase64Url(parts[0])?
+  return jsonParse(string(raw))?
+}
+
+// Whether `typ` names an access token (RFC 9068 section 4); media type names
+// are case-insensitive (RFC 7515 section 4.1.9).
+fn isAccessTokenType(typ: string): bool {
+  return equalFold(typ, accessTokenType) || equalFold(typ, accessTokenTypeFull)
+}
+
+// `payload`'s claim `name` as a non-empty string, or an error naming it.
+fn requireString(payload: Json, name: string): string! {
+  let s = memberString(payload, name)
+  if (s == "") {
+    fail newError("auth: bearer: claim '${name}' is missing or not a string")
+  }
+  return s
+}
+
+// `payload`'s claim `name` as a number, or an error naming it.
+fn requireNumber(payload: Json, name: string): i64! {
+  let v = jsonGet(payload, name)
+  if (!isSome(v)) {
+    fail newError("auth: bearer: claim '${name}' is missing")
+  }
+  let n = jsonAsInt(unwrap(v))
+  if (!isSome(n)) {
+    fail newError("auth: bearer: claim '${name}' is not a number")
+  }
+  return unwrap(n)
+}
+
+// Issues and verifies JWT access tokens. Build one at startup and share it:
+// it holds no per-request state.
+export class AccessTokens {
+  keys: KeySet
+  opts: TokenOptions
+
+  // Fails for a key set or option that cannot work, so the mistake shows when
+  // the app starts rather than at the first request: a missing issuer or
+  // audience, a `ttl` or `skew` out of range, a `KeySet` whose algorithm is
+  // not `opts.algorithm`, an HMAC secret under 32 bytes, a `signingKid` that
+  // `verify` does not list.
+  init(keys: KeySet, opts: TokenOptions)! {
+    checkOptions(opts)?
+    checkKeys(keys, opts.algorithm)?
+    this.keys = keys
+    this.opts = opts
+  }
+
+  // A signed access token for `subject`, valid for `opts.ttl` seconds from
+  // now. `claims` is an object of extra claims to carry (a role, a
+  // `client_id` as RFC 9068 section 2.2 asks); it may not set `iss`, `sub`,
+  // `aud`, `exp`, `iat`, `nbf`, `jti` or `scope`. `scope` is the
+  // space-separated list of scopes (RFC 9068 section 2.2.3), left out when
+  // empty. Every token gets a fresh random `jti`.
+  export issue(
+    subject: string,
+    claims: Json = Json.JsonObject([]JsonEntry{}),
+    scope: string = "",
+  ): string! {
+    if (subject == "") {
+      fail newError("auth: AccessTokens.issue(): `subject` must not be empty")
+    }
+    let issuedAt = this.nowSec()
+    let members = []JsonEntry{
+      JsonEntry{ key = "iss", value = Json.JsonString(this.opts.issuer) },
+      JsonEntry{ key = "sub", value = Json.JsonString(subject) },
+      JsonEntry{ key = "aud", value = Json.JsonString(this.opts.audience) },
+      JsonEntry{ key = "iat", value = Json.JsonInt(issuedAt) },
+      JsonEntry{ key = "exp", value = Json.JsonInt(issuedAt + this.opts.ttl) },
+      JsonEntry{ key = "jti", value = Json.JsonString(encodeHex(randomBytes(16))) },
+    }
+    if (scope != "") {
+      members = append(members, JsonEntry{ key = "scope", value = Json.JsonString(scope) })
+    }
+    let payload = Json.JsonObject(appendCustom(members, claims)?)
+    return signTyped(this.keys.signing, accessTokenType, this.keys.signingKid, payload)?
+  }
+
+  // The `Identity` `token` proves: `id` is `sub`, `claims` the whole payload.
+  // Fails, with a reason meant for a log and never for the client, when the
+  // header `alg` is not the pinned one (`none` included), `typ` is not
+  // `at+jwt`, `kid` is unknown, the signature is wrong, `iss` or `aud` differ,
+  // the token is expired or not yet valid beyond `opts.skew`, or `exp`, `iat`,
+  // `sub` or `jti` is missing.
+  export verify(token: string): Identity! {
+    let header = decodeHeader(token)?
+    if (memberString(header, "alg") != this.opts.algorithm) {
+      fail newError("auth: bearer: header alg is not the pinned ${this.opts.algorithm}")
+    }
+    if (!isAccessTokenType(memberString(header, "typ"))) {
+      fail newError("auth: bearer: header typ is not at+jwt")
+    }
+    let key = this.keyFor(memberString(header, "kid"))?
+    let payload = verifyToken(token, key, this.claimsOptions())?
+    requireNumber(payload, "exp")?
+    requireNumber(payload, "iat")?
+    requireString(payload, "jti")?
+    let sub = requireString(payload, "sub")?
+    return Identity{ id = sub, claims = payload }
+  }
+
+  // The listed key named `kid`; an unlisted or absent `kid` is an error that
+  // does not repeat the attacker-chosen value.
+  keyFor(kid: string): VerifyKey! {
+    if (kid == "") {
+      fail newError("auth: bearer: header has no kid")
+    }
+    return jwksFindByKid(Jwks{ keys = this.keys.verify }, kid) catch _ {
+      fail newError("auth: bearer: header kid is not a listed key")
+    }
+  }
+
+  claimsOptions(): ClaimsOptions {
+    return ClaimsOptions{
+      now = this.nowSec(),
+      leewaySeconds = this.opts.skew,
+      expectedIss = Option.Some(this.opts.issuer),
+      expectedAud = Option.Some(this.opts.audience),
+    }
+  }
+
+  nowSec(): i64 {
+    let clock = this.opts.clock
+    if (clock == nil) {
+      return now().ns / Second
+    }
+    return clock()
+  }
+}
+
+// `members` followed by the entries of `claims`. `claims` must be a JSON
+// object and must not reuse a registered name
+// `issue` writes itself.
+fn appendCustom(members: []JsonEntry, claims: Json): []JsonEntry! {
+  let extra = jsonAsObject(claims)
+  if (!isSome(extra)) {
+    fail newError("auth: AccessTokens.issue(): `claims` must be a JSON object")
+  }
+  let reserved = reservedClaims()
+  for entry of unwrap(extra) {
+    for name of reserved {
+      if (entry.key == name) {
+        fail newError("auth: AccessTokens.issue(): `claims` may not set '${name}'")
+      }
+    }
+    members = append(members, entry)
+  }
+  return members
+}
+
+// The 401 `BearerStrategy` raises. It satisfies `pkg/web`'s `HttpError`
+// (status 401, the plain message), and carries the `WWW-Authenticate` value
+// RFC 6750 section 3 requires, which `requireAuth` (middleware.bit) puts on
+// the response. The message is the same for every cause: why a token failed
+// is for `AccessTokens.verify`'s caller to log, never for the client.
+export class BearerChallenge {
+  // The `WWW-Authenticate` header value.
+  export challenge: string
+
+  export message(): string {
+    return "Unauthorized"
+  }
+
+  export status(): int {
+    return 401
+  }
+}
+
+// A `Strategy` that authenticates a request by the JWT in its
+// `Authorization: Bearer` header. Stateless: it reads and verifies, and
+// leaves the session alone. A request with no bearer credential fails with
+// the bare challenge, one whose token fails verification for any reason with
+// `error="invalid_token"` (RFC 6750 section 3).
+export class BearerStrategy {
+  tokens: AccessTokens
+
+  init(tokens: AccessTokens) {
+    this.tokens = tokens
+  }
+
+  export name(): string {
+    return "bearer"
+  }
+
+  export authenticate(c: Ctx): Identity! {
+    let header = c.header("Authorization")
+    if (len(header) < 7 || !equalFold(header[0:7], "Bearer ")) {
+      fail BearerChallenge{ challenge = challengeNoCredential }
+    }
+    return this.tokens.verify(header[7:len(header)]) catch _ {
+      fail BearerChallenge{ challenge = challengeInvalidToken }
+    }
+  }
+}
