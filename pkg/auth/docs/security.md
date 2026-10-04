@@ -63,7 +63,7 @@ providers](providers.md).
 
 ## Scopes always include `openid`
 
-`OidcOptions.scopes` left empty requests `openid email profile`. A scope
+`OidcOptions.scopes` left out requests `openid email profile`. A scope
 list you set replaces that outright, and `OidcStrategy`'s constructor
 refuses any list missing `openid` - every strategy this package builds is
 doing OpenID Connect, never bare OAuth2, so a scope list that drops the one
