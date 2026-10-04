@@ -138,7 +138,7 @@ fn main(): ()! {
   let profile = r.hash("user:1")
   profile.set(map<string, string>{ "name": "Ada", "level": "12" })?
 
-  for pair of profile.scan() {
+  for pair of profile.scan()? {
     let (field, value) = pair
     println("${field} = ${value}")
   }
@@ -148,8 +148,10 @@ fn main(): ()! {
 ```
 
 `scan(pattern = "", count = 0)` returns an iterator whose `next(): Option<
-(string, string)>` fetches a new page only when the current one runs out -
-pass `pattern` to filter field names server-side (`HSCAN`'s own `MATCH`),
+(string, string)>!` fetches a new page only when the current one runs out.
+A page that fails to arrive (a dropped connection, a timeout, a server error)
+is returned as a `RedisError`, so the loop is `for pair of it?` inside a
+function that returns `()!`. Pass `pattern` to filter field names server-side (`HSCAN`'s own `MATCH`),
 and `count` as a hint for how many entries to fetch per round trip. There is no
 queued/pipelined version of `scan()`: a cursor is several round trips, and a
 pipeline's `Future<T>` only ever resolves one.
