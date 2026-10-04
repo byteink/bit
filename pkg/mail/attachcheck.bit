@@ -1,0 +1,187 @@
+// pkg/mail/attachcheck.bit — what render refuses about `Message.attachments`,
+// and how they are handed to std/smtp.
+//
+// Every refusal is a `MailError.Invalid` naming the attachment as
+// `attachments[1]`. The inline rules exist because a mismatch between the HTML
+// and the attachments fails silently in a mailbox: a `cid:` with nothing behind
+// it is a broken image, and an inline part nothing refers to shows up as a
+// stray attachment in some clients.
+
+import { Attachment as SmtpAttachment, Message as SmtpMessage } from "std/smtp"
+
+// Whether a `cid:` in HTML may follow `b`: the start of an attribute value, a
+// CSS `url(`, or a separator. Anything else (`acid:`) is a word that ends in
+// "cid", not a reference.
+fn isCidLead(b: u8): bool {
+  return b == dq || b == u8(39) || b == u8(40) || b == u8(61) || b == comma || isHtmlSpace(b)
+}
+
+// Whether `b` ends a `cid:` reference: a closing quote or parenthesis, the end
+// of the tag, a separator, or the start of a character reference.
+fn isCidEnd(b: u8): bool {
+  return b == dq ||
+    b == u8(39) ||
+    b == u8(41) ||
+    b == lt ||
+    b == gt ||
+    b == comma ||
+    b == u8(38) ||
+    b == u8(59) ||
+    b == u8(92) ||
+    isHtmlSpace(b)
+}
+
+// The value of one hex digit, or -1.
+fn hexDigit(b: u8): int {
+  if (b >= u8(48) && b <= u8(57)) {
+    return int(b) - 48
+  }
+  let l = lowerByte(b)
+  if (l >= u8(97) && l <= u8(102)) {
+    return int(l) - 87
+  }
+  return -1
+}
+
+// `s` with its `%XX` escapes decoded (RFC 2392 writes a Content-ID that is not
+// URL-safe percent-encoded, `cid:logo%40inkwell.dev`). A `%` not followed by two
+// hex digits stays as it is.
+fn unescapeCid(s: string): string {
+  let out: []byte = []
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == u8(37) && i + 2 < len(s) && hexDigit(s[i + 1]) >= 0 && hexDigit(s[i + 2]) >= 0) {
+      out = append(out, u8(hexDigit(s[i + 1]) * 16 + hexDigit(s[i + 2])))
+      i = i + 3
+    } else {
+      out = append(out, s[i])
+      i = i + 1
+    }
+  }
+  return string(out)
+}
+
+// Every content id `html` refers to as `cid:<id>`, each once, in order.
+fn cidRefs(html: string): []string {
+  let out: []string = []
+  let i = 0
+  while (i + 4 <= len(html)) {
+    if (!eqFold(html, i, i + 4, "cid:") || (i > 0 && !isCidLead(html[i - 1]))) {
+      i = i + 1
+      continue
+    }
+    let end = i + 4
+    while (end < len(html) && !isCidEnd(html[end])) {
+      end = end + 1
+    }
+    let id = unescapeCid(html[i + 4:end])
+    if (id != "") {
+      out = appendNew(out, id)
+    }
+    i = end
+  }
+  return out
+}
+
+// The `Invalid` for attachment `i`.
+fn attachError(i: int, why: string): MailError {
+  return MailError.Invalid("attachments[${i}]: ${why}")
+}
+
+// `v` must hold no CR, LF or NUL, which std/smtp would put in a header.
+fn checkLine(i: int, field: string, v: string): ()!MailError {
+  if (hasLineByte(v)) {
+    fail attachError(i, "${field} contains a CR, LF or NUL (header injection)")
+  }
+}
+
+// What one attachment must have by itself: a name and bytes, and no line break
+// in anything that becomes a header.
+fn checkOne(a: Attachment, i: int): ()!MailError {
+  if (a.name == "") {
+    fail attachError(i, "name is empty")
+  }
+  if (len(a.data) == 0) {
+    fail attachError(i, "data is empty (${echoInput(a.name)} has no bytes)")
+  }
+  checkLine(i, "name", a.name)?
+  checkLine(i, "contentType", a.contentType)?
+  checkLine(i, "cid", a.cid)?
+}
+
+// Each inline attachment against the HTML: it needs an HTML body, a cid of its
+// own, and a `cid:` in the HTML that shows it; and every `cid:` in the HTML
+// needs an attachment behind it.
+fn checkInline(m: Message): ()!MailError {
+  let refs = cidRefs(m.html)
+  let seen = map<string, int>()
+  let i = 0
+  while (i < len(m.attachments)) {
+    let cid = m.attachments[i].cid
+    if (cid != "") {
+      checkOneCid(m, i, refs, seen[cid])?
+      seen[cid] = i + 1
+    }
+    i = i + 1
+  }
+  for r of refs {
+    if (seen[r] == 0) {
+      fail MailError.Invalid("html: refers to cid:${echoInput(r)} and no attachment has that cid; set Attachment.cid")
+    }
+  }
+}
+
+// The inline rules for attachment `i`, whose cid was last seen at
+// attachments[`prev` - 1] (`prev` is 0 when it is new).
+fn checkOneCid(m: Message, i: int, refs: []string, prev: int): ()!MailError {
+  let cid = m.attachments[i].cid
+  if (m.html == "") {
+    fail attachError(i, "cid ${echoInput(cid)} is inline and the message has no html to show it in")
+  }
+  if (prev > 0) {
+    fail attachError(i, "duplicate cid ${echoInput(cid)}, already on attachments[${prev - 1}]")
+  }
+  let at = 0
+  while (at < len(refs) && refs[at] != cid) {
+    at = at + 1
+  }
+  if (at == len(refs)) {
+    fail attachError(
+      i,
+      "cid ${echoInput(cid)} is never referenced: write cid:${cid} in the html, or clear Attachment.cid",
+    )
+  }
+}
+
+// Refuses `m`'s attachments unless each is whole, the inline ones match the
+// HTML, and together they fit in one message.
+fn checkAttachments(m: Message): ()!MailError {
+  let total = 0
+  let i = 0
+  while (i < len(m.attachments)) {
+    checkOne(m.attachments[i], i)?
+    total = total + len(m.attachments[i].data)
+    i = i + 1
+  }
+  checkInline(m)?
+  if (total > maxAttachmentBytes) {
+    fail MailError.Invalid(sizeFault(total))
+  }
+}
+
+// Hands every attachment to `sm`: inline ones beside the HTML, the rest as
+// downloads. The bytes are passed on, not copied.
+fn applyAttachments(sm: SmtpMessage, m: Message) {
+  for a of m.attachments {
+    let ct = a.contentType
+    if (ct == "") {
+      ct = guessType(a.name)
+    }
+    let part = SmtpAttachment(a.name, ct, a.data)
+    if (a.cid == "") {
+      sm.attach(part)
+    } else {
+      sm.addInline(part, a.cid)
+    }
+  }
+}
