@@ -269,22 +269,18 @@ fn main(): ()! {
   let r = open("redis://localhost:6379")?
   let board = r.zset("game:board")
   let it = board.scan()
-  for entry of it {
+  for entry of it? {
     println(entry.member)
-  }
-  match (it.err()) {
-    Some(e) => println("scan stopped early: ${e.message()}")
-    None => {}
   }
   r.close()
   return
 }
 ```
 
-`for entry of it` calls `it.next(): Option<Scored>` until it runs out -
-`next()` itself never fails; a round trip that does fail stops the
-iteration early and is kept on `it.err()` for you to check afterward,
-the same "check the error after the loop" shape Go's own `Scanner` uses.
+`for entry of it?` calls `it.next(): Option<Scored>!` until it runs out.
+A page fetch that fails (network, timeout, server error) comes back as the
+error, so the loop returns it from `main` instead of ending early as if the
+cursor were exhausted.
 
 ## Pipelines and transactions
 
