@@ -439,12 +439,44 @@ and panics via `bit_rt_panic_nil_iface` (§12.1) if so — `value` IS the
 receiver pointer, and a nil interface is a legal, checker-blessed zero value
 (SPEC §13.4) with no `TypeInfo` to load `-16` bytes from. Only once that
 passes does the callee load `info = *(value - 16)` (the header's `info`
-field, §1), then `fn = bit_rt_iface_lookup(info, id)` (§9), then call
-`fn(value, args...)`. `bit_rt_iface_lookup` linearly scans `info.methods` for
-`id` — types have few methods, so this is a short, allocation-free walk —
-and returns the code address. The checker guarantees a NON-NIL receiver
-satisfies the interface, so the id is always present there; a miss is a
-compiler bug and traps.
+field, §1), then resolves `fn` through the site's inline cache below, then
+calls `fn(value, args...)`. `bit_rt_iface_lookup(info, id)` (§9) linearly
+scans `info.methods` for `id` — types have few methods, so this is a short,
+allocation-free walk — and returns the code address. The checker guarantees a
+NON-NIL receiver satisfies the interface, so the id is always present there; a
+miss is a compiler bug and traps.
+
+**Inline cache (#5965).** Every `call_iface` site owns one writable,
+zero-initialised, 8-aligned 16-byte cell `{info, fn}` (`compiler/ifacecache.bit`
+names it `<function>$ic<k>` and registers it as a module cell). The hit path
+loads the cell's `info`, then its `fn`, compares `info` with the receiver's
+and, when equal, calls `fn` with no runtime call at all. A miss calls
+`bit_rt_iface_lookup_ic(info, id, cell)` (§9), which resolves exactly as
+`bit_rt_iface_lookup` does and returns the address; if the cell is still
+empty it also binds it. The cell is monomorphic and bound at most once: the
+first type a site sees owns it, and any other type misses on every call
+(HotSpot's monomorphic-to-megamorphic transition, never rebinding). Binding
+once is what keeps a megamorphic site from writing a shared cache line on
+every call from every worker. A miss whose cell is already bound (its `fn`,
+read by the probe, non-zero) calls `bit_rt_iface_lookup` directly, so a site
+that keeps missing pays the probe and one branch over the pre-cache sequence,
+never an extra call level; only a miss on an empty cell calls
+`bit_rt_iface_lookup_ic`.
+
+Two concurrent misses never pair one type's `info` with another type's `fn`:
+
+- The binder claims the cell with a compare-and-swap of `fn` from 0
+  (`atomicCmpxchg`), so exactly one writer ever exists per cell, and only that
+  writer then stores `info`, with release (`atomicStoreRelease`). Neither word
+  is written again, so there is no later write a reader could mix in.
+- The reader loads `info` before `fn` — `ldar` on AArch64, a plain load on
+  x86-64, which never reorders two loads. An `info` that matches the receiver
+  is therefore the binder's release store, so the `fn` loaded after it is the
+  one the binder stored before it. A reader that runs between the CAS and the
+  `info` store sees `info == 0`, which no object's header holds, and misses.
+
+The miss path never collects, so the method call stays the site's only
+safepoint.
 
 A **closure value** is one such object: `gc_alloc`'d, a fixed 16-byte
 `{ code_ptr, env_ptr }` cell (`TypeInfo{ size = 16, ptr_offsets = [8] }`). The
@@ -2818,6 +2850,7 @@ defined exactly once).
 |-----------------------|--------------------------------------------------------|
 | `bit_rt_gc_alloc`     | `(info: *const TypeInfo) -> *u8` (§6)                  |
 | `bit_rt_iface_lookup` | `(info: *const TypeInfo, id: u64) -> *const anyopaque` (§2.1) |
+| `bit_rt_iface_lookup_ic` | `(info: *const TypeInfo, id: u64, cell: *[2]usize) -> *const anyopaque` (§2.1, a `call_iface` site's cache miss) |
 | `bit_rt_safepoint`    | `() -> void` (§6)                                      |
 | `bit_rt_module_roots_register` | `(table: usize) -> void` (§4.3, called first by the entry `main` when the program has a traced module cell) |
 | `bit_rt_spawn`        | `(fn_ptr: TaskFn, arg: ?*anyopaque) -> void`            |

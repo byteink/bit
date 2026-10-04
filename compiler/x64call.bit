@@ -113,13 +113,20 @@ fn xArg0(cc: XCallConv): XReg64 {
   return XReg64.Rdi
 }
 
-// The second argument register — needed by the interface path, which passes
-// (typeinfo, methodId) to bit_rt_iface_lookup.
+// The second and third argument registers — needed by the interface path,
+// which passes (typeinfo, methodId, cell) to bit_rt_iface_lookup_ic.
 fn xArg1(cc: XCallConv): XReg64 {
   if (cc == XCallConv.Win64) {
     return XReg64.Rdx
   }
   return XReg64.Rsi
+}
+
+fn xArg2(cc: XCallConv): XReg64 {
+  if (cc == XCallConv.Win64) {
+    return XReg64.R8
+  }
+  return XReg64.Rdx
 }
 
 // A closure value is a pointer to a 16-byte GC cell {code_ptr, env_ptr}: the
@@ -670,15 +677,15 @@ fn xEmitCallWords(cx: XCtx, i: int, ins: IrInstr, w: int) {
 
 // `call_iface`: structural interface dispatch (ABI.md §2.1). Load the receiver's
 // TypeInfo (*(recv - 16), the header's info field), resolve the method id to a
-// code address via bit_rt_iface_lookup, then call it with the receiver as arg0.
+// code address through the site's inline cache (#5965, xEmitIfaceResolve), then
+// call it with the receiver as arg0.
 // The lookup never collects, so only the final indirect call records a safepoint.
 // The receiver is RELOADED after the lookup: its home is a callee-saved register
 // or a spill slot, both of which survive the call, but scratch1 does not.
 fn xEmitCallIface(
-  cx: XCtx, dst: int, ty: int, ifaceVal: int, methodId: int,
-  args: []int,
+  cx: XCtx, dst: int, ty: int, ins: IrInstr,
 ) {
-  xEmitCallIfaceSeq(cx, ifaceVal, methodId, args)
+  xEmitCallIfaceSeq(cx, ins)
   if (cx.ctx.types[ty].kind != TypeKind.Void) {
     xTakeCallResult(cx, dst, ty)
   }
@@ -688,8 +695,9 @@ fn xEmitCallIface(
 // indirect call, safepoint, teardown — shared by the one-word form above and
 // the multi-word form below (#5869) so the two cannot drift apart. Only the
 // BINDING differs between them, the same split as xEmitCallSeq/xEmitCallLike.
-fn xEmitCallIfaceSeq(cx: XCtx, ifaceVal: int, methodId: int, args: []int) {
-  let recv = xGetInt(cx, ifaceVal, xScratch1())
+fn xEmitCallIfaceSeq(cx: XCtx, ins: IrInstr) {
+  assert(ins.name != "") // assignIfaceCaches names every site's cell before codegen
+  let recv = xGetInt(cx, ins.lhs, xScratch1())
   // #2240: a nil interface value's receiver is the null word (ABI.md §2: an
   // interface value IS its receiver pointer); dispatching through it must
   // panic, not read `*(recv - 16)` as a TypeInfo pointer at address -16.
@@ -705,16 +713,9 @@ fn xEmitCallIfaceSeq(cx: XCtx, ifaceVal: int, methodId: int, args: []int) {
   }
   xPatchRel32Here(cx, niSkip)
   xMovLoad(cx.buf, xScratch2(), xMemB(recv, -16), 8, false) // r10 = *(recv - 16)
-  xMovRR(cx.buf, xArg0(cx.cc), xScratch2())
-  xMovRI(cx.buf, xArg1(cx.cc), methodId)
-  shadow = xReserveShadow(cx)
-  xCallReloc(cx, "bit_rt_iface_lookup") // rax = the method's code address
-  if (shadow > 0) {
-    xRspAddSub(cx.buf, false, shadow)
-  }
-  xMovRR(cx.buf, xScratch3(), XReg64.Rax) // r12 = fn, survives marshalling
-  let argReserve = xMarshalArgs(cx, args, 1, 1, 0)
-  let recv2 = xGetInt(cx, ifaceVal, xScratch1())
+  xEmitIfaceResolve(cx, ins.ival, ins.name)                 // r12 = fn, survives marshalling
+  let argReserve = xMarshalArgs(cx, ins.args, 1, 1, 0)
+  let recv2 = xGetInt(cx, ins.lhs, xScratch1())
   xMovRR(cx.buf, xArg0(cx.cc), recv2)
   shadow = xReserveShadow(cx)
   xCallReg(cx, xScratch3())
@@ -727,12 +728,55 @@ fn xEmitCallIfaceSeq(cx: XCtx, ifaceVal: int, methodId: int, args: []int) {
   }
 }
 
+// The inline cache (#5965, ABI.md §2.1): r12 = the code address for the
+// receiver info in r10. A hit is the cell's `{info, fn}` with `info` matching.
+// `info` is loaded before `fn` and x86-64 never reorders two loads, while the
+// binder stores `fn` before `info`, so a matching `info` carries its own `fn`.
+// The receiver in r11 is dead once r10 is loaded; it is reloaded after.
+fn xEmitIfaceResolve(cx: XCtx, methodId: int, cell: string) {
+  xMovAbsSymbol(cx, xScratch1(), cell)                           // r11 = &cell
+  xMovLoad(cx.buf, xScratch3(), xMemB(xScratch1(), 0), 8, false) // r12 = cell.info
+  xArithRR(cx.buf, XArith.Cmp, xScratch3(), xScratch2())
+  xMovLoad(cx.buf, xScratch3(), xMemB(xScratch1(), 8), 8, false) // r12 = cell.fn
+  let hit = xJccRel32Placeholder(cx, ccE())
+  xEmitIfaceCacheMiss(cx, methodId)
+  xPatchRel32Here(cx, hit)
+}
+
+// The miss path: r12 = the method's code address. A cell already bound to
+// another type (r12, its `fn`, non-zero) never binds again, so that site
+// calls bit_rt_iface_lookup directly: a site that keeps missing pays the probe
+// and one test/jne over what it paid before the cache, and no extra call
+// level. Only an unbound cell goes through bit_rt_iface_lookup_ic.
+fn xEmitIfaceCacheMiss(cx: XCtx, methodId: int) {
+  xMovRR(cx.buf, xArg0(cx.cc), xScratch2())
+  xMovRI(cx.buf, xArg1(cx.cc), methodId)
+  xTestRR(cx.buf, xScratch3(), xScratch3())
+  let bound = xJccRel32Placeholder(cx, ccNe())
+  xMovRR(cx.buf, xArg2(cx.cc), xScratch1())
+  xCallShadowed(cx, "bit_rt_iface_lookup_ic")
+  let done = xJmpRel32Placeholder(cx)
+  xPatchRel32Here(cx, bound)
+  xCallShadowed(cx, "bit_rt_iface_lookup")
+  xPatchRel32Here(cx, done)
+  xMovRR(cx.buf, xScratch3(), XReg64.Rax)
+}
+
+// A direct call to `symbol` inside the Win64 shadow space it needs.
+fn xCallShadowed(cx: XCtx, symbol: string) {
+  let shadow = xReserveShadow(cx)
+  xCallReloc(cx, symbol)
+  if (shadow > 0) {
+    xRspAddSub(cx.buf, false, shadow)
+  }
+}
+
 // #5869: the multi-word form of a vtable call. Identical to xEmitCallWords
 // but for the sequence it wraps; a vtable callee returns its words in the
 // same ABI registers a direct one does, so the binding is the same call.
 fn xEmitCallIfaceWords(cx: XCtx, i: int, ins: IrInstr, w: int) {
   let dsts = xCallWordDsts(cx, i, w)
   let tys = xCallWordTys(cx, i, w)
-  xEmitCallIfaceSeq(cx, ins.lhs, ins.ival, ins.args)
+  xEmitCallIfaceSeq(cx, ins)
   xTakeCallResults(cx, dsts, tys)
 }
