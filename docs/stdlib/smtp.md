@@ -503,6 +503,14 @@ is for a caller with its own message type.
 Pre-rendered `data` and the `env` to deliver it under. `render()` validates
 `data` as in the table above and returns it unchanged.
 
+### `Raw.render(): string!SmtpError`
+
+Validate the data as in the table above and return it unchanged.
+
+### `Raw.envelope(): Envelope`
+
+The `env` the `Raw` was made with, as given.
+
 ## Connecting
 
 ### `Options(insecureSkipVerify: bool = false, serverName: string = "", roots: TrustStore = ...)`
