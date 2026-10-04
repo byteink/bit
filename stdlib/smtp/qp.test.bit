@@ -1,0 +1,260 @@
+// stdlib/smtp/qp.test.bit — quoted-printable bodies (#6862).
+//
+// `qpEncode` is checked against RFC 2045 §6.7 rule by rule, then against an
+// in-test decoder over seeded random text: if the decoder returns the input
+// byte for byte and every line is inside the limit, the encoder is lossless and
+// well-formed. The decoder is deliberately the strict reading a real MUA has:
+// it drops whitespace before a hard line break, so an encoder that left
+// trailing whitespace unescaped fails the round trip.
+
+import { Rand } from "std/rand"
+import { contains, hasPrefix, indexOf as strIndexOf, repeat, split } from "std/strings"
+
+// The decoded bytes of quoted-printable `s`. A soft break (`=` CRLF) vanishes,
+// `=XX` is a byte, and literal (unescaped) space or tab before a CRLF is
+// removed, as a transport may do; an escaped `=20` there is data and stays.
+fn qpDecode(s: string): string {
+  let out = []byte{}
+  let ws = 0
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == u8(61) && s[i + 1] == u8(13)) {
+      i = i + 3
+    } else if (c == u8(61)) {
+      out = append(out, u8(hexVal(s[i + 1]) * 16 + hexVal(s[i + 2])))
+      ws = 0
+      i = i + 3
+    } else if (c == u8(13)) {
+      out = out[0:len(out) - ws]
+      out = append(out, c)
+      ws = 0
+      i = i + 1
+    } else {
+      out = append(out, c)
+      if (c == u8(32) || c == u8(9)) {
+        ws = ws + 1
+      } else {
+        ws = 0
+      }
+      i = i + 1
+    }
+  }
+  return string(out)
+}
+
+// The value of one uppercase hex digit; a lowercase one fails the test, since
+// RFC 2045 requires uppercase.
+fn hexVal(c: u8): int {
+  if (c >= u8(48) && c <= u8(57)) {
+    return int(c) - 48
+  }
+  assert(c >= u8(65) && c <= u8(70), "'${string([]byte{ c })}' is not an uppercase hex digit")
+  return int(c) - 55
+}
+
+// The length of the longest CRLF-terminated line in `s`.
+fn widest(s: string): int {
+  let lines = split(s, "\r\n")
+  let worst = 0
+  let i = 0
+  while (i < len(lines)) {
+    if (len(lines[i]) > worst) {
+      worst = len(lines[i])
+    }
+    i = i + 1
+  }
+  return worst
+}
+
+test "= is escaped, printable ASCII and inner whitespace are not" {
+  let got = qpEncode("a=b c\td~")
+  assert(got == "a=3Db c\td~", "got '${got}'")
+}
+
+test "trailing space and tab before a line break and at the end are escaped" {
+  let got = qpEncode("one \r\ntwo\t\r\nthree  ")
+  assert(got == "one=20\r\ntwo=09\r\nthree =20", "got '${got}'")
+}
+
+test "bare CR and LF become CRLF hard breaks, 8-bit and control bytes are escaped" {
+  let got = qpEncode("a\nb\rc\r\nd\x00\x7f")
+  assert(got == "a\r\nb\r\nc\r\nd=00=7F", "got '${got}'")
+  let high = qpEncode("\xff\xfe")
+  assert(high == "=FF=FE", "got '${high}'")
+}
+
+test "an ASCII line over 76 columns is cut with soft breaks, each line at most 76" {
+  let got = qpEncode(repeat("x", 200))
+  let want = repeat("x", 75) + "=\r\n" + repeat("x", 75) + "=\r\n" + repeat("x", 50)
+  assert(got == want, "got '${got}'")
+  assert(widest(got) == 76, "widest line ${widest(got)}")
+  assert(qpDecode(got) == repeat("x", 200), "round trip failed")
+}
+
+test "a line of exactly 76 characters needs no soft break" {
+  let line = repeat("y", 76)
+  assert(qpEncode(line) == line, "76 characters were cut")
+  // With a 77th character to come, 76 would leave no column for the `=`.
+  assert(qpEncode(line + "y") == repeat("y", 75) + "=\r\nyy", "77 characters were not cut at 75")
+}
+
+test "a UTF-8 rune at the break boundary stays whole" {
+  // 66 + 9 = 75 columns, then the last byte 'b' makes exactly 76: no break.
+  let fits = qpEncode(repeat("a", 66) + "€" + "b")
+  assert(fits == repeat("a", 66) + "=E2=82=ACb", "fits: '${fits}'")
+  // One more 'a' and the euro sign (9 columns) no longer leaves room for the
+  // soft-break '=': the break goes BEFORE the whole rune, never inside it.
+  let cut = qpEncode(repeat("a", 67) + "€" + "b")
+  assert(cut == repeat("a", 67) + "=\r\n=E2=82=ACb", "cut: '${cut}'")
+  let k = 60
+  while (k < 76) {
+    let enc = qpEncode(repeat("a", k) + "€€é😀" + repeat("z", 3))
+    assert(!contains(enc, "=E2=\r\n"), "k=${k}: a break split a rune: '${enc}'")
+    assert(!contains(enc, "=E2=82=\r\n"), "k=${k}: a break split a rune: '${enc}'")
+    assert(widest(enc) <= 76, "k=${k}: line of ${widest(enc)}")
+    k = k + 1
+  }
+}
+
+test "a line starting with a dot survives DATA dot-stuffing, after a soft break too" {
+  let text = ".first\r\n" + repeat("a", 75) + ".tail\r\n..two\r\n"
+  let enc = qpEncode(text)
+  let lines = split(enc, "\r\n")
+  assert(hasPrefix(lines[0], "."), "line 0 = '${lines[0]}'")
+  assert(lines[2] == ".tail", "the continuation line is '${lines[2]}'")
+  // Transmit: stuff every line, then the receiver removes one leading dot.
+  let wire = ""
+  let i = 0
+  while (i < len(lines)) {
+    wire = wire + stuff(lines[i]) + "\r\n"
+    i = i + 1
+  }
+  let back = ""
+  let got = split(wire, "\r\n")
+  let j = 0
+  while (j < len(got) - 1) {
+    let l = got[j]
+    if (hasPrefix(l, "..")) {
+      l = l[1:]
+    }
+    back = back + l + "\r\n"
+    j = j + 1
+  }
+  assert(qpDecode(back[0:len(back) - 2]) == text, "dot-stuffing changed the decoded text")
+}
+
+// One random character as UTF-8: ASCII, whitespace, '=', '.', a two-, three-
+// or four-byte rune, or a CRLF.
+fn randomChar(r: Rand): string {
+  let pick = r.intn(12)
+  if (pick == 0) {
+    return "\r\n"
+  }
+  if (pick == 1) {
+    return " "
+  }
+  if (pick == 2) {
+    return "="
+  }
+  if (pick == 3) {
+    return "."
+  }
+  if (pick == 4) {
+    return "é"
+  }
+  if (pick == 5) {
+    return "م"
+  }
+  if (pick == 6) {
+    return "€"
+  }
+  if (pick == 7) {
+    return "😀"
+  }
+  return string([]byte{ u8(33 + r.intn(93)) })
+}
+
+test "200 seeded random strings round-trip and keep every line within 76 characters" {
+  let r = Rand(6862)
+  let n = 0
+  while (n < 200) {
+    let s = ""
+    let size = r.intn(400)
+    let i = 0
+    while (i < size) {
+      s = s + randomChar(r)
+      i = i + 1
+    }
+    let enc = qpEncode(s)
+    assert(qpDecode(enc) == s, "string ${n} did not round-trip: '${s}' -> '${enc}'")
+    assert(widest(enc) <= 76, "string ${n}: a line of ${widest(enc)} characters")
+    let lines = split(enc, "\r\n")
+    let k = 0
+    while (k < len(lines)) {
+      let l = lines[k]
+      assert(
+        len(l) == 0 || (l[len(l) - 1] != u8(32) && l[len(l) - 1] != u8(9)),
+        "string ${n}: line ${k} ends in whitespace",
+      )
+      k = k + 1
+    }
+    n = n + 1
+  }
+}
+
+test "text with a few non-ASCII characters renders quoted-printable" {
+  let m = plainMessage()
+  m.setText("Café opens at 9\r\n")
+  let rendered = m.render() catch e {
+    assert(false, "render: ${e.message()}")
+    return
+  }
+  assert(
+    contains(rendered, "Content-Transfer-Encoding: quoted-printable\r\n"),
+    "no quoted-printable header: ${rendered}",
+  )
+  assert(contains(rendered, "\r\n\r\nCaf=C3=A9 opens at 9\r\n"), "body: ${rendered}")
+}
+
+test "an all-Arabic paragraph renders base64" {
+  let m = plainMessage()
+  m.setText(repeat("مرحبا بكم ", 8))
+  let rendered = m.render() catch e {
+    assert(false, "render: ${e.message()}")
+    return
+  }
+  assert(
+    contains(rendered, "Content-Transfer-Encoding: base64\r\n"),
+    "no base64 header: ${rendered}",
+  )
+  assert(!contains(rendered, "quoted-printable"), "quoted-printable was chosen: ${rendered}")
+}
+
+test "plain ASCII stays 7bit and the choice is the same in an HTML alternative" {
+  let m = plainMessage()
+  m.setText("Café opens at 9\r\n")
+  m.setHtml("<p>Hello</p>\r\n")
+  let rendered = m.render() catch e {
+    assert(false, "render: ${e.message()}")
+    return
+  }
+  let at = strIndexOf(rendered, "text/html")
+  assert(at > 0, "no html part: ${rendered}")
+  assert(
+    contains(rendered[0:at], "Content-Transfer-Encoding: quoted-printable\r\n"),
+    "the text part was not quoted-printable: ${rendered}",
+  )
+  assert(
+    contains(rendered[at:], "Content-Transfer-Encoding: 7bit\r\n"),
+    "the html part was not 7bit: ${rendered}",
+  )
+}
+
+test "textEncoding names all three outcomes, deterministically from the bytes" {
+  assert(textEncoding("plain\r\n") == "7bit", "plain: ${textEncoding("plain\r\n")}")
+  assert(textEncoding("café") == "quoted-printable", "cafe")
+  assert(textEncoding(repeat("م", 100)) == "base64", "arabic")
+  // A 1200-octet line is not 7bit-safe, yet is smaller as QP than base64.
+  assert(textEncoding(repeat("x", 1200)) == "quoted-printable", "long ASCII line")
+}

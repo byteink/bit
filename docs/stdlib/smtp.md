@@ -135,12 +135,24 @@ cleartext wire is worse than not sending the mail, so `AUTH` fails on a
 connection that is neither implicit TLS nor post-`STARTTLS` - and it fails
 before the command is built, so not even a username is transmitted.
 
-The fourth is a property of the data rather than a flag. A part is sent `7bit`
-only when its own bytes prove it can be: printable ASCII, and every line inside
-the limit with room for the DATA dot-stuffing octet. Anything else - a non-ASCII
-byte, a 1200-character line - becomes base64 wrapped at 76 columns. A header
-value that cannot be folded at whitespace inside the limit becomes RFC 2047
-encoded words, one per line.
+The fourth is a property of the data rather than a flag. A text part is sent
+one of three ways, chosen from its own bytes:
+
+- `7bit` when it can be: printable ASCII (tab and line breaks aside), every line
+  inside the limit with room for the DATA dot-stuffing octet.
+- Otherwise quoted-printable (RFC 2045 section 6.7) when that is no larger than
+  base64: `=XX` for a byte outside printable ASCII and for `=` itself, a trailing
+  space or tab escaped, lines cut at 76 columns with a soft break that never
+  lands inside a UTF-8 character. A mostly-English mail with one curly quote
+  stays readable in its raw form, and a 1200-character line is cut into legal
+  lines.
+- Otherwise base64 wrapped at 76 columns: text that is mostly non-ASCII, such as
+  an Arabic or Chinese paragraph, costs three characters per byte in
+  quoted-printable and about 1.3 in base64.
+
+The same text always takes the same path, and a bare LF or CR in it becomes CRLF
+on all three. A header value that cannot be folded at whitespace inside the
+limit becomes RFC 2047 encoded words, one per line.
 
 ## Addresses and messages
 
@@ -272,7 +284,29 @@ folded, or encoded as RFC 2047 words, if it is long or not printable ASCII.
 ### `Message.setText(s: string)`
 
 Set the plain-text body. Always present in the rendered message: a mail with only
-an HTML part is unreadable to a text-only client.
+an HTML part is unreadable to a text-only client. The body, and the HTML part,
+is sent `7bit`, quoted-printable or base64 as described in
+[What this module refuses to do](#what-this-module-refuses-to-do).
+
+```bit
+import { Address, Message } from "std/smtp"
+import { indexOf } from "std/strings"
+
+// The `Content-Transfer-Encoding` a body renders with: `7bit` for ASCII,
+// `quoted-printable` for a few accented letters, `base64` for a script that is
+// mostly multi-byte.
+fn encodingOf(body: string): string! {
+  let m = Message(Address{ name = "", email = "orders@inkwell.dev" })
+  m.addTo(Address{ name = "", email = "ada@example.com" })
+  m.setSubject("Your order")
+  m.setText(body)
+  let raw = m.render()?
+  let key = "Content-Transfer-Encoding: "
+  let at = indexOf(raw, key) + len(key)
+  let end = at + indexOf(raw[at:], "\r\n")
+  return raw[at:end]
+}
+```
 
 ### `Message.setHtml(s: string)`
 
