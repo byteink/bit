@@ -180,6 +180,83 @@ Whether `s` begins with `prefix`. An empty prefix is always present.
 
 Whether `s` ends with `suffix`.
 
+## Comparing text that looks the same
+
+The word `café` can be typed two ways. One is `caf` plus the single code
+point `é` (U+00E9). The other is `cafe` followed by the combining acute accent
+U+0301. A keyboard on one system and a paste from another produce them
+interchangeably. They draw the same pixels and `==` says they
+differ:
+
+```bit
+fn typedTwoWays(): bool {
+  let typed = "caf\u{E9}"
+  let pasted = "cafe\u{301}"
+  return typed == pasted // false: different code points
+}
+```
+
+Unicode calls the shared meaning *canonical equivalence* and defines four
+**normal forms** that pick one spelling for every equivalent text. `Form` names
+them:
+
+- `Form.Nfc` composes: `e` and U+0301 become U+00E9. The form to store and compare.
+- `Form.Nfd` decomposes: U+00E9 becomes `e` and U+0301. The form to take
+  accents apart.
+- `Form.Nfkc` and `Form.Nfkd` do the same and also fold *compatibility*
+  look-alikes: the ligature U+FB01 becomes `fi`, a no-break space becomes a
+  space. They lose information (`²` becomes `2`), so use them to search and
+  match, not to store.
+
+### `Form`
+
+An enum of the four normal forms: `Nfc`, `Nfd`, `Nfkc`, `Nfkd`.
+
+### `normalize(s: string, f: Form): string`
+
+`s` in form `f`, per Unicode Standard Annex #15. Normalizing is idempotent, and
+two canonically equivalent texts normalize to the same bytes, so compare after
+normalizing:
+
+```bit
+import { normalize, Form } from "std/strings"
+
+fn sameWord(a: string, b: string): bool {
+  return normalize(a, Form.Nfc) == normalize(b, Form.Nfc)
+}
+
+fn isCafe(s: string): bool {
+  return sameWord(s, "caf\u{E9}") // true for "cafe\u{301}" too
+}
+```
+
+A string with no byte at or above `0x80` is already in every form and is
+returned as is without allocating. Ill-formed UTF-8 is not preserved: each bad
+byte becomes U+FFFD, the same rule `runes` follows. The work is a single pass over `s`, and a long run of combining marks is
+sorted in linear time.
+
+### `isNormalized(s: string, f: Form): bool`
+
+Whether `s` is already in form `f`: well-formed UTF-8 that `normalize` would
+leave unchanged. Use it to skip work, or to reject input that must arrive
+normalized:
+
+```bit
+import { isNormalized, Form } from "std/strings"
+
+fn needsCleanup(name: string): bool {
+  return !isNormalized(name, Form.Nfc)
+}
+
+fn isSearchKey(query: string): bool {
+  return isNormalized(query, Form.Nfkc) // composed, no ligatures or odd spaces
+}
+```
+
+Normalizing does not change case, so `ÉCOLE` and `école` still differ; combine
+it with `equalFold` when both matter. `Form.Nfd` of `é` is two code points, so
+`runeCount` of a normalized string depends on the form.
+
 ## Searching
 
 ### `indexOf(s: string, sub: string): i64`
