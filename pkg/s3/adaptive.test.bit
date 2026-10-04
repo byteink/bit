@@ -55,6 +55,12 @@ fn adLimiter(tick: AdTick): RateLimiter {
   }
 }
 
+// The built-in limiter behind a strategy's `limiter`, for the tests that read
+// its state.
+fn adLim(s: RetryStrategy): RateLimiter {
+  return s.limiter.(RateLimiter)
+}
+
 // `parseFloat(x.toFixed(6))`, for rows the spec states to 6 decimals.
 fn adSix(x: f64): f64 {
   return f64(int(x * 1000000.0 + 0.5)) / 1000000.0
@@ -474,8 +480,8 @@ test "a throttled failure switches the limiter on before the decision and the re
   tick.ns = 500 * Millisecond
   let step = call.decide(errOf("SlowDown", 503))
   assert(isRetry(step), "throttling is retried")
-  assert(s.limiter.active(), "limiter on")
-  assert(adNear(s.limiter.rate(), 1.12), "rate ${s.limiter.rate()}")
+  assert(adLim(s).active(), "limiter on")
+  assert(adNear(adLim(s).rate(), 1.12), "rate ${adLim(s).rate()}")
   call.pause(delayOf(step))
   assert(
     len(log.items) == 2 && log.items[0] == "token" && log.items[1] == "delay",
@@ -491,13 +497,13 @@ test "the limiter hears every failed attempt, even the one that ends the call" {
   tick.ns = 500 * Millisecond
   assert(isRetry(call.decide(errOf("SlowDown", 503))), "first retry")
   tick.ns = 700 * Millisecond
-  let before = s.limiter.requestCount + s.limiter.measuredTxRate
+  let before = adLim(s).requestCount + adLim(s).measuredTxRate
   assert(
     stopsWith(call.decide(errOf("SlowDown", 503)), StopReason.AttemptsExhausted),
     "attempts spent",
   )
   assert(
-    s.limiter.requestCount + s.limiter.measuredTxRate != before,
+    adLim(s).requestCount + adLim(s).measuredTxRate != before,
     "the last failure was counted",
   )
   let t2 = adAt(0)
@@ -505,8 +511,8 @@ test "the limiter hears every failed attempt, even the one that ends the call" {
   let c2 = s2.begin()
   t2.ns = 500 * Millisecond
   c2.decide(errOf("AccessDenied", 403))
-  assert(!s2.limiter.active(), "a client error is not throttling")
-  assert(s2.limiter.requestCount + s2.limiter.measuredTxRate > 0.0, "but it is an attempt")
+  assert(!adLim(s2).active(), "a client error is not throttling")
+  assert(adLim(s2).requestCount + adLim(s2).measuredTxRate > 0.0, "but it is an attempt")
 }
 
 test "a body that cannot be replayed never reaches the limiter" {
@@ -516,8 +522,8 @@ test "a body that cannot be replayed never reaches the limiter" {
   let call = s.begin()
   tick.ns = 500 * Millisecond
   assert(stopsWith(call.decide(errOf("SlowDown", 503), false), StopReason.NotReplayable), "refused")
-  assert(!s.limiter.active(), "limiter untouched")
-  assert(s.limiter.requestCount == 0.0, "no attempt counted")
+  assert(!adLim(s).active(), "limiter untouched")
+  assert(adLim(s).requestCount == 0.0, "no attempt counted")
 }
 
 test "a success moves the rate up the curve and begin takes a token once throttled" {
@@ -528,18 +534,18 @@ test "a success moves the rate up the curve and begin takes a token once throttl
   assert(len(log.items) == 0, "off: begin does not wait")
   tick.ns = 500 * Millisecond
   first.decide(errOf("SlowDown", 503))
-  let atThrottle = s.limiter.rate()
+  let atThrottle = adLim(s).rate()
   tick.ns = 4000 * Millisecond
   first.succeeded()
   // Measured: 2 requests in the 4 s since the start, smoothed to 0.54857143;
   // the climb is capped at twice that.
   assert(adNear(atThrottle, 1.12), "at the throttle ${atThrottle}")
-  assert(adNear(s.limiter.rate(), 1.09714286), "after the success ${s.limiter.rate()}")
-  assert(adNear(s.limiter.lastMaxRate, 1.6), "the throttle's rate is kept")
+  assert(adNear(adLim(s).rate(), 1.09714286), "after the success ${adLim(s).rate()}")
+  assert(adNear(adLim(s).lastMaxRate, 1.6), "the throttle's rate is kept")
   let second = s.begin()
   assert(second.attempt() == 1, "a fresh call")
-  s.limiter.availableTokens = 0.0
-  s.limiter.lastTimestamp = f64(tick.ns) / f64(Second)
+  adLim(s).availableTokens = 0.0
+  adLim(s).lastTimestamp = f64(tick.ns) / f64(Second)
   let third = s.begin()
   assert(
     len(log.items) == 1 && log.items[0] == "token",
@@ -584,4 +590,128 @@ test "tasks sharing a starved limiter all get their tokens and never overdraw" {
     lim.availableTokens >= 0.0 && lim.availableTokens <= lim.maxCapacity,
     "tokens ${lim.availableTokens}",
   )
+}
+
+// --- a limiter of the caller's own (#6845) ------------------------------------
+
+// A `SendLimiter` that only counts: tokens asked for, answers heard and how many
+// of them were throttling ones.
+class AdCount {
+  sends: int
+  updates: int
+  throttles: int
+
+  getSendToken() {
+    this.sends = this.sends + 1
+  }
+
+  updateClientSendingRate(throttling: bool) {
+    this.updates = this.updates + 1
+    if (throttling) {
+      this.throttles = this.throttles + 1
+    }
+  }
+}
+
+fn adCounter(): AdCount {
+  return AdCount{ sends = 0, updates = 0, throttles = 0 }
+}
+
+fn adCounted(mode: RetryMode, limiter: SendLimiter): RetryStrategy {
+  let s = RetryStrategy(mode, 5, limiter = limiter) catch _ {
+    panic("strategy")
+  }
+  s.random = () => 0.0
+  s.clock = () => 1000 * Second
+  s.sleeper = (ns: int) => {}
+  return s
+}
+
+test "a limiter given to the strategy gets one token per attempt and one update per response" {
+  let c = adCounter()
+  let s = adCounted(RetryMode.Adaptive, c)
+  let call = s.begin()
+  assert(c.sends == 1 && c.updates == 0, "attempt 1 took its token: ${c.sends} sends")
+  let step = call.decide(errOf("SlowDown", 503))
+  assert(isRetry(step), "throttling is retried")
+  assert(c.updates == 1 && c.throttles == 1, "heard the throttle: ${c.updates} updates")
+  call.pause(delayOf(step))
+  assert(c.sends == 2, "attempt 2 took its token: ${c.sends} sends")
+  let step2 = call.decide(errOf("InternalError", 500))
+  assert(isRetry(step2), "a server error is retried")
+  assert(
+    c.updates == 2 && c.throttles == 1,
+    "an error that is not throttling: ${c.updates} updates",
+  )
+  call.pause(delayOf(step2))
+  call.succeeded()
+  assert(
+    c.sends == 3 && c.updates == 3 && c.throttles == 1,
+    "${c.sends} sends, ${c.updates} updates",
+  )
+  let denied = s.begin()
+  denied.decide(errOf("AccessDenied", 403))
+  assert(c.sends == 4 && c.updates == 4, "the answer that ends a call is heard too")
+  let body = s.begin()
+  body.decide(errOf("SlowDown", 503), false)
+  assert(c.sends == 5 && c.updates == 4, "a body that cannot be sent again is never an answer")
+}
+
+test "standard mode never asks the limiter it was given" {
+  let c = adCounter()
+  let s = adCounted(RetryMode.Standard, c)
+  let call = s.begin()
+  call.pause(delayOf(call.decide(errOf("SlowDown", 503))))
+  call.succeeded()
+  assert(c.sends == 0 && c.updates == 0, "${c.sends} sends, ${c.updates} updates")
+  s.limiter.getSendToken()
+  assert(c.sends == 1, "and the strategy holds the very object")
+}
+
+test "a strategy without a limiter option builds its own, one each" {
+  let a = adCounted(RetryMode.Adaptive, nil)
+  let b = adCounted(RetryMode.Adaptive, nil)
+  assert(a.limiter != nil && b.limiter != nil, "both have one")
+  assert(adLim(a).rate() == 0.5 && !adLim(a).active(), "with the SDK's constants, off")
+  adLim(a).updateClientSendingRate(true)
+  assert(adLim(a).active() && !adLim(b).active(), "not the same one")
+}
+
+test "one limiter given to two strategies hears both of their throttles" {
+  let c = adCounter()
+  let a = adCounted(RetryMode.Adaptive, c)
+  let b = adCounted(RetryMode.Adaptive, c)
+  let ca = a.begin()
+  let cb = b.begin()
+  ca.decide(errOf("SlowDown", 503))
+  assert(c.throttles == 1, "first client's throttle")
+  cb.decide(errOf("SlowDown", 503))
+  assert(c.throttles == 2, "second client's throttle")
+  cb.succeeded()
+  assert(
+    c.sends == 2 && c.updates == 3 && c.throttles == 2,
+    "${c.sends} sends, ${c.updates} updates",
+  )
+}
+
+test "the built-in limiter shared by two strategies is cut by either one's throttle" {
+  let tick = adAt(0)
+  let shared = adLimiter(tick)
+  shared.sleeper = (ns: int) => {
+    tick.ns = tick.ns + ns
+  }
+  let a = adCounted(RetryMode.Adaptive, shared)
+  let b = adCounted(RetryMode.Adaptive, shared)
+  let ca = a.begin()
+  tick.ns = 500 * Millisecond
+  assert(!shared.active(), "nothing throttled yet")
+  ca.decide(errOf("SlowDown", 503))
+  assert(shared.active(), "the first client's throttle switched it on")
+  assert(adNear(shared.rate(), 1.12), "rate ${shared.rate()}")
+  let cb = b.begin()
+  tick.ns = 1000 * Millisecond
+  let before = shared.rate()
+  cb.decide(errOf("SlowDown", 503))
+  assert(shared.rate() < before, "the second client's throttle cut it again: ${shared.rate()}")
+  assert(shared.requestCount + shared.measuredTxRate > 0.0, "and both attempts were measured")
 }

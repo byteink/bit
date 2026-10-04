@@ -319,14 +319,13 @@ a cubic curve, never above twice the measured rate.
 ```bit
 import { RateLimiter, RateLimiterOptions, RetryMode, RetryStrategy } from "s3"
 
-fn gentleNightly(): RetryStrategy! {
-  let strategy = RetryStrategy(RetryMode.Adaptive, 5)?
-  strategy.limiter = RateLimiter(RateLimiterOptions(beta = 0.5, minFillRate = 1.0))?
-  return strategy
+fn gentleNightly(): (RetryStrategy, RateLimiter)! {
+  let limiter = RateLimiter(RateLimiterOptions(beta = 0.5, minFillRate = 1.0))?
+  let strategy = RetryStrategy(RetryMode.Adaptive, 5, limiter = limiter)?
+  return (strategy, limiter)
 }
 
-fn pacing(strategy: RetryStrategy): string {
-  let limiter: RateLimiter = strategy.limiter
+fn pacing(limiter: RateLimiter): string {
   if (!limiter.active()) {
     return "S3 has not pushed back, nothing is paced"
   }
@@ -344,7 +343,7 @@ call's first token, `call.decide(e, ...)` tells the limiter how the attempt
 failed before it answers, `call.pause(delay)` waits for a token and then the
 backoff, and `call.succeeded()` tells it the attempt worked. `sendOnce` shows
 the two limiter calls by themselves, for a client that paces something the
-strategy does not see. One limiter belongs to one strategy and is shared by
+strategy does not see. A strategy that is not given a limiter builds its own and shares it between
 every call it serves, so ten thousand uploads on a client slow down together.
 
 The curve is the SDK's, constant for constant: `beta` 0.7, `scaleConstant` 0.4,
@@ -354,6 +353,71 @@ tokens a second and a bucket of at least `minCapacity` 1 token.
 would make the curve divide by zero or a send wait forever (a `beta` outside
 0 to 1, a `minCapacity` below 1, a `minFillRate` or `scaleConstant` that is not
 above 0). A `Standard` strategy never reads its limiter.
+
+#### One limiter for several clients
+
+S3 throttles an account and a prefix, not a client object. Two clients of one
+process that each paced themselves would each learn about a `SlowDown` only from
+their own requests, and the one that has not been throttled yet keeps sending at
+full speed into the limit the other found. Give both strategies the same limiter
+and a throttle seen by either slows both.
+
+The `limiter` option takes a `SendLimiter`, the SDK's `RateLimiter` interface:
+`getSendToken()`, called before every attempt, and
+`updateClientSendingRate(throttling)`, called once for every attempt's outcome,
+with `true` when the answer was a throttling one. `RateLimiter` is the built-in
+one; anything else with those two methods works, such as the counter below that
+only watches. It is called from many tasks at once, so it guards its own state.
+
+```bit
+import { Mutex } from "std/sync"
+import { RateLimiter, RetryMode, RetryStrategy, SendLimiter } from "s3"
+
+class Pushback {
+  mu: Mutex
+  sent: int
+  throttled: int
+
+  init() {
+    this.mu = Mutex()
+    this.sent = 0
+    this.throttled = 0
+  }
+
+  export getSendToken() {
+    this.mu.lock()
+    this.sent = this.sent + 1
+    this.mu.unlock()
+  }
+
+  export updateClientSendingRate(throttling: bool) {
+    if (!throttling) {
+      return
+    }
+    this.mu.lock()
+    this.throttled = this.throttled + 1
+    this.mu.unlock()
+  }
+}
+
+fn shareOne(): (RetryStrategy, RetryStrategy)! {
+  let limiter = RateLimiter()?
+  let uploads = RetryStrategy(RetryMode.Adaptive, 5, limiter = limiter)?
+  let reports = RetryStrategy(RetryMode.Adaptive, 5, limiter = limiter)?
+  return (uploads, reports)
+}
+
+fn watched(): RetryStrategy! {
+  let watcher: SendLimiter = Pushback()
+  return RetryStrategy(RetryMode.Adaptive, 5, limiter = watcher)
+}
+```
+
+Each client builds its own `RetryStrategy` (its quota stays its own) and hands
+it the same `limiter`. When `uploads` is told `SlowDown`, the limiter's rate
+drops, and the next `reports.begin()` waits for its token at the lower rate
+without `reports` having been throttled itself. Leave the option out and the
+strategy builds a `RateLimiter()` of its own.
 
 ## Sharp edges
 
