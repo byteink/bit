@@ -59,6 +59,50 @@ fn editableBy(userId: string): Where<Article>! {
 `Where<Article>()` with nothing in it is the empty filter and matches every
 article.
 
+## Writing the condition as an object literal
+
+Building clauses by hand says everything, and says it at length. Where a
+`Where<Article>` is expected you can write the condition the way you would say
+it, as an object literal whose keys are the article's fields:
+
+```bit
+import { Where } from "std/where"
+
+class Article {
+  authorId: string,
+  status: string,
+  editor: Option<string>,
+}
+
+fn mine(userId: string) {
+  let editable: Where<Article> = { authorId: userId, status: "published" }
+  let anything: Where<Article> = {}
+  let unassigned: Where<Article> = { editor: nil }
+}
+```
+
+Each entry compares its field for equality, and the entries are all required.
+`{}` is the empty filter. A key that is not a field of `Article` is an error at
+compile time, with the nearest field as a suggestion, and so is a value of the
+wrong type:
+
+```text
+error[E0301]: Article has no field "authorID"
+   |                             ^^^^^^^^ did you mean "authorId"?
+
+error[E0302]: field "authorId" of Article is 'string', found 'i64'
+```
+
+An `Option` field accepts a value of its payload type, or `nil` to test for
+absence. `nil` on any other field is the same E0302. The literal is only a
+condition because a `Where<Article>` is expected where it is written; with
+another expected type it is an ordinary map and `authorId` would be a variable.
+
+The operator forms (`{ age: { gte: 18 } }`), the `and`, `or` and `not` keys and
+`related(...)` values are reported as E0303 until they are supported. A program
+that contains a condition literal type-checks but is not yet built: lowering it
+to the clauses above is the next step.
+
 ## Or, nested and negated
 
 `Join.Or` makes a node match when any of its clauses or children match. Nesting
