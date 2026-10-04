@@ -145,7 +145,23 @@ run_cap() {
   return "$rc"
 }
 
-match=0 missing=0 falsepos=0 diff=0 timeout=0 firstfp="" firstdiff="" firsthang=""
+# FALSE POSITIVES DECLARED AGAINST THE PINNED ORACLE. One line per file:
+# `<path> <error code> #<ticket>`. A file listed here that the oracle accepts
+# and bit2 rejects WITH EXACTLY THAT CODE is a deliberate new check-time
+# rejection the pinned stage0 predates (it accepted the code and failed later,
+# at lowering), so it scores EXPLAINED, not FALSEPOS. Any other code still
+# scores FALSEPOS. An entry that no longer scores as a declared false positive
+# fails the run as RETIRED, so the list empties itself at the next repin; this
+# is the same contract as diffruntime's RELOC_DECLARED.
+FALSEPOS_DECLARED="
+_tests_/cases/class_arg_bare_class.bit E0041 #7005
+_tests_/cases/class_arg_not_class.bit E0041 #7005
+"
+declaredCode() {
+  printf '%s\n' "$FALSEPOS_DECLARED" | awk -v f="$1" '$1 == f { print $2 }'
+}
+
+match=0 missing=0 falsepos=0 diff=0 timeout=0 explained=0 firstfp="" firstdiff="" firsthang="" hitdeclared=""
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 seedcap="$work/seed.out"
@@ -217,13 +233,28 @@ for f in $(find stdlib examples _tests_/cases _tests_/imports -name '*.bit' | so
       [ -z "$firstdiff" ] && firstdiff="$f"
     fi
   elif [ "$src" -eq 0 ] && [ "$brc" -ne 0 ]; then
+    code=$(declaredCode "$f")
+    if [ -n "$code" ] && printf '%s' "$b2" | grep -q "^error\[$code\]"; then
+      explained=$((explained + 1))
+      hitdeclared="$hitdeclared $f"
+      continue
+    fi
     falsepos=$((falsepos + 1))
     [ -z "$firstfp" ] && firstfp="$f"
   else
     missing=$((missing + 1))
   fi
 done
-echo "check differential: MATCH=$match MISSING=$missing FALSEPOS=$falsepos DIFF=$diff TIMEOUT=$timeout"
+echo "check differential: MATCH=$match MISSING=$missing FALSEPOS=$falsepos DIFF=$diff EXPLAINED=$explained TIMEOUT=$timeout"
+for d in $(printf '%s\n' "$FALSEPOS_DECLARED" | awk 'NF { print $1 }'); do
+  case " $hitdeclared " in
+  *" $d "*) echo "  $d -> explained by declared false positive ($(printf '%s\n' "$FALSEPOS_DECLARED" | awk -v f="$d" '$1 == f { print $2, $3 }'))" ;;
+  *)
+    echo "RETIRED: $d is no longer a declared false positive; delete its FALSEPOS_DECLARED line" >&2
+    falsepos=$((falsepos + 1))
+    ;;
+  esac
+done
 if [ -n "$firstfp" ]; then
   echo "=== FIRST FALSE POSITIVE (bit2 rejects code the seed accepts): $firstfp"
   run "$BIT2" check "$firstfp" | head -8
