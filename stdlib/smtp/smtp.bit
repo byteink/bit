@@ -35,7 +35,7 @@
 // it off and is the only way to; it is an explicit argument at the call site,
 // never a default and never inferred.
 
-import { dial as tcpDial } from "std/net"
+import { dialDeadline as tcpDialDeadline } from "std/net"
 import {
   TlsConfig, emptyTrustStore, client as tlsUpgrade,
 } from "std/tls"
@@ -56,19 +56,37 @@ import { hasPrefix, toUpper } from "std/strings"
 //                       means the host that was dialed.
 //   roots               trust anchors. Empty means the operating system store,
 //                       with the bundled roots as the fallback.
+//   timeout             nanoseconds each step may take, bounding the connect
+//                       (TLS handshake included), the greeting, every command
+//                       and its reply, and a DATA payload and its reply. Must be
+//                       positive. A step that runs past it fails with an error
+//                       naming it and closes the connection (#6856).
 export class Options {
   export insecureSkipVerify: bool
   export serverName: string
   export roots: TrustStore
+  export timeout: int
 
   init(
     insecureSkipVerify: bool = false,
     serverName: string = "",
     roots: TrustStore = emptyTrustStore(),
+    timeout: int = defaultTimeout,
   ) {
     this.insecureSkipVerify = insecureSkipVerify
     this.serverName = serverName
     this.roots = roots
+    this.timeout = timeout
+  }
+}
+
+// Refuse a timeout that would make every step fail at once or never: a
+// non-positive one is a caller's bug (a unit slip, a zero from an unset
+// config), and a deadline in the past would surface as a "timed out" from a
+// server that never had a chance.
+fn checkTimeout(o: Options): ()!SmtpError {
+  if (o.timeout <= 0) {
+    fail localError("Options.timeout must be positive, got ${o.timeout}")
   }
 }
 
@@ -155,6 +173,7 @@ export class Client {
   // which is the plaintext command-injection shape (CVE-2011-0411), not a
   // buffer to quietly discard. The caller must `ehlo` again afterwards.
   export startTls(o: Options): ()!SmtpError {
+    checkTimeout(o)?
     if (this.secure) {
       fail localError("the connection is already TLS")
     }
@@ -166,13 +185,29 @@ export class Client {
     if (len(this.w.buf) > 0) {
       fail protoError("STARTTLS", "the server sent data before the TLS handshake")
     }
+    // The handshake gets its own budget, `o.timeout`, rather than what is left
+    // of the STARTTLS command's. `std/tls` runs it under the deadline already
+    // on the socket.
+    this.w.timeout = o.timeout
+    this.w.arm()
     let t = tlsUpgrade(this.tcp, this.host, tlsConfigOf(o, this.host)) catch e {
-      fail ioError("STARTTLS", e)
+      fail this.upgradeError(e)
     }
     this.w.s = tlsStream{ c = t }
     this.secure = true
     this.exts = []string(0)
     this.greeted = false
+  }
+
+  // The error for a TLS handshake that failed: a typed timeout, with the
+  // connection closed, when the deadline was the cause.
+  upgradeError(e: error): SmtpError {
+    if (isTimeout(e)) {
+      let t = this.w.expired("STARTTLS", e)
+      this.tcp.close()
+      return t
+    }
+    return ioError("STARTTLS", e)
   }
 
   // Authenticate with SASL PLAIN (RFC 4616). Refused outright, before the
@@ -276,8 +311,15 @@ fn checkEhloName(name: string): ()!SmtpError {
 }
 
 // Read the server's opening greeting and build the session around `s`.
-fn openSession(tcp: TcpConn, s: Stream, host: string, secure: bool): Client!SmtpError {
-  let w = Wire{ s = s, buf = "" }
+fn openSession(
+  tcp: TcpConn,
+  s: Stream,
+  host: string,
+  secure: bool,
+  timeout: int,
+): Client!SmtpError {
+  let w = Wire{ s = s, buf = "", timeout = timeout, dead = false }
+  w.arm()
   let greeting = w.readReply("greeting") catch e {
     s.shut()
     tcp.close()
@@ -293,27 +335,43 @@ fn openSession(tcp: TcpConn, s: Stream, host: string, secure: bool): Client!Smtp
   }
 }
 
-// Connect to a cleartext submission port (587, or 25 for a relay) and read the
-// greeting. The session is NOT secure yet: `startTls` makes it so, and until it
-// does, `authPlain`/`authLogin` refuse to run.
-export fn dial(host: string, port: int): Client!SmtpError {
-  let tcp = tcpDial(host, port) catch e {
+// Connect to `host:port` within `o.timeout`, failing with a typed timeout when
+// the connect does not finish in time. The returned stream's deadline is the
+// connect's own, so a TLS handshake that follows runs under the same budget;
+// `openSession` re-arms it for the greeting.
+fn connect(host: string, port: int, o: Options): TcpConn!SmtpError {
+  checkTimeout(o)?
+  return tcpDialDeadline(host, port, monotonic().ns + o.timeout) catch e {
+    if (isTimeout(e)) {
+      fail timeoutError("connect", o.timeout / Millisecond, e)
+    }
     fail ioError("connect", e)
   }
-  return openSession(tcp, plainStream{ c = tcp }, host, false)?
+}
+
+// Connect to a cleartext submission port (587, or 25 for a relay) and read the
+// greeting. The session is NOT secure yet: `startTls` makes it so, and until it
+// does, `authPlain`/`authLogin` refuse to run. The connect, the greeting and
+// every later step each get `o.timeout`; only `timeout` of `o` is read, since
+// no TLS happens here.
+export fn dial(host: string, port: int, o: Options = Options()): Client!SmtpError {
+  let tcp = connect(host, port, o)?
+  return openSession(tcp, plainStream{ c = tcp }, host, false, o.timeout)?
 }
 
 // Connect to an implicit-TLS submission port (465): the TLS handshake happens
 // before the greeting, so there is no cleartext phase and no `startTls`. The
 // server's certificate is verified against `o` — by default, against the system
-// trust anchors, for the dialed host.
+// trust anchors, for the dialed host. The connect and the handshake share one
+// `o.timeout`; the greeting and every later step get a fresh one each.
 export fn dialTls(host: string, port: int, o: Options): Client!SmtpError {
-  let tcp = tcpDial(host, port) catch e {
-    fail ioError("connect", e)
-  }
+  let tcp = connect(host, port, o)?
   let t = tlsUpgrade(tcp, host, tlsConfigOf(o, host)) catch e {
     tcp.close()
+    if (isTimeout(e)) {
+      fail timeoutError("connect", o.timeout / Millisecond, e)
+    }
     fail ioError("connect", e)
   }
-  return openSession(tcp, tlsStream{ c = t }, host, true)?
+  return openSession(tcp, tlsStream{ c = t }, host, true, o.timeout)?
 }

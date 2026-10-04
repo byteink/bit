@@ -1,0 +1,254 @@
+// stdlib/smtp/timeout.test.bit — every step of a session ends (#6856).
+//
+// The servers here answer a script and then go SILENT: they hold the socket
+// open and say nothing, which is the one peer a read with no deadline never
+// returns from. The client's `Options.timeout` is 200 ms, so the assertions are
+// a lower bound (the failure may not arrive before the timeout, or it was not
+// the timeout that produced it) and a generous upper bound that only guards
+// against a hang: a loaded machine delays wakeups, and a tight upper bound
+// would measure the machine (#7107).
+//
+// Each server also publishes how it ended. "closed" is the proof that a timed
+// out client closed the socket rather than abandoned it: the silent server's own
+// read only returns empty when the peer closed.
+//
+// `ehloPlain`, `plainMessage` and the client surface are module siblings
+// (SPEC §19).
+
+// How far a timeout may arrive early: the deadline is `now + timeout` taken just
+// before the wait starts, so the wait cannot be shorter than the timeout by more
+// than the clock's granularity.
+const earlyNs: int = 20 * Millisecond
+
+// The hang guard: five times the 30 s default would still be a hang here, and
+// the client's timeout is 200 ms, so 5 s is generous at any load.
+const hangNs: int = 5 * Second
+
+// The server's own bound on waiting for the client to close, so a client that
+// forgets to close fails this test instead of parking it.
+const serverWaitNs: int = 10 * Second
+
+// One scripted-then-silent server. `greet` says whether it sends the 220
+// greeting; `replies` are answered one per client line; after the last it says
+// nothing and waits for the client to close.
+class quiet {
+  ln: Listener,
+  greet: bool,
+  replies: []string,
+  done: chan<string>,
+}
+
+// Wait on `c` until the client closes it, up to `serverWaitNs`. "closed" when it
+// did, "server-timeout" when the client held it open past the guard.
+fn waitClosed(c: TcpConn): string {
+  c.setDeadline(monotonic().ns + serverWaitNs)
+  let turns = 0
+  while (turns < 64) {
+    turns = turns + 1
+    let chunk = c.read(65536)
+    if (len(chunk) == 0) {
+      if (c.readTimedOut()) {
+        return "server-timeout"
+      }
+      return "closed"
+    }
+  }
+  return "client-kept-talking"
+}
+
+// Serve one connection: greeting if asked, one reply per client line, then
+// silence until the client closes.
+fn serveQuiet(q: quiet) {
+  let c = q.ln.accept() catch _ {
+    q.done <- "accept-failed"
+    return
+  }
+  let outcome = runQuiet(q, c) catch e {
+    "server-error: ${e.message()}"
+  }
+  c.close()
+  q.done <- outcome
+}
+
+// The script half of `serveQuiet`; returns how the connection ended.
+fn runQuiet(q: quiet, c: TcpConn): string! {
+  if (q.greet) {
+    c.write("220 quiet.example.com ESMTP\r\n")?
+  }
+  let step = 0
+  while (step < len(q.replies)) {
+    let chunk = c.read(65536)
+    if (len(chunk) == 0) {
+      return "closed-early"
+    }
+    c.write(q.replies[step])?
+    step = step + 1
+  }
+  return waitClosed(c)
+}
+
+// Bind and start a quiet server; returns its port and the channel its ending
+// arrives on.
+fn startQuiet(greet: bool, replies: []string): (int, chan<string>)! {
+  let ln = listen("127.0.0.1", 0)?
+  let port = ln.port()?
+  let done = chan<string>(1)
+  spawn serveQuiet(quiet{ ln = ln, greet = greet, replies = replies, done = done })
+  return (port, done)
+}
+
+// Assert `e` is the typed timeout for `command` and that it took at least the
+// timeout and not a hang's worth: `started` is the monotonic ns before the call.
+fn assertTimedOut(e: SmtpError, command: string, started: int) {
+  let took = monotonic().ns - started
+  assert(contains(e.message(), "timed out"), "not a timeout: ${e.message()}")
+  assert(e.command == command, "command = '${e.command}', want '${command}'")
+  assert(e.message() == "smtp: ${command} timed out after 200ms", "message: ${e.message()}")
+  assert(e.code == 0, "a timeout carries no reply code, got ${e.code}")
+  assert(e.transient(), "a timeout is worth retrying")
+  assert(took >= 200 * Millisecond - earlyNs, "failed after ${took}ns, before the 200ms timeout")
+  assert(took < hangNs, "took ${took}ns: the timeout did not bound the wait")
+}
+
+// The options every test here dials with.
+fn quickOptions(): Options {
+  return Options(timeout = 200 * Millisecond)
+}
+
+test "a server that accepts and never greets times out the dial and is closed" {
+  let (port, done) = startQuiet(false, []string(0)) catch e {
+    assert(false, "startQuiet: ${e.message()}")
+    return
+  }
+  let started = monotonic().ns
+  dial("127.0.0.1", port, quickOptions()) catch e {
+    assertTimedOut(e, "greeting", started)
+    let ending = <- done
+    assert(ending == "closed", "the server saw '${ending}', want the client to have closed")
+    return
+  }
+  assert(false, "dial succeeded against a server that never greeted")
+}
+
+test "a server that goes silent on MAIL FROM times out send, closes, and is not reused" {
+  let (port, done) = startQuiet(true, [ehloPlain()]) catch e {
+    assert(false, "startQuiet: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port, quickOptions()) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  c.ehlo("client.example.com") catch e {
+    assert(false, "ehlo: ${e.message()}")
+    return
+  }
+  let started = monotonic().ns
+  c.send(plainMessage()) catch e {
+    assertTimedOut(e, "MAIL FROM", started)
+    let ending = <- done
+    assert(ending == "closed", "the server saw '${ending}', want the client to have closed")
+    c.send(plainMessage()) catch again {
+      assert(
+        contains(again.message(), "closed after a timeout"),
+        "reuse was not refused: ${again.message()}",
+      )
+      assert(!again.transient(), "reusing a dead connection is a caller error")
+      return
+    }
+    assert(false, "a second send went through a connection that timed out")
+    return
+  }
+  assert(false, "send succeeded against a server that never answered MAIL FROM")
+}
+
+test "a server that goes silent after the DATA payload times out the end-of-DATA reply" {
+  let (port, done) = startQuiet(
+    true, [ehloPlain(), "250 OK\r\n", "250 OK\r\n", "354 Send it\r\n"],
+  ) catch e {
+    assert(false, "startQuiet: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port, quickOptions()) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  c.ehlo("client.example.com") catch e {
+    assert(false, "ehlo: ${e.message()}")
+    return
+  }
+  let started = monotonic().ns
+  c.send(plainMessage()) catch e {
+    assertTimedOut(e, "end of DATA", started)
+    let ending = <- done
+    assert(ending == "closed", "the server saw '${ending}', want the client to have closed")
+    return
+  }
+  assert(false, "send succeeded against a server that never acknowledged the payload")
+}
+
+test "a STARTTLS handshake the server never answers times out and closes" {
+  let (port, done) = startQuiet(true, [ehloStartTls(), "220 Ready\r\n"]) catch e {
+    assert(false, "startQuiet: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port, quickOptions()) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  c.ehlo("client.example.com") catch e {
+    assert(false, "ehlo: ${e.message()}")
+    return
+  }
+  let started = monotonic().ns
+  c.startTls(quickOptions()) catch e {
+    assertTimedOut(e, "STARTTLS", started)
+    let ending = <- done
+    assert(ending == "closed", "the server saw '${ending}', want the client to have closed")
+    return
+  }
+  assert(false, "startTls succeeded against a server that never answered the handshake")
+}
+
+// Assert that dialing with `timeout` (through `dialTls` when `implicit`) fails
+// with exactly the non-positive-timeout refusal, before any connect: port 1 has
+// no listener, so a connect attempt would fail with a different message.
+fn assertRefused(implicit: bool, timeout: int) {
+  let o = Options(timeout = timeout)
+  let want = "smtp: Options.timeout must be positive, got ${timeout}"
+  if (implicit) {
+    dialTls("127.0.0.1", 1, o) catch e {
+      assert(e.message() == want, "dialTls message: ${e.message()}")
+      assert(!e.transient(), "a developer mistake is not worth retrying")
+      return
+    }
+  } else {
+    dial("127.0.0.1", 1, o) catch e {
+      assert(e.message() == want, "dial message: ${e.message()}")
+      assert(!e.transient(), "a developer mistake is not worth retrying")
+      return
+    }
+  }
+  assert(false, "a timeout of ${timeout} was accepted")
+}
+
+test "a timeout that is not positive fails before anything connects" {
+  assertRefused(false, 0)
+  assertRefused(false, 0 - 5)
+  assertRefused(true, 0)
+}
+
+test "dialTls against a server that never speaks times out the handshake" {
+  let (port, done) = startQuiet(false, []string(0)) catch e {
+    assert(false, "startQuiet: ${e.message()}")
+    return
+  }
+  let started = monotonic().ns
+  dialTls("127.0.0.1", port, quickOptions()) catch e {
+    assertTimedOut(e, "connect", started)
+    let ending = <- done
+    assert(ending == "closed", "the server saw '${ending}', want the client to have closed")
+    return
+  }
+  assert(false, "dialTls succeeded against a server that never spoke")
+}
