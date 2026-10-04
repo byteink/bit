@@ -26,7 +26,7 @@
 // DETECTION, ONCE. `crc32Hw` caches what this CPU has: on arm64 bits 3 (CRC32)
 // and 1 (PMULL) of `bit_rt_crypto_hwcaps` (ABI.md §21c: `hw.optional.armv8_crc32`
 // on Darwin, `HWCAP_CRC32` on Linux), on x86-64 CPUID leaf 1 ECX bits 20
-// (SSE4.2) and 1 (PCLMULQDQ). The CRC instruction is optional in ARMv8.0, so a
+// (SSE4.2), 19 (SSE4.1) and 1 (PCLMULQDQ). The CRC instruction is optional in ARMv8.0, so a
 // core without it takes the table path rather than faulting on the first
 // `crc32cx`. `bit_rt_port_syscalls_on_x64` is folded to the build target's
 // answer (compiler/opttarget.bit), so the untaken arch's arm is deleted.
@@ -57,7 +57,7 @@ extern fn bit_rt_port_syscalls_on_x64(): bool
 const crcHwC: int = 1     // CRC-32C instruction present
 const crcHwIeee: int = 2  // CRC-32 IEEE instruction present
 const crcHwClmul: int = 4 // carry-less multiply present (PMULL, PCLMULQDQ)
-const crcHwFold: int = 8  // x86-64 CRC-32 IEEE by PCLMULQDQ folding
+const crcHwFold: int = 8  // x86-64 CRC-32 IEEE folding (PCLMULQDQ, SSE4.1)
 const crcHwChunk: int = 8192
 // Words per three-lane block: three lanes of 128 words. The 0x400/0x800 lane
 // offsets and the join constants in the asm blocks are fixed to it.
@@ -83,7 +83,10 @@ fn crc32Hw(): int {
       caps = crcHwC
     }
     if ((ecx & 2) != 0) {
-      caps = caps | crcHwClmul | crcHwFold
+      caps = caps | crcHwClmul
+    }
+    if ((ecx & 0x80002) == 0x80002) {
+      caps = caps | crcHwFold
     }
   } else {
     let hw = bit_rt_crypto_hwcaps()
@@ -355,62 +358,58 @@ fn crc32ieee3Asm(crc: u32, p: *u8, blocks: int): u32 {
   }
 }
 
-// `blocks` (> 0) 64-byte blocks from `p` folded into four 128-bit
-// accumulators with `crc` xored into the first, then down to one, then to the
-// 64-bit remainder M returned in rax, so that the CRC of M's 8 bytes from a
-// zero state is the new state. Fold constants are x^k mod P, bit-reflected and
+// `blocks` (> 0) 64-byte blocks from `p` xored into four 128-bit
+// accumulators, the first starting from `crc`, each folded forward 512 bits
+// before the next block; then folded down to one, then to the 64-bit
+// remainder M returned in rax, so that the CRC of M's 8 bytes from a zero
+// state is the new state. Fold constants are x^k mod P, bit-reflected and
 // shifted left one: by 512 bits x^544 and x^480, by 128 bits x^160 and x^96,
-// and the last 64 bits x^96 and x^64. x86-64 only: the arm64 arm is `udf #0`.
+// and the last 64 bits x^96 and x^64. `pinsrq`/`pmovzxdq` are SSE4.1.
+// x86-64 only: the arm64 arm is `udf #0`.
 fn crc32ieeeFoldAsm(crc: u32, p: *u8, blocks: int): u64 {
   return asm {
     arm64 { 0x00000000 } // udf #0
     x64 {
-      0xF3, 0x0F, 0x6F, 0x01,                                     // movdqu xmm0, [rcx]
-      0xF3, 0x0F, 0x6F, 0x49, 0x10,                               // movdqu xmm1, [rcx + 0x10]
-      0xF3, 0x0F, 0x6F, 0x51, 0x20,                               // movdqu xmm2, [rcx + 0x20]
-      0xF3, 0x0F, 0x6F, 0x59, 0x30,                               // movdqu xmm3, [rcx + 0x30]
-      0x66, 0x0F, 0x6E, 0xE0,                                     // movd xmm4, eax
-      0x66, 0x0F, 0xEF, 0xC4,                                     // pxor xmm0, xmm4
-      0x48, 0x83, 0xC1, 0x40,                                     // add rcx, 0x40
+      0x66, 0x0F, 0x6E, 0xC0,                                     // movd xmm0, eax
+      0x66, 0x0F, 0xEF, 0xC9,                                     // pxor xmm1, xmm1
+      0x66, 0x0F, 0xEF, 0xD2,                                     // pxor xmm2, xmm2
+      0x66, 0x0F, 0xEF, 0xDB,                                     // pxor xmm3, xmm3
       0x49, 0xB8, 0xD4, 0x2B, 0x44, 0x54, 0x01, 0x00, 0x00, 0x00, // mov r8, 0x154442bd4
       0x66, 0x49, 0x0F, 0x6E, 0xE0,                               // movq xmm4, r8
       0x49, 0xB9, 0x96, 0x15, 0xE4, 0xC6, 0x01, 0x00, 0x00, 0x00, // mov r9, 0x1c6e41596
-      0x66, 0x49, 0x0F, 0x6E, 0xE9,                               // movq xmm5, r9
-      0x66, 0x0F, 0x6C, 0xE5,                                     // punpcklqdq xmm4, xmm5
-      0x48, 0xFF, 0xCA,                                           // dec rdx
-      0x74, 0x7C,                                                 // je +124
-      0x66, 0x0F, 0x6F, 0xF8,                                     // movdqa xmm7, xmm0
-      0x66, 0x0F, 0x3A, 0x44, 0xC4, 0x00,                         // pclmulqdq xmm0, xmm4, 0x0
-      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
+      0x66, 0x49, 0x0F, 0x3A, 0x22, 0xE1, 0x01,                   // pinsrq xmm4, r9, 0x1
       0xF3, 0x0F, 0x6F, 0x31,                                     // movdqu xmm6, [rcx]
-      0x66, 0x0F, 0xEF, 0xC7,                                     // pxor xmm0, xmm7
       0x66, 0x0F, 0xEF, 0xC6,                                     // pxor xmm0, xmm6
-      0x66, 0x0F, 0x6F, 0xF9,                                     // movdqa xmm7, xmm1
-      0x66, 0x0F, 0x3A, 0x44, 0xCC, 0x00,                         // pclmulqdq xmm1, xmm4, 0x0
-      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
       0xF3, 0x0F, 0x6F, 0x71, 0x10,                               // movdqu xmm6, [rcx + 0x10]
-      0x66, 0x0F, 0xEF, 0xCF,                                     // pxor xmm1, xmm7
       0x66, 0x0F, 0xEF, 0xCE,                                     // pxor xmm1, xmm6
-      0x66, 0x0F, 0x6F, 0xFA,                                     // movdqa xmm7, xmm2
-      0x66, 0x0F, 0x3A, 0x44, 0xD4, 0x00,                         // pclmulqdq xmm2, xmm4, 0x0
-      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
       0xF3, 0x0F, 0x6F, 0x71, 0x20,                               // movdqu xmm6, [rcx + 0x20]
-      0x66, 0x0F, 0xEF, 0xD7,                                     // pxor xmm2, xmm7
       0x66, 0x0F, 0xEF, 0xD6,                                     // pxor xmm2, xmm6
-      0x66, 0x0F, 0x6F, 0xFB,                                     // movdqa xmm7, xmm3
-      0x66, 0x0F, 0x3A, 0x44, 0xDC, 0x00,                         // pclmulqdq xmm3, xmm4, 0x0
-      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
       0xF3, 0x0F, 0x6F, 0x71, 0x30,                               // movdqu xmm6, [rcx + 0x30]
-      0x66, 0x0F, 0xEF, 0xDF,                                     // pxor xmm3, xmm7
       0x66, 0x0F, 0xEF, 0xDE,                                     // pxor xmm3, xmm6
       0x48, 0x83, 0xC1, 0x40,                                     // add rcx, 0x40
       0x48, 0xFF, 0xCA,                                           // dec rdx
-      0x75, 0x84,                                                 // jne -124
+      0x74, 0x52,                                                 // je +82
+      0x66, 0x0F, 0x6F, 0xF8,                                     // movdqa xmm7, xmm0
+      0x66, 0x0F, 0x3A, 0x44, 0xC4, 0x00,                         // pclmulqdq xmm0, xmm4, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
+      0x66, 0x0F, 0xEF, 0xC7,                                     // pxor xmm0, xmm7
+      0x66, 0x0F, 0x6F, 0xF9,                                     // movdqa xmm7, xmm1
+      0x66, 0x0F, 0x3A, 0x44, 0xCC, 0x00,                         // pclmulqdq xmm1, xmm4, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
+      0x66, 0x0F, 0xEF, 0xCF,                                     // pxor xmm1, xmm7
+      0x66, 0x0F, 0x6F, 0xFA,                                     // movdqa xmm7, xmm2
+      0x66, 0x0F, 0x3A, 0x44, 0xD4, 0x00,                         // pclmulqdq xmm2, xmm4, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
+      0x66, 0x0F, 0xEF, 0xD7,                                     // pxor xmm2, xmm7
+      0x66, 0x0F, 0x6F, 0xFB,                                     // movdqa xmm7, xmm3
+      0x66, 0x0F, 0x3A, 0x44, 0xDC, 0x00,                         // pclmulqdq xmm3, xmm4, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
+      0x66, 0x0F, 0xEF, 0xDF,                                     // pxor xmm3, xmm7
+      0xEB, 0x82,                                                 // jmp -126
       0x49, 0xB8, 0xD0, 0x97, 0x19, 0x75, 0x01, 0x00, 0x00, 0x00, // mov r8, 0x1751997d0
       0x66, 0x49, 0x0F, 0x6E, 0xE0,                               // movq xmm4, r8
       0x49, 0xB9, 0x9E, 0x00, 0xAA, 0xCC, 0x00, 0x00, 0x00, 0x00, // mov r9, 0xccaa009e
-      0x66, 0x49, 0x0F, 0x6E, 0xE9,                               // movq xmm5, r9
-      0x66, 0x0F, 0x6C, 0xE5,                                     // punpcklqdq xmm4, xmm5
+      0x66, 0x49, 0x0F, 0x3A, 0x22, 0xE1, 0x01,                   // pinsrq xmm4, r9, 0x1
       0x66, 0x0F, 0x6F, 0xF8,                                     // movdqa xmm7, xmm0
       0x66, 0x0F, 0x3A, 0x44, 0xC4, 0x00,                         // pclmulqdq xmm0, xmm4, 0x0
       0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
@@ -426,16 +425,13 @@ fn crc32ieeeFoldAsm(crc: u32, p: *u8, blocks: int): u64 {
       0x66, 0x0F, 0x3A, 0x44, 0xFC, 0x11,                         // pclmulqdq xmm7, xmm4, 0x11
       0x66, 0x0F, 0xEF, 0xC7,                                     // pxor xmm0, xmm7
       0x66, 0x0F, 0xEF, 0xC3,                                     // pxor xmm0, xmm3
-      0x66, 0x48, 0x0F, 0x7E, 0xC2,                               // movq rdx, xmm0
-      0x66, 0x0F, 0x73, 0xD8, 0x08,                               // psrldq xmm0, 0x8
-      0x89, 0xD0,                                                 // mov eax, edx
-      0x48, 0xC1, 0xEA, 0x20,                                     // shr rdx, 0x20
-      0x66, 0x48, 0x0F, 0x6E, 0xC8,                               // movq xmm1, rax
-      0x66, 0x48, 0x0F, 0x6E, 0xD2,                               // movq xmm2, rdx
+      0x66, 0x0F, 0x38, 0x35, 0xC8,                               // pmovzxdq xmm1, xmm0
+      0x66, 0x0F, 0x6F, 0xD1,                                     // movdqa xmm2, xmm1
       0x66, 0x0F, 0x3A, 0x44, 0xCC, 0x10,                         // pclmulqdq xmm1, xmm4, 0x10
       0x49, 0xB8, 0x24, 0x61, 0xCD, 0x63, 0x01, 0x00, 0x00, 0x00, // mov r8, 0x163cd6124
       0x66, 0x49, 0x0F, 0x6E, 0xD8,                               // movq xmm3, r8
-      0x66, 0x0F, 0x3A, 0x44, 0xD3, 0x00,                         // pclmulqdq xmm2, xmm3, 0x0
+      0x66, 0x0F, 0x3A, 0x44, 0xD3, 0x01,                         // pclmulqdq xmm2, xmm3, 0x1
+      0x66, 0x0F, 0x73, 0xD8, 0x08,                               // psrldq xmm0, 0x8
       0x66, 0x0F, 0xEF, 0xC1,                                     // pxor xmm0, xmm1
       0x66, 0x0F, 0xEF, 0xC2,                                     // pxor xmm0, xmm2
       0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
