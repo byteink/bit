@@ -169,7 +169,7 @@ them, not by documentation:
 | A CR, LF or NUL in a header value is **rejected**, never stripped | every value, on the way in |
 | `AUTH` never runs on a connection that is not TLS | `auth` |
 | The server certificate is verified | `Options.insecureSkipVerify` is the only opt-out |
-| No transmitted line reaches 998 octets | folding, encoding, and a final check |
+| No message line reaches 998 octets, no command line 12288 | folding, encoding, and a final check |
 
 Header injection is the reason for the first. A newline in a supplied subject,
 recipient or display name lets the caller close the header it was given and open
@@ -677,7 +677,7 @@ Whether this connection is TLS - an implicit-TLS dial, or a completed
 Authenticate with the mechanism `a` selects. Before a credential byte exists
 this checks, in order: the connection is TLS (refused outright otherwise, with
 no opt-out, so not even a username is transmitted), neither credential carries a
-CR, LF or NUL, `ehlo` has run, and the server's `AUTH` capability lists the
+CR, LF or NUL (a token or an OAuth username also no 0x01), `ehlo` has run, and the server's `AUTH` capability lists the
 mechanism (RFC 4954 section 3, matched case-insensitively, `AUTH=` spelling
 included). A mechanism the server does not list fails with `smtp: the server
 does not offer AUTH <MECH>` and sends nothing. An error never repeats a
@@ -701,6 +701,43 @@ new variants, never new methods.
 |---|---|
 | `Auth.Plain(user, pass)` | SASL PLAIN (RFC 4616): one initial response, `\0user\0pass` in base64 |
 | `Auth.Login(user, pass)` | SASL LOGIN: the username and the password as two base64 challenge responses |
+| `Auth.Xoauth2(user, token)` | XOAUTH2: an OAuth2 access token, `user=<user>\x01auth=Bearer <token>\x01\x01` in base64 |
+| `Auth.OauthBearer(user, token)` | OAUTHBEARER (RFC 7628): the same token with a GS2 header and the dialed host and port |
+
+#### OAuth2 tokens
+
+Google Workspace and Exchange Online no longer take a password over SMTP; they
+take an OAuth2 access token, which the caller obtains and refreshes. `auth`
+sends it, once, and does nothing else with it.
+
+| Provider | Variant |
+|---|---|
+| Gmail and Google Workspace (`smtp.gmail.com`) | `Auth.Xoauth2` or `Auth.OauthBearer`; the server's `AUTH` line lists both |
+| Microsoft 365 and Exchange Online (`smtp.office365.com`) | `Auth.Xoauth2` only |
+
+```bit
+import { Auth, Client, SmtpError } from "std/smtp"
+
+// `token` is a current access token with the scope the provider requires.
+fn gmail(c: Client, user: string, token: string): ()!SmtpError {
+  c.auth(Auth.Xoauth2(user, token))?
+}
+
+fn gmailBearer(c: Client, user: string, token: string): ()!SmtpError {
+  c.auth(Auth.OauthBearer(user, token))?
+}
+```
+
+A token or username carrying CR, LF, NUL or 0x01 is refused before anything is
+sent. When the server rejects the token it first sends a `334` reply holding a
+base64 JSON error (an expired token, a missing scope). `auth` answers it as RFC
+7628 section 3.2.3 asks, an empty line for XOAUTH2 and a single 0x01 for
+OAUTHBEARER, and fails with the server's final reply as an `SmtpError` whose
+`text` starts with the JSON's `status` and `scope`, for example `OAuth
+status=401 scope=https://mail.google.com/: Username and Password not accepted`.
+`command` is `AUTH XOAUTH2` or `AUTH OAUTHBEARER`. The token is in no error
+text. An `AUTH` command line may be up to 12288 octets (RFC 4954 section 4), so
+an Exchange Online token of over 1500 characters goes out in one line.
 
 ### `Client.send(m: Sendable): ()!SmtpError`
 
@@ -740,7 +777,7 @@ Why a step failed, and the one type every fallible call here fails with.
 | `enhanced` | the RFC 3463 status the server sent (`5.1.1`, RFC 2034), or `""` when it sent none |
 | `text` | the server's text joined by a space with the enhanced status taken off, or the local reason when `code` is 0 |
 | `cause` | the `std/net` or `std/tls` error under a transport failure, nil otherwise; a failed TLS handshake is a `std/tls` `HandshakeError` |
-| `command` | the step that failed (for a timeout, the step that ran out of time): `connect`, `greeting`, `EHLO`, `STARTTLS`, `AUTH PLAIN`, `AUTH LOGIN`, `AUTH LOGIN username`, `AUTH LOGIN password`, `MAIL FROM`, `RCPT TO`, `DATA`, `end of DATA`, `QUIT`, or `validate` for a local refusal |
+| `command` | the step that failed (for a timeout, the step that ran out of time): `connect`, `greeting`, `EHLO`, `STARTTLS`, `AUTH PLAIN`, `AUTH LOGIN`, `AUTH XOAUTH2`, `AUTH OAUTHBEARER`, `AUTH LOGIN username`, `AUTH LOGIN password`, `MAIL FROM`, `RCPT TO`, `DATA`, `end of DATA`, `QUIT`, or `validate` for a local refusal |
 
 ### `SmtpError.transient(): bool`
 

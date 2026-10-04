@@ -28,8 +28,9 @@
 //   2. A header value carrying a CR or LF is rejected, never stripped, and the
 //      whole message is rendered and validated before `MAIL FROM` is sent, so a
 //      rejected value costs zero transmitted bytes (header.bit, message.bit).
-//   3. No transmitted line reaches 998 octets (mime.bit's `checkLines`,
-//      wire.bit's `sendLine`).
+//   3. No message line reaches 998 octets (mime.bit's `checkLines`) and no
+//      command line reaches 12288, the longest RFC 4954 §4 lets `AUTH` be
+//      (wire.bit's `sendLine`).
 //
 // Certificate verification is on by default. `Options.insecureSkipVerify` turns
 // it off and is the only way to; it is an explicit argument at the call site,
@@ -122,6 +123,7 @@ export class Client {
   w: Wire
   tcp: TcpConn
   host: string
+  port: int
   secure: bool
   greeted: bool
   exts: []string
@@ -210,10 +212,12 @@ export class Client {
     return ioError("STARTTLS", e)
   }
 
-  // Authenticate with `a`: `Auth.Plain(user, pass)` (SASL PLAIN, RFC 4616) or
-  // `Auth.Login(user, pass)`. Everything is checked before a credential byte
+  // Authenticate with `a`: `Auth.Plain(user, pass)` (SASL PLAIN, RFC 4616),
+  // `Auth.Login(user, pass)`, or an OAuth2 access token with
+  // `Auth.Xoauth2(user, token)` or `Auth.OauthBearer(user, token)` (RFC 7628).
+  // Everything is checked before a credential byte
   // exists, in this order: the connection is TLS (refused outright otherwise,
-  // with no opt-out), neither credential carries a CR, LF or NUL, `ehlo` has
+  // with no opt-out), no credential carries a CR, LF or NUL (nor a 0x01, for a token), `ehlo` has
   // run, and the server's EHLO `AUTH` line offers the mechanism (RFC 4954 §3).
   // An error never repeats a credential.
   export auth(a: Auth): ()!SmtpError {
@@ -227,7 +231,41 @@ export class Client {
     match (a) {
       Plain(user, pass) => this.plainExchange(user, pass)?
       Login(user, pass) => this.loginExchange(user, pass)?
+      Xoauth2(user, token) => this.oauthExchange(mech, xoauth2Response(user, token), "")?
+      OauthBearer(user, token) => {
+        let first = oauthBearerResponse(user, this.host, this.port, token)
+        this.oauthExchange(mech, first, "\x01")?
+      }
     }
+  }
+
+  // An OAuth2 mechanism as one `AUTH <mech> <initial response>` command. A `334`
+  // reply is the server's error challenge (RFC 7628 §3.2.3; Google and
+  // Microsoft do the same for XOAUTH2): `cancel` is sent in answer, which
+  // draws the real failure, and that failure is what the caller gets, carrying
+  // the challenge's `status` and `scope`. The response, and so the token, is
+  // sent once.
+  oauthExchange(mech: string, initial: string, cancel: string): ()!SmtpError {
+    let what = "AUTH ${mech}"
+    let r = this.w.command(what, "AUTH ${mech} ${initial}")?
+    if (r.code == 334) {
+      this.oauthFailure(what, oauthDetail(r), cancel)?
+    }
+    expect(what, r, 235, 235)?
+  }
+
+  // Answer an error challenge with `cancel` and fail with the reply it draws,
+  // `detail` first in its text.
+  oauthFailure(what: string, detail: string, cancel: string): ()!SmtpError {
+    let r = this.w.command(what, cancel)?
+    if (r.code == 235) {
+      fail protoError(what, "the server accepted the credential after reporting an error")
+    }
+    let e = replyError(what, r)
+    if (len(detail) > 0) {
+      e.text = "${detail}: ${e.text}"
+    }
+    fail e
   }
 
   // SASL PLAIN as one `AUTH PLAIN <initial response>` command.
@@ -315,11 +353,17 @@ fn checkEhloName(name: string): ()!SmtpError {
   }
 }
 
+// The host and port a session dialed. OAUTHBEARER sends both (RFC 7628 §3.1).
+class Endpoint {
+  host: string,
+  port: int,
+}
+
 // Read the server's opening greeting and build the session around `s`.
 fn openSession(
   tcp: TcpConn,
   s: Stream,
-  host: string,
+  at: Endpoint,
   secure: bool,
   timeout: int,
 ): Client!SmtpError {
@@ -336,7 +380,7 @@ fn openSession(
     fail e
   }
   return Client{
-    w = w, tcp = tcp, host = host, secure = secure, greeted = false, exts = []string(0),
+    w = w, tcp = tcp, host = at.host, port = at.port, secure = secure, greeted = false, exts = []string(0),
   }
 }
 
@@ -361,7 +405,13 @@ fn connect(host: string, port: int, o: Options): TcpConn!SmtpError {
 // no TLS happens here.
 export fn dial(host: string, port: int, o: Options = Options()): Client!SmtpError {
   let tcp = connect(host, port, o)?
-  return openSession(tcp, plainStream{ c = tcp }, host, false, o.timeout)?
+  return openSession(
+    tcp,
+    plainStream{ c = tcp },
+    Endpoint{ host = host, port = port },
+    false,
+    o.timeout,
+  )?
 }
 
 // Connect to an implicit-TLS submission port (465): the TLS handshake happens
@@ -378,5 +428,5 @@ export fn dialTls(host: string, port: int, o: Options): Client!SmtpError {
     }
     fail ioError("connect", e)
   }
-  return openSession(tcp, tlsStream{ c = t }, host, true, o.timeout)?
+  return openSession(tcp, tlsStream{ c = t }, Endpoint{ host = host, port = port }, true, o.timeout)?
 }

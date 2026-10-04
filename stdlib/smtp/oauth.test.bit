@@ -1,0 +1,244 @@
+// stdlib/smtp/oauth.test.bit — XOAUTH2 and OAUTHBEARER over the TLS fake (#6875).
+//
+// What is under test is the BYTES the client sent: the decoded initial response
+// of each mechanism, what follows an error challenge, and that the token is on
+// the wire exactly once and in no error text. `startTlsFake`, `pinnedOptions`,
+// `greetedTlsClient`, `authError`, `ehloAuthOnly`, `startFake` and
+// `assertAuthRefused` are module siblings (SPEC §19).
+
+const secret: string = "ya29.SECRETTOKEN"
+
+// The scripted `334` of a Google-shaped XOAUTH2 failure: base64 of the JSON
+// status the server reports.
+fn googleChallenge(): string {
+  let json = "{\"status\":\"401\",\"schemes\":\"Bearer\",\"scope\":\"https://mail.google.com/\"}"
+  return "334 ${encodeBase64([]byte(json))}\r\n"
+}
+
+// The base64 initial response of the `AUTH <mech>` line in `sent`, decoded.
+fn initialResponse(sent: string, mech: string): string {
+  let head = "AUTH ${mech} "
+  let at = strIndexOf(sent, head)
+  assert(at >= 0, "no ${head} line in: ${sent}")
+  let rest = sent[at + len(head):]
+  let end = strIndexOf(rest, "\r\n")
+  assert(end > 0, "the AUTH line has no terminator: ${sent}")
+  let raw = decodeBase64(rest[0:end]) catch e {
+    panic("the initial response is not base64: ${e.message()}")
+  }
+  return string(raw)
+}
+
+test "XOAUTH2 sends user=, auth=Bearer and the token as one base64 initial response" {
+  let (c, log) = greetedTlsClient([ehloAuthOnly("XOAUTH2 OAUTHBEARER"), "235 2.7.0 Accepted\r\n"]) catch e {
+    assert(false, "setup: ${e.message()}")
+    return
+  }
+  c.auth(Auth.Xoauth2("a@x.com", "T")) catch e {
+    assert(false, "auth: ${e.message()}")
+    return
+  }
+  c.close()
+  let sent = <- log
+  let want = "user=a@x.com\x01auth=Bearer T\x01\x01"
+  assert(
+    initialResponse(sent, "XOAUTH2") == want,
+    "decoded to: ${initialResponse(sent, "XOAUTH2")}",
+  )
+}
+
+test "OAUTHBEARER sends the GS2 header, the dialed host and port, and the token" {
+  let (c, log) = greetedTlsClient([ehloAuthOnly("XOAUTH2 OAUTHBEARER"), "235 2.7.0 Accepted\r\n"]) catch e {
+    assert(false, "setup: ${e.message()}")
+    return
+  }
+  let port = c.port
+  c.auth(Auth.OauthBearer("a@x.com", "T")) catch e {
+    assert(false, "auth: ${e.message()}")
+    return
+  }
+  c.close()
+  let sent = <- log
+  let want = "n,a=a@x.com,\x01host=127.0.0.1\x01port=${port}\x01auth=Bearer T\x01\x01"
+  assert(
+    initialResponse(sent, "OAUTHBEARER") == want,
+    "decoded to: ${initialResponse(sent, "OAUTHBEARER")}",
+  )
+}
+
+test "OAUTHBEARER escapes = and , in the authorization identity" {
+  let (c, log) = greetedTlsClient([ehloAuthOnly("OAUTHBEARER"), "235 ok\r\n"]) catch e {
+    assert(false, "setup: ${e.message()}")
+    return
+  }
+  c.auth(Auth.OauthBearer("a,b=c", "T")) catch e {
+    assert(false, "auth: ${e.message()}")
+    return
+  }
+  c.close()
+  let sent = <- log
+  let got = initialResponse(sent, "OAUTHBEARER")
+  assert(hasPrefix(got, "n,a=a=2Cb=3Dc,\x01host="), "decoded to: ${got}")
+}
+
+test "a 1800-character token goes out on one AUTH line" {
+  let token = repeat("x", 1800)
+  let (c, log) = greetedTlsClient([ehloAuthOnly("XOAUTH2"), "235 ok\r\n"]) catch e {
+    assert(false, "setup: ${e.message()}")
+    return
+  }
+  c.auth(Auth.Xoauth2("a@x.com", token)) catch e {
+    assert(false, "auth: ${e.message()}")
+    return
+  }
+  c.close()
+  let sent = <- log
+  assert(
+    initialResponse(sent, "XOAUTH2") == "user=a@x.com\x01auth=Bearer ${token}\x01\x01",
+    "the long token was altered",
+  )
+}
+
+// Fail an XOAUTH2 or OAUTHBEARER attempt against a server that answers with an
+// error challenge and then a 535, and check the error and the transcript.
+fn checkErrorChallenge(a: Auth, mech: string, cancel: string) {
+  let (c, log) = greetedTlsClient(
+    [
+      ehloAuthOnly("XOAUTH2 OAUTHBEARER"), googleChallenge(),
+      "535 5.7.8 Username and Password not accepted\r\n",
+    ],
+  ) catch e {
+    assert(false, "setup: ${e.message()}")
+    return
+  }
+  let e = authError(c, a)
+  let m = e.message()
+  assert(e.code == 535 && e.command == "AUTH ${mech}", "code ${e.code} command ${e.command}")
+  assert(
+    e.enhanced == "5.7.8" && !e.transient(),
+    "enhanced '${e.enhanced}' transient ${e.transient()}",
+  )
+  assert(contains(m, "status=401"), "the JSON status is missing: ${m}")
+  assert(contains(m, "scope=https://mail.google.com/"), "the JSON scope is missing: ${m}")
+  assert(contains(m, "Username and Password not accepted"), "the server's text is missing: ${m}")
+  assert(
+    !contains(m, secret) && !contains(m, encodeBase64([]byte(secret))),
+    "the error carries the token: ${m}",
+  )
+  c.close()
+  let sent = <- log
+  let line = sent[strIndexOf(sent, "AUTH ${mech} "):]
+  let end = strIndexOf(line, "\r\n")
+  assert(line[end:] == "\r\n${cancel}\r\n", "after the AUTH line the client sent: ${line[end:]}")
+  assert(!contains(sent, secret), "the token was sent in the clear: ${sent}")
+}
+
+test "XOAUTH2: a 334 error challenge is answered with an empty line and the 535 is the error" {
+  checkErrorChallenge(Auth.Xoauth2("a@x.com", secret), "XOAUTH2", "")
+}
+
+test "OAUTHBEARER: a 334 error challenge is answered with a single 0x01 and the 535 is the error" {
+  checkErrorChallenge(Auth.OauthBearer("a@x.com", secret), "OAUTHBEARER", "\x01")
+}
+
+test "an error challenge that is not base64 JSON still ends in the server's failure" {
+  let (c, log) = greetedTlsClient(
+    [
+      ehloAuthOnly("XOAUTH2"),
+      "334 !!not-base64!!\r\n",
+      "535 5.7.3 Authentication unsuccessful\r\n",
+    ],
+  ) catch e {
+    assert(false, "setup: ${e.message()}")
+    return
+  }
+  let e = authError(c, Auth.Xoauth2("a@x.com", secret))
+  assert(
+    e.code == 535 && e.text == "Authentication unsuccessful",
+    "code ${e.code} text '${e.text}'",
+  )
+  c.close()
+  let _ = <- log
+}
+
+test "a server that accepts after an error challenge is a protocol error" {
+  let (c, log) = greetedTlsClient([ehloAuthOnly("XOAUTH2"), googleChallenge(), "235 ok\r\n"]) catch e {
+    assert(false, "setup: ${e.message()}")
+    return
+  }
+  let e = authError(c, Auth.Xoauth2("a@x.com", secret))
+  assert(e.code == 0 && contains(e.text, "after reporting an error"), "said: ${e.message()}")
+  assert(!contains(e.message(), secret), "the error carries the token")
+  c.close()
+  let _ = <- log
+}
+
+test "a server that does not list the mechanism refuses it before any AUTH byte is sent" {
+  let (c, log) = greetedTlsClient([ehloAuthOnly("PLAIN LOGIN")]) catch e {
+    assert(false, "setup: ${e.message()}")
+    return
+  }
+  let e = authError(c, Auth.Xoauth2("a@x.com", secret))
+  assert(e.message() == "smtp: the server does not offer AUTH XOAUTH2", "said: ${e.message()}")
+  let e2 = authError(c, Auth.OauthBearer("a@x.com", secret))
+  assert(
+    e2.message() == "smtp: the server does not offer AUTH OAUTHBEARER",
+    "said: ${e2.message()}",
+  )
+  c.close()
+  let sent = <- log
+  assert(!contains(sent, "AUTH"), "an AUTH command reached the wire: ${sent}")
+}
+
+// `c.auth(a)` must fail with a message containing `want` and must not name the
+// token; `log` must show no AUTH.
+fn checkRefused(a: Auth, want: string) {
+  let (c, log) = greetedTlsClient([ehloAuthOnly("XOAUTH2 OAUTHBEARER")]) catch e {
+    assert(false, "setup: ${e.message()}")
+    return
+  }
+  let e = authError(c, a)
+  assert(contains(e.message(), want), "said: ${e.message()}")
+  assert(!contains(e.message(), "SECRET"), "the error carries the token: ${e.message()}")
+  c.close()
+  let sent = <- log
+  assert(!contains(sent, "AUTH"), "an AUTH command reached the wire: ${sent}")
+}
+
+test "a token with 0x01, CR, LF or NUL is refused with nothing sent" {
+  checkRefused(Auth.Xoauth2("a@x.com", "SECRET\x01auth=Bearer X"), "token contains")
+  checkRefused(Auth.OauthBearer("a@x.com", "SECRET\x01"), "token contains")
+  checkRefused(Auth.Xoauth2("a@x.com", "SECRET\r\nQUIT"), "token contains")
+  checkRefused(Auth.OauthBearer("a@x.com", "SECRET\n"), "token contains")
+  checkRefused(Auth.Xoauth2("a@x.com", "SECRET\x00"), "token contains")
+}
+
+test "a username with 0x01 or CR is refused with nothing sent" {
+  checkRefused(Auth.Xoauth2("a@x.com\x01auth=Bearer X", "SECRET"), "username contains")
+  checkRefused(Auth.OauthBearer("a@x.com\r\n", "SECRET"), "username contains")
+}
+
+test "both OAuth variants refuse a cleartext connection and send nothing" {
+  let (port, log) = startFake([ehloAuthNoTls(), "235 OK\r\n"]) catch e {
+    assert(false, "startFake: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  c.ehlo("client.example.com") catch e {
+    assert(false, "ehlo: ${e.message()}")
+    return
+  }
+  let e = authError(c, Auth.Xoauth2("a@x.com", secret))
+  assert(contains(e.message(), "not TLS") && !contains(e.message(), secret), "said: ${e.message()}")
+  let e2 = authError(c, Auth.OauthBearer("a@x.com", secret))
+  assert(
+    contains(e2.message(), "not TLS") && !contains(e2.message(), secret),
+    "said: ${e2.message()}",
+  )
+  c.close()
+  let sent = <- log
+  assert(!contains(sent, "AUTH") && !contains(sent, secret), "AUTH bytes reached the wire: ${sent}")
+}
