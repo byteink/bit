@@ -1,0 +1,309 @@
+// tools/gens3 — the rule half of the endpoint emitter (#6592, epic #6565): one
+// Bit function per condition and per result of the decision diagram, and the
+// dispatch functions that pick one by its number.
+//
+// A condition function returns whether the condition holds and, when the
+// condition assigns a variable, stores it in the walk state first. A result
+// function returns the endpoint or fails with the rule's error text. The
+// dispatch functions are a tree with `epFanOut` children per node, so no
+// function has more than six branches (spec/LINT.md complexity), and the walk
+// reaches any condition in at most three calls.
+
+import { Builder, hasPrefix } from "std/strings"
+import { Json } from "std/json"
+
+const epFanOut: int = 6
+const epMaxWidth: int = 100
+
+fn epCondName(i: int): string {
+  return "endpointCond${i}"
+}
+
+fn epResultName(k: int): string {
+  return "endpointResult${k}"
+}
+
+// The variables the conditions assign, in condition order, with their kinds.
+fn epVarsOf(sc: EpScope, conds: []Json): []EpVar! {
+  let vars = []EpVar(0)
+  let i = 0
+  for c of conds {
+    let at = "condition ${i}"
+    if (hasKey(c, "assign")) {
+      let name = needString(needKey(c, "assign", at)?, at)?
+      let e = epFnCall(EpScope{ params = sc.params, vars = vars }, c, at)?
+      vars = append(vars, EpVar{ name = name, ident = epIdent(name), kind = epInner(e.kind) })
+    }
+    i = i + 1
+  }
+  return vars
+}
+
+// The statements storing the value of condition `c` in its variable and
+// answering whether it holds. A boolean condition is its own answer; an
+// optional one holds when set; a variable of a kind that is never absent
+// always holds.
+fn epCondBody(sc: EpScope, c: Json, i: int): string! {
+  let at = "condition ${i}"
+  let e = epFnCall(sc, c, at)?
+  if (!hasKey(c, "assign")) {
+    if (e.kind == EpKind.Bool) {
+      return "  return ${e.code}\n"
+    }
+    if (epIsOpt(e.kind)) {
+      return "  return isSet(${e.code})\n"
+    }
+    fail newError("${at}: a condition of kind ${epKindName(e.kind)} has no truth value")
+  }
+  let ident = epIdent(needString(needKey(c, "assign", at)?, at)?)
+  if (epIsOpt(e.kind)) {
+    return "  match (${e.code}) {\n    Some(v) => { s.${ident} = v }\n    None => return false\n  }\n  return true\n"
+  }
+  if (e.kind == EpKind.Bool) {
+    fail newError("${at}: assigning a boolean is not supported")
+  }
+  return "  s.${ident} = ${e.code}\n  return true\n"
+}
+
+fn epCondFn(sc: EpScope, c: Json, i: int): string! {
+  return "fn ${epCondName(i)}(p: EndpointParams, s: EndpointState): bool {\n${epCondBody(sc, c, i)?}}\n"
+}
+
+// A template string of the rule set: `{name}` and `{var#attribute}` between literal text.
+// Written as an interpolated string, or as the bare value when the template is one reference.
+fn epTemplate(sc: EpScope, t: string, at: string): string! {
+  let b = Builder()
+  let parts = 0
+  let i = 0
+  let soloCode = ""
+  b.write("\"")
+  while (i < len(t)) {
+    if (t[i] != '{') {
+      b.write(epLiteralByte(t[i], at)?)
+      parts = parts + 1
+      i = i + 1
+      continue
+    }
+    let end = epIndexFrom(t, '}', i)
+    if (end < 0) {
+      fail newError("${at}: unclosed { in ${t}")
+    }
+    let code = epPlaceholder(sc, t[i + 1:end], at)?
+    soloCode = code
+    parts = parts + 1
+    b.write("$" + "{${code}}")
+    i = end + 1
+  }
+  b.write("\"")
+  if (parts == 1 && soloCode != "") {
+    return soloCode
+  }
+  return b.toString()
+}
+
+fn epIndexFrom(s: string, c: byte, from: int): int {
+  let i = from
+  while (i < len(s)) {
+    if (s[i] == c) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The code of `name` or `var#attribute`, as a string.
+fn epPlaceholder(sc: EpScope, text: string, at: string): string! {
+  let hash = epIndexFrom(text, '#', 0)
+  if (hash < 0) {
+    return epAccept(epRef(sc, text, at)?, EpKind.Str, at)?
+  }
+  let base = epRef(sc, text[0:hash], at)?
+  match (epFieldKind(base.kind, text[hash + 1:len(text)])) {
+    Some(k) => {
+      if (k != EpKind.Str) {
+        fail newError("${at}: {${text}} is not a string")
+      }
+      return "${base.code}.${text[hash + 1:len(text)]}"
+    }
+    None => fail newError("${at}: {${text}} is not an attribute the generator knows")
+  }
+}
+
+// A call written on one line when it fits, one argument per line when it does not (spec/FMT.md section 5).
+fn epCallLine(lead: string, callee: string, args: []string, tail: string): string {
+  let one = "${lead}${callee}(${commaList(args)})${tail}"
+  if (len(one) <= epMaxWidth || len(args) < 2) {
+    return one + "\n"
+  }
+  let b = Builder()
+  b.write("${lead}${callee}(\n")
+  for a of args {
+    b.write("    ${a},\n")
+  }
+  b.write("  )${tail}\n")
+  return b.toString()
+}
+
+fn epStringList(items: []Json, at: string): string! {
+  let out = []string(0)
+  for it of items {
+    out = append(out, epStringLit(needString(it, at)?, at)?)
+  }
+  if (len(out) == 0) {
+    return "[]string(0)"
+  }
+  return "[${commaList(out)}]"
+}
+
+// An optional string template of a scheme: `""` when it is absent.
+fn epOptTemplate(sc: EpScope, scheme: Json, key: string, at: string): string! {
+  if (!hasKey(scheme, key)) {
+    return "\"\""
+  }
+  return epTemplate(sc, needString(needKey(scheme, key, at)?, at)?, at)?
+}
+
+// The `let authN = endpointAuth(...)` statement of one auth scheme.
+fn epAuthStatement(sc: EpScope, scheme: Json, n: int, at: string): string! {
+  onlyKeys(
+    needObject(scheme, at)?,
+    ["name", "signingName", "signingRegion", "signingRegionSet", "disableDoubleEncoding"],
+    at,
+  )?
+  if (!needBool(needKey(scheme, "disableDoubleEncoding", at)?, at)?) {
+    fail newError("${at}: an auth scheme without disableDoubleEncoding is not supported")
+  }
+  let set = "[]string(0)"
+  if (hasKey(scheme, "signingRegionSet")) {
+    set = epStringList(needArray(needKey(scheme, "signingRegionSet", at)?, at)?, at)?
+  }
+  let args = [
+    epTemplate(sc, needString(needKey(scheme, "name", at)?, at)?, at)?,
+    epTemplate(sc, needString(needKey(scheme, "signingName", at)?, at)?, at)?,
+    epOptTemplate(sc, scheme, "signingRegion", at)?,
+    set,
+  ]
+  return epCallLine("  let auth${n} = ", "endpointAuth", args, "")
+}
+
+// The statements and the `endpointOk` call of an endpoint result.
+fn epEndpointBody(sc: EpScope, e: Json, at: string): string! {
+  onlyKeys(needObject(e, at)?, ["url", "properties", "headers"], at)?
+  if (len(needObject(needKey(e, "headers", at)?, at)?) != 0) {
+    fail newError("${at}: result headers are not supported")
+  }
+  let props = needKey(e, "properties", at)?
+  onlyKeys(needObject(props, at)?, ["authSchemes", "backend"], at)?
+  let b = Builder()
+  let names = []string(0)
+  let n = 0
+  for scheme of needArray(needKey(props, "authSchemes", at)?, at)? {
+    b.write(epAuthStatement(sc, scheme, n, at)?)
+    names = append(names, "auth${n}")
+    n = n + 1
+  }
+  let backend = "\"\""
+  if (hasKey(props, "backend")) {
+    backend = epStringLit(needString(needKey(props, "backend", at)?, at)?, at)?
+  }
+  let url = epTemplate(sc, needString(needKey(e, "url", at)?, at)?, at)?
+  b.write(epCallLine("  return ", "endpointOk", [url, backend, "[${commaList(names)}]"], ""))
+  return b.toString()
+}
+
+// The function of result `k` (1-based: reference 100000000 is the implicit "no match").
+fn epResultFn(sc: EpScope, r: Json, k: int): string! {
+  let at = "result ${k}"
+  let head = "fn ${epResultName(k)}(p: EndpointParams, s: EndpointState): EndpointResult! {\n"
+  let kind = needString(needKey(r, "type", at)?, at)?
+  if (kind == "error") {
+    let msg = epTemplate(sc, needString(needKey(r, "error", at)?, at)?, at)?
+    return "${head}  fail newError(${msg})\n}\n"
+  }
+  if (kind != "endpoint") {
+    fail newError("${at}: result type ${kind} is not one the generator knows")
+  }
+  return "${head}${epEndpointBody(sc, needKey(r, "endpoint", at)?, at)?}}\n"
+}
+
+// A node of the dispatch tree: ids `lo` to `hi` (exclusive) under function `name`.
+class EpNode {
+  name: string,
+  hi: int,
+  leaf: bool,
+}
+
+// One dispatch function over `kids`: `id < hi` picks the child, the last is the default.
+fn epDispatchFn(name: string, ret: string, ask: string, kids: []EpNode): string {
+  let b = Builder()
+  b.write("fn ${name}(id: int, p: EndpointParams, s: EndpointState): ${ret} {\n")
+  let i = 0
+  while (i < len(kids)) {
+    let k = kids[i]
+    let args = "id, p, s"
+    if (k.leaf) {
+      args = "p, s"
+    }
+    if (i + 1 < len(kids)) {
+      b.write("  if (id < ${k.hi}) {\n    return ${k.name}(${args})${ask}\n  }\n")
+    } else {
+      b.write("  return ${k.name}(${args})${ask}\n")
+    }
+    i = i + 1
+  }
+  b.write("}\n")
+  return b.toString()
+}
+
+// The leaves of a dispatch tree: functions `leaf<first>` to `leaf<first + count - 1>`,
+// the root named `root`; `ask` is "?" when the leaves fail.
+class EpLeaves {
+  root: string,
+  leaf: string,
+  first: int,
+  count: int,
+  ret: string,
+  ask: string,
+}
+
+fn epLeafNodes(l: EpLeaves): []EpNode {
+  let level = []EpNode(0)
+  let n = 0
+  while (n < l.count) {
+    level = append(
+      level,
+      EpNode{ name = "${l.leaf}${l.first + n}", hi = l.first + n + 1, leaf = true },
+    )
+    n = n + 1
+  }
+  return level
+}
+
+// The dispatch functions over the leaves of `l`, leaves first.
+fn epDispatchTree(l: EpLeaves): []string {
+  let level = epLeafNodes(l)
+  let out = []string(0)
+  let depth = 1
+  while (len(level) > 1) {
+    let next = []EpNode(0)
+    let at = 0
+    while (at < len(level)) {
+      let end = at + epFanOut
+      if (end > len(level)) {
+        end = len(level)
+      }
+      let name = "${l.root}G${depth}n${len(next)}"
+      if (len(level) <= epFanOut) {
+        name = l.root
+      }
+      let kids = level[at:end]
+      out = append(out, epDispatchFn(name, l.ret, l.ask, kids))
+      next = append(next, EpNode{ name = name, hi = kids[len(kids) - 1].hi, leaf = false })
+      at = end
+    }
+    level = next
+    depth = depth + 1
+  }
+  return out
+}

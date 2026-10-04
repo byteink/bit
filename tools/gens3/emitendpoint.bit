@@ -1,0 +1,403 @@
+// tools/gens3 — renders the S3 endpoint rule set as Bit, `pkg/s3/gen_endpoint*.bit`
+// and `pkg/s3/gen_partitions.bit` (#6592, epic #6565). Run:
+//
+//   bit run tools/gens3 -- endpoint [out-dir]
+//
+// Inputs, all vendored in tools/gens3/model and named in its PIN:
+//
+//   endpoint-bdd.json    the S3 rule set as a binary decision diagram (the
+//                        model trait `smithy.rules#endpointBdd`): 75
+//                        conditions, 115 results, 553 nodes;
+//   endpoint-tests.json  the 393 endpoint tests of the model;
+//   partitions.json      the AWS partition table (aws-sdk-js-v3, pinned).
+//
+// What is written:
+//
+//   gen_endpoint.bit            the parameters, the walk state, the nodes as an
+//                               int table, and `endpointDecide`, the walk;
+//   gen_endpoint_conds_NN.bit   one function per condition and its dispatch;
+//   gen_endpoint_results_NN.bit one function per result and its dispatch;
+//   gen_endpoint_cases.bit      the 393 tests as data, one JSON object a row;
+//   gen_partitions.bit          the partition table.
+//
+// The walk is a loop, not a recursion, bounded by the node count: a path of a
+// decision diagram visits each node at most once, and `loadBdd` proves the
+// diagram is ordered (a child's condition number is greater than its parent's),
+// so the bound can only be reached by a corrupt table. Each step evaluates the
+// node's condition with the functions of pkg/s3/endpointfns.bit and follows
+// the high or the low edge; a negative reference is a complemented edge and
+// swaps them. A reference of 100000000 and above names a result (1-based:
+// 100000000 itself is "no match"), 1 and -1 are the terminals.
+//
+// Output is a pure function of the three inputs and the PIN: two runs are
+// byte-identical.
+
+import { Builder } from "std/strings"
+import { Json, jsonParse } from "std/json"
+import { Sha256, encodeHex, digest, decodeBase64 } from "std/crypto"
+import { readFile } from "std/fs"
+
+const epBddFile: string = "tools/gens3/model/endpoint-bdd.json"
+const epTestsFile: string = "tools/gens3/model/endpoint-tests.json"
+const epPartitionsFile: string = "tools/gens3/model/partitions.json"
+const epFilePrefix: string = "gen_endpoint"
+const epMaxBlockLines: int = 740
+const epResultBase: int = 100000000
+const epNodesPerLine: int = 3
+
+// The raw text of every input, and the PIN.
+class EpInputs {
+  bdd: string,
+  tests: string,
+  partitions: string,
+  pin: string,
+}
+
+// What the diagram holds, re-derived from the files and checked against what they declare.
+class EpCounts {
+  nodes: int,
+  conditions: int,
+  results: int,
+  cases: int,
+}
+
+// The decision diagram: `nodes` is `nodeCount` triples (condition, high, low),
+// the first a sentinel no walk reaches.
+class EpBdd {
+  params: []EpParam,
+  conditions: []Json,
+  results: []Json,
+  root: int,
+  nodes: []int,
+  nodeCount: int,
+}
+
+fn epSha256(text: string): string {
+  return encodeHex(digest(Sha256(), []byte(text)))
+}
+
+// The raw text of the three inputs, each checked against its `*.sha256` line of the PIN.
+fn epReadInputs(): EpInputs! {
+  let pin = readFile(pinPath)?
+  let bdd = readFile(epBddFile)?
+  let tests = readFile(epTestsFile)?
+  let parts = readFile(epPartitionsFile)?
+  epCheckSha("endpoint-bdd", bdd, pin)?
+  epCheckSha("endpoint-tests", tests, pin)?
+  epCheckSha("partitions", parts, pin)?
+  return EpInputs{ bdd = bdd, tests = tests, partitions = parts, pin = pin }
+}
+
+fn epCheckSha(name: string, text: string, pin: string): ()! {
+  let want = pinValue(pin, "${name}.sha256")?
+  let got = epSha256(text)
+  if (got != want) {
+    fail newError("${name} hashes to ${got}, PIN wants ${want}: not the pinned file")
+  }
+}
+
+// The big-endian 32-bit signed integers of `raw`.
+fn epInts(raw: []byte): []int! {
+  if (len(raw) % 4 != 0) {
+    fail newError("endpoint nodes: ${len(raw)} bytes is not a whole number of 32-bit integers")
+  }
+  let out = []int(0)
+  let i = 0
+  while (i < len(raw)) {
+    let v = int(raw[i]) * 16777216 +
+      int(raw[i + 1]) * 65536 +
+      int(raw[i + 2]) * 256 +
+      int(raw[i + 3])
+    if (v >= 2147483648) {
+      v = v - 4294967296
+    }
+    out = append(out, v)
+    i = i + 4
+  }
+  return out
+}
+
+// The parameters of the rule set in file order: a required one is a boolean
+// with default false, read as a plain `bool`; every other one is optional.
+fn epParams(j: Json): []EpParam! {
+  let out = []EpParam(0)
+  for e of needObject(j, "parameters")? {
+    let at = "parameter ${e.key}"
+    let ty = needString(needKey(e.value, "type", at)?, at)?
+    let required = hasKey(e.value, "required") && needBool(needKey(e.value, "required", at)?, at)?
+    let kind = EpKind.OptStr
+    if (ty == "boolean") {
+      kind = EpKind.OptBool
+    } else if (ty != "string") {
+      fail newError("${at}: type ${ty} is not one the generator knows")
+    }
+    if (required) {
+      if (ty != "boolean" ||
+        !hasKey(e.value, "default") ||
+        needBool(needKey(e.value, "default", at)?, at)?) {
+        fail newError("${at}: a required parameter must be a boolean defaulting to false")
+      }
+      kind = EpKind.Bool
+    }
+    out = append(out, EpParam{ name = e.key, field = fieldName(e.key), kind = kind })
+  }
+  return out
+}
+
+// The condition number of node `i`, and whether `ref` points at a node of a table of `count`.
+fn epRefOk(ref: int, count: int, results: int): bool {
+  let a = ref
+  if (a < 0) {
+    a = -a
+  }
+  return a == 1 || (a >= 2 && a <= count) || (ref >= epResultBase && ref <= epResultBase + results)
+}
+
+// The condition number a reference leads to, or -1 for a terminal or a result.
+fn epRefCond(b: EpBdd, ref: int): int {
+  let a = ref
+  if (a < 0) {
+    a = -a
+  }
+  if (a < 2 || ref >= epResultBase) {
+    return -1
+  }
+  return b.nodes[3 * (a - 1)]
+}
+
+// Node table checks: every condition and reference in range, and every child's
+// condition greater than its parent's, so no path repeats a node.
+fn epCheckNodes(b: EpBdd): ()! {
+  let i = 1
+  while (i < b.nodeCount) {
+    let cond = b.nodes[3 * i]
+    if (cond < 0 || cond >= len(b.conditions)) {
+      fail newError("node ${i}: condition ${cond} is out of range")
+    }
+    let hi = b.nodes[3 * i + 1]
+    let lo = b.nodes[3 * i + 2]
+    if (!epRefOk(hi, b.nodeCount, len(b.results)) || !epRefOk(lo, b.nodeCount, len(b.results))) {
+      fail newError("node ${i}: reference ${hi} or ${lo} is out of range")
+    }
+    if (epRefCond(b, hi) >= 0 && epRefCond(b, hi) <= cond) {
+      fail newError("node ${i}: the high edge does not lead to a later condition")
+    }
+    if (epRefCond(b, lo) >= 0 && epRefCond(b, lo) <= cond) {
+      fail newError("node ${i}: the low edge does not lead to a later condition")
+    }
+    i = i + 1
+  }
+}
+
+fn epLoadBdd(text: string): EpBdd! {
+  let j = jsonParse(text)?
+  let version = needString(needKey(j, "version", "endpoint-bdd.json")?, "version")?
+  if (version != "1.1") {
+    fail newError("endpoint-bdd.json: version ${version}, the generator reads 1.1")
+  }
+  let raw = decodeBase64(needString(needKey(j, "nodes", "endpoint-bdd.json")?, "nodes")?)?
+  let ints = epInts(raw)?
+  let declared = needInt(needKey(j, "nodeCount", "endpoint-bdd.json")?, "nodeCount")?
+  if (len(ints) != 3 * declared) {
+    fail newError("endpoint-bdd.json: nodeCount ${declared} but the table holds ${len(ints) / 3} nodes")
+  }
+  let b = EpBdd{
+    params = epParams(needKey(j, "parameters", "endpoint-bdd.json")?)?,
+    conditions = needArray(needKey(j, "conditions", "endpoint-bdd.json")?, "conditions")?,
+    results = needArray(needKey(j, "results", "endpoint-bdd.json")?, "results")?,
+    root = needInt(needKey(j, "root", "endpoint-bdd.json")?, "root")?,
+    nodes = ints,
+    nodeCount = declared,
+  }
+  if (!epRefOk(b.root, b.nodeCount, len(b.results))) {
+    fail newError("endpoint-bdd.json: root ${b.root} is out of range")
+  }
+  epCheckNodes(b)?
+  return b
+}
+
+fn epCases(text: string): []Json! {
+  let j = jsonParse(text)?
+  return needArray(needKey(j, "testCases", "endpoint-tests.json")?, "testCases")?
+}
+
+fn epCountsOf(b: EpBdd, cases: []Json): EpCounts {
+  return EpCounts{
+    nodes = b.nodeCount,
+    conditions = len(b.conditions),
+    results = len(b.results),
+    cases = len(cases),
+  }
+}
+
+// The generated files' header: where the inputs come from.
+fn epHeader(pin: string, what: string, sha: string): string! {
+  return "// Code generated by tools/gens3 from the S3 endpoint rule set; DO NOT EDIT.\n" +
+    "// Model: github.com/aws/api-models-aws at commit ${pinValue(pin, "commit")?}\n" +
+    "// (${what} sha256 ${sha}).\n" +
+    "// Regenerate with: bit run tools/gens3 -- endpoint\n\n"
+}
+
+fn epFieldLine(p: EpParam): string {
+  return "  ${p.field}: ${epKindName(p.kind)},\n"
+}
+
+fn epParamsClass(b: EpBdd): string {
+  let s = Builder()
+  s.write("// The parameters of the S3 endpoint rule set. A required one is a plain\n")
+  s.write("// boolean (the rule set's default is false); every other one is optional.\n")
+  s.write("class EndpointParams {\n")
+  for p of b.params {
+    s.write(epFieldLine(p))
+  }
+  s.write("}\n")
+  return s.toString()
+}
+
+fn epDefaultValue(k: EpKind): string {
+  if (k == EpKind.Bool) {
+    return "false"
+  }
+  return "${epKindName(k)}.None"
+}
+
+fn epDefaultParams(b: EpBdd): string {
+  let s = Builder()
+  s.write("// Every parameter unset, the required booleans false.\n")
+  s.write("fn defaultEndpointParams(): EndpointParams {\n  return EndpointParams{\n")
+  for p of b.params {
+    s.write("    ${p.field} = ${epDefaultValue(p.kind)},\n")
+  }
+  s.write("  }\n}\n")
+  return s.toString()
+}
+
+fn epZeroValue(k: EpKind): string {
+  return match (k) {
+    Part => "emptyPartition()"
+    Arn => "emptyArn()"
+    Url => "emptyEndpointUrl()"
+    _ => "\"\""
+  }
+}
+
+fn epStateClass(vars: []EpVar): string {
+  let s = Builder()
+  s.write("// The variables the conditions of one walk assign. A condition stores its\n")
+  s.write("// variable only when it holds, and the diagram reads a variable only on\n")
+  s.write("// paths through that condition's high edge, so the empty values below are\n")
+  s.write("// never read.\n")
+  s.write("class EndpointState {\n")
+  for v of vars {
+    s.write("  ${v.ident}: ${epKindName(v.kind)},\n")
+  }
+  s.write("}\n\n")
+  s.write("fn endpointStateInit(): EndpointState {\n  return EndpointState{\n")
+  for v of vars {
+    s.write("    ${v.ident} = ${epZeroValue(v.kind)},\n")
+  }
+  s.write("  }\n}\n")
+  return s.toString()
+}
+
+fn epNodesConst(b: EpBdd): string {
+  let s = Builder()
+  s.write("const endpointBddRoot: int = ${b.root}\n")
+  s.write("const endpointBddNodeCount: int = ${b.nodeCount}\n")
+  s.write("const endpointResultBase: int = ${epResultBase}\n\n")
+  s.write("// Node n is the triple (condition, high, low) at 3n; node 0 is a sentinel.\n")
+  s.write("const endpointBddNodes: []int = [\n")
+  let i = 0
+  while (i < b.nodeCount) {
+    let end = i + epNodesPerLine
+    if (end > b.nodeCount) {
+      end = b.nodeCount
+    }
+    let row = []string(0)
+    let n = i
+    while (n < end) {
+      row = append(row, "${b.nodes[3 * n]}, ${b.nodes[3 * n + 1]}, ${b.nodes[3 * n + 2]}")
+      n = n + 1
+    }
+    s.write("  ${commaList(row)},\n")
+    i = end
+  }
+  s.write("]\n")
+  return s.toString()
+}
+
+// The result types, their constructors and the walk. Static text: nothing in it varies with the rule set.
+fn epWalker(): string {
+  return `// One scheme the endpoint is signed with. An absent signing region is "" and
+// an absent region set is empty. Every scheme of the rule set carries
+// disableDoubleEncoding, which S3 signs with (the path is encoded once).
+class EndpointAuthScheme {
+  name: string,
+  signingName: string,
+  signingRegion: string,
+  signingRegionSet: []string,
+  disableDoubleEncoding: bool,
+}
+
+// The endpoint a walk resolves to: the URL, the "backend" property ("" when
+// absent) and the auth schemes in the order the rule lists them.
+class EndpointResult {
+  url: string,
+  backend: string,
+  authSchemes: []EndpointAuthScheme,
+}
+
+fn endpointAuth(
+  name: string,
+  signingName: string,
+  signingRegion: string,
+  signingRegionSet: []string,
+): EndpointAuthScheme {
+  return EndpointAuthScheme{
+    name = name,
+    signingName = signingName,
+    signingRegion = signingRegion,
+    signingRegionSet = signingRegionSet,
+    disableDoubleEncoding = true,
+  }
+}
+
+fn endpointOk(url: string, backend: string, authSchemes: []EndpointAuthScheme): EndpointResult {
+  return EndpointResult{ url = url, backend = backend, authSchemes = authSchemes }
+}
+
+// The next reference after node ref: the high edge when the condition holds
+// and the edge is not complemented, or fails and is; the low edge otherwise.
+fn endpointNext(ref: int, passed: bool, at: int): int {
+  let forward = ref > 0
+  if (forward == passed) {
+    return endpointBddNodes[at + 1]
+  }
+  return endpointBddNodes[at + 2]
+}
+
+// Walks the decision diagram for p: the endpoint, or the error text of the
+// rule that matched. At most endpointBddNodeCount steps, never a recursion.
+fn endpointDecide(p: EndpointParams): EndpointResult! {
+  let s = endpointStateInit()
+  let ref = endpointBddRoot
+  let steps = 0
+  while (ref != 1 && ref != -1 && ref < endpointResultBase) {
+    steps = steps + 1
+    if (steps > endpointBddNodeCount) {
+      fail newError("endpoint: the decision diagram walk exceeded its node count")
+    }
+    let node = ref
+    if (node < 0) {
+      node = -node
+    }
+    let at = 3 * (node - 1)
+    ref = endpointNext(ref, endpointCondAt(endpointBddNodes[at], p, s), at)
+  }
+  if (ref > endpointResultBase) {
+    return endpointResultAt(ref - endpointResultBase, p, s)?
+  }
+  fail newError("No matching endpoint.")
+}
+`
+}
