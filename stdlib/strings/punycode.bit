@@ -1,0 +1,323 @@
+// Bit standard library — strings module, Punycode (RFC 3492), #6879.
+//
+// Bootstring with the Punycode parameters of RFC 3492 §5: base 36, tmin 1,
+// tmax 26, skew 38, damp 700, initial bias 72, initial n 128. IDNA wraps each
+// non-ASCII domain label as `xn--` + this encoding; that wrapping is IDNA's,
+// not this file's.
+//
+// std/strings is imported by the compiler, which is built by the pinned stage0,
+// and a module is every file in its directory. So nothing here uses
+// `string(rune)` or `[]rune(s)`: code points are plain `int`s, read through
+// `decodeRune` (utf8.bit) and written back as UTF-8 bytes by `putUtf8`.
+//
+// Arithmetic runs in `int` (64 bit) but is bounded by the RFC's `maxint`
+// (2^32 - 1) with the §6.4 pre-checks, so an overflow is reported as
+// `punycode: overflow` exactly where a 32-bit implementation would wrap.
+
+const pcBase: int = 36
+const pcTmin: int = 1
+const pcTmax: int = 26
+const pcSkew: int = 38
+const pcDamp: int = 700
+const pcInitialBias: int = 72
+const pcInitialN: int = 128
+const pcMaxInt: int = 0xFFFFFFFF
+const pcMaxRune: int = 0x10FFFF
+
+// The mutable state both directions thread through the bootstring loop. A
+// class so the helpers below can advance it without returning a tuple.
+class PunyState {
+  n: int,
+  delta: int,
+  bias: int,
+  h: int,
+}
+
+// RFC 3492 §6.1 bias adaptation.
+fn pcAdapt(delta: int, numPoints: int, first: bool): int {
+  let d = delta / 2
+  if (first) {
+    d = delta / pcDamp
+  }
+  d = d + d / numPoints
+  let k = 0
+  while (d > (pcBase - pcTmin) * pcTmax / 2) {
+    d = d / (pcBase - pcTmin)
+    k = k + pcBase
+  }
+  return k + (pcBase - pcTmin + 1) * d / (d + pcSkew)
+}
+
+// The threshold t(k) of §6.2 for digit position `k` under `bias`.
+fn pcThreshold(k: int, bias: int): int {
+  if (k <= bias) {
+    return pcTmin
+  }
+  if (k >= bias + pcTmax) {
+    return pcTmax
+  }
+  return k - bias
+}
+
+// Digit value 0..35 as the lowercase basic code point the encoder emits.
+fn pcDigitByte(d: int): u8 {
+  if (d < 26) {
+    return byte(97 + d)
+  }
+  return byte(48 + d - 26)
+}
+
+// Value of the basic code point `c` as a digit (a-z / A-Z are 0..25, 0-9 are
+// 26..35), or -1 when it is not a digit.
+fn pcDigitValue(c: int): int {
+  if (c >= 97 && c <= 122) {
+    return c - 97
+  }
+  if (c >= 65 && c <= 90) {
+    return c - 65
+  }
+  if (c >= 48 && c <= 57) {
+    return c - 48 + 26
+  }
+  return -1
+}
+
+// §6.3 encoding of `delta` as a generalized variable-length integer.
+fn pcPutVarint(out: Builder, delta: int, bias: int) {
+  let q = delta
+  let k = pcBase
+  while (true) {
+    let t = pcThreshold(k, bias)
+    if (q < t) {
+      break
+    }
+    out.writeByte(pcDigitByte(t + (q - t) % (pcBase - t)))
+    q = (q - t) / (pcBase - t)
+    k = k + pcBase
+  }
+  out.writeByte(pcDigitByte(q))
+}
+
+// Appends the UTF-8 encoding of the scalar value `c` (callers guarantee
+// `c <= 0x10FFFF` and not a surrogate).
+fn putUtf8(out: Builder, c: int) {
+  if (c < 0x80) {
+    out.writeByte(byte(c))
+    return
+  }
+  if (c < 0x800) {
+    out.writeByte(byte(0xC0 | (c >> 6)))
+    out.writeByte(byte(0x80 | (c & 0x3F)))
+    return
+  }
+  if (c < 0x10000) {
+    out.writeByte(byte(0xE0 | (c >> 12)))
+    out.writeByte(byte(0x80 | ((c >> 6) & 0x3F)))
+    out.writeByte(byte(0x80 | (c & 0x3F)))
+    return
+  }
+  out.writeByte(byte(0xF0 | (c >> 18)))
+  out.writeByte(byte(0x80 | ((c >> 12) & 0x3F)))
+  out.writeByte(byte(0x80 | ((c >> 6) & 0x3F)))
+  out.writeByte(byte(0x80 | (c & 0x3F)))
+}
+
+// The code points of well-formed UTF-8 `s`.
+fn pcCodePoints(s: string): []int {
+  let cps = []int(0, len(s))
+  let i = 0
+  while (i < len(s)) {
+    let (cp, used) = decodeRune(s, i)
+    cps = append(cps, int(cp))
+    i = i + used
+  }
+  return cps
+}
+
+// The smallest code point in `cps` that is >= `n`. The caller guarantees one
+// exists (`h < len(cps)` means a non-basic code point is still unhandled).
+fn pcNextRune(cps: []int, n: int): int {
+  let m = pcMaxInt
+  for c of cps {
+    if (c >= n && c < m) {
+      m = c
+    }
+  }
+  return m
+}
+
+// One pass of the §6.3 main loop for code point `st.n`: emits the delta for
+// each occurrence and counts the smaller ones.
+fn pcEncodePass(out: Builder, cps: []int, st: PunyState, b: int): ()! {
+  for c of cps {
+    if (c < st.n) {
+      if (st.delta == pcMaxInt) {
+        fail newError("punycode: overflow")
+      }
+      st.delta = st.delta + 1
+    }
+    if (c == st.n) {
+      pcPutVarint(out, st.delta, st.bias)
+      st.bias = pcAdapt(st.delta, st.h + 1, st.h == b)
+      st.delta = 0
+      st.h = st.h + 1
+    }
+  }
+}
+
+// Encodes `s` (UTF-8) as Punycode (RFC 3492 §6.3). The result has no `xn--`
+// prefix. Basic (ASCII) code points are copied first, followed by `-` when
+// there is at least one, so `"abc"` encodes as `"abc-"`, as in the RFC's
+// reference encoder.
+//
+// Fails with `punycode: invalid UTF-8` when `s` is not well-formed UTF-8 and
+// `punycode: overflow` when a delta would exceed 2^32 - 1.
+export fn punycodeEncode(s: string): string! {
+  if (!isValidUtf8(s)) {
+    fail newError("punycode: invalid UTF-8")
+  }
+  let cps = pcCodePoints(s)
+  let out = Builder()
+  let b = 0
+  for c of cps {
+    if (c < pcInitialN) {
+      out.writeByte(byte(c))
+      b = b + 1
+    }
+  }
+  if (b > 0) {
+    out.writeByte('-')
+  }
+  let st = PunyState{ n = pcInitialN, delta = 0, bias = pcInitialBias, h = b }
+  while (st.h < len(cps)) {
+    let m = pcNextRune(cps, st.n)
+    if (m - st.n > (pcMaxInt - st.delta) / (st.h + 1)) {
+      fail newError("punycode: overflow")
+    }
+    st.delta = st.delta + (m - st.n) * (st.h + 1)
+    st.n = m
+    pcEncodePass(out, cps, st, b)?
+    st.delta = st.delta + 1
+    st.n = st.n + 1
+  }
+  return out.toString()
+}
+
+// `punycode: invalid input at <i>`.
+fn pcBadInput(i: int): error {
+  return newError("punycode: invalid input at ${i}")
+}
+
+// Checks that `s` is ASCII and returns the index of its last `-` when that is
+// past position 0 (the basic code points precede it), else 0.
+fn pcBasicLen(s: string): int! {
+  let b = 0
+  let i = 0
+  while (i < len(s)) {
+    let c = int(s[i])
+    if (c >= 0x80) {
+      fail pcBadInput(i)
+    }
+    if (c == 45 && i > 0) {
+      b = i
+    }
+    i = i + 1
+  }
+  return b
+}
+
+// Reads one generalized variable-length integer (§6.2) from `s` at `pos`,
+// adding it into `st.delta` (the running `i` of the RFC) and returning the new
+// read position.
+fn pcReadVarint(s: string, pos: int, st: PunyState): int! {
+  let p = pos
+  let w = 1
+  let k = pcBase
+  while (true) {
+    if (p >= len(s)) {
+      fail pcBadInput(p)
+    }
+    let digit = pcDigitValue(int(s[p]))
+    if (digit < 0) {
+      fail pcBadInput(p)
+    }
+    p = p + 1
+    if (digit > (pcMaxInt - st.delta) / w) {
+      fail newError("punycode: overflow")
+    }
+    st.delta = st.delta + digit * w
+    let t = pcThreshold(k, st.bias)
+    if (digit < t) {
+      break
+    }
+    if (w > pcMaxInt / (pcBase - t)) {
+      fail newError("punycode: overflow")
+    }
+    w = w * (pcBase - t)
+    k = k + pcBase
+  }
+  return p
+}
+
+// Inserts `c` into `cps` at index `at` (0 <= at <= len(cps)).
+fn pcInsert(cps: []int, at: int, c: int): []int {
+  cps = append(cps, c)
+  let j = len(cps) - 1
+  while (j > at) {
+    cps[j] = cps[j - 1]
+    j = j - 1
+  }
+  cps[at] = c
+  return cps
+}
+
+// Whether `c` is a Unicode scalar value.
+fn pcIsScalar(c: int): bool {
+  return c <= pcMaxRune && (c < 0xD800 || c > 0xDFFF)
+}
+
+// Decodes Punycode `s` (RFC 3492 §6.2). `s` carries no `xn--` prefix.
+//
+// Fails with `punycode: invalid input at <i>` (`i` a byte index) for a
+// non-ASCII byte, a character that is not a digit, input that ends inside a
+// number, or a number that decodes to a non-scalar code point, and with
+// `punycode: overflow` when a number exceeds 2^32 - 1.
+//
+// The insertion step shifts the already-decoded tail, so the work is
+// quadratic in the decoded length in the worst case, as in the RFC's reference
+// decoder; the loop count is still bounded by the input length.
+export fn punycodeDecode(s: string): string! {
+  let b = pcBasicLen(s)?
+  let cps = []int(0, len(s))
+  let j = 0
+  while (j < b) {
+    cps = append(cps, int(s[j]))
+    j = j + 1
+  }
+  let st = PunyState{ n = pcInitialN, delta = 0, bias = pcInitialBias, h = 0 }
+  let pos = 0
+  if (b > 0) {
+    pos = b + 1
+  }
+  while (pos < len(s)) {
+    let oldi = st.delta
+    pos = pcReadVarint(s, pos, st)?
+    let count = len(cps) + 1
+    st.bias = pcAdapt(st.delta - oldi, count, oldi == 0)
+    if (st.delta / count > pcMaxInt - st.n) {
+      fail newError("punycode: overflow")
+    }
+    st.n = st.n + st.delta / count
+    st.delta = st.delta % count
+    if (!pcIsScalar(st.n)) {
+      fail pcBadInput(pos - 1)
+    }
+    cps = pcInsert(cps, st.delta, st.n)
+    st.delta = st.delta + 1
+  }
+  let out = Builder()
+  for c of cps {
+    putUtf8(out, c)
+  }
+  return out.toString()
+}
