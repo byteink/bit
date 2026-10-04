@@ -122,6 +122,57 @@ The requirement is read-only through the interface. Writing `by.id = "x"`,
 `by.id += "x"` or `by.id++` is `E0114`, the same error a `readonly` class
 field gives. Assign on the concrete value (`ana.id = "x"`) instead.
 
+## Reading one field by name: `__field`
+
+Bit has no reflection, so an interface cannot ask "give me the field called
+`team`" of a class it has never seen. A package that stores a policy as text
+(`"team": "$user.team"`) needs exactly that. Declare a method named `__field`
+in an interface and the compiler writes it for every class in the program:
+
+```bit
+import { Json, jsonAsString } from "std/json"
+
+interface Attributes {
+  __field(name: string): Option<Json>,
+}
+
+class Author {
+  export id: string,
+  export team: string,
+  export drafts: int,
+  secret: string,
+}
+
+fn attribute(a: Attributes, name: string): string {
+  return match (a.__field(name)) {
+    Some(j) => unwrapOr(jsonAsString(j), "not text")
+    None => "none"
+  }
+}
+
+fn main() {
+  let ana = Author{ id = "ana", team = "sport", drafts = 3, secret = "s" }
+  println(attribute(ana, "team"))
+  println(attribute(ana, "drafts"))
+  println(attribute(ana, "secret"))
+}
+```
+
+`Author` writes no `__field`: it is a chain of `if (name == "team")` tests over
+its `export`ed fields, so a lookup allocates at most the one `Json` value it
+returns and never serializes the object. The result is `Some` for a string, an
+integer, a float, a bool, a payload-free enum declared in the same module (its
+variant name) and a slice of any of those. It is `None` for an unknown name, an
+unexported field, a nested class, a map or an `Option` field: a nested object
+has no flat value to return, and the member never reaches into a class that did
+not ask for it.
+
+The member exists only in a program that declares an interface with a method
+named `__field`, so every other program is unchanged. Declaring a method named
+`__field` yourself is **E0311**, because a hand-written one would satisfy such
+an interface by name alone. The name is hidden from `bit doc` like every
+`__` member.
+
 ## The built-in `error` interface
 
 Bit's own `error` type is declared the same way:

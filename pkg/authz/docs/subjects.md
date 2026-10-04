@@ -46,7 +46,7 @@ placeholder into a value:
 import { attributeOf } from "authz"
 import { jsonAsString } from "std/json"
 
-@json class User {
+class User {
   export id: string,
   export roles: []string,
   export team: string,
@@ -61,11 +61,17 @@ fn main() {
 }
 ```
 
-`id` and `roles` always resolve. Every other path is read from the class's
-`toJson()`, which only exists when you write `@json` on it. Without `@json`
-the language gives `authz` no way to see a field it has no name for, so any
-other path is `None`. A dotted path such as `address.city` walks nested
-`@json` classes; arrays are never indexed.
+`id` and `roles` always resolve, and so does any other `export`ed field: the
+compiler writes a `__field(name)` method on every class in a program that
+uses `authz`, so `attributeOf` reads the one field it was asked for. Nothing
+is serialized and nothing is allocated but the value it returns, so a lookup
+costs the same however many fields `User` has, and `User` needs no `@json`.
+
+A string, an integer, a float, a bool, an enum (its variant name) and a list
+of those resolve. A nested class, a map, an `Option` field, a field without
+`export` and a name the class does not have are `None`. Names are flat:
+`address.city` is `None`, because `address` has no single value to hand back.
+Put what a policy needs on the subject itself, as `team` is here.
 
 `None` is not an error. A condition that cannot read its attribute does not
 match, so a typo in a stored placeholder denies instead of granting. Policies
@@ -85,7 +91,7 @@ class Identity {
   claims: Json,
 }
 
-@json class User {
+class User {
   export id: string,
   export roles: []string,
   export team: string,
@@ -124,9 +130,10 @@ a policy that applies when the subject is absent.
 
 ## Sharp edges
 
-- Forgetting `@json` makes every stored `$user.<field>` placeholder
-  unresolvable, so the statement never matches. Add it to your user class.
-- The attribute is the JSON key, which is the field name unless you rename it
-  with `@key("...")`. Stored placeholders use the key.
-- `attributeOf` never reads a field the class keeps out of `toJson`; only
-  what you serialize can be named by a policy.
+- The field has to be `export`ed, the same rule that lets `User` satisfy
+  `Subject` from your app. A private field is `None`.
+- The name is the field name. `@key("...")` renames a JSON key for `@json`;
+  it does not rename an attribute.
+- `attributeOf` reads only the shapes listed above. An `Option<string>` field
+  is `None` even when it holds a value; keep a plain `string` for an
+  attribute a policy names.

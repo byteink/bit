@@ -4870,6 +4870,25 @@ Method sets:
   like any interface method, is not listed by `bit doc` or completion, and
   does not exist for a field no interface requires. Fields of a generic class
   satisfy a requirement of the instantiated type.
+- **`__field`, the by-name field read (#7110).** An interface declaring a
+  method `__field(name: string): Option<Json>` (`Json` from `std/json`) is
+  satisfied by every non-generic class that has an `export`ed field, without
+  the class declaring it. The compiler synthesizes `[export] (this: C)
+  __field(name)` as a flat chain `if (name == "f") { return Some(<this.f>) }`
+  over the class's `export`ed fields in declaration order, then `None`; a
+  lookup allocates only the returned `Json` (a list for a slice field), and
+  never serializes the object. The field types that map: `string` (`JsonString`),
+  every integer type (`JsonInt`), `f32`/`f64` (`JsonFloat`), `bool` (`JsonBool`),
+  a payload-free enum declared in the same module (`JsonString` of the variant
+  name, as `toJson` writes it) and a slice of any of those (`JsonArray`). A
+  nested class, a map, an `Option` field, an unexported field and an unknown
+  name are `None`; the name is the field name, never a `@key` rename. The member
+  is emitted only in a program that declares such an interface (the demand rule
+  `__get_<field>` follows), is dispatched like any interface method, and is not
+  listed by `bit doc` or completion. A class declaring a method named `__field`
+  is **E0311**. Modules loaded before `std/json` are loaded after it instead
+  (the project is loaded once more with `std/json` first), so a class in any
+  module of the program gets the member.
 - `S` must be a **class or enum** type (or another interface, or `nil`). An
   interface value *is* the receiver's object pointer - there is no boxed
   scalar - so only a type that is already a reference (§13.3) can sit behind
