@@ -1,17 +1,612 @@
-// pkg/redis/list.bit — `r.list(key)`: the list handle. Epic
-// #6013, #6028: SCAFFOLD ONLY, no commands wired yet (`LPUSH, RPUSH, LPOP, RPOP, LRANGE`, a
-// follow-up ticket) — this file exists so later family tickets touch only
-// their own file, never `client.bit`. `cmd.bit`'s header is the template:
-// one `Cmd<T>` factory per command, called from a method here.
-export class List {
-  client: Client,
-  key: string,
+// pkg/redis/list.bit - `r.list(key)`: every Redis list command, `LPUSH`
+// through `BLMPOP`. Epic #6013, #6028, #6031. Follows `cmd.bit`'s HOW-TO
+// header and `counter.bit`'s reference shape: one `Cmd<T>` factory per
+// command, an immediate method on `List`, a queued method on `ListBatch`.
+//
+// `List` HOLDS `client: Client`, NOT `runner: Runner`, for the reason
+// `set.bit`'s header gives: `client.bit`'s `list` accessor still builds
+// `List{ client = this, key = key }` (#6028's scaffold) and a family ticket
+// may not edit that shared file. `tx.read.list(key)` does not exist yet.
+//
+// WHICH END IS WHICH. A list reads head to tail, like an array. `push`/`pop`
+// work the TAIL (`RPUSH`/`RPOP`), `pushFront`/`popFront` the HEAD (`LPUSH`/
+// `LPOP`), so a queue is `push` in and `popFront` out, a stack is `push` and
+// `pop`. `ListEnd` names an end where one call takes two (`move`).
+//
+// ONE METHOD PER COMMAND SHAPE. Where only an option differs it is a typed
+// parameter (`insert(.., after = true)`, `remove(value, count)`). Where the
+// RETURN TYPE differs the shapes are two methods, because Bit has no
+// overloading: `pop()` is `Option<string>` (`RPOP key`), `popMany(count)` is
+// `[]string` (`RPOP key count`); `position` is one index, `positions` a list.
+// The `X` forms (`RPUSHX`, `LPUSHX`) are `pushIfExists`/`pushFrontIfExists`:
+// a variadic parameter must be last, so a `bool` option cannot follow it.
+//
+// BLOCKING POPS (`blockPop`, `blockPopFront`, `blockMove`, `blockPopAny`).
+// `timeout` is nanoseconds (`std/time`'s `Second`/`Millisecond`), `0` waits
+// forever, and a timeout is `Option.None`, never an error. Redis takes the
+// timeout in seconds, so it is sent as whole milliseconds ("2.500"); a
+// positive timeout under 1ms is sent as 1ms, because "0" would mean forever.
+// A negative timeout is sent as-is and the server refuses it.
+//
+// A BLOCKING CALL NEVER LEASES A POOL CONNECTION. `runBlocking` below dials
+// its own connection for the call and closes it after, so `poolSize` callers
+// blocked on empty queues cannot leave nothing for `get`/`set`. Cost: one
+// dial plus `HELLO` per blocking call, and for a `rediss://` URL the root
+// store is parsed each time (`tlsRootsFor`); set `tlsRootCa` to keep that
+// small. The read deadline is `timeout + commandTimeout`, so the connection's
+// own `commandTimeout` never cuts a block short; with `timeout = 0` there is
+// no read deadline at all. `runBlocking` is the shared helper any other
+// family's blocking command (`BZPOPMIN`, `XREAD BLOCK`) can reuse.
+//
+// BLOCKING COMMANDS HAVE NO `ListBatch` METHOD. A `Pipeline` writes every
+// queued command back to back on one connection under one `commandTimeout`,
+// so a blocked pop would stall the rest of the batch and be cut at 5s; inside
+// `MULTI` the server never blocks at all. Use the plain `pop`/`popFront`
+// there, and the immediate handle for a real wait.
+//
+// ALLOCATION: every variadic wire form below is built into ONE `[]string`
+// sized up front (`listArgs`), never grown by `append`.
+
+// One end of a list: the head (`LEFT`) or the tail (`RIGHT`).
+export enum ListEnd {
+  Front,
+  Back,
 }
 
-// The queued view `Pipeline.list`/`Tx.list` both return — `cmd.bit`'s
-// `Batch` is the ONE client-side queue the two executors share, so this
-// is the ONLY queued view List needs (`cmd.bit`'s header, point 2).
+// What a blocking pop returns: the element and the key it came from. With a
+// single key the key is the handle's own; `others` makes it the one that had
+// an element first.
+export class Popped { export key: string, export value: string }
+
+// `popAny`/`blockPopAny`: the key that answered and the elements taken.
+export class PoppedMany { export key: string, export values: []string }
+
+export class List {
+  client: Client
+  key: string
+
+  export push(...values: string): i64!RedisError {
+    return this.client.runCmd(listPushCmd("RPUSH", this.key, values))?
+  }
+  export pushFront(...values: string): i64!RedisError {
+    return this.client.runCmd(listPushCmd("LPUSH", this.key, values))?
+  }
+  // Only when the list already exists; otherwise nothing is created and 0 is returned.
+  export pushIfExists(...values: string): i64!RedisError {
+    return this.client.runCmd(listPushCmd("RPUSHX", this.key, values))?
+  }
+  export pushFrontIfExists(...values: string): i64!RedisError {
+    return this.client.runCmd(listPushCmd("LPUSHX", this.key, values))?
+  }
+  export pop(): Option<string>!RedisError {
+    return this.client.runCmd(listPopCmd("RPOP", this.key))?
+  }
+  export popFront(): Option<string>!RedisError {
+    return this.client.runCmd(listPopCmd("LPOP", this.key))?
+  }
+  export popMany(count: int): []string!RedisError {
+    return this.client.runCmd(listPopManyCmd("RPOP", this.key, count))?
+  }
+  export popFrontMany(count: int): []string!RedisError {
+    return this.client.runCmd(listPopManyCmd("LPOP", this.key, count))?
+  }
+  // `LMPOP`: up to `count` elements from the first non-empty list among this
+  // key and `others`, taken from `end`. `None` when all are empty.
+  export popAny(
+    end: ListEnd,
+    others: []string = []string(0),
+    count: int = 1,
+  ): Option<PoppedMany>!RedisError {
+    return this.client.runCmd(listPopAnyCmd(this.key, others, end, count))?
+  }
+  // `LRANGE`: `stop` is inclusive and a negative index counts from the tail.
+  export range(start: int, stop: int): []string!RedisError {
+    return this.client.runCmd(listRangeCmd(this.key, start, stop))?
+  }
+  export all(): []string!RedisError { return this.client.runCmd(listRangeCmd(this.key, 0, -1))? }
+  export len(): i64!RedisError { return this.client.runCmd(listLenCmd(this.key))? }
+  export index(at: int): Option<string>!RedisError {
+    return this.client.runCmd(listIndexCmd(this.key, at))?
+  }
+  // Fails `RedisError.Server("ERR", ..)` when `at` is out of range.
+  export set(at: int, value: string): ()!RedisError {
+    return this.client.runCmd(listSetCmd(this.key, at, value))?
+  }
+  // `LINSERT`: the new length, -1 when `pivot` is not in the list, 0 when the key is missing.
+  export insert(pivot: string, value: string, after: bool = false): i64!RedisError {
+    return this.client.runCmd(listInsertCmd(this.key, pivot, value, after))?
+  }
+  // `LREM`: `count` > 0 removes from the head, < 0 from the tail, 0 removes every match.
+  export remove(value: string, count: int = 0): i64!RedisError {
+    return this.client.runCmd(listRemoveCmd(this.key, count, value))?
+  }
+  export trim(start: int, stop: int): ()!RedisError {
+    return this.client.runCmd(listTrimCmd(this.key, start, stop))?
+  }
+  // `LPOS`: the index of the first match, searching from the head, or from
+  // the tail when `rank` is negative (`rank` 2 is the second match, 0 means
+  // the default). `maxLen` > 0 stops after that many elements.
+  export position(value: string, rank: int = 0, maxLen: int = 0): Option<i64>!RedisError {
+    return this.client.runCmd(listPositionCmd(this.key, value, rank, maxLen))?
+  }
+  // `LPOS .. COUNT`: up to `count` match indexes, 0 for every match.
+  export positions(
+    value: string,
+    count: int = 0,
+    rank: int = 0,
+    maxLen: int = 0,
+  ): []i64!RedisError {
+    return this.client.runCmd(listPositionsCmd(this.key, value, count, rank, maxLen))?
+  }
+  // `LMOVE`: takes one element off `fromEnd` of this list and puts it on `toEnd` of `dest`.
+  export move(dest: string, fromEnd: ListEnd, toEnd: ListEnd): Option<string>!RedisError {
+    return this.client.runCmd(listMoveCmd(this.key, dest, fromEnd, toEnd))?
+  }
+  // `BRPOP`: waits up to `timeout` for a tail element of this key or of `others`, in that order.
+  export blockPop(timeout: int, others: []string = []string(0)): Option<Popped>!RedisError {
+    return runBlocking(this.client, listBlockPopCmd("BRPOP", this.key, others, timeout), timeout)?
+  }
+  export blockPopFront(
+    timeout: int,
+    others: []string = []string(0),
+  ): Option<Popped>!RedisError {
+    return runBlocking(this.client, listBlockPopCmd("BLPOP", this.key, others, timeout), timeout)?
+  }
+  // `BLMOVE`: `move`, waiting up to `timeout` for this list to have an element.
+  export blockMove(
+    dest: string,
+    fromEnd: ListEnd,
+    toEnd: ListEnd,
+    timeout: int,
+  ): Option<string>!RedisError {
+    return runBlocking(
+      this.client,
+      listBlockMoveCmd(this.key, dest, fromEnd, toEnd, timeout),
+      timeout,
+    )?
+  }
+  // `BLMPOP`: `popAny`, waiting up to `timeout`.
+  export blockPopAny(
+    end: ListEnd,
+    timeout: int,
+    others: []string = []string(0),
+    count: int = 1,
+  ): Option<PoppedMany>!RedisError {
+    return runBlocking(
+      this.client,
+      listBlockPopAnyCmd(this.key, others, end, count, timeout),
+      timeout,
+    )?
+  }
+}
+
+// The queued view `Pipeline.list`/`Tx.list` both return - `cmd.bit`'s
+// `Batch` is the ONE client-side queue the two executors share, so this is
+// the ONLY queued view List needs (`cmd.bit`'s header, point 2). No
+// blocking methods: this file's header says why.
 export class ListBatch {
-  batch: Batch,
+  batch: Batch
+  key: string
+
+  export push(...values: string): Future<i64> {
+    return this.batch.queue(listPushCmd("RPUSH", this.key, values))
+  }
+  export pushFront(...values: string): Future<i64> {
+    return this.batch.queue(listPushCmd("LPUSH", this.key, values))
+  }
+  export pushIfExists(...values: string): Future<i64> {
+    return this.batch.queue(listPushCmd("RPUSHX", this.key, values))
+  }
+  export pushFrontIfExists(...values: string): Future<i64> {
+    return this.batch.queue(listPushCmd("LPUSHX", this.key, values))
+  }
+  export pop(): Future<Option<string>> { return this.batch.queue(listPopCmd("RPOP", this.key)) }
+  export popFront(): Future<Option<string>> {
+    return this.batch.queue(listPopCmd("LPOP", this.key))
+  }
+  export popMany(count: int): Future<[]string> {
+    return this.batch.queue(listPopManyCmd("RPOP", this.key, count))
+  }
+  export popFrontMany(count: int): Future<[]string> {
+    return this.batch.queue(listPopManyCmd("LPOP", this.key, count))
+  }
+  export popAny(
+    end: ListEnd,
+    others: []string = []string(0),
+    count: int = 1,
+  ): Future<Option<PoppedMany>> {
+    return this.batch.queue(listPopAnyCmd(this.key, others, end, count))
+  }
+  export range(start: int, stop: int): Future<[]string> {
+    return this.batch.queue(listRangeCmd(this.key, start, stop))
+  }
+  export all(): Future<[]string> { return this.batch.queue(listRangeCmd(this.key, 0, -1)) }
+  export len(): Future<i64> { return this.batch.queue(listLenCmd(this.key)) }
+  export index(at: int): Future<Option<string>> {
+    return this.batch.queue(listIndexCmd(this.key, at))
+  }
+  export set(at: int, value: string): Future<()> {
+    return this.batch.queue(listSetCmd(this.key, at, value))
+  }
+  export insert(pivot: string, value: string, after: bool = false): Future<i64> {
+    return this.batch.queue(listInsertCmd(this.key, pivot, value, after))
+  }
+  export remove(value: string, count: int = 0): Future<i64> {
+    return this.batch.queue(listRemoveCmd(this.key, count, value))
+  }
+  export trim(start: int, stop: int): Future<()> {
+    return this.batch.queue(listTrimCmd(this.key, start, stop))
+  }
+  export position(value: string, rank: int = 0, maxLen: int = 0): Future<Option<i64>> {
+    return this.batch.queue(listPositionCmd(this.key, value, rank, maxLen))
+  }
+  export positions(value: string, count: int = 0, rank: int = 0, maxLen: int = 0): Future<[]i64> {
+    return this.batch.queue(listPositionsCmd(this.key, value, count, rank, maxLen))
+  }
+  export move(dest: string, fromEnd: ListEnd, toEnd: ListEnd): Future<Option<string>> {
+    return this.batch.queue(listMoveCmd(this.key, dest, fromEnd, toEnd))
+  }
+}
+
+// `head... key others... tail...` as ONE slice sized up front - the wire
+// shape of every command here that takes a variable run of keys or values.
+fn listArgs(head: []string, key: string, rest: []string, tail: []string): []string {
+  let out = []string(len(head) + 1 + len(rest) + len(tail))
+  let at = 0
+  at = listFill(out, at, head)
+  out[at] = key
+  at = listFill(out, at + 1, rest)
+  let _ = listFill(out, at, tail)
+  return out
+}
+
+// Copies `src` into `out` from index `at`; returns the index after it.
+fn listFill(out: []string, at: int, src: []string): int {
+  let i = 0
+  while (i < len(src)) {
+    out[at + i] = src[i]
+    i = i + 1
+  }
+  return at + len(src)
+}
+
+fn endWord(e: ListEnd): string {
+  match (e) {
+    Front => return "LEFT"
+    Back => return "RIGHT"
+  }
+}
+
+// A blocking command's timeout argument, in seconds: whole milliseconds, so
+// "2.500". This file's header says why a positive sub-millisecond timeout is
+// sent as 1ms and a negative one as -1.
+fn blockSeconds(ns: int): string {
+  if (ns < 0) {
+    return "-1"
+  }
+  let ms = ns / Millisecond
+  if (ns > 0 && ms == 0) {
+    ms = 1
+  }
+  if (ms % 1000 == 0) {
+    return "${ms / 1000}"
+  }
+  let frac = ms % 1000
+  if (frac < 10) {
+    return "${ms / 1000}.00${frac}"
+  }
+  if (frac < 100) {
+    return "${ms / 1000}.0${frac}"
+  }
+  return "${ms / 1000}.${frac}"
+}
+
+// The read deadline for a blocking reply: the block itself plus the
+// connection's `commandTimeout` of slack, or none (0) for a forever wait.
+fn blockDeadline(blockNs: int, commandTimeoutNs: int): int {
+  if (blockNs <= 0 || commandTimeoutNs <= 0) {
+    return 0
+  }
+  return blockNs + commandTimeoutNs
+}
+
+fn blockRoundTrip(
+  conn: redisConn,
+  args: []string,
+  commandTimeoutNs: int,
+  blockNs: int,
+): Reply!RedisError {
+  writeCommand(conn, args, commandTimeoutNs)?
+  let deadline = blockDeadline(blockNs, commandTimeoutNs)
+  if (deadline == 0) {
+    conn.setDeadline(0)
+  }
+  return readOneReply(conn, deadline)?
+}
+
+// Runs a blocking `cmd` on a connection dialed for this call alone and
+// closed after it - this file's header, "A BLOCKING CALL NEVER LEASES A POOL
+// CONNECTION". `blockNs` must be the timeout `cmd.args` was built with.
+fn runBlocking<T>(client: Client, cmd: Cmd<T>, blockNs: int): T!RedisError {
+  let roots = tlsRootsFor(client.opts)?
+  let conn = dialConn(client.opts, roots)?
+  let r = blockRoundTrip(conn, cmd.args, client.opts.commandTimeout, blockNs) catch e {
+    conn.close()
+    fail e
+  }
+  conn.close()
+  return cmd.decode(r)?
+}
+
+fn listPushCmd(cmd: string, key: string, values: []string): Cmd<i64> {
+  return Cmd<i64>{
+    args = listArgs([cmd], key, values, []string(0)),
+    decode = (r) => asInt(r, cmd),
+    readOnly = false,
+  }
+}
+
+fn listPopCmd(cmd: string, key: string): Cmd<Option<string>> {
+  return Cmd<Option<string>>{
+    args = [cmd, key],
+    decode = (r) => asOptString(r, cmd),
+    readOnly = false,
+  }
+}
+
+fn listPopManyCmd(cmd: string, key: string, count: int): Cmd<[]string> {
+  return Cmd<[]string>{
+    args = [cmd, key, "${count}"],
+    decode = (r) => asListItems(r, cmd),
+    readOnly = false,
+  }
+}
+
+fn listPopAnyArgs(
+  head: []string,
   key: string,
+  others: []string,
+  end: ListEnd,
+  count: int,
+): []string {
+  return listArgs(head, key, others, [endWord(end), "COUNT", "${count}"])
+}
+
+fn listPopAnyCmd(key: string, others: []string, end: ListEnd, count: int): Cmd<Option<PoppedMany>> {
+  let head = ["LMPOP", "${len(others) + 1}"]
+  return Cmd<Option<PoppedMany>>{
+    args = listPopAnyArgs(head, key, others, end, count),
+    decode = (r) => asListPoppedMany(r, "LMPOP"),
+    readOnly = false,
+  }
+}
+
+fn listBlockPopAnyCmd(
+  key: string,
+  others: []string,
+  end: ListEnd,
+  count: int,
+  timeout: int,
+): Cmd<Option<PoppedMany>> {
+  let head = ["BLMPOP", blockSeconds(timeout), "${len(others) + 1}"]
+  return Cmd<Option<PoppedMany>>{
+    args = listPopAnyArgs(head, key, others, end, count),
+    decode = (r) => asListPoppedMany(r, "BLMPOP"),
+    readOnly = false,
+  }
+}
+
+fn listRangeCmd(key: string, start: int, stop: int): Cmd<[]string> {
+  return Cmd<[]string>{
+    args = ["LRANGE", key, "${start}", "${stop}"],
+    decode = (r) => asStrings(r, "LRANGE"),
+    readOnly = true,
+  }
+}
+
+fn listLenCmd(key: string): Cmd<i64> {
+  return Cmd<i64>{ args = ["LLEN", key], decode = (r) => asInt(r, "LLEN"), readOnly = true }
+}
+
+fn listIndexCmd(key: string, at: int): Cmd<Option<string>> {
+  return Cmd<Option<string>>{
+    args = ["LINDEX", key, "${at}"],
+    decode = (r) => asOptString(r, "LINDEX"),
+    readOnly = true,
+  }
+}
+
+fn listSetCmd(key: string, at: int, value: string): Cmd<()> {
+  return Cmd<()>{
+    args = ["LSET", key, "${at}", value],
+    decode = (r) => asOk(r, "LSET"),
+    readOnly = false,
+  }
+}
+
+fn listInsertCmd(key: string, pivot: string, value: string, after: bool): Cmd<i64> {
+  let side = "BEFORE"
+  if (after) {
+    side = "AFTER"
+  }
+  return Cmd<i64>{
+    args = ["LINSERT", key, side, pivot, value],
+    decode = (r) => asInt(r, "LINSERT"),
+    readOnly = false,
+  }
+}
+
+fn listRemoveCmd(key: string, count: int, value: string): Cmd<i64> {
+  return Cmd<i64>{
+    args = ["LREM", key, "${count}", value],
+    decode = (r) => asInt(r, "LREM"),
+    readOnly = false,
+  }
+}
+
+fn listTrimCmd(key: string, start: int, stop: int): Cmd<()> {
+  return Cmd<()>{
+    args = ["LTRIM", key, "${start}", "${stop}"],
+    decode = (r) => asOk(r, "LTRIM"),
+    readOnly = false,
+  }
+}
+
+// `LPOS key value [RANK r] [COUNT n] [MAXLEN m]`: RANK is left out at 0 (the
+// server refuses an explicit 0), MAXLEN at 0 (its own "no limit"), and COUNT
+// when negative - the single-index form; 0 or more is the form that answers
+// with a list, 0 meaning every match.
+fn listPositionArgs(key: string, value: string, rank: int, count: int, maxLen: int): []string {
+  let args = ["LPOS", key, value]
+  if (rank != 0) {
+    args = append(args, "RANK", "${rank}")
+  }
+  if (count >= 0) {
+    args = append(args, "COUNT", "${count}")
+  }
+  if (maxLen > 0) {
+    args = append(args, "MAXLEN", "${maxLen}")
+  }
+  return args
+}
+
+fn listPositionCmd(key: string, value: string, rank: int, maxLen: int): Cmd<Option<i64>> {
+  return Cmd<Option<i64>>{
+    args = listPositionArgs(key, value, rank, -1, maxLen),
+    decode = (r) => asOptInt(r, "LPOS"),
+    readOnly = true,
+  }
+}
+
+fn listPositionsCmd(key: string, value: string, count: int, rank: int, maxLen: int): Cmd<[]i64> {
+  return Cmd<[]i64>{
+    args = listPositionArgs(key, value, rank, count, maxLen),
+    decode = (r) => asInts(r, "LPOS"),
+    readOnly = true,
+  }
+}
+
+fn listMoveCmd(key: string, dest: string, fromEnd: ListEnd, toEnd: ListEnd): Cmd<Option<string>> {
+  return Cmd<Option<string>>{
+    args = ["LMOVE", key, dest, endWord(fromEnd), endWord(toEnd)],
+    decode = (r) => asOptString(r, "LMOVE"),
+    readOnly = false,
+  }
+}
+
+fn listBlockMoveCmd(
+  key: string,
+  dest: string,
+  fromEnd: ListEnd,
+  toEnd: ListEnd,
+  timeout: int,
+): Cmd<Option<string>> {
+  return Cmd<Option<string>>{
+    args = ["BLMOVE", key, dest, endWord(fromEnd), endWord(toEnd), blockSeconds(timeout)],
+    decode = (r) => asOptString(r, "BLMOVE"),
+    readOnly = false,
+  }
+}
+
+// `BLPOP`/`BRPOP key [key ...] timeout`: the timeout is the LAST argument.
+fn listBlockPopCmd(cmd: string, key: string, others: []string, timeout: int): Cmd<Option<Popped>> {
+  return Cmd<Option<Popped>>{
+    args = listArgs([cmd], key, others, [blockSeconds(timeout)]),
+    decode = (r) => asListPopped(r, cmd),
+    readOnly = false,
+  }
+}
+
+// A reply that is a list of strings, or nothing: `RPOP key count` on a
+// missing key answers a null (RESP3 `Null`, RESP2 null array), read as empty.
+fn asListItems(r: Reply, cmd: string): []string!RedisError {
+  match (r) {
+    Null => return []string(0)
+    _ => return asStrings(r, cmd)?
+  }
+}
+
+// `Reply.Int` or a null, as `Option<i64>` - `LPOS` without `COUNT`.
+fn asOptInt(r: Reply, cmd: string): Option<i64>!RedisError {
+  match (r) {
+    Int(n) => return Option.Some(n)
+    Null => return Option.None
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// `LPOS .. COUNT`'s array of indexes.
+fn asInts(r: Reply, cmd: string): []i64!RedisError {
+  match (r) {
+    Array(items) => return intsFromOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn intsFromOpt(items: Option<[]Reply>, cmd: string): []i64!RedisError {
+  match (items) {
+    Some(list) => return intsFromList(list, cmd)?
+    None => return []i64(0)
+  }
+}
+
+fn intsFromList(list: []Reply, cmd: string): []i64!RedisError {
+  let out = []i64(len(list))
+  let i = 0
+  while (i < len(list)) {
+    out[i] = asInt(list[i], cmd)?
+    i = i + 1
+  }
+  return out
+}
+
+// `[key, element]` (`BLPOP`, `BRPOP`); a null (RESP3 `Null` or RESP2's null
+// array) is a timeout.
+fn asListPopped(r: Reply, cmd: string): Option<Popped>!RedisError {
+  match (r) {
+    Null => return Option.None
+    Array(items) => return poppedFromOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn poppedFromOpt(items: Option<[]Reply>, cmd: string): Option<Popped>!RedisError {
+  match (items) {
+    Some(list) => return poppedFromPair(list, cmd)?
+    None => return Option.None
+  }
+}
+
+fn poppedFromPair(list: []Reply, cmd: string): Option<Popped>!RedisError {
+  if (len(list) != 2) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let key = replyToString(list[0], cmd)?
+  let value = replyToString(list[1], cmd)?
+  return Option.Some(Popped{ key = key, value = value })
+}
+
+// `[key, [element ...]]` (`LMPOP`, `BLMPOP`); null is "nothing to pop" or a timeout.
+fn asListPoppedMany(r: Reply, cmd: string): Option<PoppedMany>!RedisError {
+  match (r) {
+    Null => return Option.None
+    Array(items) => return poppedManyFromOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn poppedManyFromOpt(items: Option<[]Reply>, cmd: string): Option<PoppedMany>!RedisError {
+  match (items) {
+    Some(list) => return poppedManyFromPair(list, cmd)?
+    None => return Option.None
+  }
+}
+
+fn poppedManyFromPair(list: []Reply, cmd: string): Option<PoppedMany>!RedisError {
+  if (len(list) != 2) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let key = replyToString(list[0], cmd)?
+  let values = asStrings(list[1], cmd)?
+  return Option.Some(PoppedMany{ key = key, values = values })
 }
