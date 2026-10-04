@@ -1,0 +1,168 @@
+// compiler/lowerswitchrange.bit — a `switch` case's label test (#7058).
+// Sibling of lowerbranch.bit: same module, so this needs no imports and no
+// call-site changes.
+//
+// `case A, B, C, D:` tests `subject == label` once per label and ORs the
+// answers: four compares, four `cset`s and three `orr`s on arm64 before the
+// branch (pkg/toml's `readScalar`). When the subject is one integer word — an
+// integer prim or a tag-only enum — and the labels are constants forming one
+// contiguous run `[lo, lo + width]`, the same answer is ONE unsigned range
+// test, `(subject - lo) <=u width`: the map `x -> (x - lo) mod 2^N` is a
+// bijection on the type's 2^N values that sends exactly `[lo, lo + width]`
+// onto `[0, width]`, so every value just outside the run lands above `width`.
+// Both ops run at the UNSIGNED prim of the subject's width: the `sub` then
+// wraps by spec and never takes SPEC §13.5's debug signed-overflow trap, and
+// the compare reads the same N bits the `sub` wrote.
+
+// The label count above which no run is looked for: `labelRun`'s check is
+// quadratic in it, and a case this long is generated code, not a hot test.
+fn maxRunLabels(): int {
+  return 256
+}
+
+// The unsigned prim a run test over `ty` computes in, or -1 when `ty` is not
+// one integer word (`lowerCompare`'s plain `icmp_eq` arm). A tag-only enum is
+// an unsigned 8-byte word (`widthOf`); a boxed one compares through
+// `value_eq` and never qualifies.
+fn runPrim(ctx: TypeContext, ty: int): int {
+  let td = ctx.types[ty]
+  if (td.kind == TypeKind.Enum) {
+    if (td.enumBoxed) {
+      return -1
+    }
+    return 7
+  }
+  if (td.kind != TypeKind.Prim || !isIntPrim(td.prim)) {
+    return -1
+  }
+  return 4 + td.prim % 4
+}
+
+// One label's value when it lowered to a `const_int` already canonical for
+// the subject (`canon`, so the run check orders values the way the type
+// does), else (false, 0) and the case keeps its compare chain.
+fn runLabelConst(fc: FnCtx, ty: int, v: int): (bool, int) {
+  let ins = fc.b.instrs[v]
+  if (ins.op != Op.ConstInt) {
+    return (false, 0)
+  }
+  let td = fc.c.ctx.types[ty]
+  if (td.kind == TypeKind.Prim &&
+    canon(ins.ival, primBits(td.prim), isSignedPrim(td.prim)) != ins.ival) {
+    return (false, 0)
+  }
+  return (true, ins.ival)
+}
+
+// Whether the constants `vals` are exactly the integers `[lo, hi]`: every
+// value but `hi` has its successor in the set, so walking up from `lo` reaches
+// `hi` without a gap. `v + 1` cannot overflow, since `v < hi`.
+fn isContiguous(vals: []int, lo: int, hi: int): bool {
+  let i = 0
+  while (i < len(vals)) {
+    if (vals[i] != hi && !containsInt(vals, vals[i] + 1)) {
+      return false
+    }
+    i = i + 1
+  }
+  return lo <= hi
+}
+
+// The run the lowered `labels` form as (ok, lo, width), or ok false when any
+// label is not a canonical constant or the set has a gap. Duplicates are
+// allowed: they test the same value twice either way.
+fn labelRun(fc: FnCtx, ty: int, labels: []int): (bool, int, int) {
+  let vals = []int(0)
+  let i = 0
+  while (i < len(labels)) {
+    let (ok, v) = runLabelConst(fc, ty, labels[i])
+    if (!ok) {
+      return (false, 0, 0)
+    }
+    vals = append(vals, v)
+    i = i + 1
+  }
+  let lo = vals[0]
+  let hi = vals[0]
+  for v of vals {
+    if (v < lo) {
+      lo = v
+    }
+    if (v > hi) {
+      hi = v
+    }
+  }
+  if (!isContiguous(vals, lo, hi)) {
+    return (false, 0, 0)
+  }
+  return (true, lo, hi - lo)
+}
+
+// `(subject - lo) <=u width` at the unsigned prim `up`, `lo` masked to that
+// width so the constant is canonical for it.
+fn emitRunTest(fc: FnCtx, st: SwitchLowerState, up: int, lo: int, width: int): int {
+  let uty = primType(fc.c.ctx, up)
+  let loC = mkInstr(Op.ConstInt, uty)
+  loC.ival = maskTo(lo, primBits(up))
+  let off = emitBin(fc, Op.Sub, uty, st.subject, builderEmit(fc.b, loC))
+  let wC = mkInstr(Op.ConstInt, uty)
+  wC.ival = width
+  return emitBin(fc, Op.ICmpUle, st.boolTy, off, builderEmit(fc.b, wC))
+}
+
+// `subject == label` for each already-lowered label, OR-folded.
+fn orLabelTests(fc: FnCtx, st: SwitchLowerState, exprs: []int, labels: []int): int {
+  let cond = 0
+  let i = 0
+  while (i < len(labels)) {
+    let eq = lowerCompare(
+      fc,
+      int(Kind.EqEq),
+      CompareOperand{ ty = st.subjectTy, span = getNode(fc.c.tree, exprs[i]).span },
+      st.subject,
+      labels[i],
+    )
+    cond = orInto(fc, st, cond, eq, i)
+    i = i + 1
+  }
+  return cond
+}
+
+// `cond | next` (`next` alone for the first label, `i == 0`).
+fn orInto(fc: FnCtx, st: SwitchLowerState, cond: int, next: int, i: int): int {
+  if (i == 0) {
+    return next
+  }
+  return emitBin(fc, Op.BOr, st.boolTy, cond, next)
+}
+
+// A case's whole label test: the run test when the subject is one integer word
+// and its labels form one contiguous constant run, else each label's
+// `caseTest` OR-folded. On the word path every label is lowered before any
+// compare; the subject is an SSA value and each compare a pure `icmp_eq`, so
+// the labels still evaluate once each, in source order, as before.
+fn switchCaseCond(fc: FnCtx, st: SwitchLowerState, exprs: []int): int {
+  let up = runPrim(fc.c.ctx, st.subjectTy)
+  if (!st.hasSubject || up < 0 || len(exprs) < 2 || len(exprs) > maxRunLabels()) {
+    let cond = 0
+    let i = 0
+    while (i < len(exprs) && !fc.failed) {
+      let t = caseTest(fc, st.hasSubject, st.subject, st.subjectTy, exprs[i])
+      cond = orInto(fc, st, cond, t, i)
+      i = i + 1
+    }
+    return cond
+  }
+  let labels = []int(0)
+  for e of exprs {
+    labels = append(labels, lowerExprH(fc, e, st.subjectTy))
+    if (fc.failed) {
+      return 0
+    }
+  }
+  let (ok, lo, width) = labelRun(fc, st.subjectTy, labels)
+  if (ok) {
+    return emitRunTest(fc, st, up, lo, width)
+  }
+  return orLabelTests(fc, st, exprs, labels)
+}
