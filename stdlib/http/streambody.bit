@@ -17,22 +17,23 @@
 // below move a body in bounded chunks instead: memory use is O(chunk size),
 // never O(body size), on either side of the wire.
 //
-// PUT (`requestWithStreamingBody`): the caller supplies the declared byte
-// count up front — SigV4 needs it to sign the request anyway, and HTTP/1.1
-// needs either a declared Content-Length or chunked transfer coding to frame
-// a request body at all — plus a `BodySource` pulled repeatedly until it is
-// exhausted. A declared Content-Length is what every S3-compatible PUT
-// already sends and it always wins when the length is known.
-//
-// PUT of unknown length (`requestWithChunkedBody`, #6575): the body goes out
-// `Transfer-Encoding: chunked` (RFC 9112 section 7.1), followed by an
-// optional trailer section (RFC 9112 section 7.1.2, RFC 9110 section 6.5)
-// the caller computes AFTER the last body byte has gone out — a checksum over
-// the streamed bytes, as `aws-chunked` trailer checksums need. RFC 9112
-// section 6.1 forbids a client to use chunked unless it knows the server
-// handles HTTP/1.1, so the caller states that (`ChunkedBody.peerHttp11`) and
-// the call fails before dialing when it does not. Per-chunk `aws-chunked`
-// SIGNING (a chunk-extension protocol AWS layers on top) is not implemented.
+// PUT (`requestWithStreamingBody`, #6575): one call, one typed `StreamBody`.
+// A body with a declared length (`StreamBody.length = Option.Some(n)`) sends
+// `Content-Length: n` — SigV4 needs the count up front anyway, and a known
+// length always wins over chunked. A body without one goes out
+// `Transfer-Encoding: chunked` (RFC 9112 section 7.1), followed by an optional
+// trailer section (RFC 9112 section 7.1.2, RFC 9110 section 6.5) the caller
+// computes AFTER the last body byte has gone out — a checksum over the
+// streamed bytes, as `aws-chunked` trailer checksums need. Chunked is sent
+// by default, as Go's net/http, curl and undici do for an unknown length:
+// RFC 9112 section 6.1 lets a client's knowledge that the server speaks
+// HTTP/1.1 come from configuration or a prior response, and every connection
+// here is a fresh one-shot dial with no pool recording an earlier response's
+// version, so there is nothing to refuse on — a server that answers HTTP/1.0
+// to a chunked request is the server's own non-conformance. Trailers need
+// chunked framing, so a declared length with trailers is refused before
+// anything is dialed. Per-chunk `aws-chunked` SIGNING (a chunk-extension
+// protocol AWS layers on top) is not implemented.
 //
 // GET (`getStreaming`): delivers the response body to a `BodySink` one
 // bounded chunk at a time instead of accumulating a `string`, for the
@@ -121,59 +122,26 @@ fn streamingTlsConfig(): TlsConfig {
   return cfg
 }
 
-// Runs `method url` with a request body of `contentLength` bytes streamed
-// from `source`, and returns the response exactly as `request` (client.bit)
-// does — the RESPONSE is still read in full, which is correct for an
-// S3-compatible PUT/POST: the reply is a small XML document or an empty
-// body, never the multi-GB payload the REQUEST side is streaming out.
-// http:// and https:// are both supported, same as `requestWith`;
-// `https+h3://` is not (see the file header).
-export fn requestWithStreamingBody(
-  method: string,
-  url: string,
-  headers: []Header,
-  contentLength: int,
-  source: BodySource,
-): Response! {
-  let block = serializeHeaders(headers)?
-  let u = parseUrl(url)?
-  if (u.h3) {
-    fail newError("requestWithStreamingBody: https+h3:// is not supported")
-  }
-  let head = buildStreamingRequestHead(
-    method,
-    u,
-    block,
-    "Content-Length: ${itoa(contentLength)}\r\n",
-  )
-  if (u.https) {
-    let s = tlsStream{ conn = tlsDial(u.host, u.port, streamingTlsConfig())? }
-    defer s.shut()
-    s.writeStr(head)?
-    writeStreamingBody(s, contentLength, source)?
-    return readResponse(s, method, defaultMaxBodyBytes)?
-  }
-  let s = netStream{ conn = dial(u.host, u.port)? }
-  defer s.shut()
-  s.writeStr(head)?
-  writeStreamingBody(s, contentLength, source)?
-  return readResponse(s, method, defaultMaxBodyBytes)?
-}
-
 // Pulls trailer fields once the request body is complete (RFC 9112 section
-// 7.1.2): called by `requestWithChunkedBody` exactly once, after `source` has
+// 7.1.2): called by `requestWithStreamingBody` exactly once, after `source` has
 // returned "", so a value computed over the streamed bytes (a checksum, a
-// byte count) is final. Return `[]Header(0)` for no trailer section.
+// byte count) is final. Omit `StreamBody.trailers` for no trailer section.
 export type TrailerSource = () => []Header!
 
-// What `requestWithChunkedBody` sends: the body `source` (pulled until it
-// returns ""), the `trailers` computed after it, and `peerHttp11`, the
-// caller's statement that the server is known to handle HTTP/1.1 (RFC 9112
-// section 6.1: from configuration, or the version of an earlier response).
-export class ChunkedBody {
+// The request body `requestWithStreamingBody` sends: the `source` pulled until
+// it returns "", how long it is, and the trailer fields that follow it.
+//
+//   - `length = Option.Some(n)`: exactly `n` bytes, framed by `Content-Length`.
+//   - `length` omitted (`Option.None`): unknown length, framed
+//     `Transfer-Encoding: chunked`, and `trailers`, when set, are sent after
+//     the last chunk.
+//
+// `trailers` with a `length` is refused: a Content-Length message has no
+// trailer section.
+export class StreamBody {
   export source: BodySource,
-  export trailers: TrailerSource,
-  export peerHttp11: bool,
+  export length: Option<int>,
+  export trailers: Option<TrailerSource>,
 }
 
 // The widest size line a chunk of at most `streamChunkSize` bytes needs
@@ -285,20 +253,20 @@ class chunkFrame {
   }
 }
 
-// Writes `body.source` to `s` as a chunked body (RFC 9112 section 7.1):
+// Writes `source` to `s` as a chunked body (RFC 9112 section 7.1):
 // chunks of up to `streamChunkSize` bytes, the zero-size last chunk, the
-// trailer section `body.trailers` returns once the source is exhausted, and
+// trailer section `trailers` returns once the source is exhausted, and
 // the final CRLF. The last data chunk and the terminator share one write.
-fn writeChunkedBody(s: byteStream, body: ChunkedBody): ()! {
+fn writeChunkedBody(s: byteStream, source: BodySource, trailers: Option<TrailerSource>): ()! {
   let f = chunkFrame{ buf = []byte(chunkPrefix, chunkFrameCap), eof = false }
   while (!f.eof) {
-    f.fill(body.source)?
+    f.fill(source)?
     let start = len(f.buf)
     if (len(f.buf) > chunkPrefix) {
       start = f.seal()
     }
     if (f.eof) {
-      let block = serializeTrailers(body.trailers()?)?
+      let block = trailerBlock(trailers)?
       f.buf = append(f.buf, "0\r\n")
       f.buf = append(f.buf, block)
       f.buf = append(f.buf, "\r\n")
@@ -307,44 +275,88 @@ fn writeChunkedBody(s: byteStream, body: ChunkedBody): ()! {
   }
 }
 
-// Sends `head` and the chunked body, then reads the response — the
-// transport-independent half of `requestWithChunkedBody`.
-fn exchangeChunked(s: byteStream, method: string, head: string, body: ChunkedBody): Response! {
+// The trailer section text `trailers` yields once the body is complete: ""
+// for none.
+fn trailerBlock(trailers: Option<TrailerSource>): string! {
+  match (trailers) {
+    Some(t) => { return serializeTrailers(t()?)? }
+    None => { return "" }
+  }
+}
+
+// Fails when `trailers` is set: a Content-Length message has no trailer
+// section, and silently dropping them would hide a caller's mistake.
+fn refuseTrailers(trailers: Option<TrailerSource>): ()! {
+  match (trailers) {
+    Some(_) => {
+      fail newError("requestWithStreamingBody: trailers need chunked framing, but the body declares a length")
+    }
+    None => {}
+  }
+}
+
+// The framing header line and the body writer's inputs, decided once: a
+// declared length is a `Content-Length` line, anything else is chunked.
+fn framingLine(body: StreamBody): string! {
+  match (body.length) {
+    Some(n) => {
+      if (n < 0) {
+        fail newError("requestWithStreamingBody: negative body length ${itoa(n)}")
+      }
+      refuseTrailers(body.trailers)?
+      return "Content-Length: ${itoa(n)}\r\n"
+    }
+    None => { return "Transfer-Encoding: chunked\r\n" }
+  }
+}
+
+// Writes the body in the framing `framingLine` chose.
+fn writeBody(s: byteStream, body: StreamBody): ()! {
+  match (body.length) {
+    Some(n) => { writeStreamingBody(s, n, body.source)? }
+    None => { writeChunkedBody(s, body.source, body.trailers)? }
+  }
+}
+
+// Sends `head` and the body, then reads the response — the
+// transport-independent half of `requestWithStreamingBody`.
+fn exchangeStreaming(s: byteStream, method: string, head: string, body: StreamBody): Response! {
   s.writeStr(head)?
-  writeChunkedBody(s, body)?
+  writeBody(s, body)?
   return readResponse(s, method, defaultMaxBodyBytes)?
 }
 
-// As `requestWithStreamingBody`, for a body whose length is not known up
-// front: it goes out `Transfer-Encoding: chunked`, then the trailer fields
-// `body.trailers` returns after the last body byte. Announce them with a
-// `Trailer` header in `headers` (RFC 9110 section 6.5.2). Fails before
-// dialing unless `body.peerHttp11` (RFC 9112 section 6.1: never chunked to
-// an HTTP/1.0 peer); when the length IS known, use `requestWithStreamingBody`,
-// which sends a Content-Length instead. `https+h3://` is not supported.
-export fn requestWithChunkedBody(
+// Runs `method url` with the request body `body` streamed from its source,
+// and returns the response exactly as `request` (client.bit) does — the
+// RESPONSE is still read in full, which is correct for an S3-compatible
+// PUT/POST: the reply is a small XML document or an empty body, never the
+// multi-GB payload the REQUEST side is streaming out. A declared length
+// sends `Content-Length`; an unknown one sends `Transfer-Encoding: chunked`
+// and then `body.trailers` (announce them with a `Trailer` header in
+// `headers`, RFC 9110 section 6.5.2). http:// and https:// are both
+// supported, same as `requestWith`; `https+h3://` is not (see the file
+// header).
+export fn requestWithStreamingBody(
   method: string,
   url: string,
   headers: []Header,
-  body: ChunkedBody,
+  body: StreamBody,
 ): Response! {
-  if (!body.peerHttp11) {
-    fail newError("requestWithChunkedBody: chunked transfer coding needs a peer known to speak HTTP/1.1 (RFC 9112 section 6.1); send a Content-Length with requestWithStreamingBody instead")
-  }
+  let framing = framingLine(body)?
   let block = serializeHeaders(headers)?
   let u = parseUrl(url)?
   if (u.h3) {
-    fail newError("requestWithChunkedBody: https+h3:// is not supported")
+    fail newError("requestWithStreamingBody: https+h3:// is not supported")
   }
-  let head = buildStreamingRequestHead(method, u, block, "Transfer-Encoding: chunked\r\n")
+  let head = buildStreamingRequestHead(method, u, block, framing)
   if (u.https) {
     let s = tlsStream{ conn = tlsDial(u.host, u.port, streamingTlsConfig())? }
     defer s.shut()
-    return exchangeChunked(s, method, head, body)?
+    return exchangeStreaming(s, method, head, body)?
   }
   let s = netStream{ conn = dial(u.host, u.port)? }
   defer s.shut()
-  return exchangeChunked(s, method, head, body)?
+  return exchangeStreaming(s, method, head, body)?
 }
 
 // Reads the remaining `cl - len(initial)` bytes of a Content-Length-framed
