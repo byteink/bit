@@ -105,9 +105,10 @@ protected route that is not itself doing the authenticating just reads
   verifying a submitted code with a skew window and caller-owned replay
   protection.
 - `generateRecoveryCodes`, `RecoveryOptions`, `RecoverySet`,
-  `redeemRecoveryCode`, `RecoveryRedeem` - single-use recovery codes for a
-  lost authenticator: generated from the CSPRNG, stored salted and hashed,
-  redeemed once, and replaced wholesale by regenerating.
+  `redeemRecoveryCode`, `RedeemOptions`, `RecoveryRedeem` - single-use
+  recovery codes for a lost authenticator: generated from the CSPRNG, stored
+  as Argon2id hashes, redeemed at the cost of one hash, optionally throttled
+  with a `LoginThrottle`, and replaced wholesale by regenerating.
 
 Every one of these is used in a full example in [`docs/`](docs/README.md),
 along with the security properties this package enforces (PKCE, constant-time

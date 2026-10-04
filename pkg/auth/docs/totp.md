@@ -107,23 +107,26 @@ fn issueRecoveryCodes(): (RecoverySet, RecoveryState)! {
 }
 ```
 
-A code looks like `k3x9a-7qm2p`: two groups of five characters from an
-alphabet with no `i`, `l`, `o` or `u`. That is 50 random bits from the
-operating system's CSPRNG, far beyond what anyone can guess through a
-login form. The shape is a typed option rather than a second function:
+A code looks like `a3k9-k3x9a-7qm2p`. The first group, `a3k9`, is an
+identifier that says which stored entry the code belongs to; the other two
+groups are 50 random bits from the operating system's CSPRNG, far beyond
+what anyone can guess through a login form. The letters come from an alphabet
+with no `i`, `l`, `o` or `u`. The shape of the secret part is a typed option
+rather than a second function:
 
 ```bit
 import { RecoveryOptions, RecoverySet, generateRecoveryCodes } from "auth"
 
-// Eight longer codes: three groups of five is 75 bits each.
+// Eight longer codes: three groups of five is 75 secret bits each.
 fn longerCodes(): RecoverySet! {
   return generateRecoveryCodes(RecoveryOptions{ count = 8, groups = 3, groupLen = 5 })?
 }
 ```
 
-`count` is 1 to 32, and a code must carry at least 50 bits
+`count` is 1 to 32, and the secret part must carry at least 50 bits
 (`groups * groupLen * 5`); anything else fails with an error before a
-single code is made.
+single code is made. Making a set costs one password hash per code, so a
+batch of ten takes about as long as ten password hashes.
 
 ## Using a recovery code at login
 
@@ -132,44 +135,78 @@ The login form takes the code in the same box as a TOTP code. When
 dashes, and reads `0`/`o` and `1`/`i`/`l` as the same character, so a code
 retyped from a printout still works. A match returns `remaining`, the
 stored list without the code that was just used - **persist it**, or the
-code works again:
+code works again.
+
+A recovery code is a guessable secret in a way a TOTP code never is: it does
+not expire. Hand `redeemRecoveryCode` the same `LoginThrottle` your password
+login uses, through `RedeemOptions`, so a client that keeps guessing is
+locked out. The throttle counts these attempts under their own name for the
+account, so a flood of wrong codes does not lock the password login:
 
 ```bit
-import { RecoveryRedeem, redeemRecoveryCode } from "auth"
+import {
+  LoginThrottle,
+  RecoveryRedeem,
+  RedeemOptions,
+  redeemRecoveryCode,
+} from "auth"
 
 class RecoveryRecord {
+  email: string,
   hashes: []string,
 }
 
 // Returns the record to save. Fails with one message whether the code was
-// wrong, already used, or not a code at all.
-fn useRecoveryCode(record: RecoveryRecord, typed: string): RecoveryRecord! {
-  let redeemed: RecoveryRedeem = redeemRecoveryCode(record.hashes, typed)?
-  return RecoveryRecord{ hashes = redeemed.remaining }
+// wrong, already used, or not a code at all, and with a `Throttled` (a 429
+// when it escapes a route) once the account or the address has failed too
+// often.
+fn useRecoveryCode(
+  record: RecoveryRecord,
+  typed: string,
+  throttle: LoginThrottle,
+  ip: string,
+): RecoveryRecord! {
+  let opts = RedeemOptions{
+    throttle = Option<LoginThrottle>.Some(throttle),
+    account = record.email,
+    ip = ip,
+  }
+  let redeemed: RecoveryRedeem = redeemRecoveryCode(record.hashes, typed, opts)?
+  return RecoveryRecord{ email = record.email, hashes = redeemed.remaining }
 }
 ```
 
-If the user used a recovery code, they have probably lost their phone: send
-them to enroll a new authenticator (`generateSecret` again) right after.
+`redeemRecoveryCode(record.hashes, typed)` with no options works and counts
+nothing; then the throttling is yours to add, and without it a recovery
+code is the weakest door into the account. If the user used a recovery
+code, they have probably lost their phone: send them to enroll a new
+authenticator (`generateSecret` again) right after.
 
 ## Regenerating
 
 There is no "revoke" call. Run `generateRecoveryCodes()` again and store
-the new `hashes` over the old list. The old codes are checked against
+the new `hashes` over the old list. The old codes name identifiers and
 hashes you no longer keep, so all of them fail, used or not. Offer this
 button after a user spends most of their set, and always when they re-enroll.
 
 ## How the codes are stored
 
-You store `hashes`, never `codes`. Each entry is a random 16-byte salt
-and the SHA-256 of the salt plus the code. A fast, salted hash is right
-here and a password hash would not help: a password hash exists to slow
-down guessing of secrets a person chose, and these are not chosen, they
-are 50 random bits with nothing to build a dictionary from. The salt makes
-every entry unique so a precomputed table is useless, and a code can be used
-only once, so what a thief who copies the database learns is worth nothing
-after the real user spends it. Comparison runs through `ctEq` over every
-stored entry, so timing does not say which entry was close.
+You store `hashes`, never `codes`. Each entry is the code's identifier
+followed by an Argon2id hash of its secret part - the same hash, with the same
+cost, that `hashPassword` makes for a password. NIST SP 800-63B treats a code
+a person types as a low-entropy secret: under 112 bits it has to be stored
+with a password hash, not a fast one, because 50 bits is something a graphics
+card can search through when it holds your table. Argon2id makes each guess
+cost about what a password check costs, and the salt inside it is fresh for
+every entry.
+
+The identifier is what keeps redemption cheap. It is stored in the open and
+is not counted in the 50 bits, because anyone holding the table knows it. It
+tells `redeemRecoveryCode` which one entry to check, so a redemption runs
+exactly one Argon2id hash whether you store one code or thirty-two. A
+code with an identifier you do not have is checked against a fixed dummy hash
+instead, so a hit, a wrong secret and an unknown identifier all take the same
+time. Without the identifier, every guess would cost one hash per stored code.
 
 ## The low-level primitive: HOTP
 
@@ -219,9 +256,12 @@ not for a user's phone.
 - **A code is exactly 6 (or your chosen `digits`) ASCII digits.** `verify`
   compares byte for byte in constant time; a submission with leading or
   trailing whitespace never matches - trim it before calling `verify`.
-- **Persist `remaining` after every redemption.** `redeemRecoveryCode` is
-  a pure function: it holds no state, so a recovery code is single use only
-  as long as you save the shorter list.
+- **Persist `remaining` after every redemption.** `redeemRecoveryCode`
+  holds no codes of its own, so a recovery code is single use only as long as
+  you save the shorter list.
+- **Pass a throttle to `redeemRecoveryCode`.** Each guess already costs a
+  password hash, but nothing stops a client making guesses all day unless the
+  throttle does.
 - **Clock skew is a security/usability tradeoff.** `skew = 1` (one step
   either side, 30 seconds) covers ordinary drift; a much larger skew widens
   the window an intercepted code stays valid in.
