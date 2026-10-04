@@ -1,0 +1,129 @@
+// The retired-task cache (#6007): a bounded free list of task blocks, each
+// still owning its guarded `schedStackBytes` stack, so a `spawn` after a
+// retirement maps nothing. Same module as sched.bit.
+//
+// WHY. `runtime/root/<os>`'s `rtSpawn` made ~5 memory syscalls per spawn
+// (`mapGuardedStack`'s mmap + guard mprotect + two slop munmaps, then the task
+// block's mmap) and `workerBody`'s teardown 3 more (stack, guard, block). A
+// server that spawns per connection paid all 8 on every churned connection.
+// This is the shape of Go's runtime keeping a dead G's standard-size stack on
+// the free-G list (`gfput`/`gfget`): the block and its stack travel together,
+// so the guard stays exactly where `mapGuardedStack` protected it and is never
+// remapped or unprotected.
+//
+// ONE GLOBAL LIST UNDER A SPINLOCK, not per worker. The common spawner is one
+// accept loop on one worker while its connections retire on every worker; a
+// per-worker list would fill on the retiring workers and stay empty on the
+// spawning one. The critical section is a handful of loads and stores, and the
+// lock it replaces is the kernel's per-process mmap lock, which every one of
+// those 8 syscalls took.
+//
+// BOUNDED (Power of 10 rule 3): `stackCacheCap` entries and never more. Each
+// entry is one `schedStackBytes` (256 KiB) stack, its 256 KiB PROT_NONE guard
+// (address space only, never resident) and one task-block page, so the cache
+// holds at most 64 * 256 KiB = 16 MiB of stack, resident only as far as the
+// retired tasks had touched it. A retirement that finds the list full unmaps
+// exactly as before.
+//
+// SCRUBBED WHERE THE COLLECTOR READS BEFORE THE TASK WRITES, AND ONLY THERE.
+// A fresh mapping is zero; a reused one holds the last task's words. The
+// collector reads two parts of a registered task's stack whatever the task has
+// written (`runtime/stw/stwscan.bit`): the scratch words `[scrCounter,
+// chanScratchWords)` at the base, for every registered task, and `[ctxSp, top)`
+// conservatively. The scratch is zeroed here. `[ctxSp, top)` is the frames of
+// the task that owns the stack: before its first run it is the `entryBias`
+// window above the initial `sp`, zeroed by `schedStackScrubTop` once
+// `schedTaskInit` has placed that `sp`; after that every word in it belongs to
+// one of the new task's own live frames, the same words an unmapped-and-remapped
+// stack page would hold for a task's own earlier, deeper calls. Nothing below
+// `ctxSp` is ever read, so the rest is left as is: scrubbing 256 KiB would
+// fault in every page of every cached stack and cost more than the syscalls.
+// No program can observe it either: Bit initialises every local before a read,
+// and all tasks share one process and one trust domain, as Go's do.
+export const stackCacheCap: int = 64
+
+// Word 0 the lock (an i32 cell, via `spinCellAt`), word 1 the count, word 2 the
+// reuse counter, then `stackCacheCap` task addresses.
+const scLock: int = 0
+const scLen: int = 1
+const scReuses: int = 2
+const scSlots: int = 3
+let stackCache: [scSlots + stackCacheCap]i64
+
+// A cached task block, its stack scratch zeroed, or 0 when the list is empty.
+// The block's `taskStackBase` names its stack; `schedTaskInit` rewrites every
+// other word of the block. Pinned: `runtime/root/<os>`'s `rtSpawn` calls it.
+export @nosplit @symbol("bit_rt_port_sched_stack_cache_take") fn schedStackCacheTake(): int {
+  let c: *i64 = ptrOf(stackCache)
+  spinAcquire(spinCellAt(c, scLock))
+  let n = *(c + scLen)
+  if (n <= 0) {
+    spinRelease(spinCellAt(c, scLock))
+    return 0
+  }
+  let task = *(c + scSlots + n - 1)
+  *(c + scLen) = n - 1
+  *(c + scReuses) = *(c + scReuses) + 1
+  spinRelease(spinCellAt(c, scLock))
+  return task
+}
+
+// Keep a retired task's block and stack for the next spawn. False when the
+// block is not a standard spawn (its stack is not `schedStackBytes`) or the
+// list is full, and the caller then unmaps it as before. The caller has already
+// unregistered the task, so no collector can be reading its scratch.
+export @nosplit @symbol("bit_rt_port_sched_stack_cache_put") fn schedStackCachePut(task: int): bool {
+  if (task == 0) {
+    return false
+  }
+  let t = taskAt(task)
+  let base = *(t + taskStackBase)
+  if (base <= 0 || *(t + taskStackBytes) != schedStackBytes) {
+    return false
+  }
+  let c: *i64 = ptrOf(stackCache)
+  if (atomicLoad(c + scLen) >= stackCacheCap) {
+    return false
+  }
+  let i = scrCounter
+  while (i < chanScratchWords) {
+    *(taskAt(base) + i) = 0
+    i = i + 1
+  }
+  spinAcquire(spinCellAt(c, scLock))
+  let n = *(c + scLen)
+  if (n >= stackCacheCap) {
+    spinRelease(spinCellAt(c, scLock))
+    return false
+  }
+  *(c + scSlots + n) = task
+  *(c + scLen) = n + 1
+  spinRelease(spinCellAt(c, scLock))
+  return true
+}
+
+// Zero `[ctxSp, top)` of a task `schedTaskInit` just built: the words above its
+// initial `sp` that the collector scans before the task has run. Empty on arm64
+// (`entryBias` is 0), one word on x64. A no-op on a fresh mapping, so it is not
+// worth a branch on whether the block came from the cache.
+export @nosplit @symbol("bit_rt_port_sched_stack_scrub_top") fn schedStackScrubTop(task: *i64) {
+  let top = *(task + taskStackBase) + *(task + taskStackBytes)
+  let a = *(task + ctxSp)
+  let n = 0
+  // Bounded by the constant as well as by `top`: `entryBias` is at most 8.
+  while (a + 8 <= top && n < 4) {
+    *taskAt(a) = 0
+    a = a + 8
+    n = n + 1
+  }
+}
+
+// How many spawns the cache served, and how many blocks it holds now. Read by
+// `_tests_/stress/spawnjoin` to prove reuse happens and the cap holds.
+export @nosplit @symbol("bit_rt_stack_cache_reuses") fn stackCacheReuses(): int {
+  return atomicLoad(ptrOf(stackCache) + scReuses)
+}
+
+export @nosplit @symbol("bit_rt_stack_cache_len") fn stackCacheLen(): int {
+  return atomicLoad(ptrOf(stackCache) + scLen)
+}
