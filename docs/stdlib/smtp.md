@@ -222,6 +222,48 @@ a header recipient that is not delivered to.
 
 Add a `Cc:` recipient, delivered to like a `To:`.
 
+### `Message.addBcc(a: Address)`
+
+Add a blind recipient: delivered to like a `To:`, and never written into any
+header, not even a `Bcc:` one. RFC 5322 section 3.6.3 allows a `Bcc:` header,
+but a relay or a mail client that keeps it shows every recipient the whole list,
+so this module sends the copy and leaves the header out. The address is
+validated at `render()` like any other, because it still ends up in a
+`RCPT TO:` command.
+
+```bit
+import { Message, Address } from "std/smtp"
+
+// The auditor gets every invoice; the customer never learns that.
+fn invoice(): string! {
+  let m = Message(Address{ name = "Billing", email = "billing@inkwell.dev" })
+  m.addTo(Address{ name = "", email = "customer@example.net" })
+  m.addBcc(Address{ name = "Audit", email = "audit@inkwell.dev" })
+  return m.render()?
+}
+```
+
+The rendered message above has a `To:` line and no mention of
+`audit@inkwell.dev`; `Client.send` still issues a `RCPT TO` for it.
+
+### `Message.addReplyTo(a: Address)`
+
+Add a `Reply-To:` address, the place a reply goes instead of the sender. It is
+rendered as one header after `Cc:`, validated like `To:` and `Cc:`, and is not
+an envelope recipient: nothing is delivered to it.
+
+```bit
+import { Message, Address } from "std/smtp"
+
+// Mail comes from a no-reply address; answers go to the support desk.
+fn notice(): string! {
+  let m = Message(Address{ name = "Inkwell", email = "no-reply@inkwell.dev" })
+  m.addTo(Address{ name = "", email = "customer@example.net" })
+  m.addReplyTo(Address{ name = "Support", email = "support@inkwell.dev" })
+  return m.render()?
+}
+```
+
 ### `Message.setSubject(s: string)`
 
 Set the `Subject:` header. Rejected at `render()` if it carries a CR, LF or NUL;
@@ -274,14 +316,14 @@ ASCII with no space, CR, LF or NUL, at most 250 octets.
 
 ### `Message.recipients(): []Address`
 
-Every address this message is delivered to, `To:` then `Cc:`, in the order
-added - the envelope `RCPT TO` list.
+Every address this message is delivered to, `To:`, then `Cc:`, then `Bcc:`, in
+the order added - the envelope `RCPT TO` list. `Reply-To:` is not in it.
 
 ### `Message.render(): string!SmtpError`
 
 The complete RFC 5322 message: headers, a blank line, and the body, CRLF
 throughout, dot-stuffing NOT applied (that belongs to the transmission, not to
-the message). The headers are, in order, `Date`, `From`, `To`, `Cc`, `Subject`,
+the message). The headers are, in order, `Date`, `From`, `To`, `Cc`, `Reply-To`, `Subject`,
 `Message-ID`, `MIME-Version` and the `Content-*` fields. `Date` is the time of
 the render in RFC 5322 form with a numeric zone, `Date: Sun, 06 Nov 1994
 08:49:37 +0000`, and `Message-ID` is `<uuidv7@sender-domain>` unless
