@@ -261,17 +261,58 @@
 # range"`, `rt_call panic(%) void` and `unreachable` in the oracle and k fewer
 # `jump bb()`, k > 0. Retires at the first repin after 0.36.0.
 #
+# 6982-error-path-nil (`ir`, `iropt`). #6982 returns nil instead of a freshly
+# allocated zero box on a fallible function's error path (a boxed-enum ok
+# value; `fail` and `?`). The 0.36.0 oracle allocates it. Files:
+# _tests_/cases/jsonc_parse_comments, jsonc_parse_json5_rejected,
+# jsonc_parse_trailing_comma, jsonc_parse_two_trailing_commas,
+# run_errword_methods, run_forof_iterator_iface, run_json_decode_lenient,
+# stdlib/jwt/jwt.bit and stdlib/quic/frames.bit. The identity (nilWalk in
+# ir-signatures-walk.sh), walked under one %id bijection per
+# function, every other line unchanged: the oracle holds, straight after
+# `rt_call err_set(%e)`, `%a = gc_alloc size=16 ptrs=[..] T` (T a named type,
+# not a string), up to two `const_int i64 0`, one `field_set %a[0]` and one
+# `field_set %a[8]` of a zero `const_int i64 0` (any definition in the
+# function), then `ret %a`; the tree holds `%b = const_nil`, `ret %b`. A box
+# built after the `err_set(nil)` of a success return is not this shape.
+# Retires at the first repin after 0.36.0.
+#
+# 7058-switch-case-range (`ir`) and 7058-switch-case-range-opt (`iropt`).
+# #7058 lowers a switch case with two or more labels over one integer word (an
+# integer prim or a tag-only enum) after lowering every label: hoisted, all
+# `const_int` labels first and then the same compares and ors in the same
+# order; or, when the constants are the integers [lo, hi], one `sub uT %S, lo`
+# and `icmp_ule bool %off, width` (uT the unsigned prim of the subject's width,
+# u64 for an enum; lo masked to it). Files: _tests_/cases/ir_switch_case_range,
+# run_switch, run_switch_eq_agreement, run_switch_range and examples/switch/
+# switch.bit. `ir`: rangeWalk, one %id bijection per function, every other
+# line unchanged; the oracle chain is `%e1 = icmp_eq bool %S, %c1` then
+# (`const_int T v`, `icmp_eq`, `bor`) per further label, then `br` of the last
+# `bor`, all labels of one type T, and the tree is the hoisted form or the
+# range form with lo = min, width = max - min, the values contiguous. `iropt`:
+# no text identity holds (a constant subject folds the range test and the
+# cascade rewires the CFG of main), so the identity is on functions
+# (explainSwitchPostOpt): the pre-opt dumps of the file are explained by
+# 7058-switch-case-range, and every function whose post-opt text differs has a
+# pre-opt text that differs or transitively calls one that does. The post-opt
+# text inside those functions is not independently verified; their behaviour
+# is what _tests_/cases/run_switch*.bit and the examples differential run.
+# Retires at the first repin after 0.36.0.
+#
 # The input protocol is the text the awk body reads: the oracle's dump, a line
 # `@@@BIT2@@@`, then the tree's dump, with the kind and the corpus file as
 # `-v` variables. A new entry must satisfy the rules in the header: an exact
 # identity, derived from FULL dumps (the oracle's from `sh scripts/stage0.sh`,
 # the tree's from `bit-out/bin/bit`), never an excerpt.
 #
+# shellcheck source=scripts/ir-signatures-walk.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-walk.sh"
+
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does.
 explainMismatch() {
-  awk -v kind="$3" -v file="${4:-}" '
+  awk -v kind="$3" -v file="${4:-}" "${IR_WALK_AWK}"'
     # canonT -- rewrite every `$t<N>` of arr[1..n] to `$c<idx>` in first-
     # appearance order, the same canonicalization scripts/selfhost-ir-canon.sh
     # applies, so interning-order numbering never hides an identity.
@@ -538,6 +579,10 @@ explainMismatch() {
       if (kind == "iropt" && bceWindow()) {
         print "6840-bce-window-guard"; exit 0
       }
+      ptrsLit("%", "#")
+      if (nilWalk()) { print "6982-error-path-nil"; exit 0 }
+      if (kind == "ir" && rangeWalk()) { print "7058-switch-case-range"; exit 0 }
+      ptrsLit("#", "%")
       moveTramp()
       canonK(linesA, nA, "A"); canonK(linesB, nB, "B")
       if (!shiftOk()) { exit 1 }
@@ -622,9 +667,9 @@ declaredSignatureNames() {
   local kind=${1:-}
   case "$kind" in
     ast|fmt|tokens|diags|types) return ;;
-    ir) printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words"; return ;;
-    iropt) printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard"; return ;;
+    ir) printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6982-error-path-nil" "7058-switch-case-range"; return ;;
+    iropt) printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6982-error-path-nil" "7058-switch-case-range-opt"; return ;;
     safepoints) printf '%s\n' "6847-test-module-functions"; return ;;
   esac
-  printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6847-test-module-functions"
+  printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6847-test-module-functions" "6982-error-path-nil" "7058-switch-case-range" "7058-switch-case-range-opt"
 }
