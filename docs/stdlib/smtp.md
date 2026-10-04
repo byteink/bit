@@ -171,6 +171,30 @@ default is random (UUIDv4), which is what a boundary must be - one derived from
 the content is one an attacker who controls a part can reproduce and embed.
 Rejected at `render()` unless it is a legal RFC 2046 boundary.
 
+### `Message.setMessageId(id: string)`
+
+Set the `Message-ID` to `id`, the bare id without angle brackets. Without it,
+`render()` writes a fresh one: a UUIDv7 at the sender's own domain, never the
+local hostname, so no two messages share an id and the id names no machine.
+Set one when the id has to be known before the send, to thread a reply or to
+find the message again in a log:
+
+```bit
+import { Message, Address } from "std/smtp"
+
+// The id is chosen by the caller, so a later `In-Reply-To` can name it.
+fn receipt(order: string): string! {
+  let m = Message(Address{ name = "Billing", email = "billing@inkwell.dev" })
+  m.addTo(Address{ name = "", email = "customer@example.net" })
+  m.setMessageId("receipt-${order}@inkwell.dev")
+  return m.render()?
+}
+```
+
+Rejected at `render()`, as `smtp: '<id>' is not a valid Message-ID`, unless it
+is RFC 5322 `id-left "@" id-right`: dot-atom-text on both sides, printable
+ASCII with no space, CR, LF or NUL, at most 250 octets.
+
 ### `Message.recipients(): []Address`
 
 Every address this message is delivered to, `To:` then `Cc:`, in the order
@@ -180,9 +204,16 @@ added - the envelope `RCPT TO` list.
 
 The complete RFC 5322 message: headers, a blank line, and the body, CRLF
 throughout, dot-stuffing NOT applied (that belongs to the transmission, not to
-the message). Fails on a header value carrying a CR, LF or NUL, on a malformed
-envelope address, on an illegal explicit boundary, or if any line would exceed
-the octet limit.
+the message). The headers are, in order, `Date`, `From`, `To`, `Cc`, `Subject`,
+`Message-ID`, `MIME-Version` and the `Content-*` fields. `Date` is the time of
+the render in RFC 5322 form with a numeric zone, `Date: Sun, 06 Nov 1994
+08:49:37 +0000`, and `Message-ID` is `<uuidv7@sender-domain>` unless
+`setMessageId` set one. Both are written here rather than left to a relay: a
+relay that adds a missing one changes bytes the sender may already have signed,
+and a receiving provider counts a message without them against it. Fails on a
+header value carrying a CR, LF or NUL, on a malformed envelope address, on an
+illegal explicit boundary or Message-ID, or if any line would exceed the octet
+limit.
 
 ## Connecting
 
