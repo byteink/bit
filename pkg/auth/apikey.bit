@@ -1,0 +1,565 @@
+// pkg/auth/apikey.bit — API keys for machine-to-machine access (#6949, epic
+// #3960): `ApiKeys` creates, verifies and revokes them, `ApiKeyStrategy` puts
+// the verifier behind `requireAuth`, `hasScope` reads what a key may do.
+//
+//   let keys = ApiKeys(MemoryApiKeyStore(), ApiKeyOptions{ prefix = "bk" })?
+//   let made = keys.create("svc-billing", []string{ "invoices:read" })?  // show made.key ONCE
+//   let rec = keys.verify(made.key)?                                      // rec.subject == "svc-billing"
+//
+// STANDARDS. GitHub's token format ("Behind GitHub's new authentication token
+// formats"): a recognisable prefix so a secret scanner can find a leaked key,
+// and a checksum so a typo is refused without a database read. OWASP ASVS v5
+// (keys stored hashed, revocable, scoped), RFC 6750 for the bearer transport.
+//
+// ## The key
+//
+//   <prefix>_<keyId>_<secret><checksum>      e.g. bk_7QXJ2A4M5TD3K_<32 chars><6 chars>
+//
+//  - `prefix` is the app's, `[a-z0-9]{2,12}`, so a leaked key names its owner.
+//  - `keyId` is 8 random bytes in base32, 13 characters. It is the lookup
+//    handle, not a secret: it may appear in logs, admin screens and audit
+//    trails, and `revoke` takes it.
+//  - `secret` is 32 characters of base62 drawn from the OS CSPRNG by rejection
+//    sampling (no modulo bias): 190 bits, well past ASVS's 128.
+//  - `checksum` is the CRC-32 (IEEE, std/hash) of everything before it, base62,
+//    fixed at 6 characters. It is an integrity check against typos and
+//    truncation, not authentication: anyone can compute it.
+//
+// ## What is guaranteed
+//
+//  - The store sees the SHA-256 of the secret in hex, never the secret. The
+//    secret has 190 bits of entropy, so a plain hash needs no salt or
+//    stretching, and verification costs one hash and one lookup.
+//  - `verify` refuses a wrong prefix, a malformed key and a bad checksum
+//    before it touches the store: a typo costs no database read.
+//  - Past that, the secret's hash is ALWAYS computed and compared with `ctEq`
+//    (std/crypto/subtle.bit), also for a key id the store does not know (it is
+//    compared with a decoy), so how long a refusal takes does not say whether
+//    the id exists.
+//  - Every refusal, whatever the cause, is the same `InvalidApiKey`. The error
+//    never contains the key, or any part of it.
+//  - `lastUsedAt` is written at most once per `touchInterval` seconds per key,
+//    so a busy key does not become a write per request.
+import { Mutex, AtomicI64 } from "std/sync"
+import { crc32 } from "std/hash"
+
+// What a store keeps for one key. `hash` is the SHA-256 of the secret in hex.
+// Zero in a time field means "never": `lastUsedAt` 0 is unused, `revokedAt` 0
+// is live, `expiresAt` 0 does not expire. All times are seconds since the
+// epoch.
+export class ApiKeyRecord {
+  export keyId: string,
+  export hash: string,
+  export subject: string,
+  export scopes: []string,
+  export createdAt: i64,
+  export lastUsedAt: i64,
+  export revokedAt: i64,
+  export expiresAt: i64,
+}
+
+// Where records live. Structural (§14.3): any type with these four methods is
+// a store, so a database table fits with no declaration.
+//
+// `insert` fails when the key id is already there. `find` answers
+// `Option.None` for an id it does not hold. `touch` records a use at `at` and
+// is a no-op for an unknown id. `revoke` records the revocation at `at`, keeps
+// the earliest time when the key is already revoked, and fails for an unknown
+// id so a mistyped id is not mistaken for a revocation.
+export interface ApiKeyStore {
+  insert(rec: ApiKeyRecord): ()!,
+  find(keyId: string): Option<ApiKeyRecord>!,
+  touch(keyId: string, at: i64): ()!,
+  revoke(keyId: string, at: i64): ()!,
+}
+
+// The default number of records a `MemoryApiKeyStore` holds.
+const memoryApiKeyCapacity: int = 10_000
+
+// An in-process store for tests, development and a single-process app. Its
+// records die with the process. Bounded: when full, `insert` fails rather
+// than dropping a credential someone still holds.
+export class MemoryApiKeyStore {
+  entries: map<string, ApiKeyRecord>
+  capacity: int
+  mu: Mutex
+
+  // A capacity below 1 could hold no key, so it panics: a mistake at startup,
+  // and it keeps `MemoryApiKeyStore()` infallible.
+  init(capacity: int = memoryApiKeyCapacity) {
+    if (capacity < 1) {
+      panic("auth: MemoryApiKeyStore(): `capacity` is ${capacity} — it must be at least 1")
+    }
+    this.entries = map<string, ApiKeyRecord>()
+    this.capacity = capacity
+    this.mu = Mutex()
+  }
+
+  export insert(rec: ApiKeyRecord): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (_, present) = this.entries[rec.keyId]
+    if (present) {
+      fail newError("auth: MemoryApiKeyStore.insert(): key id '${rec.keyId}' already exists")
+    }
+    if (len(this.entries) >= this.capacity) {
+      fail newError("auth: MemoryApiKeyStore.insert(): the store is full at ${this.capacity} keys")
+    }
+    this.entries[rec.keyId] = apiKeyCopy(rec)
+  }
+
+  export find(keyId: string): Option<ApiKeyRecord>! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (rec, ok) = this.entries[keyId]
+    if (!ok) {
+      return Option.None
+    }
+    return Option.Some(apiKeyCopy(rec))
+  }
+
+  export touch(keyId: string, at: i64): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (rec, ok) = this.entries[keyId]
+    if (!ok) {
+      return
+    }
+    rec.lastUsedAt = at
+    this.entries[keyId] = rec
+  }
+
+  export revoke(keyId: string, at: i64): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (rec, ok) = this.entries[keyId]
+    if (!ok) {
+      fail newError("auth: MemoryApiKeyStore.revoke(): no key '${keyId}'")
+    }
+    if (rec.revokedAt != 0) {
+      return
+    }
+    rec.revokedAt = at
+    this.entries[keyId] = rec
+  }
+}
+
+// A copy a caller can hold without aliasing the store's own record.
+fn apiKeyCopy(r: ApiKeyRecord): ApiKeyRecord {
+  let scopes = []string(0)
+  for s of r.scopes {
+    scopes = append(scopes, s)
+  }
+  return ApiKeyRecord{
+    keyId = r.keyId,
+    hash = r.hash,
+    subject = r.subject,
+    scopes = scopes,
+    createdAt = r.createdAt,
+    lastUsedAt = r.lastUsedAt,
+    revokedAt = r.revokedAt,
+    expiresAt = r.expiresAt,
+  }
+}
+
+// What an `ApiKeys` is built with.
+export class ApiKeyOptions {
+  // The app's key prefix, `[a-z0-9]{2,12}`. Required: it is what a secret
+  // scanner searches for, and it is checked on every key before the store is
+  // asked.
+  export prefix: string,
+  // Seconds between `lastUsedAt` writes for one key: five minutes. Zero
+  // writes on every verification; below zero is refused.
+  export touchInterval: i64 = 300,
+  // Seconds since the epoch. The zero value, `nil`, is the wall clock; a test
+  // passes its own and moves it by hand.
+  export clock: () => i64,
+}
+
+// A key as `create` returns it. `key` is the only copy of the secret there
+// will ever be: show it to its owner once and store nothing but `keyId`.
+export class CreatedKey {
+  export key: string,
+  export keyId: string,
+}
+
+// The one failure `verify` gives for a key it will not honour: malformed,
+// wrong prefix, bad checksum, unknown, wrong secret, revoked or expired.
+export class InvalidApiKey {
+  export message(): string {
+    return "auth: invalid API key"
+  }
+}
+
+const apiKeyIdBytes: int = 8
+// Length of 8 bytes in unpadded base32.
+const apiKeyIdChars: int = 13
+const apiKeySecretChars: int = 32
+const apiKeyChecksumChars: int = 6
+// The longest string `verify` looks at; longer cannot be a key this package made.
+const apiKeyMaxLen: int = 128
+const apiKeyAlphabet: string = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+// 62 * 4: a random byte below this maps to a base62 character without bias.
+const apiKeyUnbiased: int = 248
+const apiKeyDraws: int = 16
+// The hash `verify` compares against for an unknown key id: 64 hex digits, so
+// the compare costs what a real one does. Whatever it is compared with, an
+// unknown id is refused.
+const apiKeyDecoyHash: string = "0000000000000000000000000000000000000000000000000000000000000000"
+
+// Issues, verifies and revokes API keys over an `ApiKeyStore`. Stateless apart
+// from the store, so one value is shared by every request.
+export class ApiKeys {
+  store: ApiKeyStore
+  opts: ApiKeyOptions
+  decoy: ApiKeyRecord
+  // Secret-hash comparisons made, so a test can show every refusal path
+  // takes exactly one.
+  compares: AtomicI64
+
+  // Fails for a missing store, a prefix outside `[a-z0-9]{2,12}` or a negative
+  // `touchInterval`, so the mistake shows when the app starts.
+  init(store: ApiKeyStore, opts: ApiKeyOptions)! {
+    if (store == nil) {
+      fail newError("auth: ApiKeys(): no store — pass one, for example `ApiKeys(MemoryApiKeyStore(), ApiKeyOptions{ prefix = \"bk\" })`")
+    }
+    if (!apiKeyValidPrefix(opts.prefix)) {
+      fail newError("auth: ApiKeys(): `prefix` must be 2 to 12 characters from a-z and 0-9, got '${opts.prefix}'")
+    }
+    if (opts.touchInterval < 0) {
+      fail newError("auth: ApiKeys(): `touchInterval` is ${opts.touchInterval} — it must not be negative")
+    }
+    this.store = store
+    this.opts = opts
+    this.decoy = ApiKeyRecord{ hash = apiKeyDecoyHash }
+    this.compares = AtomicI64(0)
+  }
+
+  // A new key for `subject` with `scopes`, valid until `expiresAt` (seconds
+  // since the epoch; 0 for no expiry). The returned `key` is the only copy of
+  // the secret: the store gets its hash.
+  //
+  // Fails for an empty `subject`, a scope that is empty or holds a space or
+  // control character, an `expiresAt` that is negative or already past, or a
+  // store that refuses the record.
+  export create(subject: string, scopes: []string, expiresAt: i64 = 0): CreatedKey! {
+    let nowSec = this.nowSec()
+    apiKeyCheckNew(subject, scopes, expiresAt, nowSec)?
+    let keyId = apiKeyNewId()?
+    let secret = apiKeyRandomChars(apiKeySecretChars)?
+    let body = "${this.opts.prefix}_${keyId}_${secret}"
+    this.store.insert(
+      ApiKeyRecord{
+        keyId = keyId,
+        hash = apiKeyHash(secret),
+        subject = subject,
+        scopes = scopes,
+        createdAt = nowSec,
+        expiresAt = expiresAt,
+      },
+    )?
+    return CreatedKey{ key = "${body}${apiKeyChecksum(body)}", keyId = keyId }
+  }
+
+  // The record `key` belongs to, or `InvalidApiKey` for every reason it cannot
+  // be honoured (see the file header). A store failure is returned as it came:
+  // it is the operator's to see and nothing a client can cause.
+  //
+  // Records the use through `touch` when the last one is `touchInterval` or
+  // more seconds old.
+  export verify(key: string): ApiKeyRecord! {
+    let parsed = apiKeyParse(key, this.opts.prefix) catch _ {
+      fail InvalidApiKey{}
+    }
+    let found = this.store.find(parsed.keyId)?
+    let known = isSome(found)
+    let rec = this.decoy
+    if (known) {
+      rec = unwrap(found)
+    }
+    let matched = this.secretMatches(parsed.secret, rec.hash)
+    let nowSec = this.nowSec()
+    if (!known || !matched || !apiKeyUsable(rec, nowSec)) {
+      fail InvalidApiKey{}
+    }
+    if (nowSec - rec.lastUsedAt >= this.opts.touchInterval) {
+      this.store.touch(rec.keyId, nowSec)?
+    }
+    return rec
+  }
+
+  // Revokes the key with `keyId` from now on. Fails for an empty or unknown id.
+  export revoke(keyId: string): ()! {
+    if (keyId == "") {
+      fail newError("auth: ApiKeys.revoke(): `keyId` is empty")
+    }
+    this.store.revoke(keyId, this.nowSec())?
+  }
+
+  secretMatches(secret: string, storedHash: string): bool {
+    this.compares.add(1)
+    return ctEq([]byte(apiKeyHash(secret)), []byte(storedHash))
+  }
+
+  nowSec(): i64 {
+    let clock = this.opts.clock
+    if (clock == nil) {
+      return now().ns / Second
+    }
+    return clock()
+  }
+}
+
+fn apiKeyValidPrefix(p: string): bool {
+  if (len(p) < 2 || len(p) > 12) {
+    return false
+  }
+  for c of []byte(p) {
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) {
+      return false
+    }
+  }
+  return true
+}
+
+fn apiKeyCheckNew(subject: string, scopes: []string, expiresAt: i64, nowSec: i64): ()! {
+  if (subject == "") {
+    fail newError("auth: ApiKeys.create(): `subject` is empty — name whom the key is for")
+  }
+  for scope of scopes {
+    if (!apiKeyValidScope(scope)) {
+      fail newError("auth: ApiKeys.create(): a scope is empty or holds a space or control character")
+    }
+  }
+  if (expiresAt < 0 || (expiresAt != 0 && expiresAt <= nowSec)) {
+    fail newError("auth: ApiKeys.create(): `expiresAt` is ${expiresAt} — it must be 0 or a future time")
+  }
+}
+
+fn apiKeyValidScope(s: string): bool {
+  if (s == "") {
+    return false
+  }
+  for c of []byte(s) {
+    if (c <= ' ' || c >= 127) {
+      return false
+    }
+  }
+  return true
+}
+
+// Not revoked and not expired at `nowSec`.
+fn apiKeyUsable(rec: ApiKeyRecord, nowSec: i64): bool {
+  if (rec.revokedAt != 0) {
+    return false
+  }
+  return rec.expiresAt == 0 || rec.expiresAt > nowSec
+}
+
+// The SHA-256 of `secret` in hex: what the store holds.
+fn apiKeyHash(secret: string): string {
+  return encodeHex(digest(Sha256(), []byte(secret)))
+}
+
+// The 13-character key id: 8 random bytes in base32 with the padding cut off.
+fn apiKeyNewId(): string! {
+  let raw = randomBytes(apiKeyIdBytes)
+  if (len(raw) != apiKeyIdBytes) {
+    fail newError("auth: ApiKeys.create(): the system random source returned ${len(raw)} bytes, wanted ${apiKeyIdBytes}")
+  }
+  return encodeBase32(raw)[0:apiKeyIdChars]
+}
+
+// `n` base62 characters from the CSPRNG. A byte at or above 248 is dropped,
+// so every character is equally likely; 16 draws of 64 bytes leave the chance
+// of falling short below 2^-1000.
+fn apiKeyRandomChars(n: int): string! {
+  let out = []byte(n)
+  let filled = 0
+  let draws = 0
+  while (filled < n && draws < apiKeyDraws) {
+    let raw = randomBytes(64)
+    if (len(raw) != 64) {
+      fail newError("auth: ApiKeys.create(): the system random source returned ${len(raw)} bytes, wanted 64")
+    }
+    filled = apiKeyFill(out, filled, raw)
+    draws = draws + 1
+  }
+  if (filled < n) {
+    fail newError("auth: ApiKeys.create(): the system random source gave too few usable bytes")
+  }
+  return string(out)
+}
+
+// Writes a base62 character into `out` for every usable byte of `raw`, from
+// position `filled`; returns the new count.
+fn apiKeyFill(out: []byte, filled: int, raw: []byte): int {
+  let alpha = []byte(apiKeyAlphabet)
+  for b of raw {
+    if (filled >= len(out)) {
+      return filled
+    }
+    if (int(b) < apiKeyUnbiased) {
+      out[filled] = alpha[int(b) % 62]
+      filled = filled + 1
+    }
+  }
+  return filled
+}
+
+// The 6-character base62 CRC-32 of `body`, most significant digit first.
+// 62^6 is above 2^32, so six digits always hold it.
+fn apiKeyChecksum(body: string): string {
+  let alpha = []byte(apiKeyAlphabet)
+  let out = []byte(apiKeyChecksumChars)
+  let n = i64(crc32([]byte(body)))
+  let i = apiKeyChecksumChars - 1
+  while (i >= 0) {
+    out[i] = alpha[int(n % 62)]
+    n = n / 62
+    i = i - 1
+  }
+  return string(out)
+}
+
+// The two parts of a key `verify` acts on.
+class ParsedApiKey {
+  keyId: string,
+  secret: string,
+}
+
+// Splits `key` and checks everything that needs no store: length, prefix,
+// shape of each part and the checksum. Fails with a plain error that never
+// leaves `verify`.
+fn apiKeyParse(key: string, prefix: string): ParsedApiKey! {
+  if (len(key) > apiKeyMaxLen) {
+    fail newError("malformed")
+  }
+  let parts = split(key, "_")
+  if (len(parts) != 3 || parts[0] != prefix) {
+    fail newError("malformed")
+  }
+  let tail = parts[2]
+  if (len(parts[1]) != apiKeyIdChars || len(tail) != apiKeySecretChars + apiKeyChecksumChars) {
+    fail newError("malformed")
+  }
+  let secret = tail[0:apiKeySecretChars]
+  if (!apiKeyAllBase62(secret) ||
+    !apiKeyAllBase62(tail[apiKeySecretChars:len(tail)]) ||
+    !apiKeyAllBase32(parts[1])) {
+    fail newError("malformed")
+  }
+  let body = key[0:len(key) - apiKeyChecksumChars]
+  if (!ctEq([]byte(apiKeyChecksum(body)), []byte(tail[apiKeySecretChars:len(tail)]))) {
+    fail newError("bad checksum")
+  }
+  return ParsedApiKey{ keyId = parts[1], secret = secret }
+}
+
+fn apiKeyAllBase62(s: string): bool {
+  for c of []byte(s) {
+    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) {
+      return false
+    }
+  }
+  return true
+}
+
+fn apiKeyAllBase32(s: string): bool {
+  for c of []byte(s) {
+    if (!((c >= 'A' && c <= 'Z') || (c >= '2' && c <= '7'))) {
+      return false
+    }
+  }
+  return true
+}
+
+// The `Identity` of a verified key: the subject, and claims `keyId` and
+// `scopes` for `hasScope` and the handler.
+fn apiKeyIdentity(rec: ApiKeyRecord): Identity {
+  let scopes = []Json(0)
+  for s of rec.scopes {
+    scopes = append(scopes, Json.JsonString(s))
+  }
+  return Identity{
+    id = rec.subject,
+    claims = Json.JsonObject(
+      []JsonEntry{
+        JsonEntry{ key = "keyId", value = Json.JsonString(rec.keyId) },
+        JsonEntry{ key = "scopes", value = Json.JsonArray(scopes) },
+      },
+    ),
+  }
+}
+
+// Whether the key behind `id` carries `scope`. This reads the `scopes` claim
+// `ApiKeyStrategy` wrote; it is a check of what a key was issued for, not
+// authorization of a user or role. An identity from another strategy has no
+// `scopes` claim and has none.
+export fn hasScope(id: Identity, scope: string): bool {
+  let claim = jsonGet(id.claims, "scopes")
+  if (!isSome(claim)) {
+    return false
+  }
+  let items = jsonAsArray(unwrap(claim))
+  if (!isSome(items)) {
+    return false
+  }
+  for item of unwrap(items) {
+    let s = jsonAsString(item)
+    if (isSome(s) && unwrap(s) == scope) {
+      return true
+    }
+  }
+  return false
+}
+
+// A `Strategy` that authenticates a request by an API key in its
+// `Authorization: Bearer` header or, when that holds none, in one named
+// header (`X-API-Key` by default). Stateless like `BearerStrategy`
+// (bearer.bit): it creates and regenerates no session. A request with no key
+// fails with the bare `Bearer` challenge, one whose key `InvalidApiKey`
+// refuses with `error="invalid_token"` (RFC 6750 section 3), never saying
+// why. A store failure is raised as it came.
+export class ApiKeyStrategy {
+  keys: ApiKeys
+  header: string
+
+  // `header` names the request header read when `Authorization` carries no
+  // bearer value. It must not be `Authorization` itself, which is always
+  // read as a bearer value first.
+  init(keys: ApiKeys, header: string = "X-API-Key")! {
+    if (header == "" || equalFold(header, "Authorization")) {
+      fail newError("auth: ApiKeyStrategy(): `header` is '${header}' — name a header other than Authorization, for example X-API-Key")
+    }
+    this.keys = keys
+    this.header = header
+  }
+
+  export name(): string {
+    return "apikey"
+  }
+
+  export authenticate(c: Ctx): Identity! {
+    let key = this.credential(c)
+    if (key == "") {
+      fail BearerChallenge{ challenge = challengeNoCredential }
+    }
+    let rec = this.keys.verify(key) catch e {
+      let (_, refused) = e.(InvalidApiKey)
+      if (!refused) {
+        fail e
+      }
+      fail BearerChallenge{ challenge = challengeInvalidToken }
+    }
+    return apiKeyIdentity(rec)
+  }
+
+  credential(c: Ctx): string {
+    let auth = c.header("Authorization")
+    if (len(auth) >= 7 && equalFold(auth[0:7], "Bearer ")) {
+      return auth[7:len(auth)]
+    }
+    return c.header(this.header)
+  }
+}

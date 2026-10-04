@@ -1,0 +1,534 @@
+// pkg/auth/apikey.test.bit — #6949's acceptance: API keys (GitHub token
+// format, OWASP ASVS v5, RFC 6750) over a recording store, on a hand-moved
+// clock. A failing verification is only believable when the cause under test
+// is the ONLY thing wrong with the key, so each refusal below starts from a
+// key `create` just made. `contains` and the names the other files bind are
+// module-wide (SPEC section 17.1); nothing new is imported here.
+
+class AkClock {
+  t: i64,
+}
+
+// A store that counts every call and delegates to a real one, so a test can
+// say how many reads, writes and last-used writes a verification made.
+class AkStore {
+  inner: MemoryApiKeyStore
+  inserts: int
+  finds: int
+  touches: int
+  failFind: bool
+
+  insert(rec: ApiKeyRecord): ()! {
+    this.inserts = this.inserts + 1
+    this.inner.insert(rec)?
+  }
+
+  find(keyId: string): Option<ApiKeyRecord>! {
+    this.finds = this.finds + 1
+    if (this.failFind) {
+      fail newError("akstore: the database is down")
+    }
+    return this.inner.find(keyId)?
+  }
+
+  touch(keyId: string, at: i64): ()! {
+    this.touches = this.touches + 1
+    this.inner.touch(keyId, at)?
+  }
+
+  revoke(keyId: string, at: i64): ()! {
+    this.inner.revoke(keyId, at)?
+  }
+}
+
+fn akStore(): AkStore {
+  return AkStore{
+    inner = MemoryApiKeyStore(),
+    inserts = 0,
+    finds = 0,
+    touches = 0,
+    failFind = false,
+  }
+}
+
+fn akKeys(store: AkStore, clock: AkClock): ApiKeys {
+  let read: () => i64 = () => clock.t
+  return ApiKeys(store, ApiKeyOptions{ prefix = "bk", clock = read }) catch e {
+    panic("ApiKeys: ${e.message()}")
+  }
+}
+
+fn akCreate(keys: ApiKeys, subject: string, scopes: []string, expiresAt: i64): CreatedKey {
+  return keys.create(subject, scopes, expiresAt) catch e {
+    panic("create: ${e.message()}")
+  }
+}
+
+// `verify`'s failure message, or "" when it accepted.
+fn akVerifyError(keys: ApiKeys, key: string): string {
+  keys.verify(key) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+fn akBuildError(store: AkStore, opts: ApiKeyOptions): string {
+  ApiKeys(store, opts) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+// `key` with the character at `at` replaced by a different base62 one.
+fn akFlip(key: string, at: int): string {
+  let swap = "A"
+  if (key[at] == 'A') {
+    swap = "B"
+  }
+  return key[0:at] + swap + key[at + 1:len(key)]
+}
+
+test "create then verify returns the record of the subject, scopes and times" {
+  let clock = AkClock{ t = 1000 }
+  let keys = akKeys(akStore(), clock)
+  let made = akCreate(keys, "svc-billing", []string{ "invoices:read", "invoices:write" }, 5000)
+  let rec = keys.verify(made.key) catch e {
+    panic("verify: ${e.message()}")
+  }
+
+  assert(rec.keyId == made.keyId, "want key id ${made.keyId}, got ${rec.keyId}")
+  assert(rec.subject == "svc-billing", "want subject svc-billing, got ${rec.subject}")
+  assert(len(rec.scopes) == 2 && rec.scopes[1] == "invoices:write", "scopes were not kept")
+  assert(rec.createdAt == 1000 && rec.expiresAt == 5000, "times were not kept")
+}
+
+test "a key is prefix_keyId_secret then a 6 character checksum, and no two keys repeat" {
+  let keys = akKeys(akStore(), AkClock{ t = 1000 })
+  let a = akCreate(keys, "u1", []string{}, 0)
+  let b = akCreate(keys, "u1", []string{}, 0)
+  let parts = split(a.key, "_")
+
+  assert(len(parts) == 3 && parts[0] == "bk", "want bk_<id>_<rest>, got a different shape")
+  assert(len(parts[1]) == 13 && parts[1] == a.keyId, "key id must be 13 characters and match")
+  assert(len(parts[2]) == 38, "secret and checksum must be 38 characters, got ${len(parts[2])}")
+  assert(a.key != b.key && a.keyId != b.keyId, "two keys must differ")
+}
+
+test "the checksum is the base62 CRC-32 of the text before it (CRC-32 check value 0xCBF43926)" {
+  // zlib's crc32(b"123456789") is 3421780262, which is "3jZRME" in six base62
+  // digits, most significant first; computed outside Bit.
+  assert(apiKeyChecksum("123456789") == "3jZRME", "got ${apiKeyChecksum("123456789")}")
+  assert(
+    apiKeyChecksum("") == "000000",
+    "the empty string checksums to zero, got ${apiKeyChecksum("")}",
+  )
+}
+
+test "a typo fails the checksum with 0 store calls, wherever it lands" {
+  let store = akStore()
+  let keys = akKeys(store, AkClock{ t = 1000 })
+  let made = akCreate(keys, "u1", []string{}, 0)
+  let wantErr = "auth: invalid API key"
+
+  // In the prefix, the key id, the secret and the checksum itself.
+  for at of []int{ 1, 5, 20, len(made.key) - 1 } {
+    assert(akVerifyError(keys, akFlip(made.key, at)) == wantErr, "typo at ${at} was accepted")
+  }
+  assert(store.finds == 0, "a typo must not reach the store, got ${store.finds} reads")
+  assert(keys.compares.load() == 0, "a typo must not reach the hash compare")
+}
+
+test "malformed input is refused before the store: empty, short, long, other prefix, extra part" {
+  let store = akStore()
+  let keys = akKeys(store, AkClock{ t = 1000 })
+  let made = akCreate(keys, "u1", []string{}, 0)
+  let bad = []string{
+    "",
+    "bk",
+    "bk__",
+    made.key[0:20],
+    made.key + made.key,
+    "xx" + made.key[2:len(made.key)],
+    made.key + "_x",
+    "bk_" + made.keyId + "_" + "!" + made.key[18:len(made.key)],
+  }
+
+  for k of bad {
+    assert(akVerifyError(keys, k) == "auth: invalid API key", "'${k}' was not refused")
+  }
+  assert(store.finds == 0, "malformed input reached the store ${store.finds} time(s)")
+}
+
+test "unknown id, wrong secret, revoked and expired return one identical error and one hash compare each" {
+  let clock = AkClock{ t = 1000 }
+  let store = akStore()
+  let keys = akKeys(store, clock)
+  let good = akCreate(keys, "u1", []string{}, 0)
+  let revoked = akCreate(keys, "u2", []string{}, 0)
+  let expiring = akCreate(keys, "u3", []string{}, 1500)
+  keys.revoke(revoked.keyId) catch e {
+    panic("revoke: ${e.message()}")
+  }
+  clock.t = 2000
+
+  // A real key id with another key's secret, re-checksummed so it passes the
+  // shape checks and reaches the compare.
+  let other = akCreate(keys, "u4", []string{}, 0)
+  let parts = split(other.key, "_")
+  let body = "bk_" + good.keyId + "_" + parts[2][0:32]
+  let wrongSecret = body + apiKeyChecksum(body)
+  // An id the store does not hold, with a valid checksum.
+  let ghostBody = "bk_" + "ABCDEFGHIJKLM" + "_" + parts[2][0:32]
+  let unknownId = ghostBody + apiKeyChecksum(ghostBody)
+
+  let causes = []string{ unknownId, wrongSecret, revoked.key, expiring.key }
+  let first = akVerifyError(keys, causes[0])
+  for k of causes {
+    let before = keys.compares.load()
+    let msg = akVerifyError(keys, k)
+    assert(msg != "" && msg == first, "cause '${k}' gave a different error: '${msg}'")
+    assert(
+      keys.compares.load() - before == 1,
+      "cause '${k}' ran ${keys.compares.load() - before} compares, want 1",
+    )
+  }
+  // And the control: the intact key still verifies, with its one compare.
+  assert(akVerifyError(keys, good.key) == "", "the good key must still verify")
+}
+
+test "the error never contains the key or any part of it" {
+  let keys = akKeys(akStore(), AkClock{ t = 1000 })
+  let made = akCreate(keys, "u1", []string{}, 0)
+  let flipped = akFlip(made.key, 20)
+  let msg = akVerifyError(keys, flipped)
+  let secret = split(made.key, "_")[2][0:32]
+
+  assert(msg == "auth: invalid API key", "got '${msg}'")
+  assert(!contains(msg, made.keyId) && !contains(msg, secret), "the error leaks part of the key")
+}
+
+test "the store holds 0 of 5 plaintext secrets, only their SHA-256 in hex" {
+  let store = akStore()
+  let keys = akKeys(store, AkClock{ t = 1000 })
+  let leaked = 0
+  let n = 0
+  while (n < 5) {
+    let made = akCreate(keys, "u${n}", []string{ "read" }, 0)
+    let secret = split(made.key, "_")[2][0:32]
+    let rec = store.inner.find(made.keyId) catch e {
+      panic("find: ${e.message()}")
+    }
+    let held = unwrap(rec)
+    if (contains(held.hash, secret) ||
+      contains(held.subject, secret) ||
+      contains(held.keyId, secret)) {
+      leaked = leaked + 1
+    }
+    assert(
+      held.hash == apiKeyHash(secret) && len(held.hash) == 64,
+      "the store must hold the SHA-256 hex",
+    )
+    n = n + 1
+  }
+  assert(leaked == 0, "${leaked} of 5 plaintext secrets reached the store")
+}
+
+test "SHA-256 of the secret is the standard digest (known answer for 'abc')" {
+  assert(
+    apiKeyHash("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    "got ${apiKeyHash("abc")}",
+  )
+}
+
+test "last-used is written at most once per touchInterval across 10 calls" {
+  let clock = AkClock{ t = 1000 }
+  let store = akStore()
+  let keys = akKeys(store, clock)
+  let made = akCreate(keys, "u1", []string{}, 0)
+  let n = 0
+  while (n < 10) {
+    keys.verify(made.key) catch e {
+      panic("verify: ${e.message()}")
+    }
+    clock.t = clock.t + 10
+    n = n + 1
+  }
+  assert(store.touches == 1, "10 calls inside 300s wrote last-used ${store.touches} times, want 1")
+
+  clock.t = clock.t + 300
+  keys.verify(made.key) catch e {
+    panic("verify: ${e.message()}")
+  }
+  assert(store.touches == 2, "a call past the interval must write again, got ${store.touches}")
+  let rec = unwrap(
+    store.inner.find(made.keyId) catch e {
+      panic("find: ${e.message()}")
+    },
+  )
+  assert(rec.lastUsedAt == clock.t, "lastUsedAt must be the last write, got ${rec.lastUsedAt}")
+}
+
+test "revoke makes the key fail at once, twice is fine, an unknown id is an error" {
+  let clock = AkClock{ t = 1000 }
+  let keys = akKeys(akStore(), clock)
+  let made = akCreate(keys, "u1", []string{}, 0)
+  assert(akVerifyError(keys, made.key) == "", "the key must verify before it is revoked")
+
+  keys.revoke(made.keyId) catch e {
+    panic("revoke: ${e.message()}")
+  }
+  clock.t = 1100
+  keys.revoke(made.keyId) catch e {
+    panic("second revoke: ${e.message()}")
+  }
+  assert(akVerifyError(keys, made.key) != "", "a revoked key verified")
+  let refused = 0
+  keys.revoke("NOSUCHKEYID00") catch _ {
+    refused = refused + 1
+  }
+  keys.revoke("") catch _ {
+    refused = refused + 1
+  }
+  assert(refused == 2, "want an unknown and an empty id refused, got ${refused}")
+}
+
+test "a revoked key keeps its first revokedAt" {
+  let clock = AkClock{ t = 1000 }
+  let store = akStore()
+  let keys = akKeys(store, clock)
+  let made = akCreate(keys, "u1", []string{}, 0)
+  keys.revoke(made.keyId) catch e {
+    panic("revoke: ${e.message()}")
+  }
+  clock.t = 2000
+  keys.revoke(made.keyId) catch e {
+    panic("revoke: ${e.message()}")
+  }
+  let rec = unwrap(
+    store.inner.find(made.keyId) catch e {
+      panic("find: ${e.message()}")
+    },
+  )
+  assert(rec.revokedAt == 1000, "want the first revocation time 1000, got ${rec.revokedAt}")
+}
+
+test "a key expires at expiresAt, not a second before" {
+  let clock = AkClock{ t = 1000 }
+  let keys = akKeys(akStore(), clock)
+  let made = akCreate(keys, "u1", []string{}, 1060)
+
+  clock.t = 1059
+  assert(akVerifyError(keys, made.key) == "", "the key must verify before expiresAt")
+  clock.t = 1060
+  assert(akVerifyError(keys, made.key) != "", "the key must be dead at expiresAt")
+}
+
+test "create refuses an empty subject, a bad scope and a bad expiry" {
+  let keys = akKeys(akStore(), AkClock{ t = 1000 })
+  let none = []string{}
+  let failures = 0
+  keys.create("", none, 0) catch _ {
+    failures = failures + 1
+  }
+  keys.create("u1", []string{ "" }, 0) catch _ {
+    failures = failures + 1
+  }
+  keys.create("u1", []string{ "a b" }, 0) catch _ {
+    failures = failures + 1
+  }
+  keys.create("u1", none, -5) catch _ {
+    failures = failures + 1
+  }
+  keys.create("u1", none, 1000) catch _ {
+    failures = failures + 1
+  }
+  assert(failures == 5, "want 5 of 5 refused, got ${failures}")
+}
+
+test "5 of 5 invalid prefixes and a missing store are rejected at construction" {
+  let store = akStore()
+  let prefixes = []string{ "", "a", "Upper", "has_underscore", "thirteenchars", "dash-ed" }
+  let refused = 0
+  for p of prefixes {
+    let msg = akBuildError(store, ApiKeyOptions{ prefix = p })
+    if (contains(msg, "`prefix` must be 2 to 12")) {
+      refused = refused + 1
+    }
+  }
+  assert(refused == 6, "want 6 of 6 invalid prefixes refused, got ${refused}")
+  assert(akBuildError(store, ApiKeyOptions{ prefix = "ab" }) == "", "a 2 character prefix is valid")
+  assert(
+    akBuildError(store, ApiKeyOptions{ prefix = "abcdefghij12" }) == "",
+    "a 12 character prefix is valid",
+  )
+  assert(
+    akBuildError(store, ApiKeyOptions{ prefix = "bk", touchInterval = -1 }) != "",
+    "a negative interval is invalid",
+  )
+  let noStore: ApiKeyStore = nil
+  let msg = ""
+  ApiKeys(noStore, ApiKeyOptions{ prefix = "bk" }) catch e {
+    msg = e.message()
+  }
+  assert(contains(msg, "no store"), "a nil store must be refused, got '${msg}'")
+}
+
+test "a store failure is returned as it came, not as an invalid key" {
+  let store = akStore()
+  let keys = akKeys(store, AkClock{ t = 1000 })
+  let made = akCreate(keys, "u1", []string{}, 0)
+  store.failFind = true
+
+  assert(contains(akVerifyError(keys, made.key), "the database is down"), "the outage was hidden")
+}
+
+test "MemoryApiKeyStore refuses a duplicate id, a full store, and hands out copies" {
+  let store = MemoryApiKeyStore(1)
+  let rec = ApiKeyRecord{
+    keyId = "AAAAAAAAAAAAA",
+    hash = "h",
+    subject = "u1",
+    scopes = []string{ "a" },
+  }
+  store.insert(rec) catch e {
+    panic("insert: ${e.message()}")
+  }
+  let dup = 0
+  store.insert(rec) catch _ {
+    dup = dup + 1
+  }
+  store.insert(
+    ApiKeyRecord{ keyId = "BBBBBBBBBBBBB", hash = "h", subject = "u2", scopes = []string{} },
+  ) catch _ {
+    dup = dup + 1
+  }
+  assert(dup == 2, "want the duplicate and the overflow refused, got ${dup}")
+
+  let held = unwrap(
+    store.find("AAAAAAAAAAAAA") catch e {
+      panic("find: ${e.message()}")
+    },
+  )
+  held.subject = "mallory"
+  let again = unwrap(
+    store.find("AAAAAAAAAAAAA") catch e {
+      panic("find: ${e.message()}")
+    },
+  )
+  assert(again.subject == "u1", "a caller changed the store's record")
+}
+
+// --- hasScope and ApiKeyStrategy ---------------------------------------------
+
+fn akApp(keys: ApiKeys, header: string): App {
+  let app = App(Config{ secret = "test-secret", sessions = MemoryStore(1000) })
+  let strategy = ApiKeyStrategy(keys, header) catch e {
+    panic("ApiKeyStrategy: ${e.message()}")
+  }
+  app.use(requireAuth([]Strategy{ strategy }))
+  app.get("/x", (c) => {
+    let identity = currentIdentity(c) catch e {
+      panic("currentIdentity: ${e.message()}")
+    }
+    return c.text(
+      "${identity.id}|${hasScope(identity, "invoices:read")}|${hasScope(identity, "invoices:write")}",
+    )
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+fn akReq(headers: string): Request {
+  return Request{ method = "GET", path = "/x", headers = headers, body = "" }
+}
+
+test "the strategy reads Authorization: Bearer and X-API-Key, 2 of 2, with scopes on the identity" {
+  let keys = akKeys(akStore(), AkClock{ t = 1000 })
+  let made = akCreate(keys, "svc", []string{ "invoices:read" }, 0)
+  let app = akApp(keys, "X-API-Key")
+
+  let viaBearer = app.handle(akReq("Authorization: Bearer " + made.key))
+  let viaHeader = app.handle(akReq("X-API-Key: " + made.key))
+
+  assert(
+    viaBearer.status == 200 && viaBearer.body == "svc|true|false",
+    "bearer: ${viaBearer.status} '${viaBearer.body}'",
+  )
+  assert(
+    viaHeader.status == 200 && viaHeader.body == "svc|true|false",
+    "header: ${viaHeader.status} '${viaHeader.body}'",
+  )
+}
+
+test "the header option names the one custom header read" {
+  let keys = akKeys(akStore(), AkClock{ t = 1000 })
+  let made = akCreate(keys, "svc", []string{}, 0)
+  let app = akApp(keys, "X-Service-Key")
+
+  assert(
+    app.handle(akReq("X-Service-Key: " + made.key)).status == 200,
+    "the configured header was not read",
+  )
+  assert(
+    app.handle(akReq("X-API-Key: " + made.key)).status == 401,
+    "the default header must not be read",
+  )
+}
+
+test "no key is the bare Bearer challenge, a refused key is invalid_token, revoked included" {
+  let keys = akKeys(akStore(), AkClock{ t = 1000 })
+  let made = akCreate(keys, "svc", []string{}, 0)
+  let app = akApp(keys, "X-API-Key")
+  keys.revoke(made.keyId) catch e {
+    panic("revoke: ${e.message()}")
+  }
+
+  let none = app.handle(akReq(""))
+  let revoked = app.handle(akReq("X-API-Key: " + made.key))
+  let junk = app.handle(akReq("Authorization: Bearer not-a-key"))
+
+  assert(
+    none.status == 401 && none.getHeader("WWW-Authenticate") == "Bearer",
+    "no key: ${none.status}",
+  )
+  assert(
+      revoked.status == 401 &&
+      revoked.getHeader("WWW-Authenticate") == "Bearer error=\"invalid_token\"",
+    "revoked: ${revoked.status} '${revoked.getHeader("WWW-Authenticate")}'",
+  )
+  assert(
+    junk.status == 401 && junk.getHeader("WWW-Authenticate") == "Bearer error=\"invalid_token\"",
+    "junk was accepted",
+  )
+}
+
+test "ApiKeyStrategy is named apikey and refuses Authorization as its header" {
+  let keys = akKeys(akStore(), AkClock{ t = 1000 })
+  let s = ApiKeyStrategy(keys) catch e {
+    panic("ApiKeyStrategy: ${e.message()}")
+  }
+  assert(s.name() == "apikey", "name must be apikey")
+
+  let refused = 0
+  ApiKeyStrategy(keys, "authorization") catch _ {
+    refused = refused + 1
+  }
+  ApiKeyStrategy(keys, "") catch _ {
+    refused = refused + 1
+  }
+  assert(refused == 2, "want 2 of 2 refused, got ${refused}")
+}
+
+test "hasScope reads the scopes claim and is false for an identity with none" {
+  let withScopes = apiKeyIdentity(
+    ApiKeyRecord{ keyId = "K", subject = "u1", scopes = []string{ "a:read", "b:write" } },
+  )
+  let plain = Identity{ id = "u2", claims = Json.JsonNull }
+
+  assert(hasScope(withScopes, "b:write"), "a granted scope must be true")
+  assert(!hasScope(withScopes, "b"), "a prefix of a scope must be false")
+  assert(!hasScope(withScopes, "c:read"), "an ungranted scope must be false")
+  assert(!hasScope(plain, "a:read"), "an identity with no scopes claim has none")
+}
