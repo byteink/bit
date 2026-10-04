@@ -454,10 +454,14 @@ and, when equal, calls `fn` with no runtime call at all. A miss calls
 `bit_rt_iface_lookup_ic(info, id, cell)` (§9), which resolves exactly as
 `bit_rt_iface_lookup` does and returns the address; if the cell is still
 empty it also binds it. The cell is monomorphic and bound at most once: the
-first type a site sees owns it, and any other type resolves through the miss
-path on every call (HotSpot's monomorphic-to-megamorphic transition, never
-rebinding). Binding once is what keeps a megamorphic site from writing a
-shared cache line on every call from every worker.
+first type a site sees owns it, and any other type misses on every call
+(HotSpot's monomorphic-to-megamorphic transition, never rebinding). Binding
+once is what keeps a megamorphic site from writing a shared cache line on
+every call from every worker. A miss whose cell is already bound (its `fn`,
+read by the probe, non-zero) calls `bit_rt_iface_lookup` directly, so a site
+that keeps missing pays the probe and one branch over the pre-cache sequence,
+never an extra call level; only a miss on an empty cell calls
+`bit_rt_iface_lookup_ic`.
 
 Two concurrent misses never pair one type's `info` with another type's `fn`:
 
