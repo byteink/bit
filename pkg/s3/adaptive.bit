@@ -1,0 +1,380 @@
+// pkg/s3/adaptive.bit — the client-side rate limiter behind `RetryMode.Adaptive`
+// (#6587): a token bucket whose fill rate follows the CUBIC congestion curve.
+//
+// Followed, not paraphrased: smithy-typescript commit
+// 5d104567b7180c8a4055eb2f04c91854026a01c2 (2026-09-30), packages/core/src/
+// submodules/retry/util-retry/DefaultRateLimiter.ts, the limiter
+// @aws-sdk/client-s3 3.1146.0 (aws-sdk-js-v3 054298b1520f) runs in adaptive mode.
+//   - The bucket is off until the first throttling answer. Before that every
+//     `getSendToken` returns at once, so a healthy service never sees a limit.
+//   - Every attempt's outcome moves the sending rate: a throttling answer drops
+//     it to `beta` (0.7) of the lower of the measured send rate and the current
+//     fill rate and remembers that rate as `lastMaxRate`; any other outcome
+//     lets it climb the cubic curve `scaleConstant * (t - lastThrottle -
+//     window)^3 + lastMaxRate` (scaleConstant 0.4), never above twice the
+//     measured rate.
+//   - The measured send rate is requests per second over half-second buckets,
+//     smoothed with factor 0.8.
+//   - The fill rate is never below 0.5 tokens a second and the bucket never
+//     holds less than 1 token; one second of fill is the capacity.
+//   - A send waits `(1 - tokens) / fillRate` seconds when the bucket is empty,
+//     then looks again, because the rate may have fallen meanwhile.
+//   - Rates are rounded to 8 decimals as `toFixed(8)` rounds them: from the
+//     exact binary value, halves up (`precise`).
+//
+// Times are seconds as f64 inside, read from a nanosecond clock; the default
+// clock is monotonic, so a wall clock stepping backwards cannot make the bucket
+// lose tokens. The SDK reads the wall clock, which differs only by that step.
+
+import { Mutex } from "std/sync"
+import { Mono, Second, monotonic, sleep } from "std/time"
+import { ceil, floor, pow, round } from "std/math"
+
+// `DefaultRateLimiter` constructor defaults.
+const defaultBeta: f64 = 0.7
+const defaultMinCapacity: f64 = 1.0
+const defaultMinFillRate: f64 = 0.5
+const defaultScaleConstant: f64 = 0.4
+const defaultSmooth: f64 = 0.8
+
+// 10^8, the grid `getPrecise` rounds to, and 2^52 and 2^53, where a double
+// stops having a fraction and then stops being able to hold every integer.
+const gridScale: f64 = 100000000.0
+const twoPow52: f64 = 4503599627370496.0
+const twoPow53: f64 = 9007199254740992.0
+
+// 2^27 + 1, the Veltkamp splitter that cuts a double into two 26-bit halves.
+const splitter: f64 = 134217729.0
+
+// The longest a single sleep of a send token is; the wait is re-checked after.
+const maxSleep: int = 3600 * Second
+
+// The wait for `need` more tokens at `rate` tokens a second, in milliseconds.
+fn tokenDelayMs(need: f64, rate: f64): f64 {
+  return need / rate * 1000.0
+}
+
+// What `num.toFixed(8)` followed by `parseFloat` gives (`getPrecise`).
+// `toFixed` rounds the exact binary value, not its shortest text, and takes the
+// larger candidate on a tie; so `x * 1e8` is formed exactly as `hi + lo` (a
+// Dekker product, 1e8 being exact in 27 bits) and the integer nearest to it is
+// picked by that exact sum. A value past 2^53 grid steps is finer than the
+// doubles around it and is already its own answer.
+fn precise(x: f64): f64 {
+  if (x != x || x == 0.0) {
+    return x
+  }
+  if (x < 0.0) {
+    return -precise(-x)
+  }
+  let hi = x * gridScale
+  if (!(hi < twoPow53)) {
+    return x
+  }
+  let c = splitter * x
+  let xh = c - (c - x)
+  let xl = x - xh
+  let lo = xh * gridScale - hi + xl * gridScale
+  let n = round(hi)
+  let off = hi - n
+  if (off == -0.5 && lo < 0.0) {
+    n = n - 1.0
+  }
+  if (hi >= twoPow52 && lo >= 0.5) {
+    n = n + 1.0
+  }
+  return n / gridScale
+}
+
+fn limiterSeconds(ns: int): f64 {
+  return f64(ns) / f64(Second)
+}
+
+fn limiterMonotonicNs(): int {
+  let m: Mono = monotonic()
+  return m.ns
+}
+
+// A wait of `ms` milliseconds as the whole nanoseconds that cover it, so the
+// bucket has its token when the sleep ends.
+fn limiterWaitNs(ms: f64): int {
+  let ns = ceil(ms * f64(Second) / 1000.0)
+  if (ns < 1.0) {
+    return 1
+  }
+  if (ns > f64(maxSleep)) {
+    return maxSleep
+  }
+  return int(ns)
+}
+
+// The constants of the curve (`DefaultRateLimiterOptions`); the defaults are
+// the SDK's.
+//   beta           how far a throttle cuts the rate: to `beta` of it
+//   minCapacity    the least the bucket holds, in tokens
+//   minFillRate    the least the bucket refills at, tokens a second
+//   scaleConstant  steepness of the cubic climb
+//   smooth         weight of the newest half-second in the measured send rate
+export class RateLimiterOptions {
+  export beta: f64
+  export minCapacity: f64
+  export minFillRate: f64
+  export scaleConstant: f64
+  export smooth: f64
+
+  init(
+    beta: f64 = defaultBeta,
+    minCapacity: f64 = defaultMinCapacity,
+    minFillRate: f64 = defaultMinFillRate,
+    scaleConstant: f64 = defaultScaleConstant,
+    smooth: f64 = defaultSmooth,
+  ) {
+    this.beta = beta
+    this.minCapacity = minCapacity
+    this.minFillRate = minFillRate
+    this.scaleConstant = scaleConstant
+    this.smooth = smooth
+  }
+}
+
+// A refusal for a curve option that makes no sense, or "".
+fn curveOptionError(o: RateLimiterOptions): string {
+  if (!(o.beta > 0.0 && o.beta < 1.0)) {
+    return "beta must be between 0 and 1, got ${o.beta}"
+  }
+  if (!(o.smooth > 0.0 && o.smooth <= 1.0)) {
+    return "smooth must be above 0 and at most 1, got ${o.smooth}"
+  }
+  if (!(o.scaleConstant > 0.0 && o.scaleConstant < twoPow52)) {
+    return "scaleConstant must be above 0, got ${o.scaleConstant}"
+  }
+  return ""
+}
+
+// A refusal for a bucket option that makes no sense, or "".
+fn bucketOptionError(o: RateLimiterOptions): string {
+  if (!(o.minCapacity >= 1.0 && o.minCapacity < twoPow52)) {
+    return "minCapacity must be at least 1, got ${o.minCapacity}"
+  }
+  if (!(o.minFillRate > 0.0 && o.minFillRate < twoPow52)) {
+    return "minFillRate must be above 0, got ${o.minFillRate}"
+  }
+  return ""
+}
+
+// The client-side rate limiter of one `RetryStrategy`, shared by every call it
+// serves. Safe to share between tasks.
+//
+//   let limiter = RateLimiter()!
+//   limiter.getSendToken()                  // before an attempt; waits only once throttled
+//   limiter.updateClientSendingRate(true)   // an attempt came back throttled
+export class RateLimiter {
+  beta: f64
+  minCapacity: f64
+  minFillRate: f64
+  scaleConstant: f64
+  smooth: f64
+  // Unix or monotonic nanoseconds. Replaced in tests.
+  clock: () => int
+  // Parks the caller for this many nanoseconds. Replaced in tests.
+  sleeper: (int) => ()
+  mu: Mutex
+  // False until the first throttling answer.
+  enabled: bool
+  availableTokens: f64
+  // The rate at the last throttle, tokens a second.
+  lastMaxRate: f64
+  // Smoothed requests a second.
+  measuredTxRate: f64
+  requestCount: f64
+  fillRate: f64
+  // Seconds.
+  lastThrottleTime: f64
+  // Seconds of the last refill; 0 means never.
+  lastTimestamp: f64
+  lastTxRateBucket: f64
+  maxCapacity: f64
+  timeWindow: f64
+
+  // Fails on an option that would make the curve divide by zero or a send wait
+  // forever: `beta` outside (0, 1), `smooth` outside (0, 1], `minCapacity`
+  // below 1 (a bucket that can never hold one token), `minFillRate` or
+  // `scaleConstant` not above 0. `clock` reads nanoseconds; it is monotonic by
+  // default.
+  init(options: RateLimiterOptions = RateLimiterOptions(), clock: () => int = limiterMonotonicNs)! {
+    let why = curveOptionError(options)
+    if (why == "") {
+      why = bucketOptionError(options)
+    }
+    if (why != "") {
+      fail newError("s3: rate limiter: ${why}")
+    }
+    this.beta = options.beta
+    this.minCapacity = options.minCapacity
+    this.minFillRate = options.minFillRate
+    this.scaleConstant = options.scaleConstant
+    this.smooth = options.smooth
+    this.clock = clock
+    this.sleeper = sleep
+    this.mu = Mutex()
+    this.enabled = false
+    this.availableTokens = 0.0
+    this.lastMaxRate = 0.0
+    this.measuredTxRate = 0.0
+    this.requestCount = 0.0
+    this.fillRate = options.minFillRate
+    this.maxCapacity = options.minCapacity
+    this.timeWindow = 0.0
+    this.lastTimestamp = 0.0
+    let t = limiterSeconds(clock())
+    this.lastThrottleTime = t
+    this.lastTxRateBucket = floor(t)
+  }
+
+  // True once a throttling answer has switched the limit on.
+  export active(): bool {
+    this.mu.lock()
+    let on = this.enabled
+    this.mu.unlock()
+    return on
+  }
+
+  // The current fill rate, tokens a second.
+  export rate(): f64 {
+    this.mu.lock()
+    let r = this.fillRate
+    this.mu.unlock()
+    return r
+  }
+
+  // Takes one send token, waiting for it when the bucket is empty. Returns at
+  // once until a throttling answer has been seen.
+  export getSendToken() {
+    while (true) {
+      let waitMs = this.tryTake(1.0)
+      if (waitMs == 0.0) {
+        return
+      }
+      this.sleeper(limiterWaitNs(waitMs))
+    }
+  }
+
+  // Takes `amount` tokens and answers 0, or answers how many milliseconds the
+  // bucket needs to hold them and takes none.
+  tryTake(amount: f64): f64 {
+    this.mu.lock()
+    let waitMs = this.take(limiterSeconds(this.clock()), amount)
+    this.mu.unlock()
+    return waitMs
+  }
+
+  take(t: f64, amount: f64): f64 {
+    if (!this.enabled) {
+      return 0.0
+    }
+    this.refill(t)
+    if (amount > this.availableTokens) {
+      return tokenDelayMs(amount - this.availableTokens, this.fillRate)
+    }
+    this.availableTokens = this.availableTokens - amount
+    return 0.0
+  }
+
+  // Tells the limiter how an attempt ended: `throttling` for a throttling
+  // answer, false for success or any other failure.
+  export updateClientSendingRate(throttling: bool) {
+    this.mu.lock()
+    let t = limiterSeconds(this.clock())
+    let calculated = this.calculate(t, throttling)
+    let capped = calculated
+    if (capped > 2.0 * this.measuredTxRate) {
+      capped = 2.0 * this.measuredTxRate
+    }
+    this.updateTokenBucketRate(t, capped)
+    this.mu.unlock()
+  }
+
+  // The rate the curve asks for after an attempt at second `t`, before the cap
+  // of twice the measured rate: the throttle drop or the cubic climb.
+  calculate(t: f64, throttling: bool): f64 {
+    this.updateMeasuredRate(t)
+    if (!throttling) {
+      this.calculateTimeWindow()
+      return this.cubicSuccess(t)
+    }
+    let rate = this.measuredTxRate
+    if (this.enabled && this.fillRate < rate) {
+      rate = this.fillRate
+    }
+    this.lastMaxRate = rate
+    this.calculateTimeWindow()
+    this.lastThrottleTime = t
+    let calculated = this.cubicThrottle(rate)
+    this.enabled = true
+    return calculated
+  }
+
+  // Adds the tokens earned since the last refill, up to the capacity. A clock
+  // that went backwards earns nothing.
+  refill(t: f64) {
+    if (this.lastTimestamp == 0.0) {
+      this.lastTimestamp = t
+      return
+    }
+    let earned = (t - this.lastTimestamp) * this.fillRate
+    if (earned < 0.0) {
+      earned = 0.0
+    }
+    let held = this.availableTokens + earned
+    if (held > this.maxCapacity) {
+      held = this.maxCapacity
+    }
+    this.availableTokens = held
+    this.lastTimestamp = t
+  }
+
+  calculateTimeWindow() {
+    this.timeWindow = precise(
+      pow(this.lastMaxRate * (1.0 - this.beta) / this.scaleConstant, 1.0 / 3.0),
+    )
+  }
+
+  cubicThrottle(rate: f64): f64 {
+    return precise(rate * this.beta)
+  }
+
+  cubicSuccess(t: f64): f64 {
+    return precise(this.scaleConstant * pow(t - this.lastThrottleTime - this.timeWindow, 3.0) + this.lastMaxRate)
+  }
+
+  // Sets the fill rate and, with it, the capacity: one second of fill.
+  updateTokenBucketRate(t: f64, newRate: f64) {
+    this.refill(t)
+    let fill = this.minFillRate
+    if (newRate > fill) {
+      fill = newRate
+    }
+    let room = this.minCapacity
+    if (newRate > room) {
+      room = newRate
+    }
+    this.fillRate = fill
+    this.maxCapacity = room
+    if (this.availableTokens > room) {
+      this.availableTokens = room
+    }
+  }
+
+  // Counts the attempt and, when a half-second bucket has closed, folds its
+  // request rate into the smoothed measured rate.
+  updateMeasuredRate(t: f64) {
+    let bucket = floor(t * 2.0) / 2.0
+    this.requestCount = this.requestCount + 1.0
+    if (bucket > this.lastTxRateBucket) {
+      let current = this.requestCount / (bucket - this.lastTxRateBucket)
+      this.measuredTxRate = precise(current * this.smooth + this.measuredTxRate * (1.0 - this.smooth))
+      this.requestCount = 0.0
+      this.lastTxRateBucket = bucket
+    }
+  }
+}
