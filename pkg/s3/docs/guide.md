@@ -305,6 +305,56 @@ the same error is retried. `strategy.tokens()` reads what is left in the quota;
 a strategy that sits at 0 for long is talking to a service that is down, and
 its callers see the first error at once instead of waiting on retries.
 
+### Slowing down before S3 has to say it again
+
+The quota stops a client that retries too much; it does not make the whole
+night's job send less. For that the strategy has a second mode,
+`RetryMode.Adaptive`, the SDK's adaptive mode: everything above, plus a
+client-side rate limiter. It stays out of the way until S3 has answered
+`SlowDown` once. From then on every attempt first waits for a send token, and
+every outcome moves the sending rate: a throttling answer cuts it to 70% of the
+rate the client was really sending, any other answer lets it climb back along
+a cubic curve, never above twice the measured rate.
+
+```bit
+import { RateLimiter, RateLimiterOptions, RetryMode, RetryStrategy } from "s3"
+
+fn gentleNightly(): RetryStrategy! {
+  let strategy = RetryStrategy(RetryMode.Adaptive, 5)?
+  strategy.limiter = RateLimiter(RateLimiterOptions(beta = 0.5, minFillRate = 1.0))?
+  return strategy
+}
+
+fn pacing(strategy: RetryStrategy): string {
+  let limiter: RateLimiter = strategy.limiter
+  if (!limiter.active()) {
+    return "S3 has not pushed back, nothing is paced"
+  }
+  return "sending at most ${limiter.rate()} requests a second"
+}
+
+fn sendOnce(strategy: RetryStrategy, throttled: bool) {
+  strategy.limiter.getSendToken()
+  strategy.limiter.updateClientSendingRate(throttled)
+}
+```
+
+The loop of the section above does not change: `strategy.begin()` waits for the
+call's first token, `call.decide(e, ...)` tells the limiter how the attempt
+failed before it answers, `call.pause(delay)` waits for a token and then the
+backoff, and `call.succeeded()` tells it the attempt worked. `sendOnce` shows
+the two limiter calls by themselves, for a client that paces something the
+strategy does not see. One limiter belongs to one strategy and is shared by
+every call it serves, so ten thousand uploads on a client slow down together.
+
+The curve is the SDK's, constant for constant: `beta` 0.7, `scaleConstant` 0.4,
+`smooth` 0.8 for the measured rate, a fill rate of at least `minFillRate` 0.5
+tokens a second and a bucket of at least `minCapacity` 1 token.
+`RateLimiterOptions` changes them, and `RateLimiter(...)` refuses a value that
+would make the curve divide by zero or a send wait forever (a `beta` outside
+0 to 1, a `minCapacity` below 1, a `minFillRate` or `scaleConstant` that is not
+above 0). A `Standard` strategy never reads its limiter.
+
 ## Sharp edges
 
 - `put`/`get` hold the whole object in memory and are bounded by `std/http`'s
