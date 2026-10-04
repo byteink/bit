@@ -18,12 +18,12 @@ cannot have in a test: CI has no business reaching `accounts.google.com`,
 and a real provider gives you no way to force an expired token or a wrong
 nonce on demand.
 
-The route above does not change for a test. `OidcStrategy` carries an
-optional `tokenFetch` field - `nil` means the real network call, the same
-way every constructor in this package defaults it - and `handleCallback`
-reads it off the strategy value instead of taking it as a parameter. Build
-`oidc` with a fake `tokenFetch` and a JWKS cache that already knows its
-keys, and the identical route code runs end to end against a provider you
+The route above does not change for a test. `OidcStrategy` carries a
+`tokenFetch` field, set through `OidcOptions` - `nil` means the real network
+call, the same way every constructor in this package defaults it - and
+`handleCallback` reads it off the strategy value instead of taking it as a
+parameter. Build `oidc` from `Provider.Endpoints` with a fake `tokenFetch`
+and a JWKS cache that already knows its keys, and the identical route code runs end to end against a provider you
 control, with zero network access.
 
 ## A fake provider, the same route
@@ -37,7 +37,7 @@ function: `beginAuthorization` and `handleCallback` are the two calls
 ```bit
 import { App, Config, MemoryStore } from "web"
 import {
-  JwksCache, JwksSource, OidcConfig, OidcSource, OidcStrategy, TokenFetch,
+  JwksCache, JwksSource, OidcConfig, OidcOptions, OidcStrategy, Provider, TokenFetch,
   beginAuthorization, handleCallback,
 } from "auth"
 import { Request } from "std/http"
@@ -85,11 +85,11 @@ fn buildFakeStrategy(box: TokenBox): OidcStrategy! {
   let jwks = parseJwks(jwksDoc)?
   let cache = JwksCache(config.jwksUri, tls, JwksSource.Parsed(jwks))?
   return OidcStrategy(
-    OidcSource.Given(config, cache),
+    Provider.Endpoints(config, cache),
     fakeClientId,
     "test-client-secret",
     "https://app.example.com/auth/google/callback",
-    tokenFetch = fakeTokenFetch(box),
+    OidcOptions{ tokenFetch = fakeTokenFetch(box) },
   )?
 }
 

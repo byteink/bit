@@ -10,15 +10,15 @@ same `/me` route - neither login method needs to know the other exists.
 The OIDC authorization-code flow is two requests, not one call:
 `beginAuthorization` redirects the browser to Google with a PKCE challenge,
 and `handleCallback` runs when Google redirects back, exchanging the code for
-an ID token and verifying it. Both take the `OidcStrategy` a provider preset
-builds and the request's `Ctx` - wire them straight onto two routes.
+an ID token and verifying it. Both take the `OidcStrategy` built for a
+`Provider` and the request's `Ctx` - wire them straight onto two routes.
 
 ```bit
 import { App, Config, MemoryStore, unauthorized } from "web"
 import {
-  Identity, Lookup, LookupResult, OidcStrategy, Strategy,
-  beginAuthorization, currentIdentity, googleStrategy, handleCallback,
-  PasswordStrategy, requireAuth, withScopes,
+  Identity, Lookup, LookupResult, OidcOptions, OidcStrategy, Provider, Strategy,
+  beginAuthorization, currentIdentity, handleCallback,
+  PasswordStrategy, requireAuth,
 } from "auth"
 import { TlsConfig } from "std/tls"
 import { fromPem } from "std/crypto"
@@ -39,13 +39,13 @@ fn users(username: string): LookupResult! {
 // guesses one; see `fromPem` in std/crypto.
 fn google(rootsPem: string): OidcStrategy! {
   let tls = TlsConfig(fromPem(rootsPem)?)
-  let s = googleStrategy(
+  return OidcStrategy(
+    Provider.Google,
     "your-client-id.apps.googleusercontent.com",
     "your-client-secret",
     "https://app.example.com/auth/google/callback",
-    tls,
+    OidcOptions{ tls = Option.Some(tls), scopes = ["openid", "email"] },
   )?
-  return withScopes(s, ["openid", "email"])?
 }
 
 fn build(rootsPem: string): App! {
@@ -83,18 +83,26 @@ through. Neither `beginAuthorization` nor `handleCallback` goes through
 
 ## Choosing scopes
 
-`googleStrategy` already requests `openid email profile`. `withScopes`
-replaces a strategy's scope list outright - useful when you want less, or a
-scope Google's preset does not request by default. It refuses any list
-missing `openid`, since every strategy this package builds is doing OpenID
-Connect, never bare OAuth2:
+`OidcOptions.scopes` left empty requests `openid email profile` from every
+provider. Set it to replace the list outright - useful when you want less,
+or a scope the default does not request, as the route registration above
+does with `["openid", "email"]`. The constructor refuses any list missing
+`openid`, since every strategy this package builds is doing OpenID Connect,
+never bare OAuth2:
 
 ```bit
-fn scopesMustIncludeOpenid(s: OidcStrategy): OidcStrategy {
-  return withScopes(s, ["profile"]) catch _ {
+fn scopesMustIncludeOpenid(tls: TlsConfig): bool {
+  OidcStrategy(
+    Provider.Google,
+    "your-client-id",
+    "your-client-secret",
+    "https://app.example.com/auth/google/callback",
+    OidcOptions{ tls = Option.Some(tls), scopes = ["profile"] },
+  ) catch _ {
     // fails: "openid" is required
-    return s
+    return true
   }
+  return false
 }
 ```
 

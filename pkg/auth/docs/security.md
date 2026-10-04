@@ -42,25 +42,32 @@ follows it - there is no path that stores an `Identity` without it.
 
 ## Microsoft Entra ID: single tenant only
 
-`microsoftStrategy` refuses the three multi-tenant aliases Microsoft
+`Provider.Microsoft(tenant)` refuses the three multi-tenant aliases Microsoft
 documents - `common`, `organizations`, `consumers` - before making any
 request. See [Other OIDC providers](providers.md) for why: `discover()`'s
 issuer check, which every strategy in this package relies on, cannot be
 satisfied by a document served under one of those aliases.
 
-## Scopes default to `openid`, and stay that way
+## Scopes always include `openid`
 
-`OidcStrategy`'s constructor requests `openid` alone unless you widen it.
-`withScopes(s, scopes)` replaces a strategy's scope list outright, and
+`OidcOptions.scopes` left empty requests `openid email profile`. A scope
+list you set replaces that outright, and `OidcStrategy`'s constructor
 refuses any list missing `openid` - every strategy this package builds is
 doing OpenID Connect, never bare OAuth2, so a scope list that drops the one
 scope that makes it OIDC is rejected rather than silently accepted:
 
 ```bit
-import { OidcStrategy, withScopes } from "auth"
+import { OidcOptions, OidcStrategy, Provider } from "auth"
+import { TlsConfig } from "std/tls"
 
-fn rejectsMissingOpenid(s: OidcStrategy): bool {
-  withScopes(s, ["email"]) catch _ {
+fn rejectsMissingOpenid(tls: TlsConfig): bool {
+  OidcStrategy(
+    Provider.Google,
+    "your-client-id",
+    "your-client-secret",
+    "https://app.example.com/auth/google/callback",
+    OidcOptions{ tls = Option.Some(tls), scopes = ["email"] },
+  ) catch _ {
     return true
   }
   return false
