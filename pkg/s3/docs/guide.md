@@ -207,7 +207,18 @@ throttling or transient failure is retried after a random wait, and a client
 that has already retried a lot stops retrying.
 
 ```bit
-import { Body, Invocation, RetryDecision, RetryErrorType, RetryMode, RetryStrategy, StopReason, classifyError, isReplayable, retryAfterHint } from "s3"
+import {
+  Body,
+  Invocation,
+  RetryDecision,
+  RetryErrorType,
+  RetryMode,
+  RetryStrategy,
+  StopReason,
+  classifyError,
+  isReplayable,
+  retryAfterHint,
+} from "s3"
 
 fn nightlyStrategy(): RetryStrategy! {
   return RetryStrategy(RetryMode.Standard, 5)?
@@ -223,7 +234,8 @@ fn uploadCover(strategy: RetryStrategy, body: Body, send: (Invocation) => Option
         outcome = "stored after ${call.attempt()} of ${strategy.maxAttempts} attempts (call ${call.id})"
       }
       Some(e) => {
-        match (call.decide(e, isReplayable(body))) {
+        let step: RetryDecision = call.decide(e, isReplayable(body))
+        match (step) {
           Retry(delay) => call.pause(delay)
           Stop(why) => outcome = "gave up (${describe(why)}): ${e.message()}"
         }
@@ -259,7 +271,7 @@ The rules `decide` follows:
 | attempts | `maxAttempts`, 3 by default, the first included; below 1 is refused when the strategy is built |
 | what is retried | throttling (`SlowDown`, `ThrottlingException`, status 429, ...) and transient (`InternalError`, `RequestTimeout`, 500, 502, 503 and 504, a refused connection or a timeout); not the other 5xx, not a client error, never a cancelled call |
 | the wait | a random time between 0 and `min(20 s, 100 ms * 2^n)` before retry `n`, counted from 0; 500 ms in place of 100 ms after throttling |
-| the server's hint | `retryAfterHint(headers, nowNs)` reads `Retry-After` and `x-amz-retry-after`; the wait is raised to the hint, but never more than 5 s above the random draw |
+| the server's hint | `retryAfterHint(headers, nowNs)` reads `Retry-After` (seconds or a date) and `x-amz-retry-after` (milliseconds) from a response's header block and gives the instant to come back; the wait is raised to the hint, but never more than 5 s above the random draw |
 | the quota | 500 tokens per strategy, shared by every call that uses it; a retry costs 5, 10 after a transient failure; a success gives back the cost of its last retry, or 1 if it needed none; at zero, errors are returned |
 | a body read once | `isReplayable(body)` is false for a `Stream`, and `decide` then never retries |
 
@@ -267,11 +279,21 @@ The rules `decide` follows:
 
 ```bit
 fn worthWaiting(e: S3Error): bool {
-  return match (classifyError(e)) {
+  let kind: RetryErrorType = classifyError(e)
+  return match (kind) {
     Throttling => true
     Transient => true
     Server => false
     Client => false
+  }
+}
+```
+
+```bit
+fn serverWaitMs(headers: string, nowNs: int): int {
+  return match (retryAfterHint(headers, nowNs)) {
+    Some(at) => (at - nowNs) / 1000000
+    None => 0
   }
 }
 ```
