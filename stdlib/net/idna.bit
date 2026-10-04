@@ -1,0 +1,556 @@
+// Bit standard library — net module: internationalized domain names (#6881).
+//
+// `idnaToAscii` and `idnaToUnicode` are UTS #46 section 4 processing with
+// Transitional_Processing=false (the browsers' and IDNA2008's choice: `ß`
+// stays `ß` and encodes as `xn--zca`), UseSTD3ASCIIRules, CheckHyphens,
+// CheckBidi and CheckJoiners on, and, for ToASCII, VerifyDnsLength on. The
+// tables are gen_idna.bit; normalization and Punycode are std/strings.
+//
+// A domain is first mapped code point by code point, normalized to NFC and
+// split at `.`. Each `xn--` label is Punycode-decoded, then every label has
+// to meet the section 4.1 validity criteria: NFC, the hyphen rules, no
+// leading combining mark, only valid or deviation code points (ASCII only as
+// a-z, 0-9 and `-`), RFC 5892 CONTEXTJ for U+200C and U+200D, and, when any
+// label of the domain is right-to-left, the RFC 5893 Bidi rule.
+//
+// A failure names the rule: `idna: label '<label>' <reason>`.
+//
+// The ASCII fast path: a domain of ASCII bytes with no `xn--` label needs no
+// mapping table, no normalization and no Punycode. It is checked in place
+// and, when it has no uppercase letter, returned as the very string passed
+// in, with no allocation.
+//
+// This file is built by the pinned stage0 compiler (std/net is imported by
+// the compiler), so it uses neither `string(rune)` nor `[]rune(s)`; bytes are
+// written through `Builder`, and runes come from `runes`.
+import {
+  split,
+  join,
+  runes,
+  hasPrefix,
+  normalize,
+  isNormalized,
+  punycodeEncode,
+  punycodeDecode,
+  Form,
+  Builder,
+} from "std/strings"
+
+const idnaMaxLabel: int = 63
+const idnaMaxDomain: int = 253
+const idnaZwnj: int = 0x200C
+const idnaZwj: int = 0x200D
+
+// RFC 5893 section 2 as sets of Bidi_Class codes, one bit per `bidi*` code.
+// Rule 2 (right-to-left label): R AL AN EN ES CS ET ON BN NSM.
+const idnaRtlAllowed: int = 0x23FE
+// Rule 3: a label ends with R AL EN AN, then any number of NSM.
+const idnaRtlEnds: int = 0x4E
+// Rule 5 (left-to-right label): L EN ES CS ET ON BN NSM.
+const idnaLtrAllowed: int = 0x23B9
+// Rule 6: a label ends with L or EN, then any number of NSM.
+const idnaLtrEnds: int = 0x9
+
+fn idnaErr(label: string, why: string): error {
+  return newError("idna: label '${label}' ${why}")
+}
+
+// "U+0041" for 0x41: at least four uppercase hex digits.
+fn idnaHexCp(cp: int): string {
+  let digits = "0123456789ABCDEF"
+  let out = ""
+  let n = cp
+  while (n > 0) {
+    out = digits[n % 16:n % 16 + 1] + out
+    n = n / 16
+  }
+  while (len(out) < 4) {
+    out = "0" + out
+  }
+  return "U+" + out
+}
+
+// Appends the UTF-8 encoding of the scalar value `c`.
+fn idnaPut(out: Builder, c: int) {
+  if (c < 0x80) {
+    out.writeByte(u8(c))
+    return
+  }
+  if (c < 0x800) {
+    out.writeByte(u8(0xC0 | (c >> 6)))
+    out.writeByte(u8(0x80 | (c & 0x3F)))
+    return
+  }
+  if (c < 0x10000) {
+    out.writeByte(u8(0xE0 | (c >> 12)))
+    out.writeByte(u8(0x80 | ((c >> 6) & 0x3F)))
+    out.writeByte(u8(0x80 | (c & 0x3F)))
+    return
+  }
+  out.writeByte(u8(0xF0 | (c >> 18)))
+  out.writeByte(u8(0x80 | ((c >> 12) & 0x3F)))
+  out.writeByte(u8(0x80 | ((c >> 6) & 0x3F)))
+  out.writeByte(u8(0x80 | (c & 0x3F)))
+}
+
+fn idnaIsUpper(c: u8): bool {
+  return c >= 'A' && c <= 'Z'
+}
+
+// Whether `c` is a lowercase letter, a digit or a hyphen: the only ASCII
+// UseSTD3ASCIIRules allows after mapping.
+fn idnaIsStd3(c: int): bool {
+  let letter = c >= int('a') && c <= int('z')
+  let digit = c >= int('0') && c <= int('9')
+  return letter || digit || c == int('-')
+}
+
+fn idnaAllAscii(s: string): bool {
+  let i = 0
+  while (i < len(s)) {
+    if (int(s[i]) >= 0x80) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// An empty label is only the root label: the last of two or more, and then
+// only where the caller does not verify DNS length (an empty label has no
+// valid length). `allowed` is that verdict.
+fn idnaEmptyLabel(allowed: bool): ()! {
+  if (!allowed) {
+    fail idnaErr("", "is empty")
+  }
+}
+
+// --- the ASCII fast path -----------------------------------------------------
+
+// Whether `s` is ASCII throughout and no label of it starts with `xn--` in
+// any case: a domain the fast path handles without a table.
+fn idnaIsPlain(s: string): bool {
+  let start = true
+  let i = 0
+  while (i < len(s)) {
+    let c = int(s[i])
+    if (c >= 0x80) {
+      return false
+    }
+    if (start && idnaXnAt(s, i)) {
+      return false
+    }
+    start = c == int('.')
+    i = i + 1
+  }
+  return true
+}
+
+fn idnaXnAt(s: string, i: int): bool {
+  if (i + 4 > len(s)) {
+    return false
+  }
+  let x = (int(s[i]) | 0x20) == int('x')
+  let n = (int(s[i + 1]) | 0x20) == int('n')
+  return x && n && s[i + 2] == '-' && s[i + 3] == '-'
+}
+
+// The hyphen rules and STD3 characters of the non-empty ASCII label
+// `s[lo:hi]`.
+fn idnaAsciiLabel(s: string, lo: int, hi: int): ()! {
+  if (s[lo] == '-' || s[hi - 1] == '-') {
+    fail idnaErr(s[lo:hi], "begins or ends with a hyphen")
+  }
+  if (hi - lo >= 4 && s[lo + 2] == '-' && s[lo + 3] == '-') {
+    fail idnaErr(s[lo:hi], "has hyphens in the third and fourth positions")
+  }
+  let i = lo
+  while (i < hi) {
+    let c = int(s[i])
+    if (!idnaIsStd3(c) && !idnaIsUpper(s[i])) {
+      fail idnaErr(
+        s[lo:hi],
+        "contains the ASCII character ${idnaHexCp(c)}, which UseSTD3ASCIIRules rejects",
+      )
+    }
+    i = i + 1
+  }
+}
+
+// The label ending at byte `hi` of `s` and starting at `lo`.
+fn idnaAsciiEnd(s: string, lo: int, hi: int, toAscii: bool): ()! {
+  if (hi == lo) {
+    idnaEmptyLabel(!toAscii && hi == len(s) && lo > 0)?
+    return
+  }
+  if (toAscii && hi - lo > idnaMaxLabel) {
+    fail idnaErr(s[lo:hi], "is longer than ${idnaMaxLabel} octets")
+  }
+  idnaAsciiLabel(s, lo, hi)?
+}
+
+// Checks `s`, an ASCII domain without an `xn--` label, in place.
+fn idnaCheckAscii(s: string, toAscii: bool): ()! {
+  if (toAscii && len(s) > idnaMaxDomain) {
+    fail newError("idna: domain is longer than ${idnaMaxDomain} octets")
+  }
+  let lo = 0
+  let i = 0
+  // Bounded by `len(s)`: `i` advances every iteration.
+  while (i <= len(s)) {
+    if (i == len(s) || s[i] == '.') {
+      idnaAsciiEnd(s, lo, i, toAscii)?
+      lo = i + 1
+    }
+    i = i + 1
+  }
+}
+
+// `s` with ASCII uppercase lowered; `s` itself, unallocated, when it has none.
+fn idnaLower(s: string): string {
+  let i = 0
+  while (i < len(s) && !idnaIsUpper(s[i])) {
+    i = i + 1
+  }
+  if (i == len(s)) {
+    return s
+  }
+  let b = Builder()
+  let j = 0
+  while (j < len(s)) {
+    if (idnaIsUpper(s[j])) {
+      b.writeByte(s[j] + 32)
+    } else {
+      b.writeByte(s[j])
+    }
+    j = j + 1
+  }
+  return b.toString()
+}
+
+// --- the general path: map, normalize, split, decode --------------------------
+
+// `domain` with every code point replaced as UTS #46 section 4 step 1 says:
+// ignored ones dropped, mapped ones replaced, the rest (valid, deviation and
+// disallowed) kept. A disallowed code point is reported by the label check,
+// which can name its label.
+fn idnaMap(domain: string): string {
+  let b = Builder()
+  for r of runes(domain) {
+    let st = idnaStatus(r)
+    if (st == idnaMapped) {
+      for m of idnaMapping(r) {
+        idnaPut(b, int(m))
+      }
+    } else if (st != idnaIgnored) {
+      idnaPut(b, int(r))
+    }
+  }
+  return b.toString()
+}
+
+// The Unicode form of one label: itself, or for an `xn--` label its Punycode
+// decoding, which must hold at least one non-ASCII code point.
+fn idnaDecode(label: string): string! {
+  if (!hasPrefix(label, "xn--")) {
+    return label
+  }
+  if (!idnaAllAscii(label)) {
+    fail idnaErr(label, "has non-ASCII characters after the xn-- prefix")
+  }
+  let u = punycodeDecode(label[4:len(label)]) catch e {
+    fail idnaErr(label, "is not valid Punycode (${e.message()})")
+  }
+  if (idnaAllAscii(u)) {
+    fail idnaErr(label, "is Punycode for an empty or all-ASCII label")
+  }
+  return u
+}
+
+// The Unicode labels of the mapped, NFC-normalized `parts`, empty ones kept
+// as "". Fails on a bad empty label and on undecodable Punycode.
+fn idnaDecodeAll(parts: []string, toAscii: bool): []string! {
+  let out = []string(0, len(parts))
+  let i = 0
+  while (i < len(parts)) {
+    if (len(parts[i]) == 0) {
+      idnaEmptyLabel(!toAscii && i == len(parts) - 1 && i > 0)?
+    }
+    out = append(out, idnaDecode(parts[i])?)
+    i = i + 1
+  }
+  return out
+}
+
+// --- validity criteria (UTS #46 section 4.1) ---------------------------------
+
+fn idnaCheckHyphens(label: string, rs: []rune): ()! {
+  let n = len(rs)
+  if (int(rs[0]) == int('-') || int(rs[n - 1]) == int('-')) {
+    fail idnaErr(label, "begins or ends with a hyphen")
+  }
+  if (n >= 4 && int(rs[2]) == int('-') && int(rs[3]) == int('-')) {
+    fail idnaErr(label, "has hyphens in the third and fourth positions")
+  }
+}
+
+// Every code point valid or deviation, and ASCII only as STD3 allows.
+fn idnaCheckCodePoints(label: string, rs: []rune): ()! {
+  for r of rs {
+    let c = int(r)
+    if (c < 0x80 && !idnaIsStd3(c)) {
+      fail idnaErr(
+        label,
+        "contains the ASCII character ${idnaHexCp(c)}, which UseSTD3ASCIIRules rejects",
+      )
+    }
+    let st = idnaStatus(r)
+    if (st != idnaValid && st != idnaDeviation) {
+      fail idnaErr(label, "contains ${idnaHexCp(c)}, which IDNA does not allow")
+    }
+  }
+}
+
+// RFC 5892 A.1, left half: a Joining_Type L or D, then any number of T.
+fn idnaJoinsLeft(rs: []rune, i: int): bool {
+  let j = i - 1
+  while (j >= 0 && joiningType(rs[j]) == joinT) {
+    j = j - 1
+  }
+  if (j < 0) {
+    return false
+  }
+  let t = joiningType(rs[j])
+  return t == joinL || t == joinD
+}
+
+// RFC 5892 A.1, right half: any number of T, then a Joining_Type R or D.
+fn idnaJoinsRight(rs: []rune, i: int): bool {
+  let j = i + 1
+  while (j < len(rs) && joiningType(rs[j]) == joinT) {
+    j = j + 1
+  }
+  if (j >= len(rs)) {
+    return false
+  }
+  let t = joiningType(rs[j])
+  return t == joinR || t == joinD
+}
+
+// RFC 5892 appendix A.1 and A.2: U+200C follows a virama or sits between
+// joining letters; U+200D follows a virama.
+fn idnaJoinerOk(rs: []rune, i: int): bool {
+  if (i > 0 && isVirama(rs[i - 1])) {
+    return true
+  }
+  if (int(rs[i]) == idnaZwj) {
+    return false
+  }
+  return idnaJoinsLeft(rs, i) && idnaJoinsRight(rs, i)
+}
+
+fn idnaCheckJoiners(label: string, rs: []rune): ()! {
+  let i = 0
+  while (i < len(rs)) {
+    let c = int(rs[i])
+    if ((c == idnaZwnj || c == idnaZwj) && !idnaJoinerOk(rs, i)) {
+      fail idnaErr(
+        label,
+        "has ${idnaHexCp(c)} where the CONTEXTJ rule (RFC 5892 appendix A) does not allow it",
+      )
+    }
+    i = i + 1
+  }
+}
+
+fn idnaClassIn(mask: int, c: int): bool {
+  return ((mask >> c) & 1) == 1
+}
+
+// Whether `rs` has a right-to-left code point (Bidi_Class R, AL or AN): the
+// label is then an RTL label.
+fn idnaHasRtl(rs: []rune): bool {
+  for r of rs {
+    let c = bidiClass(r)
+    if (c == bidiR || c == bidiAL || c == bidiAN) {
+      return true
+    }
+  }
+  return false
+}
+
+fn idnaBidiErr(label: string, rule: int, what: string): error {
+  return idnaErr(label, "violates the Bidi rule (RFC 5893 section 2, condition ${rule}): ${what}")
+}
+
+// Conditions 2 and 5: every code point is of an allowed Bidi_Class.
+fn idnaBidiAllowed(label: string, rs: []rune, allowed: int, rule: int): ()! {
+  for r of rs {
+    let c = bidiClass(r)
+    if (!idnaClassIn(allowed, c)) {
+      fail idnaBidiErr(label, rule, "it has a code point of Bidi_Class ${c} here")
+    }
+  }
+}
+
+// Conditions 3 and 6: the last code point that is not NSM is of a Bidi_Class
+// in `ends`.
+fn idnaBidiEnd(label: string, rs: []rune, ends: int, rule: int): ()! {
+  let j = len(rs) - 1
+  while (j > 0 && bidiClass(rs[j]) == bidiNSM) {
+    j = j - 1
+  }
+  if (!idnaClassIn(ends, bidiClass(rs[j]))) {
+    fail idnaBidiErr(label, rule, "it must end with a strong or number character, then any marks")
+  }
+}
+
+// Condition 4: a right-to-left label has European or Arabic-Indic digits,
+// never both.
+fn idnaBidiDigits(label: string, rs: []rune): ()! {
+  let en = false
+  let an = false
+  for r of rs {
+    let c = bidiClass(r)
+    en = en || c == bidiEN
+    an = an || c == bidiAN
+  }
+  if (en && an) {
+    fail idnaBidiErr(label, 4, "it mixes European and Arabic-Indic digits")
+  }
+}
+
+// RFC 5893 conditions 2 to 4 (`rtl`) or 5 and 6 (left-to-right).
+fn idnaBidiBody(label: string, rs: []rune, rtl: bool): ()! {
+  if (rtl) {
+    idnaBidiAllowed(label, rs, idnaRtlAllowed, 2)?
+    idnaBidiEnd(label, rs, idnaRtlEnds, 3)?
+    idnaBidiDigits(label, rs)?
+    return
+  }
+  idnaBidiAllowed(label, rs, idnaLtrAllowed, 5)?
+  idnaBidiEnd(label, rs, idnaLtrEnds, 6)?
+}
+
+// RFC 5893 condition 1 picks the direction, the rest is `idnaBidiBody`.
+fn idnaCheckBidi(label: string, rs: []rune): ()! {
+  let first = bidiClass(rs[0])
+  if (first == bidiL) {
+    idnaBidiBody(label, rs, false)?
+    return
+  }
+  if (first == bidiR || first == bidiAL) {
+    idnaBidiBody(label, rs, true)?
+    return
+  }
+  fail idnaBidiErr(
+    label,
+    1,
+    "it must start with a letter of a left-to-right or right-to-left script",
+  )
+}
+
+// UTS #46 section 4.1 for the non-empty label `label`. `decoded` is true for
+// a label that came out of Punycode, which has not been normalized yet.
+fn idnaCheckLabel(label: string, decoded: bool, bidi: bool): ()! {
+  if (decoded && !isNormalized(label, Form.Nfc)) {
+    fail idnaErr(label, "is not in Unicode normalization form NFC")
+  }
+  let rs = runes(label)
+  idnaCheckHyphens(label, rs)?
+  if (isMark(rs[0])) {
+    fail idnaErr(label, "begins with a combining mark")
+  }
+  idnaCheckCodePoints(label, rs)?
+  idnaCheckJoiners(label, rs)?
+  if (bidi) {
+    idnaCheckBidi(label, rs)?
+  }
+}
+
+fn idnaIsBidiDomain(labels: []string): bool {
+  for l of labels {
+    if (idnaHasRtl(runes(l))) {
+      return true
+    }
+  }
+  return false
+}
+
+// Validates every non-empty label; `parts` are the labels before decoding.
+fn idnaCheckAll(parts: []string, labels: []string): ()! {
+  let bidi = idnaIsBidiDomain(labels)
+  let i = 0
+  while (i < len(labels)) {
+    if (len(labels[i]) > 0) {
+      idnaCheckLabel(labels[i], hasPrefix(parts[i], "xn--"), bidi)?
+    }
+    i = i + 1
+  }
+}
+
+// UTS #46 section 4 processing: the validated Unicode labels of `domain`.
+fn idnaLabels(domain: string, toAscii: bool): []string! {
+  let mapped = normalize(idnaMap(domain), Form.Nfc)
+  let parts = split(mapped, ".")
+  let labels = idnaDecodeAll(parts, toAscii)?
+  idnaCheckAll(parts, labels)?
+  return labels
+}
+
+// --- ToASCII and ToUnicode ---------------------------------------------------
+
+// The A-label of `label`: itself when ASCII, else `xn--` and its Punycode.
+// Verifies the DNS label length.
+fn idnaALabel(label: string): string! {
+  let a = label
+  if (!idnaAllAscii(label)) {
+    let p = punycodeEncode(label) catch e {
+      fail idnaErr(label, "cannot be encoded as Punycode (${e.message()})")
+    }
+    a = "xn--" + p
+  }
+  if (len(a) > idnaMaxLabel) {
+    fail idnaErr(a, "is longer than ${idnaMaxLabel} octets")
+  }
+  return a
+}
+
+// Joins the A-labels of `labels` and verifies the DNS length of the domain.
+fn idnaJoinAscii(labels: []string): string! {
+  let out = []string(0, len(labels))
+  for l of labels {
+    out = append(out, idnaALabel(l)?)
+  }
+  let s = join(out, ".")
+  if (len(s) > idnaMaxDomain) {
+    fail newError("idna: domain is longer than ${idnaMaxDomain} octets")
+  }
+  return s
+}
+
+// `domain` as the ASCII domain a resolver or a certificate carries (UTS #46
+// section 4.2, non-transitional, VerifyDnsLength): `"Bücher.Example"` is
+// `"xn--bcher-kva.example"`. Fails, naming the rule, for a domain that does
+// not pass the validity criteria or the DNS lengths (a label of 1 to 63
+// octets, a domain of at most 253): a trailing root dot is an empty label and
+// fails too.
+export fn idnaToAscii(domain: string): string! {
+  if (idnaIsPlain(domain)) {
+    idnaCheckAscii(domain, true)?
+    return idnaLower(domain)
+  }
+  return idnaJoinAscii(idnaLabels(domain, true)?)?
+}
+
+// `domain` as the Unicode domain a person reads (UTS #46 section 4.3,
+// non-transitional): `"xn--bcher-kva.Example"` is `"bücher.example"`. Every
+// `xn--` label is decoded and validated; a trailing root dot is kept and no
+// DNS length is verified. Fails, naming the rule, as `idnaToAscii` does.
+export fn idnaToUnicode(domain: string): string! {
+  if (idnaIsPlain(domain)) {
+    idnaCheckAscii(domain, false)?
+    return idnaLower(domain)
+  }
+  return join(idnaLabels(domain, false)?, ".")
+}

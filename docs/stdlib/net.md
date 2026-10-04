@@ -408,3 +408,73 @@ fn storageUrl(host: string, bucket: string): string {
   return "https://${bucket}.${host}"
 }
 ```
+
+## International domain names
+
+A mail address or a URL may carry a host a person typed in their own script:
+`Bücher.Example`, `例子.广告`. DNS, SMTP and a TLS certificate carry only ASCII,
+so the host has to become the A-label form (`xn--bcher-kva.example`) before it
+goes on the wire, and an A-label has to become readable again before it goes on
+screen. `idnaToAscii` and `idnaToUnicode` do both, the way browsers do
+(UTS #46, non-transitional processing, which is what IDNA2008 also gives).
+
+### `idnaToAscii(domain: string): string!`
+
+The ASCII form of `domain`, ready for a resolver, a `Host` header or a
+certificate name match. Each label is mapped (case folded, full-width forms
+narrowed, ignorable code points dropped), normalized to NFC, validated and,
+when it is not ASCII, encoded as `xn--` plus Punycode. `ß` stays `ß`
+(`faß.de` is `xn--fa-hia.de`), the one place this differs from the older IDNA2003
+processing, which wrote `fass.de`.
+
+An ASCII domain that is already lowercase comes back as the very string passed
+in, after one pass over its bytes, with no allocation. `Bücher.Example` goes
+through the tables and takes a few microseconds.
+
+The checks are the ones that keep a hostile name from passing for another: a
+label may not begin or end with `-` or have `-` in its third and fourth
+positions, may not begin with a combining mark, may use only the code points
+IDNA allows (ASCII only as `a-z`, `0-9` and `-`), must follow the CONTEXTJ rule
+for U+200C and U+200D, and, when any label of the domain is written right to
+left, must follow the Bidi rule of RFC 5893. Then the DNS lengths: every label 1
+to 63 octets and the domain at most 253.
+
+A failure names the label and the rule, never a generic message:
+
+```text
+idna: label 'a b' contains the ASCII character U+0020, which UseSTD3ASCIIRules rejects
+idna: label '-a' begins or ends with a hyphen
+idna: label 'xn--abc-' is Punycode for an empty or all-ASCII label
+```
+
+A trailing root dot is an empty label and is an error here, because an empty
+label has no valid DNS length; strip it first. `idnaToUnicode` keeps it.
+
+### `idnaToUnicode(domain: string): string!`
+
+The Unicode form of `domain`: every `xn--` label decoded and validated by the
+same rules, the rest mapped and normalized. No DNS length is verified, so a
+long or root-dotted name still reads back. Use it to show a host to a person,
+never to compare two hosts: compare the `idnaToAscii` forms.
+
+```bit
+import { idnaToAscii, idnaToUnicode } from "std/net"
+
+// The host a certificate or a resolver sees, from what the user typed.
+fn wireHost(typed: string): string {
+  return idnaToAscii(typed) catch e {
+    print("not a valid host: ${e.message()}\n")
+    ""
+  }
+}
+
+fn main() {
+  print(wireHost("Bücher.Example") + "\n")
+  let shown = idnaToUnicode("xn--bcher-kva.example") catch ""
+  print(shown + "\n")
+}
+```
+
+Prints `xn--bcher-kva.example` and `bücher.example`. The functions are checked
+against every line of Unicode's `IdnaTestV2.txt` for 17.0.0 (the 6391 cases for
+`toUnicode` and `toAsciiN`).
