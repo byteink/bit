@@ -90,6 +90,14 @@ The inverse of `ecdsaSigToRaw`. Fails on any length other than 64 bytes.
 Sign `payload` as a compact JWS (`header.payload.signature`, base64url). The
 header is always `{"alg":"<key's own algorithm>","typ":"JWT"}`.
 
+### `signTyped(key: SigningKey, typ: string, kid: string, payload: Json): string!`
+
+`sign` with the header's `typ` and `kid` chosen by the caller: the header is
+`{"alg":"<key's own algorithm>","typ":"<typ>","kid":"<kid>"}`. An access token
+(RFC 9068 section 2.1) is `typ` `at+jwt`, and a rotating issuer names its key by
+`kid` so a verifier can pick the right one. A `kid` of `""` leaves the member
+out; an empty `typ` fails.
+
 ### `verify(token: string, key: VerifyKey): Json!`
 
 Verify `token`'s signature under `key` and return its payload. Rejects a
