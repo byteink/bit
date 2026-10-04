@@ -217,6 +217,18 @@ bb0(%0: fn(Rows) i64!error, %1: Rows):
   expect "6847 counters on a string literal line" 'x = const_string "m15$read"' 'x = const_string "m14$read"' ir ""
   expect "6847 is not a types signature" "$cnt_oracle" "$cnt_tree" types ""
 
+  # The #6730 identity on top of the counter renaming, with a box whose ptrs
+  # list names an offset: the 6982/7058 walks rewrite those in place and must
+  # put them back before this one runs (#7074).
+  comb_oracle="${call_oracle/@next/@m15\$next}"
+  comb_tree="${call_tree/@next/@m14\$next}"
+  comb_tree="${comb_tree/ptrs=\[\]/ptrs=[%8]}"
+  if [ "$comb_tree" = "$call_tree" ] || [ "$comb_oracle" = "$call_oracle" ]; then echo "FAIL: 6847 combined: the mutation did not apply"; fail=1; fi
+  for kind in ir iropt; do
+    expect "6847 counters with fallible enum words, box with a ptrs offset ($kind)" "$comb_oracle" "$comb_tree" "$kind" 6847-test-module-counters-with-fallible-enum-words
+    refuse "6847 combined, box stores the call twice ($kind)" "$comb_oracle" "$comb_tree" "${comb_tree/field_set %3\[8\] = %2/field_set %3[8] = %1}" "$kind"
+  done
+
   # --- 6840-bce-window-guard: a bounds check dropped (post-opt only) ---
   bce_oracle='func f(%0: []u8, %1: i64) void {
 bb0(%0: []u8, %1: i64):

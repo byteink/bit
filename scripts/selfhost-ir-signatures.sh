@@ -579,9 +579,10 @@ explainMismatch() {
       if (kind == "iropt" && bceWindow()) {
         print "6840-bce-window-guard"; exit 0
       }
-      ptrsLit()
+      ptrsLit("%", "#")
       if (nilWalk()) { print "6982-error-path-nil"; exit 0 }
       if (kind == "ir" && rangeWalk()) { print "7058-switch-case-range"; exit 0 }
+      ptrsLit("#", "%")
       moveTramp()
       canonK(linesA, nA, "A"); canonK(linesB, nB, "B")
       if (!shiftOk()) { exit 1 }

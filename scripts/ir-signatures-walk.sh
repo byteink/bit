@@ -16,17 +16,19 @@
 IR_WALK_AWK='
 # ptrsLit -- `ptrs=[%N, ..]` lists the byte offsets of a box pointer
 # fields, not values of the function: the numbers are never renumbered with the
-# ids, so the bijection must see them as text. Turns each `%` inside the
-# brackets into `#` on every line of both dumps.
-function ptrsLit(    k) {
-  for (k = 1; k <= nA; k++) { linesA[k] = ptrsText(linesA[k]) }
-  for (k = 1; k <= nB; k++) { linesB[k] = ptrsText(linesB[k]) }
+# ids, so the bijection must see them as text. ptrsLit("%", "#") turns each `%`
+# inside the brackets into `#` on every line of both dumps for the walks below;
+# ptrsLit("#", "%") puts them back, so the other signatures see the dumps as
+# they were.
+function ptrsLit(from, to,    k) {
+  for (k = 1; k <= nA; k++) { linesA[k] = ptrsText(linesA[k], from, to) }
+  for (k = 1; k <= nB; k++) { linesB[k] = ptrsText(linesB[k], from, to) }
 }
-function ptrsText(s,    a, t, b, inner) {
+function ptrsText(s, from, to,    a, t, b, inner) {
   a = index(s, "ptrs=[")
   if (a == 0) { return s }
   t = substr(s, a + 6); b = index(t, "]"); inner = substr(t, 1, b - 1)
-  gsub(/%/, "#", inner)
+  gsub(from, to, inner)
   return substr(s, 1, a + 5) inner substr(t, b)
 }
 # zeroAt -- oracle id v is a `const_int i64 0` defined in this function.
