@@ -3443,18 +3443,48 @@ empty `[]` against a non-slice type gets (§15.2).
 A bare `{ k: v, ... }` entry list whose expected type is `Where<T>` (std/where,
 a class `T`) is a **condition literal**, not a map. Each key is then a bare
 identifier naming a field of `T` (a name no scope binds is not an E0040 there),
-and each value is compared with that field for equality. Every key must be a
-field of `T`, else **E0301** naming `T`, the key and the nearest field name; a
-field of another module's class must be `export`ed (E0046, as for a read, §10.5).
-Every value must be assignable to its field's type, else **E0302** naming the
-field and both types: an `Option<X>` field also accepts an `X`, and `nil` is
-a value only for an `Option` field. `{}` is the empty condition. An operator
-object (`{ age: { gte: 18 } }`), an `and`, `or` or `not` key and a `related(...)`
-value are not covered yet and are **E0303**, never mis-checked. The expected
-type alone makes the literal a condition; with any other expected type, or none,
-the entry list is a map and an unbound key is the ordinary E0040. A condition
-literal is checked but not yet lowered: building a program that contains one is
-refused at lowering until it lowers to std/where's constructors.
+and the entries are all required. Every key must be a field of `T`, else
+**E0301** naming `T`, the key and the nearest field name; a field of another
+module's class must be `export`ed (E0046, as for a read, §10.5). A plain value
+is compared with the field for equality and must be assignable to its field's
+type, else **E0302** naming the field and both types: an `Option<X>` field
+also accepts an `X`, and `nil` is a value only for an `Option` field. `{}` is
+the empty condition.
+
+A field's value may instead be an **operator object**, `{ age: { gte: 18, lt:
+65 } }`, whose keys are operators and whose entries are ANDed. The operators
+are `eq`, `ne`, `in`, `lt`, `lte`, `gt` and `gte` (no `$`: a key is a field or
+an operator by position, and the set is closed; `in` is accepted as a key
+here although it is a keyword). Each operand is assignable to the field's type
+(an `Option<X>` field also takes an `X`), and the operand of `in` is a list of
+that type, which may be empty and then matches nothing. `lt`, `lte`, `gt` and
+`gte` need an ordered field, one of integer, float and `decimal` types,
+`string`, and the std/time types `Timestamp`, `Date`, `Time`, `DateTime` and
+`NaiveDateTime`, or an `Option` of one; on `bool`, an enum, `Option<bool>`, a
+byte slice or a class they are **E0302** naming the operator and the type, and
+`nil` is never an ordering operand. A name that is not one of the seven is
+**E0301** listing them. A field of map type takes a `{...}` as an ordinary
+value, not an operator object.
+
+The keys `and`, `or` and `not` combine conditions: `and` and `or` take a list
+of conditions, `not` one, and each operand is a `Where<T>` of the same `T`,
+a literal checked by these same rules or an existing value, nested to any
+depth. A field of `T` with one of these names wins as a top-level key (its value
+is then judged as a plain value, E0302), and the combinator is spelled with
+std/where's constructors; the error says so.
+
+A field's value may be `related("editor")`, a call to the function `related`
+with one string literal. It tests a relationship, so the field must be a
+relation or foreign-key field: class-typed (or an `Option` of a class), carrying
+`@belongsTo`, `@hasOne`, `@hasMany` or `@manyToMany`, the foreign key a
+`@belongsTo` names, or `id`; any other field is **E0302**. Only the call's form
+is judged here, and a `related` whose argument is not one string literal is
+**E0303**, as are a key that is not a name and an operator object with no
+operator. The expected type alone makes the literal a condition; with any
+other expected type, or none, the entry list is a map and an unbound key is
+the ordinary E0040. A condition literal is checked but not yet lowered:
+building a program that contains one is refused at lowering until it lowers to
+std/where's constructors.
 
 A bare element list is a slice literal **in every context, including where an
 array type is expected**. It is therefore ill-typed against an `[N]T`
