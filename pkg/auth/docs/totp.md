@@ -82,6 +82,95 @@ On failure - a bad code, or `parseSecret` failing on a corrupted stored
 value - the handler answers `unauthorized()` exactly like a wrong password
 does, and the session stays pending: the user can retry.
 
+## When the phone is lost: recovery codes
+
+An authenticator app lives on one phone. Lose it and the user is locked out
+of their own account, with a second factor nobody can reproduce. The usual
+answer is a short list of recovery codes, shown once at enrollment, each
+good for exactly one login in place of a TOTP code.
+
+`generateRecoveryCodes()` makes ten of them. `codes` is for the user - show
+it once, then forget it. `hashes` is for your database:
+
+```bit
+import { RecoverySet, generateRecoveryCodes } from "auth"
+
+class RecoveryState {
+  hashes: []string,
+}
+
+// Called when the user finishes enrolling: the codes go on screen, the
+// hashes go in the database.
+fn issueRecoveryCodes(): (RecoverySet, RecoveryState)! {
+  let set = generateRecoveryCodes()?
+  return (set, RecoveryState{ hashes = set.hashes })
+}
+```
+
+A code looks like `k3x9a-7qm2p`: two groups of five characters from an
+alphabet with no `i`, `l`, `o` or `u`. That is 50 random bits from the
+operating system's CSPRNG, far beyond what anyone can guess through a
+login form. The shape is a typed option rather than a second function:
+
+```bit
+import { RecoveryOptions, RecoverySet, generateRecoveryCodes } from "auth"
+
+// Eight longer codes: three groups of five is 75 bits each.
+fn longerCodes(): RecoverySet! {
+  return generateRecoveryCodes(RecoveryOptions{ count = 8, groups = 3, groupLen = 5 })?
+}
+```
+
+`count` is 1 to 32, and a code must carry at least 50 bits
+(`groups * groupLen * 5`); anything else fails with an error before a
+single code is made.
+
+## Using a recovery code at login
+
+The login form takes the code in the same box as a TOTP code. When
+`checkCode` fails, try `redeemRecoveryCode`. It ignores case, spaces and
+dashes, and reads `0`/`o` and `1`/`i`/`l` as the same character, so a code
+retyped from a printout still works. A match returns `remaining`, the
+stored list without the code that was just used - **persist it**, or the
+code works again:
+
+```bit
+import { RecoveryRedeem, redeemRecoveryCode } from "auth"
+
+class RecoveryRecord {
+  hashes: []string,
+}
+
+// Returns the record to save. Fails with one message whether the code was
+// wrong, already used, or not a code at all.
+fn useRecoveryCode(record: RecoveryRecord, typed: string): RecoveryRecord! {
+  let redeemed: RecoveryRedeem = redeemRecoveryCode(record.hashes, typed)?
+  return RecoveryRecord{ hashes = redeemed.remaining }
+}
+```
+
+If the user used a recovery code, they have probably lost their phone: send
+them to enroll a new authenticator (`generateSecret` again) right after.
+
+## Regenerating
+
+There is no "revoke" call. Run `generateRecoveryCodes()` again and store
+the new `hashes` over the old list. The old codes are checked against
+hashes you no longer keep, so all of them fail, used or not. Offer this
+button after a user spends most of their set, and always when they re-enroll.
+
+## How the codes are stored
+
+You store `hashes`, never `codes`. Each entry is a random 16-byte salt
+and the SHA-256 of the salt plus the code. A fast, salted hash is right
+here and a password hash would not help: a password hash exists to slow
+down guessing of secrets a person chose, and these are not chosen, they
+are 50 random bits with nothing to build a dictionary from. The salt makes
+every entry unique so a precomputed table is useless, and a code can be used
+only once, so what a thief who copies the database learns is worth nothing
+after the real user spends it. Comparison runs through `ctEq` over every
+stored entry, so timing does not say which entry was close.
+
 ## The low-level primitive: HOTP
 
 `totp`/`verify` are what a real enrollment uses. They are built on `hotp`,
@@ -130,6 +219,9 @@ not for a user's phone.
 - **A code is exactly 6 (or your chosen `digits`) ASCII digits.** `verify`
   compares byte for byte in constant time; a submission with leading or
   trailing whitespace never matches - trim it before calling `verify`.
+- **Persist `remaining` after every redemption.** `redeemRecoveryCode` is
+  a pure function: it holds no state, so a recovery code is single use only
+  as long as you save the shorter list.
 - **Clock skew is a security/usability tradeoff.** `skew = 1` (one step
   either side, 30 seconds) covers ordinary drift; a much larger skew widens
   the window an intercepted code stays valid in.

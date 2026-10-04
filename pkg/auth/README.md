@@ -104,6 +104,10 @@ protected route that is not itself doing the authenticating just reads
   (RFC 6238) two-factor codes: enrollment, the `otpauth://` QR-code URI, and
   verifying a submitted code with a skew window and caller-owned replay
   protection.
+- `generateRecoveryCodes`, `RecoveryOptions`, `RecoverySet`,
+  `redeemRecoveryCode`, `RecoveryRedeem` - single-use recovery codes for a
+  lost authenticator: generated from the CSPRNG, stored salted and hashed,
+  redeemed once, and replaced wholesale by regenerating.
 
 Every one of these is used in a full example in [`docs/`](docs/README.md),
 along with the security properties this package enforces (PKCE, constant-time
