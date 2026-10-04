@@ -280,13 +280,13 @@ explode (§1.2.1's eligibility, `explodedWordTypes`) and the word list must fit
 the return-register budget (`retWordsFitRegisters`; a return word past the
 fifth int or sixth float word has no path).
 
-**A fallible result** `T!E` is decided on its ok type alone (#5874): the
-error rides §13's per-task slot and never a return register. An ok type that
-is a tuple of words (`tupleWordTypes`) returns in words under the rules here,
-and every err-path `ret` carries one zero constant per word
-(`fallibleZeroArgs`, `compiler/lowerfail.bit`), which no caller reads (§13).
-A `string`, `decimal` or enum ok type keeps one handle, and so does every
-method whose name an interface declares with a fallible result.
+**A fallible result** `T!E` is decided on its ok type and one more int word
+(#6693): the error is the LAST return word (§13), so a fallible ok type gets at
+most 4 int words. A tuple-of-words ok type (`tupleWordTypes`) returns in words
+followed by the error word; every err-path `ret` carries one zero constant per
+ok word (`fallibleZeroArgs`, `compiler/lowerfail.bit`) before the error. A
+`string`, `decimal` or enum ok type keeps one handle, as does every method an
+interface declares fallible. `x86_64-windows` and `BIT_ERR_REG=0` use §13's slot.
 
 **A method reached only by a direct `call`** returns its result in words when
 `methodRetExplodes` (`compiler/lowerexplodemethod.bit`) admits it: the same
@@ -2957,9 +2957,9 @@ fourth rows are emitted as ordinary lowered IR instead, by `compiler/lowerentry.
 
 - the user's fallible `main` body is emitted under the private link name
   **`main$fallible`** (same shape it always had — a void or `T` result, with the
-  error travelling in the §7 error slot);
-- a synthesized `main`, result `i64`, calls it, reads the slot with
-  `bit_rt_get_err`, and branches. The `i64` result is also what stops the
+  error travelling as the last return word, §13);
+- a synthesized `main`, result `i64`, calls it, tests that error word (on
+  `x86_64-windows` it reads the slot with `bit_rt_get_err`), and branches. The `i64` result is also what stops the
   trampoline zeroing the return register: its void-`main` test reads the IR
   function's result type.
 
@@ -2967,8 +2967,7 @@ The err arm writes **`error: <msg>\n`** to fd 2 through `bit_rt_eprint`, as one
 concatenated write. SPEC §17.4 fixes fd 2 and exit 1 but not the wording; the
 prefix matches the runtime's own `panic: <msg>\n` (§12), which is the only other
 line a running Bit program puts on fd 2, and keeps a failed `main` from reading
-as the program's own logging. No new runtime symbol: `bit_rt_get_err`,
-`bit_rt_string_concat` and `bit_rt_eprint` all already exist.
+as the program's own logging. No new runtime symbol: `bit_rt_string_concat` and `bit_rt_eprint` all already exist.
 
 The ok arm returns the declared `int` as the exit code for `main(): int!`
 (§17.4's fourth signature), widened to `i64` first, and `0` for `main(): ()!`.
@@ -2994,7 +2993,8 @@ call to `bit$startup`, and so is the first statement of the `bit test` dispatch
 first green task, after `boot` has brought up the scheduler and the collector, so
 an initializer may allocate, spawn and block.
 
-The driver reads the §7 error slot after each init function. A pending error
+The driver tests each init function's error word (§13; the §7 error slot on
+`x86_64-windows`) after the call. A pending error
 writes one line to fd 2 through `bit_rt_eprint` and ends the process through
 `bit_rt_os_exit`:
 
@@ -3316,10 +3316,49 @@ have the mapping compiled into it.
 
 ## 13. Fallible results — the error channel (SPEC.md §18)
 
-A fallible function (`T!`) returns its **ok value** in the normal return
-register (`rax` / `x0`, or `xmm0` / `d0` for a float ok), or in the return
-words of §1.2.2 for a tuple ok type, exactly like a non-fallible one. The **error** rides a separate side channel: a per-task
-scratch slot, accessed through two symbols.
+A fallible function (`T!`) returns its **ok value** exactly like a non-fallible
+one — in `rax` / `x0` (or `xmm0` / `d0` for a float ok), or in the return words
+of §1.2.2 for a tuple ok type — and its **error as one more return word**: the
+next integer return register after the ok's integer words (#6562, on by default
+since #6693).
+
+| target             | ok words (int)        | error word, one-word ok | error word, `()!` or `f64!` |
+|--------------------|-----------------------|-------------------------|-----------------------------|
+| `aarch64-macos`    | `x0`, `x1`, `x2`, ... | `x1`                    | `x0`                        |
+| `aarch64-linux`    | `x0`, `x1`, `x2`, ... | `x1`                    | `x0`                        |
+| `x86_64-linux`     | `rax`, `rdx`, `rcx`, `rsi`, `rdi`, ... | `rdx`  | `rax`                       |
+| `x86_64-windows`   | none: the slot below  | (slot)                  | (slot)                      |
+
+The word is typed `error` (a GC object pointer), `nil` meaning ok, and the ok
+words plus the error word must fit the return registers (§1.2.2: at most 4 int
+ok words). It is decided from the declaration alone, like every return-word
+rule, so a callee's `ret` and every call site agree without seeing each other.
+
+The convention (a fallible callee's postcondition):
+
+- **ok return** — runs defers, then returns the ok words and a `nil` error word.
+- **`fail e`** — runs defers, then returns a zero word per ok word and `e` as the
+  error word (after defers, so a deferred call cannot clobber the error).
+- **`expr?`** — binds the call's words, then tests the error word; if non-nil,
+  propagate: run defers and return zero ok words and that same error word. If
+  nil, use the call's ok result.
+- **`catch`** — binds the call's words, then tests the error word; if non-nil
+  the error is handled, so evaluate the default / run the binding block; if nil,
+  use the ok result.
+
+**GC.** The error word is a pointer into the heap and has no root of its own. It
+lives in a register only between the callee's `ret` and the call's single
+binding move (`Op.CallWord`), and no safepoint sits in that window; from the
+binding on it is an SSA value, which the safepoint root maps already cover like
+any other. This is the same window argument the slot made, with nothing stored
+anywhere in between.
+
+### The slot (`x86_64-windows`, `BIT_ERR_REG=0`)
+
+`x86_64-windows` keeps the per-task slot until `multiWordRet` is on there
+(#5875), and so does code built by the pinned compiler until the repin that
+carries #6693; the compiler's `BIT_ERR_REG=0` selects it too. Nothing else
+reads or writes it. The slot is accessed through two symbols:
 
 ```
 bit_rt_set_err(e: ?*anyopaque)  -> void   // publish (or, with nil, clear)
@@ -3335,18 +3374,13 @@ M:N scheduler migrating a goroutine to a different worker between the write
 and the read. Per-task scratch does, because it travels with the task rather
 than being pinned to the worker (§22).
 
-The convention (a fallible callee's postcondition):
-
-- **ok return** — leaves the slot **null**. Codegen clears it after running
-  defers (`bit_rt_set_err(nil)`), so a deferred call can't leave a stale error.
-- **`fail e`** — runs defers, then `bit_rt_set_err(e)` (after defers, so a
-  deferred call cannot clobber the error), then returns a zero ok value.
-- **`expr?`** — after the call, `bit_rt_get_err()`; if non-null, propagate: run
-  defers, re-`set_err` the saved error (defers may have overwritten the slot),
-  and return a zero ok value. If null, use the call's ok result.
-- **`catch`** — after the call, `bit_rt_get_err()`; if non-null, `set_err(nil)`
-  (the error is handled) and evaluate the default / run the binding block; if
-  null, use the ok result.
+Under the slot the convention is: an ok return leaves it **null** (cleared after
+defers, so a deferred call can't leave a stale error); `fail e` runs defers,
+then `bit_rt_set_err(e)`, then returns a zero ok value; `expr?` calls
+`bit_rt_get_err()` after the call and, if non-null, runs defers, re-`set_err`s
+the saved error (defers may have overwritten the slot) and returns a zero ok
+value; `catch` calls `bit_rt_get_err()`, and if non-null `set_err(nil)`s (the
+error is handled) and takes the default / binding block.
 
 The slot is **read immediately after the call, before any yield or GC
 safepoint**: codegen emits `set_err`/`get_err` back to back and both are
@@ -3354,10 +3388,17 @@ safepoint**: codegen emits `set_err`/`get_err` back to back and both are
 its `?`/`catch` check. That adjacency is not what makes the slot
 migration-safe — per-task scratch already is, independent of it (above) —
 it is what makes the *unrooted* error pointer safe from a collection while it
-sits there. The error value is an `error`-interface object pointer (a GC
-object); because it is live in the slot only across that safepoint-free
-window, it needs no distinct root registration — the caller roots it the
-instant it reads it.
+sits there.
+
+**Measured (#6691, main 2784502ef, A = `BIT_ERR_REG=0`, B = `=1`, one compiler,
+Apple M5 Max).** Per `!` call on the ok path, the probe went 134.3 -> 53.2
+instructions and 19.2 -> 7.8 cycles per iteration on arm64, and 152 -> 66 static
+on x86-64. pkg/toml `bitbench loop`: fixture -10.9% and config -10.1% wall.
+bench json: Bit/C 3.53 -> 3.28. pkg/web plaintext at c=64: +1.7% req/s. The
+error-slot helpers (`set_err`, `get_err`, `port_sched_current_scratch`) went from
+7.47% of pkg/toml samples to 0. One cost: x86-64 `readScalar` spill/reload sites
+rose from 29 to 36 (arm64 unchanged), because the error word is one more value
+live across calls in a large function.
 
 ## 14. Filesystem primitives
 
