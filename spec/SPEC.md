@@ -4911,6 +4911,18 @@ enum Ticket {
   an enum with the right methods satisfies an interface exactly as a class
   does - a value of that enum type is then storable wherever the interface
   is expected, dispatched dynamically like any other interface value.
+- Every enum whose variants all carry no payload (a **C-like** enum, §14.6)
+  that is not generic and has at least one variant has two compiler-synthesized
+  members, so a program can turn a value into its variant name, and list the
+  names, with no reflection: an instance method `__variantName(): string`
+  returning the variant's identifier as written, and `static __variants():
+  []string` returning every variant name in declaration order. They are called
+  `v.__variantName()` and `E.__variants()`, and satisfy an interface
+  requirement of the same signature through a type parameter bound
+  (§10.4.1). An enum with any payload variant, a generic enum and an enum with
+  no variant have neither, so a call is the ordinary E0057. Declaring a member
+  named `__variantName` or `__variants` in an enum that would get them is
+  **E0189**, naming the enum and the member.
 - Enum values are consumed by `match` (§13.8), which is exhaustive over the
   variants and binds a variant's payload in its arm. Enums are not ordered.
   Equality is §14.6: a C-like enum compares by tag, a payload-carrying enum
