@@ -1059,7 +1059,7 @@ fn main() {
 ```
 class_decl  = [ attr_list ] "class" IDENT [ generic_params ] "{" [ member { ( ";" | "," ) member } [ ";" | "," ] ] "}" .
 member      = field | method_decl | static_method_decl .    (* method_decl, §10.4; static_method_decl, §10.4.1 *)
-field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
+field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .   (* a constant, or a composite, slice or map literal of constants - below *)
 ```
 
 - `struct` is not a keyword (§5.2): the compiler rejects it with `E0102`,
@@ -1087,7 +1087,7 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   its body runs - so `init` may leave a defaulted field alone. Defaults are
   therefore part of the type's zero value (§13.4), not a composite-literal
   convenience, and every construction of the type agrees on them.
-- For a field whose own type is not a class, the initializer is a
+- For a field whose own type is not a class, slice or map, the initializer is a
   **constant expression** (§15.4), folded at compile time. It may name a
   module-level `const` that folds, including an imported one (a `const` set at
   startup, §11.11, does not fold), and is evaluated in the
@@ -1116,6 +1116,19 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   payload-carrying enum field still cannot have a default: no value of that
   type is a constant expression or a composite literal, so it still has no
   zero value and still raises `E0083` when omitted (§13.4).
+- A field of **slice or map type** may carry a default written as a slice
+  literal `[a, b]`, a map literal `{k: v}` (including the empty `[]` and
+  `{}`), or the sized form `[]T(n)` (`[]T(0)` is the explicit empty spelling).
+  Every element, key and value in it must in turn be a compile-time constant
+  (§15.4) or a nested such literal; anything else - a call, a non-constant
+  name - is the same `E0064` as elsewhere. Like a class-typed default it is
+  **rebuilt fresh at every construction site** the field is omitted from:
+  two `C{}` values never share a backing store, so appending to or assigning
+  through one's field never shows in the other, and `C{}.headers["k"] =
+  "v"` writes a live map, not a `nil` one (§13.4). An empty slice default
+  costs nothing - it is the zero value of a slice (§13.4), no allocation and
+  no store; an empty map default allocates one map per construction, which a
+  `nil` map cannot stand in for because writing it panics (§18.4).
 - Defaults are class-only. `trait_field` (§10.7) carries none.
 - A field may carry **attributes**, written above it, one per line, before any
   `export` or `readonly`. **An attribute is sugar for a call to an ordinary
