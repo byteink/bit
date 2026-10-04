@@ -108,6 +108,74 @@ Numbers, `bool`, `string` and `rune` compare with `==`/`!=`; numbers and
 strings also order with `< <= > >=`. Slices and maps compare only against
 `nil`. A map key must be a comparable type.
 
+## Enum variant names {#enum-variant-names}
+
+Storing a `Status` in a database column, a config file or a JSON document
+means writing its variant as text, and reading it back means knowing which
+texts are valid. Bit has no reflection, so without help every enum would
+need its own hand-written `match` returning each name. Every enum whose
+variants all carry no payload gets two members from the compiler instead:
+
+```bit
+enum Status { Draft, Published, Archived }
+
+fn main() {
+  let s = Status.Published
+  println(s.__variantName())              // Published
+  println(Status.__variants().join(", ")) // Draft, Published, Archived
+}
+```
+
+`__variantName(): string` is an instance method that returns the variant's
+identifier exactly as written. `static __variants(): []string` lists every
+variant name in declaration order, and needs no value of the enum.
+
+A function generic over any such enum binds both through an interface, and
+reads the names off the type parameter:
+
+```bit
+interface Named {
+  static __variants(): []string,
+  __variantName(): string,
+}
+
+enum Status { Draft, Published, Archived }
+
+fn isValid<T: Named>(text: string): bool {
+  for name of T.__variants() {
+    if (name == text) {
+      return true
+    }
+  }
+  return false
+}
+
+fn label<T: Named>(v: T): string {
+  return "status=${v.__variantName()}"
+}
+
+fn main() {
+  println("${isValid<Status>("Draft")} ${isValid<Status>("Deleted")}")
+  println(label(Status.Archived))
+}
+```
+
+The names are the stored form, so reordering the enum's variants changes
+`__variants()` but never what `__variantName()` returns for a given
+variant.
+
+A few edges:
+
+- An enum with any payload variant (`Circle(f64)`), a generic enum and an
+  enum with no variants get neither member; calling one is the ordinary
+  "no field or method" error (E0057).
+- Declaring a member named `__variantName` or `__variants` in an enum that
+  would get them is **E0189**, naming the enum and the member. The names are
+  reserved so a hand-written one can never hide the synthesized one from a
+  generic bound.
+- `__variantName` is a comparison chain, linear in the number of variants.
+  Call `__variants()` once and keep the slice when you need it in a loop.
+
 ## Next
 
 A `map<string, string>` can only hold a title per id. [Classes](classes.md)

@@ -97,7 +97,7 @@ chain on a plain string could never give you.
 status to exactly three possibilities; `match` on `Status` is checked for
 every case at compile time. `store.bit`'s `parseStatus` (chapter 2) is the
 same idea in the other direction: a `switch` over a `string`, since Bit has
-no way to check a string against an enum's variants for you - which is
+no way to turn a string into an enum value for you - which is
 exactly why `Status` and not a bare `string` is what `Draft.status` holds.
 
 Next: [chapter 4, when things go wrong](04-when-things-go-wrong.md): what
