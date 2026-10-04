@@ -1,0 +1,386 @@
+// tools/gens3 — the expression half of the endpoint emitter (#6592, epic
+// #6565): turns the rule set's condition and result expressions into typed Bit
+// source that calls the functions of pkg/s3/endpointfns.bit directly.
+//
+// Every expression has a kind (`EpKind`), the Bit type its code has. A call is
+// checked against its signature while the code is written, so a rule set that
+// uses a function or an attribute the generator does not know stops the run
+// with the condition's number, never emits code that would not compile.
+//
+// A string parameter is an `Option<string>`; where a function wants a string
+// the code reads it with `orEmpty`. The decision diagram only reads such a
+// parameter on a path where an `isSet` condition already passed, and the
+// endpoint test vectors walk every one of those paths.
+
+import { Json } from "std/json"
+import { Builder, hasPrefix, parseInt } from "std/strings"
+
+enum EpKind {
+  Str,
+  Bool,
+  Int,
+  List,
+  Part,
+  Arn,
+  Url,
+  OptStr,
+  OptBool,
+  OptArn,
+  OptUrl,
+}
+
+class EpExpr {
+  code: string,
+  kind: EpKind,
+}
+
+// A rule parameter: its Smithy name, its Bit field, and the kind a read of it has.
+class EpParam {
+  name: string,
+  field: string,
+  kind: EpKind,
+}
+
+// A variable a condition assigns: its Smithy name, its field of the walk state, its kind.
+class EpVar {
+  name: string,
+  ident: string,
+  kind: EpKind,
+}
+
+class EpScope {
+  params: []EpParam,
+  vars: []EpVar,
+}
+
+// A function of the rules engine: the Bit function it calls, its parameter kinds and what it returns.
+class EpFn {
+  name: string,
+  callee: string,
+  params: []EpKind,
+  ret: EpKind,
+}
+
+fn epFn(name: string, callee: string, params: []EpKind, ret: EpKind): EpFn {
+  return EpFn{ name = name, callee = callee, params = params, ret = ret }
+}
+
+fn epFns(): []EpFn {
+  let s = EpKind.Str
+  let b = EpKind.Bool
+  let i = EpKind.Int
+  return [
+    epFn("booleanEquals", "booleanEquals", [b, b], b),
+    epFn("stringEquals", "stringEquals", [s, s], b),
+    epFn("substring", "substring", [s, i, i, b], EpKind.OptStr),
+    epFn("aws.partition", "awsPartition", [s], EpKind.Part),
+    epFn("aws.parseArn", "awsParseArn", [s], EpKind.OptArn),
+    epFn("aws.isVirtualHostableS3Bucket", "awsIsVirtualHostableS3Bucket", [s, b], b),
+    epFn("isValidHostLabel", "isValidHostLabel", [s, b], b),
+    epFn("parseURL", "parseURL", [s], EpKind.OptUrl),
+    epFn("uriEncode", "uriEncode", [s], s),
+  ]
+}
+
+fn epKindName(k: EpKind): string {
+  if (epIsOpt(k)) {
+    return "Option<${epKindName(epInner(k))}>"
+  }
+  return match (k) {
+    Str => "string"
+    Bool => "bool"
+    Int => "int"
+    List => "[]string"
+    Part => "Partition"
+    Arn => "Arn"
+    _ => "EndpointUrl"
+  }
+}
+
+fn epIsOpt(k: EpKind): bool {
+  return match (k) {
+    OptStr => true
+    OptBool => true
+    OptArn => true
+    OptUrl => true
+    _ => false
+  }
+}
+
+// The kind inside an optional kind; any other kind is its own.
+fn epInner(k: EpKind): EpKind {
+  return match (k) {
+    OptStr => EpKind.Str
+    OptBool => EpKind.Bool
+    OptArn => EpKind.Arn
+    OptUrl => EpKind.Url
+    _ => k
+  }
+}
+
+// The Bit identifier of a rule variable: `outpostId_ssa_2` is `outpostIdSsa2`, `_s3e_ds` is `s3eDs`.
+fn epIdent(name: string): string {
+  let b = Builder()
+  let up = false
+  let first = true
+  for c of []byte(name) {
+    if (c == '_') {
+      up = !first
+      continue
+    }
+    if (up && c >= 'a' && c <= 'z') {
+      b.writeByte(c - 32)
+    } else {
+      b.writeByte(c)
+    }
+    up = false
+    first = false
+  }
+  return b.toString()
+}
+
+// One byte of text as it is written inside a Bit string literal; `\$` is how a
+// literal dollar sign is written, so it never starts an interpolation.
+fn epLiteralByte(c: byte, at: string): string! {
+  if (c == '"' || c == '\\' || c == '$') {
+    return "\\" + string([c])
+  }
+  if (c < ' ' || c > '~') {
+    fail newError("${at}: byte ${int(c)} has no escape in a generated string")
+  }
+  return string([c])
+}
+
+// The Bit string literal for `s`.
+fn epStringLit(s: string, at: string): string! {
+  let b = Builder()
+  b.write("\"")
+  for c of []byte(s) {
+    b.write(epLiteralByte(c, at)?)
+  }
+  b.write("\"")
+  return b.toString()
+}
+
+fn epFindParam(sc: EpScope, name: string): Option<EpParam> {
+  for p of sc.params {
+    if (p.name == name) {
+      return Option<EpParam>.Some(p)
+    }
+  }
+  return Option<EpParam>.None
+}
+
+fn epFindVar(sc: EpScope, name: string): Option<EpVar> {
+  for v of sc.vars {
+    if (v.name == name) {
+      return Option<EpVar>.Some(v)
+    }
+  }
+  return Option<EpVar>.None
+}
+
+// The code that reads parameter or variable `name`.
+fn epRef(sc: EpScope, name: string, at: string): EpExpr! {
+  match (epFindVar(sc, name)) {
+    Some(v) => return EpExpr{ code = "s.${v.ident}", kind = v.kind }
+    None => {}
+  }
+  match (epFindParam(sc, name)) {
+    Some(p) => return EpExpr{ code = "p.${p.field}", kind = p.kind }
+    None => fail newError("${at}: ${name} is neither a parameter nor an assigned variable")
+  }
+}
+
+// `e` where a function wants kind `want`: an optional string is read with `orEmpty`.
+fn epAccept(e: EpExpr, want: EpKind, at: string): string! {
+  if (e.kind == want) {
+    return e.code
+  }
+  if (want == EpKind.Str && e.kind == EpKind.OptStr) {
+    return "orEmpty(${e.code})"
+  }
+  fail newError("${at}: expected ${epKindName(want)}, the expression is ${epKindName(e.kind)}")
+}
+
+fn epCallCode(callee: string, args: []string): string {
+  return "${callee}(${commaList(args)})"
+}
+
+fn epFnNamed(name: string): Option<EpFn> {
+  for f of epFns() {
+    if (f.name == name) {
+      return Option<EpFn>.Some(f)
+    }
+  }
+  return Option<EpFn>.None
+}
+
+fn epTable(sc: EpScope, f: EpFn, args: []EpExpr, at: string): EpExpr! {
+  if (len(args) != len(f.params)) {
+    fail newError("${at}: ${f.name} takes ${len(f.params)} arguments, got ${len(args)}")
+  }
+  let code = []string(0)
+  let i = 0
+  while (i < len(args)) {
+    code = append(code, epAccept(args[i], f.params[i], at)?)
+    i = i + 1
+  }
+  return EpExpr{ code = epCallCode(f.callee, code), kind = f.ret }
+}
+
+// `coalesce(a, b)`: `a` when set, else `b`.
+fn epCoalesce(args: []EpExpr, at: string): EpExpr! {
+  if (len(args) != 2 || !epIsOpt(args[0].kind) || epInner(args[0].kind) != args[1].kind) {
+    fail newError("${at}: coalesce wants an optional value and a default of its kind")
+  }
+  return EpExpr{ code = epCallCode("coalesce", [args[0].code, args[1].code]), kind = args[1].kind }
+}
+
+// `ite(cond, a, b)`: `a` when `cond`, else `b`.
+fn epIte(args: []EpExpr, at: string): EpExpr! {
+  if (len(args) != 3 || args[0].kind != EpKind.Bool || args[1].kind != args[2].kind) {
+    fail newError("${at}: ite wants a boolean and two values of one kind")
+  }
+  let code = []string(0)
+  for a of args {
+    code = append(code, a.code)
+  }
+  return EpExpr{ code = epCallCode("ite", code), kind = args[1].kind }
+}
+
+fn epIsSet(args: []EpExpr, at: string): EpExpr! {
+  if (len(args) != 1 || !epIsOpt(args[0].kind)) {
+    fail newError("${at}: isSet wants one optional value")
+  }
+  return EpExpr{ code = "isSet(${args[0].code})", kind = EpKind.Bool }
+}
+
+// `split(value, delimiter, 0)`; a limit other than 0 is not one the rules use.
+fn epSplit(args: []EpExpr, at: string, limit: Json): EpExpr! {
+  if (len(args) != 3 || args[1].kind != EpKind.Str) {
+    fail newError("${at}: split wants a string and a delimiter")
+  }
+  if (needInt(limit, at)? != 0) {
+    fail newError("${at}: split with a limit is not supported")
+  }
+  let value = epAccept(args[0], EpKind.Str, at)?
+  return EpExpr{ code = epCallCode("split", [value, args[1].code]), kind = EpKind.List }
+}
+
+// The field of a `Partition`, `Arn` or `EndpointUrl` a `getAttr` path names, and its kind.
+fn epFieldKind(base: EpKind, field: string): Option<EpKind> {
+  let strs = match (base) {
+    Part => ["name", "dnsSuffix", "dualStackDnsSuffix", "implicitGlobalRegion"]
+    Arn => ["partition", "service", "region", "accountId"]
+    Url => ["scheme", "authority", "path", "normalizedPath"]
+    _ => []string(0)
+  }
+  if (inList(strs, field)) {
+    return Option<EpKind>.Some(EpKind.Str)
+  }
+  let bools = match (base) {
+    Part => ["supportsFIPS", "supportsDualStack"]
+    Url => ["isIp"]
+    _ => []string(0)
+  }
+  if (inList(bools, field)) {
+    return Option<EpKind>.Some(EpKind.Bool)
+  }
+  return Option<EpKind>.None
+}
+
+// The index of a `[N]` suffix, N possibly negative.
+fn epIndexOf(text: string, at: string): int! {
+  if (len(text) < 3 || text[0] != '[' || text[len(text) - 1] != ']') {
+    fail newError("${at}: ${text} is not an index")
+  }
+  return parseInt(text[1:len(text) - 1]) catch e {
+    fail newError("${at}: ${text}: ${e.message()}")
+  }
+}
+
+// `getAttr(base, path)`: a field, or an index into a list.
+fn epGetAttr(args: []EpExpr, pathJson: Json, at: string): EpExpr! {
+  if (len(args) != 2) {
+    fail newError("${at}: getAttr takes a value and a path")
+  }
+  let base = args[0]
+  let path = pathText(pathJson, at)?
+  if (base.kind == EpKind.List) {
+    return EpExpr{
+      code = epCallCode("listAt", [base.code, "${epIndexOf(path, at)?}"]),
+      kind = EpKind.OptStr,
+    }
+  }
+  if (base.kind == EpKind.Arn && hasPrefix(path, "resourceId[")) {
+    let n = epIndexOf(path[10:len(path)], at)?
+    return EpExpr{
+      code = epCallCode("listAt", ["${base.code}.resourceId", "${n}"]),
+      kind = EpKind.OptStr,
+    }
+  }
+  match (epFieldKind(base.kind, path)) {
+    Some(k) => return EpExpr{ code = "${base.code}.${path}", kind = k }
+    None => fail newError("${at}: getAttr(${epKindName(base.kind)}, \"${path}\") is not an attribute the generator knows")
+  }
+}
+
+fn pathText(j: Json, at: string): string! {
+  return needString(j, at)?
+}
+
+// The code of expression `j`.
+fn epExpr(sc: EpScope, j: Json, at: string): EpExpr! {
+  match (j) {
+    JsonBool(b) => return EpExpr{ code = "${b}", kind = EpKind.Bool }
+    JsonInt(n) => return EpExpr{ code = "${n}", kind = EpKind.Int }
+    JsonString(s) => return EpExpr{ code = epStringLit(s, at)?, kind = EpKind.Str }
+    JsonObject(_) => return epObject(sc, j, at)?
+    _ => fail newError("${at}: an expression of this shape is not one the rules use")
+  }
+}
+
+fn epObject(sc: EpScope, j: Json, at: string): EpExpr! {
+  if (hasKey(j, "ref")) {
+    return epRef(sc, needString(needKey(j, "ref", at)?, at)?, at)?
+  }
+  return epFnCall(sc, j, at)?
+}
+
+fn epFnCall(sc: EpScope, j: Json, at: string): EpExpr! {
+  let name = needString(needKey(j, "fn", at)?, at)?
+  let argv = needArray(needKey(j, "argv", at)?, at)?
+  let args = []EpExpr(0)
+  for a of argv {
+    // getAttr's path and split's limit are literals, read from the JSON.
+    if ((name == "getAttr" && len(args) == 1) || (name == "split" && len(args) == 2)) {
+      args = append(args, EpExpr{ code = "", kind = EpKind.Str })
+    } else {
+      args = append(args, epExpr(sc, a, "${at}: ${name}")?)
+    }
+  }
+  return epKnown(sc, name, args, argv, at)?
+}
+
+fn epKnown(sc: EpScope, name: string, args: []EpExpr, argv: []Json, at: string): EpExpr! {
+  if (name == "isSet") {
+    return epIsSet(args, at)?
+  }
+  if (name == "coalesce") {
+    return epCoalesce(args, at)?
+  }
+  if (name == "ite") {
+    return epIte(args, at)?
+  }
+  if (name == "getAttr" && len(argv) == 2) {
+    return epGetAttr(args, argv[1], at)?
+  }
+  if (name == "split" && len(argv) == 3) {
+    return epSplit(args, at, argv[2])?
+  }
+  match (epFnNamed(name)) {
+    Some(f) => return epTable(sc, f, args, at)?
+    None => fail newError("${at}: the function ${name} is not one the generator knows")
+  }
+}
