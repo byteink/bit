@@ -17,6 +17,11 @@ Cloud Storage's XML API.
 }
 ```
 
+The request signing, the credential types and providers and the shared config
+profiles are [`pkg/aws`](../aws/README.md); `bit add` fetches it as a dependency
+of this package, and a program that builds its own credential imports
+`AwsCredential` and `Credentials` from `"aws"`.
+
 ## Usage
 
 ```bit
@@ -51,8 +56,8 @@ fn main(): ()! {
 
 Addressing is path-style only (`${endpoint}/${bucket}/${key}`), which every
 target this package is built for accepts. Requests are signed with AWS
-Signature Version 4, checked against AWS's own published test suite
-(`pkg/s3/sigv4.test.bit`, `pkg/s3/sigv4suite.test.bit`).
+Signature Version 4 (`pkg/aws`), checked against AWS's own published test
+suite (`pkg/aws/sigv4.test.bit`, `pkg/aws/sigv4suite.test.bit`).
 
 The full method surface (put/get/head/delete, `list`'s paginated iterator,
 multipart upload, `presignGet`/`presignPut`), streaming large objects, and
