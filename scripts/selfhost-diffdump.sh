@@ -346,6 +346,20 @@ run_types() {
       # row — a `types` divergence that matches a registered identity
       # (ptrofStringType, selfhost-ir-signatures.sh) is oracle lag, not a
       # regression.
+      #
+      # #7072: the oracle's `check` is the honest side, as run_ir's #5175 block
+      # explains: a file the pinned oracle's own `check` declines (a member this
+      # tree synthesizes and the published oracle has never heard of) dumps
+      # `<error>` types with rc=0 there, so the divergence is the oracle's own
+      # swallow, not a difference in the typed tree. Asked only on the
+      # disagreement path, never over the corpus.
+      ccap="$work/oracle-check.cap"
+      alarmrun_retry_cap ORACLECHECK "" "$ccap" "$ORACLE" check "$f"
+      crc=$?
+      if [ "$(classify_rc "$crc" "$ccap")" = decline ]; then
+        skip=$((skip + 1))
+        continue
+      fi
       sig=$(explainMismatch "$seed" "$b2" types "$f")
       if [ -n "$sig" ]; then
         echo "$f${sep}explained by declared signature '$sig'" >>"$work/explained"
