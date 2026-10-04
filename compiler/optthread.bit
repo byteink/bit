@@ -1,0 +1,559 @@
+// compiler/optthread.bit: a join whose parameter is only tested against a
+// constant is skipped on every edge where the test is already decided
+// (#5977, #6694). Same module as opt.bit; `optimizeModule` runs
+// `threadJoins` after inlining, ahead of the fold that prunes what it skips.
+//
+// ## The shape
+//
+// A spliced call's `ret`s become edges into one join, and the caller's test of
+// the result is the join's whole body:
+//
+//   P1:    ...; jump J(%zero)              P2: ...; jump J(%t)
+//   J(%p): %z = const_int 0; %c = icmp_ne %p, %z; br %c, S(..), E(..)
+//
+// On P1's edge the answer is known, so P1 jumps straight to E with the
+// arguments J would have passed. A fallible callee's error word is the same
+// shape: `const_nil` on its ok edge and a `gc_alloc` on its fail edge, which is
+// never nil (`gcAlloc` terminates the process rather than return 0).
+//
+// ## Why it is sound
+//
+// J's body is the compare, constants and the `br`, with no effect and no use
+// outside J, so skipping J on a decided edge changes the path and nothing else.
+// The edge carries the target's arguments with J's parameters replaced by the
+// edge's own, which is exactly what J's `br` would have bound.
+//
+// A parameter read OUTSIDE J (the ok value read after `?`) is what a skipped J
+// would leave unbound. That case threads only when every edge is decided, S and
+// E each receive exactly one, and each had J as its only predecessor: the
+// edge's block then dominates everything S (or E) dominates, and each such read
+// is pointed at that edge's argument. Anything else leaves J whole.
+//
+// No edge is threaded into a block a back edge enters, and no join a back edge
+// enters is touched: loop headers and the back-edge safepoint are read off the
+// block schedule (`isBackEdge`), and this pass never reshapes a loop.
+
+// A join `threadJoinAt` accepted: block `j`, its tested parameter `p`, the
+// constant `c` it is compared with, the compare and J's `br`. `j` is -1 when
+// the block asked about is not one.
+class ThreadJoin {
+  j: int,
+  p: int,
+  c: int,
+  cmp: int,
+  term: int,
+}
+
+// One edge into J: the predecessor `pb`, which arm of its terminator (0 a
+// `jump`, 1 a `br`'s then, 2 its else), the arguments it passes, and where it
+// goes once decided (1 J's then-target, 0 its else-target, -1 undecided).
+class ThreadEdge {
+  pb: int,
+  side: int,
+  args: []int,
+  to: int,
+}
+
+// What every candidate test reads, rebuilt after each join that threads.
+class ThreadFacts {
+  uses: []int,
+  pos: []int,
+  header: []bool,
+  preds: PredMap,
+}
+
+fn noThreadJoin(): ThreadJoin {
+  return ThreadJoin{ j = -1, p = 0, c = 0, cmp = 0, term = 0 }
+}
+
+fn threadConstOp(op: Op): bool {
+  return op == Op.ConstInt || op == Op.ConstNil || op == Op.ConstBool
+}
+
+fn isJoinParam(blk: IrBlock, v: int): bool {
+  return v >= blk.instsStart && v < blk.instsStart + blk.paramCount
+}
+
+fn threadFactsOf(f: IrFunc): ThreadFacts {
+  let order = blockEmissionOrder(f)
+  let pos = []int(len(f.blocks))
+  let k = 0
+  while (k < len(order)) {
+    pos[order[k]] = k
+    k = k + 1
+  }
+  let fx = ThreadFacts{
+    uses = useCounts(f), pos = pos, header = []bool(len(f.blocks)), preds = licmPredMap(f),
+  }
+  let b = 0
+  while (b < len(f.blocks)) {
+    for t of licmTargets(f, b) {
+      if (pos[t] <= pos[b]) {
+        fx.header[t] = true
+      }
+    }
+    b = b + 1
+  }
+  return fx
+}
+
+// How many of `cmp`'s two operands are `v`.
+fn cmpReads(ci: IrInstr, v: int): int {
+  let n = 0
+  if (ci.lhs == v) {
+    n = n + 1
+  }
+  if (ci.rhs == v) {
+    n = n + 1
+  }
+  return n
+}
+
+// Every instruction of J between its parameters and its `br` is the compare or
+// a constant only the compare reads.
+fn joinBodyPure(f: IrFunc, fx: ThreadFacts, blk: IrBlock, tj: ThreadJoin): bool {
+  let ci = f.instrs[tj.cmp]
+  let i = blk.instsStart + blk.paramCount
+  while (i < tj.term) {
+    if (i != tj.cmp && (!threadConstOp(f.instrs[i].op) || fx.uses[i] != cmpReads(ci, i))) {
+      return false
+    }
+    i = i + 1
+  }
+  return fx.uses[tj.cmp] == 1
+}
+
+// J's `br`, when J is no loop header, has parameters, and ends in a `br` on a
+// value its own body computes; else -1.
+fn joinBranch(f: IrFunc, fx: ThreadFacts, j: int): int {
+  let blk = f.blocks[j]
+  if (j == 0 || fx.header[j] || blk.paramCount == 0 || blk.instsLen < blk.paramCount + 2) {
+    return -1
+  }
+  let term = blk.instsStart + blk.instsLen - 1
+  let t = f.instrs[term]
+  if (t.op != Op.Br ||
+    t.ival == t.ival2 ||
+    t.lhs < blk.instsStart + blk.paramCount ||
+    t.lhs >= term) {
+    return -1
+  }
+  return term
+}
+
+// Block `j` as a threadable join, or `noThreadJoin()`.
+fn threadJoinAt(f: IrFunc, fx: ThreadFacts, j: int): ThreadJoin {
+  let term = joinBranch(f, fx, j)
+  if (term < 0) {
+    return noThreadJoin()
+  }
+  let blk = f.blocks[j]
+  let cmp = f.instrs[term].lhs
+  let ci = f.instrs[cmp]
+  if (ci.op != Op.ICmpEq && ci.op != Op.ICmpNe) {
+    return noThreadJoin()
+  }
+  let tj = ThreadJoin{ j = j, p = ci.lhs, c = ci.rhs, cmp = cmp, term = term }
+  if (!isJoinParam(blk, ci.lhs) || !threadConstOp(f.instrs[ci.rhs].op)) {
+    tj.p = ci.rhs
+    tj.c = ci.lhs
+  }
+  if (!isJoinParam(blk, tj.p) ||
+    !threadConstOp(f.instrs[tj.c].op) ||
+    !joinBodyPure(f, fx, blk, tj)) {
+    return noThreadJoin()
+  }
+  return tj
+}
+
+// 1 when `v` equals the constant `c`, 0 when it provably does not, -1 unknown.
+fn constEquals(f: IrFunc, v: int, c: int): int {
+  let d = f.instrs[v]
+  let k = f.instrs[c]
+  if (k.op == Op.ConstNil) {
+    return nilEquals(d.op)
+  }
+  if (k.op != d.op || k.ty != d.ty) {
+    return -1
+  }
+  if (k.op == Op.ConstInt) {
+    return boolInt(k.ival == d.ival)
+  }
+  return boolInt(k.bval == d.bval)
+}
+
+// Whether a value made by `op` equals nil: a `gc_alloc` never does.
+fn nilEquals(op: Op): int {
+  if (op == Op.ConstNil) {
+    return 1
+  }
+  if (op == Op.GcAlloc) {
+    return 0
+  }
+  return -1
+}
+
+fn boolInt(b: bool): int {
+  if (b) {
+    return 1
+  }
+  return 0
+}
+
+// Where an edge passing `args` goes: 1 J's then-target, 0 its else-target, -1
+// when the compare is not decided on it.
+fn edgeDecision(f: IrFunc, fx: ThreadFacts, tj: ThreadJoin, e: ThreadEdge): int {
+  let blk = f.blocks[tj.j]
+  let k = tj.p - blk.instsStart
+  if (len(e.args) != blk.paramCount) {
+    return -1
+  }
+  let eq = constEquals(f, e.args[k], tj.c)
+  if (eq < 0) {
+    eq = branchFact(f, fx, e, e.args[k], tj.c)
+  }
+  if (eq < 0 || f.instrs[tj.cmp].op == Op.ICmpEq) {
+    return eq
+  }
+  return 1 - eq
+}
+
+// `e` with its decision filled in.
+fn decided(f: IrFunc, fx: ThreadFacts, tj: ThreadJoin, e: ThreadEdge): ThreadEdge {
+  e.to = edgeDecision(f, fx, tj, e)
+  return e
+}
+
+// What a `br` already taken says about `v` against the constant `c`: 1 equal,
+// 0 not, -1 nothing. The edge's own arm first, then up the chain of blocks
+// with one predecessor each, whose entering edge every path to the edge takes.
+// That is how a callee's `return f()?` arrives: its fail edge passes the error
+// word the `?` just found non-nil. Eight hops bound the climb.
+fn branchFact(f: IrFunc, fx: ThreadFacts, e: ThreadEdge, v: int, c: int): int {
+  if (e.side != 0) {
+    let r = armFact(f, blockTerm(f, e.pb), e.side == 1, v, c)
+    if (r >= 0) {
+      return r
+    }
+  }
+  let b = e.pb
+  let hops = 0
+  while (hops < 8 && predCount(fx.preds, b) == 1) {
+    let q = fx.preds.list[fx.preds.start[b]]
+    let t = blockTerm(f, q)
+    if (t >= 0 && f.instrs[t].ival != f.instrs[t].ival2) {
+      let r = armFact(f, t, f.instrs[t].ival == b, v, c)
+      if (r >= 0) {
+        return r
+      }
+    }
+    b = q
+    hops = hops + 1
+  }
+  return -1
+}
+
+// What taking `t`'s then arm (`thenArm`) or its else arm says about `v` against
+// `c`, when `t` is a `br` on `v` compared with that same constant.
+fn armFact(f: IrFunc, t: int, thenArm: bool, v: int, c: int): int {
+  if (t < 0 || f.instrs[t].op != Op.Br) {
+    return -1
+  }
+  let ci = f.instrs[f.instrs[t].lhs]
+  if (ci.op != Op.ICmpEq && ci.op != Op.ICmpNe) {
+    return -1
+  }
+  let other = ci.rhs
+  if (ci.rhs == v) {
+    other = ci.lhs
+  } else if (ci.lhs != v) {
+    return -1
+  }
+  if (!threadConstOp(f.instrs[other].op) || constEquals(f, other, c) != 1) {
+    return -1
+  }
+  if (ci.op == Op.ICmpEq) {
+    return boolInt(thenArm)
+  }
+  return boolInt(!thenArm)
+}
+
+// Every edge into J. A `br` with both arms on J is listed twice in a row by
+// `licmPredMap`; it gives two edges, each decided on its own arguments.
+fn threadEdgesOf(f: IrFunc, fx: ThreadFacts, tj: ThreadJoin): []ThreadEdge {
+  let out = []ThreadEdge(0)
+  let k = fx.preds.start[tj.j]
+  while (k < fx.preds.start[tj.j + 1]) {
+    let pb = fx.preds.list[k]
+    let pblk = f.blocks[pb]
+    let t = f.instrs[pblk.instsStart + pblk.instsLen - 1]
+    if (k > fx.preds.start[tj.j] && fx.preds.list[k - 1] == pb) {
+      k = k + 1
+      continue
+    }
+    if (t.op == Op.Jump) {
+      out = append(out, decided(f, fx, tj, ThreadEdge{ pb = pb, side = 0, args = t.args, to = -1 }))
+    }
+    if (t.op == Op.Br && t.ival == tj.j) {
+      out = append(
+        out,
+        decided(f, fx, tj, ThreadEdge{ pb = pb, side = 1, args = t.thenArgs, to = -1 }),
+      )
+    }
+    if (t.op == Op.Br && t.ival2 == tj.j) {
+      out = append(
+        out,
+        decided(f, fx, tj, ThreadEdge{ pb = pb, side = 2, args = t.elseArgs, to = -1 }),
+      )
+    }
+    k = k + 1
+  }
+  return out
+}
+
+// J's then- or else-target for `to`.
+fn threadTarget(f: IrFunc, tj: ThreadJoin, to: int): int {
+  if (to == 1) {
+    return f.instrs[tj.term].ival
+  }
+  return f.instrs[tj.term].ival2
+}
+
+// Whether edge `e` may be redirected: it is decided, and both it and its new
+// target sit where the block schedule makes the new edge a forward one into a
+// block no back edge enters.
+fn edgeThreadable(f: IrFunc, fx: ThreadFacts, tj: ThreadJoin, e: ThreadEdge): bool {
+  if (e.to < 0) {
+    return false
+  }
+  let s = threadTarget(f, tj, e.to)
+  return fx.pos[e.pb] < fx.pos[tj.j] && fx.pos[s] > fx.pos[e.pb] && !fx.header[s]
+}
+
+// J's arguments for `to`, with every J parameter replaced by `e`'s own.
+fn threadedArgs(f: IrFunc, tj: ThreadJoin, e: ThreadEdge): []int {
+  let blk = f.blocks[tj.j]
+  let t = f.instrs[tj.term]
+  let src = t.elseArgs
+  if (e.to == 1) {
+    src = t.thenArgs
+  }
+  let out = []int(0)
+  for a of src {
+    if (isJoinParam(blk, a)) {
+      out = append(out, e.args[a - blk.instsStart])
+    } else {
+      out = append(out, a)
+    }
+  }
+  return out
+}
+
+// Redirects edge `e` past J. Writes only the terminator's target and argument
+// fields, so no index moves.
+fn threadEdge(f: IrFunc, tj: ThreadJoin, e: ThreadEdge) {
+  let pblk = f.blocks[e.pb]
+  let t = f.instrs[pblk.instsStart + pblk.instsLen - 1]
+  let s = threadTarget(f, tj, e.to)
+  let args = threadedArgs(f, tj, e)
+  if (e.side == 0) {
+    t.ival = s
+    t.args = args
+  } else if (e.side == 1) {
+    t.ival = s
+    t.thenArgs = args
+  } else {
+    t.ival2 = s
+    t.elseArgs = args
+  }
+}
+
+// Whether any J parameter is read anywhere but J's own compare and `br`
+// arguments, or is named by a keepalive pair (which this pass does not move).
+fn joinParamsEscape(f: IrFunc, fx: ThreadFacts, tj: ThreadJoin): bool {
+  let blk = f.blocks[tj.j]
+  let t = f.instrs[tj.term]
+  let ci = f.instrs[tj.cmp]
+  let q = blk.instsStart
+  while (q < blk.instsStart + blk.paramCount) {
+    let inside = cmpReads(ci, q) + countId(t.thenArgs, q) + countId(t.elseArgs, q)
+    if (fx.uses[q] > inside) {
+      return true
+    }
+    q = q + 1
+  }
+  return false
+}
+
+fn countId(ids: []int, v: int): int {
+  let n = 0
+  for x of ids {
+    if (x == v) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+fn joinPinned(f: IrFunc, blk: IrBlock): bool {
+  for v of f.keepAlive {
+    if (isJoinParam(blk, v)) {
+      return true
+    }
+  }
+  return false
+}
+
+// Threads every decided edge into a join whose parameters are read nowhere
+// else. Returns whether any edge moved.
+fn threadSomeEdges(f: IrFunc, fx: ThreadFacts, tj: ThreadJoin, edges: []ThreadEdge): bool {
+  let moved = false
+  for e of edges {
+    if (edgeThreadable(f, fx, tj, e)) {
+      threadEdge(f, tj, e)
+      moved = true
+    }
+  }
+  return moved
+}
+
+// Joins tested one at a time, each against facts that describe the function as
+// it is now: a threaded edge changes use counts and predecessors.
+fn threadJoins(f: IrFunc): IrFunc {
+  let fx = threadFactsOf(f)
+  let j = 0
+  while (j < len(f.blocks)) {
+    let tj = threadJoinAt(f, fx, j)
+    if (tj.j >= 0 && threadJoin(f, fx, tj)) {
+      fx = threadFactsOf(f)
+    }
+    j = j + 1
+  }
+  return f
+}
+
+fn threadJoin(f: IrFunc, fx: ThreadFacts, tj: ThreadJoin): bool {
+  if (joinPinned(f, f.blocks[tj.j])) {
+    return false
+  }
+  let edges = threadEdgesOf(f, fx, tj)
+  if (!joinParamsEscape(f, fx, tj)) {
+    return threadSomeEdges(f, fx, tj, edges)
+  }
+  return threadAllEdges(f, fx, tj, edges)
+}
+
+// The escaping case: both edges decided and threadable, one to each of J's
+// targets, each target entered only from J, and every outside read of a J
+// parameter below one of them, where it is pointed at that edge's argument.
+fn threadAllEdges(f: IrFunc, fx: ThreadFacts, tj: ThreadJoin, edges: []ThreadEdge): bool {
+  if (len(edges) != 2 ||
+    !edgeThreadable(f, fx, tj, edges[0]) ||
+    !edgeThreadable(f, fx, tj, edges[1])) {
+    return false
+  }
+  if (edges[0].to + edges[1].to != 1 ||
+    !soleFromJoin(f, fx, tj, 0) ||
+    !soleFromJoin(f, fx, tj, 1)) {
+    return false
+  }
+  let ev = edges[0]
+  let et = edges[1]
+  if (ev.to == 1) {
+    ev = edges[1]
+    et = edges[0]
+  }
+  let alias = [joinAlias(f, tj, ev), joinAlias(f, tj, et)]
+  let plan = escapeRewrites(f, tj, alias)
+  if (len(plan) == 1) {
+    return false
+  }
+  threadEdge(f, tj, edges[0])
+  threadEdge(f, tj, edges[1])
+  let k = 0
+  while (k < len(plan)) {
+    rewriteOperandIds(f, alias[plan[k + 1]], plan[k])
+    k = k + 2
+  }
+  return true
+}
+
+// Whether J's target for `to` has J as its only predecessor.
+fn soleFromJoin(f: IrFunc, fx: ThreadFacts, tj: ThreadJoin, to: int): bool {
+  let s = threadTarget(f, tj, to)
+  return predCount(fx.preds, s) == 1
+}
+
+// Identity, except that J's parameters read as edge `e`'s arguments.
+fn joinAlias(f: IrFunc, tj: ThreadJoin, e: ThreadEdge): []int {
+  let blk = f.blocks[tj.j]
+  let alias = []int(len(f.instrs))
+  let i = 0
+  while (i < len(alias)) {
+    alias[i] = i
+    i = i + 1
+  }
+  let k = 0
+  while (k < blk.paramCount) {
+    alias[blk.instsStart + k] = e.args[k]
+    k = k + 1
+  }
+  return alias
+}
+
+// Every instruction outside J that reads a J parameter, as (instruction, 0 for
+// the else-target's region or 1 for the then-target's) pairs. `[-1]` refuses:
+// a read below neither target, in an unreachable block, or one whose new
+// operand would not be defined before it in the flat order.
+fn escapeRewrites(f: IrFunc, tj: ThreadJoin, alias: [][]int): []int {
+  let blk = f.blocks[tj.j]
+  let dom = buildDomTree(f)
+  let owner = domBlockOf(f)
+  let out = []int(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    let b = owner[i]
+    if (b != tj.j && readsJoinParam(f, blk, i)) {
+      let r = escapeRegion(f, tj, dom, b)
+      if (r < 0 || !aliasDefinedBefore(f, alias[r], i)) {
+        return [-1]
+      }
+      out = append(out, i)
+      out = append(out, r)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn readsJoinParam(f: IrFunc, blk: IrBlock, i: int): bool {
+  for v of instrOperands(f, i) {
+    if (isJoinParam(blk, v)) {
+      return true
+    }
+  }
+  return false
+}
+
+// 1 when block `b` is below J's then-target, 0 below its else-target, else -1.
+fn escapeRegion(f: IrFunc, tj: ThreadJoin, dom: DomTree, b: int): int {
+  if (b < 0 || dom.rpo[b] < 0) {
+    return -1
+  }
+  if (domDominates(dom, threadTarget(f, tj, 1), b)) {
+    return 1
+  }
+  if (domDominates(dom, threadTarget(f, tj, 0), b)) {
+    return 0
+  }
+  return -1
+}
+
+fn aliasDefinedBefore(f: IrFunc, alias: []int, i: int): bool {
+  for v of instrOperands(f, i) {
+    if (alias[v] >= i) {
+      return false
+    }
+  }
+  return true
+}
