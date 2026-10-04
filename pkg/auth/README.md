@@ -129,6 +129,13 @@ protected route that is not itself doing the authenticating just reads
   retired one, and `BearerStrategy` answers a failure with the 401 and
   `WWW-Authenticate` header RFC 6750 asks for, never saying why; see
   [Bearer tokens for an API](docs/bearer-tokens.md).
+- `ApiKeys`, `ApiKeyOptions`, `ApiKeyStore`, `ApiKeyRecord`, `MemoryApiKeyStore`,
+  `CreatedKey`, `InvalidApiKey`, `ApiKeyStrategy`, `hasScope` - API keys for scripts
+  and integrations: a prefix and CRC-32 checksum so typos and leaks are caught,
+  the SHA-256 of the secret at rest, scopes, expiry, throttled last-used,
+  revoke, a constant-time check that answers every failure the same way, and a
+  `Strategy` reading `Authorization: Bearer` or `X-API-Key`; see
+  [API keys for scripts and integrations](docs/api-keys.md).
 - `generateRecoveryCodes`, `RecoveryOptions`, `RecoverySet`,
   `redeemRecoveryCode`, `RedeemOptions`, `RecoveryRedeem` - single-use
   recovery codes for a lost authenticator: generated from the CSPRNG, stored
