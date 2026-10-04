@@ -12,6 +12,7 @@ The chapters below, in reading order.
 | [Two-factor authentication with TOTP](totp.md) | A second login step with an authenticator app: enrollment, verifying a code, skew and replay protection, recovery codes for a lost phone. |
 | [Slow down password guessing](brute-force.md) | Throttle failed logins per account and per address: backoff, lockout, reset on success, an audit trail. |
 | [One-time tokens for account emails](account-tokens.md) | The token behind password reset, email verification and magic links: hashed at rest, single use, expiring, one purpose each. |
+| [Confirm an author's email address](email-verification.md) | Email verification on one-time tokens: send a link at signup, confirm it once, resend without revealing which addresses exist, and what happens when the address changes. |
 | [Security model](security.md) | What this package checks for you, and the one thing it cannot: your token exchange TLS roots. |
 
 For install and the exported surface, see [`pkg/auth/README.md`](../README.md).
