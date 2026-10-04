@@ -299,6 +299,18 @@
 # is what _tests_/cases/run_switch*.bit and the examples differential run.
 # Retires at the first repin after 0.36.0.
 #
+# 6990-interface-field-presyntax and 6997-where-in-key-presyntax (`diags`,
+# also the `diags` row of selfhost-fuzzdiff.sh). The 0.36.0 oracle cannot parse
+# #6990's interface field (`id: string,` in an interface body: E0021 `expected
+# '(', found ':'` and a cascade) nor #6997's `in:` object-literal key (E0021
+# `expected an expression, found kw_in`); the tree parses both, so its
+# diagnostics are empty. Files: _tests_/cases/iface_field_missing, iface_field_ok,
+# iface_field_write, iface_field_wrongtype, where_ops_ok, where_ops_ordered_types,
+# where_ops_wrong_operand, and the fuzz differential's truncations of them.
+# explainDiagsPresyntax states both identities; a `diags` signature has no
+# RETIRED audit, so removing these two at the repin is by hand.
+# Retires at the first repin after 0.36.0.
+#
 # The input protocol is the text the awk body reads: the oracle's dump, a line
 # `@@@BIT2@@@`, then the tree's dump, with the kind and the corpus file as
 # `-v` variables. A new entry must satisfy the rules in the header: an exact
@@ -307,11 +319,16 @@
 #
 # shellcheck source=scripts/ir-signatures-walk.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-walk.sh"
+irWalkAwk
 
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does.
 explainMismatch() {
+  if [ "$3" = diags ]; then
+    explainDiagsPresyntax "$1" "$2"
+    return
+  fi
   awk -v kind="$3" -v file="${4:-}" "${IR_WALK_AWK}"'
     # canonT -- rewrite every `$t<N>` of arr[1..n] to `$c<idx>` in first-
     # appearance order, the same canonicalization scripts/selfhost-ir-canon.sh
@@ -597,6 +614,91 @@ explainMismatch() {
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
 }
 
+# explainDiagsPresyntax <oracle_diags> <tree_diags> -- the two `diags`
+# signatures declared against the 0.36.0 oracle. Prints the name and returns 0
+# when the divergence is the oracle failing to PARSE syntax the tree accepts;
+# else prints nothing, returns 1. Both retire at the first repin after 0.36.0.
+#
+# Every record below is one `error[E....]: msg` block of `--dump-diags`: its
+# code, message, the `--> path:L:C` position and the one source line it quotes.
+#   6997-where-in-key-presyntax -- #6997 lets `in` be an object-literal key
+#     (`{ age: { in: [18, 21] } }`, parserlit.bit); the oracle lexes `in` as
+#     a keyword and reports `expected an expression, found kw_in`, once per
+#     key, recovering cleanly. Identity: every oracle record the tree lacks
+#     is that exact error with the caret on an `in:` in its quoted line, at
+#     least one is, and the records left over are the tree's, byte for byte.
+#   6990-interface-field-presyntax -- #6990 lets an interface body hold
+#     `name: Type,`; the oracle takes the name for a method and reports
+#     `expected '(', found ':'` at the colon, then a cascade it cannot
+#     recover from, so nothing after the first record is comparable. Identity:
+#     the FIRST oracle record is that error with the caret on the colon of a
+#     quoted line that is `identifier:`; every oracle record is a parse error
+#     (E0021); and every tree record is a truncation error (`found end of
+#     file`), which the fuzz differential's cut files produce and a complete
+#     corpus file never does, so a complete file must be clean in the tree.
+# Any other code, any lag-shaped record whose quoted line does not say what
+# the message claims, and any tree error beyond the above fails both.
+explainDiagsPresyntax() {
+  awk '
+    function load(txt, arr,    n, lines, i, m, cur, c, src) {
+      sub(/\n+$/, "", txt)
+      n = split(txt, lines, "\n"); cur = 0; arr["n"] = 0
+      for (i = 1; i <= n; i++) {
+        if (lines[i] ~ /^error\[E[0-9]+\]: /) {
+          cur = ++arr["n"]; arr["text", cur] = lines[i]
+          arr["code", cur] = substr(lines[i], 7, index(lines[i], "]") - 7)
+          arr["msg", cur] = substr(lines[i], index(lines[i], "]: ") + 3)
+          arr["col", cur] = 0; arr["src", cur] = ""
+        } else if (cur > 0) {
+          arr["text", cur] = arr["text", cur] "\n" lines[i]
+          if (match(lines[i], /^ *--> .*:[0-9]+:[0-9]+$/)) {
+            c = lines[i]; sub(/^.*:[0-9]+:/, "", c); arr["col", cur] = c + 0
+          } else if (match(lines[i], /^ *[0-9]+ [|] /)) {
+            src = substr(lines[i], RSTART + RLENGTH); arr["src", cur] = src
+          }
+        }
+      }
+    }
+    function isIn(arr, k,    s) {
+      s = arr["src", k]
+      return arr["code", k] == "E0021" && arr["msg", k] == "expected an expression, found kw_in" \
+        && arr["col", k] > 0 && substr(s, arr["col", k], 3) == "in:"
+    }
+    function isField(arr, k,    s) {
+      s = arr["src", k]
+      return arr["code", k] == "E0021" && arr["msg", k] == "expected '\''('\'', found '\'':'\''" \
+        && s ~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*:/ && arr["col", k] == index(s, ":")
+    }
+    function isEof(arr, k) {
+      return arr["code", k] == "E0021" && arr["msg", k] ~ /, found end of file$/
+    }
+    function inArm(    i, j, nin, rest) {
+      nin = 0; rest = 0
+      for (i = 1; i <= A["n"]; i++) {
+        if (isIn(A, i)) { nin++; continue }
+        rest++
+        if (rest > B["n"] || A["text", i] != B["text", rest]) { return 0 }
+      }
+      return nin > 0 && rest == B["n"]
+    }
+    function fieldArm(    i) {
+      if (A["n"] == 0 || !isField(A, 1)) { return 0 }
+      for (i = 1; i <= A["n"]; i++) { if (A["code", i] != "E0021") { return 0 } }
+      for (i = 1; i <= B["n"]; i++) { if (!isEof(B, i)) { return 0 } }
+      return 1
+    }
+    FNR == 1 { fi++ }
+    fi == 1 { ta = ta $0 "\n"; next }
+    { tb = tb $0 "\n" }
+    END {
+      load(ta, A); load(tb, B)
+      if (inArm()) { print "6997-where-in-key-presyntax"; exit 0 }
+      if (fieldArm()) { print "6990-interface-field-presyntax"; exit 0 }
+      exit 1
+    }
+  ' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
+}
+
 # objFnSites <object> -- one line per text function, "<name> <bit_rt_safepoint
 # call sites inside it>", then "@@total <sites>" and "@@other <sites outside
 # any text function>" (#6847). A site belongs to the
@@ -666,10 +768,11 @@ explainTestFunctions() {
 declaredSignatureNames() {
   local kind=${1:-}
   case "$kind" in
-    ast|fmt|tokens|diags|types) return ;;
+    ast|fmt|tokens|types) return ;;
+    diags) printf '%s\n' "6990-interface-field-presyntax" "6997-where-in-key-presyntax"; return ;;
     ir) printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6982-error-path-nil" "7058-switch-case-range"; return ;;
     iropt) printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6982-error-path-nil" "7058-switch-case-range-opt"; return ;;
     safepoints) printf '%s\n' "6847-test-module-functions"; return ;;
   esac
-  printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6847-test-module-functions" "6982-error-path-nil" "7058-switch-case-range" "7058-switch-case-range-opt"
+  printf '%s\n' "6730-fallible-enum-words" "6847-test-module-counters" "6847-test-module-counters-with-fallible-enum-words" "6840-bce-window-guard" "6847-test-module-functions" "6982-error-path-nil" "7058-switch-case-range" "7058-switch-case-range-opt" "6990-interface-field-presyntax" "6997-where-in-key-presyntax"
 }

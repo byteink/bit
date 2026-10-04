@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Sourced-only (by scripts/selfhost-ir-signatures.sh, #7074): the two walking
 # signatures declared against the 0.36.0 oracle, split out so that file stays
-# under the 800-line ceiling. Defines IR_WALK_AWK, a block of awk functions
+# under the 800-line ceiling. irWalkAwk sets IR_WALK_AWK (a function so the file
+# has no top-level statement and test-shebang-mode accepts mode 100644; the
+# sourcer calls it once), a block of awk functions
 # explainMismatch concatenates in front of its own program (it calls
 # `same`, `reset`, `isBox`, `idOf`, `lastTok`, `linesA`/`linesB`, `M`/`R`
 # from there, and nilWalk/rangeWalk from its END block), and
@@ -13,7 +15,8 @@
 # tree %id bijection per function (`same`, the #6730 walker's machinery), so a
 # wrong operand, opcode or type on any unchanged line fails, and a hunk may
 # only be exactly the shape its signature names.
-IR_WALK_AWK='
+irWalkAwk() {
+  IR_WALK_AWK='
 # ptrsLit -- `ptrs=[%N, ..]` lists the byte offsets of a box pointer
 # fields, not values of the function: the numbers are never renumbered with the
 # ids, so the bijection must see them as text. ptrsLit("%", "#") turns each `%`
@@ -198,6 +201,7 @@ function rangeWalk(    i, j, n, e) {
   return n > 0 ? 1 : 0
 }
 '
+}
 
 # switchPostOptOk <pre_oracle> <pre_tree> <post_oracle> <post_tree> -- returns
 # 0 when every function whose post-opt text differs is a function whose
