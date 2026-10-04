@@ -14,7 +14,7 @@ A session is `dial` (or `dialTls`), `ehlo`, optionally `startTls` and an `auth`
 mechanism, then one `send` per message, then `quit`.
 
 ```bit
-import { dial, Options, Address, Client, Message } from "std/smtp"
+import { dial, Options, Address, Auth, Client, Message } from "std/smtp"
 
 // Submit `m` through a relay on the cleartext submission port, upgrading to TLS
 // before the credential is sent. `startTls` verifies the server's certificate
@@ -26,7 +26,7 @@ fn submit(host: string, user: string, pass: string, m: Message): ()! {
   c.ehlo("client.example.com")?
   c.startTls(Options())?
   c.ehlo("client.example.com")?
-  c.authPlain(user, pass)?
+  c.auth(Auth.Plain(user, pass))?
   c.send(m)?
   c.quit()?
 }
@@ -167,7 +167,7 @@ them, not by documentation:
 | Rule | Where |
 |---|---|
 | A CR, LF or NUL in a header value is **rejected**, never stripped | every value, on the way in |
-| `AUTH` never runs on a connection that is not TLS | `authPlain`, `authLogin` |
+| `AUTH` never runs on a connection that is not TLS | `auth` |
 | The server certificate is verified | `Options.insecureSkipVerify` is the only opt-out |
 | No transmitted line reaches 998 octets | folding, encoding, and a final check |
 
@@ -631,7 +631,7 @@ answered. It is for tests and pinned lab servers.
 
 Connect to a cleartext submission port (587, or 25 for a relay) and read the
 greeting. The session is not secure yet: `startTls` makes it so, and until it
-does, `authPlain` and `authLogin` refuse to run. The connect, the greeting and
+does, `auth` refuses to run. The connect, the greeting and
 every later step are bounded by `o.timeout`; nothing else in `o` is read, since
 no TLS happens here. See "When a server goes quiet".
 
@@ -672,16 +672,35 @@ case-insensitively against the first word of each capability line, so
 Whether this connection is TLS - an implicit-TLS dial, or a completed
 `startTls`.
 
-### `Client.authPlain(user: string, pass: string): ()!SmtpError`
+### `Client.auth(a: Auth): ()!SmtpError`
 
-Authenticate with SASL PLAIN (RFC 4616). Refused, before the command is built,
-on a connection that is not TLS.
+Authenticate with the mechanism `a` selects. Before a credential byte exists
+this checks, in order: the connection is TLS (refused outright otherwise, with
+no opt-out, so not even a username is transmitted), neither credential carries a
+CR, LF or NUL, `ehlo` has run, and the server's `AUTH` capability lists the
+mechanism (RFC 4954 section 3, matched case-insensitively, `AUTH=` spelling
+included). A mechanism the server does not list fails with `smtp: the server
+does not offer AUTH <MECH>` and sends nothing. An error never repeats a
+credential.
 
-### `Client.authLogin(user: string, pass: string): ()!SmtpError`
+```bit
+import { Auth, Client, SmtpError } from "std/smtp"
 
-Authenticate with SASL LOGIN - username and password as two base64 challenge
-responses. Same refusal on a non-TLS connection, and it fires before the
-`AUTH LOGIN` command, so not even the username is transmitted.
+// A relay that offers only `AUTH LOGIN`.
+fn loginOnly(c: Client): ()!SmtpError {
+  c.auth(Auth.Login("mustafa", "hunter2"))?
+}
+```
+
+### `Auth`
+
+The credentials `auth` takes. The variant is the mechanism; new mechanisms are
+new variants, never new methods.
+
+| Variant | Mechanism |
+|---|---|
+| `Auth.Plain(user, pass)` | SASL PLAIN (RFC 4616): one initial response, `\0user\0pass` in base64 |
+| `Auth.Login(user, pass)` | SASL LOGIN: the username and the password as two base64 challenge responses |
 
 ### `Client.send(m: Sendable): ()!SmtpError`
 
