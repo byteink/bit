@@ -1,0 +1,361 @@
+// pkg/s3/request.bit — what the generated request serializers
+// (gen_req_ops_*.bit, #6620) write against: one request's method, path, query,
+// header fields, host prefix and body hand-off, plus the typed writers they are
+// built from. A serializer fills everything of an input that travels in the
+// URI, the query, a header or a string, blob or streaming payload; the XML
+// body of an input (a structure or union payload, or members bound to no HTTP
+// location) is NOT here: the XML serializer (#6621) sets `body` after it.
+//
+// Wire rules, as the SDK and the Smithy HTTP binding traits have them:
+//
+//   - a label is percent-encoded (every byte but A-Z a-z 0-9 - _ . ~), a
+//     greedy label keeps its `/`; an empty label is an error, never `//`;
+//   - query names and values are encoded when the query string is rendered
+//     (`queryString`), literal query keys of the URI (`?uploads`) are sent as
+//     `uploads=`, the form the SDK signs and sends;
+//   - header names are lower-case; a value holding CR, LF or NUL is an error
+//     (it would split the request), never sent;
+//   - a timestamp is written by the member's format: `http-date` (the header
+//     default), `date-time` (the query and label default, millisecond
+//     precision, no fraction when zero) or `epoch-seconds`;
+//   - an enum is its wire value, an `Unknown(v)` is `v`; a list header is the
+//     values joined with ", ".
+
+import { percentEncode } from "std/http"
+import { Builder, join, split, toLower } from "std/strings"
+import { Timestamp, formatHttpDate } from "std/time"
+import { sortInPlace } from "std/sort"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// One query parameter, name and value as written (encoded by `queryString`).
+class QueryField {
+  name: string,
+  value: string,
+}
+
+// A request as the serializers build it. `path` is encoded and starts with `/`;
+// `hostPrefix` is the endpoint trait's prefix with its labels filled ("" when
+// the operation has none); `body` is the payload member's body (Empty when the
+// operation has none or its body is XML).
+class RequestHead {
+  method: string,
+  path: string,
+  query: []QueryField,
+  fields: []HeaderField,
+  hostPrefix: string,
+  body: Body,
+}
+
+fn requestHead(method: string): RequestHead {
+  return RequestHead{
+    method = method,
+    path = "",
+    query = []QueryField(0),
+    fields = []HeaderField(0),
+    hostPrefix = "",
+    body = Body.Empty,
+  }
+}
+
+// The query string of `req` without its `?`, "" when it has no parameters.
+fn queryString(req: RequestHead): string {
+  let b = Builder()
+  let i = 0
+  while (i < len(req.query)) {
+    if (i > 0) {
+      b.write("&")
+    }
+    b.write("${percentEncode(req.query[i].name)}=${percentEncode(req.query[i].value)}")
+    i = i + 1
+  }
+  return b.toString()
+}
+
+// The value of header `name` (lower-case) of `req`, None when absent.
+fn sentHeader(req: RequestHead, name: string): Option<string> {
+  for f of req.fields {
+    if (f.name == name) {
+      return Option.Some(f.value)
+    }
+  }
+  return Option.None
+}
+
+// The catch-all of a chained `wire<Enum>`: every variant is handled by the
+// function that names it, so reaching this is a generator bug, never data.
+fn unreachableWire(name: string): string {
+  panic("wire${name}: a variant no function of the chain handles")
+}
+
+// --- path ---
+
+fn pathLiteral(req: RequestHead, text: string) {
+  req.path = req.path + text
+}
+
+fn labelValue(name: string, value: string): string! {
+  if (value == "") {
+    fail newError("empty value provided for input HTTP label: ${name}")
+  }
+  return value
+}
+
+fn pathLabel(req: RequestHead, name: string, value: string): ()! {
+  req.path = req.path + percentEncode(labelValue(name, value)?)
+}
+
+// A greedy label (`{Key+}`): each `/` separated segment encoded, the `/` kept.
+fn pathGreedy(req: RequestHead, name: string, value: string): ()! {
+  let parts = []string(0)
+  for seg of split(labelValue(name, value)?, "/") {
+    parts = append(parts, percentEncode(seg))
+  }
+  req.path = req.path + join(parts, "/")
+}
+
+// --- host prefix ---
+
+fn hostLiteral(req: RequestHead, text: string) {
+  req.hostPrefix = req.hostPrefix + text
+}
+
+// A host label: one DNS label, or the request would be sent to another host.
+fn hostLabel(req: RequestHead, name: string, value: string): ()! {
+  if (!isValidHostLabel(value, false)) {
+    fail newError("input host label ${name}: \"${value}\" is not a valid host label")
+  }
+  req.hostPrefix = req.hostPrefix + value
+}
+
+// --- timestamps ---
+
+fn floorSeconds(t: Timestamp): int {
+  let s = t.ns / 1000000000
+  if (t.ns % 1000000000 < 0) {
+    s = s - 1
+  }
+  return s
+}
+
+// The milliseconds past `floorSeconds(t)`.
+fn millisOf(t: Timestamp): int {
+  return (t.ns - floorSeconds(t) * 1000000000) / 1000000
+}
+
+// `.123` for 123 ms, `.5` for 500, "" for 0.
+fn fractionText(ms: int): string {
+  if (ms == 0) {
+    return ""
+  }
+  let padded = "${1000 + ms}"
+  let digits = padded[1:4]
+  let end = len(digits)
+  while (digits[end - 1] == '0') {
+    end = end - 1
+  }
+  return "." + digits[0:end]
+}
+
+fn httpDateText(t: Timestamp): string {
+  return formatHttpDate(t)
+}
+
+// `2019-12-16T23:48:18Z`, a fraction of whole milliseconds only when non-zero.
+fn dateTimeText(t: Timestamp): string {
+  let whole = Timestamp{ ns = floorSeconds(t) * 1000000000 }.toString()
+  return whole[0:len(whole) - 1] + fractionText(millisOf(t)) + "Z"
+}
+
+// `1576540098`, `1576540098.5`; a fraction of whole milliseconds only when non-zero.
+fn epochSecondsText(t: Timestamp): string {
+  return "${floorSeconds(t)}" + fractionText(millisOf(t))
+}
+
+// --- headers ---
+
+fn checkHeaderValue(name: string, value: string): ()! {
+  let i = 0
+  while (i < len(value)) {
+    let c = value[i]
+    if (c == '\r' || c == '\n' || c == 0) {
+      fail newError("header ${name}: the value has a CR, LF or NUL byte")
+    }
+    i = i + 1
+  }
+}
+
+fn setHeader(req: RequestHead, name: string, value: string): ()! {
+  checkHeaderValue(name, value)?
+  req.fields = append(req.fields, HeaderField{ name = toLower(name), value = value })
+}
+
+fn addHeaderText(req: RequestHead, name: string, v: Option<string>): ()! {
+  match (v) {
+    None => {}
+    Some(s) => setHeader(req, name, s)?
+  }
+}
+
+fn addHeaderInt(req: RequestHead, name: string, v: Option<int>): ()! {
+  match (v) {
+    None => {}
+    Some(n) => setHeader(req, name, "${n}")?
+  }
+}
+
+fn addHeaderBool(req: RequestHead, name: string, v: Option<bool>): ()! {
+  match (v) {
+    None => {}
+    Some(b) => setHeader(req, name, "${b}")?
+  }
+}
+
+fn addHeaderEnum<T>(req: RequestHead, name: string, v: Option<T>, wire: (T) => string): ()! {
+  match (v) {
+    None => {}
+    Some(e) => setHeader(req, name, wire(e))?
+  }
+}
+
+// A list of enums: one header, the wire values joined with ", ". An empty list
+// sends no header.
+fn addHeaderEnumList<T>(
+  req: RequestHead,
+  name: string,
+  v: Option<[]T>,
+  wire: (T) => string,
+): ()! {
+  match (v) {
+    None => {}
+    Some(items) => {
+      if (len(items) == 0) {
+        return
+      }
+      let values = []string(0)
+      for e of items {
+        values = append(values, wire(e))
+      }
+      setHeader(req, name, join(values, ", "))?
+    }
+  }
+}
+
+fn addHeaderTime(
+  req: RequestHead,
+  name: string,
+  v: Option<Timestamp>,
+  format: (Timestamp) => string,
+): ()! {
+  match (v) {
+    None => {}
+    Some(t) => setHeader(req, name, format(t))?
+  }
+}
+
+// An idempotency token header: the caller's value, else a fresh UUID v4.
+fn addHeaderToken(req: RequestHead, name: string, v: Option<string>): ()! {
+  match (v) {
+    None => setHeader(req, name, uuidFormat(uuidV4()))?
+    Some(s) => setHeader(req, name, s)?
+  }
+}
+
+// The members of a prefix-headers map as `prefix` + key, in key order so two
+// runs send the same bytes.
+fn addPrefixHeaders(req: RequestHead, prefix: string, v: Option<map<string, string>>): ()! {
+  match (v) {
+    None => {}
+    Some(m) => {
+      let keys = []string(0)
+      for (k, _) of m {
+        keys = append(keys, k)
+      }
+      sortInPlace(keys, (a: string, b: string) => a < b)
+      for k of keys {
+        setHeader(req, prefix + k, m[k])?
+      }
+    }
+  }
+}
+
+// --- query ---
+
+fn queryLiteral(req: RequestHead, name: string, value: string) {
+  req.query = append(req.query, QueryField{ name = name, value = value })
+}
+
+fn addQueryText(req: RequestHead, name: string, v: Option<string>) {
+  match (v) {
+    None => {}
+    Some(s) => queryLiteral(req, name, s)
+  }
+}
+
+fn addQueryInt(req: RequestHead, name: string, v: Option<int>) {
+  match (v) {
+    None => {}
+    Some(n) => queryLiteral(req, name, "${n}")
+  }
+}
+
+fn addQueryBool(req: RequestHead, name: string, v: Option<bool>) {
+  match (v) {
+    None => {}
+    Some(b) => queryLiteral(req, name, "${b}")
+  }
+}
+
+fn addQueryEnum<T>(req: RequestHead, name: string, v: Option<T>, wire: (T) => string) {
+  match (v) {
+    None => {}
+    Some(e) => queryLiteral(req, name, wire(e))
+  }
+}
+
+fn addQueryTime(
+  req: RequestHead,
+  name: string,
+  v: Option<Timestamp>,
+  format: (Timestamp) => string,
+) {
+  match (v) {
+    None => {}
+    Some(t) => queryLiteral(req, name, format(t))
+  }
+}
+
+// --- body ---
+
+// Sets the Content-Type the protocol defaults to for a payload (`octet-stream`
+// for a blob, `text/plain` for a string) unless the caller or a member of the
+// input set one: `fallback` is "" when the input has a Content-Type member of
+// its own, which then governs alone.
+fn defaultContentType(req: RequestHead, fallback: string): ()! {
+  if (fallback == "") {
+    return
+  }
+  match (sentHeader(req, "content-type")) {
+    Some(_) => {}
+    None => setHeader(req, "content-type", fallback)?
+  }
+}
+
+fn setBody(req: RequestHead, v: Option<Body>, contentType: string): ()! {
+  match (v) {
+    None => {}
+    Some(b) => {
+      req.body = b
+      defaultContentType(req, contentType)?
+    }
+  }
+}
+
+fn setTextBody(req: RequestHead, v: Option<string>, contentType: string): ()! {
+  match (v) {
+    None => {}
+    Some(s) => {
+      req.body = Body.Text(s)
+      defaultContentType(req, contentType)?
+    }
+  }
+}

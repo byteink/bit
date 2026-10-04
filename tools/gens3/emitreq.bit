@@ -1,0 +1,656 @@
+// tools/gens3 — renders the request serializers of the pinned S3 model as Bit
+// source (#6620, epic #6565): `pkg/s3/gen_req_enums_NN.bit` (one wire writer
+// per enum an input names) and `pkg/s3/gen_req_ops_NN.bit` (one
+// `serialize<Op>Input` per operation). The runtime they are written against is
+// pkg/s3/request.bit.
+//
+// What `serialize<Op>Input(input)` builds, in this order:
+//
+//   - the method and the host prefix of the endpoint trait (its `{Label}`s
+//     filled from the input, each checked to be one host label);
+//   - the path from the URI template: literals as they are, `{Label}` percent
+//     encoded, `{Label+}` (greedy) encoded per segment with its `/` kept;
+//   - the literal query of the URI (`?x-id=PutObject`, `?uploads`);
+//   - every member bound to the query or a header, typed: strings as they are,
+//     integers and booleans printed, enums by their wire value, a list of
+//     enums joined, timestamps by the member's or its target's
+//     `timestampFormat` (header: HTTP-date, query and label: date-time),
+//     `Expires` as an HTTP-date, an `idempotencyToken` header filled with a
+//     fresh UUID when unset;
+//   - every `httpPrefixHeaders` member as one header per entry;
+//   - the payload member when it is a streaming blob (`Body`) or a string.
+//
+// The seam to the XML serializer (#6621): an input whose body is XML (a
+// structure or union payload, or members bound to no HTTP location) leaves
+// `body` Empty and the block says `body: xml`. The XML serializer sets
+// `req.body` after this one ran; nothing here reads those members.
+//
+// A member the generator cannot write (a list in the query, a list of a kind
+// other than enums in a header, a `httpQueryParams` map, a bound member with a
+// default, a label that is not a required string) is an error, so a model
+// bump that brings one stops here.
+
+import { Builder, contains, indexOf, split, toLower } from "std/strings"
+
+// Statement lines of one generated function; the lint ceiling is 80, and the
+// signature, the `let` and the closing lines take the rest.
+const reqMaxFnLines: int = 60
+
+// Arms of one generated `wire<Enum>` function: the lint ceiling on complexity
+// is 10 and the catch-all that hands on to the next function takes one.
+const wireArmsPerFn: int = 7
+
+// Where an input's body travels.
+enum ReqBody {
+  None,
+  Stream,
+  Text,
+  Xml,
+}
+
+fn reqBodyText(k: ReqBody): string {
+  return match (k) {
+    None => "none"
+    Stream => "stream"
+    Text => "text"
+    Xml => "xml (the XML serializer sets req.body after this)"
+  }
+}
+
+fn isHttpBound(mem: Member): bool {
+  return mem.header != "" ||
+    mem.query != "" ||
+    mem.queryParams ||
+    mem.label ||
+    mem.payload ||
+    mem.prefixHeaders != ""
+}
+
+fn targetShape(p: Plan, mem: Member): Shape {
+  return p.m.shapes[shapeIndex(p.m, mem.target)]
+}
+
+// The input type `op` takes.
+fn inputUnit(p: Plan, op: Operation): Unit! {
+  for u of p.units {
+    if (u.name == op.name + "Input") {
+      return u
+    }
+  }
+  fail newError("${op.id}: no input type ${op.name}Input in the plan")
+}
+
+fn reqPayloadBody(p: Plan, u: Unit, mem: Member): ReqBody! {
+  let s = targetShape(p, mem)
+  if (s.kind == ShapeKind.Union && !s.streaming) {
+    return ReqBody.Xml
+  }
+  return match (payloadBody(p, u, mem)?) {
+    Stream => ReqBody.Stream
+    Text => ReqBody.Text
+    Xml => ReqBody.Xml
+    _ => ReqBody.None
+  }
+}
+
+fn reqBodyKind(p: Plan, u: Unit): ReqBody! {
+  let kind = ReqBody.None
+  for mem of u.shape.members {
+    if (mem.payload) {
+      return reqPayloadBody(p, u, mem)?
+    }
+    if (!isHttpBound(mem) && !mem.hostLabel) {
+      kind = ReqBody.Xml
+    }
+  }
+  return kind
+}
+
+// `input.<field>` as the Option a typed writer takes.
+fn valueOf(mem: Member): string {
+  if (isOptionalMember(mem)) {
+    return "input.${fieldName(mem.name)}"
+  }
+  return "Option.Some(input.${fieldName(mem.name)})"
+}
+
+// A statement `  fn(req, args)<q>`, wrapped the way `bit fmt` wraps a call whose
+// line is wider than `respMaxWidth` (one argument per line).
+fn reqCall(fnName: string, args: []string, q: string): string {
+  let one = "  ${fnName}(req, ${commaList(args)})${q}"
+  if (len(one) <= respMaxWidth) {
+    return one + "\n"
+  }
+  let b = Builder()
+  b.write("  ${fnName}(\n    req,\n")
+  for a of args {
+    b.write("    ${a},\n")
+  }
+  b.write("  )${q}\n")
+  return b.toString()
+}
+
+// The Bit string literal for a name or text of the model; a byte the
+// generator does not escape is an error.
+fn lit(s: string, at: string): string! {
+  checkWireValue(s, at)?
+  return "\"${s}\""
+}
+
+// The runtime formatter of timestamp format `f`, `fallback` when neither the
+// member nor its target names one.
+fn timestampWriter(mem: Member, s: Shape, fallback: string, at: string): string! {
+  let f = mem.timestampFormat
+  if (f == "") {
+    f = s.timestampFormat
+  }
+  if (f == "") {
+    f = fallback
+  }
+  if (f == "http-date") {
+    return "httpDateText"
+  }
+  if (f == "date-time") {
+    return "dateTimeText"
+  }
+  if (f == "epoch-seconds") {
+    return "epochSecondsText"
+  }
+  fail newError("${at}: timestamp format ${f} is not one the generator writes")
+}
+
+// The writer function of an enum shape: `wire<Enum>`.
+fn wireName(p: Plan, i: int): string {
+  return "wire${p.names[i]}"
+}
+
+fn isEnumShape(p: Plan, id: string): bool {
+  return p.m.shapes[shapeIndex(p.m, id)].kind == ShapeKind.Enum
+}
+
+// The kinds a header or query member may target; a list only as an enum list
+// header (checked beside it).
+fn isWritableKind(k: ShapeKind): bool {
+  return match (k) {
+    String => true
+    Boolean => true
+    Integer => true
+    Long => true
+    Timestamp => true
+    Enum => true
+    List => true
+    _ => false
+  }
+}
+
+// The shape rules of a bound member's target.
+fn checkBoundShape(p: Plan, u: Unit, mem: Member): ()! {
+  let at = "${u.shape.id}.${mem.name}"
+  let s = targetShape(p, mem)
+  if (s.kind == ShapeKind.List && (mem.header == "" || !isEnumShape(p, s.members[0].target))) {
+    fail newError("${at}: a list is written only as an enum list header")
+  }
+  if (s.kind == ShapeKind.Map && mem.prefixHeaders == "") {
+    fail newError("${at}: a map is written only as prefix headers")
+  }
+  checkBoundKind(mem, s, at)?
+}
+
+// A header or query member is a scalar the writers cover, a label a string.
+fn checkBoundKind(mem: Member, s: Shape, at: string): ()! {
+  if ((mem.header != "" || mem.query != "") && !isWritableKind(s.kind)) {
+    fail newError("${at}: a header or query of this kind is not one the generator writes")
+  }
+  if (mem.label && s.kind != ShapeKind.String) {
+    fail newError("${at}: a label must be a string")
+  }
+}
+
+// A bound member must be a kind the writers cover, optional or required with
+// no default (a default would have to be sent or skipped, the model has none).
+fn checkBound(p: Plan, u: Unit, mem: Member): ()! {
+  let at = "${u.shape.id}.${mem.name}"
+  if (mem.hasDefault && !mem.payload) {
+    fail newError("${at}: a bound member with a default is not one the generator writes")
+  }
+  if (mem.queryParams) {
+    fail newError("${at}: an httpQueryParams member is not one the generator writes")
+  }
+  checkBoundShape(p, u, mem)?
+}
+
+fn headerList(p: Plan, mem: Member, s: Shape): string! {
+  let name = lit(toLower(mem.header), mem.name)?
+  let i = shapeIndex(p.m, s.members[0].target)
+  return reqCall("addHeaderEnumList", [name, valueOf(mem), wireName(p, i)], "?")
+}
+
+// The header statement of a scalar member.
+fn headerScalar(p: Plan, u: Unit, mem: Member, s: Shape): string! {
+  let at = "${u.shape.id}.${mem.name}"
+  let name = lit(toLower(mem.header), at)?
+  let v = valueOf(mem)
+  return match (s.kind) {
+    String => reqCall("addHeaderText", [name, v], "?")
+    Boolean => reqCall("addHeaderBool", [name, v], "?")
+    Integer => reqCall("addHeaderInt", [name, v], "?")
+    Long => reqCall("addHeaderInt", [name, v], "?")
+    Timestamp => reqCall("addHeaderTime", [name, v, timestampWriter(mem, s, "http-date", at)?], "?")
+    Enum => reqCall("addHeaderEnum", [name, v, wireName(p, shapeIndex(p.m, mem.target))], "?")
+    _ => ""
+  }
+}
+
+fn reqHeaderStatement(p: Plan, u: Unit, mem: Member): string! {
+  let at = "${u.shape.id}.${mem.name}"
+  let s = targetShape(p, mem)
+  let name = lit(toLower(mem.header), at)?
+  if (isExpiresDate(u, mem)) {
+    return reqCall("addHeaderTime", [name, valueOf(mem), "httpDateText"], "?")
+  }
+  if (mem.idempotencyToken && s.kind == ShapeKind.String) {
+    return reqCall("addHeaderToken", [name, valueOf(mem)], "?")
+  }
+  if (s.kind == ShapeKind.List) {
+    return headerList(p, mem, s)?
+  }
+  return headerScalar(p, u, mem, s)?
+}
+
+fn queryStatement(p: Plan, u: Unit, mem: Member): string! {
+  let at = "${u.shape.id}.${mem.name}"
+  let s = targetShape(p, mem)
+  let name = lit(mem.query, at)?
+  let v = valueOf(mem)
+  return match (s.kind) {
+    String => reqCall("addQueryText", [name, v], "")
+    Boolean => reqCall("addQueryBool", [name, v], "")
+    Integer => reqCall("addQueryInt", [name, v], "")
+    Long => reqCall("addQueryInt", [name, v], "")
+    Timestamp => reqCall("addQueryTime", [name, v, timestampWriter(mem, s, "date-time", at)?], "")
+    Enum => reqCall("addQueryEnum", [name, v, wireName(p, shapeIndex(p.m, mem.target))], "")
+    _ => ""
+  }
+}
+
+// `x-amz-meta-` and a map of strings: one header per entry.
+fn reqPrefixStatement(p: Plan, u: Unit, mem: Member): string! {
+  let at = "${u.shape.id}.${mem.name}"
+  let s = targetShape(p, mem)
+  for e of s.members {
+    if (targetShape(p, e).kind != ShapeKind.String) {
+      fail newError("${at}: prefix headers must be a map of strings")
+    }
+  }
+  return reqCall("addPrefixHeaders", [lit(toLower(mem.prefixHeaders), at)?, valueOf(mem)], "?")
+}
+
+// Whether the input has a header member of its own named Content-Type.
+fn hasContentTypeMember(u: Unit): bool {
+  for mem of u.shape.members {
+    if (toLower(mem.header) == "content-type") {
+      return true
+    }
+  }
+  return false
+}
+
+// The Content-Type a payload gets when the input names none: Smithy's default
+// for the payload's kind, "" when the input's own member governs.
+fn payloadContentType(u: Unit, fallback: string): string {
+  if (hasContentTypeMember(u)) {
+    return "\"\""
+  }
+  return "\"${fallback}\""
+}
+
+fn reqPayloadStatement(p: Plan, u: Unit, mem: Member): string! {
+  return match (reqPayloadBody(p, u, mem)?) {
+    Stream => reqCall(
+      "setBody",
+      [valueOf(mem), payloadContentType(u, "application/octet-stream")],
+      "?",
+    )
+    Text => reqCall("setTextBody", [valueOf(mem), payloadContentType(u, "text/plain")], "?")
+    _ => ""
+  }
+}
+
+// The statement writing `mem` into a header, the query or the body, "" for a
+// member that has no such location (a label, a host label, an XML member).
+fn reqMemberStatement(p: Plan, u: Unit, mem: Member): string! {
+  if (isHttpBound(mem)) {
+    checkBound(p, u, mem)?
+  }
+  if (mem.payload) {
+    return reqPayloadStatement(p, u, mem)?
+  }
+  if (mem.prefixHeaders != "") {
+    return reqPrefixStatement(p, u, mem)?
+  }
+  let out = ""
+  if (mem.query != "") {
+    out = queryStatement(p, u, mem)?
+  }
+  if (mem.header != "") {
+    out = out + reqHeaderStatement(p, u, mem)?
+  }
+  return out
+}
+
+// A template `a/{X}/b/{Y+}` as its pieces: ("lit", text), ("label", name),
+// ("greedy", name). An unclosed `{` is an error.
+class Piece {
+  kind: string,
+  text: string,
+}
+
+fn templatePieces(t: string, at: string): []Piece! {
+  let pieces = []Piece(0)
+  let rest = t
+  while (len(rest) > 0) {
+    let open = indexOf(rest, "{")
+    if (open < 0) {
+      pieces = append(pieces, Piece{ kind = "lit", text = rest })
+      break
+    }
+    let end = indexOf(rest, "}")
+    if (end < open) {
+      fail newError("${at}: the template ${t} has an unclosed {")
+    }
+    if (open > 0) {
+      pieces = append(pieces, Piece{ kind = "lit", text = rest[0:open] })
+    }
+    let name = rest[open + 1:end]
+    if (len(name) > 1 && name[len(name) - 1] == '+') {
+      pieces = append(pieces, Piece{ kind = "greedy", text = name[0:len(name) - 1] })
+    } else {
+      pieces = append(pieces, Piece{ kind = "label", text = name })
+    }
+    rest = rest[end + 1:len(rest)]
+  }
+  return pieces
+}
+
+// The input member that `name` labels, which must be a required string.
+fn labelMember(p: Plan, u: Unit, name: string, kind: string): Member! {
+  let at = "${u.shape.id}.${name}"
+  for mem of u.shape.members {
+    if (mem.name == name) {
+      if (kind != "host" && !mem.label) {
+        fail newError("${at}: the URI names it but it is not an httpLabel")
+      }
+      if (kind == "host" && !mem.hostLabel) {
+        fail newError("${at}: the host prefix names it but it is not a hostLabel")
+      }
+      if (!mem.required || targetShape(p, mem).kind != ShapeKind.String) {
+        fail newError("${at}: a label must be a required string")
+      }
+      return mem
+    }
+  }
+  fail newError("${at}: the template names a member the input does not have")
+}
+
+// The path statements of the URI template `path` of `op`.
+fn pathStatements(p: Plan, u: Unit, path: string): []string! {
+  let out = []string(0)
+  for piece of templatePieces(path, u.shape.id)? {
+    if (piece.kind == "lit") {
+      out = append(out, reqCall("pathLiteral", [lit(piece.text, u.shape.id)?], ""))
+    } else {
+      let mem = labelMember(p, u, piece.text, "path")?
+      let callee = "pathLabel"
+      if (piece.kind == "greedy") {
+        callee = "pathGreedy"
+      }
+      out = append(
+        out,
+        reqCall(callee, [lit(mem.name, u.shape.id)?, "input.${fieldName(mem.name)}"], "?"),
+      )
+    }
+  }
+  return out
+}
+
+// The host prefix statements of an endpoint trait's `hostPrefix`.
+fn hostStatements(p: Plan, u: Unit, prefix: string): []string! {
+  let out = []string(0)
+  for piece of templatePieces(prefix, u.shape.id)? {
+    if (piece.kind == "lit") {
+      out = append(out, reqCall("hostLiteral", [lit(piece.text, u.shape.id)?], ""))
+    } else {
+      let mem = labelMember(p, u, piece.text, "host")?
+      out = append(
+        out,
+        reqCall("hostLabel", [lit(mem.name, u.shape.id)?, "input.${fieldName(mem.name)}"], "?"),
+      )
+    }
+  }
+  return out
+}
+
+// The literal query of a URI (`?x-id=PutObject&foo`): one `queryLiteral` per
+// parameter, a bare key sent with an empty value.
+fn literalQueryStatements(query: string, at: string): []string! {
+  let out = []string(0)
+  for pair of split(query, "&") {
+    let eq = indexOf(pair, "=")
+    if (eq < 0) {
+      out = append(out, reqCall("queryLiteral", [lit(pair, at)?, "\"\""], ""))
+    } else {
+      out = append(
+        out,
+        reqCall("queryLiteral", [lit(pair[0:eq], at)?, lit(pair[eq + 1:len(pair)], at)?], ""),
+      )
+    }
+  }
+  return out
+}
+
+// Every label of the input appears in the URI, and the other way round.
+fn checkLabelsUsed(u: Unit, path: string, host: string): ()! {
+  for mem of u.shape.members {
+    if (mem.label && !(contains(path, "{${mem.name}}") || contains(path, "{${mem.name}+}"))) {
+      fail newError("${u.shape.id}.${mem.name}: an httpLabel the URI does not name")
+    }
+    if (mem.hostLabel && !contains(host, "{${mem.name}}")) {
+      fail newError("${u.shape.id}.${mem.name}: a hostLabel the host prefix does not name")
+    }
+  }
+}
+
+// The statements building the request of `op`, in wire order.
+fn requestStatements(p: Plan, op: Operation, u: Unit): []string! {
+  let q = indexOf(op.uri, "?")
+  let path = op.uri
+  let query = ""
+  if (q >= 0) {
+    path = op.uri[0:q]
+    query = op.uri[q + 1:len(op.uri)]
+  }
+  checkLabelsUsed(u, path, op.hostPrefix)?
+  let out = []string(0)
+  for s of hostStatements(p, u, op.hostPrefix)? {
+    out = append(out, s)
+  }
+  for s of pathStatements(p, u, path)? {
+    out = append(out, s)
+  }
+  if (query != "") {
+    for s of literalQueryStatements(query, u.shape.id)? {
+      out = append(out, s)
+    }
+  }
+  for mem of u.shape.members {
+    let s = reqMemberStatement(p, u, mem)?
+    if (s != "") {
+      out = append(out, s)
+    }
+  }
+  return out
+}
+
+// `fn name(input: In, req: RequestHead): ()! {`, its parameters one per line when
+// the line is wider than `respMaxWidth`, as `bit fmt` writes it.
+fn fillReqSignature(name: string, inType: string): string {
+  let one = "fn ${name}(input: ${inType}, req: RequestHead): ()! {"
+  if (len(one) <= respMaxWidth) {
+    return one + "\n"
+  }
+  return "fn ${name}(\n  input: ${inType},\n  req: RequestHead,\n): ()! {\n"
+}
+
+// `fn serialize<In>(input: In): RequestHead! {` likewise.
+fn serializeSignature(name: string, inType: string): string {
+  let one = "fn ${name}(input: ${inType}): RequestHead! {"
+  if (len(one) <= respMaxWidth) {
+    return one + "\n"
+  }
+  return "fn ${name}(\n  input: ${inType},\n): RequestHead! {\n"
+}
+
+fn writeSerializer(b: Builder, op: Operation, u: Unit, parts: []string) {
+  let name = "serialize${u.name}"
+  if (len(parts) > 1) {
+    let i = 0
+    while (i < len(parts)) {
+      b.write(fillReqSignature("fill${u.name}${i + 1}", u.name))
+      b.write("${parts[i]}}\n\n")
+      i = i + 1
+    }
+  }
+  b.write(serializeSignature(name, u.name))
+  b.write("  let req = requestHead(\"${op.method}\")\n")
+  if (len(parts) == 1) {
+    b.write(parts[0])
+  }
+  if (len(parts) > 1) {
+    let i = 0
+    while (i < len(parts)) {
+      b.write("  fill${u.name}${i + 1}(input, req)?\n")
+      i = i + 1
+    }
+  }
+  b.write("  return req\n}\n")
+}
+
+fn renderRequestOp(p: Plan, op: Operation): string! {
+  let u = inputUnit(p, op)?
+  let body = reqBodyKind(p, u)?
+  let b = Builder()
+  b.write("// ${u.shape.id}: ${op.id}\n// body: ${reqBodyText(body)}\n")
+  writeSerializer(b, op, u, partitionStatements(requestStatements(p, op, u)?))
+  return b.toString()
+}
+
+// `wire<Enum>(e)`: the wire value of a variant, `v` for `Unknown(v)`. One
+// function per `wireArmsPerFn` variants, each handing the rest to the next.
+fn renderEnumWire(p: Plan, u: Unit): string! {
+  let b = Builder()
+  b.write("// ${u.shape.id}\n")
+  let vars = []string(0)
+  let wires = []string(0)
+  for mem of u.shape.members {
+    checkWireValue(mem.enumValue, "${u.shape.id}.${mem.name}")?
+    vars = append(vars, variantName(mem.name)?)
+    wires = append(wires, mem.enumValue)
+  }
+  let at = 0
+  let n = 0
+  while (at < len(vars)) {
+    let end = at + wireArmsPerFn
+    if (end > len(vars)) {
+      end = len(vars)
+    }
+    let fnName = "wire${u.name}"
+    if (n > 0) {
+      fnName = "wire${u.name}${n + 1}"
+    }
+    b.write("fn ${fnName}(e: ${u.name}): string {\n  return match (e) {\n")
+    let i = at
+    while (i < end) {
+      b.write("    ${vars[i]} => \"${wires[i]}\"\n")
+      i = i + 1
+    }
+    b.write(wireTail(u, n, end >= len(vars)))
+    at = end
+    n = n + 1
+  }
+  return b.toString()
+}
+
+// The last arms of a `wire<Enum>` function: for the last one `Unknown(v)` and a
+// catch-all no value can reach (every earlier variant left through the first
+// function that names it), for the others a hand-over to the next function.
+fn wireTail(u: Unit, n: int, last: bool): string {
+  if (last && n == 0) {
+    return "    Unknown(v) => v\n  }\n}\n"
+  }
+  if (last) {
+    return "    Unknown(v) => v\n    _ => unreachableWire(\"${u.name}\")\n  }\n}\n"
+  }
+  return "    _ => wire${u.name}${n + 2}(e)\n  }\n}\n\n"
+}
+
+// The enum a header or query member writes (itself, or the element of its
+// list), -1 when it writes none.
+fn writtenEnum(p: Plan, mem: Member): int {
+  if (mem.header == "" && mem.query == "") {
+    return -1
+  }
+  let i = shapeIndex(p.m, mem.target)
+  if (p.m.shapes[i].kind == ShapeKind.List) {
+    i = shapeIndex(p.m, p.m.shapes[i].members[0].target)
+  }
+  if (p.m.shapes[i].kind != ShapeKind.Enum) {
+    return -1
+  }
+  return i
+}
+
+// Whether some input writes the enum at shape index `i` into a header or the query.
+fn isWrittenEnum(p: Plan, i: int): bool {
+  for u of p.units {
+    if (u.role != Role.Input) {
+      continue
+    }
+    for mem of u.shape.members {
+      if (writtenEnum(p, mem) == i) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// The wire writer of every enum an input writes, in plan order.
+fn enumWireBlocks(p: Plan): []string! {
+  let blocks = []string(0)
+  for u of p.units {
+    if (u.shape.kind == ShapeKind.Enum && isWrittenEnum(p, shapeIndex(p.m, u.shape.id))) {
+      blocks = append(blocks, renderEnumWire(p, u)?)
+    }
+  }
+  return blocks
+}
+
+// The `serialize` block of every operation with an input.
+fn requestOpBlocks(p: Plan): []string! {
+  let blocks = []string(0)
+  for op of p.m.operations {
+    blocks = append(blocks, renderRequestOp(p, op)?)
+  }
+  return blocks
+}
+
+// Every `gen_req_*.bit`, enum writers first. `commit` and `sha` are the model pin.
+fn renderReq(m: Model, commit: string, sha: string): []GenFile! {
+  let p = planShapes(m)?
+  let head = headerLines("req", commit, sha) + "\n"
+  let files = packRespFiles("gen_req_enums_", head, enumWireBlocks(p)?)
+  for f of packRespFiles("gen_req_ops_", head, requestOpBlocks(p)?) {
+    files = append(files, f)
+  }
+  return files
+}

@@ -1,0 +1,287 @@
+// tools/gens3 — renders the restXml request vectors as a generated test file,
+// `pkg/s3/gen_reqvec.test.bit` (#6620, epic #6565).
+//
+// The vectors are the httpRequestTests of smithy-aws-protocol-tests
+// (smithy-lang/smithy, commit in tools/gens3/model/restxml-request-vectors.json)
+// that bind a method, URI labels, query, headers, prefix headers, a string or
+// streaming payload or a host prefix, filtered to what S3 has and what is not
+// an XML body (the file's `filter`; every test it drops is in `excluded` with
+// its reason, every member it removes in the case's `dropped`). The file holds
+// the input shapes of those tests as a Smithy model. This emitter writes, into
+// the one generated test file, the vector model's shapes (emitshapes.bit), its
+// enum writers and serializers (emitreq.bit: the SAME renderers pkg/s3 is
+// generated with), and one test per vector: it builds the input from the
+// vector's params, runs the generated `serialize<Op>Input` and asserts the
+// method, the path, the query (exactly the listed parameters, none of the
+// forbidden ones), the listed headers (none of the forbidden ones), the body
+// and the resolved host. The assertion helpers are pkg/s3/request.test.bit.
+
+import { Builder } from "std/strings"
+import { Json, jsonParse } from "std/json"
+
+const reqVecFile: string = "tools/gens3/model/restxml-request-vectors.json"
+const reqVecTestName: string = "gen_reqvec.test.bit"
+
+const hexDigits: string = "0123456789ABCDEF"
+
+// The Bit string literal for `s` (a vector value: any byte): `"`, `\`, `$` and
+// the bytes outside printable ASCII are escaped, so the text reads back the
+// same bytes.
+fn vecString(s: string): string {
+  let b = Builder()
+  b.write("\"")
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == '"' || c == '\\' || c == '$') {
+      b.write("\\")
+      b.writeByte(c)
+    } else if (c < ' ' || c > '~') {
+      b.write("\\x${hexDigits[int(c >> 4):int(c >> 4) + 1]}${hexDigits[int(c & 15):int(c & 15) + 1]}")
+    } else {
+      b.writeByte(c)
+    }
+    i = i + 1
+  }
+  b.write("\"")
+  return b.toString()
+}
+
+// The input type of the operation named `opShortName` in the vector model.
+fn inputOf(p: Plan, opShortName: string): Unit! {
+  for u of p.units {
+    if (u.name == opShortName + "Input") {
+      return u
+    }
+  }
+  fail newError("vector operation ${opShortName}: no input type in the vector model")
+}
+
+// A list of Bit string literals, `["a", "b"]`.
+fn stringListLiteral(items: Json, at: string): string! {
+  let lits = []string(0)
+  for it of needArray(items, at)? {
+    lits = append(lits, vecString(needString(it, at)?))
+  }
+  return bracketList(lits)
+}
+
+fn mapLiteral(v: Json, at: string): string! {
+  let b = Builder()
+  b.write("map<string, string>{")
+  let first = true
+  for e of needObject(v, at)? {
+    if (!first) {
+      b.write(",")
+    }
+    first = false
+    b.write(" ${vecString(e.key)}: ${vecString(needString(e.value, at)?)}")
+  }
+  if (first) {
+    return "map<string, string>{}"
+  }
+  b.write(" }")
+  return b.toString()
+}
+
+fn listLiteral(p: Plan, s: Shape, v: Json, at: string): string! {
+  let ei = shapeIndex(p.m, s.members[0].target)
+  let lits = []string(0)
+  for it of needArray(v, at)? {
+    lits = append(lits, enumLiteral(p, ei, needString(it, at)?, at)?)
+  }
+  return bracketList(lits)
+}
+
+// A timestamp param is epoch seconds.
+fn timestampLiteral(v: Json, at: string): string! {
+  let secs = needInt(v, at)?
+  return "Timestamp{ ns = ${secs * 1000000000} }"
+}
+
+// The Bit expression of a scalar param `v` of shape `s` (enum `i`), "" for an
+// aggregate.
+fn scalarLiteral(p: Plan, s: Shape, i: int, v: Json, at: string): string! {
+  return match (s.kind) {
+    String => vecString(needString(v, at)?)
+    Integer => "${needInt(v, at)?}"
+    Long => "${needInt(v, at)?}"
+    Boolean => "${needBool(v, at)?}"
+    Timestamp => timestampLiteral(v, at)?
+    Enum => enumLiteral(p, i, needString(v, at)?, at)?
+    _ => ""
+  }
+}
+
+// The Bit expression of the param value `v` for member `mem`, not yet wrapped
+// in `Option.Some`.
+fn valueLiteral(p: Plan, mem: Member, v: Json, at: string): string! {
+  let i = shapeIndex(p.m, mem.target)
+  let s = p.m.shapes[i]
+  return match (s.kind) {
+    Blob => "Body.Text(${vecString(needString(v, at)?)})"
+    Map => mapLiteral(v, at)?
+    List => listLiteral(p, s, v, at)?
+    _ => scalarLiteral(p, s, i, v, at)?
+  }
+}
+
+// `field = value` of the input literal for param `name`, "" for a null param
+// (the member stays unset).
+fn fieldInit(p: Plan, u: Unit, name: string, v: Json, at: string): string! {
+  if (jsonIsNull(v)) {
+    return ""
+  }
+  let mem = memberNamed(u, name, at)?
+  let lit = valueLiteral(p, mem, v, at)?
+  if (lit == "") {
+    fail newError("${at}: a param of this kind is not one the vectors read")
+  }
+  return "${fieldName(name)} = ${someOf(mem, lit)}"
+}
+
+fn jsonIsNull(v: Json): bool {
+  return match (v) {
+    JsonNull => true
+    _ => false
+  }
+}
+
+// The `let input = <Op>Input{ ... }` statement, one field per line.
+fn inputStatement(p: Plan, u: Unit, params: Json, at: string): string! {
+  let inits = []string(0)
+  for e of needObject(params, at)? {
+    let f = fieldInit(p, u, e.key, e.value, "${at}.${e.key}")?
+    if (f != "") {
+      inits = append(inits, f)
+    }
+  }
+  if (len(inits) == 0) {
+    return "  let input = ${u.name}{}\n"
+  }
+  let b = Builder()
+  b.write("  let input = ${u.name}{\n")
+  for f of inits {
+    b.write("    ${f},\n")
+  }
+  b.write("  }\n")
+  return b.toString()
+}
+
+// `  vecFn(req, <arg>)` for every string of `items`, one call per item.
+fn eachCall(b: Builder, fnName: string, items: []Json, at: string): ()! {
+  for it of items {
+    b.write(reqCall(fnName, [vecString(needString(it, at)?)], ""))
+  }
+}
+
+fn strKey(c: Json, key: string, at: string): string! {
+  return needString(vecKey(c, key, at)?, at)?
+}
+
+fn stringsOf(c: Json, key: string, at: string): []Json! {
+  return needArray(vecKey(c, key, at)?, at)?
+}
+
+// The query assertion: written when the vector lists, requires or forbids a
+// parameter, then the listed ones are the whole query.
+fn queryExpectation(b: Builder, c: Json, at: string): ()! {
+  let q = stringsOf(c, "queryParams", at)?
+  if (len(q) > 0 ||
+    len(stringsOf(c, "forbidQueryParams", at)?) > 0 ||
+    len(stringsOf(c, "requireQueryParams", at)?) > 0) {
+    b.write(reqCall("vecQuery", [stringListLiteral(vecKey(c, "queryParams", at)?, at)?], ""))
+  }
+  eachCall(b, "vecQueryHas", stringsOf(c, "requireQueryParams", at)?, at)?
+  eachCall(b, "vecQueryLacks", stringsOf(c, "forbidQueryParams", at)?, at)?
+}
+
+// The assertions of one vector, in the order the Smithy test lists them.
+fn expectations(c: Json, at: string): string! {
+  let b = Builder()
+  b.write(reqCall("vecMethod", [vecString(strKey(c, "method", at)?)], ""))
+  b.write(reqCall("vecPath", [vecString(strKey(c, "uri", at)?)], ""))
+  queryExpectation(b, c, at)?
+  for hd of needArray(vecKey(c, "headers", at)?, at)? {
+    let pair = needArray(hd, at)?
+    b.write(
+      reqCall(
+        "vecHeader",
+        [vecString(needString(pair[0], at)?), vecString(needString(pair[1], at)?)],
+        "",
+      ),
+    )
+  }
+  eachCall(b, "vecHeaderHas", stringsOf(c, "requireHeaders", at)?, at)?
+  eachCall(b, "vecHeaderLacks", stringsOf(c, "forbidHeaders", at)?, at)?
+  b.write(reqCall("vecBody", [vecString(strKey(c, "body", at)?)], ""))
+  let host = strKey(c, "host", at)?
+  if (host != "") {
+    b.write(reqCall("vecHost", [vecString(host), vecString(strKey(c, "resolvedHost", at)?)], ""))
+  }
+  return b.toString()
+}
+
+fn reqCaseTest(p: Plan, c: Json, n: int, total: int): string! {
+  let id = needString(vecKey(c, "id", "case")?, "case id")?
+  let at = "vector ${id}"
+  let opName = needString(vecKey(c, "operation", at)?, at)?
+  let u = inputOf(p, opName)?
+  let b = Builder()
+  b.write("test \"restXml request vector ${n} of ${total}: ${id} (${opName})\" {\n")
+  b.write(inputStatement(p, u, vecKey(c, "params", at)?, at)?)
+  b.write("  let req = serialize${u.name}(input) catch e {\n")
+  b.write("    panic(\"${id}: " + interpolation + "\")\n  }\n")
+  b.write(expectations(c, at)?)
+  b.write("  println(\"restXml request vector ${n} of ${total}: ${id}\")\n}\n")
+  return b.toString()
+}
+
+fn reqVectorHeader(root: Json, commit: string, sha: string): string! {
+  let src = needKey(root, "source", "vectors")?
+  let at = needString(needKey(src, "commit", "vectors: source")?, "vectors: source commit")?
+  let dir = needString(needKey(src, "dir", "vectors: source")?, "vectors: source dir")?
+  let filter = needString(needKey(root, "filter", "vectors")?, "vectors: filter")?
+  return headerLines("reqvec", commit, sha) +
+    "// Vectors: github.com/smithy-lang/smithy at commit ${at}, ${dir}.\n" +
+    "// Filter: ${filter}\n\n"
+}
+
+// The vector model's types, enum writers and serializers, as blocks.
+fn reqVectorCode(p: Plan): []string! {
+  let blocks = []string(0)
+  for u of p.units {
+    blocks = append(blocks, renderUnit(p, u)?)
+  }
+  for e of enumWireBlocks(p)? {
+    blocks = append(blocks, e)
+  }
+  for o of requestOpBlocks(p)? {
+    blocks = append(blocks, o)
+  }
+  return blocks
+}
+
+// `gen_reqvec.test.bit` for the vector file text `src` and the S3 model pin.
+fn renderReqVectors(src: string, commit: string, sha: string): GenFile! {
+  let root = jsonParse(src)?
+  let p = planShapes(vectorModel(root)?)?
+  let cases = needArray(needKey(root, "cases", "vectors")?, "vectors: cases")?
+  let b = Builder()
+  b.write(reqVectorHeader(root, commit, sha)?)
+  if (vectorUsesTimestamp(p)) {
+    b.write("import { Timestamp } from \"std/time\"\n\n")
+  }
+  for block of reqVectorCode(p)? {
+    b.write(block + "\n")
+  }
+  let n = 1
+  for c of cases {
+    b.write(reqCaseTest(p, c, n, len(cases))?)
+    if (n < len(cases)) {
+      b.write("\n")
+    }
+    n = n + 1
+  }
+  return GenFile{ name = reqVecTestName, text = b.toString() }
+}
