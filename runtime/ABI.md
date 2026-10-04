@@ -323,7 +323,7 @@ anywhere and leaves every refused shape exactly as it was.
 **What no agreement can rescue.** A method taken as a VALUE is called back
 through `Op.CallValue`'s one-handle convention (`lowerStructMethodValue`,
 `compiler/lowerfuncval.bit`), and an interface method taken as a value gets a
-trampoline whose own `ret` is single-word (`compiler/lowerglobal.bit`); neither
+trampoline whose own `ret` is single-word (`compiler/lowertrampoline.bit`); neither
 call site can know the callee returned words. Those names, and the three
 synthesized ones, are excluded before agreement is computed.
 
