@@ -2790,6 +2790,7 @@ defined exactly once).
 | `bit_rt_string_slice` | `(s: *const RtBytes, lo: usize, hi: usize) -> *const RtBytes` (§2, `s[lo:hi]`; a shared-backing view — header only, `base = s`, no byte copy) |
 | `bit_rt_bytes_from_string` | `(s: *const RtBytes) -> *SliceHeader` (§2, `[]byte(s)`) |
 | `bit_rt_string_from_bytes` | `(h: *const SliceHeader) -> *const RtBytes` (§2, `string(b)`) |
+| `bit_rt_string_from_byte_range` | `(h: *const SliceHeader, lo: usize, hi: usize) -> *const RtBytes` (§2, `string(b[lo:hi])` in one call, #6558: a fresh string holding bytes `lo..hi` of `b`'s view, with no intermediate slice header. Bounds and panic are `bit_rt_slice_slice`'s exactly — a null `h` admits only `[0:0]`, otherwise `0 <= lo <= hi <= cap`, else "slice bounds out of range" — and the caller has already evaluated `b`, `lo`, `hi` in reslice order) |
 | `bit_rt_string_from_int`   | `(v: i64) -> *const RtBytes` (§2, the signed prims i8..i64) |
 | `bit_rt_string_from_uint`  | `(v: u64) -> *const RtBytes` (§2, the unsigned prims u8..u64, zero-extended by the caller) |
 | `bit_rt_string_from_float` | `(v: f64) -> *const RtBytes` (§2)                  |
