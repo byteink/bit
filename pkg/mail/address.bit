@@ -1,0 +1,181 @@
+// pkg/mail/address.bit — `Address` and the two parsers that make one:
+// `parseAddress` for a single mailbox typed into a form field or a config
+// file, `parseAddressList` for a comma-separated list of them.
+//
+// What is accepted is the RFC 5322 §3.4 `mailbox` people actually write, with
+// UTF-8 anywhere (RFC 6532). What is refused is everything a sender never
+// needs and an attacker does: comments, group syntax, domain literals, source
+// routes and every control byte. The grammar lives in addrparse.bit, the
+// encoded-word decoder in encword.bit, the byte classes in addrchars.bit.
+//
+// The email is stored in the form the SMTP envelope carries: an unquoted local
+// part whenever it is a plain dot-atom (`"sara"@x` becomes `sara@x`, so two
+// spellings of one address compare equal), a quoted one only when it must be.
+// The domain is kept exactly as given, case and all: converting an
+// internationalized domain to its ASCII form happens when the message is sent.
+
+import { contains, trimSpace } from "std/strings"
+import { encodeBase64 } from "std/crypto"
+
+// How much of a refused input an error message repeats.
+const echoMax: int = 80
+
+// A mailbox: an optional display name and the address mail is delivered to.
+// `parseAddress` fills both in; `name` is the decoded, UTF-8 text, never the
+// RFC 2047 or quoted form it arrived in.
+export class Address {
+  export name: string
+  export email: string
+
+  // The mailbox as a person writes it: `Sara Ali <sara@example.com>`, or just
+  // `sara@example.com` without a name. A name that needs it is quoted
+  // (`"Ali, Sara" <sara@example.com>`), so the text parses back to this same
+  // Address.
+  export toString(): string {
+    if (this.name == "") {
+      return this.email
+    }
+    return "${displayName(this.name)} <${this.email}>"
+  }
+}
+
+// Whether `name` can stand unquoted: words of letters, digits, dots and the
+// other atext symbols, one space apart.
+fn isPlainName(name: string): bool {
+  let i = 0
+  let prevSpace = true
+  while (i < len(name)) {
+    let c = name[i]
+    if (c == space && prevSpace) {
+      return false
+    }
+    if (c != space && !isAtext(c) && c != dot) {
+      return false
+    }
+    prevSpace = c == space
+    i = i + 1
+  }
+  return !prevSpace
+}
+
+// `name` spelled so `parseAddress` reads back the same text. A name holding
+// `=?` would be decoded as an encoded word on the way back in, so it travels
+// as one encoded word itself.
+fn displayName(name: string): string {
+  if (contains(name, "=?")) {
+    return "=?UTF-8?B?" + encodeBase64([]byte(name)) + "?="
+  }
+  if (isPlainName(name)) {
+    return name
+  }
+  return quoteString(name)
+}
+
+// `s` for an error message: quoted, with every byte that could break a log
+// line escaped, and cut short so a megabyte of junk is not echoed back.
+fn echoInput(s: string): string {
+  let out = Builder()
+  out.writeByte(dq)
+  let n = len(s)
+  if (n > echoMax) {
+    n = echoMax
+    while (n > 0 && s[n] >= u8(128) && s[n] < u8(192)) {
+      n = n - 1
+    }
+  }
+  let i = 0
+  while (i < n) {
+    writeEchoByte(out, s[i])
+    i = i + 1
+  }
+  if (n < len(s)) {
+    out.write("...")
+  }
+  out.writeByte(dq)
+  return out.toString()
+}
+
+fn writeEchoByte(out: Builder, c: u8) {
+  if (c == dq || c == backslash) {
+    out.writeByte(backslash)
+    out.writeByte(c)
+  } else if (c == u8(13)) {
+    out.write("\\r")
+  } else if (c == u8(10)) {
+    out.write("\\n")
+  } else if (c < space || c == u8(127)) {
+    out.write("\\x" + hexByte(c)[2:])
+  } else {
+    out.writeByte(c)
+  }
+}
+
+// The error for `input` and the reason it was refused.
+fn refuse(input: string, reason: string): MailError {
+  return MailError.Invalid("invalid address ${echoInput(input)}: ${reason}")
+}
+
+// The mailboxes of `s`, each trimmed. Refuses an input holding a control byte
+// or invalid UTF-8, and an empty one.
+fn listParts(s: string): []string!MailError {
+  let why = inputFault(s)
+  if (why != "") {
+    fail refuse(s, "the input ${why}")
+  }
+  let t = trimSpace(s)
+  if (t == "") {
+    fail refuse(s, "empty")
+  }
+  let shape = shapeProblem(t)
+  if (shape != "") {
+    fail refuse(s, shape)
+  }
+  let parts = splitList(t)
+  let out: []string = []
+  for p of parts {
+    out = append(out, trimSpace(p))
+  }
+  return out
+}
+
+// One mailbox, its failures worded with the mailbox that caused them.
+fn mailbox(piece: string): Address!MailError {
+  return parseMailbox(piece) catch e {
+    match (e) {
+      Invalid(why) => fail refuse(piece, why)
+    }
+  }
+}
+
+// Parses exactly one mailbox: `sara@example.com`, `Sara <sara@example.com>`,
+// `"Ali, Sara" <sara@example.com>`, `"odd local"@example.com`,
+// `<sara@example.com>`. Surrounding whitespace is ignored.
+//
+// Fails with `MailError.Invalid` naming the input and the reason when the
+// input is empty, has no `@`, holds more than one address, uses group syntax
+// or a comment, contains a CR, LF, NUL or any other control byte, is not valid
+// UTF-8, or has a local part over 64 octets, an address over 254 octets, an
+// empty or over-63-octet domain label, or a domain literal.
+export fn parseAddress(s: string): Address!MailError {
+  let parts = listParts(s)?
+  if (len(parts) > 1) {
+    fail refuse(
+      s,
+      "more than one address (a ',' outside quotes; quote a display name that contains a comma)",
+    )
+  }
+  return mailbox(parts[0])?
+}
+
+// Parses a comma-separated list of mailboxes, in order. A comma inside a quoted
+// display name or an `<...>` does not separate; an empty element (`a@x.com,,
+// b@x.com`) is refused, and so is anything `parseAddress` refuses, naming the
+// mailbox at fault.
+export fn parseAddressList(s: string): []Address!MailError {
+  let parts = listParts(s)?
+  let out: []Address = []
+  for p of parts {
+    out = append(out, mailbox(p)?)
+  }
+  return out
+}
