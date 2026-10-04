@@ -100,8 +100,8 @@ protected route that is not itself doing the authenticating just reads
 
 Every one of these is used in a full example in [`docs/`](docs/README.md),
 along with the security properties this package enforces (PKCE, constant-time
-state comparison, session regeneration, and the Microsoft single-tenant
-restriction).
+state comparison, session regeneration, and Microsoft's per-token tenant
+check).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).

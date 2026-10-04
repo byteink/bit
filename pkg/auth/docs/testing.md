@@ -192,6 +192,14 @@ refetch-on-miss that one built from `JwksSource.Remote` does (a `kid` your fake 
 whatever `fetch` you pass it, `nil` included) - a fake key set is not
 exempt from the cooldown that protects a real JWKS endpoint.
 
+To fake Microsoft's `common` or `organizations` sign-in, write the config
+the same way with `multiTenant = true` and the template
+`https://login.microsoftonline.com/{tenantid}/v2.0` as `issuer`, and sign the
+fake token with a `tid` claim and the matching `iss`; `allowedTenants` on the
+config is the allow-list `OidcOptions.allowedTenants` fills in production. The
+issuer, GUID and allow-list checks run on a fake token exactly as on a real
+one.
+
 Setting `tokenFetch` on a strategy your production code builds is the one
 way to misuse this seam: a strategy is configuration your app builds once
 at startup, so a non-`nil` `tokenFetch` reaching a real deployment means
