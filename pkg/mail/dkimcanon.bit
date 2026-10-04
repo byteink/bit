@@ -1,0 +1,233 @@
+// pkg/mail/dkimcanon.bit — the canonical form DKIM signs (RFC 6376 §3.4), and
+// the split of a rendered message into the header fields and body it feeds.
+//
+// Only the relaxed algorithms are here. Every mainstream signer uses
+// relaxed/relaxed because it survives a relay that re-folds headers or re-pads
+// whitespace, so this package fixes that choice and `simple` is not offered.
+//
+// Both canonicalizers are one pass over the input into one `Builder`: the
+// output is built once, never by repeated concatenation, so the cost is linear
+// in the input however many fields, lines or blank lines it holds. They allocate
+// nothing but that buffer and the returned string.
+
+import { Builder, indexOfFrom } from "std/strings"
+
+const crlf: string = "\r\n"
+const cr: u8 = 13
+const lf: u8 = 10
+const colon: u8 = 58
+
+// RFC 6376 §3.4.2 relaxed header canonicalization of one field: the name in
+// lower case, then `:`, then the value unfolded (a CRLF before WSP is
+// removed), every WSP run collapsed to one SP, and all WSP removed before the
+// colon, after it and at the value's end; the field ends with CRLF.
+//
+// `name` is the text before the colon, with or without the WSP an RFC 5322
+// obsolete field may keep before it; `value` is the raw text after the colon,
+// continuation lines included. Only ASCII letters are lowered: a field name is
+// ASCII, and a byte of any other kind is not ours to rewrite.
+fn relaxedHeader(name: string, value: string): string {
+  let out = Builder()
+  let n = len(name)
+  while (n > 0 && isWs(name[n - 1])) {
+    n = n - 1
+  }
+  let i = 0
+  while (i < n) {
+    out.writeByte(lowerAscii(name[i]))
+    i = i + 1
+  }
+  out.writeByte(colon)
+  writeRelaxedValue(out, value)
+  out.write(crlf)
+  return out.toString()
+}
+
+// Writes `value` with its folds removed and its WSP collapsed. A WSP run is
+// held back as `pending` and written as one SP only when a byte follows it on
+// the value, which is what drops the leading and the trailing run.
+fn writeRelaxedValue(out: Builder, value: string) {
+  let pending = false
+  let started = false
+  let i = 0
+  while (i < len(value)) {
+    let c = value[i]
+    if (isFold(value, i)) {
+      i = i + 2
+    } else if (isWs(c)) {
+      pending = true
+      i = i + 1
+    } else {
+      if (pending && started) {
+        out.writeByte(space)
+      }
+      out.writeByte(c)
+      pending = false
+      started = true
+      i = i + 1
+    }
+  }
+}
+
+// Whether `s[i:]` starts a CRLF that is followed by WSP, which is the only
+// CRLF RFC 5322 §2.2.3 unfolds.
+fn isFold(s: string, i: int): bool {
+  if (i + 2 >= len(s)) {
+    return false
+  }
+  return s[i] == cr && s[i + 1] == lf && isWs(s[i + 2])
+}
+
+fn lowerAscii(c: u8): u8 {
+  if (c >= u8(65) && c <= u8(90)) {
+    return c + u8(32)
+  }
+  return c
+}
+
+// RFC 6376 §3.4.4 relaxed body canonicalization: WSP at the end of a line is
+// dropped, a WSP run inside a line becomes one SP, empty lines at the end of
+// the body are dropped, and a non-empty result ends with exactly one CRLF. An
+// empty body, or one of nothing but empty lines, canonicalizes to the empty
+// string.
+fn relaxedBody(body: string): string {
+  let canon = BodyCanon()
+  let i = 0
+  while (i < len(body)) {
+    if (body[i] == cr && i + 1 < len(body) && body[i + 1] == lf) {
+      canon.endLine()
+      i = i + 2
+    } else {
+      canon.take(body[i])
+      i = i + 1
+    }
+  }
+  canon.finish()
+  return canon.out.toString()
+}
+
+// The state of one relaxed body pass. An empty line is not written when it
+// ends, because it is only kept if a line with text comes after it: `blanks`
+// counts those held back, and a line with text writes them first. A WSP run
+// is held in `pending` the same way, so the one at a line's end is never
+// written.
+class BodyCanon {
+  out: Builder
+  blanks: int
+  pending: bool
+  hasText: bool
+
+  init() {
+    this.out = Builder()
+    this.blanks = 0
+    this.pending = false
+    this.hasText = false
+  }
+
+  // Takes one byte of the current line.
+  take(c: u8) {
+    if (isWs(c)) {
+      this.pending = true
+      return
+    }
+    if (!this.hasText) {
+      this.flushBlanks()
+    }
+    if (this.pending) {
+      this.out.writeByte(space)
+    }
+    this.out.writeByte(c)
+    this.pending = false
+    this.hasText = true
+  }
+
+  // Ends the current line: a line with text is closed, an empty one is held.
+  endLine() {
+    if (this.hasText) {
+      this.out.write(crlf)
+    } else {
+      this.blanks = this.blanks + 1
+    }
+    this.pending = false
+    this.hasText = false
+  }
+
+  // Ends the body, closing a last line the sender left without its CRLF.
+  // Held empty lines are the trailing ones and are dropped.
+  finish() {
+    if (this.hasText) {
+      this.out.write(crlf)
+    }
+  }
+
+  flushBlanks() {
+    while (this.blanks > 0) {
+      this.out.write(crlf)
+      this.blanks = this.blanks - 1
+    }
+  }
+}
+
+// Splits a message into its header fields, in order, and its body.
+//
+// Each field is `(name, value)`: the name is the text before the first colon
+// as written (an obsolete `B : Y` keeps its space, which `relaxedHeader`
+// removes), the value everything after the colon up to the CRLF that ends
+// the field, so continuation lines are inside it with their CRLFs. The body
+// is what follows the first CRLF CRLF, or empty when the message ends with
+// its last field's CRLF.
+//
+// Refused: a field that has no colon or no name, a name with a byte outside
+// printable ASCII, a continuation line with no field before it, and a header
+// section that never ends in CRLF. A message with bare LF line ends is
+// refused too, in the only way a CRLF reader can see it: it has no CRLF.
+fn splitMessage(data: string): ([](string, string), string)!MailError {
+  let headers = [](string, string)(0)
+  let pos = 0
+  while (pos < len(data)) {
+    if (data[pos] == cr && pos + 1 < len(data) && data[pos + 1] == lf) {
+      return (headers, data[pos + 2:])
+    }
+    let end = fieldEnd(data, pos)?
+    headers = append(headers, splitField(data[pos:end])?)
+    pos = end + 2
+  }
+  return (headers, "")
+}
+
+// The index of the CRLF that ends the field starting at `from`: the first CRLF
+// not followed by WSP.
+fn fieldEnd(data: string, from: int): int!MailError {
+  let end = indexOfFrom(data, crlf, from)
+  while (end >= 0 && isFold(data, end)) {
+    end = indexOfFrom(data, crlf, end + 2)
+  }
+  if (end < 0) {
+    fail MailError.Invalid("a header field does not end in CRLF")
+  }
+  return end
+}
+
+// One field's text, without its final CRLF, as `(name, value)`.
+fn splitField(field: string): (string, string)!MailError {
+  let colonAt = indexOfFrom(field, ":", 0)
+  if (colonAt < 0) {
+    fail MailError.Invalid("a header field has no colon")
+  }
+  let name = field[:colonAt]
+  let n = len(name)
+  while (n > 0 && isWs(name[n - 1])) {
+    n = n - 1
+  }
+  if (n == 0) {
+    fail MailError.Invalid("a header field has no name")
+  }
+  let i = 0
+  while (i < n) {
+    if (name[i] < u8(33) || name[i] > u8(126)) {
+      fail MailError.Invalid("a header field name has a byte that is not printable ASCII")
+    }
+    i = i + 1
+  }
+  return (name, field[colonAt + 1:])
+}
