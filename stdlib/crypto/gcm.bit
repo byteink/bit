@@ -31,11 +31,19 @@
 // keystream — GCM's real bulk cost — whenever `encryptBlockInto` itself would
 // take a hardware route: `cipher.hw` (the ARM64 Crypto Extension block path,
 // decided once at key setup in `Aes.init`) or `bit_rt_crypto_aes_hw_available()`
-// (the x86-64 AES-NI flag, still unimplemented per #1223 and so always false
-// today). `aes.bit` already declared `bit_rt_crypto_aes_hw_available` for
-// (siblings share one module, so it needs no re-declaration here); see that
-// file and ABI.md §21b.
+// (x86-64 AES-NI, `runtime/cryptohw/x64aes.bit`, #7390), whose GCTR runs
+// through the multi-block `bit_rt_crypto_aes_ctr32_hw`. `aes.bit` already
+// declared `bit_rt_crypto_aes_hw_available` (siblings share one module, so it
+// needs no re-declaration here); see that file and ABI.md §21b.
 extern fn bit_rt_crypto_ghash_hw_available(): bool
+extern fn bit_rt_crypto_aes_ctr32_hw(
+  rk: *byte,
+  nr: int,
+  ctr: *byte,
+  src: *byte,
+  dst: *byte,
+  blocks: int,
+)
 extern fn bit_rt_crypto_ghash_mul_hw(
   acc0: uint,
   acc1: uint,
@@ -332,14 +340,51 @@ fn gcmCounterAfter(ctr: []byte, j0: []byte) {
   gcmInc32(ctr)
 }
 
-// Whether `gcmGctr` should take the per-block hardware route through
-// `encryptBlockInto` rather than the bitsliced software keystream:
-// `cipher.hw` (the ARM64 Crypto Extension block path) or
-// `bit_rt_crypto_aes_hw_available()` (the x86-64 AES-NI flag). Split out of
-// `gcmGctr` itself to keep its own cyclomatic complexity under the file's
-// lint ceiling — this is a pure predicate with no other caller.
-fn gcmGctrUsesHw(cipher: Aes): bool {
-  return cipher.hw || bit_rt_crypto_aes_hw_available()
+// GCTR over `data` into `out` one hardware block call per counter block, the
+// ARM64 Crypto Extension route (`cipher.hw`), and the trailing partial block
+// of the AES-NI route. Arguments as `gcmGctrInto`.
+fn gcmGctrBlocks(out: []byte, cipher: Aes, counter: []byte, ks: []byte, data: []byte) {
+  let off = 0
+  while (off < len(data)) {
+    cipher.encryptBlockInto(ks, counter)
+    gcmInc32(counter)
+    let n = len(data) - off
+    if (n > 16) {
+      n = 16
+    }
+    let k = 0
+    while (k < n) {
+      out[off + k] = data[off + k] ^ ks[k]
+      k = k + 1
+    }
+    off = off + 16
+  }
+}
+
+// GCTR on x86-64 AES-NI: every full block in one `bit_rt_crypto_aes_ctr32_hw`
+// call, which pipelines four counter blocks per round key and XORs in the
+// same pass, then the trailing partial block through `gcmGctrBlocks`.
+// Arguments as `gcmGctrInto`.
+fn gcmGctrAesNi(out: []byte, cipher: Aes, counter: []byte, ks: []byte, data: []byte) {
+  let full = len(data) / 16
+  if (full > 0) {
+    bit_rt_crypto_aes_ctr32_hw(
+      ptrOf(cipher.roundKeys),
+      cipher.nr,
+      ptrOf(counter),
+      ptrOf(data),
+      ptrOf(out),
+      full,
+    )
+  }
+  let off = full * 16
+  if (off < len(data)) {
+    gcmGctrBlocks(out[off:len(data)], cipher, counter, ks, data[off:len(data)])
+  }
+  keepAlive(cipher.roundKeys)
+  keepAlive(counter)
+  keepAlive(data)
+  keepAlive(out)
 }
 
 // GCTR keystream into `out` (exactly `len(data)` bytes): encipher `counter`,
@@ -356,27 +401,12 @@ fn gcmGctrUsesHw(cipher: Aes): bool {
 // `gcmInc32` per block), so ciphertext is unchanged. Lanes past the data end
 // still get a valid (advanced) counter but their keystream is simply not used.
 fn gcmGctrInto(out: []byte, cipher: Aes, counter: []byte, ks: []byte, data: []byte) {
-  if (gcmGctrUsesHw(cipher)) {
-    // One hardware block encrypt per counter block (ARM64 Crypto Extension
-    // via `cipher.hw`, or x86-64 AES-NI once #1223 lands) beats even the
-    // bitsliced 4-wide software keystream by a wide margin, so prefer it
-    // outright rather than only accelerating the scalar path below.
-    // `encryptBlockInto` itself picks the right hardware primitive.
-    let off = 0
-    while (off < len(data)) {
-      cipher.encryptBlockInto(ks, counter)
-      gcmInc32(counter)
-      let n = len(data) - off
-      if (n > 16) {
-        n = 16
-      }
-      let k = 0
-      while (k < n) {
-        out[off + k] = data[off + k] ^ ks[k]
-        k = k + 1
-      }
-      off = off + 16
-    }
+  if (cipher.hw) {
+    gcmGctrBlocks(out, cipher, counter, ks, data)
+    return
+  }
+  if (bit_rt_crypto_aes_hw_available()) {
+    gcmGctrAesNi(out, cipher, counter, ks, data)
     return
   }
 
@@ -413,11 +443,13 @@ fn gcmGctrInto(out: []byte, cipher: Aes, counter: []byte, ks: []byte, data: []by
   }
 }
 
-// Whether `gcmMulHWords` is taking the PCLMULQDQ hardware path on this host
-// (task #1223) rather than the shift-and-xor software path — a diagnostic
-// query, like `hwAvailableAes` (aes.bit); the dispatch itself is transparent.
+// Whether GCM's GHASH runs on a hardware carry-less multiply on this host
+// (PCLMULQDQ on x86-64, PMULL on arm64; `hwPmull()`, the flag `AesGcm`
+// caches) rather than the constant-time shift-and-xor software path — a
+// diagnostic query, like `hwAvailableAes` (aes.bit); the dispatch itself is
+// transparent.
 export fn hwAvailableGhash(): bool {
-  return bit_rt_crypto_ghash_hw_available()
+  return hwPmull()
 }
 
 // The per-call work area `sealInto`/`openInto` carve five 16-byte blocks from:
