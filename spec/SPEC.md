@@ -174,7 +174,7 @@ unaffected, since only the root module's link names are left bare.
 - Types: `i8 i16 i32 i64  u8 u16 u32 u64  f32 f64  decimal  int uint  byte rune  bool string  error`
 - Constants: none beyond the `true`/`false`/`nil` literals.
 - Builtin functions: `len cap append delete close panic assert` (§16),
-  and `parseFloat` (below).
+  and `parseFloat` and `umulHi` (below).
 
 `int` is an alias for `i64`; `uint` for `u64`; `byte` for `u8`; `rune` for `i32`.
 Sizes are fixed on every target for deterministic behavior (this is not Go's
@@ -236,6 +236,14 @@ without breaking every caller, and NaN is already the IEEE 754 value reserved fo
 "not a number". Returning `0.0` - which earlier implementations did - made a bad
 parse indistinguishable from a good one, silently turning every malformed numeric
 field into zero.
+
+**`umulHi(a: u64, b: u64) -> u64`** is the high 64 bits of the full 128-bit
+product of `a` and `b`; the low 64 bits are the ordinary wrapping `a * b`, so the
+pair is the whole product (`std/math`'s `mul64` returns both). It compiles to one
+instruction - AArch64 `UMULH`, x86-64 one-operand `MUL` - with no call, no
+allocation and no safepoint, so it is admitted inside `@nosplit`. Both
+instructions take the same time for every operand value, which is what makes it
+usable in constant-time code.
 
 ### 5.4 Integer Literals
 
