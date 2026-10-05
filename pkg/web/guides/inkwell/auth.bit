@@ -24,13 +24,14 @@
 import { conflict, forbidden, minLen, unauthorized } from "web"
 import {
   Identity, Lookup, LookupResult, OidcOptions, OidcStrategy, Provider, Strategy, beginAuthorization,
-  currentIdentity, handleCallback, hashPassword, PasswordStrategy, requireAuth,
+  InvalidRefreshToken, RefreshRecord, RefreshTokens, currentIdentity, handleCallback, hashPassword,
+  PasswordStrategy, requireAuth,
 } from "auth"
 import { UniqueViolation, classify } from "orm"
 import { jsonDecString, jsonGet } from "std/json"
 import { isSome, unwrap } from "std/core"
 import { SigningKey, VerifyKey, defaultClaimsOptions, sign, verifyToken } from "std/jwt"
-import { digest, encodeHex, randomBytes, systemRoots, Sha256 } from "std/crypto"
+import { systemRoots } from "std/crypto"
 import { TlsConfig } from "std/tls"
 import { hasPrefix } from "std/strings"
 
@@ -42,7 +43,6 @@ const sessionRoleKey = "inkwell:role"
 // tokens (`POST /auth/token/refresh`), plus Sign in with Google.
 const bearerPrefix = "Bearer "
 const accessTokenTtlSeconds = 900
-const refreshTokenTtlSeconds = 30 * 24 * 3600
 
 // `pkg/auth`'s `Lookup` — the seam `PasswordStrategy` calls with the
 // POST body's `username`, per pkg/auth/docs/getting-started.md.
@@ -180,101 +180,132 @@ export @json class TokenResponse {
   expiresIn: int,
 }
 
-// SHA-256 hex of a raw opaque token — "hashed at rest", never the token
-// itself, the same discipline `users.password_hash` already carries.
-// Looked up by exact match (a unique index on `token_hash`), not a
-// constant-time compare: the attacker-controlled input here is a whole
-// 256-bit token an index lookup either has or does not have, not a
-// byte-by-byte secret comparison the way a password check is.
-fn hashToken(raw: string): string {
-  return encodeHex(digest(Sha256(), []byte(raw)))
-}
-
-// 256 bits of CSPRNG output, hex-encoded — the same "high-entropy random
-// string" `oidc_authorize.bit`'s own PKCE `code_verifier` draws, sized for
-// a token nothing ever asks a human to type.
-fn randomToken(): string {
-  return encodeHex(randomBytes(32))
-}
-
-// `refresh_tokens` — `rotated` is `0`/`1` (an `i64`), matching
-// `db.bit`'s `t.int("rotated")` column, not a native `boolean` one.
-@table("refresh_tokens") class RefreshToken {
+// `refresh_tokens` — one row per refresh token, the shape of pkg/auth's
+// `RefreshRecord`. `revoked` is `0`/`1` (an `i64`), matching the migration's
+// `t.int("revoked")` column, not a native `boolean` one; `rotatedAt` is `0`
+// while the token has not been exchanged.
+@table("refresh_tokens") class RefreshRow {
   id: i64,
-  userId: i64,
   tokenHash: string,
+  family: string,
+  subject: string,
   expiresAt: i64,
-  rotated: i64,
-  createdAt: i64,
+  familyExpiresAt: i64,
+  rotatedAt: i64,
+  revoked: i64,
+  data: string,
 }
 
-fn insertRefreshToken(db: Db, userId: i64, tokenHash: string, expiresAt: i64): ()! {
-  db.table<RefreshToken>().insert(
-    RefreshToken{
-      id = 0, userId = userId, tokenHash = tokenHash, expiresAt = expiresAt, rotated = 0,
-      createdAt = now().ns,
-    },
-  )?
-}
-
-fn findRefreshTokenByHash(db: Db, tokenHash: string): RefreshToken! {
-  let found = db.table<RefreshToken>().where("tokenHash", tokenHash).first()?
-  if (!isSome(found)) {
-    fail newError("no refresh token with that hash")
+fn toRefreshRow(rec: RefreshRecord): RefreshRow {
+  let revoked: i64 = 0
+  if (rec.revoked) {
+    revoked = 1
   }
-  return unwrap(found)
+  return RefreshRow{
+    id = 0, tokenHash = rec.hash, family = rec.family, subject = rec.subject,
+    expiresAt = rec.expiresAt, familyExpiresAt = rec.familyExpiresAt, rotatedAt = rec.rotatedAt,
+    revoked = revoked, data = rec.data,
+  }
 }
 
-fn markRefreshTokenRotated(db: Db, id: i64): ()! {
-  db.table<RefreshToken>().where("id", id).set("rotated", 1).updateAll()?
+fn toRefreshRecord(row: RefreshRow): RefreshRecord {
+  return RefreshRecord{
+    hash = row.tokenHash, family = row.family, subject = row.subject, expiresAt = row.expiresAt,
+    familyExpiresAt = row.familyExpiresAt, rotatedAt = row.rotatedAt, revoked = row.revoked != 0,
+    data = row.data,
+  }
 }
 
-// Issues an access token plus a fresh refresh token for `u`, storing the
-// refresh token's hash — the one place both `issueTokens` (login) and
-// `refreshTokenRoute` (rotation) build a `TokenResponse` from, so the two
-// can never drift.
-fn issueTokenPair(db: Db, u: User, jwtSecret: string): TokenResponse! {
-  let access = issueAccessToken(u, jwtSecret)?
-  let raw = randomToken()
-  let expiresAt = now().ns / Second + refreshTokenTtlSeconds
-  insertRefreshToken(db, u.id, hashToken(raw), expiresAt)?
+// pkg/auth's `RefreshStore` over the `refresh_tokens` table
+// (pkg/auth/docs/refresh-tokens.md, "Your own store"). Every method is one
+// statement except `rotate`, which is the one that has to be atomic.
+class OrmRefreshStore {
+  db: Db
+
+  init(db: Db) {
+    this.db = db
+  }
+
+  export insert(rec: RefreshRecord): ()! {
+    this.db.table<RefreshRow>().insert(toRefreshRow(rec))?
+  }
+
+  export findByHash(hash: string): Option<RefreshRecord>! {
+    let found = this.db.table<RefreshRow>().where("tokenHash", hash).first()?
+    if (!isSome(found)) {
+      return Option.None
+    }
+    return Option.Some(toRefreshRecord(unwrap(found)))
+  }
+
+  // The conditional UPDATE and the INSERT of the next token are one
+  // transaction, and the UPDATE's row count is the answer: of two requests
+  // rotating one token, Postgres lets the second UPDATE re-check the WHERE
+  // after the first commits, finds `rotated_at` set, and touches no row. A
+  // SELECT then an UPDATE would let both win. `db.tx` hands no value back
+  // (15-transactions.md), so the answer travels out in `won`.
+  export rotate(oldHash: string, next: RefreshRecord, at: i64): bool! {
+    let won = []bool{ false }
+    this.db.tx((tx) => {
+      let row = tx.table<RefreshRow>().where("tokenHash", oldHash)
+      let n = row.where("rotatedAt", 0).where("revoked", 0).set("rotatedAt", at).updateAll()?
+      if (n == 0) {
+        return
+      }
+      tx.table<RefreshRow>().insert(toRefreshRow(next))?
+      won[0] = true
+    })?
+    return won[0]
+  }
+
+  export revokeFamily(family: string): ()! {
+    this.db.table<RefreshRow>().where("family", family).set("revoked", 1).updateAll()?
+  }
+
+  export revokeSubject(subject: string): ()! {
+    this.db.table<RefreshRow>().where("subject", subject).set("revoked", 1).updateAll()?
+  }
+}
+
+fn tokenResponse(access: string, refresh: string): TokenResponse {
   return TokenResponse{
-    accessToken = access, refreshToken = raw, tokenType = "Bearer",
+    accessToken = access, refreshToken = refresh, tokenType = "Bearer",
     expiresIn = accessTokenTtlSeconds,
   }
 }
 
 // `POST /auth/token`: the same `Strategy.authenticate(c)` `login` uses —
 // same `Credentials` body, same Argon2id check — but issues a bearer token
-// pair instead of a cookie session.
-fn issueTokens(c: Ctx, db: Db, strategy: Strategy, jwtSecret: string): Res! {
+// pair instead of a cookie session. `tokens.issue` starts a new refresh
+// family: this login.
+fn issueTokens(c: Ctx, db: Db, tokens: RefreshTokens, strategy: Strategy, jwtSecret: string): Res! {
   let identity = strategy.authenticate(c)?
-  let uid = parseId(identity.id)?
-  let u = findUserById(db, uid)?
-  return c.json(issueTokenPair(db, u, jwtSecret)?)
+  let u = findUserById(db, parseId(identity.id)?)?
+  let refresh = tokens.issue("${u.id}")?
+  return c.json(tokenResponse(issueAccessToken(u, jwtSecret)?, refresh))
 }
 
 export @json class RefreshInput {
   refreshToken: string,
 }
 
-// `POST /auth/token/refresh` (part 35): single-use rotation — a refresh
-// token already marked `rotated` is refused outright, closing the replay
-// window a stolen-and-reused refresh token would otherwise open.
-fn refreshTokenRoute(c: Ctx, db: Db, jwtSecret: string): Res! {
+// `POST /auth/token/refresh` (part 35): `tokens.rotate` swaps the presented
+// refresh token for the next one in its family. A token that is unknown,
+// expired, revoked or already rotated is one `InvalidRefreshToken` and one
+// 401 message — presenting a rotated one also revokes the whole family
+// (RFC 9700 section 4.14, pkg/auth/docs/refresh-tokens.md). Anything else
+// is the store's failure and propagates as a 500.
+fn refreshTokenRoute(c: Ctx, db: Db, tokens: RefreshTokens, jwtSecret: string): Res! {
   let input = c.body<RefreshInput>()?
-  let row = findRefreshTokenByHash(db, hashToken(input.refreshToken)) catch _ {
-    fail unauthorized("invalid refresh token")
+  let next = tokens.rotate(input.refreshToken) catch e {
+    let (_, invalid) = e.(InvalidRefreshToken)
+    if (invalid) {
+      fail unauthorized("invalid refresh token")
+    }
+    fail e
   }
-  if (row.rotated != 0) {
-    fail unauthorized("refresh token already used")
-  }
-  if (now().ns / Second > row.expiresAt) {
-    fail unauthorized("refresh token expired")
-  }
-  markRefreshTokenRotated(db, row.id)?
-  let u = findUserById(db, row.userId)?
-  return c.json(issueTokenPair(db, u, jwtSecret)?)
+  let u = findUserById(db, parseId(next.subject)?)?
+  return c.json(tokenResponse(issueAccessToken(u, jwtSecret)?, next.token))
 }
 
 fn showApiMe(c: Ctx, db: Db): Res! {
@@ -355,14 +386,15 @@ fn googleCallback(c: Ctx, db: Db, cfg: AppConfig): Res! {
   return c.noContent()
 }
 
-export fn mountAuth(app: App, db: Db, cfg: AppConfig) {
+export fn mountAuth(app: App, db: Db, cfg: AppConfig): ()! {
+  let tokens = RefreshTokens(OrmRefreshStore(db))?
   let strategy = PasswordStrategy(userLookup(db))
   let bearer = BearerStrategy(cfg.jwtSecret)
   app.post("/auth/register", (c) => register(c, db))
   app.post("/auth/login", (c) => login(c, strategy))
   app.post("/auth/logout", (c) => logout(c))
-  app.post("/auth/token", (c) => issueTokens(c, db, strategy, cfg.jwtSecret))
-  app.post("/auth/token/refresh", (c) => refreshTokenRoute(c, db, cfg.jwtSecret))
+  app.post("/auth/token", (c) => issueTokens(c, db, tokens, strategy, cfg.jwtSecret))
+  app.post("/auth/token/refresh", (c) => refreshTokenRoute(c, db, tokens, cfg.jwtSecret))
   app.get("/auth/google", (c) => googleBegin(c, cfg))
   app.get("/auth/google/callback", (c) => googleCallback(c, db, cfg))
   app.get("/me", (c) => showMe(c, db))

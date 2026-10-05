@@ -227,6 +227,12 @@ SHA-256 hash of the token:
 - `revokeFamily(family)` and `revokeSubject(subject)` set `revoked` on every
   matching record.
 
+Inkwell's own store, `OrmRefreshStore` in `pkg/web/guides/inkwell/auth.bit`,
+is the SQL version of this: one `refresh_tokens` row per record, and a `rotate`
+that runs the conditional `UPDATE` and the `INSERT` of the next token inside one
+`db.tx`, answering `true` only when the `UPDATE` touched a row. Its test starts
+sixteen rotations of one token at once and checks that exactly one wins.
+
 The store only ever sees hashes. This one wraps another store and counts the
 rotations, the shape of any decorator, an audit log or a metrics hook:
 
