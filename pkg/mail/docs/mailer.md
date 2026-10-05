@@ -289,6 +289,7 @@ fn advice(e: MailError): string {
     Config(why) => return "fix the setup: ${why}"
     Auth(r) => return "check the credentials: ${r.toString()}"
     Rejected(r) => return "do not retry: ${r.toString()}"
+    Signature(why) => return "answer 401: ${why}"
     Transient(r) => return "retry later: ${r.toString()}"
   }
 }
@@ -304,12 +305,14 @@ fn main(): ()! {
 * **`Config`**: the setup is wrong; raised by `Mailer(...)`.
 * **`Auth`**: the server refused the login. Nothing was sent.
 * **`Rejected`**: the server refused the message or its recipients for good.
+* **`Signature`**: a webhook posted to your program failed its signature
+  check; see [Webhooks](webhooks.md). It is not about a send.
 * **`Transient`**: the server cannot take it now. This is the only variant a
   retry is for, and `send` already retries it; see [Retries and pace](retry.md).
 
-The first two carry text naming the field; the last three carry the server's
-`Reply`: its `code`, its `enhanced` status code (`""` when it sent none) and its
-`text`.
+`Invalid`, `Config` and `Signature` carry text naming the field or the reason;
+`Auth`, `Rejected` and `Transient` carry the server's `Reply`: its `code`, its
+`enhanced` status code (`""` when it sent none) and its `text`.
 
 ## Where to go next
 

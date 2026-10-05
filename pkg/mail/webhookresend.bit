@@ -1,0 +1,311 @@
+// pkg/mail/webhookresend.bit — Resend's webhooks: the Svix signature
+// (Standard Webhooks, https://www.standardwebhooks.com) and the event JSON.
+//
+// A request carries `svix-id`, `svix-timestamp` and `svix-signature` (the
+// Standard Webhooks names `webhook-id`, `webhook-timestamp` and
+// `webhook-signature` are read too, `svix-` first). The signature is
+// HMAC-SHA256 over `<id>.<timestamp>.<body>` keyed with the base64-decoded
+// secret after its `whsec_` prefix. The header holds space-separated
+// `<version>,<base64>` entries so a secret can be rotated without downtime;
+// any `v1` entry that matches passes, other versions are skipped. The tags are
+// compared in constant time (`hmacEqual`) and the timestamp must be within 5
+// minutes of now, which bounds a replay.
+
+import { decodeBase64, hmac, hmacEqual, HashAlg } from "std/crypto"
+import { jsonAsArray, jsonAsString, jsonGet, jsonParse, Json } from "std/json"
+import { hasPrefix, parseInt, split, toLower } from "std/strings"
+import { Second, parseRfc3339 } from "std/time"
+
+const secretPrefix: string = "whsec_"
+const toleranceNs: int = 300 * Second
+// Ten digits is a timestamp to the year 2286; more could overflow `parseInt`.
+const maxTimestampDigits: int = 10
+// A Svix signature header holds one entry per active secret, never hundreds.
+const maxSignatureEntries: int = 16
+
+// A rejected webhook as the typed error; `why` never holds the secret or the
+// body.
+fn webhookRejected(why: string): MailError {
+  return MailError.Signature(why)
+}
+
+// The HMAC key inside `secret` (`whsec_<base64>`). It fails with a `Config` for
+// a secret that is empty, lacks the prefix or does not decode, and the text
+// never repeats the secret.
+fn svixKey(secret: string): []byte!MailError {
+  if (!hasPrefix(secret, secretPrefix) || len(secret) == len(secretPrefix)) {
+    fail MailError.Config("the Resend webhook secret must be the whsec_ value from the dashboard")
+  }
+  let key = decodeBase64(secret[len(secretPrefix):]) catch _ {
+    fail MailError.Config("the Resend webhook secret is not whsec_ followed by base64")
+  }
+  return key
+}
+
+// The header `name` for Resend (`svix-<name>`) or, when that is absent, for
+// Standard Webhooks (`webhook-<name>`).
+fn svixHeader(header: (string) => string, name: string): string {
+  let v = header("svix-${name}")
+  if (v != "") {
+    return v
+  }
+  return header("webhook-${name}")
+}
+
+// The seconds in the `svix-timestamp` text `s`: ASCII digits only, so a sign, a
+// space or a fraction is refused and the text signed is the text parsed.
+fn svixSeconds(s: string): int!MailError {
+  if (s == "" || len(s) > maxTimestampDigits) {
+    fail webhookRejected("timestamp is not a Unix time in seconds")
+  }
+  for c of []byte(s) {
+    if (c < '0' || c > '9') {
+      fail webhookRejected("timestamp is not a Unix time in seconds")
+    }
+  }
+  return parseInt(s) catch _ {
+    fail webhookRejected("timestamp is not a Unix time in seconds")
+  }
+}
+
+// Whether `entry`, one `<version>,<base64>` item of the signature header, is a
+// `v1` signature equal to `want`.
+fn svixEntryMatches(entry: string, want: []byte): bool {
+  let parts = split(entry, ",")
+  if (len(parts) != 2 || parts[0] != "v1") {
+    return false
+  }
+  let got = decodeBase64(parts[1]) catch _ {
+    return false
+  }
+  return hmacEqual(got, want)
+}
+
+// Whether any entry of the space-separated signature header `sigs` matches
+// `want`. Every entry up to the cap is tried; the loop does not stop at the
+// first mismatch so the work does not depend on which entry matches.
+fn svixAnyMatch(sigs: string, want: []byte): bool {
+  let entries = split(sigs, " ")
+  let ok = false
+  let n = len(entries)
+  if (n > maxSignatureEntries) {
+    n = maxSignatureEntries
+  }
+  let i = 0
+  while (i < n) {
+    if (entries[i] != "" && svixEntryMatches(entries[i], want)) {
+      ok = true
+    }
+    i = i + 1
+  }
+  return ok
+}
+
+// Checks the request is a genuine, recent Resend delivery and returns its
+// `svix-id`. The order is cheapest first: headers, then the clock, then the
+// HMAC.
+fn svixVerify(
+  header: (string) => string,
+  body: string,
+  key: []byte,
+  at: Timestamp,
+): string!MailError {
+  let id = svixHeader(header, "id")
+  let ts = svixHeader(header, "timestamp")
+  let sigs = svixHeader(header, "signature")
+  if (id == "") {
+    fail webhookRejected("svix-id header is missing")
+  }
+  if (ts == "") {
+    fail webhookRejected("svix-timestamp header is missing")
+  }
+  if (sigs == "") {
+    fail webhookRejected("svix-signature header is missing")
+  }
+  let sent = svixSeconds(ts)? * Second
+  let skew = at.ns - sent
+  if (skew > toleranceNs || skew < 0 - toleranceNs) {
+    fail webhookRejected("timestamp is more than 5 minutes from now")
+  }
+  let want = hmac(HashAlg.Sha256, key, []byte("${id}.${ts}.${body}"))
+  if (!svixAnyMatch(sigs, want)) {
+    fail webhookRejected("signature does not match")
+  }
+  return id
+}
+
+// The string member `key` of `o`, "" when `o` has none or it is not a string.
+fn rsText(o: Json, key: string): string {
+  let v = jsonGet(o, key)
+  if (!isSome(v)) {
+    return ""
+  }
+  let s = jsonAsString(unwrap(v))
+  if (!isSome(s)) {
+    return ""
+  }
+  return unwrap(s)
+}
+
+// The Resend event types this package maps, and the `EventKind` of each at the
+// same index. Every other type is ignored.
+const rsTypes: []string = [
+  "email.delivered", "email.delivery_delayed", "email.bounced", "email.complained", "email.failed",
+  "email.suppressed", "email.opened", "email.clicked",
+]
+
+fn rsKinds(): []EventKind {
+  return [
+    EventKind.Delivered, EventKind.Deferred, EventKind.Bounced, EventKind.Complained, EventKind.Rejected,
+    EventKind.Rejected, EventKind.Opened, EventKind.Clicked,
+  ]
+}
+
+// The `EventKind` of the Resend event type `t`, `None` for one not mapped.
+fn rsKind(t: string): Option<EventKind> {
+  let kinds = rsKinds()
+  let i = 0
+  while (i < len(rsTypes)) {
+    if (rsTypes[i] == t) {
+      return Option.Some(kinds[i])
+    }
+    i = i + 1
+  }
+  return Option.None
+}
+
+// The Message-ID of the mail: `data.message_id`, else the `Message-ID` entry of
+// `data.headers` (a list of `{name, value}`), else "".
+fn rsMessageId(data: Json): string {
+  let direct = rsText(data, "message_id")
+  if (direct != "") {
+    return direct
+  }
+  let h = jsonGet(data, "headers")
+  if (!isSome(h)) {
+    return ""
+  }
+  let list = jsonAsArray(unwrap(h))
+  if (!isSome(list)) {
+    return ""
+  }
+  for e of unwrap(list) {
+    if (toLower(rsText(e, "name")) == "message-id") {
+      return rsText(e, "value")
+    }
+  }
+  return ""
+}
+
+// The provider's explanation: the `message` or `reason` of the `bounce`,
+// `failed` or `suppressed` object, whichever the event has.
+fn rsReason(data: Json): string {
+  for k of ["bounce", "failed", "suppressed"] {
+    let o = jsonGet(data, k)
+    if (isSome(o)) {
+      let why = rsText(unwrap(o), "message") + rsText(unwrap(o), "reason")
+      if (why != "") {
+        return why
+      }
+    }
+  }
+  return ""
+}
+
+// Whether a bounce is for good: Resend's `bounce.type` says `Permanent` or
+// `Temporary`; with none it is taken as permanent, the safe side for a
+// suppression list.
+fn rsPermanent(kind: EventKind, data: Json): bool {
+  match (kind) {
+    Bounced => {
+      let b = jsonGet(data, "bounce")
+      if (!isSome(b)) {
+        return true
+      }
+      let t = rsText(unwrap(b), "type")
+      return t == "" || t == "Permanent"
+    }
+    _ => return false
+  }
+}
+
+// The instant of the event: the payload's `created_at`, else the delivery time.
+fn rsAt(j: Json, fallback: Timestamp): Timestamp {
+  let s = rsText(j, "created_at")
+  if (s == "") {
+    return fallback
+  }
+  return parseRfc3339(s) catch _ {
+    return fallback
+  }
+}
+
+// The addresses in `data.to`; a missing list is none, anything else than a list
+// of strings is a malformed payload.
+fn rsRecipients(data: Json): []string!MailError {
+  let to = jsonGet(data, "to")
+  if (!isSome(to)) {
+    return []
+  }
+  let list = jsonAsArray(unwrap(to))
+  if (!isSome(list)) {
+    fail MailError.Invalid("Resend webhook data.to is not a list")
+  }
+  let out: []string = []
+  for r of unwrap(list) {
+    let s = jsonAsString(r)
+    if (!isSome(s)) {
+      fail MailError.Invalid("Resend webhook data.to holds something that is not an address")
+    }
+    out = append(out, unwrap(s))
+  }
+  return out
+}
+
+// The events of the verified Resend payload `j`: one per address in `data.to`.
+fn rsBuild(j: Json, deliveryId: string, delivered: Timestamp): []Event!MailError {
+  let kind = rsKind(rsText(j, "type"))
+  if (!isSome(kind)) {
+    return []
+  }
+  let d = jsonGet(j, "data")
+  if (!isSome(d)) {
+    fail MailError.Invalid("Resend webhook has no data object")
+  }
+  let data = unwrap(d)
+  let k = unwrap(kind)
+  let out: []Event = []
+  for to of rsRecipients(data)? {
+    out = append(
+      out,
+      Event{
+        kind = k,
+        recipient = to,
+        messageId = rsMessageId(data),
+        providerId = rsText(data, "email_id"),
+        deliveryId = deliveryId,
+        at = rsAt(j, delivered),
+        permanent = rsPermanent(k, data),
+        reason = rsReason(data),
+        provider = Provider.Resend,
+      },
+    )
+  }
+  return out
+}
+
+// `parseEvents` for Resend at the instant `at`: the signature first, then the
+// JSON.
+fn resendEvents(
+  header: (string) => string,
+  body: string,
+  secret: string,
+  at: Timestamp,
+): []Event!MailError {
+  let key = svixKey(secret)?
+  let id = svixVerify(header, body, key, at)?
+  let j = jsonParse(body) catch _ {
+    fail MailError.Invalid("Resend webhook body is not valid JSON")
+  }
+  return rsBuild(j, id, at)?
+}

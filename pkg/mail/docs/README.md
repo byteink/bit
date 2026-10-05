@@ -13,5 +13,6 @@ bitlang.org's sidebar reads it in.
 | [Sending for real](open.md) | `open` on Inkwell's production setup: `smtps://` and `smtp://` URLs, STARTTLS that is required and never optional, `tls=off` for a local catcher, `caFile` and `serverName` for a private CA, how server answers map to `MailError` |
 | [Signing your mail](dkim.md) | `Options.dkim` and `Dkim` on Inkwell's publish mail: RSA and Ed25519 keys, what is checked at startup, DMARC alignment per message, providers that sign for you |
 | [Retries and pace](retry.md) | `Options.retry`, `Retry`, `Options.rate` and `Reply.retryAfter` on Inkwell's publish mail: which failures repeat, full-jitter backoff, a server's Retry-After, a token bucket under the provider's limit |
+| [Webhooks](webhooks.md) | `parseEvents`, `Event`, `EventKind` and `Provider` on Inkwell's suppression list: Resend's Svix signature, the 5 minute window, de-duplicating on `deliveryId`, what each Resend event becomes |
 
 See the [package front page](../README.md) for install and a minimal example.
