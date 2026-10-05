@@ -1,0 +1,476 @@
+// pkg/auth/mfa.test.bit — #6954's acceptance: a password-only (pending) session
+// is refused by every reader of the session identity with 401
+// `second_factor_required`; `completeSecondFactor` verifies, regenerates the
+// session id and promotes; a wrong or replayed code does not; the second step is
+// throttled; the pending state expires.
+//
+// Every test goes through `app.handle(req)` with the cookie the previous response
+// armed, the way a browser would. `App`, `Config`, `MemoryStore`, `Request`,
+// `Response`, `split`, `AlwaysFail` and `AlwaysOk` come from middleware.test.bit,
+// `FakeClock`, `FakeStore`, `fakeStore`, `freshClock` and `throttleOn` from
+// throttle.test.bit (one module); the throttle's clock is moved by hand.
+
+const mfIp = "10.0.0.7"
+
+// What the code route reads: `{"code": "123456"}`.
+@json class MfCode {
+  code: string,
+}
+
+// The enrolled secrets and last accepted counters of the app's users.
+class MfUsers {
+  secret: Secret,
+  last: map<string, uint>,
+  advances: int,
+}
+
+fn mfUsers(): MfUsers {
+  return MfUsers{
+    secret = Secret{ key = []byte("12345678901234567890") },
+    last = map<string, uint>(),
+    advances = 0,
+  }
+}
+
+// A `TotpFactorOptions` over `u`, throttled by `t`. The counter callbacks are
+// the compare-and-set an application's database would do in one statement.
+fn mfOptions(u: MfUsers, t: LoginThrottle): TotpFactorOptions {
+  let last: (string) => uint! = (id) => {
+    let (v, ok) = u.last[id]
+    if (!ok) {
+      return 0
+    }
+    return v
+  }
+  let advance: (string, uint) => bool! = (id, counter) => {
+    let (v, ok) = u.last[id]
+    if (ok && counter <= v) {
+      return false
+    }
+    u.last[id] = counter
+    u.advances = u.advances + 1
+    return true
+  }
+  return TotpFactorOptions{
+    throttle = Option<LoginThrottle>.Some(t),
+    lastCounter = last,
+    advanceCounter = advance,
+  }
+}
+
+fn mfSecretFor(u: MfUsers): (string) => Option<Secret> {
+  let f: (string) => Option<Secret> = (id) => {
+    if (id != "u1") {
+      return Option<Secret>.None
+    }
+    return Option<Secret>.Some(u.secret)
+  }
+  return f
+}
+
+fn mfFactor(u: MfUsers, t: LoginThrottle): TotpFactor {
+  return TotpFactor(mfSecretFor(u), mfOptions(u, t)) catch e {
+    panic("TotpFactor: ${e.message()}")
+  }
+}
+
+// A session reader: a Strategy that accepts only when the session already holds
+// an identity, the way a custom strategy that trusts `currentIdentity` would.
+class MfReader {
+  label: string
+
+  export name(): string {
+    return this.label
+  }
+
+  export authenticate(c: Ctx): Identity! {
+    return currentIdentity(c)?
+  }
+}
+
+// A second factor that accepts exactly `want`, for the throttle that is
+// `CompleteOptions`' and not the factor's own.
+class MfStub {
+  want: string
+  asked: int
+
+  export name(): string {
+    return "stub"
+  }
+
+  export verify(c: Ctx, userId: string, input: string): bool! {
+    this.asked = this.asked + 1
+    return input == this.want
+  }
+}
+
+// The app: `/login` is the first factor (it always accepts "u1" and holds the
+// session pending), `/login/code` the second, `/a` and `/b` sit behind
+// `requireAuth`, `/me` reads `currentIdentity` itself, `/readers` is guarded by
+// two session-reading strategies, `/expire` and `/expiry` poke the pending clock.
+fn mfApp(factor: SecondFactor, opts: CompleteOptions, ttl: i64): App {
+  let app = App(Config{ secret = "test-secret", sessions = MemoryStore(1000) })
+  app.post("/login", (c) => {
+    c.session()?.regenerate()?
+    bindSession(
+      c,
+      Identity{ id = "u1", claims = Json.JsonNull },
+      BindOptions{ second = true, pendingTtl = ttl },
+    )?
+    return c.text("pending")
+  })
+  app.post("/login/ghost", (c) => {
+    bindSession(c, Identity{ id = "ghost", claims = Json.JsonNull }, BindOptions{ second = true })?
+    return c.text("pending")
+  })
+  app.post("/login/code", (c) => {
+    let form = c.body<MfCode>()?
+    let id = completeSecondFactor(c, factor, form.code, opts)?
+    return c.text(id.id)
+  })
+  let guarded = app.group("/g")
+  guarded.use(requireAuth([]Strategy{ AlwaysFail{} }))
+  guarded.get("/a", (c) => c.text("a"))
+  guarded.get("/b", (c) => c.text("b"))
+  app.get("/me", (c) => {
+    let id = currentIdentity(c) catch e {
+      let (_, http) = e.(HttpError)
+      if (http) {
+        fail e
+      }
+      fail unauthorized()
+    }
+    return c.text(id.id)
+  })
+  let readers = app.group("/readers")
+  readers.use(requireAuth([]Strategy{ MfReader{ label = "r1" }, MfReader{ label = "r2" } }))
+  readers.get("/", (c) => c.text("in"))
+  app.post("/expire", (c) => {
+    c.session()?.set(pendingExpiryKey, "1")
+    c.session()?.save()?
+    return c.text("expired")
+  })
+  app.get("/expiry", (c) => c.text(c.session()?.get(pendingExpiryKey)))
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+fn mfCookie(res: Response): string {
+  let line = res.getHeader("Set-Cookie")
+  if (line == "") {
+    return ""
+  }
+  return split(line, ";")[0]
+}
+
+fn mfReq(method: string, path: string, cookie: string, body: string): Request {
+  return Request{
+    method = method,
+    path = path,
+    headers = "Content-Type: application/json\r\nCookie: ${cookie}",
+    body = body,
+    peer = mfIp,
+  }
+}
+
+fn mfCodeReq(cookie: string, code: string): Request {
+  return mfReq("POST", "/login/code", cookie, "{\"code\":\"${code}\"}")
+}
+
+// The cookie of a fresh pending session.
+fn mfPending(app: App): string {
+  let res = app.handle(mfReq("POST", "/login", "", ""))
+  assert(res.status == 200, "/login: want 200, got ${res.status}")
+  let cookie = mfCookie(res)
+  assert(cookie != "", "/login must arm a session cookie")
+  return cookie
+}
+
+fn mfNow(): int {
+  return now().ns / Second
+}
+
+fn mfGoodCode(u: MfUsers): string {
+  return totp(u.secret, mfNow())
+}
+
+// A code that is wrong now and at every skew step: the code of a far step.
+fn mfWrongCode(u: MfUsers): string {
+  let far = totp(u.secret, mfNow() + 3000)
+  if (far == mfGoodCode(u)) {
+    return totp(u.secret, mfNow() + 6000)
+  }
+  return far
+}
+
+fn mfDefault(u: MfUsers, clock: FakeClock): App {
+  let t = throttleOn(fakeStore(clock), clock, ThrottleOptions{})
+  return mfApp(mfFactor(u, t), CompleteOptions{}, 300)
+}
+
+fn mfHas(res: Response, needle: string): bool {
+  return contains(res.body, needle)
+}
+
+test "a pending session gets 401 second_factor_required on 3 of 3 protected routes" {
+  let app = mfDefault(mfUsers(), freshClock())
+  let cookie = mfPending(app)
+  for path of []string{ "/g/a", "/g/b", "/me" } {
+    let res = app.handle(mfReq("GET", path, cookie, ""))
+    assert(res.status == 401, "${path}: want 401, got ${res.status}")
+    assert(
+      mfHas(res, "second_factor_required"),
+      "${path}: body must carry the code, got '${res.body}'",
+    )
+  }
+}
+
+test "an anonymous request is a plain 401 without the code, so the check can tell them apart" {
+  let app = mfDefault(mfUsers(), freshClock())
+  for path of []string{ "/g/a", "/me" } {
+    let res = app.handle(mfReq("GET", path, "", ""))
+    assert(res.status == 401, "${path}: want 401, got ${res.status}")
+    assert(
+      !mfHas(res, "second_factor_required"),
+      "${path}: anonymous must not see the code: '${res.body}'",
+    )
+  }
+}
+
+test "a pending session cannot be used by 2 of 2 session-reading strategies" {
+  let app = mfDefault(mfUsers(), freshClock())
+  let cookie = mfPending(app)
+  let res = app.handle(mfReq("GET", "/readers", cookie, ""))
+  assert(res.status == 401, "want 401, got ${res.status}")
+  assert(mfHas(res, "second_factor_required"), "want the code, got '${res.body}'")
+}
+
+test "the session readers accept the same session once the second factor completed" {
+  let u = mfUsers()
+  let app = mfDefault(u, freshClock())
+  let done = app.handle(mfCodeReq(mfPending(app), mfGoodCode(u)))
+  assert(done.status == 200, "want 200, got ${done.status}: ${done.body}")
+  let res = app.handle(mfReq("GET", "/readers", mfCookie(done), ""))
+  assert(res.status == 200, "a completed session must reach the readers' route, got ${res.status}")
+}
+
+test "a correct code completes, promotes the identity and regenerates the session id" {
+  let u = mfUsers()
+  let app = mfDefault(u, freshClock())
+  let pending = mfPending(app)
+  let done = app.handle(mfCodeReq(pending, mfGoodCode(u)))
+  assert(done.status == 200, "want 200, got ${done.status}: ${done.body}")
+  assert(done.body == "u1", "want the identity's id, got '${done.body}'")
+  let fresh = mfCookie(done)
+  assert(fresh != "", "completion must issue a new session cookie")
+  assert(fresh != pending, "old sid ${pending} == new sid ${fresh}")
+  let me = app.handle(mfReq("GET", "/me", fresh, ""))
+  assert(me.status == 200 && me.body == "u1", "want u1 on /me, got ${me.status} '${me.body}'")
+  let g = app.handle(mfReq("GET", "/me", pending, ""))
+  assert(g.status == 401, "the pre-completion sid must be dead, got ${g.status}")
+  assert(!mfHas(g, "second_factor_required"), "a dead sid is anonymous, not pending")
+}
+
+test "a wrong code does not complete and leaves the session pending" {
+  let u = mfUsers()
+  let app = mfDefault(u, freshClock())
+  let pending = mfPending(app)
+  let res = app.handle(mfCodeReq(pending, mfWrongCode(u)))
+  assert(res.status == 401, "want 401, got ${res.status}")
+  assert(
+    mfCookie(res) == "" || mfCookie(res) == pending,
+    "a failed code must not rotate the session",
+  )
+  assert(u.advances == 0, "a wrong code must not advance the counter")
+  let me = app.handle(mfReq("GET", "/me", pending, ""))
+  assert(mfHas(me, "second_factor_required"), "still pending after a wrong code, got '${me.body}'")
+}
+
+test "a malformed code is a plain failure, not a crash" {
+  let u = mfUsers()
+  let clock = freshClock()
+  let app = mfDefault(u, clock)
+  let pending = mfPending(app)
+  for bad of []string{
+    "",
+    "abcdef",
+    "12345",
+    "1234567",
+    "12345678901234567890123456789012345678901234567890",
+  } {
+    let res = app.handle(mfCodeReq(pending, bad))
+    assert(res.status == 401, "'${bad}': want 401, got ${res.status}")
+    clock.t = clock.t + 20
+  }
+}
+
+test "replaying a used code on a fresh half login fails" {
+  let u = mfUsers()
+  let app = mfDefault(u, freshClock())
+  let code = mfGoodCode(u)
+  let first = app.handle(mfCodeReq(mfPending(app), code))
+  assert(first.status == 200, "first use: want 200, got ${first.status}")
+  let again = app.handle(mfCodeReq(mfPending(app), code))
+  assert(again.status == 401, "replay: want 401, got ${again.status}")
+  assert(u.advances == 1, "the counter must have advanced exactly once, got ${u.advances}")
+}
+
+test "6 consecutive wrong codes are throttled: five 401s, then 429" {
+  let u = mfUsers()
+  let clock = freshClock()
+  let app = mfDefault(u, clock)
+  let pending = mfPending(app)
+  let seen = []int{}
+  let i = 0
+  while (i < 6) {
+    seen = append(seen, app.handle(mfCodeReq(pending, mfWrongCode(u))).status)
+    clock.t = clock.t + 20
+    i = i + 1
+  }
+  assert(
+    seen[0] == 401 && seen[1] == 401 && seen[2] == 401 && seen[3] == 401 && seen[4] == 401,
+    "first five: ${codes(seen)}",
+  )
+  assert(seen[5] == 429, "the 6th wrong code must be 429, got ${codes(seen)}")
+}
+
+test "a locked second step refuses even the correct code" {
+  let u = mfUsers()
+  let clock = freshClock()
+  let app = mfDefault(u, clock)
+  let pending = mfPending(app)
+  let i = 0
+  while (i < 5) {
+    app.handle(mfCodeReq(pending, mfWrongCode(u)))
+    clock.t = clock.t + 20
+    i = i + 1
+  }
+  let res = app.handle(mfCodeReq(pending, mfGoodCode(u)))
+  assert(
+    res.status == 429,
+    "a locked account must answer 429 to the right code too, got ${res.status}",
+  )
+  assert(u.advances == 0, "a throttled attempt must not reach the counter")
+}
+
+test "the pending state expires: the readers see an anonymous session and the code no longer completes" {
+  let u = mfUsers()
+  let app = mfDefault(u, freshClock())
+  let pending = mfPending(app)
+  app.handle(mfReq("POST", "/expire", pending, ""))
+  let me = app.handle(mfReq("GET", "/me", pending, ""))
+  assert(me.status == 401, "want 401, got ${me.status}")
+  assert(
+    !mfHas(me, "second_factor_required"),
+    "an expired half login must not advertise itself: '${me.body}'",
+  )
+  let late = app.handle(mfCodeReq(pending, mfGoodCode(u)))
+  assert(late.status == 401, "a correct code after the expiry must fail, got ${late.status}")
+  assert(u.advances == 0, "an expired half login must not touch the counter")
+}
+
+test "the pending expiry is pendingTtl seconds from now, default 300" {
+  assert(
+    BindOptions{}.pendingTtl == 300,
+    "default pendingTtl must be 300, got ${BindOptions{}.pendingTtl}",
+  )
+  let u = mfUsers()
+  let t = throttleOn(fakeStore(freshClock()), freshClock(), ThrottleOptions{})
+  let app = mfApp(mfFactor(u, t), CompleteOptions{}, 60)
+  let before = mfNow()
+  let cookie = mfPending(app)
+  let at = parseInt(app.handle(mfReq("GET", "/expiry", cookie, "")).body) catch e {
+    panic("expiry: ${e.message()}")
+  }
+  assert(
+    at >= before + 60 && at <= mfNow() + 60,
+    "expiry ${at} not within [${before + 60}, ${mfNow() + 60}]",
+  )
+}
+
+test "completeSecondFactor with nothing pending is a plain 401" {
+  let u = mfUsers()
+  let app = mfDefault(u, freshClock())
+  let res = app.handle(mfCodeReq("", mfGoodCode(u)))
+  assert(res.status == 401, "want 401, got ${res.status}")
+  assert(u.advances == 0, "nothing pending must not reach the counter")
+}
+
+test "TotpFactor without a throttle is rejected at construction" {
+  let u = mfUsers()
+  let opts = mfOptions(u, throttleOn(fakeStore(freshClock()), freshClock(), ThrottleOptions{}))
+  opts.throttle = Option<LoginThrottle>.None
+  let msg = ""
+  TotpFactor(mfSecretFor(u), opts) catch e {
+    msg = e.message()
+  }
+  assert(contains(msg, "no throttle"), "want a 'no throttle' error, got '${msg}'")
+}
+
+test "TotpFactor without its counter callbacks or with a negative skew is rejected" {
+  let u = mfUsers()
+  let t = throttleOn(fakeStore(freshClock()), freshClock(), ThrottleOptions{})
+  let noLast = mfOptions(u, t)
+  noLast.lastCounter = nil
+  let noAdvance = mfOptions(u, t)
+  noAdvance.advanceCounter = nil
+  let negative = mfOptions(u, t)
+  negative.skew = 0 - 1
+  for o of []TotpFactorOptions{ noLast, noAdvance, negative } {
+    let failed = false
+    TotpFactor(mfSecretFor(u), o) catch _ {
+      failed = true
+    }
+    assert(failed, "an unusable TotpFactorOptions must fail at construction")
+  }
+}
+
+test "a user with no enrolled secret fails like a wrong code, and counts against the throttle" {
+  let u = mfUsers()
+  let app = mfDefault(u, freshClock())
+  let res0 = app.handle(mfReq("POST", "/login/ghost", "", ""))
+  let cookie = mfCookie(res0)
+  let res = app.handle(mfCodeReq(cookie, mfGoodCode(u)))
+  assert(res.status == 401, "want 401 for a user with no secret, got ${res.status}")
+  assert(u.advances == 0, "no secret, no counter")
+}
+
+test "CompleteOptions.throttle throttles a factor that does not throttle itself" {
+  let clock = freshClock()
+  let stub = MfStub{ want = "open", asked = 0 }
+  let t = throttleOn(fakeStore(clock), clock, ThrottleOptions{})
+  let app = mfApp(stub, CompleteOptions{ throttle = Option<LoginThrottle>.Some(t) }, 300)
+  let pending = mfPending(app)
+  let seen = []int{}
+  let i = 0
+  while (i < 6) {
+    seen = append(seen, app.handle(mfCodeReq(pending, "wrong")).status)
+    clock.t = clock.t + 20
+    i = i + 1
+  }
+  assert(seen[4] == 401 && seen[5] == 429, "want 401 x5 then 429, got ${codes(seen)}")
+  assert(stub.asked == 5, "the locked 6th attempt must not reach the factor, asked ${stub.asked}")
+}
+
+test "a custom SecondFactor completes through completeSecondFactor" {
+  let stub = MfStub{ want = "open", asked = 0 }
+  let app = mfApp(stub, CompleteOptions{}, 300)
+  let pending = mfPending(app)
+  let done = app.handle(mfCodeReq(pending, "open"))
+  assert(done.status == 200, "want 200, got ${done.status}")
+  assert(mfCookie(done) != pending, "the session id must change")
+}
+
+test "a throttle whose store is down refuses the code" {
+  let u = mfUsers()
+  let clock = freshClock()
+  let store = fakeStore(clock)
+  let app = mfApp(mfFactor(u, throttleOn(store, clock, ThrottleOptions{})), CompleteOptions{}, 300)
+  let pending = mfPending(app)
+  store.broken = true
+  let res = app.handle(mfCodeReq(pending, mfGoodCode(u)))
+  assert(res.status == 500, "a down throttle must fail closed with 500, got ${res.status}")
+  assert(u.advances == 0, "the counter must not move")
+}

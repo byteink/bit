@@ -1,0 +1,291 @@
+// pkg/auth/mfa.bit — the second step of a two-factor login (#6954, epic
+// #3960): a session that has proved the first factor but not yet the second
+// is held in a pending state no route accepts, until `completeSecondFactor`
+// verifies the second.
+//
+// STANDARDS. NIST SP 800-63B section 4.2 (AAL2: the session grants access only
+// after TWO distinct factors verified) and section 5.2.2 (rate-limit failed
+// authentication attempts), OWASP ASVS v5 V2 (MFA is enforced, never a
+// client-side or optional step; an unfinished login gets no access) and the
+// OWASP Multifactor Authentication Cheat Sheet (re-issue the session id when
+// the assurance level rises; a half-logged-in session expires fast).
+//
+// THE STATE. `bindSession(c, id, BindOptions{ second = true })` (strategy.bit)
+// stores the Identity under `pendingSessionKey`, NOT `identitySessionKey`.
+// Every reader this package has (`currentIdentity`, `requireAuth`, and a
+// custom `Strategy` that reads the session through them) looks only at the
+// second key, so a password-only session finds no identity and cannot reach a
+// protected route by any path that forgot about two factors: the default is
+// closed. They answer 401 with the code `second_factor_required` in the body's
+// `detail`, so a front end can tell "sign in" from "enter your code".
+// `completeSecondFactor` is the one promotion: verify, then regenerate the
+// session id, then a plain `bindSession` that moves the pending Identity to
+// `identitySessionKey`.
+//
+// THE CLOCK. The pending state carries its own expiry (`BindOptions.pendingTtl`,
+// 300 seconds by default), read on every use, so an abandoned half login stops
+// counting at once and does not wait for the session's own 24 hours.
+//
+// BRUTE FORCE. A 6-digit code has a million values, so an unthrottled second
+// step is a weak spot, not an option: `TotpFactor` refuses to be built without
+// a `LoginThrottle`, and `CompleteOptions.throttle` does the same for any other
+// factor.
+//
+// `Ctx`, `Session`, `unauthorized` (web), `Identity`, `decodeIdentity`,
+// `pendingSessionKey`, `pendingExpiryKey` (strategy.bit), `LoginThrottle`,
+// `Throttled` (throttle.bit), `Secret`, `sha1` (totp.bit), `isSome`, `unwrap`,
+// `now`, `Second` and `parseInt` are already bound module-wide (an import binds
+// per MODULE, SPEC §17.1); only `HttpError` is new here.
+import { HttpError } from "web"
+
+// The machine-readable reason in a 401's `detail`. A front end switches on it.
+const secondFactorCode = "second_factor_required"
+
+// The refusal every reader of a pending session answers.
+fn secondFactorRequired(): HttpError {
+  return unauthorized(secondFactorCode)
+}
+
+// The unix second the pending state expires at, 0 when this session has none
+// (or the stored value is not a number, which no writer produces).
+fn pendingExpiry(session: Session): i64 {
+  let raw = session.get(pendingExpiryKey)
+  if (raw == "") {
+    return 0
+  }
+  let at = parseInt(raw) catch _ {
+    return 0
+  }
+  return i64(at)
+}
+
+// Whether `c`'s session holds a half login that has not expired. A session
+// that cannot be read (the app configured no store) holds none.
+fn pendingActive(c: Ctx): bool {
+  let session = c.session() catch _ {
+    return false
+  }
+  if (session.get(pendingSessionKey) == "") {
+    return false
+  }
+  return pendingExpiry(session) > now().ns / Second
+}
+
+// The Identity the first factor verified, or the 401 that says there is
+// nothing to complete (no half login, or it expired).
+fn pendingIdentity(c: Ctx): Identity! {
+  if (!pendingActive(c)) {
+    fail unauthorized()
+  }
+  return decodeIdentity(c.session()?.get(pendingSessionKey))?
+}
+
+// A second factor: something that can say whether `input`, typed by the user
+// `userId`, is that user's second proof. `name()` is for logs and the
+// throttle's counters. `verify` answers `true` for a correct proof and `false`
+// for a wrong one; it fails only when it could not decide (its store is down),
+// and a failure refuses the login. `TotpFactor` is the one this package ships;
+// a custom factor (an e-mailed code, a hardware key) needs only these two
+// methods.
+export interface SecondFactor {
+  name(): string,
+  verify(c: Ctx, userId: string, input: string): bool!,
+}
+
+// How a `TotpFactor` finds and protects its state. Every field but `skew` has
+// no default, because each one is something only your application knows:
+//
+//  - `throttle`: required. The code is 6 digits, so without it a client could
+//    try every one.
+//  - `lastCounter(userId)`: the counter of the last code accepted for that user
+//    (0 before the first). It is the replay protection of RFC 6238 section 5.2.
+//  - `advanceCounter(userId, counter)`: store `counter` as the user's last, but
+//    only if it is greater than what is stored, and say whether it was. Make it
+//    one atomic statement (`UPDATE ... WHERE counter < ?`): two requests
+//    carrying the same code both pass `lastCounter`, and exactly one may win
+//    here.
+//  - `skew`: time steps either side of now still accepted; 1 (30 seconds) by
+//    default, the RFC's own suggestion.
+export class TotpFactorOptions {
+  export throttle: Option<LoginThrottle>,
+  export lastCounter: (string) => uint!,
+  export advanceCounter: (string, uint) => bool!,
+  export skew: int = 1,
+}
+
+// A `SecondFactor` over `totp.bit`'s `verify`: the code from the user's
+// authenticator app. `TotpFactor(secretFor, opts)` takes `secretFor(userId)`,
+// the user's enrolled `Secret` (`None` for a user who never enrolled, whose
+// every attempt fails like a wrong code), and the `TotpFactorOptions` above.
+// Fails at construction, so a misconfiguration is found when the app starts,
+// when `opts.throttle` is `None` or either counter callback is `nil`.
+//
+// Each attempt is counted under `totp:<userId>` in the throttle, so wrong
+// codes lock the second step without locking the password step, and the
+// throttle is asked BEFORE the code is checked. A throttle whose store is down
+// refuses the attempt.
+export class TotpFactor {
+  secretFor: (string) => Option<Secret>
+  throttle: LoginThrottle
+  lastCounter: (string) => uint!
+  advanceCounter: (string, uint) => bool!
+  skew: int
+
+  init(secretFor: (string) => Option<Secret>, opts: TotpFactorOptions)! {
+    if (!isSome(opts.throttle)) {
+      fail newError("auth: TotpFactor(): no throttle — a 6-digit code has 10^6 values, so pass `throttle = Option<LoginThrottle>.Some(LoginThrottle(...)?)`")
+    }
+    if (secretFor == nil) {
+      fail newError("auth: TotpFactor(): `secretFor` is nil — pass the function that returns a user's enrolled Secret")
+    }
+    if (opts.lastCounter == nil || opts.advanceCounter == nil) {
+      fail newError("auth: TotpFactor(): `lastCounter` and `advanceCounter` are both required — without them a used code verifies again")
+    }
+    if (opts.skew < 0) {
+      fail newError("auth: TotpFactor(): `skew` is ${opts.skew} — it cannot be negative")
+    }
+    this.secretFor = secretFor
+    this.throttle = unwrap(opts.throttle)
+    this.lastCounter = opts.lastCounter
+    this.advanceCounter = opts.advanceCounter
+    this.skew = opts.skew
+  }
+
+  export name(): string {
+    return "totp"
+  }
+
+  // `true` when `input` is a current code for `userId` that was not used
+  // before; `false` for a wrong, reused or malformed one, a user with no
+  // secret included. Fails with a `Throttled` (a 429 when it escapes a route)
+  // when the account or the address is locked, and with a plain error when a
+  // callback or the throttle's store failed: the attempt is refused, never
+  // waved through.
+  export verify(c: Ctx, userId: string, input: string): bool! {
+    let account = "totp:" + userId
+    let ip = c.peer()
+    this.admit(account, ip)?
+    let hit = this.accepts(userId, input)?
+    this.record(account, ip, hit)?
+    return hit
+  }
+
+  admit(account: string, ip: string): ()! {
+    this.throttle.check(account, ip) catch e {
+      let (_, locked) = e.(Throttled)
+      if (locked) {
+        fail e
+      }
+      fail totpDown(e)
+    }
+  }
+
+  record(account: string, ip: string, hit: bool): ()! {
+    if (hit) {
+      this.throttle.recordSuccess(account) catch e {
+        fail totpDown(e)
+      }
+      return
+    }
+    this.throttle.recordFailure(account, ip) catch e {
+      fail totpDown(e)
+    }
+  }
+
+  // The code check proper: a matching counter newer than the stored one, and
+  // then the atomic advance that makes the code single use.
+  accepts(userId: string, input: string): bool! {
+    let found = this.secretFor(userId)
+    if (!isSome(found)) {
+      return false
+    }
+    let last = this.lastCounter(userId)?
+    let counter = sha1(totpDefaultDigits, totpDefaultPeriod).verify(
+      unwrap(found),
+      input,
+      now().ns / Second,
+      last,
+      this.skew,
+    ) catch _ {
+      return false
+    }
+    return this.advanceCounter(userId, counter)?
+  }
+}
+
+fn totpDown(e: error): error {
+  return newError("auth: TotpFactor: the throttle failed, refusing the code: ${e.message()}")
+}
+
+// What `completeSecondFactor` can be given beyond the factor. `throttle` is
+// for a `SecondFactor` that does not throttle itself (a custom one); leave it
+// `None` for a `TotpFactor`, which already counts its attempts, so a failure
+// is not counted twice. Counters are kept under `second:<name>:<userId>`.
+export class CompleteOptions {
+  export throttle: Option<LoginThrottle>,
+}
+
+// The second half of a two-factor login. `c`'s session must hold a half login
+// (`bindSession(c, id, BindOptions{ second = true })`) that has not expired;
+// `factor.verify` is asked whether `input` proves the same user. A correct
+// proof regenerates the session id (OWASP: new id when the assurance level
+// rises, so an id seen during the half login is worthless), promotes the
+// Identity to a full login and returns it. A wrong one fails with
+// `unauthorized()` and leaves the session pending, so the user can retry until
+// the throttle or the expiry stops them. Nothing pending (never started,
+// already completed, expired) is the same `unauthorized()`: there is no way
+// to learn which from outside.
+export fn completeSecondFactor(
+  c: Ctx,
+  factor: SecondFactor,
+  input: string,
+  opts: CompleteOptions = CompleteOptions{},
+): Identity! {
+  let id = pendingIdentity(c)?
+  let account = "second:" + factor.name() + ":" + id.id
+  admitSecond(opts, account, c.peer())?
+  let ok = factor.verify(c, id.id, input)?
+  recordSecond(opts, account, c.peer(), ok)?
+  if (!ok) {
+    fail unauthorized()
+  }
+  c.session()?.regenerate()?
+  bindSession(c, id)?
+  return id
+}
+
+fn admitSecond(opts: CompleteOptions, account: string, ip: string): ()! {
+  match (opts.throttle) {
+    None => return
+    Some(t) => {
+      t.check(account, ip) catch e {
+        let (_, locked) = e.(Throttled)
+        if (locked) {
+          fail e
+        }
+        fail secondDown(e)
+      }
+    }
+  }
+}
+
+fn recordSecond(opts: CompleteOptions, account: string, ip: string, ok: bool): ()! {
+  match (opts.throttle) {
+    None => return
+    Some(t) => {
+      if (ok) {
+        t.recordSuccess(account) catch e {
+          fail secondDown(e)
+        }
+        return
+      }
+      t.recordFailure(account, ip) catch e {
+        fail secondDown(e)
+      }
+    }
+  }
+}
+
+fn secondDown(e: error): error {
+  return newError("auth: completeSecondFactor(): the throttle failed, refusing the code: ${e.message()}")
+}
