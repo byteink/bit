@@ -163,6 +163,13 @@ protected route that is not itself doing the authenticating just reads
   for every address, `authenticate` spends it once, refuses another browser's
   copy, and regenerates the session id; optionally throttled with a
   `LoginThrottle`; see [Sign in with a link in an email](docs/magic-link.md).
+- `PasswordReset`, `ResetOptions`, `ResetErrorHook` - password reset on the
+  one-time token: `request` mails a one-hour link that replaces the earlier
+  ones and answers the same for every identifier, `confirm` spends it once,
+  applies the `PasswordPolicy` without spending the link on a refusal, stores
+  the new hash with your `setPassword` and ends every session of the user with
+  `logoutEverywhere`; see
+  [Let an author reset a forgotten password](docs/password-reset.md).
 - `RefreshTokens`, `RefreshStore`, `RefreshRecord`, `RefreshOptions`,
   `RefreshRotation`, `MemoryRefreshStore`, `InvalidRefreshToken` - opaque refresh
   tokens (RFC 9700): 256 random bits stored only as a SHA-256 hash, rotated on
