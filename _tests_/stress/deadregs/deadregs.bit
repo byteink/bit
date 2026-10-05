@@ -1,0 +1,188 @@
+// #7304: `smDeadRegsAt` (runtime/gc/stackmaplive.bit) names, for every
+// safepoint in THIS binary's stack-map table, exactly the `regs[n]` words a
+// collector may zero: at a back-edge poll the ones clear in its `live_regs`
+// mask (#7303) that hold no caller's value, and nothing anywhere else. Then
+// `gcZeroDeadRegs` zeroes exactly those words of a frame and no other.
+//
+// The walk is this file's own decoder, as in ../stackmapidx, and the
+// callee-saved set is this file's own copy of each target's ABI, so neither
+// half of the oracle is the runtime's code. This program's own loops are
+// compiled by the tree compiler, so its entries carry version 2 masks; the
+// pinned stage0's libbitrt.a entries carry version 1, where nothing is dead.
+// Whether the mask itself is right is the stress corpus's question: a live
+// register it misses is zeroed and the program fails under `BIT_GC=stress`.
+
+import { loadByte, loadWord, smDeadRegsAt, gcZeroDeadRegs } from "../../../runtime/gc"
+import { smFormatVersionV1 } from "../../../runtime/gc"
+
+// `runtime/gc/stackmap.bit`'s `smMaxEntries`: the linear walk's own bound.
+const MAX_ENTRIES = 4194304
+
+const MASK32 = 4294967295
+
+// A `SafepointFrame` (ABI.md §4): ret, fp, regs[32].
+let frame: [34]i64
+
+let nEntries: i64 = 0
+let nPolls: i64 = 0
+let nDeadPolls: i64 = 0
+let nWrong: i64 = 0   // a poll whose dead set differs from the oracle's
+let nCallers: i64 = 0 // a dead set naming a live register or a caller's value
+let nNonPoll: i64 = 0 // a call record or version-1 entry with a dead word
+let deadPc: i64 = 0
+let deadMask: i64 = 0
+
+fn u16At(a: int): int {
+  return loadByte(a) | (loadByte(a + 1) << 8)
+}
+
+fn u32At(a: int): int {
+  return u16At(a) | (u16At(a + 2) << 16)
+}
+
+// The registers each target's ABI preserves across a call, as a mask over
+// `regs[n]`: SysV rbx rbp r12..r15, Win64 adds rsi rdi, AAPCS64 x19..x28.
+fn calleeSaved(): int {
+  let t = hostTarget()
+  if (t == 0) {
+    return 0xF028
+  }
+  if (t == 3) {
+    return 0xF0E8
+  }
+  return 0x1FF80000
+}
+
+fn savedMask(a: int): int {
+  let m = 0
+  let k = 0
+  while (k < u16At(a + 14)) {
+    m = m | (1 << u16At(a + 16 + k * 6))
+    k = k + 1
+  }
+  return m
+}
+
+// The poll mask the trailer at `t` gives record `si`, or -1.
+fn pollMask(t: int, si: int): int {
+  let k = 0
+  while (k < u16At(t)) {
+    if (u16At(t + 2 + k * 6) == si) {
+      return u32At(t + 4 + k * 6)
+    }
+    k = k + 1
+  }
+  return -1
+}
+
+fn checkRecord(pc: int, live: int, keep: int) {
+  let dead = smDeadRegsAt(pc)
+  if (live < 0) {
+    if (dead != 0) {
+      nNonPoll = nNonPoll + 1
+    }
+    return
+  }
+  nPolls = nPolls + 1
+  if ((dead & (live | keep)) != 0) {
+    nCallers = nCallers + 1
+  }
+  if (dead != (~(live | keep) & MASK32)) {
+    nWrong = nWrong + 1
+  }
+  if (dead != 0 && deadPc == 0) {
+    nDeadPolls = nDeadPolls + 1
+    deadPc = pc
+    deadMask = dead
+  } else if (dead != 0) {
+    nDeadPolls = nDeadPolls + 1
+  }
+}
+
+// Checks the entry at `base + off` and returns the next entry's offset.
+fn checkEntry(base: int, off: int): int {
+  let a = base + off
+  let code = loadWord(a)
+  let v1 = u16At(a + 8) == smFormatVersionV1
+  let keep = calleeSaved() & ~savedMask(a)
+  let p = a + 16 + u16At(a + 14) * 6
+  let nsp = u16At(p)
+  p = p + 2
+  let rets = []int(0)
+  let i = 0
+  while (i < nsp) {
+    rets = append(rets, u32At(p))
+    p = p + 6 + u16At(p + 4) * 4
+    p = p + 2 + u16At(p) * 2
+    i = i + 1
+  }
+  let trailer = p
+  if (!v1) {
+    p = p + 2 + u16At(p) * 6
+  }
+  i = 0
+  while (i < nsp) {
+    // The runtime answers for the FIRST record at a pc, so the oracle does.
+    let first = 0
+    while (rets[first] != rets[i]) {
+      first = first + 1
+    }
+    let live = -1
+    if (!v1) {
+      live = pollMask(trailer, first)
+    }
+    checkRecord(code + rets[i], live, keep)
+    i = i + 1
+  }
+  let end = p - base
+  return (end + 7) / 8 * 8
+}
+
+// `gcZeroDeadRegs` over a frame returning to `pc`: true when exactly the
+// words `dead` names read 0 afterwards and every other word is untouched.
+fn zeroesExactly(pc: int, dead: int): bool {
+  let f = int(ptrOf(frame))
+  frame[0] = pc
+  frame[1] = 0
+  let n = 0
+  while (n < 32) {
+    frame[2 + n] = n + 1
+    n = n + 1
+  }
+  gcZeroDeadRegs(f)
+  n = 0
+  while (n < 32) {
+    let want = n + 1
+    if (((dead >> n) & 1) != 0) {
+      want = 0
+    }
+    if (frame[2 + n] != want) {
+      return false
+    }
+    n = n + 1
+  }
+  return frame[0] == pc
+}
+
+fn main() {
+  let base = int(stackMapsBegin())
+  let tblLen = int(stackMapsEnd()) - base
+  let off = 0
+  while (off < tblLen && nEntries < MAX_ENTRIES) {
+    off = checkEntry(base, off)
+    nEntries = nEntries + 1
+  }
+  if (nWrong != 0 || nCallers != 0 || nNonPoll != 0) {
+    println("deadregs: FAIL: wrong=${nWrong} callers=${nCallers} nonpoll=${nNonPoll}")
+    return
+  }
+  if (nPolls == 0 || nDeadPolls == 0) {
+    println("deadregs: FAIL: vacuous: entries=${nEntries} polls=${nPolls} dead=${nDeadPolls}")
+    return
+  }
+  if (!zeroesExactly(deadPc, deadMask) || !zeroesExactly(0, 0)) {
+    println("deadregs: FAIL: gcZeroDeadRegs zeroed the wrong words")
+    return
+  }
+  println("deadregs: ok")
+}
