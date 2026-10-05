@@ -5,83 +5,64 @@ with GitHub". GitHub, Discord, Slack and plenty of others speak plain OAuth 2.0:
 they hand your server an access token, not an ID token, so
 [`OidcStrategy`](oidc.md) has nothing to verify. `OAuth2Strategy` runs the same
 redirect flow and then asks the provider's own profile API who the user is.
+For GitHub that last step is built in: `github(...)` returns the endpoints and
+the profile call, and you supply your client id and secret.
 
-## Two routes, and one function that knows the provider
+## GitHub in one function
 
-You supply three things the package cannot guess: the provider's two endpoints,
-your client id and secret, and a `ProfileFetch`, the function that turns an
-access token into an `Identity`. Every provider's profile document looks
-different, so that function is yours; it is usually ten lines.
+`github(...)` returns the `OAuth2Endpoints` for GitHub: its authorize and token
+URLs, and a `ProfileFetch` that reads `GET /user` and `GET /user/emails` with
+the headers GitHub's REST API asks for. Pass it to `OAuth2Strategy` with
+`githubScopes`, which is `read:user user:email`: the first lets it read the
+profile, the second the email addresses.
 
 ```bit
 import { App, Config, MemoryStore, unauthorized } from "web"
 import {
+  GithubOptions,
   Identity,
   OAuth2Endpoints,
   OAuth2Options,
   OAuth2Strategy,
-  ProfileFetch,
   currentIdentity,
+  github,
+  githubScopes,
 } from "auth"
 import { TlsConfig } from "std/tls"
-import { Client, Header } from "std/http"
 import { fromPem } from "std/crypto"
-import { Json, jsonAsInt, jsonAsString, jsonGet, jsonParse } from "std/json"
+import { jsonAsString, jsonGet } from "std/json"
 import { isSome, unwrap } from "std/core"
-
-// GitHub's `GET /user` answer: a stable numeric `id` and a `login`.
-fn githubIdentity(body: string): Identity! {
-  let doc = jsonParse(body)?
-  let id = jsonGet(doc, "id")
-  if (!isSome(id) || !isSome(jsonAsInt(unwrap(id)))) {
-    fail newError("github: profile has no numeric id")
-  }
-  let login = jsonGet(doc, "login")
-  if (!isSome(login) || !isSome(jsonAsString(unwrap(login)))) {
-    fail newError("github: profile has no login")
-  }
-  return Identity{
-    id = "github:${unwrap(jsonAsInt(unwrap(id)))}",
-    claims = Json.JsonString(unwrap(jsonAsString(unwrap(login)))),
-  }
-}
-
-fn githubProfile(tls: TlsConfig): ProfileFetch {
-  let f: ProfileFetch = (token) => {
-    let headers = []Header{
-      Header{ name = "Authorization", value = "Bearer " + token },
-      Header{ name = "Accept", value = "application/json" },
-    }
-    let res = Client(tls = tls).requestWith("GET", "https://api.github.com/user", headers, "")?
-    if (res.status != 200) {
-      fail newError("github: profile request answered ${res.status}")
-    }
-    return githubIdentity(res.body)?
-  }
-  return f
-}
 
 // `rootsPem` is your deployment's trusted CA bundle; this package never
 // guesses one.
-fn github(rootsPem: string): OAuth2Strategy! {
+fn githubStrategy(rootsPem: string): OAuth2Strategy! {
   let tls = TlsConfig(fromPem(rootsPem)?)
-  let endpoints = OAuth2Endpoints{
-    authorize = "https://github.com/login/oauth/authorize",
-    token = "https://github.com/login/oauth/access_token",
-    profile = githubProfile(tls),
-  }
+  let endpoints = github(GithubOptions{ tls = Option.Some(tls) })?
   return OAuth2Strategy(
     endpoints,
     "your-client-id",
     "your-client-secret",
     "https://app.example.com/auth/github/callback",
-    OAuth2Options{ scopes = ["read:user"], tls = Option.Some(tls) },
+    OAuth2Options{ scopes = githubScopes, tls = Option.Some(tls), name = "github" },
   )?
+}
+
+// A claim of the Identity as text, "" when it is not there.
+fn claim(identity: Identity, key: string): string {
+  let v = jsonGet(identity.claims, key)
+  if (!isSome(v)) {
+    return ""
+  }
+  let s = jsonAsString(unwrap(v))
+  if (!isSome(s)) {
+    return ""
+  }
+  return unwrap(s)
 }
 
 fn build(rootsPem: string): App! {
   let app = App(Config{ secret = "change-me", sessions = MemoryStore(10_000) })
-  let gh = github(rootsPem)?
+  let gh = githubStrategy(rootsPem)?
 
   app.get("/auth/github", (c) => gh.beginAuthorization(c))
   app.get("/auth/github/callback", (c) => {
@@ -93,19 +74,114 @@ fn build(rootsPem: string): App! {
     let identity: Identity = currentIdentity(c) catch _ {
       fail unauthorized()
     }
-    return c.text(identity.id)
+    return c.text("${identity.id} ${claim(identity, "login")} ${claim(identity, "email")}")
   })
   return app
 }
 ```
 
 `beginAuthorization` stores a random `state` and a PKCE verifier on the user's
-session and redirects to GitHub. `authenticate` is the other half: the route
-GitHub sends the browser back to. It checks the `state`, exchanges the code,
-calls your `ProfileFetch` with the access token, regenerates the session id and
-stores the `Identity` exactly as the password and OpenID Connect logins do, so
-`/me` does not care which one ran. Because `OAuth2Strategy` has `name()` and
-`authenticate(c)`, it is also a `Strategy` you can hand to `requireAuth`.
+session and redirects to GitHub, which supports PKCE with `S256`. `authenticate`
+is the other half: the route GitHub sends the browser back to. It checks the
+`state`, exchanges the code, calls the profile step with the access token,
+regenerates the session id and stores the `Identity` exactly as the password and
+OpenID Connect logins do, so `/me` does not care which one ran. Because
+`OAuth2Strategy` has `name()` and `authenticate(c)`, it is also a `Strategy` you
+can hand to `requireAuth`.
+
+## What the Identity holds
+
+- **`id` is GitHub's numeric user id**, as a decimal string, such as `583231`.
+  Never the login: a user can rename their login and someone else can then take
+  the old one, so a login is not an identity. Key your users table on `id`.
+- **`email` is the primary address, and only if GitHub has verified it.** GitHub
+  lets anyone add an address they have not proven to their account, so an
+  unverified one, or a verified one that is not the primary, is never returned;
+  neither is the public `email` on the profile, which is whatever the user chose
+  to show. When there is none, `email` is `""` and `email_verified` is `false`.
+  `email_verified` is `true` exactly when `email` is set.
+- **`login`, `name` and `avatar_url`** are strings; `name` is `""` when the user
+  has not set one.
+
+By default a sign-in whose account has no verified primary email fails with an
+`Error`, because most apps key mail and account recovery on it. An app that does
+not need one sets `requireVerifiedEmail = false` and gets the empty `email`.
+
+## GitHub Enterprise Server
+
+`enterpriseHost` points all three URLs at your server: the authorize URL
+`https://HOST/login/oauth/authorize`, the token URL
+`https://HOST/login/oauth/access_token` and the API under `https://HOST/api/v3`.
+It is a bare host, with an optional port, and nothing else.
+
+```bit
+fn enterprise(tls: TlsConfig): OAuth2Endpoints! {
+  return github(
+    GithubOptions{
+      enterpriseHost = "ghe.example.com",
+      requireVerifiedEmail = false,
+      tls = Option.Some(tls),
+    },
+  )?
+}
+```
+
+A host with a scheme, a path, a query or userinfo is an `Error` when the app
+starts: that string would be a URL the access token is sent to.
+
+## Any other provider
+
+For a provider with no preset you supply the same three things yourself: the
+provider's two endpoints, your client id and secret, and a `ProfileFetch`, the
+function that turns an access token into an `Identity`. Every provider's profile
+document looks different, so that function is yours; it is usually ten lines.
+Here is Discord's.
+
+```bit
+import { Client, Header } from "std/http"
+import { Json, jsonAsInt, jsonParse } from "std/json"
+import { ProfileFetch } from "auth"
+
+// Discord's `GET /users/@me` answer: a stable `id` and a `username`.
+fn discordIdentity(body: string): Identity! {
+  let doc = jsonParse(body)?
+  let id = jsonGet(doc, "id")
+  if (!isSome(id) || !isSome(jsonAsString(unwrap(id)))) {
+    fail newError("discord: profile has no id")
+  }
+  let name = jsonGet(doc, "username")
+  if (!isSome(name) || !isSome(jsonAsString(unwrap(name)))) {
+    fail newError("discord: profile has no username")
+  }
+  return Identity{
+    id = "discord:${unwrap(jsonAsString(unwrap(id)))}",
+    claims = Json.JsonString(unwrap(jsonAsString(unwrap(name)))),
+  }
+}
+
+fn discordProfile(tls: TlsConfig): ProfileFetch {
+  let f: ProfileFetch = (token) => {
+    let headers = []Header{
+      Header{ name = "Authorization", value = "Bearer " + token },
+      Header{ name = "Accept", value = "application/json" },
+    }
+    let res = Client(tls = tls).requestWith("GET", "https://discord.com/api/users/@me", headers, "")?
+    if (res.status != 200) {
+      fail newError("discord: profile request answered ${res.status}")
+    }
+    return discordIdentity(res.body)?
+  }
+  return f
+}
+
+fn discordEndpoints(tls: TlsConfig): OAuth2Endpoints {
+  return OAuth2Endpoints{
+    authorize = "https://discord.com/oauth2/authorize",
+    token = "https://discord.com/api/oauth2/token",
+    profile = discordProfile(tls),
+  }
+}
+```
 
 ## What it checks so you do not have to
 
@@ -206,6 +282,11 @@ these:
 - no `tls` and no `tokenFetch`;
 - an `issuer` that is not `https`.
 
+`github(...)` fails the same way: an `enterpriseHost` that is not a bare host, or
+no `tls` and no `apiFetch`. A request that GitHub refuses at sign-in time, such
+as `/user/emails` answering 404 because the `user:email` scope was not asked
+for, fails the sign-in with the status in the message and never the token.
+
 Scopes may be left empty; the request then carries no `scope`, which is what a
 provider with a fixed scope wants. Providers that need one will answer
 `invalid_scope`, which surfaces as an `OAuth2Error`.
@@ -213,35 +294,35 @@ provider with a fixed scope wants. Providers that need one will answer
 ## Testing your routes
 
 `tokenFetch` stands in for the token endpoint, the same seam
-[`OidcOptions.tokenFetch`](testing.md) is, and your `ProfileFetch` is already a
-function you can replace. Nothing touches the network.
+[`OidcOptions.tokenFetch`](testing.md) is, and `GithubOptions.apiFetch` stands in
+for GitHub's API: it receives each URL and its headers and answers the body.
+With both set no `tls` is needed and nothing touches the network.
 
 ```bit
-import { TokenFetch } from "auth"
+import { GithubFetch, TokenFetch } from "auth"
+import { contains } from "std/strings"
 
-fn fakeProvider(): OAuth2Strategy! {
+fn fakeGithub(): OAuth2Strategy! {
   let token: TokenFetch = (url, headers, body) => {
     return "{\"access_token\":\"at-1\",\"token_type\":\"Bearer\"}"
   }
-  let profile: ProfileFetch = (accessToken) => {
-    return Identity{ id = "github:1", claims = Json.JsonString("ada") }
-  }
-  let endpoints = OAuth2Endpoints{
-    authorize = "https://github.com/login/oauth/authorize",
-    token = "https://github.com/login/oauth/access_token",
-    profile = profile,
+  let api: GithubFetch = (url, headers) => {
+    if (contains(url, "/user/emails")) {
+      return "[{\"email\":\"ada@example.com\",\"primary\":true,\"verified\":true}]"
+    }
+    return "{\"id\":583231,\"login\":\"ada\",\"name\":\"Ada\"}"
   }
   return OAuth2Strategy(
-    endpoints,
+    github(GithubOptions{ apiFetch = api })?,
     "test-client",
     "test-secret",
     "http://localhost:8080/auth/github/callback",
-    OAuth2Options{ tokenFetch = token },
+    OAuth2Options{ scopes = githubScopes, tokenFetch = token },
   )?
 }
 ```
 
-Pass `fakeProvider()` where the real one was built and the same two routes run
+Pass `fakeGithub()` where the real one was built and the same two routes run
 unchanged. A real `state` still has to come back, so a test calls the begin route
 first and replays the `state` it put in the redirect.
 
@@ -250,7 +331,7 @@ first and replays the `state` it put in the redirect.
 If the provider publishes an OpenID Connect discovery document and returns an ID
 token, use [`OidcStrategy`](oidc.md): it verifies the token's signature and
 claims, which a profile call cannot. Reach for `OAuth2Strategy` when there is no
-ID token to verify.
+ID token to verify, as there is not for GitHub.
 
 Next: [Security model](security.md), for the one thing this package cannot
 check: the TLS roots your token exchange trusts.

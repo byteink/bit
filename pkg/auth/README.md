@@ -112,6 +112,12 @@ protected route that is not itself doing the authenticating just reads
   `ProfileFetch` you supply turns the access token into an `Identity`, and a
   provider's refusal arrives as a typed `OAuth2Error`; see
   [Sign in with GitHub](docs/oauth2.md).
+- `github`, `GithubOptions`, `GithubFetch`, `githubScopes` - Sign in with GitHub on
+  `OAuth2Strategy`: `github(opts)` returns GitHub's endpoints and a profile step whose
+  `Identity.id` is the numeric user id (never the login) and whose `email` is the primary
+  address only when GitHub has verified it; `enterpriseHost` targets GitHub Enterprise
+  Server, `requireVerifiedEmail` decides whether a missing one fails the sign-in, and
+  `apiFetch` is the test seam; see [Sign in with GitHub](docs/oauth2.md#github-in-one-function).
 - `endSession`, `handleLogoutCallback`, `LogoutOptions`,
   `OidcOptions.postLogoutRedirectUris`, `OidcConfig.endSessionEndpoint` - OpenID
   Connect RP-Initiated Logout 1.0: `endSession` destroys the local session, then

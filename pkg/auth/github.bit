@@ -1,0 +1,283 @@
+// pkg/auth/github.bit — Sign in with GitHub (#6944): the `OAuth2Endpoints`
+// (oauth2.bit) for GitHub, whose `ProfileFetch` asks GitHub who the user is.
+// GitHub issues no ID token, so this is the plain OAuth 2.0 flow
+// `OAuth2Strategy` runs, with a profile step. Followed from GitHub's own
+// pages, read 2026-10-05: "Authorizing OAuth apps" and "Scopes for OAuth
+// apps" (docs.github.com/en/apps/oauth-apps/building-oauth-apps), REST "Get
+// the authenticated user" (GET /user) and "List email addresses for the
+// authenticated user" (GET /user/emails, scope `user:email`), and "API
+// versions" (docs.github.com/en/rest/about-the-rest-api/api-versions).
+//
+//   - Authorize https://github.com/login/oauth/authorize and token
+//     https://github.com/login/oauth/access_token. The token endpoint answers
+//     an error with HTTP 200 and an `error` member, which `OAuth2Strategy`
+//     already turns into an `OAuth2Error`; it asks for JSON with `Accept:
+//     application/json`, which `OAuth2Strategy` already sends. GitHub supports
+//     PKCE (`code_challenge`, S256 only), and `OAuth2Strategy` sends it on
+//     every flow.
+//   - `githubScopes` is `read:user user:email`: the first for /user, the
+//     second for /user/emails. `OAuth2Options.scopes` is the strategy's, not
+//     the endpoints', so the app passes `githubScopes` there. Without
+//     `user:email` /user/emails answers 404 and the profile step fails with
+//     that status.
+//   - /user and /user/emails are sent `Authorization: Bearer <token>`,
+//     `Accept: application/vnd.github+json`, `X-GitHub-Api-Version` and a
+//     `User-Agent` (GitHub rejects a request without one). The version is
+//     2026-03-10, the latest `GET https://api.github.com/versions` lists. A
+//     GitHub Enterprise Server before 3.21 lists only 2022-11-28 and refuses
+//     a version it does not know, so `enterpriseHost` sends that one.
+//   - The identity is the numeric `id`, never `login`: a login can be renamed
+//     and given to someone else, an id never is. It is the decimal string.
+//   - The email is the one entry of /user/emails with `primary` AND
+//     `verified` both true. An unverified address, or a verified one that is
+//     not the primary, is never returned: GitHub lets anyone add an address
+//     they have not proven, and treating one as the user's would let them
+//     sign in as its owner. The `email` of /user is not read, for the same
+//     reason: it is whatever the user chose to publish.
+//     /user/emails is read 100 entries a page, at most `githubEmailsMaxPages`
+//     pages.
+//   - `enterpriseHost` ("ghe.example.com" or "ghe.example.com:8443", no
+//     scheme, no path) points the three URLs at GitHub Enterprise Server:
+//     https://HOST/login/oauth/authorize, /login/oauth/access_token and
+//     https://HOST/api/v3/user, /user/emails.
+//
+// `Identity.claims` is an object: `login`, `name` and `avatar_url` as
+// strings ("" when GitHub sends null), `email` ("" when there is no verified
+// primary) and `email_verified`, which is true exactly when `email` is set.
+//
+// Like `OidcOptions.tls` (providers.bit), the profile request's `TlsConfig`
+// is an explicit option, not a guess; `apiFetch` is the typed test seam over
+// the two GETs, the way `OAuth2Options.tokenFetch` is over the token POST, so
+// the app's tests never touch GitHub.
+//
+// Everything this file uses that is not imported below (`Client`, `Header`,
+// `Json`, `JsonEntry`, `jsonGet`, `jsonParse`, `jsonAsArray`, `jsonAsBool`,
+// `jsonAsInt`, `oauth2Field`, `checkStatus`, `indexOf`, `emptyTrustStore`, ...)
+// is already bound module-wide by its siblings; an import binds per MODULE
+// (SPEC §17.1), so repeating one here is E0042.
+
+// The scopes GitHub's profile and email endpoints need, for
+// `OAuth2Options.scopes`.
+export const githubScopes = ["read:user", "user:email"]
+
+const githubApiVersion = "2026-03-10"
+const githubServerApiVersion = "2022-11-28"
+const githubUserAgent = "bit-pkg-auth"
+const githubEmailsPerPage = 100
+const githubEmailsMaxPages = 5
+
+// One GET to GitHub's API with the headers `github()` built (the access token
+// among them), returning the body of a 200 and failing otherwise.
+export type GithubFetch = (string, []Header) => string!
+
+// The optional knobs of `github(...)`. `enterpriseHost` is a GitHub
+// Enterprise Server host, empty meaning github.com. `requireVerifiedEmail`
+// (the default) fails a sign-in whose account has no verified primary email;
+// false lets it through with `email` "" and `email_verified` false. `tls` is
+// the `TlsConfig` the profile requests run under, required unless `apiFetch`
+// is set; `apiFetch` is the test seam, `nil` meaning the real network.
+export class GithubOptions {
+  export enterpriseHost: string = "",
+  export requireVerifiedEmail: bool = true,
+  export tls: Option<TlsConfig>,
+  export apiFetch: GithubFetch,
+}
+
+// The three base URLs one host implies, and the API version it takes.
+class GithubUrls {
+  login: string,
+  api: string,
+  version: string,
+}
+
+fn githubHostByte(b: byte): bool {
+  return (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 46
+}
+
+fn githubPortOk(port: string): bool {
+  if (len(port) == 0 || len(port) > 5) {
+    return false
+  }
+  for b of []byte(port) {
+    if (b < 48 || b > 57) {
+      return false
+    }
+  }
+  return true
+}
+
+// A host name: letters, digits, '-' and '.', no empty label.
+fn githubNameOk(name: string): bool {
+  if (len(name) == 0 || hasPrefix(name, ".") || hasPrefix(name, "-") || contains(name, "..")) {
+    return false
+  }
+  if (name[len(name) - 1:len(name)] == "." || name[len(name) - 1:len(name)] == "-") {
+    return false
+  }
+  for b of []byte(name) {
+    if (!githubHostByte(b)) {
+      return false
+    }
+  }
+  return true
+}
+
+// `host[:port]` and nothing else: a scheme, a path, a query, userinfo or
+// whitespace would send the access token somewhere the developer did not mean.
+fn githubCheckHost(host: string): ()! {
+  let name = host
+  let colon = int(indexOf(host, ":"))
+  if (colon >= 0) {
+    name = host[0:colon]
+    if (!githubPortOk(host[colon + 1:len(host)])) {
+      fail newError("auth: github(): GithubOptions.enterpriseHost '${host}' has a bad port")
+    }
+  }
+  if (!githubNameOk(name)) {
+    fail newError("auth: github(): GithubOptions.enterpriseHost '${host}' must be a bare host name like \"ghe.example.com\" or \"ghe.example.com:8443\", with no scheme, path, query or userinfo")
+  }
+}
+
+fn githubUrls(host: string): GithubUrls! {
+  if (host == "") {
+    return GithubUrls{
+      login = "https://github.com/login/oauth",
+      api = "https://api.github.com",
+      version = githubApiVersion,
+    }
+  }
+  githubCheckHost(host)?
+  return GithubUrls{
+    login = "https://" + host + "/login/oauth",
+    api = "https://" + host + "/api/v3",
+    version = githubServerApiVersion,
+  }
+}
+
+// The real network: a GET under `tls`, a 200 or a failure naming the URL and
+// the status (never the token).
+fn githubHttp(tls: TlsConfig): GithubFetch {
+  let f: GithubFetch = (url, headers) => {
+    let res = Client(tls = tls).requestWith("GET", url, headers, "")?
+    return checkStatus(url, res)?
+  }
+  return f
+}
+
+fn githubFetch(opts: GithubOptions): GithubFetch! {
+  if (opts.apiFetch != nil) {
+    return opts.apiFetch
+  }
+  match (opts.tls) {
+    Some(cfg) => return githubHttp(cfg)
+    None => fail newError("auth: github(): GithubOptions.tls is required unless GithubOptions.apiFetch is set (the profile requests run over an explicit TlsConfig, see oidc_discovery.bit)")
+  }
+}
+
+fn githubHeaders(token: string, version: string): []Header {
+  return []Header{
+    Header{ name = "Authorization", value = "Bearer " + token },
+    Header{ name = "Accept", value = "application/vnd.github+json" },
+    Header{ name = "X-GitHub-Api-Version", value = version },
+    Header{ name = "User-Agent", value = githubUserAgent },
+  }
+}
+
+// The numeric `id` of the /user document as a decimal string.
+fn githubUserId(user: Json): string! {
+  let id = jsonGet(user, "id")
+  if (!isSome(id)) {
+    fail newError("auth: github: /user has no 'id'")
+  }
+  let n = jsonAsInt(unwrap(id))
+  if (!isSome(n) || unwrap(n) <= 0) {
+    fail newError("auth: github: /user 'id' is not a positive integer")
+  }
+  return "${unwrap(n)}"
+}
+
+fn githubFlag(entry: Json, key: string): bool {
+  let v = jsonGet(entry, key)
+  if (!isSome(v)) {
+    return false
+  }
+  let b = jsonAsBool(unwrap(v))
+  return isSome(b) && unwrap(b)
+}
+
+// The address of the first entry that is `primary` and `verified`, else "".
+fn githubVerifiedPrimary(entries: []Json): string {
+  for e of entries {
+    if (githubFlag(e, "primary") && githubFlag(e, "verified")) {
+      let email = oauth2Field(e, "email")
+      if (email != "") {
+        return email
+      }
+    }
+  }
+  return ""
+}
+
+fn githubEmailPage(body: string): []Json! {
+  let items = jsonAsArray(jsonParse(body)?)
+  if (!isSome(items)) {
+    fail newError("auth: github: /user/emails did not answer an array")
+  }
+  return unwrap(items)
+}
+
+// The user's verified primary email, "" when there is none.
+fn githubPrimaryEmail(fetch: GithubFetch, api: string, headers: []Header): string! {
+  for (let page = 1; page <= githubEmailsMaxPages; page++) {
+    let url = "${api}/user/emails?per_page=${githubEmailsPerPage}&page=${page}"
+    let entries = githubEmailPage(fetch(url, headers)?)?
+    let email = githubVerifiedPrimary(entries)
+    if (email != "" || len(entries) < githubEmailsPerPage) {
+      return email
+    }
+  }
+  return ""
+}
+
+fn githubIdentity(user: Json, id: string, email: string): Identity {
+  return Identity{
+    id = id,
+    claims = Json.JsonObject(
+      []JsonEntry{
+        JsonEntry{ key = "login", value = Json.JsonString(oauth2Field(user, "login")) },
+        JsonEntry{ key = "name", value = Json.JsonString(oauth2Field(user, "name")) },
+        JsonEntry{ key = "avatar_url", value = Json.JsonString(oauth2Field(user, "avatar_url")) },
+        JsonEntry{ key = "email", value = Json.JsonString(email) },
+        JsonEntry{ key = "email_verified", value = Json.JsonBool(email != "") },
+      },
+    ),
+  }
+}
+
+fn githubProfile(fetch: GithubFetch, urls: GithubUrls, requireEmail: bool): ProfileFetch {
+  let f: ProfileFetch = (token) => {
+    let headers = githubHeaders(token, urls.version)
+    let user = jsonParse(fetch(urls.api + "/user", headers)?)?
+    let id = githubUserId(user)?
+    let email = githubPrimaryEmail(fetch, urls.api, headers)?
+    if (email == "" && requireEmail) {
+      fail newError("auth: github: the account has no verified primary email (GithubOptions.requireVerifiedEmail)")
+    }
+    return githubIdentity(user, id, email)
+  }
+  return f
+}
+
+// GitHub's `OAuth2Endpoints`, for `OAuth2Strategy(github(...), clientId,
+// clientSecret, redirectUri, OAuth2Options{ scopes = githubScopes, ... })` —
+// see the file header. A bad `enterpriseHost` and a missing `tls` are an
+// `Error` here, at startup.
+export fn github(opts: GithubOptions = GithubOptions{}): OAuth2Endpoints! {
+  let urls = githubUrls(opts.enterpriseHost)?
+  let fetch = githubFetch(opts)?
+  return OAuth2Endpoints{
+    authorize = urls.login + "/authorize",
+    token = urls.login + "/access_token",
+    profile = githubProfile(fetch, urls, opts.requireVerifiedEmail),
+  }
+}
