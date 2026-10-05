@@ -1,0 +1,165 @@
+// Bit standard library — crypto module, the RSA private-key operation.
+//
+// RSADP / RSASP1 (RFC 8017 §5.1.2, §5.2.1) on the fixed-width Montgomery
+// workspace of `./bigintmont.bit`: one context per modulus (`n`, `p`, `q`) and a
+// handful of limb buffers sized to it, allocated once per operation. Every
+// multiply, reduction and exponentiation writes into those buffers in place;
+// one RSA-2048 signature used to allocate 18 MB of per-step temporaries
+// (#7156). Sibling of `./rsa.bit`, same module (SPEC §17.1).
+//
+// Constant time: every loop runs over a modulus width, every reduction and
+// conditional subtraction is masked, and the secret exponents `dp`/`dq`/`d`
+// are widened to their modulus and scanned over the modulus bit length, so
+// their own bit length no longer sets the iteration count. The only
+// variable-time step is inverting the fresh random blinding factor.
+
+// RSADP / RSASP1: `c^d mod n` under base blinding. A fresh random `r` coprime
+// to `n` blinds the input (`c*r^e`), the constant-time ladder exponentiates the
+// blinded value, and multiplying by `r^-1` removes the blind, so the secret
+// exponentiation never runs on the attacker-chosen `c` directly.
+fn rsaPrivateOp(priv: RsaPrivateKey, c: Nat): Nat! {
+  if (bigintCmp(c, priv.n) >= 0) {
+    fail newError("rsa: representative out of range")
+  }
+  if ((priv.n.limbs[0] & 1) == 0) {
+    fail newError("rsa: modulus is even")
+  }
+  let nc = bigintMontNew(priv.n)
+  let k = len(priv.n.limbs)
+  let cw = bigintWiden(c, k)
+  let r = []u32(k)
+  let rInv = []u32(k)
+  let t1 = []u32(k)
+  rsaBlindFactor(nc, rsaModulusBytes(priv.n), r, rInv, t1)?
+  // t1 = c * r^e mod n.
+  bigintMontPowPublicTo(nc, t1, r, priv.e)
+  bigintMontMulTo(nc, t1, t1, nc.r2)
+  bigintMontMulTo(nc, t1, cw, t1)
+  let m = rsaExp(priv, nc, t1)?
+  // m = m * r^-1 mod n.
+  bigintMontMulTo(nc, rInv, rInv, nc.r2)
+  bigintMontMulTo(nc, m, m, rInv)
+
+  // FAULT CHECK, AND IT IS NOT OPTIONAL ON THE CRT PATH. A single faulty leg
+  // yields an `m` correct modulo one prime and wrong modulo the other, and
+  // `gcd(m^e - c, n)` then hands an attacker the factorisation of `n` from ONE
+  // bad signature (Boneh-DeMillo-Lipton). Re-doing the public operation costs a
+  // modexp with `e`, about 17 multiplications for 65537, noise next to the
+  // private exponentiation. Run on BOTH paths: a check that only guards one
+  // path is one refactor away from guarding neither.
+  bigintMontPowPublicTo(nc, t1, m, priv.e)
+  if (bigintCmpLimbs(bigintMake(t1).limbs, c.limbs) != 0) {
+    fail newError("rsa: private operation failed verification")
+  }
+  return bigintMake(m)
+}
+
+// Draw the blinding factor: `r` uniform-ish in `[1, n)` with `gcd(r, n) = 1`,
+// and `rInv = r^-1 mod n`. `x` is `k`-limb scratch.
+fn rsaBlindFactor(nc: MontCtx, nbytes: int, r: []u32, rInv: []u32, x: []u32): ()! {
+  let tries = 0
+  while (tries < 256) {
+    rsaLoadBytes(x, randomBytes(nbytes))
+    bigintMontReduceTo(nc, r, x)
+    if (bigintInverseVarTimeTo(rInv, r, nc.n)) {
+      // r * r^-1 must be one; a wrong inverse would surface only as a failed
+      // fault check, so assert it here where the cause is known.
+      bigintMontMulTo(nc, x, r, rInv)
+      bigintMontMulTo(nc, x, x, nc.r2)
+      if (bigintCmpLimbs(bigintMake(x).limbs, nc.one[0:1]) != 0) {
+        fail newError("rsa: blinding inverse failed verification")
+      }
+      return
+    }
+    tries = tries + 1
+  }
+  fail newError("rsa: base blinding could not find an invertible factor")
+}
+
+// Load the big-endian bytes `be` into the limb buffer `dst`, zeroing the rest.
+// `len(be) <= 4 * len(dst)`.
+fn rsaLoadBytes(dst: []u32, be: []byte) {
+  let i = 0
+  while (i < len(dst)) {
+    dst[i] = 0
+    i = i + 1
+  }
+  let nb = len(be)
+  i = 0
+  while (i < nb) {
+    dst[i / 4] = dst[i / 4] | (u32(be[nb - 1 - i]) << u32(i % 4 * 8))
+    i = i + 1
+  }
+}
+
+// `x^d mod n` for `x < n` (width `k`), by the Chinese Remainder Theorem when
+// the key carries its primes and by the plain full-width exponentiation when it
+// does not. Returns a fresh `k`-limb buffer.
+//
+// WHY THIS IS WORTH THE BRANCH. `x^d mod n` for RSA-2048 is a 2048-bit exponent
+// modulo a 2048-bit modulus; the CRT form is two exponentiations of half the
+// width AND half the exponent length, roughly 3.5x less work on the term that
+// is 90% of a signature (#1862/#1913). If a later measurement shows only ~2x,
+// suspect a leg running at full width rather than a limit of the technique.
+fn rsaExp(priv: RsaPrivateKey, nc: MontCtx, x: []u32): []u32! {
+  let k = len(nc.n)
+  if (bigintIsZero(priv.p) || bigintIsZero(priv.q)) {
+    let out = []u32(k)
+    bigintMontExpTo(nc, out, x, bigintWiden(priv.d, k), bigintBitLen(priv.n))
+    return out
+  }
+  if ((priv.p.limbs[0] & priv.q.limbs[0] & 1) == 0) {
+    fail newError("rsa: prime factor is even")
+  }
+  let pc = bigintMontNew(priv.p)
+  let kp = len(pc.n)
+  let m1 = []u32(kp)
+  bigintMontReduceTo(pc, m1, x)
+  bigintMontExpTo(pc, m1, m1, bigintWiden(priv.dp, kp), bigintBitLen(priv.p))
+  let m2 = rsaCrtLeg(priv.q, priv.dq, x)
+  // h = qinv * (m1 - m2) mod p, all reduced mod p first.
+  let h = []u32(kp)
+  bigintMontReduceTo(pc, h, m2)
+  bigintModSubTo(m1, h, pc.n)
+  bigintMontReduceTo(pc, h, priv.qinv.limbs)
+  bigintMontMulTo(pc, h, h, pc.r2)
+  bigintMontMulTo(pc, h, m1, h)
+  return rsaCrtJoin(h, priv.q.limbs, m2, k)?
+}
+
+// One CRT leg: `(x mod q)^dq mod q` in a fresh `len(q)`-limb buffer.
+fn rsaCrtLeg(q: Nat, dq: Nat, x: []u32): []u32 {
+  let qc = bigintMontNew(q)
+  let kq = len(qc.n)
+  let m = []u32(kq)
+  bigintMontReduceTo(qc, m, x)
+  bigintMontExpTo(qc, m, m, bigintWiden(dq, kq), bigintBitLen(q))
+  return m
+}
+
+// Garner's recombination `m2 + h*q`, which is below `n` and so fits `k` limbs;
+// the product is formed over the full `len(h) + len(q) + 1` width and its high
+// limbs must come out zero.
+fn rsaCrtJoin(h: []u32, q: []u32, m2: []u32, k: int): []u32! {
+  let kp = len(h)
+  let kq = len(q)
+  let prod = []u32(kp + kq + 1)
+  let i = 0
+  while (i < kp) {
+    let cy: u64 = 0
+    let j = 0
+    while (j < kq) {
+      let s = u64(prod[i + j]) + u64(h[i]) * u64(q[j]) + cy
+      prod[i + j] = u32(s & 0xffffffff)
+      cy = s >> 32
+      j = j + 1
+    }
+    prod[i + kq] = u32(cy)
+    i = i + 1
+  }
+  bigintAddTo(prod, bigintWiden(Nat{ limbs = m2 }, len(prod)))
+  if (!bigintLimbsZero(prod[k:len(prod)])) {
+    fail newError("rsa: CRT recombination out of range")
+  }
+  return prod[0:k]
+}

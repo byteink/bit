@@ -1,0 +1,351 @@
+// Bit standard library — crypto module, fixed-width Montgomery workspace.
+//
+// One modular operation (an RSA signature, a modexp) used to allocate a fresh
+// limb vector per multiply, per reduction and per doubling: 18 MB for one
+// RSA-2048 signature (#7156). `MontCtx` is the fix, the shape of Go's
+// crypto/internal/bigmod and BoringSSL's BN_MONT_CTX: everything sized to the
+// modulus is allocated once when the context is built, and every primitive
+// below writes into caller-owned buffers of exactly `k = len(n)` limbs.
+//
+// Constant time: every loop bound is a function of `k` (public) or of an
+// explicitly public length, every conditional subtraction is a mask, and no
+// array index depends on a value. `bigintInverseVarTime` is the one exception
+// and says so in its name. Sibling of `./bigintmodexp.bit` (SPEC §17.1).
+
+// A Montgomery context for the odd modulus `n` (normalized, `k` limbs):
+// `n0inv = -n^-1 mod 2^32`, `r2 = R^2 mod n` with `R = 2^(32k)`, the width-`k`
+// constant one, the `k+2`-limb accumulator every multiply reuses, and `s`, the
+// `k`-limb scratch of `bigintMontReduceTo`/`ExpTo`/`PowPublicTo` (never pass it
+// to them as an argument). A context is per operation, never shared between
+// threads.
+class MontCtx { n: []u32, n0inv: u32, r2: []u32, one: []u32, t: []u32, s: []u32 }
+
+// The inverse of the odd word `a` modulo 2^32, by Newton's iteration: each step
+// doubles the number of correct low bits, so five steps from a one-bit seed
+// cover all 32 bits. All arithmetic is `u32`, i.e. modulo 2^32.
+fn bigintInvWord(a: u32): u32 {
+  let x: u32 = 1
+  let i = 0
+  while (i < 5) {
+    x = x * (2 - a * x)
+    i = i + 1
+  }
+  return x
+}
+
+// The context for the odd, normalized modulus `modN` (at least one limb).
+fn bigintMontNew(modN: Nat): MontCtx {
+  let n = modN.limbs
+  let k = len(n)
+  let c = MontCtx{
+    n = n,
+    n0inv = u32(0) - bigintInvWord(n[0]),
+    r2 = []u32(k),
+    one = bigintOneWidth(k),
+    t = []u32(k + 2),
+    s = []u32(k),
+  }
+  bigintMontR2To(c)
+  return c
+}
+
+// Montgomery multiplication (CIOS form, Koc et al. 1996): `out = a*b*R^-1 mod
+// n` for `a < R` and `b < n`, both of width `k`. Under that bound the
+// accumulator stays below `2n`, so one masked subtraction reduces it. The
+// product is built in the context's scratch `t` and copied out last, so `out`
+// may alias `a` or `b`.
+fn bigintMontMulTo(c: MontCtx, out: []u32, a: []u32, b: []u32) {
+  let n = c.n
+  let t = c.t
+  let k = len(n)
+  let i = 0
+  while (i < k + 2) {
+    t[i] = 0
+    i = i + 1
+  }
+  i = 0
+  while (i < k) {
+    bigintMontRow(c, a, b[i])
+    i = i + 1
+  }
+  i = 0
+  while (i < k) {
+    out[i] = t[i]
+    i = i + 1
+  }
+  bigintCondSub(out, t[k], n)
+}
+
+// One CIOS row: `t += a*bi`, then `t = (t + m*n) / 2^32` with `m` chosen so
+// the low limb cancels. Each `(carry, limb)` update tops out at 2^64 - 1.
+fn bigintMontRow(c: MontCtx, a: []u32, bi: u32) {
+  let n = c.n
+  let t = c.t
+  let k = len(n)
+  let cy: u64 = 0
+  let j = 0
+  while (j < k) {
+    let uv = u64(t[j]) + u64(a[j]) * u64(bi) + cy
+    t[j] = u32(uv & 0xffffffff)
+    cy = uv >> 32
+    j = j + 1
+  }
+  let uv2 = u64(t[k]) + cy
+  t[k] = u32(uv2 & 0xffffffff)
+  t[k + 1] = u32(uv2 >> 32)
+  let m = u32((u64(t[0]) * u64(c.n0inv)) & 0xffffffff)
+  cy = (u64(t[0]) + u64(m) * u64(n[0])) >> 32
+  j = 1
+  while (j < k) {
+    let uv = u64(t[j]) + u64(m) * u64(n[j]) + cy
+    t[j - 1] = u32(uv & 0xffffffff)
+    cy = uv >> 32
+    j = j + 1
+  }
+  let uv4 = u64(t[k]) + cy
+  t[k - 1] = u32(uv4 & 0xffffffff)
+  t[k] = u32(u64(t[k + 1]) + (uv4 >> 32))
+}
+
+// `x = 2x mod n` in place, for `x < n`.
+fn bigintModDoubleTo(x: []u32, n: []u32) {
+  let carry: u32 = 0
+  let i = 0
+  while (i < len(n)) {
+    let top = x[i] >> 31
+    x[i] = (x[i] << 1) | carry
+    carry = top
+    i = i + 1
+  }
+  bigintCondSub(x, carry, n)
+}
+
+// `c.r2 = R^2 mod n`. Start at `2^(bitlen-1)`, the largest power of two below
+// `n`, and double up to `2^(32k + k) = 2^k * R`, the Montgomery form of `2^k`;
+// five Montgomery squarings then give the form of `2^(32k) = R`, which is
+// `R^2`. A doubling costs `3k` limb operations and a squaring `2k^2`, so five
+// squarings after `~k` doublings beats both pure doubling (`32k` of them) and
+// the longest squaring chain. Every count is a function of the modulus width
+// and bit length, both public.
+fn bigintMontR2To(c: MontCtx) {
+  let n = c.n
+  let k = len(n)
+  let x = c.r2
+  let top = bigintBitLen(Nat{ limbs = n }) - 1
+  x[top / 32] = u32(1) << u32(top % 32)
+  let steps = 32 * k - top + k
+  let i = 0
+  while (i < steps) {
+    bigintModDoubleTo(x, n)
+    i = i + 1
+  }
+  i = 0
+  while (i < 5) {
+    bigintMontMulTo(c, x, x, x)
+    i = i + 1
+  }
+}
+
+// `out = x mod n` for a limb slice `x` of any length, in constant time for a
+// given `len(x)`: Horner over `k`-limb chunks from the top, entirely in the
+// Montgomery domain. `acc*R` is one multiply by `r2` (`Mont(v) -> Mont(v*R)`)
+// and each chunk enters as `Mont(chunk)`, another; one multiply by one leaves
+// the domain. `out` must not alias `x`.
+fn bigintMontReduceTo(c: MontCtx, out: []u32, x: []u32) {
+  let k = len(c.n)
+  let chunk = c.s
+  let i = 0
+  while (i < k) {
+    out[i] = 0
+    i = i + 1
+  }
+  let ci = (len(x) + k - 1) / k - 1
+  while (ci >= 0) {
+    bigintMontMulTo(c, out, out, c.r2)
+    i = 0
+    while (i < k) {
+      let src = ci * k + i
+      chunk[i] = 0
+      if (src < len(x)) {
+        chunk[i] = x[src]
+      }
+      i = i + 1
+    }
+    bigintMontMulTo(c, chunk, chunk, c.r2)
+    bigintModAddTo(out, chunk, c.n)
+    ci = ci - 1
+  }
+  bigintMontMulTo(c, out, out, c.one)
+}
+
+// `out = base^exp mod n` by a constant-time Montgomery powering ladder over the
+// low `bits` exponent bits: every bit costs one swap, one multiply and one
+// square whatever its value.
+// `base < n` and may alias `out`. `exp` must hold at least `bits` bits (`(bits+31)/32` limbs) so
+// no bit fetch depends on the exponent's normalized length.
+fn bigintMontExpTo(c: MontCtx, out: []u32, base: []u32, exp: []u32, bits: int) {
+  let r0 = out
+  let r1 = c.s
+  bigintMontMulTo(c, r1, base, c.r2)
+  bigintMontMulTo(c, r0, c.one, c.r2)
+  let bit = bits - 1
+  while (bit >= 0) {
+    let b = (exp[bit / 32] >> u32(bit % 32)) & 1
+    bigintCswap(r0, r1, b)
+    bigintMontMulTo(c, r1, r0, r1)
+    bigintMontMulTo(c, r0, r0, r0)
+    bigintCswap(r0, r1, b)
+    bit = bit - 1
+  }
+  bigintMontMulTo(c, r0, r0, c.one)
+}
+
+// `out = base^exp mod n` for a PUBLIC exponent: left-to-right square and
+// multiply that skips the multiply on a zero bit. `base < n`. Never call it
+// with a secret exponent.
+fn bigintMontPowPublicTo(c: MontCtx, out: []u32, base: []u32, exp: Nat) {
+  let acc = c.s
+  let bits = bigintBitLen(exp)
+  bigintMontMulTo(c, out, base, c.r2)
+  bigintMontMulTo(c, acc, c.one, c.r2)
+  let bit = bits - 1
+  while (bit >= 0) {
+    bigintMontMulTo(c, acc, acc, acc)
+    if (((exp.limbs[bit / 32] >> u32(bit % 32)) & 1) == 1) {
+      bigintMontMulTo(c, acc, acc, out)
+    }
+    bit = bit - 1
+  }
+  bigintMontMulTo(c, out, acc, c.one)
+}
+
+// `x = x + y` over `len(x)` limbs, returning the carry out.
+fn bigintAddTo(x: []u32, y: []u32): u32 {
+  let carry: u64 = 0
+  let i = 0
+  while (i < len(x)) {
+    let s = u64(x[i]) + u64(y[i]) + carry
+    x[i] = u32(s & 0xffffffff)
+    carry = s >> 32
+    i = i + 1
+  }
+  return u32(carry)
+}
+
+// `x = x - y` over `len(x)` limbs, returning the borrow out.
+fn bigintSubTo(x: []u32, y: []u32): u32 {
+  let borrow: u64 = 0
+  let i = 0
+  while (i < len(x)) {
+    let d = u64(x[i]) + 0x100000000 - u64(y[i]) - borrow
+    x[i] = u32(d & 0xffffffff)
+    borrow = 1 - (d >> 32)
+    i = i + 1
+  }
+  return u32(borrow)
+}
+
+// `x = (top:x) >> 1`, shifting the bit `top` in at the high end.
+fn bigintShr1To(x: []u32, top: u32) {
+  let i = 0
+  while (i < len(x)) {
+    let hi = top
+    if (i + 1 < len(x)) {
+      hi = x[i + 1]
+    }
+    x[i] = (x[i] >> 1) | (hi << 31)
+    i = i + 1
+  }
+}
+
+// Whether every limb of `x` is zero.
+fn bigintLimbsZero(x: []u32): bool {
+  let acc: u32 = 0
+  let i = 0
+  while (i < len(x)) {
+    acc = acc | x[i]
+    i = i + 1
+  }
+  return acc == 0
+}
+
+// Halve the even one of `u`/`v` and keep `u = A*a - B*m` (or `v = D*m - C*a`)
+// exact: when either coefficient is odd, add `(m, x)` first so both halve.
+fn bigintXgcdHalve(y: []u32, p: []u32, q: []u32, g: XgcdState) {
+  bigintShr1To(y, 0)
+  if (((p[0] | q[0]) & 1) == 1) {
+    bigintShr1To(p, bigintAddTo(p, g.m))
+    bigintShr1To(q, bigintAddTo(q, g.x))
+    return
+  }
+  bigintShr1To(p, 0)
+  bigintShr1To(q, 0)
+}
+
+// The binary extended GCD state: `u = A*x - B*m` and `v = D*m - C*x` over
+// fixed `k`-limb buffers, `x` the value being inverted and `m` the modulus.
+class XgcdState { u: []u32, v: []u32, aa: []u32, b: []u32, cc: []u32, d: []u32, m: []u32, x: []u32 }
+
+// `out = a^-1 mod m` by the bounded binary extended GCD (HAC 14.61 as adapted
+// by BoringSSL's bn_mod_inverse_consttime and Go's bigmod, proof in fiat-crypto
+// PR 333), on fixed `k`-limb buffers: `u = A*a - B*m` and `v = D*m - C*a` hold
+// before and after every step, and each step halves `u` or `v`, so at most
+// `64k` steps run. VARIABLE TIME in `a`: callers pass only a fresh random
+// value (the RSA blinding factor). Returns false when `gcd(a, m) != 1`. `a < m`,
+// `m` odd, both `k` limbs; `out` is `A`.
+fn bigintInverseVarTimeTo(out: []u32, a: []u32, m: []u32): bool {
+  let k = len(m)
+  let g = XgcdState{
+    u = []u32(k),
+    v = []u32(k),
+    aa = out,
+    b = []u32(k),
+    cc = []u32(k),
+    d = []u32(k),
+    m = m,
+    x = a,
+  }
+  let i = 0
+  while (i < k) {
+    g.u[i] = a[i]
+    g.v[i] = m[i]
+    out[i] = 0
+    i = i + 1
+  }
+  out[0] = 1
+  g.d[0] = 1
+  if (bigintLimbsZero(g.u)) {
+    return false
+  }
+  let steps = 0
+  while (!bigintLimbsZero(g.v) && steps <= 64 * k) {
+    bigintXgcdStep(g)
+    steps = steps + 1
+  }
+  if (!bigintLimbsZero(g.v)) {
+    return false
+  }
+  return bigintLimbsZero(g.u[1:k]) && g.u[0] == 1
+}
+
+// One iteration of `bigintInverseVarTimeTo`: subtract the smaller of two odd
+// `u`/`v` from the larger (updating its coefficient pair modulo `(m, x)`),
+// then halve whichever is even.
+fn bigintXgcdStep(g: XgcdState) {
+  if ((g.u[0] & g.v[0] & 1) == 1) {
+    if (bigintSubTo(g.v, g.u) == 1) {
+      let _ = bigintAddTo(g.v, g.u)
+      let _ = bigintSubTo(g.u, g.v)
+      bigintModAddTo(g.aa, g.cc, g.m)
+      bigintModAddTo(g.b, g.d, g.x)
+    } else {
+      bigintModAddTo(g.cc, g.aa, g.m)
+      bigintModAddTo(g.d, g.b, g.x)
+    }
+  }
+  if ((g.u[0] & 1) == 0) {
+    bigintXgcdHalve(g.u, g.aa, g.b, g)
+    return
+  }
+  bigintXgcdHalve(g.v, g.cc, g.d, g)
+}
