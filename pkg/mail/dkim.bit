@@ -1,0 +1,514 @@
+// pkg/mail/dkim.bit — the DKIM signer (RFC 6376), with the rsa-sha256 and the
+// ed25519-sha256 (RFC 8463) algorithms, relaxed/relaxed only.
+//
+// `loadDkim` parses a `Dkim` once, when the mailer opens, so a bad key is a
+// `MailError.Config` at startup and never a failure on the first message.
+// `dkimSign` canonicalizes the message ONCE (`dkimCanon`: every header field
+// and the body hash) and every key signs from that: a second key costs one
+// header-data assembly and one signature, not a second pass over the body.
+//
+// Every signature covers the message as it was handed in, never another new
+// signature, so the signatures are independent of each other and a receiver
+// can verify whichever algorithm it supports.
+//
+// Never emitted: `l=` (a body length lets an attacker append text), `z=`, and
+// SHA-1. A header that is present is listed once more than it occurs
+// ("oversigning"), so a copy of From or Subject added in transit breaks the
+// signature instead of being shown above the signed one.
+
+import { Builder, contains, toLower } from "std/strings"
+import { digest, encodeBase64, pemDecode, HashAlg, Sha256, RsaPrivateKey } from "std/crypto"
+import { rsaParsePrivateKey, rsaParsePkcs1PrivateKey, rsaSignPkcs1v15, rsaDigestInfoSha256 } from "std/crypto"
+import { ed25519ParsePrivateKey, ed25519Sign, bigintBitLen } from "std/crypto"
+import { Second, Timestamp } from "std/time"
+
+const sigName: string = "DKIM-Signature"
+const foldWidth: int = 78
+const minRsaBits: int = 2048
+const hyphen: u8 = 45
+const colonByte: u8 = 58
+const maxDnsName: int = 253
+const maxShown: int = 64
+
+// One DKIM identity: the key a message is signed with and where a receiver
+// finds its public half (`<selector>._domainkey.<domain>` in DNS).
+export class Dkim {
+  // The domain in `d=`: the one whose DNS holds the public key.
+  export domain: string,
+  // The key's name in DNS, `s=`. It may contain dots.
+  export selector: string,
+  // The private key as PEM: PKCS#8 (`PRIVATE KEY`, RSA or Ed25519) or PKCS#1
+  // (`RSA PRIVATE KEY`). An RSA key needs 2048 bits or more, and it must not be
+  // encrypted.
+  export key: string,
+  // The header names to sign; `[]` means the default list. From is required.
+  export headers: []string = [],
+  // Seconds a signature stays valid; above 0 it adds `x=`.
+  export expire: int = 0,
+}
+
+// The private key behind one identity: what signs, and the `a=` it announces.
+enum DkimMaterial {
+  Rsa(RsaPrivateKey)
+  Ed25519([]byte)
+
+  // The `a=` tag value.
+  alg(): string {
+    match (this) {
+      Rsa(_) => return "rsa-sha256"
+      Ed25519(_) => return "ed25519-sha256"
+    }
+  }
+
+  // The raw signature over the canonical header data: RSASSA-PKCS1-v1_5 over
+  // SHA-256 for RSA, and for Ed25519 the SHA-256 of the data signed with
+  // PureEdDSA (RFC 8463 section 3), the hash and not the data itself.
+  sign(data: string): []byte!MailError {
+    match (this) {
+      Rsa(key) => {
+        return rsaSignPkcs1v15(key, HashAlg.Sha256, rsaDigestInfoSha256(), []byte(data)) catch _ {
+          fail MailError.Invalid("dkim: the RSA signature could not be made")
+        }
+      }
+      Ed25519(seed) => return ed25519Sign(seed, digest(Sha256(), []byte(data)))
+    }
+  }
+}
+
+// A `Dkim` after `loadDkim`: parsed, checked, and ready to sign any number of
+// messages. `names` are the lower-case header names to sign, without
+// duplicates.
+class DkimKey {
+  domain: string,
+  selector: string,
+  material: DkimMaterial,
+  names: []string,
+  expire: int,
+}
+
+// A message after its one canonicalization pass: each header field in relaxed
+// form (`fields[i]` is the field named `names[i]`, lower case, in message
+// order) and the body hash `bh=` value.
+class DkimCanon {
+  names: []string,
+  fields: []string,
+  bh: string,
+}
+
+// The headers signed when `Dkim.headers` is empty.
+fn defaultHeaders(): []string {
+  return []string{
+    "from", "to", "cc", "reply-to", "subject", "date", "message-id", "in-reply-to",
+    "references", "mime-version", "content-type", "list-unsubscribe",
+    "list-unsubscribe-post", "list-id", "feedback-id",
+  }
+}
+
+fn dkimConfig(name: string, why: string): MailError {
+  return MailError.Config("dkim ${name}: ${why}")
+}
+
+// `s` for an error text: printable ASCII only, never longer than `maxShown`,
+// so a bad value cannot put a line break or a control byte in a log line.
+fn shown(s: string): string {
+  let out = Builder()
+  let i = 0
+  while (i < len(s) && i < maxShown) {
+    if (s[i] >= u8(33) && s[i] <= u8(126)) {
+      out.writeByte(s[i])
+    } else {
+      out.writeByte(u8(63))
+    }
+    i = i + 1
+  }
+  return out.toString()
+}
+
+// Whether `s` is a DNS name of letter-digit-hyphen labels: 1 to 63 bytes each,
+// none starting or ending with a hyphen, 253 bytes in all.
+fn isDnsName(s: string): bool {
+  if (len(s) == 0 || len(s) > maxDnsName) {
+    return false
+  }
+  let labelLen = 0
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == dot) {
+      if (labelLen == 0) {
+        return false
+      }
+      labelLen = 0
+    } else if (okLabelByte(s, i, labelLen)) {
+      labelLen = labelLen + 1
+    } else {
+      return false
+    }
+    i = i + 1
+  }
+  return labelLen > 0
+}
+
+// Whether the byte at `s[i]`, which would be byte `labelLen` of its label, may
+// be there: a letter or digit, a hyphen that does not start or end the label,
+// and no label over 63 bytes. The byte before a dot is checked as the label's
+// last, so `a-.com` fails here.
+fn okLabelByte(s: string, i: int, labelLen: int): bool {
+  if (labelLen >= maxLabel) {
+    return false
+  }
+  if (isAlnum(s[i])) {
+    return true
+  }
+  return s[i] == hyphen && labelLen > 0 && i + 1 < len(s) && s[i + 1] != dot
+}
+
+// The RSA key must be 2048 bits or more: a 1024-bit key is within reach of a
+// well-funded attacker and Gmail and others stop honouring it.
+fn checkRsaSize(key: RsaPrivateKey, name: string): RsaPrivateKey!MailError {
+  let bits = bigintBitLen(key.n)
+  if (bits < minRsaBits) {
+    fail dkimConfig(
+      name,
+      "the RSA key has ${bits} bits and the minimum is ${minRsaBits}; make one with `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`",
+    )
+  }
+  return key
+}
+
+fn ed25519Material(der: []byte, name: string): DkimMaterial!MailError {
+  let seed = ed25519ParsePrivateKey(der) catch _ {
+    fail dkimConfig(name, "the PRIVATE KEY is neither an RSA nor an Ed25519 key")
+  }
+  return DkimMaterial.Ed25519(seed)
+}
+
+// A PKCS#8 key is RSA when it parses as one, and otherwise has to be Ed25519.
+fn pkcs8Material(der: []byte, name: string): DkimMaterial!MailError {
+  let rsa = rsaParsePrivateKey(der) catch _ {
+    return ed25519Material(der, name)?
+  }
+  return DkimMaterial.Rsa(checkRsaSize(rsa, name)?)
+}
+
+// The key in `pem`. The text of every refusal names the identity and the
+// problem; none carries a byte of the key.
+fn parseDkimKey(pem: string, name: string): DkimMaterial!MailError {
+  let blocks = pemDecode(pem) catch _ {
+    fail dkimConfig(name, "the key is not PEM text")
+  }
+  if (len(blocks) != 1) {
+    fail dkimConfig(name, "the key must be exactly one PEM block")
+  }
+  let block = blocks[0]
+  if (block.label == "PRIVATE KEY") {
+    return pkcs8Material(block.der, name)?
+  }
+  if (block.label == "RSA PRIVATE KEY") {
+    let rsa = rsaParsePkcs1PrivateKey(block.der) catch _ {
+      fail dkimConfig(name, "the RSA PRIVATE KEY is not valid PKCS#1")
+    }
+    return DkimMaterial.Rsa(checkRsaSize(rsa, name)?)
+  }
+  if (block.label == "ENCRYPTED PRIVATE KEY") {
+    fail dkimConfig(
+      name,
+      "the key is encrypted; decrypt it first (`openssl pkey -in key.pem -out plain.pem`)",
+    )
+  }
+  fail dkimConfig(
+    name,
+    "the PEM label ${shown(block.label)} is not a PRIVATE KEY or an RSA PRIVATE KEY",
+  )
+}
+
+// The lower-case, de-duplicated header names to sign. A name is a field name:
+// printable ASCII and no colon. From must be one of them.
+fn headerNames(given: []string, name: string): []string!MailError {
+  if (len(given) == 0) {
+    return defaultHeaders()
+  }
+  let out = []string(0)
+  let sawFrom = false
+  let i = 0
+  while (i < len(given)) {
+    let h = toLower(given[i])
+    if (!isFieldName(h)) {
+      fail dkimConfig(name, "headers has ${shown(given[i])}, which is not a header field name")
+    }
+    if (!listHas(out, h)) {
+      out = append(out, h)
+    }
+    sawFrom = sawFrom || h == "from"
+    i = i + 1
+  }
+  if (!sawFrom) {
+    fail dkimConfig(name, "headers must include From")
+  }
+  return out
+}
+
+fn isFieldName(s: string): bool {
+  if (len(s) == 0) {
+    return false
+  }
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] < u8(33) || s[i] > u8(126) || s[i] == colonByte) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn listHas(list: []string, s: string): bool {
+  let i = 0
+  while (i < len(list)) {
+    if (list[i] == s) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Parses and checks `d` once. Refused as `MailError.Config`: a domain or
+// selector that is not a DNS name, a negative `expire`, a `headers` without
+// From, a key that is not PEM, is encrypted, is neither RSA nor Ed25519, or is
+// an RSA key under 2048 bits.
+fn loadDkim(d: Dkim): DkimKey!MailError {
+  let name = "${shown(d.selector)}._domainkey.${shown(d.domain)}"
+  if (!isDnsName(d.selector)) {
+    fail dkimConfig(name, "the selector is not a DNS name")
+  }
+  if (!isDnsName(d.domain) || !contains(d.domain, ".")) {
+    fail dkimConfig(name, "the domain is not a DNS name")
+  }
+  if (len(d.selector) + len(d.domain) + 12 > maxDnsName) {
+    fail dkimConfig(name, "the key's DNS name is longer than ${maxDnsName} bytes")
+  }
+  if (d.expire < 0) {
+    fail dkimConfig(name, "expire must not be negative")
+  }
+  let names = headerNames(d.headers, name)?
+  let material = parseDkimKey(d.key, name)?
+  return DkimKey{
+    domain = d.domain,
+    selector = d.selector,
+    material = material,
+    names = names,
+    expire = d.expire,
+  }
+}
+
+// The one pass over `data`: every header field canonicalized and the body
+// hashed. Refused when the message does not split or has no From.
+fn dkimCanon(data: string): DkimCanon!MailError {
+  let parts = splitMessage(data)?
+  let names = []string(0)
+  let fields = []string(0)
+  let i = 0
+  while (i < len(parts.0)) {
+    names = append(names, toLower(trimWs(parts.0[i].0)))
+    fields = append(fields, relaxedHeader(parts.0[i].0, parts.0[i].1))
+    i = i + 1
+  }
+  if (!listHas(names, "from")) {
+    fail MailError.Invalid("dkim: the message has no From header")
+  }
+  let bh = encodeBase64(digest(Sha256(), []byte(relaxedBody(parts.1))))
+  return DkimCanon{ names = names, fields = fields, bh = bh }
+}
+
+fn trimWs(s: string): string {
+  let n = len(s)
+  while (n > 0 && isWs(s[n - 1])) {
+    n = n - 1
+  }
+  return s[:n]
+}
+
+// The `h=` names for `names` on this message: each one that is present listed
+// once per occurrence and once more, and each one that is absent left out.
+fn oversigned(c: DkimCanon, names: []string): []string {
+  let out = []string(0)
+  let i = 0
+  while (i < len(names)) {
+    let n = countName(c, names[i])
+    let j = 0
+    while (n > 0 && j <= n) {
+      out = append(out, names[i])
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn countName(c: DkimCanon, name: string): int {
+  let n = 0
+  let i = 0
+  while (i < len(c.names)) {
+    if (c.names[i] == name) {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// RFC 6376 section 5.4.2: the canonical header fields `h` selects. Each name
+// takes the last field of that name not yet taken, so the instances come from
+// the bottom up, and a name with no field left selects nothing.
+fn selectFields(c: DkimCanon, h: []string): string {
+  let taken = []bool(len(c.names))
+  let out = Builder()
+  let i = 0
+  while (i < len(h)) {
+    let at = lastUntaken(c, taken, h[i])
+    if (at >= 0) {
+      taken[at] = true
+      out.write(c.fields[at])
+    }
+    i = i + 1
+  }
+  return out.toString()
+}
+
+fn lastUntaken(c: DkimCanon, taken: []bool, name: string): int {
+  let i = len(c.names) - 1
+  while (i >= 0) {
+    if (c.names[i] == name && !taken[i]) {
+      return i
+    }
+    i = i - 1
+  }
+  return -1
+}
+
+// The `b=` value for the signature header `unsigned`, which is the whole
+// header up to and including `b=` (RFC 6376 section 3.7: the signature header
+// is hashed with an empty `b=`, last, and without its final CRLF). `h` names
+// the fields that come first.
+fn dkimSignature(c: DkimCanon, h: []string, unsigned: string, m: DkimMaterial): string!MailError {
+  let own = relaxedHeader(sigName, unsigned[len(sigName) + 1:])
+  let data = selectFields(c, h) + own[:len(own) - 2]
+  return encodeBase64(m.sign(data)?)
+}
+
+// Header text with a fold before any token that would pass column 78, so the
+// result keeps to the 78-column lines std/smtp's line check expects.
+class Fold {
+  out: Builder
+  col: int
+
+  init(first: string) {
+    this.out = Builder()
+    this.out.write(first)
+    this.col = len(first)
+  }
+
+  // `tok` after one space, or after a fold when it does not fit.
+  word(tok: string) {
+    if (this.col + 1 + len(tok) > foldWidth) {
+      this.out.write("\r\n ")
+      this.col = 1
+    } else {
+      this.out.write(" ")
+      this.col = this.col + 1
+    }
+    this.out.write(tok)
+    this.col = this.col + len(tok)
+  }
+
+  // `tok` right after the text so far, with a fold before it only when it does
+  // not fit. Only used where the grammar allows FWS: after a colon in `h=`.
+  next(tok: string) {
+    if (this.col + len(tok) > foldWidth) {
+      this.out.write("\r\n ")
+      this.col = 1
+    }
+    this.out.write(tok)
+    this.col = this.col + len(tok)
+  }
+
+  // Base64 `s`, folded wherever the line is full: FWS is allowed inside it.
+  fill(s: string) {
+    let i = 0
+    while (i < len(s)) {
+      if (this.col >= foldWidth) {
+        this.out.write("\r\n ")
+        this.col = 1
+      }
+      let end = i + foldWidth - this.col
+      if (end > len(s)) {
+        end = len(s)
+      }
+      this.out.write(s[i:end])
+      this.col = this.col + end - i
+      i = end
+    }
+  }
+
+  toString(): string {
+    return this.out.toString()
+  }
+}
+
+// The header up to `b=` for the key `k`: the tags in their fixed order.
+fn unsignedHeader(c: DkimCanon, k: DkimKey, h: []string, t: int): Fold {
+  let f = Fold("${sigName}:")
+  f.word("v=1;")
+  f.word("a=${k.material.alg()};")
+  f.word("c=relaxed/relaxed;")
+  f.word("d=${k.domain};")
+  f.word("s=${k.selector};")
+  f.word("t=${t};")
+  if (k.expire > 0) {
+    f.word("x=${t + k.expire};")
+  }
+  let i = 0
+  while (i < len(h)) {
+    let tok = h[i] + ":"
+    if (i == len(h) - 1) {
+      tok = h[i] + ";"
+    }
+    if (i == 0) {
+      f.word("h=${tok}")
+    } else {
+      f.next(tok)
+    }
+    i = i + 1
+  }
+  f.word("bh=${c.bh};")
+  f.word("b=")
+  return f
+}
+
+// The complete `DKIM-Signature` header of key `k` over `c`, with its CRLF.
+fn signedHeader(c: DkimCanon, k: DkimKey, t: int): string!MailError {
+  let h = oversigned(c, k.names)
+  let f = unsignedHeader(c, k, h, t)
+  let b = dkimSignature(c, h, f.toString(), k.material)?
+  f.fill(b)
+  return f.toString() + "\r\n"
+}
+
+// `data` with one `DKIM-Signature` per key put in front of it, in key order,
+// each signed at `now`. `data` is a rendered message with CRLF line ends and a
+// From header; anything else is `MailError.Invalid`.
+fn dkimSign(data: string, keys: []DkimKey, now: Timestamp): string!MailError {
+  if (len(keys) == 0) {
+    return data
+  }
+  let c = dkimCanon(data)?
+  let t = now.ns / Second
+  let out = Builder()
+  let i = 0
+  while (i < len(keys)) {
+    out.write(signedHeader(c, keys[i], t)?)
+    i = i + 1
+  }
+  out.write(data)
+  return out.toString()
+}
