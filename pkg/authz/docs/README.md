@@ -6,3 +6,4 @@
 | [Subjects](subjects.md) | Who is asking: the `Subject` interface, `$user.x` attributes with `attributeOf`, the guest as an absent subject |
 | [Resources](resources.md) | Registering `@table` classes with `resource<T>()`, names from the class, `all`, `resourceRef`, `resourceByName`, `fieldType` |
 | [Conditions](conditions.md) | The `Cond` tree: `eq`, `ne`, `oneOf`, `lt`, `lte`, `gt`, `gte`, `and`, `or`, `not`, `evalCond` and its `Truth` answer, `validate` at startup, `fromWhere`, how NULL and CASL differ |
+| [Relationships](relationships.md) | Tuples such as `user:sara`, `editor`, `folder:launch`: `relate`, `unrelate`, `related`, usersets, validation, `RelationStore` and `MemoryRelationStore` |

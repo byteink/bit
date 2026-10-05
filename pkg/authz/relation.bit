@@ -1,0 +1,307 @@
+// pkg/authz/relation.bit — relationship tuples, the data ReBAC is made of.
+//
+//   authz.relate("user:sara", "editor", "folder:launch")?
+//   authz.related("user:sara", "editor", "folder:launch")?   // true
+//   authz.unrelate("user:sara", "editor", "folder:launch")?
+//
+// A tuple reads "subject is `relation` of object" and follows the Zanzibar
+// model that SpiceDB and OpenFGA share (`object#relation@subject`). An object
+// is a typed reference `type:id`: the type is a registered resource's class
+// name with its first letter lowered (`Folder` is `folder`, `OrderLine` is
+// `orderLine`), so the tuple above needs `authz.resource<Folder>()`. One
+// spelling only, or `Folder:x` and `folder:x` would be two different
+// objects. A subject is
+// `user:<id>`, another typed reference, or a USERSET `type:id#relation`
+// ("team:eng#member": everyone who is a member of team eng), which is what
+// makes groups and folder inheritance expressible. `related` answers for the
+// DIRECT tuple only; walking usersets is the check that comes after it.
+//
+// Callers pass strings that came from an admin endpoint, so all of it is
+// validated here, before any store sees it, and every refusal is an
+// InvalidPolicy:
+//
+//  - relation: `[a-z][a-z0-9_]{0,31}`.
+//  - type: `user` (subjects only) or a registered resource's type name.
+//  - id: 1 to 128 printable ASCII bytes with no space, ':' or '#'. Refusing
+//    everything else keeps a reference unambiguous in every store's key and
+//    keeps control characters and look-alike Unicode out of logs and keys.
+//  - a reference with no ':' is refused.
+//
+// A refusal never repeats the rejected text: it is untrusted and unbounded.
+// A RelationStore trusts its input for the same reason a SQL store binds its
+// parameters: validation is one function (`checkTuple`), run by `Authz`.
+
+import { Mutex } from "std/sync"
+import { indexOf, join, toLower } from "std/strings"
+import { sorted } from "std/sort"
+
+const maxIdBytes: int = 128
+const maxRelationBytes: int = 32
+
+// "subject is `relation` of object", as validated strings.
+export class Tuple {
+  export subject: string,
+  export relation: string,
+  export object: string,
+}
+
+// Where tuples live. Writes are idempotent: writing a tuple that is already
+// there, or deleting one that is not, changes nothing and keeps `version`.
+// `version` grows on every effective write or delete, which is what lets a
+// cache of relationship answers know it is stale. Implementations may assume
+// every tuple was validated by `Authz`.
+//
+// `direct` answers the subjects holding `relation` on `object` (userset
+// subjects included, as written), oldest first. `list` answers every tuple
+// whose subject is exactly `subject`, oldest first.
+export interface RelationStore {
+  write(t: Tuple): ()!,
+  delete(t: Tuple): ()!,
+  direct(object: string, relation: string): []string!,
+  list(subject: string): []Tuple!,
+  version(): i64!,
+}
+
+// The default number of tuples a `MemoryRelationStore` holds.
+const memoryRelationCapacity: int = 100_000
+
+// An in-process store for tests, development and a single-process app. Its
+// tuples die with the process. Bounded: when full, `write` fails rather than
+// growing without limit.
+export class MemoryRelationStore {
+  keys: map<string, bool>
+  bySlot: map<string, []string>
+  bySubject: map<string, []Tuple>
+  capacity: int
+  ver: i64
+  mu: Mutex
+
+  // A capacity below 1 could hold no tuple, so it panics: a mistake at
+  // startup, and it keeps `MemoryRelationStore()` infallible.
+  init(capacity: int = memoryRelationCapacity) {
+    if (capacity < 1) {
+      panic("authz: MemoryRelationStore(): `capacity` is ${capacity} — it must be at least 1")
+    }
+    this.keys = map<string, bool>()
+    this.bySlot = map<string, []string>()
+    this.bySubject = map<string, []Tuple>()
+    this.capacity = capacity
+    this.ver = 0
+    this.mu = Mutex()
+  }
+
+  export write(t: Tuple): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let key = tupleKey(t)
+    let (_, present) = this.keys[key]
+    if (present) {
+      return
+    }
+    if (len(this.keys) >= this.capacity) {
+      fail newError("authz: MemoryRelationStore.write(): the store is full at ${this.capacity} tuples")
+    }
+    this.keys[key] = true
+    let slot = slotKey(t.object, t.relation)
+    let (subs, _) = this.bySlot[slot]
+    this.bySlot[slot] = append(subs, t.subject)
+    let (held, _) = this.bySubject[t.subject]
+    this.bySubject[t.subject] = append(held, copyTuple(t))
+    this.ver = this.ver + 1
+  }
+
+  export delete(t: Tuple): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let key = tupleKey(t)
+    let (_, present) = this.keys[key]
+    if (!present) {
+      return
+    }
+    delete(this.keys, key)
+    let slot = slotKey(t.object, t.relation)
+    let (subs, _) = this.bySlot[slot]
+    this.bySlot[slot] = without(subs, t.subject)
+    let (held, _) = this.bySubject[t.subject]
+    this.bySubject[t.subject] = withoutTuple(held, t)
+    this.ver = this.ver + 1
+  }
+
+  export direct(object: string, relation: string): []string! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (subs, _) = this.bySlot[slotKey(object, relation)]
+    return appendAll([]string(0), subs)
+  }
+
+  export list(subject: string): []Tuple! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (held, _) = this.bySubject[subject]
+    let out = []Tuple(0)
+    for t of held {
+      out = append(out, copyTuple(t))
+    }
+    return out
+  }
+
+  export version(): i64! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.ver
+  }
+}
+
+// The type a registered class goes by in a tuple: its name, first letter
+// lowered.
+fn typeName(r: ResourceInfo): string {
+  return toLower(r.name[0:1]) + r.name[1:]
+}
+
+fn isType(resources: []ResourceInfo, typ: string): bool {
+  for r of resources {
+    if (typeName(r) == typ) {
+      return true
+    }
+  }
+  return false
+}
+
+// Type names in alphabetical order, for the refusal that lists them.
+fn typeNames(resources: []ResourceInfo): []string {
+  let names = []string(0)
+  for r of resources {
+    names = append(names, typeName(r))
+  }
+  return sorted(names, (a, b) => a < b)
+}
+
+// `object#relation@subject`. Unambiguous for a validated tuple: an object has
+// no '#', a relation has neither '#' nor '@'.
+fn tupleKey(t: Tuple): string {
+  return "${slotKey(t.object, t.relation)}@${t.subject}"
+}
+
+fn slotKey(object: string, relation: string): string {
+  return "${object}#${relation}"
+}
+
+fn copyTuple(t: Tuple): Tuple {
+  return Tuple{ subject = t.subject, relation = t.relation, object = t.object }
+}
+
+fn appendAll(dst: []string, src: []string): []string {
+  for s of src {
+    dst = append(dst, s)
+  }
+  return dst
+}
+
+fn without(list: []string, drop: string): []string {
+  let out = []string(0)
+  for s of list {
+    if (s != drop) {
+      out = append(out, s)
+    }
+  }
+  return out
+}
+
+fn withoutTuple(list: []Tuple, drop: Tuple): []Tuple {
+  let out = []Tuple(0)
+  for t of list {
+    if (tupleKey(t) != tupleKey(drop)) {
+      out = append(out, t)
+    }
+  }
+  return out
+}
+
+// Whether `t` is stored, by its object's direct subjects.
+fn isStored(store: RelationStore, t: Tuple): bool! {
+  for s of store.direct(t.object, t.relation)? {
+    if (s == t.subject) {
+      return true
+    }
+  }
+  return false
+}
+
+fn refuse(detail: string): ()! {
+  fail InvalidPolicy{ detail = detail }
+}
+
+fn relationOk(r: string): bool {
+  if (len(r) < 1 || len(r) > maxRelationBytes) {
+    return false
+  }
+  let first = true
+  for c of []byte(r) {
+    let lower = c >= 'a' && c <= 'z'
+    let tail = (c >= '0' && c <= '9') || c == '_'
+    if (!lower && !(tail && !first)) {
+      return false
+    }
+    first = false
+  }
+  return true
+}
+
+fn idOk(id: string): bool {
+  if (len(id) < 1 || len(id) > maxIdBytes) {
+    return false
+  }
+  for c of []byte(id) {
+    if (c <= ' ' || c > '~' || c == ':' || c == '#') {
+      return false
+    }
+  }
+  return true
+}
+
+fn checkRelation(role: string, r: string): ()! {
+  if (!relationOk(r)) {
+    refuse("${role} must match [a-z][a-z0-9_]{0,31}")?
+  }
+}
+
+// `ref` must be `type:id`, its type `user` (when `allowUser`) or registered.
+fn checkRef(role: string, ref: string, resources: []ResourceInfo, allowUser: bool): ()! {
+  let colon = indexOf(ref, ":")
+  if (colon < 0) {
+    refuse("${role} must be \"type:id\"")?
+  }
+  if (!idOk(ref[colon + 1:])) {
+    refuse("${role} id must be 1 to ${maxIdBytes} printable ASCII bytes with no space, ':' or '#'")?
+  }
+  let typ = ref[0:colon]
+  if ((allowUser && typ == "user") || isType(resources, typ)) {
+    return
+  }
+  refuse("${role} type is not a registered resource (registered: ${join(typeNames(resources), ", ")})")?
+}
+
+// The subject's reference part, checking a trailing `#relation` on the way.
+fn checkSubject(subject: string, resources: []ResourceInfo): ()! {
+  let hash = indexOf(subject, "#")
+  if (hash < 0) {
+    checkRef("subject", subject, resources, true)?
+    return
+  }
+  checkRelation("subject relation", subject[hash + 1:])?
+  checkRef("subject", subject[0:hash], resources, true)?
+}
+
+// The tuple, or the InvalidPolicy that says which part is wrong. The one
+// place a caller's strings are trusted.
+fn checkTuple(
+  resources: []ResourceInfo,
+  subject: string,
+  relation: string,
+  object: string,
+): Tuple! {
+  checkRelation("relation", relation)?
+  checkRef("object", object, resources, false)?
+  checkSubject(subject, resources)?
+  return Tuple{ subject = subject, relation = relation, object = object }
+}

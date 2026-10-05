@@ -29,3 +29,4 @@ The [chapters](docs/README.md) start with [Actions](docs/actions.md), then
 [Subjects](docs/subjects.md), then
 [Resources](docs/resources.md), then
 [Conditions](docs/conditions.md).
+[Relationships](docs/relationships.md).
