@@ -14,6 +14,15 @@
 
 import { Conn as NetConn } from "std/net"
 import { TlsConn } from "std/tls"
+import { monotonic } from "std/time"
+
+// How long the rest of a message may take once its first bytes have arrived.
+// A server that sent half a message and stalled is a lost connection, not a
+// reason to park the reader forever.
+const messageGraceNs: int = 30000000000
+
+// How many bytes one wait reads. Any leftover stays in `pgReader.buf`.
+const waitChunkBytes: int = 4096
 
 // The v3 protocol version, 3.0 as a packed major/minor pair: 3 * 65536.
 const protocolVersion: int = 196608
@@ -32,11 +41,35 @@ interface pgStream {
   shut(),
 }
 
+// A `pgStream` whose reads may be bounded: the
+// listener (listen.bit) waits for the next message against a deadline and
+// must tell "nothing arrived in time" from "the peer closed". Asked for by
+// shape (`s.(pgDeadline)`, so it repeats `pgStream`'s methods: an assertion
+// needs the target to satisfy the source) and a scripted stream that never
+// times out need not implement it. `setDeadline` takes an absolute `std/time.monotonic()`
+// nanosecond instant, `0` for none; `timedOut` is true when the most recent
+// `readUp` returned empty because that deadline elapsed.
+interface pgDeadline {
+  readUp(n: int): string!,
+  writeAll(s: string): ()!,
+  shut(),
+  setDeadline(ns: int),
+  timedOut(): bool,
+}
+
 // `pgStream` over a cleartext socket.
 class plainStream {
   c: NetConn
   readUp(n: int): string! {
     return this.c.read(n)
+  }
+
+  setDeadline(ns: int) {
+    this.c.setDeadline(ns)
+  }
+
+  timedOut(): bool {
+    return this.c.readTimedOut()
   }
 
   writeAll(s: string): ()! {
@@ -54,6 +87,14 @@ class tlsStream {
   c: TlsConn
   readUp(n: int): string! {
     return string(this.c.read(n)?)
+  }
+
+  setDeadline(ns: int) {
+    this.c.setDeadline(ns)
+  }
+
+  timedOut(): bool {
+    return this.c.readTimedOut()
   }
 
   writeAll(s: string): ()! {
@@ -76,9 +117,21 @@ class pgMessage {
 // that the current message did not need — a single `read` can return any
 // mixture of whole and partial messages, so the leftover has to live somewhere
 // that outlives one call.
+//
+// ASYNCHRONOUS NOTIFICATIONS PASS THROUGH `next`. A NotificationResponse ('A')
+// may arrive at any message boundary — between a CommandComplete and its
+// ReadyForQuery, or while the connection is idle — so the one place every
+// message goes through is the one place that can keep it. With `keep` set
+// (a listener's own connection, listen.bit) `next` appends it to `notes` and
+// still returns it, so every existing caller skips it exactly as it skips any
+// tag it does not read. With `keep` unset (every pooled connection) it is
+// dropped without error, and a pooled connection that ran `LISTEN` by hand
+// cannot grow an unbounded queue nobody drains.
 class pgReader {
   s: pgStream
   buf: string
+  keep: bool = false
+  notes: []Notification = []Notification(0)
   // Exactly `n` bytes. Fails if the peer closes first: the length prefix
   // promised them, so a short read is a truncated message, not an end of
   // stream.
@@ -100,6 +153,34 @@ class pgReader {
     return out
   }
 
+  // The next message, or `None` if none began arriving before `deadlineNs`
+  // (`std/time.monotonic()` nanoseconds). The deadline bounds only the wait
+  // for a message's FIRST byte: once one is here the rest gets
+  // `messageGraceNs`, so a timeout can never land mid-message and leave
+  // `buf` split at an offset no later call could recover. A closed peer
+  // fails, as it does in `take`. The stream must be a `pgDeadline`.
+  nextWithin(deadlineNs: int): Option<pgMessage>! {
+    let (d, ok) = this.s.(pgDeadline)
+    if (!ok) {
+      fail newError("postgres: this stream cannot bound a read")
+    }
+    if (len(this.buf) == 0) {
+      d.setDeadline(deadlineNs)
+      let chunk = this.s.readUp(waitChunkBytes)?
+      if (len(chunk) == 0) {
+        if (d.timedOut()) {
+          return Option.None
+        }
+        fail newError("postgres: server closed the connection")
+      }
+      this.buf = chunk
+    }
+    d.setDeadline(monotonic().ns + messageGraceNs)
+    let m = this.next()?
+    d.setDeadline(0)
+    return Option.Some(m)
+  }
+
   // The next tagged message. A length below 4 does not even cover its own
   // field and is refused rather than used to size a slice.
   next(): pgMessage! {
@@ -108,8 +189,27 @@ class pgReader {
     if (size < 4) {
       fail newError("postgres: message '${tag}' declares a length of ${size}")
     }
-    return pgMessage{ tag = tag, body = this.take(size - 4)? }
+    let m = pgMessage{ tag = tag, body = this.take(size - 4)? }
+    if (tag == "A" && this.keep) {
+      this.notes = append(this.notes, decodeNotification(m.body)?)
+    }
+    return m
   }
+}
+
+// A NotificationResponse body: the notifying backend's process ID (an Int32),
+// the channel name and the payload, the two `\0`-terminated. The payload is
+// empty, not absent, for a bare `NOTIFY chan`. Bytes after the payload's
+// terminator mean the length field lied, so they fail rather than being read
+// past.
+fn decodeNotification(body: string): Notification! {
+  let pid = readBe32(body, 0)?
+  let (channel, next) = readCstr(body, 4)?
+  let (payload, end) = readCstr(body, next)?
+  if (end != len(body)) {
+    fail newError("postgres: NotificationResponse has ${len(body) - end} bytes after the payload")
+  }
+  return Notification{ pid = pid, channel = channel, payload = payload }
 }
 
 // A four-byte big-endian integer.
@@ -195,11 +295,4 @@ fn startupMessage(user: string, database: string): string {
 // bare byte, `S` (proceed with the handshake) or `N` (no TLS here).
 fn sslRequestMessage(): string {
   return be32(8) + be32(sslRequestCode)
-}
-
-// An ErrorResponse body as the text a startup failure reports. The parsing —
-// and the SQLSTATE a statement failure needs to carry — lives in `serverError`
-// (query.bit); this is the one caller that wants only the sentence.
-fn errorText(body: string): string {
-  return serverError(body).message()
 }

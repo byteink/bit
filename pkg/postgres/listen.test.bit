@@ -1,0 +1,471 @@
+// pkg/postgres/listen.test.bit — LISTEN/NOTIFY (#6994): the NotificationResponse
+// decoder, the channel rules, `notify`, and the `Listener` state machine over a
+// scripted backend, plus one live test against a real server.
+//
+// THE BACKEND SPEAKS THE WIRE, IT DOES NOT REPLAY A RECORDING. It decodes each
+// frontend frame by tag and length, records the statement text of every Parse,
+// answers the extended protocol, and lets a test push bytes at the points the
+// protocol allows them: `between` lands after a statement's CommandComplete
+// and before its ReadyForQuery, `push` lands whenever the connection is idle.
+// A connection that is `dead` reports end of stream once its bytes are read;
+// an alive one reports a read timeout, which is what an idle socket does.
+
+import { repeat } from "std/strings"
+
+class listenBackend {
+  out: string
+  statements: []string
+  between: string
+  dead: bool
+  expired: bool
+  readUp(n: int): string! {
+    if (len(this.out) == 0) {
+      this.expired = !this.dead
+      return ""
+    }
+    this.expired = false
+    let take = n
+    if (take > len(this.out)) {
+      take = len(this.out)
+    }
+    let head = this.out[0:take]
+    this.out = this.out[take:len(this.out)]
+    return head
+  }
+
+  // Bounded by `len(s)`: every iteration consumes a whole frame, at least five
+  // bytes.
+  writeAll(s: string): ()! {
+    let at = 0
+    while (at + 5 <= len(s)) {
+      let size = readBe32(s, at + 1)?
+      let body = s[at + 5:at + 1 + size]
+      this.out = this.out + this.answer(s[at:at + 1], body)?
+      at = at + 1 + size
+    }
+  }
+
+  shut() {}
+
+  setDeadline(ns: int) {}
+
+  timedOut(): bool {
+    return this.expired
+  }
+
+  // Bytes the server sends on its own.
+  push(bytes: string) {
+    this.out = this.out + bytes
+  }
+
+  answer(tag: string, body: string): string! {
+    if (tag == "P") {
+      let (_, afterName) = readCstr(body, 0)?
+      let (text, _) = readCstr(body, afterName)?
+      this.statements = append(this.statements, text)
+      return backendMessage("1", "")
+    }
+    if (tag == "B") {
+      return backendMessage("2", "")
+    }
+    if (tag == "D") {
+      return backendMessage("n", "")
+    }
+    if (tag == "E") {
+      let extra = this.between
+      this.between = ""
+      return commandComplete("LISTEN") + extra
+    }
+    return readyForQuery()
+  }
+}
+
+fn newListenBackend(): listenBackend {
+  return listenBackend{
+    out = "", statements = []string(0), between = "", dead = false, expired = false,
+  }
+}
+
+// A connection onto `b` as the listener holds it: notifications kept.
+fn listenConn(b: listenBackend, keep: bool): pgConn {
+  return pgConn{
+    r = pgReader{ s = b, buf = "", keep = keep }, s = b, closed = false, cache = newStmtCache(0),
+  }
+}
+
+// NotificationResponse bytes.
+fn notification(pid: int, channel: string, payload: string): string {
+  return backendMessage("A", be32(pid) + cstr(channel) + cstr(payload))
+}
+
+// The scripted connect function: attempt `i` returns `backends[i]` listening on
+// `channels`, unless `plan[i]` says otherwise: "refused" is a transport
+// failure, any other non-empty text is the SQLSTATE of a server refusal.
+class dialer {
+  backends: []listenBackend
+  plan: []string
+  channels: []string
+  at: int
+  attempts(): int {
+    return this.at
+  }
+
+  dial(): pgConn! {
+    let i = this.at
+    this.at = this.at + 1
+    if (i < len(this.plan) && this.plan[i] == "refused") {
+      fail newError("connection refused")
+    }
+    if (i < len(this.plan) && this.plan[i] != "") {
+      fail pgError{ severity = "FATAL", state = this.plan[i], text = "refused" }
+    }
+    let c = listenConn(this.backends[i], true)
+    subscribe(c, this.channels)?
+    return c
+  }
+}
+
+fn scripted(backends: []listenBackend, plan: []string, channels: []string): (dialer, Listener) {
+  let d = dialer{ backends = backends, plan = plan, channels = channels, at = 0 }
+  let l = startListener(() => d.dial(), channels) catch e {
+    panic("startListener: ${e.message()}")
+  }
+  return (d, l)
+}
+
+// One event as text: `none`, `reconnected`, or `channel/payload`.
+fn show(o: Option<Event>): string {
+  match (o) {
+    None => return "none"
+    Some(ev) => {
+      match (ev) {
+        Reconnected => return "reconnected"
+        Notify(n) => return "${n.channel}/${n.payload}"
+      }
+    }
+  }
+}
+
+fn nextText(l: Listener, ms: int): string {
+  return show(
+    l.next(ms) catch e {
+      panic("next: ${e.message()}")
+    },
+  )
+}
+
+test "decode: NotificationResponse with an empty payload" {
+  let n = decodeNotification(be32(4242) + cstr("jobs") + cstr("")) catch e {
+    panic("decode: ${e.message()}")
+  }
+  assert(n.pid == 4242)
+  assert(n.channel == "jobs")
+  assert(n.payload == "")
+}
+
+test "decode: NotificationResponse with a utf-8 payload" {
+  let n = decodeNotification(be32(7) + cstr("greet") + cstr("héllo — 世界")) catch e {
+    panic("decode: ${e.message()}")
+  }
+  assert(n.channel == "greet")
+  assert(n.payload == "héllo — 世界")
+}
+
+test "decode: NotificationResponse with a 63-byte channel" {
+  let ch = repeat("c", 63)
+  let n = decodeNotification(be32(1) + cstr(ch) + cstr("x")) catch e {
+    panic("decode: ${e.message()}")
+  }
+  assert(len(n.channel) == 63)
+  assert(n.channel == ch)
+  assert(n.payload == "x")
+}
+
+test "decode: two NotificationResponses back to back, in one read" {
+  let b = newListenBackend()
+  b.push(notification(1, "a", "one") + notification(2, "b", "two"))
+  let r = pgReader{ s = b, buf = "", keep = true }
+  let m1 = r.next() catch e {
+    panic("next 1: ${e.message()}")
+  }
+  let m2 = r.next() catch e {
+    panic("next 2: ${e.message()}")
+  }
+  assert(m1.tag == "A")
+  assert(m2.tag == "A")
+  assert(len(r.notes) == 2)
+  assert(r.notes[0].channel == "a")
+  assert(r.notes[0].payload == "one")
+  assert(r.notes[1].pid == 2)
+  assert(r.notes[1].channel == "b")
+  assert(r.notes[1].payload == "two")
+}
+
+fn decodeFails(body: string): bool {
+  decodeNotification(body) catch _ {
+    return true
+  }
+  return false
+}
+
+test "decode: a truncated body and trailing bytes both fail" {
+  assert(decodeFails(be32(1) + "chan"))
+  assert(decodeFails("abc"))
+  assert(decodeFails(be32(1) + cstr("a") + cstr("b") + "zz"))
+  assert(!decodeFails(be32(1) + cstr("a") + cstr("b")))
+}
+
+test "a pooled connection drops notifications without error" {
+  let b = newListenBackend()
+  let c = listenConn(b, false)
+  b.between = notification(9, "x", "y")
+  c.exec("select 1", []Value(0)) catch e {
+    panic("exec: ${e.message()}")
+  }
+  assert(len(c.r.notes) == 0)
+}
+
+test "a notification between CommandComplete and ReadyForQuery is kept" {
+  let b = newListenBackend()
+  let c = listenConn(b, true)
+  b.between = notification(9, "x", "mid")
+  subscribe(c, ["x"]) catch e {
+    panic("subscribe: ${e.message()}")
+  }
+  assert(len(c.r.notes) == 1)
+  assert(c.r.notes[0].payload == "mid")
+}
+
+fn listenFails(channels: []string): bool {
+  listen("postgres://u@127.0.0.1:1/db", channels) catch _ {
+    return true
+  }
+  return false
+}
+
+test "listen rejects 3 of 3 hostile channel names, and an empty list" {
+  assert(listenFails([""]))
+  assert(listenFails(["a" + string([]byte(1)) + "b"]))
+  assert(listenFails([repeat("x", 64)]))
+  assert(listenFails([]string(0)))
+}
+
+test "quoteIdent makes a hostile name one identifier" {
+  assert(quoteIdent("jobs") == "\"jobs\"")
+  assert(quoteIdent("x\"; drop table t; --") == "\"x\"\"; drop table t; --\"")
+}
+
+test "LISTEN goes out quoted, one statement per channel" {
+  let b = newListenBackend()
+  let c = listenConn(b, true)
+  subscribe(c, ["jobs", "x\"; drop table t; --"]) catch e {
+    panic("subscribe: ${e.message()}")
+  }
+  assert(len(b.statements) == 2)
+  assert(b.statements[0] == "LISTEN \"jobs\"")
+  assert(b.statements[1] == "LISTEN \"x\"\"; drop table t; --\"")
+}
+
+// Records the statement and parameters of `exec`.
+class recExec {
+  sqls: []string
+  params: [][]Value
+  query(sqlText: string, params: []Value): Rows! {
+    fail newError("recExec: query")
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.sqls = append(this.sqls, sqlText)
+    this.params = append(this.params, params)
+    return 1
+  }
+}
+
+fn textOf(v: Value): string {
+  return asText(v) catch e {
+    panic("not text: ${e.message()}")
+  }
+}
+
+test "notify binds channel and payload as parameters" {
+  let r = recExec{ sqls = []string(0), params = [][]Value(0) }
+  notify(r, "jobs", "it's \"hostile\"; select 1") catch e {
+    panic("notify: ${e.message()}")
+  }
+  assert(len(r.sqls) == 1)
+  assert(r.sqls[0] == "select pg_notify($1, $2)")
+  assert(textOf(r.params[0][0]) == "jobs")
+  assert(textOf(r.params[0][1]) == "it's \"hostile\"; select 1")
+}
+
+test "notify: 7999 bytes pass, 8000 fail, a bad channel fails" {
+  let r = recExec{ sqls = []string(0), params = [][]Value(0) }
+  notify(r, "jobs", repeat("p", 7999)) catch e {
+    panic("7999: ${e.message()}")
+  }
+  assert(len(r.sqls) == 1)
+  let failed = 0
+  notify(r, "jobs", repeat("p", 8000)) catch _ {
+    failed = failed + 1
+  }
+  notify(r, "", "x") catch _ {
+    failed = failed + 1
+  }
+  assert(failed == 2)
+  assert(len(r.sqls) == 1)
+}
+
+test "next: an idle listener times out with None" {
+  let b = newListenBackend()
+  let (_, l) = scripted([b], []string(0), ["a"])
+  assert(nextText(l, 0) == "none")
+  assert(nextText(l, 20) == "none")
+  l.close()
+}
+
+test "next: a notification pushed while idle is delivered" {
+  let b = newListenBackend()
+  let (_, l) = scripted([b], []string(0), ["a"])
+  b.push(notification(5, "a", "hi"))
+  assert(nextText(l, 100) == "a/hi")
+  assert(nextText(l, 0) == "none")
+}
+
+test "next: a notification that arrived during LISTEN is delivered first" {
+  let b = newListenBackend()
+  b.between = notification(5, "a", "during")
+  let (_, l) = scripted([b], []string(0), ["a"])
+  assert(nextText(l, 0) == "a/during")
+}
+
+test "reconnect: re-LISTENs every channel, then Reconnected, then the new session" {
+  let b1 = newListenBackend()
+  let b2 = newListenBackend()
+  let (d, l) = scripted([b1, b2], []string(0), ["a", "b"])
+  b1.push(notification(5, "a", "before"))
+  b1.dead = true
+  // The new session's first notification lands while it re-LISTENs.
+  b2.between = notification(6, "b", "after")
+  assert(nextText(l, 1000) == "a/before")
+  assert(nextText(l, 3000) == "reconnected")
+  assert(len(b2.statements) == 2)
+  assert(b2.statements[0] == "LISTEN \"a\"")
+  assert(b2.statements[1] == "LISTEN \"b\"")
+  assert(nextText(l, 1000) == "b/after")
+  assert(nextText(l, 0) == "none")
+  assert(d.attempts() == 2)
+}
+
+test "reconnect: a refused attempt backs off and tries again" {
+  let b1 = newListenBackend()
+  let b2 = newListenBackend()
+  let (d, l) = scripted([b1, b1, b2], ["", "refused", ""], ["a"])
+  b1.dead = true
+  assert(nextText(l, 3000) == "reconnected")
+  assert(d.attempts() == 3)
+  assert(l.delayMs == 100)
+}
+
+test "reconnect: the server's FATAL on an idle connection is a lost connection" {
+  let b1 = newListenBackend()
+  let b2 = newListenBackend()
+  let (_, l) = scripted([b1, b2], []string(0), ["a"])
+  b1.push(errorResponse("57P01", "terminating connection due to administrator command"))
+  assert(nextText(l, 3000) == "reconnected")
+}
+
+test "reconnect: a refusal that retrying cannot fix fails and closes" {
+  let b1 = newListenBackend()
+  let (_, l) = scripted([b1, b1], ["", "28P01"], ["a"])
+  b1.dead = true
+  let failed = 0
+  l.next(3000) catch e {
+    assert(contains(e.message(), "28P01"))
+    failed = 1
+  }
+  assert(failed == 1)
+  assert(l.closed)
+}
+
+test "retryable: which failed reconnects are tried again" {
+  assert(retryable(newError("dial failed")))
+  assert(retryable(pgError{ severity = "FATAL", state = "57P01", text = "" }))
+  assert(retryable(pgError{ severity = "FATAL", state = "57P03", text = "" }))
+  assert(retryable(pgError{ severity = "FATAL", state = "08006", text = "" }))
+  assert(retryable(pgError{ severity = "FATAL", state = "53300", text = "" }))
+  assert(!retryable(pgError{ severity = "FATAL", state = "28P01", text = "" }))
+  assert(!retryable(pgError{ severity = "FATAL", state = "3D000", text = "" }))
+}
+
+test "backoff: 100 ms doubling to a 5 s cap" {
+  let d = 0
+  let seen = []int(0)
+  let i = 0
+  while (i < 8) {
+    d = nextDelayMs(d)
+    seen = append(seen, d)
+    i = i + 1
+  }
+  let want = [100, 200, 400, 800, 1600, 3200, 5000, 5000]
+  let j = 0
+  while (j < len(want)) {
+    assert(seen[j] == want[j])
+    j = j + 1
+  }
+}
+
+test "next: a closed listener and a negative timeout both fail" {
+  let b = newListenBackend()
+  let (_, l) = scripted([b], []string(0), ["a"])
+  let negative = 0
+  l.next(0 - 1) catch _ {
+    negative = 1
+  }
+  assert(negative == 1)
+  l.close()
+  l.close()
+  let closed = 0
+  l.next(0) catch _ {
+    closed = 1
+  }
+  assert(closed == 1)
+}
+
+// The live test needs a real server: PG_TEST_TRUST_URI, as live.test.bit does.
+test "live: NOTIFY across two connections, and the reconnect marker after pg_terminate_backend" {
+  let uri = env("PG_TEST_TRUST_URI")
+  if (uri == "") {
+    print("  skipped: PG_TEST_TRUST_URI is unset, no live server to talk to")
+    return
+  }
+  let db = pool(newPgAdapter(), Datasource{ uri = uri }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  let l = listen(uri, ["bit_listen_a", "bit_listen_b\"q"]) catch e {
+    panic("listen: ${e.message()}")
+  }
+  notify(db, "bit_listen_a", "hello") catch e {
+    panic("notify: ${e.message()}")
+  }
+  assert(nextText(l, 5000) == "bit_listen_a/hello")
+  notify(db, "bit_listen_b\"q", "") catch e {
+    panic("notify b: ${e.message()}")
+  }
+  assert(nextText(l, 5000) == "bit_listen_b\"q/")
+  let killed = db.query(
+      "select pg_terminate_backend(pid) from pg_stat_activity " +
+      "where pid <> pg_backend_pid() and datname = current_database() " +
+      "and query like 'LISTEN \"bit_listen_%'",
+    []Value(0),
+  ) catch e {
+    panic("terminate: ${e.message()}")
+  }
+  killed.close()
+  assert(nextText(l, 10000) == "reconnected")
+  notify(db, "bit_listen_a", "again") catch e {
+    panic("notify again: ${e.message()}")
+  }
+  assert(nextText(l, 5000) == "bit_listen_a/again")
+  l.close()
+  db.close()
+}
