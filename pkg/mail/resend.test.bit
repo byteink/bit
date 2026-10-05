@@ -1,0 +1,546 @@
+// pkg/mail/resend.test.bit — the `resend://` transport against an in-test
+// HTTPS server (a `std/tls` listener answering HTTP/1.1 from a script, the same
+// throwaway leaf smtp.test.bit uses), pinned with a non-default host and
+// `insecureSkipVerify=true`. No test reaches the network.
+//
+// What the server saw is the whole request text, so a test reads the request
+// line, the headers and the exact JSON body. Every error a test provokes goes
+// through `rsClean`, which fails when its text holds the API key.
+
+import { listen as tlsListen, TlsConn, TlsListener } from "std/tls"
+import { Millisecond, Second } from "std/time"
+
+const rsKey: string = "re_test_key_9f3"
+
+// The body a full message must produce: every field Resend takes, in the order
+// resendbody.bit writes them, field for field.
+const rsFullBody: string = "{\"from\":\"Inkwell <hello@inkwell.dev>\",\"to\":[\"Sara Ali <sara@example.com>\"],\"cc\":[\"lee@example.com\"],\"bcc\":[\"audit@example.com\"],\"reply_to\":[\"support@inkwell.dev\"],\"subject\":\"Welcome to Inkwell\",\"html\":\"<p>Hello <img src=\\\"cid:logo\\\"></p>\",\"text\":\"Hello Sara.\",\"headers\":{\"Auto-Submitted\":\"auto-generated\",\"In-Reply-To\":\"<thread-1@inkwell.dev>\",\"References\":\"<thread-1@inkwell.dev>\",\"X-Run\":\"7\"},\"attachments\":[{\"filename\":\"logo.png\",\"content\":\"AQID\",\"content_type\":\"image/png\",\"content_id\":\"logo\"},{\"filename\":\"invoice.pdf\",\"content\":\"UERG\",\"content_type\":\"application/pdf\"}],\"tags\":[{\"name\":\"campaign\",\"value\":\"welcome\"},{\"name\":\"user\",\"value\":\"7\"}]}"
+
+class rsFake {
+  ln: TlsListener,
+  replies: []string,
+  log: chan<string>,
+}
+
+// One HTTP/1.1 response, closing the connection after it.
+fn rsReply(status: int, extra: string, body: string): string {
+  return "HTTP/1.1 ${status} X\r\nContent-Type: application/json\r\n${extra}Content-Length: ${len(body)}\r\nConnection: close\r\n\r\n${body}"
+}
+
+fn rsOk(): string {
+  return rsReply(200, "", "{\"id\":\"49a3999c-0ce1-4ea6-ab68-afcd6dc2e794\"}")
+}
+
+// The request on `c` as text: the head, then as many body bytes as its
+// Content-Length says.
+fn rsReadRequest(c: TlsConn): string! {
+  let seen = ""
+  let want = -1
+  let turns = 0
+  while (turns < 256) {
+    turns = turns + 1
+    let chunk = string(c.read(65536)?)
+    if (len(chunk) == 0) {
+      return seen
+    }
+    seen = seen + chunk
+    let end = indexOf(seen, "\r\n\r\n")
+    if (end < 0) {
+      continue
+    }
+    if (want < 0) {
+      want = rsLength(seen[0:end])
+    }
+    if (len(seen) - (end + 4) >= want) {
+      return seen
+    }
+  }
+  return seen
+}
+
+fn rsLength(head: string): int {
+  let at = indexOf(toLower(head), "content-length:")
+  if (at < 0) {
+    return 0
+  }
+  let rest = head[at + 15:]
+  let nl = indexOf(rest, "\r\n")
+  if (nl >= 0) {
+    rest = rest[0:nl]
+  }
+  return parseInt(trimSpace(rest)) catch _ {
+    return 0
+  }
+}
+
+// One connection per scripted reply: read the request, log it, answer.
+fn rsServe(f: rsFake) {
+  for reply of f.replies {
+    let c = f.ln.accept() catch e {
+      f.log <- "accept-failed: ${e.message()}"
+      continue
+    }
+    let seen = rsReadRequest(c) catch e {
+      f.log <- "read-failed: ${e.message()}"
+      continue
+    }
+    c.write([]byte(reply)) catch _ {}
+    c.close()
+    f.log <- seen
+  }
+}
+
+fn rsStart(replies: []string): (int, chan<string>)! {
+  let ln = tlsListen("127.0.0.1", 0, smServerConfig()?)?
+  let port = ln.port()?
+  let log = chan<string>(len(replies) + 1)
+  spawn rsServe(rsFake{ ln = ln, replies = replies, log = log })
+  return (port, log)
+}
+
+fn rsUrl(port: int): string {
+  return "resend://${rsKey}@127.0.0.1:${port}?insecureSkipVerify=true"
+}
+
+fn rsOpts(): Options {
+  // One try, so a test reads the transport's own answer and not a retry's.
+  return Options{
+    from = "Inkwell <hello@inkwell.dev>",
+    timeout = 10 * Second,
+    retry = Retry{ attempts = 1 },
+  }
+}
+
+fn rsMsg(): Message {
+  return Message{
+    to = ["Sara Ali <sara@example.com>"],
+    subject = "Welcome to Inkwell",
+    text = "Hello Sara.",
+    id = "welcome-1",
+  }
+}
+
+fn rsFull(): Message {
+  return Message{
+    to = ["Sara Ali <sara@example.com>"],
+    cc = ["lee@example.com"],
+    bcc = ["audit@example.com"],
+    replyTo = ["support@inkwell.dev"],
+    subject = "Welcome to Inkwell",
+    text = "Hello Sara.",
+    html = "<p>Hello <img src=\"cid:logo\"></p>",
+    attachments = [
+      Attachment{ name = "logo.png", data = [u8(1), u8(2), u8(3)], cid = "logo" },
+      Attachment{ name = "invoice.pdf", data = []byte("PDF") },
+    ],
+    headers = { "X-Run": "7" },
+    tags = { "user": "7", "campaign": "welcome" },
+    inReplyTo = "<thread-1@inkwell.dev>",
+    id = "welcome-1",
+  }
+}
+
+fn rsClean(e: MailError) {
+  assert(!contains(e.message(), rsKey), "an error repeated the API key: ${e.message()}")
+}
+
+// What one send came to: the request the server saw, and either the receipt or
+// the error.
+class RsRun {
+  seen: string,
+  receipt: Receipt,
+  err: Option<MailError>,
+}
+
+// Sends `m` to a server that answers `reply` once.
+fn rsSend(reply: string, m: Message): RsRun {
+  let (port, log) = rsStart([reply]) catch e {
+    panic("fake: ${e.message()}")
+  }
+  let mailer = open(rsUrl(port), rsOpts()) catch e {
+    panic("open: ${e.message()}")
+  }
+  defer mailer.close()
+  let run = RsRun{ seen = "", receipt = Receipt{}, err = Option<MailError>.None }
+  let r = mailer.send(m) catch e {
+    run.err = Option<MailError>.Some(e)
+    run.seen = <- log
+    return run
+  }
+  run.receipt = r
+  run.seen = <- log
+  return run
+}
+
+// The error a send fails with; panics when it succeeds.
+fn rsFail(reply: string): MailError {
+  match (rsSend(reply, rsMsg()).err) {
+    Some(e) => {
+      rsClean(e)
+      return e
+    }
+    None => panic("the send succeeded against a server scripted to refuse")
+  }
+}
+
+fn rsBody(request: string): string {
+  return request[indexOf(request, "\r\n\r\n") + 4:]
+}
+
+test "a full message is posted as the exact JSON Resend documents, with the key, type and Idempotency-Key" {
+  let run = rsSend(rsOk(), rsFull())
+  assert(isNone(run.err), "the send failed")
+  let seen = run.seen
+  let receipt = run.receipt
+  assert(hasPrefix(seen, "POST /emails HTTP/1.1\r\n"), "request line: ${seen}")
+  assert(contains(seen, "Authorization: Bearer ${rsKey}\r\n"), "no Bearer key: ${seen}")
+  assert(contains(seen, "Content-Type: application/json\r\n"), "no content type: ${seen}")
+  assert(
+    contains(seen, "Idempotency-Key: welcome-1\r\n"),
+    "Idempotency-Key is not Message.id: ${seen}",
+  )
+  assert(rsBody(seen) == rsFullBody, "body:\n${rsBody(seen)}\nwant:\n${rsFullBody}")
+  assert(
+    receipt.providerId == "49a3999c-0ce1-4ea6-ab68-afcd6dc2e794",
+    "providerId: ${receipt.providerId}",
+  )
+  assert(receipt.id == "<welcome-1@inkwell.dev>", "id: ${receipt.id}")
+  assert(len(receipt.accepted) == 3, "accepted: ${join(receipt.accepted, ",")}")
+}
+
+test "without Message.id the Idempotency-Key is the local part of the Message-ID" {
+  let m = rsMsg()
+  m.id = ""
+  let run = rsSend(rsOk(), m)
+  assert(isNone(run.err), "send failed")
+  let seen = run.seen
+  let receipt = run.receipt
+  let at = indexOf(receipt.id, "@")
+  let local = receipt.id[1:at]
+  assert(len(local) > 0, "id: ${receipt.id}")
+  assert(contains(seen, "Idempotency-Key: ${local}\r\n"), "key is not ${local}: ${seen}")
+}
+
+test "the default From and Reply-To of Options fill a message that sets none" {
+  let (port, log) = rsStart([rsOk()]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let opts = rsOpts()
+  opts.replyTo = "Help <help@inkwell.dev>"
+  let mailer = open(rsUrl(port), opts) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  mailer.send(rsMsg()) catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let body = rsBody(<- log)
+  assert(hasPrefix(body, "{\"from\":\"Inkwell <hello@inkwell.dev>\",\"to\":"), body)
+  assert(contains(body, "\"reply_to\":[\"Help <help@inkwell.dev>\"]"), body)
+  assert(
+    !contains(body, "\"cc\"") && !contains(body, "\"bcc\"") && !contains(body, "\"tags\""),
+    body,
+  )
+}
+
+test "429 with Retry-After is Transient and carries the wait" {
+  let e = rsFail(
+    rsReply(
+      429,
+      "Retry-After: 2\r\n",
+      "{\"name\":\"rate_limit_exceeded\",\"message\":\"Too many requests\",\"statusCode\":429}",
+    ),
+  )
+  match (e) {
+    Transient(r) => {
+      assert(r.retryAfter == 2 * Second, "retryAfter: ${r.retryAfter}")
+      assert(r.code == 429 && contains(r.text, "Too many requests"), r.toString())
+    }
+    _ => assert(false, "want Transient, got ${e.message()}")
+  }
+}
+
+test "5xx is Transient with no wait when Resend names none" {
+  let e = rsFail(
+    rsReply(
+      503,
+      "",
+      "{\"name\":\"service_unavailable\",\"message\":\"API is temporarily unavailable\",\"statusCode\":503}",
+    ),
+  )
+  match (e) {
+    Transient(r) => assert(r.code == 503 && r.retryAfter == 0, r.toString())
+    _ => assert(false, "want Transient, got ${e.message()}")
+  }
+}
+
+test "a Retry-After that is a date or absurd is no hint" {
+  let e = rsFail(rsReply(429, "Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n", "{}"))
+  match (e) {
+    Transient(r) => assert(r.retryAfter == 0, "retryAfter: ${r.retryAfter}")
+    _ => assert(false, "want Transient, got ${e.message()}")
+  }
+  let big = rsFail(rsReply(429, "Retry-After: 99999999999\r\n", "{}"))
+  match (big) {
+    Transient(r) => assert(r.retryAfter == 0, "retryAfter: ${r.retryAfter}")
+    _ => assert(false, "want Transient, got ${big.message()}")
+  }
+}
+
+test "422 is Rejected with Resend's message" {
+  let e = rsFail(
+    rsReply(
+      422,
+      "",
+      "{\"name\":\"missing_required_field\",\"message\":\"Missing `subject` field.\",\"statusCode\":422}",
+    ),
+  )
+  match (e) {
+    Rejected(r) => assert(
+      r.code == 422 && contains(r.text, "Missing `subject` field."),
+      r.toString(),
+    )
+    _ => assert(false, "want Rejected, got ${e.message()}")
+  }
+}
+
+test "401 and a 403 about the key are Auth, a 403 validation_error is Rejected" {
+  let a = rsFail(
+    rsReply(
+      401,
+      "",
+      "{\"name\":\"missing_api_key\",\"message\":\"Missing API key.\",\"statusCode\":401}",
+    ),
+  )
+  match (a) {
+    Auth(r) => assert(r.code == 401, r.toString())
+    _ => assert(false, "want Auth, got ${a.message()}")
+  }
+  let b = rsFail(
+    rsReply(
+      403,
+      "",
+      "{\"name\":\"suspended_api_key\",\"message\":\"This API key is suspended\",\"statusCode\":403}",
+    ),
+  )
+  match (b) {
+    Auth(r) => assert(r.code == 403, r.toString())
+    _ => assert(false, "want Auth, got ${b.message()}")
+  }
+  let c = rsFail(
+    rsReply(
+      403,
+      "",
+      "{\"name\":\"validation_error\",\"message\":\"The inkwell.dev domain is not verified.\",\"statusCode\":403}",
+    ),
+  )
+  match (c) {
+    Rejected(r) => assert(contains(r.text, "not verified"), r.toString())
+    _ => assert(false, "want Rejected, got ${c.message()}")
+  }
+}
+
+test "409 is Invalid for a changed payload and Transient while the key is in flight" {
+  let a = rsFail(
+    rsReply(
+      409,
+      "",
+      "{\"name\":\"invalid_idempotent_request\",\"message\":\"This idempotency key has been used with a different body.\",\"statusCode\":409}",
+    ),
+  )
+  match (a) {
+    Invalid(why) => assert(contains(why, "idempotency key"), why)
+    _ => assert(false, "want Invalid, got ${a.message()}")
+  }
+  let b = rsFail(
+    rsReply(
+      409,
+      "",
+      "{\"name\":\"concurrent_idempotent_requests\",\"message\":\"Another request is in progress.\",\"statusCode\":409}",
+    ),
+  )
+  match (b) {
+    Transient(r) => assert(r.code == 409, r.toString())
+    _ => assert(false, "want Transient, got ${b.message()}")
+  }
+}
+
+test "a server that echoes the key in its message does not leak it" {
+  let e = rsFail(
+    rsReply(
+      422,
+      "",
+      "{\"name\":\"validation_error\",\"message\":\"bad key ${rsKey} here\",\"statusCode\":422}",
+    ),
+  )
+  match (e) {
+    Rejected(r) => assert(contains(r.text, "bad key *** here"), r.text)
+    _ => assert(false, "want Rejected, got ${e.message()}")
+  }
+}
+
+test "a body that is not JSON still maps by status" {
+  let e = rsFail(rsReply(502, "", "<html>bad gateway</html>"))
+  match (e) {
+    Transient(r) => assert(r.code == 502 && r.text == "HTTP 502", r.toString())
+    _ => assert(false, "want Transient, got ${e.message()}")
+  }
+}
+
+test "51 recipients fail Invalid before any request" {
+  let to: []string = []
+  let i = 0
+  while (i < 51) {
+    to = append(to, "u${i}@example.com")
+    i = i + 1
+  }
+  let m = rsMsg()
+  m.to = to
+  // Nothing listens on this port: a send that tried would be Transient.
+  let mailer = open("resend://${rsKey}@127.0.0.1:1?insecureSkipVerify=true", rsOpts()) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  mailer.send(m) catch e {
+    match (e) {
+      Invalid(why) => assert(contains(why, "51 recipients") && contains(why, "50"), why)
+      _ => assert(false, "want Invalid, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "51 recipients were accepted")
+}
+
+test "a tag Resend would refuse is Invalid before any request" {
+  let m = rsMsg()
+  m.tags = { "user": "sara@example.com" }
+  let mailer = open("resend://${rsKey}@127.0.0.1:1?insecureSkipVerify=true", rsOpts()) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  mailer.send(m) catch e {
+    match (e) {
+      Invalid(why) => assert(contains(why, "tags[\"user\"]"), why)
+      _ => assert(false, "want Invalid, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "a tag with '@' was accepted")
+}
+
+test "an unreachable host is Transient" {
+  let mailer = open("resend://${rsKey}@127.0.0.1:1?insecureSkipVerify=true", rsOpts()) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  mailer.send(rsMsg()) catch e {
+    rsClean(e)
+    match (e) {
+      Transient(_) => return
+      _ => assert(false, "want Transient, got ${e.message()}")
+    }
+  }
+  assert(false, "a send to a closed port succeeded")
+}
+
+test "a certificate that does not verify is Rejected and sends nothing, and the flag is the only way past it" {
+  let (port, log) = rsStart([rsOk()]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let mailer = open("resend://${rsKey}@127.0.0.1:${port}", rsOpts()) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  mailer.send(rsMsg()) catch e {
+    rsClean(e)
+    match (e) {
+      Rejected(r) => assert(r.code == 0 && hasPrefix(r.text, "resend: "), r.toString())
+      _ => assert(false, "want Rejected, got ${e.message()}")
+    }
+    let seen = <- log
+    assert(!contains(seen, "POST /emails"), "the request was sent anyway: ${seen}")
+    return
+  }
+  assert(false, "an unverifiable certificate was accepted")
+}
+
+fn rsRefused(url: string, want: string) {
+  open(url) catch e {
+    match (e) {
+      Config(why) => {
+        assert(contains(why, want), "wanted '${want}' in: ${why}")
+        assert(!contains(e.message(), rsKey), "the error repeated the key: ${e.message()}")
+      }
+      _ => assert(false, "want Config, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "${url} opened")
+}
+
+test "the real host opens and every URL mistake fails at open" {
+  open("resend://${rsKey}@default") catch e {
+    assert(false, "default: ${e.message()}")
+    return
+  }
+  open("RESEND://${rsKey}@proxy.internal:8443?insecureSkipVerify=false") catch e {
+    assert(false, "proxy: ${e.message()}")
+    return
+  }
+  rsRefused("resend://default", "no API key")
+  rsRefused("resend://@default", "API key is empty")
+  rsRefused("resend://${rsKey}:pw@default", "no password")
+  rsRefused("resend://${rsKey}@", "names no host")
+  rsRefused("resend://${rsKey}@default:443", "takes no port")
+  rsRefused("resend://${rsKey}@proxy.internal:0", "port 0 is outside")
+  rsRefused(
+    "resend://${rsKey}@default?insecureSkipVerify=true",
+    "real api.resend.com is always verified",
+  )
+  rsRefused("resend://${rsKey}@proxy.internal?tls=off", "only query parameter")
+  rsRefused("resend://${rsKey}@proxy.internal/emails", "host is a name")
+  rsRefused("resend://%0d%0a@default", "control byte")
+  rsRefused("resend://%e2%82%ac@default", "not printable ASCII")
+}
+
+test "Options.dkim is refused at open: Resend signs with its own key" {
+  let opts = rsOpts()
+  opts.dkim = [dwRsa()]
+  open("resend://${rsKey}@default", opts) catch e {
+    match (e) {
+      Config(why) => assert(contains(why, "builds it itself and signs with its own DKIM key"), why)
+      _ => assert(false, "want Config, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "Options.dkim was accepted by a transport that cannot carry the signature")
+}
+
+test "a retried send carries the same Idempotency-Key and the body of the first try" {
+  let (port, log) = rsStart([rsReply(503, "", "{}"), rsOk()]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let opts = rsOpts()
+  opts.retry = Retry{ attempts = 2, base = Millisecond, max = 5 * Millisecond }
+  let mailer = open(rsUrl(port), opts) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  let m = rsMsg()
+  m.id = ""
+  let r = mailer.send(m) catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let first = <- log
+  let second = <- log
+  let local = r.id[1:indexOf(r.id, "@")]
+  assert(contains(first, "Idempotency-Key: ${local}\r\n"), first)
+  assert(contains(second, "Idempotency-Key: ${local}\r\n"), second)
+  assert(rsBody(first) == rsBody(second), "the retry sent a different body")
+  assert(r.providerId != "", "no providerId after the retry")
+}

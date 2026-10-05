@@ -1,0 +1,213 @@
+// pkg/mail/resendbody.bit — the JSON a `resend://` transport posts to Resend's
+// `POST /emails` (https://resend.com/docs/api-reference/emails/send-email):
+// one object with `from`, `to`, `cc`, `bcc`, `reply_to`, `subject`, `text`,
+// `html`, `headers`, `attachments` and `tags`, in that order, a field left out
+// when it is empty.
+//
+// Resend builds the MIME message itself, so this file maps fields and never
+// bytes: `Delivery.raw` is not sent. What the SMTP path gets from the renderer
+// is reproduced from the same functions, so both transports agree on it: the
+// text part made from the HTML (`textBody`), the threading and `Auto-Submitted`
+// headers (`extraFields`), the attachment type (`guessType`).
+
+import { Json, JsonEntry, jsonEncode } from "std/json"
+import { encodeBase64 } from "std/crypto"
+import { keys } from "std/seq"
+import { sorted } from "std/sort"
+
+// Resend takes at most this many addresses across `to`, `cc` and `bcc`.
+const resendMaxRecipients: int = 50
+
+// Tag names and values: letters, digits, `_` and `-`, up to this many bytes.
+const resendMaxTag: int = 256
+
+// An `Idempotency-Key` is at most this many bytes.
+const resendMaxKey: int = 256
+
+fn resendEntry(key: string, value: Json): JsonEntry {
+  return JsonEntry{ key = key, value = value }
+}
+
+fn resendStrings(list: []string): Json {
+  let out: []Json = []
+  for s of list {
+    out = append(out, Json.JsonString(s))
+  }
+  return Json.JsonArray(out)
+}
+
+// `list` parsed as `field[i]` and written back as `Name <email>`.
+fn resendAddresses(field: string, list: []string): []string!MailError {
+  let out: []string = []
+  for a of parseFields(field, list)? {
+    out = append(out, a.toString())
+  }
+  return out
+}
+
+// The object being built: fields in the order they are written, a field with
+// nothing to say left out.
+class ResendFields {
+  entries: []JsonEntry = []
+
+  put(name: string, value: Json) {
+    this.entries = append(this.entries, resendEntry(name, value))
+  }
+
+  putList(name: string, list: []string) {
+    if (len(list) > 0) {
+      this.put(name, resendStrings(list))
+    }
+  }
+
+  putText(name: string, text: string) {
+    if (text != "") {
+      this.put(name, Json.JsonString(text))
+    }
+  }
+}
+
+// Whether `c` may appear in a tag name or value: a letter, a digit, `_` or `-`.
+fn resendTagByte(c: byte): bool {
+  if (c >= 65 && c <= 90) {
+    return true
+  }
+  if (c >= 97 && c <= 122) {
+    return true
+  }
+  return (c >= 48 && c <= 57) || c == 95 || c == 45
+}
+
+// Whether `s` is 1 to `resendMaxTag` bytes of `[A-Za-z0-9_-]`.
+fn resendTagOk(s: string): bool {
+  if (len(s) == 0 || len(s) > resendMaxTag) {
+    return false
+  }
+  for c of []byte(s) {
+    if (!resendTagByte(c)) {
+      return false
+    }
+  }
+  return true
+}
+
+// `Message.tags` as Resend's `[{name, value}]`, sorted by name. Resend limits
+// both halves to `[A-Za-z0-9_-]`; a tag it would refuse is refused here, before
+// the request, naming the tag.
+fn resendTags(m: Message): []Json!MailError {
+  let out: []Json = []
+  for name of sorted(keys(m.tags), (a, b) => a < b) {
+    let value = m.tags[name]
+    if (!resendTagOk(name) || !resendTagOk(value)) {
+      fail MailError.Invalid("tags[${echoInput(name)}]: Resend takes tag names and values of 1 to ${resendMaxTag} letters, digits, '_' and '-'")
+    }
+    out = append(
+      out,
+      Json.JsonObject(
+        [resendEntry("name", Json.JsonString(name)), resendEntry("value", Json.JsonString(value))],
+      ),
+    )
+  }
+  return out
+}
+
+// `Message.headers` plus the threading pair and `Auto-Submitted`, as the SMTP
+// renderer writes them, sorted by name.
+fn resendHeaders(m: Message): []JsonEntry!MailError {
+  let out: []JsonEntry = []
+  for f of sortFields(extraFields(m)?)? {
+    out = append(out, resendEntry(f.name, Json.JsonString(f.value)))
+  }
+  return out
+}
+
+fn resendAttachment(a: Attachment): Json {
+  let t = a.contentType
+  if (t == "") {
+    t = guessType(a.name)
+  }
+  let e = [
+    resendEntry("filename", Json.JsonString(a.name)),
+    resendEntry("content", Json.JsonString(encodeBase64(a.data))),
+    resendEntry("content_type", Json.JsonString(t)),
+  ]
+  if (a.cid != "") {
+    e = append(e, resendEntry("content_id", Json.JsonString(a.cid)))
+  }
+  return Json.JsonObject(e)
+}
+
+fn resendAttachments(m: Message): []Json {
+  let out: []Json = []
+  for a of m.attachments {
+    out = append(out, resendAttachment(a))
+  }
+  return out
+}
+
+// What Resend cannot carry, refused before anything is sent.
+fn resendCheck(d: Delivery): ()!MailError {
+  if (len(d.envelope.to) > resendMaxRecipients) {
+    fail MailError.Invalid("${len(d.envelope.to)} recipients; Resend takes at most ${resendMaxRecipients} across to, cc and bcc, so send in batches")
+  }
+  match (d.message.invite) {
+    Some(_) => fail MailError.Invalid("Message.invite: Resend has no calendar alternative; send an invite through smtp:// or attach the .ics yourself")
+    None => return
+  }
+}
+
+// The request body for `d`. `from` and `replyTo` are the mailer's defaults, for
+// a message that sets none.
+fn resendPayload(d: Delivery, from: string, replyTo: []string): string!MailError {
+  resendCheck(d)?
+  let m = d.message
+  let sender = from
+  if (m.from != "") {
+    sender = m.from
+  }
+  let reply = replyTo
+  if (len(m.replyTo) > 0) {
+    reply = m.replyTo
+  }
+  let f = ResendFields{}
+  f.put("from", Json.JsonString(parseField("from", sender)?.toString()))
+  f.putList("to", resendAddresses("to", m.to)?)
+  f.putList("cc", resendAddresses("cc", m.cc)?)
+  f.putList("bcc", resendAddresses("bcc", m.bcc)?)
+  f.putList("reply_to", resendAddresses("replyTo", reply)?)
+  f.put("subject", Json.JsonString(m.subject))
+  f.putText("html", m.html)
+  f.putText("text", textBody(m))
+  let headers = resendHeaders(m)?
+  if (len(headers) > 0) {
+    f.put("headers", Json.JsonObject(headers))
+  }
+  let files = resendAttachments(m)
+  if (len(files) > 0) {
+    f.put("attachments", Json.JsonArray(files))
+  }
+  let tags = resendTags(m)?
+  if (len(tags) > 0) {
+    f.put("tags", Json.JsonArray(tags))
+  }
+  return jsonEncode(Json.JsonObject(f.entries))
+}
+
+// The `Idempotency-Key`: `Message.id` when it is set, else the local part of
+// the Message-ID the renderer made. The `Mailer` renders once and retries the
+// same `Delivery`, so every attempt carries the same key.
+fn resendKey(d: Delivery): string!MailError {
+  let key = d.message.id
+  if (key == "") {
+    let id = d.messageId
+    let at = lastIndexOf(id, "@")
+    if (len(id) < 3 || at < 2) {
+      fail MailError.Invalid("the Message-ID ${echoInput(id)} has no local part to use as an Idempotency-Key")
+    }
+    key = id[1:at]
+  }
+  if (len(key) > resendMaxKey) {
+    fail MailError.Invalid("the Idempotency-Key is ${len(key)} bytes; Resend takes at most ${resendMaxKey}")
+  }
+  return key
+}

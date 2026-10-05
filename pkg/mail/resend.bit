@@ -1,0 +1,287 @@
+// pkg/mail/resend.bit — the `Transport` `open("resend://KEY@default")` returns:
+// one `POST https://api.resend.com/emails` per message with the API key as a
+// Bearer token (https://resend.com/docs/api-reference/emails/send-email). The
+// JSON is made in resendbody.bit; this file is the URL, the request and what
+// each answer means.
+//
+//   resend://KEY@default                        api.resend.com
+//   resend://KEY@host[:port]                    https://host[:port], for a proxy or a test
+//   resend://KEY@host[:port]?insecureSkipVerify=true     ... without checking its certificate
+//
+// The request is always TLS: there is no URL that sends the key over plaintext,
+// and `insecureSkipVerify` is refused for the real host, so only a stand-in
+// can be left unverified. The key is never in an error, a `Receipt` or the
+// text of the transport.
+//
+// What Resend answers, and what the caller gets:
+//   2xx                          `Receipt.providerId` is the `id` it returns
+//   401, 403 (but see below)     `Auth`
+//   403 `validation_error`       `Rejected`: an unverified domain is not a bad key
+//   409 concurrent/locked        `Transient`: the same key is in flight, try later
+//   409 otherwise                `Invalid`: the key was used with another payload
+//   429 and 5xx                  `Transient`, `Reply.retryAfter` from `Retry-After`
+//   a failed TLS handshake       `Rejected`: the same certificate is presented next time
+//   any other network failure    `Transient`
+//   any other 4xx                `Rejected` with Resend's `message`
+
+import { Client as HttpClient, header as httpHeader } from "std/http"
+import { HandshakeError, HandshakeFailure, TlsConfig, emptyTrustStore } from "std/tls"
+import { jsonAsString, jsonGet, jsonParse } from "std/json"
+import { hasPrefix, parseInt, replace, trimSpace } from "std/strings"
+import { Millisecond, Second } from "std/time"
+
+// What `default` stands for in the host position.
+const resendDefaultHost: string = "api.resend.com"
+
+const resendScheme: string = "resend://"
+
+// The longest `Retry-After` taken at its word, in seconds: a day. A larger
+// number is a misread or an attack, and `Options.retry.max` caps the wait anyway.
+const resendMaxRetryAfter: int = 86400
+
+// The longest server text kept in an error.
+const resendMaxText: int = 500
+
+// What a `resend://` URL names.
+class ResendTarget {
+  key: string = "",
+  // `https://host[:port]`, no path.
+  base: string = "",
+  insecure: bool = false,
+  // The URL as an error shows it: `resend://***@default`.
+  display: string = "",
+}
+
+fn resendUrlError(why: string): MailError {
+  return MailError.Config("resend://: ${why}")
+}
+
+// Whether `url` is a `resend://` URL, whatever follows.
+fn isResendUrl(url: string): bool {
+  return hasPrefix(toLower(url), resendScheme)
+}
+
+// A key that is printable ASCII, so it can be written into a header.
+fn resendKeyOk(key: string): bool {
+  for c of []byte(key) {
+    if (c <= 32 || c >= 127) {
+      return false
+    }
+  }
+  return len(key) > 0
+}
+
+// `host[:port]` as it is written after `@`, with the default host resolved.
+fn resendHost(hostport: string): string!MailError {
+  if (indexOf(hostport, "[") >= 0 || indexOf(hostport, "/") >= 0) {
+    fail resendUrlError("the host is a name with an optional port, `default` or host[:port]")
+  }
+  let host = hostport
+  let port = ""
+  let colon = lastIndexOf(hostport, ":")
+  if (colon >= 0) {
+    host = hostport[0:colon]
+    parsePort(hostport[colon + 1:])?
+    port = hostport[colon:]
+  }
+  if (host == "") {
+    fail resendUrlError("the URL names no host; use resend://KEY@default")
+  }
+  if (host == "default") {
+    if (port != "") {
+      fail resendUrlError("`default` is api.resend.com and takes no port")
+    }
+    return resendDefaultHost
+  }
+  return pctDecode(host, "the host")? + port
+}
+
+// The one query parameter, `insecureSkipVerify`.
+fn resendQuery(query: string, defaulted: bool): bool!MailError {
+  if (query == "") {
+    return false
+  }
+  if (query != "insecureSkipVerify=true" && query != "insecureSkipVerify=false") {
+    fail resendUrlError("the only query parameter is insecureSkipVerify=true|false")
+  }
+  if (defaulted) {
+    fail resendUrlError("insecureSkipVerify is for a stand-in host; the real api.resend.com is always verified")
+  }
+  return query == "insecureSkipVerify=true"
+}
+
+// `url` as a target, or a `Config` that never repeats the key.
+fn parseResend(url: string): ResendTarget!MailError {
+  let rest = url[len(resendScheme):]
+  let query = ""
+  let q = indexOf(rest, "?")
+  if (q >= 0) {
+    query = rest[q + 1:]
+    rest = rest[0:q]
+  }
+  let at = lastIndexOf(rest, "@")
+  if (at < 0) {
+    fail resendUrlError("the URL has no API key; use resend://KEY@default")
+  }
+  if (indexOf(rest[0:at], ":") >= 0) {
+    fail resendUrlError("the API key goes before the @ alone, as resend://KEY@host; there is no password")
+  }
+  let key = pctDecode(rest[0:at], "the API key")?
+  if (!resendKeyOk(key)) {
+    fail resendUrlError("the API key is empty or not printable ASCII")
+  }
+  let host = resendHost(rest[at + 1:])?
+  let insecure = resendQuery(query, host == resendDefaultHost)?
+  return ResendTarget{
+    key = key,
+    base = "https://${host}",
+    insecure = insecure,
+    display = "resend://***@${host}",
+  }
+}
+
+// `Retry-After` in nanoseconds: delta-seconds only (RFC 9110 §10.2.3); an HTTP
+// date, a negative or an unreadable value is 0, no hint.
+fn resendRetryAfter(headers: string): int {
+  let v = trimSpace(httpHeader(headers, "retry-after"))
+  let n = parseInt(v) catch _ {
+    return 0
+  }
+  if (n < 0 || n > resendMaxRetryAfter) {
+    return 0
+  }
+  return n * Second
+}
+
+// A string field of the error body Resend sends, `{"name","message","statusCode"}`.
+fn resendField(body: string, name: string): string {
+  let j = jsonParse(body) catch _ {
+    return ""
+  }
+  match (jsonGet(j, name)) {
+    Some(v) => return unwrapOr(jsonAsString(v), "")
+    None => return ""
+  }
+}
+
+class ResendTransport {
+  t: ResendTarget
+  from: string
+  replyTo: []string
+  timeoutMs: int
+
+  init(t: ResendTarget, opts: Options) {
+    this.t = t
+    this.from = opts.from
+    this.replyTo = []
+    if (opts.replyTo != "") {
+      this.replyTo = [opts.replyTo]
+    }
+    this.timeoutMs = opts.timeout / Millisecond
+  }
+
+  // Posts `d` as one Resend email. See the top of this file for what each
+  // answer becomes.
+  export deliver(d: Delivery): Receipt!MailError {
+    let body = resendPayload(d, this.from, this.replyTo)?
+    let key = resendKey(d)?
+    let c = this.client()
+    defer c.close()
+    this.setHeaders(c, key)?
+    let res = c.requestTimeout("POST", "${this.t.base}/emails", body, this.timeoutMs) catch e {
+      fail this.netError(e)
+    }
+    return this.answer(res.status, res.headers, res.body, d)?
+  }
+
+  // The mail is built at Resend, so what leaves is not `Delivery.raw`.
+  export signs(): bool {
+    return false
+  }
+
+  // Nothing is held between sends.
+  export close() {}
+
+  // `resend://***@api.resend.com`, the key hidden.
+  export toString(): string {
+    return this.t.display
+  }
+
+  // A fresh client per send: its headers carry this send's key, and the
+  // `Mailer` may call `deliver` from many tasks at once.
+  client(): HttpClient {
+    if (this.t.insecure) {
+      return HttpClient(TlsConfig(emptyTrustStore(), insecureSkipVerify = true))
+    }
+    return HttpClient()
+  }
+
+  // A request that got no answer. A certificate or protocol failure of the
+  // handshake is the same next time, so it is `Rejected`; everything else (a
+  // refused connection, a reset, a timeout) is `Transient`.
+  netError(e: error): MailError {
+    let r = Reply{ text = "resend: ${this.scrub(e.message())}" }
+    let (h, ok) = e.(HandshakeError)
+    if (ok && h.kind != HandshakeFailure.Io) {
+      return MailError.Rejected(r)
+    }
+    return MailError.Transient(r)
+  }
+
+  // The headers every send carries. The key was checked at `open` and the
+  // Idempotency-Key at `resendKey`, so a refusal here is a bug, reported and
+  // never with either value.
+  setHeaders(c: HttpClient, key: string): ()!MailError {
+    c.setHeader("Authorization", "Bearer ${this.t.key}") catch _ {
+      fail MailError.Config("resend://: the API key cannot be sent as a header")
+    }
+    c.setHeader("Content-Type", "application/json") catch _ {
+      fail MailError.Config("resend://: Content-Type cannot be set")
+    }
+    c.setHeader("Idempotency-Key", key) catch _ {
+      fail MailError.Invalid("the Idempotency-Key ${echoInput(key)} cannot be sent as a header")
+    }
+  }
+
+  scrub(s: string): string {
+    return replace(s, this.t.key, "***")
+  }
+
+  // The `Receipt` for a 2xx, else the `MailError` for the answer.
+  answer(status: int, headers: string, body: string, d: Delivery): Receipt!MailError {
+    if (status >= 200 && status < 300) {
+      return Receipt{
+        id = d.messageId,
+        providerId = resendField(body, "id"),
+        accepted = d.envelope.to,
+      }
+    }
+    let name = resendField(body, "name")
+    let text = this.scrub(resendField(body, "message"))
+    if (len(text) > resendMaxText) {
+      text = text[0:resendMaxText]
+    }
+    if (text == "") {
+      text = "HTTP ${status}"
+    }
+    let r = Reply{ code = status, text = text, retryAfter = resendRetryAfter(headers) }
+    fail resendError(status, name, r)
+  }
+}
+
+// The `MailError` for a non-2xx answer; the table is at the top of this file.
+fn resendError(status: int, name: string, r: Reply): MailError {
+  if (status == 401 || (status == 403 && name != "validation_error")) {
+    return MailError.Auth(r)
+  }
+  if (status == 409) {
+    if (name == "concurrent_idempotent_requests" || name == "resource_locked") {
+      return MailError.Transient(r)
+    }
+    return MailError.Invalid(r.text)
+  }
+  if (status == 429 || status >= 500) {
+    return MailError.Transient(r)
+  }
+  return MailError.Rejected(r)
+}
