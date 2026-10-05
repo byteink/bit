@@ -98,15 +98,22 @@ instead of leaning on 429. The key is never in an error or a `Receipt`: a text
 that Resend echoes it into shows `***`.
 
 ```bit
-import { MailError, Message, Options, Retry, open } from "mail"
+import { Message, Options, Retry, open } from "mail"
 import { Second } from "std/time"
 
 fn main(): ()! {
   let mailer = open(
     "resend://re_123456789@default",
-    Options{ from = "Inkwell <hello@inkwell.dev>", rate = 10, retry = Retry{ attempts = 5 }, timeout = 20 * Second },
+    Options{
+      from = "Inkwell <hello@inkwell.dev>",
+      rate = 10,
+      retry = Retry{ attempts = 5 },
+      timeout = 20 * Second,
+    },
   )?
-  mailer.send(Message{ to = ["sara@example.com"], subject = "Your digest", text = "This week on Inkwell" }) catch e {
+  mailer.send(
+    Message{ to = ["sara@example.com"], subject = "Your digest", text = "This week on Inkwell" },
+  ) catch e {
     match (e) {
       Auth(r) => println("check the Resend key: ${r.toString()}")
       Rejected(r) => println("Resend refused it: ${r.text}")
