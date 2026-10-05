@@ -77,6 +77,13 @@ Put what a policy needs on the subject itself, as `team` is here.
 match, so a typo in a stored placeholder denies instead of granting. Policies
 written in code skip all this: the closure reads `user.team` directly.
 
+Because a closure can read any field, `authz` keeps a user's rules per user
+VALUE: the next check with an equal `User` (every field equal, even in a new
+object) reuses them, and one whose `team` changed gets fresh rules. Keep the
+user class to strings, numbers, bools, enums, slices, maps, `Option`s and
+classes of those; a field holding a function, an interface or a generic class
+means the rules are built on every check (see [decisions](decisions.md)).
+
 ## Joining pkg/auth
 
 `pkg/auth` hands you an `Identity` with an `id` and a bag of `claims`. `authz`

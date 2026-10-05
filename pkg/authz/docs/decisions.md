@@ -212,9 +212,18 @@ mistake is logged at ERROR the first time. It is a refusal, never a grant.
 - A rule on `all` allows every resource, including ones you register later.
 - The log line names the policy; it is for the server log only. `Denied`
   keeps the policy for `deciding()` and not for `message()`.
-- Each call runs the policy closures for this user (`rolesOf`) and reads the
-  row once when a matching rule has a condition; a rule without one never
-  reads it.
+- The first check for a user runs the policy closures (`rolesOf`) and keeps
+  the rules, indexed by resource and action. Every later check for a user of
+  the same value reuses them, so a rule without a condition allocates
+  nothing and one with a condition reads the row once. "Same value" means
+  every field: a user whose `team` changed, in a fresh object or in place,
+  gets the new team's rules. Registering a role or a resource rebuilds every
+  user's rules on their next check. Up to 512 users' rules are kept; a user
+  whose slot another took is rebuilt on the next check.
+- A user class needs value semantics to be kept (strings, numbers, bools,
+  enums, slices, maps, `Option`s and classes of those). A class with a
+  function, an interface or a generic class field has its rules built on
+  every call instead, which is correct and slower.
 
 ## Next
 

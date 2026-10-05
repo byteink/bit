@@ -1,0 +1,376 @@
+// pkg/authz/rulecache.bit — a subject's rules, built once per subject VALUE
+// and reused by every later `can` and `check`: CASL's Ability-per-user, kept
+// by the package so the app holds no handle.
+//
+// THE KEY IS THE WHOLE SUBJECT. A policy closure may read any attribute
+// (`user.team`), so the rules are a function of the subject's value, not of
+// its id and roles. The compiler writes `__valueHash`, `__sameValue` and
+// `__snapshot` for every class with value semantics (SPEC §14.3, #7327): an
+// entry is found by the hash, confirmed with `__sameValue` against a deep
+// copy taken when it was built, and the policies run on that copy, so a
+// later change to the caller's object (even in place, even to a slice) is a
+// different key and the rules can hold nothing the caller can still mutate.
+//
+// WHEN IT IS DROPPED. Every `role` and `resource` registration bumps
+// `version`; an entry built under an older one is a miss. The table is
+// direct-mapped: `cacheSlots` entries, the slot is the hash modulo that, and a
+// miss overwrites whatever held its slot. At most `cacheSlots` subjects' rules
+// are kept, and a lookup is one slot, never a scan.
+//
+// NOT EVERY SUBJECT IS KEPT. A class with a field that has no value semantics
+// (a function, an interface, a generic class, a tuple; E0313) has none of the
+// three members: its rules are built on every call, as before this cache.
+// So is a subject whose class has no role registered for it, and one a policy
+// written against an interface type runs for (that policy reads the caller's
+// own object).
+//
+// INSIDE AN ENTRY the rules are indexed by (resource class, action) on first
+// use: a check scans only the rules that can match, and each carries the
+// Decision it makes, built once. Allocation on a hit: none for rules without
+// a condition; the row's `__values()` once when a matching rule has one.
+
+import { Mutex } from "std/sync"
+import { Json } from "std/json"
+
+// How many subjects' rules are kept at once.
+const cacheSlots: int = 512
+
+// What #7327 writes for a class with value semantics. `Subject`'s requirements
+// are repeated so a `Subject` can be asserted to it.
+interface Valued<S> {
+  id: string,
+  roles: []string,
+  __field(name: string): Option<Json>,
+  __sameValue(other: S): bool,
+  __valueHash(): u64,
+  __snapshot(): S,
+}
+
+// A subject's snapshot, type-erased: a `Held<S>`.
+interface Frozen {}
+
+class Held<S: Subject> {
+  v: S,
+}
+
+// What `Frozen` holds before anything is frozen.
+class Unheld {}
+
+// The value operations of one subject class `S`, erased: `owns` is true for a
+// subject of exactly class `S` when `S` has the three members.
+class SubjectKind {
+  owns: (Subject) => bool,
+  hash: (Subject) => u64,
+  same: (Frozen, Subject) => bool,
+  freeze: (Subject) => Frozen,
+}
+
+fn kindFor<S: Subject>(): SubjectKind {
+  return SubjectKind{
+    owns = (s: Subject) => {
+      let (_, ok) = s.(Valued<S>)
+      return ok
+    },
+    hash = (s: Subject) => {
+      let (v, _) = s.(Valued<S>)
+      return v.__valueHash()
+    },
+    same = (f: Frozen, s: Subject) => {
+      let (h, held) = f.(Held<S>)
+      let (v, ok) = s.(Valued<S>)
+      return held && ok && v.__sameValue(h.v)
+    },
+    freeze = (s: Subject) => {
+      let (v, _) = s.(Valued<S>)
+      let f: Frozen = Held<S>{ v = v.__snapshot() }
+      return f
+    },
+  }
+}
+
+fn noKind(): SubjectKind {
+  return SubjectKind{
+    owns = (s: Subject) => false,
+    hash = (s: Subject) => 0,
+    same = (f: Frozen, s: Subject) => false,
+    freeze = (s: Subject) => {
+      let f: Frozen = Unheld{}
+      return f
+    },
+  }
+}
+
+// The rules of one (resource class, action) pair, in rule order, with each
+// rule's position in its policy and the Decision it makes when it matches;
+// `none` is the default deny. `names` are the class's column names.
+class RuleSlot<A: ActionEnum> {
+  className: string,
+  action: A,
+  names: []string,
+  rules: []Rule<A>,
+  at: []int,
+  decs: []Decision,
+  none: Decision,
+}
+
+// One subject's rules. `clean` is true when no rule was faulty when it was
+// built, so a check skips the per-rule fault lookup.
+class RuleSet<A: ActionEnum> {
+  version: int,
+  hash: u64,
+  kind: SubjectKind,
+  held: Frozen,
+  rules: []Rule<A>,
+  skipped: []string,
+  clean: bool,
+  slots: []RuleSlot<A>,
+}
+
+fn allowedBy(policy: string): Decision {
+  return Decision{ allowed = true, policy = policy, reason = "allowed by rule", invalid = false }
+}
+
+// Each rule's position within its policy (rules of one policy are contiguous).
+fn positions<A: ActionEnum>(rules: []Rule<A>): []int {
+  let at = []int(0)
+  let prev = ""
+  let k = 0
+  for r of rules {
+    if (r.policy != prev) {
+      prev = r.policy
+      k = 0
+    }
+    at = append(at, k)
+    k = k + 1
+  }
+  return at
+}
+
+fn newSlot<A: ActionEnum>(
+  set: RuleSet<A>,
+  st: DecideState<A>,
+  cls: string,
+  action: A,
+  wildcard: bool,
+): RuleSlot<A> {
+  let want = actionName(action)
+  let slot = RuleSlot<A>{
+    className = cls, action = action, names = st.namesOf(cls),
+    rules = []Rule<A>(0), at = []int(0), decs = []Decision(0),
+    none = Decision{ allowed = false, policy = "", reason = noAllowRule, invalid = false },
+  }
+  let at = positions<A>(set.rules)
+  let i = 0
+  while (i < len(set.rules)) {
+    let r = set.rules[i]
+    if (applies<A>(r, cls, want, wildcard)) {
+      slot.rules = append(slot.rules, r)
+      slot.at = append(slot.at, at[i])
+      if (r.effect == Effect.Deny) {
+        slot.decs = append(slot.decs, denyAll(r.policy))
+      } else {
+        slot.decs = append(slot.decs, allowedBy(r.policy))
+      }
+    }
+    i = i + 1
+  }
+  return slot
+}
+
+// Whether every rule passes the check `can` would make, with no verdict
+// cached against it.
+fn rulesClean<A: ActionEnum>(
+  st: DecideState<A>,
+  resources: []ResourceInfo,
+  rules: []Rule<A>,
+): bool {
+  let at = positions<A>(rules)
+  let i = 0
+  while (i < len(rules)) {
+    let code = st.lookup(rules[i], at[i])
+    if (code == 2 || (code == 0 && ruleFault<A>(resources, rules[i]) != "")) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn newSet<A: ActionEnum>(
+  a: Authz<A>,
+  version: int,
+  rules: []Rule<A>,
+  skipped: []string,
+): RuleSet<A> {
+  return RuleSet<A>{
+    version = version, hash = 0, kind = noKind(), held = Unheld{}, rules = rules,
+    skipped = skipped, clean = rulesClean<A>(a.state, a.resources, rules),
+    slots = []RuleSlot<A>(0),
+  }
+}
+
+fn emptySet<A: ActionEnum>(): RuleSet<A> {
+  return RuleSet<A>{
+    version = -1, hash = 0, kind = noKind(), held = Unheld{}, rules = []Rule<A>(0),
+    skipped = []string(0), clean = true, slots = []RuleSlot<A>(0),
+  }
+}
+
+// The subjects' rule sets and the guest's, under `mu`. `none` (version -1)
+// fills every empty slot and is what a miss returns.
+class RuleCache<A: ActionEnum> {
+  mu: Mutex
+  version: int
+  table: []RuleSet<A>
+  guest: RuleSet<A>
+  none: RuleSet<A>
+  kinds: []SubjectKind
+
+  init() {
+    this.mu = Mutex()
+    this.version = 0
+    this.none = emptySet<A>()
+    this.table = []RuleSet<A>(0)
+    let i = 0
+    while (i < cacheSlots) {
+      this.table = append(this.table, this.none)
+      i = i + 1
+    }
+    this.guest = this.none
+    this.kinds = []SubjectKind(0)
+  }
+
+  // Called by every registration that can change a subject's rules.
+  bump() {
+    this.mu.lock()
+    this.version = this.version + 1
+    this.mu.unlock()
+  }
+
+  addKind(k: SubjectKind) {
+    this.mu.lock()
+    this.kinds = append(this.kinds, k)
+    this.mu.unlock()
+  }
+
+  current(): int {
+    this.mu.lock()
+    let v = this.version
+    this.mu.unlock()
+    return v
+  }
+
+  // The kind that owns `s`, or `none`'s kind when no class registered has
+  // the three members for it.
+  kindOf(s: Subject): SubjectKind {
+    this.mu.lock()
+    let kinds = this.kinds
+    this.mu.unlock()
+    for k of kinds {
+      if (k.owns(s)) {
+        return k
+      }
+    }
+    return this.none.kind
+  }
+
+  // The current entry for `s`, whose hash is `h`, or `none`.
+  find(h: u64, s: Subject): RuleSet<A> {
+    this.mu.lock()
+    let e = this.table[int(h % u64(cacheSlots))]
+    let ver = this.version
+    this.mu.unlock()
+    if (e.version == ver && e.hash == h && e.kind.same(e.held, s)) {
+      return e
+    }
+    return this.none
+  }
+
+  // Stores `e` in its slot unless a registration made it stale meanwhile.
+  put(e: RuleSet<A>) {
+    this.mu.lock()
+    if (e.version == this.version) {
+      this.table[int(e.hash % u64(cacheSlots))] = e
+    }
+    this.mu.unlock()
+  }
+
+  // The guest's set while it is current, else `none`.
+  guestSet(): RuleSet<A> {
+    this.mu.lock()
+    let g = this.guest
+    if (g.version != this.version) {
+      g = this.none
+    }
+    this.mu.unlock()
+    return g
+  }
+
+  putGuest(e: RuleSet<A>) {
+    this.mu.lock()
+    if (e.version == this.version) {
+      this.guest = e
+    }
+    this.mu.unlock()
+  }
+
+  // The slot of `set` for (`cls`, `action`), built the first time it is
+  // asked. The action is compared as a value: its name is read only to build.
+  slotOf(set: RuleSet<A>, st: DecideState<A>, cls: string, action: A, wildcard: bool): RuleSlot<A> {
+    this.mu.lock()
+    for sl of set.slots {
+      if (sl.action == action && sl.className == cls) {
+        this.mu.unlock()
+        return sl
+      }
+    }
+    let sl = newSlot<A>(set, st, cls, action, wildcard)
+    set.slots = append(set.slots, sl)
+    this.mu.unlock()
+    return sl
+  }
+}
+
+// The guest's rules: the role called "guest", run once at registration.
+fn guestRuleSet<A: ActionEnum>(a: Authz<A>): RuleSet<A> {
+  let c = a.state.cache
+  let g = c.guestSet()
+  if (g.version >= 0) {
+    return g
+  }
+  let fresh = newSet<A>(a, c.current(), a.state.guest, []string(0))
+  c.putGuest(fresh)
+  return fresh
+}
+
+// The rules of `user`: the cached set for a subject of the same value, else
+// a fresh one, kept when the subject's class can be a key.
+fn ruleSetOf<A: ActionEnum>(a: Authz<A>, user: Option<Subject>): RuleSet<A> {
+  if (!isSome(user)) {
+    return guestRuleSet<A>(a)
+  }
+  let c = a.state.cache
+  let s = unwrap(user)
+  let k = c.kindOf(s)
+  let ver = c.current()
+  if (!k.owns(s)) {
+    let got = resolveRoles<A>(a.roles, s, Option<Frozen>.None)
+    return newSet<A>(a, ver, got.rules, got.skipped)
+  }
+  let h = k.hash(s)
+  let hit = c.find(h, s)
+  if (hit.version >= 0) {
+    return hit
+  }
+  let held = k.freeze(s)
+  let got = resolveRoles<A>(a.roles, s, Option<Frozen>.Some(held))
+  let set = newSet<A>(a, ver, got.rules, got.skipped)
+  if (got.live) {
+    return set
+  }
+  set.hash = h
+  set.kind = k
+  set.held = held
+  c.put(set)
+  return set
+}
