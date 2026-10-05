@@ -1028,6 +1028,24 @@ safepoint, or a `pc` with no record, which a consumer must treat as "every
 saved register may be live". The mask covers only the allocatable integer
 file; a register outside it is never named.
 
+**The consumer zeroes dead words (#7304).** Bit n of `live_regs` is
+`regs[n]` of the poll's `SafepointFrame`, on every target: both backends
+number the mask by physical register (`physRegMask`), as the shim lays out
+`regs[n]` at `+16+8n`. Before `stwCollect` walks a frame precisely, for its
+own snapshot and for every parked mutator's, `gcZeroDeadRegs`
+(`runtime/gc/stackmaplive.bit`) stores 0 into every `regs[n]` that is clear
+in the mask AND holds no caller's value, so neither the precise walk nor
+the conservative scans of classes 8 and 10 root what a dead register last
+held. A register the target ABI preserves across calls (x19..x28 on
+AArch64; rbx, rbp, r12..r15 on x86-64, plus rsi and rdi on Win64) that
+the function's entry does not list in `saved` carries a caller's value
+and is kept; one it does list is dead, its caller's value being in the
+save slot. Zeroing rather than skipping is deliberate: the shim reloads
+its caller-saved words on the way out, so a mask that misses a live
+register zeroes that register and the program fails under
+`BIT_GC=stress`, instead of a live object being freed in silence. An
+unknown mask zeroes nothing.
+
 **The producer and the reader are separate build inputs, and this format's
 correctness depends on them agreeing.** The padding above is written by
 whichever compiler emitted an object (`compiler/codegen.bit`'s
