@@ -51,6 +51,15 @@ anti-automation control OWASP ASVS asks for and the throttling NIST SP 800-63B
 requires of a password verifier. See [Slow down password
 guessing](brute-force.md).
 
+## Passwords are checked when they are set, if you ask
+
+`hashPassword` hashes whatever it is given. A `PasswordPolicy` is the opt-in check
+for a new password, after NIST SP 800-63B: a length in code points, NFKC
+normalization applied when the password is set and when it is verified, the
+username and your own words kept out, a blocklist, runs like `12345`, and an
+optional breach check. It adds no composition rules and no expiry, because NIST
+says not to. See [Check a new password](password-policy.md).
+
 ## Microsoft Entra ID: the tenant is checked, not assumed
 
 `Provider.Microsoft(tenant)` with a real tenant accepts only that tenant's
