@@ -106,6 +106,45 @@ The error `homeDir` fails with.
 One sentence naming the sources that were empty: `HOME`, `USERPROFILE`,
 `HOMEDRIVE` + `HOMEPATH` and the user database.
 
+## The host name
+
+### `hostname(): string!`
+
+Inkwell's mail server introduces itself to the receiving server with `EHLO <name>`,
+and when the sender has no domain of its own the right name is the machine's.
+`hostname` is that name: the one the `hostname` command prints, without a domain.
+It is `gethostname(2)` on macOS, the `nodename` that `uname(2)` reports on
+Linux and the DNS host name (`GetComputerNameExW`) on Windows.
+
+It fails with `HostnameError` rather than hand back something wrong: when the OS
+cannot report a name, when the name is longer than 255 bytes (it is never
+returned cut short) and when it is empty, so a caller never holds a silent `""`.
+
+```bit
+import { hostname, HostnameError } from "std/os"
+
+// What to say after EHLO: the machine's own name, else "localhost".
+fn helloName(): string {
+  return hostname() catch "localhost"
+}
+
+fn describeHost(): string {
+  let h = hostname() catch e {
+    return e.(HostnameError).message()
+  }
+  return h
+}
+```
+
+### `HostnameError`
+
+The error `hostname` fails with.
+
+### `HostnameError.message(): string`
+
+`hostname: ` followed by what failed: no name reported or one over 255 bytes, or
+an empty name.
+
 ## The running executable
 
 ### `selfExe(): string`
