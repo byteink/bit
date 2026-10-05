@@ -1,0 +1,217 @@
+// pkg/authz/condparam.bit — subject placeholders in stored conditions. A
+// policy saved in a database cannot hold a closure, so "an editor may update
+// their own team's articles" is stored as a tree whose operand is the text
+// "$user.team". `operandOf` reads that text into an `Operand`, and `bind`
+// replaces every `Param` in a tree with the asking subject's value, once per
+// request, before the tree is evaluated:
+//
+//   let c = Cond.Cmp("team", Op.Eq, [operandOf("$user.team")])
+//   let (bound, missing) = bind(c, Option<Subject>.Some(user))
+//
+// SYNTAX. Only a LEADING `$` is special. "$user.<path>" is a placeholder;
+// "$$..." is the literal text with one `$` dropped, so "$$user.team" is the
+// string "$user.team"; any other text, "$5" and "a$b" included, is itself.
+//
+// FAIL CLOSED. A path the subject cannot supply (the guest, a missing or
+// unsupported attribute, a dotted path: `attributeOf` names are flat) makes
+// its comparison not hold, and the path is listed so the decision log can say
+// why. "Not hold" is False, but False under an odd number of `not`s would
+// flip to a grant, so there it is True and the `not` still yields False. A
+// comparison that cannot be bound is therefore never the reason for access.
+//
+// A list attribute (`$user.roles`) is `in`'s source: it expands to one
+// operand per element, and an empty list is a definite False (nothing is in
+// it). Any other operator given a list cannot be bound.
+
+// The operand a stored condition's text stands for.
+export fn operandOf(text: string): Operand {
+  let n = len(text)
+  if (n >= 2 && text[0:2] == "$$") {
+    return Operand.Lit(Value.Text(text[1:n]))
+  }
+  if (n >= 6 && text[0:6] == "$user.") {
+    return Operand.Param(text[6:n])
+  }
+  return Operand.Lit(Value.Text(text))
+}
+
+// The scalar a `Json` attribute holds as a `Value`, or None for null, an
+// array or an object.
+fn scalarOf(j: Json): Option<Value> {
+  return match (j) {
+    JsonBool(b) => Option<Value>.Some(Value.Bool(b))
+    JsonInt(i) => Option<Value>.Some(Value.Int(i))
+    JsonFloat(f) => Option<Value>.Some(Value.Float(f))
+    JsonString(s) => Option<Value>.Some(Value.Text(s))
+    _ => Option<Value>.None
+  }
+}
+
+// Every element of a list attribute as an operand, or None when one is not a
+// scalar.
+fn elementsOf(js: []Json): Option<[]Operand> {
+  let out = []Operand(0)
+  for j of js {
+    let v = scalarOf(j)
+    if (!isSome(v)) {
+      return Option<[]Operand>.None
+    }
+    out = append(out, Operand.Lit(unwrap(v)))
+  }
+  return Option<[]Operand>.Some(out)
+}
+
+// What a read attribute turns into: one operand, or for `in` its elements.
+fn operandsOf(j: Json, op: Op): Option<[]Operand> {
+  return match (j) {
+    JsonArray(js) => listOperands(js, op)
+    _ => single(scalarOf(j))
+  }
+}
+
+fn listOperands(js: []Json, op: Op): Option<[]Operand> {
+  if (op != Op.In) {
+    return Option<[]Operand>.None
+  }
+  return elementsOf(js)
+}
+
+fn single(v: Option<Value>): Option<[]Operand> {
+  if (!isSome(v)) {
+    return Option<[]Operand>.None
+  }
+  return Option<[]Operand>.Some([Operand.Lit(unwrap(v))])
+}
+
+// The operands `o` stands for under `s`: itself when a literal, otherwise the
+// subject's attribute, None when it cannot be supplied.
+fn expandOperand(s: Option<Subject>, op: Op, o: Operand): Option<[]Operand> {
+  return match (o) {
+    Lit(_) => Option<[]Operand>.Some([o])
+    Param(path) => expandParam(s, op, path)
+  }
+}
+
+fn expandParam(s: Option<Subject>, op: Op, path: string): Option<[]Operand> {
+  if (!isSome(s)) {
+    return Option<[]Operand>.None
+  }
+  let got = attributeOf(unwrap(s), path)
+  if (!isSome(got)) {
+    return Option<[]Operand>.None
+  }
+  return operandsOf(unwrap(got), op)
+}
+
+fn paramPath(o: Operand): string {
+  return match (o) {
+    Param(path) => path
+    _ => ""
+  }
+}
+
+fn isParam(o: Operand): bool {
+  return match (o) {
+    Param(_) => true
+    _ => false
+  }
+}
+
+fn anyParam(ops: []Operand): bool {
+  for o of ops {
+    if (isParam(o)) {
+      return true
+    }
+  }
+  return false
+}
+
+fn anyCondParam(cs: []Cond): bool {
+  for c of cs {
+    if (hasParam(c)) {
+      return true
+    }
+  }
+  return false
+}
+
+// Does `c` hold a placeholder? Reads only; allocates nothing.
+fn hasParam(c: Cond): bool {
+  return match (c) {
+    Cmp(_, _, ops) => anyParam(ops)
+    And(cs) => anyCondParam(cs)
+    Or(cs) => anyCondParam(cs)
+    Not(inner) => hasParam(inner)
+    _ => false
+  }
+}
+
+// One `bind` call: the subject and the paths it could not supply.
+class Binding {
+  subject: Option<Subject>,
+  missing: []string,
+}
+
+// The comparison that cannot hold: False, or True under an odd number of
+// `not`s so the `not` above it is False too.
+fn cannotHold(neg: bool): Cond {
+  if (neg) {
+    return Cond.True
+  }
+  return Cond.False
+}
+
+fn bindCmp(b: Binding, field: string, op: Op, ops: []Operand, neg: bool): Cond {
+  let out = []Operand(0)
+  for o of ops {
+    let got = expandOperand(b.subject, op, o)
+    if (!isSome(got)) {
+      b.missing = append(b.missing, paramPath(o))
+      return cannotHold(neg)
+    }
+    out = withOperands(out, unwrap(got))
+  }
+  if (len(out) == 0 && len(ops) > 0) {
+    return Cond.False
+  }
+  return Cond.Cmp(field, op, out)
+}
+
+fn withOperands(out: []Operand, more: []Operand): []Operand {
+  for o of more {
+    out = append(out, o)
+  }
+  return out
+}
+
+fn bindEach(b: Binding, cs: []Cond, neg: bool): []Cond {
+  let out = []Cond(0)
+  for c of cs {
+    out = append(out, bindTree(b, c, neg))
+  }
+  return out
+}
+
+fn bindTree(b: Binding, c: Cond, neg: bool): Cond {
+  return match (c) {
+    True => Cond.True
+    False => Cond.False
+    Cmp(field, op, ops) => bindCmp(b, field, op, ops, neg)
+    And(cs) => Cond.And(bindEach(b, cs, neg))
+    Or(cs) => Cond.Or(bindEach(b, cs, neg))
+    Not(inner) => Cond.Not(bindTree(b, inner, !neg))
+  }
+}
+
+// `c` with every placeholder replaced by `s`'s value, and the paths `s` could
+// not supply (see FAIL CLOSED above). A tree without a placeholder comes back
+// as it is, without a copy. `None` is the guest. The result holds no `Param`,
+// so `evalCond` accepts it; one that still does fails with an InvalidPolicy.
+export fn bind(c: Cond, s: Option<Subject>): (Cond, []string) {
+  if (!hasParam(c)) {
+    return (c, []string(0))
+  }
+  let b = Binding{ subject = s, missing = []string(0) }
+  let bound = bindTree(b, c, false)
+  return (bound, b.missing)
+}

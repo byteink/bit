@@ -290,6 +290,99 @@ fn main(): ()! {
 This prints `true`. A `Where` with no clauses and no children matches every
 row, so it becomes the always-true condition whatever its join.
 
+## Stored conditions and the asking user
+
+A condition kept in a database cannot hold a closure, so "editors may update
+their own team's articles" has no `user.team` to read when it is saved. It
+names the attribute instead: the operand is the text `"$user.team"`.
+`operandOf` reads stored text into an `Operand`, which is either `Lit(value)`
+or `Param(path)`, and `bind` replaces every `Param` with the value the asking
+user has, once per request, before the condition is evaluated:
+
+```bit
+import { Cond, Operand, Subject, Truth, bind, evalCond, operandOf } from "authz"
+import { Tabled } from "orm"
+import { Op } from "std/where"
+
+@table class Article {
+  @id
+  id: i64
+  team: string
+  status: string
+}
+
+class User {
+  export id: string,
+  export roles: []string,
+  export team: string,
+}
+
+fn describe(o: Operand): string {
+  return match (o) {
+    Lit(_) => "a value"
+    Param(path) => "the user's ${path}"
+  }
+}
+
+fn main(): ()! {
+  let stored = Cond.Cmp("team", Op.Eq, [operandOf("$user.team")])
+  let article = Article{ id = 1, team = "sport", status = "draft" }
+  println(describe(operandOf("$user.team")))
+
+  let mira = User{ id = "mira", roles = ["editor"], team = "sport" }
+  let (bound, missing) = bind(stored, Option<Subject>.Some(mira))
+  println("mira: ${evalCond(bound, article)? == Truth.True}, unresolved ${len(missing)}")
+
+  let (asGuest, why) = bind(stored, Option<Subject>.None)
+  println("guest: ${evalCond(asGuest, article)? == Truth.True}, unresolved ${why[0]}")
+}
+```
+
+This prints `the user's team`, then `mira: true, unresolved 0`, then `guest:
+false, unresolved team`. `bind` returns the condition and the paths it could
+not fill in, so the decision log can say why a stored rule did not apply.
+
+Binding fails closed. A path the user cannot supply (the guest, a name the
+class does not have, a field that is private or an `Option`, a dotted path such
+as `org.id`: attribute names are flat, see the subjects chapter) makes that one
+comparison not hold, and the path is listed. Under a `not` it is the `not`
+that must not hold, so `bind` writes the always-true condition there and
+`not(team == $user.nope)` never grants. An attribute that does not exist can
+never be the reason someone gets in.
+
+A list attribute is the source of `oneOf`: `"$user.roles"` expands to one
+operand per role, and a user with no roles matches nothing. Any other
+comparison given a list cannot be bound.
+
+Only a leading `$` is special in stored text. `"$user.<path>"` is a
+placeholder, `"$$..."` is the literal text with one `$` dropped, and
+everything else, `"$5"` included, is itself:
+
+```bit
+import { Operand, operandOf } from "authz"
+
+fn show(text: string): string {
+  return match (operandOf(text)) {
+    Lit(_) => "${text} is text"
+    Param(path) => "${text} is the user's ${path}"
+  }
+}
+
+fn main() {
+  println(show("$user.team"))
+  println(show("$$user.team"))
+  println(show("$5"))
+}
+```
+
+This prints `$user.team is the user's team`, `$$user.team is text` and `$5 is
+text`; the second one means the literal string `$user.team`.
+
+A condition that still holds a `Param` when it is evaluated is an
+`InvalidPolicy` naming the field and the path, never a quiet false: call `bind`
+first. `validate` accepts a placeholder (its value is not known until the
+request) and still checks the field it compares.
+
 ## Sharp edges
 
 - Only fields stored in a row can be named: scalars (`i64`, `int`, `f64`,
