@@ -40,13 +40,14 @@ A user name that is an address has an `@` in it, which a URL spells `%40`. User
 name and password are percent-decoded, so a password with `@`, `/` or `:` in it
 is written `%40`, `%2F`, `%3A`.
 
-## The two forms, and why there is no third
+## The URL forms, and why TLS cannot be turned off
 
 | URL | What happens |
 |---|---|
 | `smtps://user:pass@host` | TLS from the first byte, port 465 (RFC 8314) |
 | `smtp://user:pass@host` | port 587; STARTTLS (RFC 3207), required |
 | `smtp://host:1025?tls=off` | no TLS, no login: for a server on your own machine |
+| `resend://key@default` | Resend's HTTPS API instead of SMTP: see [Sending through Resend](resend.md) |
 
 TLS is not a setting you can lose. With `smtp://` the connection is upgraded
 with STARTTLS before any password is sent, and a server that does not offer
