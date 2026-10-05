@@ -487,6 +487,44 @@ with the default policy. What happens on each hop:
 - The body of a redirect response is read, within the body cap, before the
   next hop. A `requestTimeout` deadline covers every hop together.
 
+### Retrying a request that failed
+
+Inkwell charges a card by posting to a payment service. When that call fails
+with a reset, did the service charge the card or not? Repeating a request that
+was processed is a double charge, and RFC 9110 section 9.2.2 says a client must
+not repeat a `POST` unless it knows the request was not processed.
+
+A request that fails once it reached the network layer fails with a
+`RequestError`. Its `sent` is `true` once the client began writing the request,
+so the server may have acted on it, and `false` when nothing left: a refused or
+timed-out connect, a failed TLS handshake, a wait for a free connection that ran
+out. `cause` is the error underneath, so a `HandshakeError` is still one
+(`e.cause.(HandshakeError)`).
+
+```bit
+import { Client, RequestError } from "std/http"
+
+fn charge(c: Client, body: string): string! {
+  let res = c.post("https://pay.inkwell.example/charges", body) catch e {
+    let (r, ok) = e.(RequestError)
+    if (ok && !r.sent) {
+      // The request never left: sending it again cannot double charge.
+      return c.post("https://pay.inkwell.example/charges", body)?.body
+    }
+    fail e
+  }
+  return res.body
+}
+```
+
+`sent` is conservative: it is `true` after a write that may have been partial,
+and after a followed redirect whichever hop failed. A failure before the
+network layer (a URL that does not parse, a header that cannot be sent) is a
+plain error and sent nothing. A streamed request (`Client.send` with
+`stream = true`) reports its failures as before. A reused connection that fails
+is repeated on a fresh one for an idempotent method only, and a `POST` fails
+with the `RequestError` of that connection.
+
 ## Serving requests: the basics
 
 ```bit
@@ -759,6 +797,13 @@ A request for `Client.send`: `method` (`"GET"` by default), `url`, `headers`
 `body` (`""` by default) and `timeoutMs` (`0`, no bound, by default): the bound
 in milliseconds on the connect, the response head and each body `read` of a
 streamed response.
+
+### `RequestError`
+
+The error a request fails with once it reached the network layer: `sent`
+(`bool`) is `true` when any byte of the request may have been written, `false`
+when nothing was; `cause` (`error`) is the error underneath. `message()` is
+the cause's text.
 
 ### `TimeoutError`
 
