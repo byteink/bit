@@ -12,9 +12,11 @@ the profile call, and you supply your client id and secret.
 
 `github(...)` returns the `OAuth2Endpoints` for GitHub: its authorize and token
 URLs, and a `ProfileFetch` that reads `GET /user` and `GET /user/emails` with
-the headers GitHub's REST API asks for. Pass it to `OAuth2Strategy` with
-`githubScopes`, which is `read:user user:email`: the first lets it read the
-profile, the second the email addresses.
+the headers GitHub's REST API asks for. Pass it to `OAuth2Strategy`: the
+endpoints carry the scopes GitHub needs, `read:user user:email`, the first to
+read the profile and the second the email addresses, so there is nothing else to
+remember. An `OAuth2Options.scopes` you set replaces them, and one without
+`user:email` leaves the profile step without an email.
 
 ```bit
 import { App, Config, MemoryStore, unauthorized } from "web"
@@ -26,7 +28,6 @@ import {
   OAuth2Strategy,
   currentIdentity,
   github,
-  githubScopes,
 } from "auth"
 import { TlsConfig } from "std/tls"
 import { fromPem } from "std/crypto"
@@ -43,7 +44,7 @@ fn githubStrategy(rootsPem: string): OAuth2Strategy! {
     "your-client-id",
     "your-client-secret",
     "https://app.example.com/auth/github/callback",
-    OAuth2Options{ scopes = githubScopes, tls = Option.Some(tls), name = "github" },
+    OAuth2Options{ tls = Option.Some(tls), name = "github" },
   )?
 }
 
@@ -287,8 +288,10 @@ no `tls` and no `apiFetch`. A request that GitHub refuses at sign-in time, such
 as `/user/emails` answering 404 because the `user:email` scope was not asked
 for, fails the sign-in with the status in the message and never the token.
 
-Scopes may be left empty; the request then carries no `scope`, which is what a
-provider with a fixed scope wants. Providers that need one will answer
+Scopes may be left empty; the request then carries the endpoints'
+`defaultScopes` (`github()` sets them; your own `OAuth2Endpoints` may too) and,
+when those are empty as well, no `scope`, which is what a provider with a fixed
+scope wants. Providers that need one will answer
 `invalid_scope`, which surfaces as an `OAuth2Error`.
 
 ## Testing your routes
@@ -317,7 +320,7 @@ fn fakeGithub(): OAuth2Strategy! {
     "test-client",
     "test-secret",
     "http://localhost:8080/auth/github/callback",
-    OAuth2Options{ scopes = githubScopes, tokenFetch = token },
+    OAuth2Options{ tokenFetch = token },
   )?
 }
 ```
