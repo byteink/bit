@@ -191,6 +191,131 @@ granting) quietly at request time.
 A policy that branches on the user is checked for the branch the sample takes;
 pass a sample that reaches every `can` you want checked.
 
+## Roles bundle policies
+
+Inkwell has three kinds of people: readers, authors and admins. Nobody should
+list policies per user; a role is a name for a list of them, and a user's
+`roles` say which lists apply. Register the resources first, then each role:
+
+```bit
+import { Authz, Policy, eq } from "authz"
+import { Tabled } from "orm"
+import { Value } from "std/sql"
+import { join } from "std/strings"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+  authorId: string
+  status: string
+}
+
+class User {
+  export id: string,
+  export roles: []string,
+}
+
+fn main(): ()! {
+  let readPublished = Policy<User, Action>("ReadPublished", (p, user) => {
+    p.can<Article>([Action.Read], eq("status", Value.Text("published")))
+  })
+  let editOwn = Policy<User, Action>("EditOwnArticles", (p, user) => {
+    p.can<Article>([Action.Read, Action.Update], eq("authorId", Value.Text(user.id)))
+  })
+  let manageAll = Policy<User, Action>("ManageAll", (p, user) => {
+    p.canAll([Action.Manage])
+  })
+  let authz = Authz<Action>()?
+  authz.resource<Article>()?
+  authz.role<User>("reader", [readPublished])?
+  authz.role<User>("author", [readPublished, editOwn])?
+  let ada = User{ id = "ada", roles = ["admin"] }
+  authz.role<User>("admin", [manageAll], probe = Option<User>.Some(ada))?
+  println(join(authz.roleNames(), ", "))
+}
+```
+
+This prints `admin, author, reader`. `role` returns the handle, so the calls
+chain, each with its own `?`. A role name is 1 to 64 characters of letters,
+digits, `_`, `.` and `-`, because stored attachments refer to it; a name used
+twice fails with `invalid policy: role author defined twice`. `guest` is an
+ordinary name here. Every policy is checked when its role is registered, as
+`validatePolicy` checks it, so a typo stops the app at startup. The sample
+user the policy is run for is a user with every field empty; `probe`, as on
+`admin` above, passes a real one to check the branch it takes.
+
+A policy's name is its identity: `ReadPublished` in two roles is one policy.
+
+## What a user's roles give them
+
+`rolesOf(user)` reads `user.roles` and returns the union of those roles'
+policies, each policy once, in the order the roles list them:
+
+```bit
+import { Authz, Policy, eq } from "authz"
+import { Tabled } from "orm"
+import { Value } from "std/sql"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+  authorId: string
+  status: string
+}
+
+class User {
+  export id: string,
+  export roles: []string,
+}
+
+fn main(): ()! {
+  let readPublished = Policy<User, Action>("ReadPublished", (p, user) => {
+    p.can<Article>([Action.Read], eq("status", Value.Text("published")))
+  })
+  let editOwn = Policy<User, Action>("EditOwnArticles", (p, user) => {
+    p.can<Article>([Action.Read, Action.Update], eq("authorId", Value.Text(user.id)))
+  })
+  let authz = Authz<Action>()?
+  authz.resource<Article>()?
+  authz.role<User>("reader", [readPublished])?
+  authz.role<User>("author", [readPublished, editOwn])?
+  let mira = User{ id = "mira", roles = ["reader", "author", "intern"] }
+  let got = authz.rolesOf(mira)
+  println("${len(got.rules)} rules, ${len(got.skipped)} skipped: ${got.skipped[0]}")
+}
+```
+
+This prints `2 rules, 1 skipped: role intern is not defined`. `ReadPublished`
+comes in once although two roles list it. A role nothing defines gives no
+rules, so a user can only lose access to a mistake, and the reason is in
+`skipped` for the server log. A user of another class than the policy was
+written for gets no rules from that policy and a line in `skipped` too.
+
+To catch a role nothing defines before any request, list the roles your
+identity provider can issue at startup:
+
+```bit
+import { Authz } from "authz"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+fn main() {
+  let authz = Authz<Action>() catch e {
+    panic(e.message())
+  }
+  authz.checkRoles(["reader"]) catch e {
+    println(e.message())
+  }
+}
+```
+
+This prints `invalid policy: unknown role reader (defined: )`: here nothing
+was registered. With the three roles above it passes.
+
 ## Sharp edges
 
 - Today the type arguments are written out: `Policy<User, Action>(...)`.
@@ -202,9 +327,10 @@ pass a sample that reaches every `can` you want checked.
   `@table` class; a plain class is refused at compile time.
 - `can` and `cannot` record rules; nothing evaluates them yet. Deny-wins and
   default-deny are applied by the evaluation chapter's `authz.can`.
+- Roles come from `user.roles` alone. Policies attached to one user directly
+  arrive with stored policies.
 
 ## Next
 
-Policies become useful once roles bundle them and `authz.can(user, action,
-thing)` answers for a user; both build on the `Rule` list this chapter
-produces.
+Policies and roles become useful once `authz.can(user, action, thing)`
+answers for a user; it builds on the `Rule` list `rolesOf` returns.

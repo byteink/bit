@@ -1,0 +1,175 @@
+// pkg/authz/role.bit — roles are named lists of policies, the RBAC half of
+// the package (users -> roles -> permissions):
+//
+//   authz.role("reader", [readPublished])?
+//   authz.role("author", [readPublished, editOwn])?
+//
+// `Authz<A>` is not parameterised by the app's user class, so a role keeps
+// each policy type-erased: a `PolicyRun` holds the policy's name and a closure
+// over the whole `Policy<S, A>` that takes any `Subject`, asserts it is an `S`
+// and runs `rulesFor`. A subject that is not an `S` gets no rules from that
+// policy and the reason is returned beside the rules (fail closed).
+//
+// A policy's name is its identity: the same name in two roles is one policy,
+// and stored attachments refer to policies and roles by these names.
+
+import { sorted } from "std/sort"
+import { join } from "std/strings"
+
+// What an erased policy made of a subject: `rules`, or `ok` false when the
+// subject is not the class the policy was written for.
+class Ran<A: ActionEnum> {
+  ok: bool,
+  rules: []Rule<A>,
+}
+
+// A policy with its subject type erased.
+class PolicyRun<A: ActionEnum> {
+  name: string,
+  run: (Subject) => Ran<A>,
+}
+
+// A role: its name and its policies, in the order they were listed.
+class RoleDef<A: ActionEnum> {
+  name: string,
+  policies: []PolicyRun<A>,
+}
+
+// What a subject's roles resolve to: the rules of the union of its roles'
+// policies, and one line for every policy or role that contributed nothing.
+// The lines are for the decision log, never for a client.
+export class Resolved<A: ActionEnum> {
+  export rules: []Rule<A>,
+  export skipped: []string,
+}
+
+// Whether `c` may appear in a role name: letters, digits, `_`, `.` and `-`.
+fn roleChar(c: u8): bool {
+  return (c >= 97 && c <= 122) ||
+    (c >= 65 && c <= 90) ||
+    (c >= 48 && c <= 57) ||
+    c == 95 ||
+    c == 46 ||
+    c == 45
+}
+
+// Fails with an InvalidPolicy unless `name` is 1 to 64 characters of
+// `[A-Za-z0-9_.-]`, the alphabet stored attachments may refer to.
+fn checkRoleName(name: string): ()! {
+  if (len(name) < 1 || len(name) > 64) {
+    fail InvalidPolicy{ detail = "role name must be 1 to 64 characters, got ${len(name)}" }
+  }
+  let i = 0
+  while (i < len(name)) {
+    if (!roleChar(name[i])) {
+      fail InvalidPolicy{ detail = "role ${name}: character ${i} is not one of A-Z a-z 0-9 _ . -" }
+    }
+    i = i + 1
+  }
+}
+
+fn findRole<A: ActionEnum>(roles: []RoleDef<A>, name: string): Option<RoleDef<A>> {
+  for r of roles {
+    if (r.name == name) {
+      return Option<RoleDef<A>>.Some(r)
+    }
+  }
+  return Option<RoleDef<A>>.None
+}
+
+// A policy held with its subject type still known; `run` is what a PolicyRun
+// keeps, so the type argument `S` never reaches the role.
+class Bound<S: Subject, A: ActionEnum> {
+  policy: Policy<S, A>
+
+  // The policy's rules for `s`, or `ok` false when `s` is not an `S`.
+  run(s: Subject): Ran<A> {
+    let (user, ok) = s.(S)
+    if (!ok) {
+      return Ran<A>{ ok = false, rules = []Rule<A>(0) }
+    }
+    return Ran<A>{ ok = true, rules = this.policy.rulesFor(user) }
+  }
+}
+
+// Erases `p`'s subject type: `run` asserts the subject is an `S`.
+fn erase<S: Subject, A: ActionEnum>(p: Policy<S, A>): PolicyRun<A> {
+  let b = Bound<S, A>{ policy = p }
+  return PolicyRun<A>{ name = p.name, run = b.run }
+}
+
+// Checks every policy of a new role against the registered resources, for
+// the sample subject `probe`, then erases them. The role is not stored here.
+fn buildRole<S: Subject, A: ActionEnum>(
+  resources: []ResourceInfo,
+  name: string,
+  policies: []Policy<S, A>,
+  probe: S,
+): RoleDef<A>! {
+  let runs = []PolicyRun<A>(0)
+  for p of policies {
+    validateRulesIn<A>(resources, p.name, p.rulesFor(probe))?
+    runs = append(runs, erase<S, A>(p))
+  }
+  return RoleDef<A>{ name = name, policies = runs }
+}
+
+// Fails with an InvalidPolicy when `def` has a bad name or repeats one of `roles`.
+fn checkNewRole<A: ActionEnum>(roles: []RoleDef<A>, def: RoleDef<A>): ()! {
+  checkRoleName(def.name)?
+  if (isSome(findRole<A>(roles, def.name))) {
+    fail InvalidPolicy{ detail = "role ${def.name} defined twice" }
+  }
+}
+
+fn roleNamesIn<A: ActionEnum>(roles: []RoleDef<A>): []string {
+  let names = []string(0)
+  for r of roles {
+    names = append(names, r.name)
+  }
+  return sorted(names, (a, b) => a < b)
+}
+
+// Fails with an InvalidPolicy naming the first of `names` that no role
+// defines, so a role an identity provider can issue but nothing defines stops
+// the app at startup.
+fn checkRolesIn<A: ActionEnum>(roles: []RoleDef<A>, names: []string): ()! {
+  for n of names {
+    if (!isSome(findRole<A>(roles, n))) {
+      fail InvalidPolicy{ detail = "unknown role ${n} (defined: ${join(roleNamesIn<A>(roles), ", ")})" }
+    }
+  }
+}
+
+// The union of the policies of `s`'s roles, each policy once, in the order
+// the roles list them. A role nothing defines and a policy written for
+// another subject class add no rules and one line to `skipped`.
+fn resolveRoles<A: ActionEnum>(roles: []RoleDef<A>, s: Subject): Resolved<A> {
+  let out = Resolved<A>{ rules = []Rule<A>(0), skipped = []string(0) }
+  let seen = []string(0)
+  for name of s.roles {
+    let def = findRole<A>(roles, name)
+    if (!isSome(def)) {
+      out.skipped = append(out.skipped, "role ${name} is not defined")
+      continue
+    }
+    for pr of unwrap(def).policies {
+      if (hasName(seen, pr.name)) {
+        continue
+      }
+      seen = append(seen, pr.name)
+      let got = pr.run(s)
+      if (!got.ok) {
+        out.skipped = append(
+          out.skipped,
+          "policy ${pr.name} (role ${name}) is for another subject class",
+        )
+        continue
+      }
+      for r of got.rules {
+        out.rules = append(out.rules, r)
+      }
+    }
+  }
+  return out
+}
