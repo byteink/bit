@@ -740,6 +740,11 @@ fn retire(c: Client, sent: int): bool {
 }
 ```
 
+### `Limits`
+
+The caps `Client.limits()` returns: `rcptMax` and `mailMax`, both `int`, each 0
+when the server did not advertise it.
+
 ### `Client.isSecure(): bool`
 
 Whether this connection is TLS - an implicit-TLS dial, or a completed
