@@ -72,10 +72,8 @@
 //          1e1: 48 89 e5              movq  %rsp, %rbp
 //          1e4: 48 89 f8              movq  %rdi, %rax
 //          1e7: 48 89 f1              movq  %rsi, %rcx
-//          1ea: 48 89 c2              movq  %rax, %rdx
-//          1ed: 48 83 c2 05           addq  $0x5, %rdx
-//          1f1: 48 89 c8              movq  %rcx, %rax
-//          1f4: 48 83 c0 05           addq  $0x5, %rax
+//          1ea: 48 8d 90 05 00 00 00  leaq  0x5(%rax), %rdx
+//          1f1: 48 8d 81 05 00 00 00  leaq  0x5(%rcx), %rax
 //          1f8: 48 89 d1              movq  %rdx, %rcx
 //          1fb: 48 0f af c8           imulq %rax, %rcx
 //          1ff: 48 89 c8              movq  %rcx, %rax
@@ -83,8 +81,13 @@
 //          203: c3                    retq
 //     nm -n f.o | grep -E ' (twoFolds|main)$'   ->   0x1e0, 0x220  (36 bytes)
 //
-// giving 0 `movq $0x5, %r64`, 2 `addq $0x5, %r64` and 36 bytes of code over that
-// range (42 until #5933 gave a sign-extended imm8 add/sub/cmp the 4-byte
+// giving 0 `movq $0x5, %r64`, 2 folds of 5 (each a `leaq 0x5(%src), %dst`) and
+// 36 bytes of code over that range. What moved at #6850/#7187: an `x + k` whose
+// result goes to a DIFFERENT register than `x` is one `leaq k(%src), %dst`
+// instead of `movq %src, %dst; addq $k, %dst`, so the two `movq; addq` pairs
+// became two 7-byte leas (the disp is still a disp32: 7 + 7 = 3 + 4 + 3 + 4,
+// which is why the size did not change). The literal still never reaches a
+// register: the 5 rides in the instruction either way. (42 until #5933 gave a sign-extended imm8 add/sub/cmp the 4-byte
 // `REX.W 83 /digit ib` form in place of the 7-byte `REX.W 81 /digit id`; 44 with
 // a `pushq %rbx`/`popq %rbx` pair until #6839 stopped a folded constant from
 // holding a register, which freed caller-saved %rdx for the first sum). Since
@@ -101,9 +104,12 @@
 // immediate), `REX.W 81 /0 id` (7 bytes, group 1's ADD with a 32-bit
 // immediate) and `REX.W 83 /0 ib` (4 bytes, the same ADD with a sign-extended
 // 8-bit immediate, which is what #5933 emits for -128..127), each with
-// `mod == 11` and reg field `000`. Either ADD width counts as the fold: the
-// property is that the literal rode in an immediate, and the atom size pins
-// which encoding the compiler chose. The scan is over every byte offset, which
+// `mod == 11` and reg field `000`; and, since #6850, `REX.W 8D /r` (LEA) with
+// a displacement of 5, as `mod == 01` + disp8 (4 bytes) or `mod == 10` + disp32
+// (7 bytes), the base register being any but the SIB-escape `rm == 100`. Any of
+// those counts as the fold: the property is that the literal rode in an
+// immediate or displacement, and the atom size pins which encoding the
+// compiler chose. The scan is over every byte offset, which
 // is why the atom size is pinned beside the counts: a pattern count alone could
 // not tell 2 real `addq`s from 2 bytes that happened to spell one. The
 // materialization query is not one that can only answer zero — the same
@@ -141,10 +147,10 @@ const wantInsts: int = 5
 const wantAdds: int = 2
 const wantMovs: int = 0
 
-// The x86-64 half, derived by objdump at the #4674 commit and re-derived after #6839 and #5933 — same header.
+// The x86-64 half, derived by objdump at the #4674 commit and re-derived after #6839, #5933 and #6850 — same header.
 const wantXBytes: int = 36
 const wantXAtom: int = 64
-const wantXAdds: int = 2
+const wantXFolds: int = 2
 const wantXMovs: int = 0
 
 // What the fixture prints: (3 + 5) * (4 + 5).
@@ -188,7 +194,7 @@ fn isMovImm(w: int, imm: int): bool {
 }
 
 // ---------------------------------------------------------------------------
-// x86-64 decode — three encodings, matched by pattern
+// x86-64 decode — five encodings, matched by pattern
 // ---------------------------------------------------------------------------
 
 // A REX prefix with W set: 0x48-0x4f. R/X/B vary with which registers the
@@ -233,26 +239,46 @@ fn isXAddImm8(b: []u8, off: int): bool {
     int(b[off + 3]) == foldedImm
 }
 
-class XCounts { movs: int, adds: int }
+// `REX.W 8D /r` with `mod == 01` at `off` — `leaq disp8(%base), %r64`, the
+// fold of `x + k` into a different register (#6850) with an 8-bit displacement.
+// `rm == 100` is the SIB escape, so it is not a plain base and not read here.
+fn isXLeaDisp8(b: []u8, off: int): bool {
+  let m = int(b[off + 2])
+  return isRexW(int(b[off])) &&
+    int(b[off + 1]) == 0x8d &&
+    (m & 0xc0) == 0x40 &&
+    (m & 7) != 4 &&
+    int(b[off + 3]) == foldedImm
+}
 
-// Both patterns of `foldedImm` over `[start, start + n)`. Every offset is tried:
-// see the header for why a pattern scan is what this is, and why the atom size
-// is pinned beside its result. The 4-byte form must fit (`n - 4`); the 7-byte
+// `REX.W 8D /r` with `mod == 10` at `off` — the same LEA with a 32-bit
+// displacement, which is what the compiler emits today (see the header).
+fn isXLeaDisp32(b: []u8, off: int): bool {
+  let m = int(b[off + 2])
+  return isRexW(int(b[off])) && int(b[off + 1]) == 0x8d && (m & 0xc0) == 0x80 && (m & 7) != 4
+}
+
+class XCounts { movs: int, folds: int }
+
+// Both forms of the fold of `foldedImm` — addq and leaq — and the `movq`
+// materialization over `[start, start + n)`. Every offset is tried: see the
+// header for why a pattern scan is what this is, and why the atom size is
+// pinned beside its result. The 4-byte forms must fit (`n - 4`); the 7-byte
 // forms are tried only where they do too.
 fn countXPatterns(b: []u8, start: int, n: int): XCounts {
-  let c = XCounts{ movs = 0, adds = 0 }
+  let c = XCounts{ movs = 0, folds = 0 }
   let i = 0
   while (i + 4 <= n) {
     let o = start + i
-    if (isXAddImm8(b, o)) {
-      c.adds = c.adds + 1
+    if (isXAddImm8(b, o) || isXLeaDisp8(b, o)) {
+      c.folds = c.folds + 1
     }
     if (i + 7 <= n && imm32At(b, o + 3) == foldedImm) {
       if (isXMovImm(b, o)) {
         c.movs = c.movs + 1
       }
-      if (isXAddImm32(b, o)) {
-        c.adds = c.adds + 1
+      if (isXAddImm32(b, o) || isXLeaDisp32(b, o)) {
+        c.folds = c.folds + 1
       }
     }
     i = i + 1
@@ -500,8 +526,8 @@ fn checkTextX64(t: Tally, c: Cfg, src: string) {
   let base = img.obj.secs[a.sect].off + a.start
   let n = countXPatterns(img.bytes, base, a.size)
   check(
-    t, n.adds == wantXAdds,
-    "${fnSymElf} folds $${foldedImm} into ${wantXAdds} addq immediates, saw ${n.adds}",
+    t, n.folds == wantXFolds,
+    "${fnSymElf} folds $${foldedImm} into ${wantXFolds} addq/leaq immediates, saw ${n.folds}",
   )
   check(
     t, n.movs == wantXMovs,
