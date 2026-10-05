@@ -1,0 +1,394 @@
+// compiler/optselect.bit: a value-context `a || b` / `a && b` whose right
+// operand is a few pure compares is computed without a branch (#6056). Same
+// module as opt.bit; `optimizeModule` runs `selectShortCircuits` after the
+// inliner, so a spliced predicate's compares are visible to it, and after
+// `threadJoins`, which serves the joins a `br` tests better than a `bor` would.
+//
+// ## The shape
+//
+// `lowerShortCircuit` (lowercond.bit) lowers `a || b` to a diamond whose join
+// parameter is the result (`a && b` swaps the arms of the `br`):
+//
+//   A:     ...; br %a, J(%a), R()
+//   R:     <pure, non-trapping>; jump J(%b)
+//   J(%p): ...
+//
+// A evaluates R's body itself and passes `bor %a, %b` (`band` for `&&`) to J.
+// R is gone, and J, now entered from A alone, is appended to A together with
+// any single-predecessor `jump` chain after it, so a chain of such operands
+// becomes one block. Rounds repeat until no diamond is left: an inner
+// operand's diamond collapses first, which is what makes the outer R one block.
+//
+// ## Why it is sound
+//
+// R has A as its only predecessor and jumps only to J, so dropping the branch
+// changes which instructions run, never what a value is. On the arm where `%a`
+// decided, J received `%a` itself, and `%a | %b` (`%a & %b`) equals `%a` there;
+// on R's arm it equals `%b`. Every other argument must be the same value on
+// both edges. Running R's body when `%a` decided is safe only because every
+// instruction in it is `speculatable`: constants, integer compares and bitwise
+// ops, none of which loads, stores, calls, traps or polls. A right operand that
+// indexes (`i < len(s) && s[i] == c`) carries a bounds check, so its R branches
+// to a panic block and is never taken.
+//
+// Only forward edges are touched (A before R before J in the block schedule),
+// so no loop header, back edge or back-edge safepoint moves.
+
+// R's non-constant instructions above which it stays a branch: they run on
+// the path where `%a` already decided. 4 admits a two-sided range test
+// (`c >= lo && c <= hi`: two compares and a `band`) and one operand more.
+fn maxSelectInsts(): int {
+  return 4
+}
+
+// The ops R may hold: no memory, no call, no trap, no safepoint.
+fn speculatable(op: Op): bool {
+  let o = int(op)
+  if (o >= int(Op.ICmpEq) && o <= int(Op.ICmpUge)) {
+    return true
+  }
+  return op == Op.ConstInt || op == Op.ConstBool || op == Op.BAnd || op == Op.BOr || op == Op.BXor
+}
+
+// One round's decisions, indexed by the block they are made at. `r[a]` is the
+// R block A absorbs (-1 none), `j[a]` its join, `isOr[a]` the operator.
+// `next[c]` is the block appended after block `c`'s body (-1 none), and
+// `absorbed` marks every block emitted inside another.
+class SelectPlan {
+  r: []int,
+  j: []int,
+  isOr: []bool,
+  next: []int,
+  absorbed: []bool,
+  count: int,
+}
+
+class SelectFacts {
+  pos: []int,
+  predStart: []int,
+}
+
+fn selectFactsOf(f: IrFunc): SelectFacts {
+  let order = blockEmissionOrder(f)
+  let pos = []int(len(f.blocks))
+  let k = 0
+  while (k < len(order)) {
+    pos[order[k]] = k
+    k = k + 1
+  }
+  return SelectFacts{ pos = pos, predStart = licmPredStarts(f) }
+}
+
+fn selectPreds(sf: SelectFacts, b: int): int {
+  return sf.predStart[b + 1] - sf.predStart[b]
+}
+
+// Index of block `bi`'s terminator, or -1 when it has none.
+fn termIdx(f: IrFunc, bi: int): int {
+  let blk = f.blocks[bi]
+  if (blk.instsLen <= blk.paramCount) {
+    return -1
+  }
+  let t = blk.instsStart + blk.instsLen - 1
+  if (!opIsTerminator(f.instrs[t].op)) {
+    return -1
+  }
+  return t
+}
+
+// Whether R's body may run unconditionally: speculatable, and small.
+fn bodySpeculatable(f: IrFunc, r: int): bool {
+  let blk = f.blocks[r]
+  let n = 0
+  let i = blk.instsStart + blk.paramCount
+  while (i < blk.instsStart + blk.instsLen - 1) {
+    let op = f.instrs[i].op
+    if (!speculatable(op)) {
+      return false
+    }
+    if (op != Op.ConstInt && op != Op.ConstBool) {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n <= maxSelectInsts()
+}
+
+// Whether A's arm into `r` is an R that ends in `jump j`.
+fn selectArm(f: IrFunc, sf: SelectFacts, a: int, r: int, j: int): bool {
+  if (r == a || j == a || r == j) {
+    return false
+  }
+  if (sf.pos[a] >= sf.pos[r] || sf.pos[r] >= sf.pos[j]) {
+    return false
+  }
+  if (selectPreds(sf, r) != 1 || f.blocks[r].paramCount != 0) {
+    return false
+  }
+  return jumpsTo(f, r, j) && bodySpeculatable(f, r)
+}
+
+// Whether block `r` ends in `jump j`.
+fn jumpsTo(f: IrFunc, r: int, j: int): bool {
+  let t = termIdx(f, r)
+  return t >= 0 && f.instrs[t].op == Op.Jump && f.instrs[t].ival == j
+}
+
+// Whether every J argument is the same value on both edges, or is the
+// condition on A's edge.
+fn argsSelectable(jargs: []int, rargs: []int, cond: int): bool {
+  if (len(jargs) != len(rargs)) {
+    return false
+  }
+  let k = 0
+  while (k < len(jargs)) {
+    if (jargs[k] != rargs[k] && jargs[k] != cond) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+// R's `jump` arguments.
+fn rJumpArgs(f: IrFunc, r: int): []int {
+  return f.instrs[termIdx(f, r)].args
+}
+
+// The R block A's `br` may absorb (-1 none); `||` when R is the else arm.
+fn selectAt(f: IrFunc, sf: SelectFacts, a: int): (int, bool) {
+  let t = termIdx(f, a)
+  if (t < 0 || f.instrs[t].op != Op.Br) {
+    return (-1, false)
+  }
+  let br = f.instrs[t]
+  if (len(br.thenArgs) == 0 && selectArm(f, sf, a, br.ival, br.ival2)) {
+    if (argsSelectable(br.elseArgs, rJumpArgs(f, br.ival), br.lhs)) {
+      return (br.ival, false)
+    }
+  }
+  if (len(br.elseArgs) == 0 && selectArm(f, sf, a, br.ival2, br.ival)) {
+    if (argsSelectable(br.thenArgs, rJumpArgs(f, br.ival2), br.lhs)) {
+      return (br.ival2, true)
+    }
+  }
+  return (-1, false)
+}
+
+fn newSelectPlan(n: int): SelectPlan {
+  let p = SelectPlan{
+    r = []int(n), j = []int(n), isOr = []bool(n), next = []int(n),
+    absorbed = []bool(n), count = 0,
+  }
+  let i = 0
+  while (i < n) {
+    p.r[i] = -1
+    p.j[i] = -1
+    p.next[i] = -1
+    i = i + 1
+  }
+  return p
+}
+
+// The block a chain at `c` continues into after a diamond or inside a chain
+// (`chained`), or -1. J joins when A and R were its only predecessors; any
+// later block when it is a forward `jump`'s sole target.
+fn chainNext(f: IrFunc, sf: SelectFacts, p: SelectPlan, c: int, chained: bool): int {
+  if (p.r[c] >= 0) {
+    if (selectPreds(sf, p.j[c]) == 2 && !p.absorbed[p.j[c]]) {
+      return p.j[c]
+    }
+    return -1
+  }
+  let t = termIdx(f, c)
+  if (!chained || t < 0 || f.instrs[t].op != Op.Jump) {
+    return -1
+  }
+  let y = f.instrs[t].ival
+  if (selectPreds(sf, y) != 1 || sf.pos[y] <= sf.pos[c] || p.absorbed[y]) {
+    return -1
+  }
+  return y
+}
+
+// Plans the chain that starts at block `bi`.
+fn planChain(f: IrFunc, sf: SelectFacts, p: SelectPlan, bi: int) {
+  let c = bi
+  let chained = false
+  let steps = 0
+  while (steps < len(f.blocks)) {
+    let (r, isOr) = selectAt(f, sf, c)
+    if (r >= 0) {
+      p.r[c] = r
+      p.j[c] = f.instrs[termIdx(f, r)].ival
+      p.isOr[c] = isOr
+      p.absorbed[r] = true
+      p.count = p.count + 1
+      chained = true
+    }
+    let y = chainNext(f, sf, p, c, chained)
+    if (y < 0) {
+      return
+    }
+    p.next[c] = y
+    p.absorbed[y] = true
+    c = y
+    steps = steps + 1
+  }
+}
+
+fn selectPlanOf(f: IrFunc, sf: SelectFacts): SelectPlan {
+  let p = newSelectPlan(len(f.blocks))
+  let order = blockEmissionOrder(f)
+  let k = 0
+  while (k < len(order)) {
+    if (!p.absorbed[order[k]]) {
+      planChain(f, sf, p, order[k])
+    }
+    k = k + 1
+  }
+  return p
+}
+
+class SelectCtx {
+  b: IrBuilder,
+  f: IrFunc,
+  p: SelectPlan,
+  known: []ConstVal,
+  remap: []int,
+  blockMap: []int,
+}
+
+// Emits instructions `lo..hi` of the old function.
+fn emitRange(sc: SelectCtx, lo: int, hi: int) {
+  let i = lo
+  while (i < hi) {
+    emitTranslated(sc.b, sc.f, sc.known, sc.remap, sc.blockMap, i)
+    i = i + 1
+  }
+}
+
+// R's body in A, then the `bor`/`band` for each argument that differs; returns
+// J's translated arguments.
+fn emitSelect(sc: SelectCtx, a: int): []int {
+  let r = sc.p.r[a]
+  let blk = sc.f.blocks[r]
+  emitRange(sc, blk.instsStart, blk.instsStart + blk.instsLen - 1)
+  let br = sc.f.instrs[termIdx(sc.f, a)]
+  let jargs = br.thenArgs
+  let op = Op.BOr
+  if (!sc.p.isOr[a]) {
+    jargs = br.elseArgs
+    op = Op.BAnd
+  }
+  let rargs = rJumpArgs(sc.f, r)
+  let out = []int(0)
+  let k = 0
+  while (k < len(jargs)) {
+    if (jargs[k] == rargs[k]) {
+      out = append(out, sc.remap[jargs[k]])
+    } else {
+      let n = mkInstr(op, sc.f.instrs[br.lhs].ty)
+      n.lhs = sc.remap[br.lhs]
+      n.rhs = sc.remap[rargs[k]]
+      n.span = br.span
+      out = append(out, builderEmit(sc.b, n))
+    }
+    k = k + 1
+  }
+  return out
+}
+
+// The arguments block `c` passes on into its chain successor.
+fn chainArgs(sc: SelectCtx, c: int): []int {
+  if (sc.p.r[c] >= 0) {
+    return emitSelect(sc, c)
+  }
+  return trList(sc.remap, sc.f.instrs[termIdx(sc.f, c)].args)
+}
+
+// Block `bi`, followed by every block its chain appends.
+fn emitChain(sc: SelectCtx, bi: int) {
+  builderBeginBlock(sc.b, sc.blockMap[bi])
+  let blk = sc.f.blocks[bi]
+  let k = 0
+  while (k < blk.paramCount) {
+    sc.remap[blk.instsStart + k] = builderAddParam(sc.b, sc.f.instrs[blk.instsStart + k].ty)
+    k = k + 1
+  }
+  let c = bi
+  let steps = 0
+  while (steps < len(sc.f.blocks)) {
+    let cb = sc.f.blocks[c]
+    if (sc.p.r[c] < 0 && sc.p.next[c] < 0) {
+      emitRange(sc, cb.instsStart + cb.paramCount, cb.instsStart + cb.instsLen)
+      break
+    }
+    emitRange(sc, cb.instsStart + cb.paramCount, cb.instsStart + cb.instsLen - 1)
+    let args = chainArgs(sc, c)
+    let y = sc.p.next[c]
+    if (y < 0) {
+      let jmp = mkInstr(Op.Jump, sc.f.instrs[termIdx(sc.f, c)].ty)
+      jmp.ival = sc.blockMap[sc.p.j[c]]
+      jmp.args = args
+      jmp.span = sc.f.instrs[termIdx(sc.f, c)].span
+      let _ = builderEmit(sc.b, jmp)
+      break
+    }
+    let yb = sc.f.blocks[y]
+    k = 0
+    while (k < yb.paramCount) {
+      sc.remap[yb.instsStart + k] = args[k]
+      k = k + 1
+    }
+    c = y
+    steps = steps + 1
+  }
+  builderEndBlock(sc.b)
+}
+
+fn selectEmit(f: IrFunc, p: SelectPlan): IrFunc {
+  let order = blockEmissionOrder(f)
+  let b = newBuilder()
+  let blockMap = []int(len(f.blocks))
+  let k = 0
+  while (k < len(order)) {
+    if (!p.absorbed[order[k]]) {
+      blockMap[order[k]] = builderNewBlock(b)
+    }
+    k = k + 1
+  }
+  let known = []ConstVal(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    known = append(known, noConst())
+    i = i + 1
+  }
+  let sc = SelectCtx{
+    b = b, f = f, p = p, known = known, remap = []int(len(f.instrs)), blockMap = blockMap,
+  }
+  k = 0
+  while (k < len(order)) {
+    if (!p.absorbed[order[k]]) {
+      emitChain(sc, order[k])
+    }
+    k = k + 1
+  }
+  return irFuncRebuilt(f, b, trKeepAlive(f.keepAlive, sc.remap))
+}
+
+// Every select-able diamond of `f` collapsed. `f` itself, untouched, when it
+// has none; at most one round per block, since each round removes one.
+fn selectShortCircuits(f: IrFunc): IrFunc {
+  let g = f
+  let round = 0
+  while (round < len(f.blocks)) {
+    let p = selectPlanOf(g, selectFactsOf(g))
+    if (p.count == 0) {
+      return g
+    }
+    g = selectEmit(g, p)
+    round = round + 1
+  }
+  return g
+}
