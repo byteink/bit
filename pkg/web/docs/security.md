@@ -45,6 +45,44 @@ type implementing `SessionStore` directly - a future `SqlStore` or
 tombstone bounded by the same session ttl, so a stale writer can never bring
 a destroyed id back once its tombstone exists.
 
+### Revoking every session of one user
+
+A session is addressable by its id alone, so "log this user out everywhere"
+- after a password reset, or when an identity provider sends a back-channel
+logout - needs a second way in. A session can carry an **index**: `key` to
+`value` pairs, one value per key, set with `session.index(key, value)` and
+written with the session's data in the same `compareAndSet`, so the index
+never disagrees with the data and costs no extra store round trip.
+`destroyIndexed(key, value, except, tombstoneTtl)` then destroys every live
+session holding that pair, leaving the same tombstones `destroy()` does, and
+returns how many it destroyed. `except` is the one session to keep (the
+caller's own), or `""` for none. Namespace the keys (`"auth:sub"`); both the
+key and the value must be non-empty.
+
+```bit
+import { Ctx, Res, SessionStore } from "web"
+
+fn markLogin(c: Ctx, userId: string): ()! {
+  c.session()?.index("auth:sub", userId)
+}
+
+fn logoutOthers(c: Ctx, store: SessionStore, userId: string): Res! {
+  let s = c.session()?
+  let n = store.destroyIndexed("auth:sub", userId, s.id(), 86400)?
+  return c.text("signed out of ${n} other session(s)")
+}
+```
+
+A store you write yourself must maintain what makes this cheap: a secondary
+index on `(key, value)` to session id, replaced in the same transaction (or
+script) as the `compareAndSet` that writes the session - drop the session's
+old pairs, insert the new ones - and emptied when the session expires or is
+destroyed. `load` returns the session's index with its data. `destroyIndexed`
+must cost the number of sessions holding the pair, not a scan of every
+session, and must neither count nor tombstone a session whose ttl has passed.
+`MemoryStore` does this with a reverse map under its one lock, swept and
+bounded together with its entries.
+
 ### Saving is automatic
 
 `session.set()`/`delete()`/`regenerate()` only change this request's own

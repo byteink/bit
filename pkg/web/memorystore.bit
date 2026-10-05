@@ -61,8 +61,14 @@ const memoryStoreCapMessage = "web: MemoryStore(maxEntries): the cap must be " +
 // what stops a stale writer from resurrecting a destroyed session. A
 // tombstone is bounded the same way a live entry is: it carries its own
 // `expiresAtNs` and is swept and evicted exactly like one.
+//
+// `index` (#6928) is the session's `key` -> `value` index as last written, kept
+// on the entry so that leaving the store by ANY path (overwrite, sweep,
+// eviction, expiry on read, destroy) can take its pairs out of
+// `MemoryStore.byIndex` without scanning it. A tombstone's is empty.
 class MemoryEntry {
   data: map<string, string>,
+  index: map<string, string>,
   expiresAtNs: i64,
   version: i64,
   tombstone: bool,
@@ -70,6 +76,12 @@ class MemoryEntry {
 
 export class MemoryStore {
   entries: map<string, MemoryEntry>
+  // The reverse index (#6928): `indexSlot(key, value)` -> the set of sids whose
+  // entry's index holds that pair. It is only ever changed together with
+  // `entries`, under the same lock, by `putEntry` and `dropEntry`, so it is
+  // swept with expiry and bounded by `maxEntries` like everything else, and
+  // `destroyIndexed` is O(sessions holding the pair), not a scan of `entries`.
+  byIndex: map<string, map<string, bool>>
   // The ceiling on `len(entries)`, from the constructor. No default: how
   // much memory a process may spend on sessions is a fact about a
   // deployment, and a framework that guesses it silently is how a store
@@ -92,6 +104,7 @@ export class MemoryStore {
       panic(memoryStoreCapMessage)
     }
     this.entries = map<string, MemoryEntry>()
+    this.byIndex = map<string, map<string, bool>>()
     this.maxEntries = maxEntries
     this.writesSinceSweep = 0
     this.mu = Mutex()
@@ -102,11 +115,12 @@ export class MemoryStore {
   // the session, not an encoding of absence. A tombstoned id is a miss too —
   // `load` never distinguishes "never written" from "destroyed"; only
   // `compareAndSet` needs to, and only it sees the tombstone.
-  export load(sid: string): Option<(map<string, string>, i64)>! {
+  export load(sid: string): Option<(map<string, string>, i64, map<string, string>)>! {
     return this.loadAt(sid, now().ns)
   }
 
-  // Writes `data` only when `expectedVersion` still matches this id's
+  // Writes `data` and REPLACES the id's index with `index`, in the one
+  // operation, only when `expectedVersion` still matches this id's
   // current version and the id is not tombstoned; returns the new version.
   // Fails with a conflict, naming what changed, otherwise — the caller
   // decides whether to reload and retry, this store never overwrites a
@@ -115,9 +129,11 @@ export class MemoryStore {
     sid: string,
     expectedVersion: i64,
     data: map<string, string>,
+    index: map<string, string>,
     ttl: i64,
   ): i64! {
-    return this.compareAndSetAt(sid, expectedVersion, data, ttl, now().ns)?
+    let nowNs = now().ns
+    return this.compareAndSetAt(sid, expectedVersion, newEntry(data, index, ttl, nowNs), nowNs)?
   }
 
   // Unconditional: tombstones `sid` so no `compareAndSet` holding an older
@@ -127,7 +143,16 @@ export class MemoryStore {
     this.destroyAt(sid, tombstoneTtl, now().ns)
   }
 
-  // `compareAndSet` against a caller-supplied clock, module-private for
+  // Tombstones every live session whose index holds `key` = `value`, except
+  // `except` ("" = none), exactly as `destroy` would, and returns how many.
+  // Fails on an empty `key` or `value`: an empty value would otherwise be a
+  // request to revoke sessions that never set the key.
+  export destroyIndexed(key: string, value: string, except: string, tombstoneTtl: i64): int! {
+    return this.destroyIndexedAt(key, value, except, tombstoneTtl, now().ns)?
+  }
+
+  // `compareAndSet` against a caller-supplied clock (`write` is built by
+  // `newEntry`, which owns the copy of the caller's maps), module-private for
   // `readAt`'s original reason: it is what lets a test drive the sweep and
   // the eviction order deterministically instead of racing the wall clock.
   //
@@ -136,13 +161,7 @@ export class MemoryStore {
   // evicting a live session; the version check runs before the cap is
   // touched at all, so a losing writer never pays for a slot it will not
   // get.
-  compareAndSetAt(
-    sid: string,
-    expectedVersion: i64,
-    data: map<string, string>,
-    ttl: i64,
-    nowNs: i64,
-  ): i64! {
+  compareAndSetAt(sid: string, expectedVersion: i64, write: MemoryEntry, nowNs: i64): i64! {
     this.mu.lock()
     defer this.mu.unlock()
     this.writesSinceSweep = this.writesSinceSweep + 1
@@ -165,17 +184,8 @@ export class MemoryStore {
       this.evictOldestExpiring()
     }
     let newVersion = expectedVersion + 1
-    // The caller's map is copied, not aliased. A store is a persistence
-    // boundary: a real one serialises here, so an in-memory one that kept
-    // handing back the very map a previous request is still mutating would
-    // make `MemoryStore` behave differently from every other implementation
-    // of the interface — the one thing a dev store must not do.
-    this.entries[sid] = MemoryEntry{
-      data = copyData(data),
-      expiresAtNs = nowNs + ttl * nsPerSecond,
-      version = newVersion,
-      tombstone = false,
-    }
+    write.version = newVersion
+    this.putEntry(sid, write)
     return newVersion
   }
 
@@ -194,11 +204,110 @@ export class MemoryStore {
     if (!present && len(this.entries) >= this.maxEntries) {
       this.evictOldestExpiring()
     }
-    this.entries[sid] = MemoryEntry{
-      data = map<string, string>(),
-      expiresAtNs = nowNs + tombstoneTtl * nsPerSecond,
-      version = currentVersion + 1,
-      tombstone = true,
+    this.putEntry(
+      sid,
+      MemoryEntry{
+        data = map<string, string>(),
+        index = map<string, string>(),
+        expiresAtNs = nowNs + tombstoneTtl * nsPerSecond,
+        version = currentVersion + 1,
+        tombstone = true,
+      },
+    )
+  }
+
+  // `destroyIndexed` against a caller-supplied clock, `compareAndSetAt`'s
+  // reason. Walks only the sids in the one `byIndex` slot. An entry whose
+  // ttl has passed is dropped, not tombstoned and not counted: it is already
+  // gone as far as any caller can tell, and a tombstone for it would only
+  // spend a slot. The sids are copied out first because `putEntry` and
+  // `dropEntry` edit the slot being walked.
+  destroyIndexedAt(
+    key: string,
+    value: string,
+    except: string,
+    tombstoneTtl: i64,
+    nowNs: i64,
+  ): int! {
+    if (len(key) == 0 || len(value) == 0) {
+      fail newError("web: session: destroyIndexed(key, value): both must be non-empty")
+    }
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (slot, found) = this.byIndex[indexSlot(key, value)]
+    if (!found) {
+      return 0
+    }
+    let sids = []string(0)
+    for (sid, _) of slot {
+      sids = append(sids, sid)
+    }
+    let destroyed = 0
+    for sid of sids {
+      let (e, present) = this.entries[sid]
+      if (!present || sid == except) {
+        continue
+      }
+      if (e.expiresAtNs <= nowNs) {
+        this.dropEntry(sid)
+        continue
+      }
+      this.putEntry(
+        sid,
+        MemoryEntry{
+          data = map<string, string>(),
+          index = map<string, string>(),
+          expiresAtNs = nowNs + tombstoneTtl * nsPerSecond,
+          version = e.version + 1,
+          tombstone = true,
+        },
+      )
+      destroyed = destroyed + 1
+    }
+    return destroyed
+  }
+
+  // The one way an entry is written: takes the old entry's index pairs out of
+  // `byIndex`, stores the new entry, puts its pairs in. LOCK HELD by the
+  // caller.
+  putEntry(sid: string, entry: MemoryEntry) {
+    this.unindex(sid)
+    this.entries[sid] = entry
+    for (key, value) of entry.index {
+      let slotKey = indexSlot(key, value)
+      let (slot, found) = this.byIndex[slotKey]
+      if (!found) {
+        slot = map<string, bool>()
+        this.byIndex[slotKey] = slot
+      }
+      slot[sid] = true
+    }
+  }
+
+  // The one way an entry is removed (sweep, eviction, expiry on read).
+  // LOCK HELD by the caller.
+  dropEntry(sid: string) {
+    this.unindex(sid)
+    delete(this.entries, sid)
+  }
+
+  // Removes `sid`'s pairs from `byIndex`, deleting a slot that empties so the
+  // reverse map never outgrows `entries`. LOCK HELD by the caller.
+  unindex(sid: string) {
+    let (old, present) = this.entries[sid]
+    if (!present) {
+      return
+    }
+    for (key, value) of old.index {
+      let slotKey = indexSlot(key, value)
+      let (slot, found) = this.byIndex[slotKey]
+      if (!found) {
+        continue
+      }
+      delete(slot, sid)
+      if (len(slot) == 0) {
+        delete(this.byIndex, slotKey)
+      }
     }
   }
 
@@ -216,7 +325,7 @@ export class MemoryStore {
       }
     }
     for sid of dead {
-      delete(this.entries, sid)
+      this.dropEntry(sid)
     }
   }
 
@@ -243,7 +352,7 @@ export class MemoryStore {
       }
     }
     if (found) {
-      delete(this.entries, victim)
+      this.dropEntry(victim)
     }
   }
 
@@ -263,7 +372,7 @@ export class MemoryStore {
   //
   // Not fallible: an in-memory map cannot fail. `load` is, only because the
   // interface says so for the stores that do I/O.
-  loadAt(sid: string, nowNs: i64): Option<(map<string, string>, i64)> {
+  loadAt(sid: string, nowNs: i64): Option<(map<string, string>, i64, map<string, string>)> {
     this.mu.lock()
     defer this.mu.unlock()
     let (e, ok) = this.entries[sid]
@@ -274,14 +383,42 @@ export class MemoryStore {
     // instant it was written. That is the same rule a positive ttl obeys,
     // one second later, rather than a special case meaning "never expires".
     if (e.expiresAtNs <= nowNs) {
-      delete(this.entries, sid)
+      this.dropEntry(sid)
       return Option.None
     }
     if (e.tombstone) {
       return Option.None
     }
-    return Option.Some((copyData(e.data), e.version))
+    return Option.Some((copyData(e.data), e.version, copyData(e.index)))
   }
+}
+
+// The entry a `compareAndSet` of `data` and `index` with `ttl` at `nowNs`
+// stores, before the store assigns its version. The caller's maps are copied,
+// not aliased. A store is a persistence boundary: a real one serialises here,
+// so an in-memory one that kept handing back the very map a previous request
+// is still mutating would make `MemoryStore` behave differently from every
+// other implementation of the interface — the one thing a dev store must not
+// do.
+fn newEntry(
+  data: map<string, string>,
+  index: map<string, string>,
+  ttl: i64,
+  nowNs: i64,
+): MemoryEntry {
+  return MemoryEntry{
+    data = copyData(data),
+    index = copyData(index),
+    expiresAtNs = nowNs + ttl * nsPerSecond,
+    version = 0,
+    tombstone = false,
+  }
+}
+
+// The `byIndex` slot for one (key, value) pair. The key's length leads so two
+// different pairs can never spell the same slot, whatever bytes either holds.
+fn indexSlot(key: string, value: string): string {
+  return "${len(key)}:${key}${value}"
 }
 
 // An independent copy of `m`. Maps are reference types (SPEC §13.3), so
