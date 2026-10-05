@@ -1,0 +1,179 @@
+// x86-64 hardware GHASH via PCLMULQDQ (#7385): the x86-64 half of the two
+// pins `armghash.bit` exports, `bit_rt_ghash_hw_blocks` and
+// `bit_rt_ghash_hw_mul`, which route here when `onX64()`. Same contract as
+// the arm64 path: state = (state XOR block) * H once per 16-byte block, in
+// GF(2^128) under GCM's bit order (NIST SP 800-38D §6.3), checked against the
+// constant-time software path in `stdlib/crypto/gcm.bit` by the cryptogcm
+// differential.
+//
+// THE ALGORITHM is Intel's "Carry-Less Multiplication and Its Usage for
+// Computing the GCM Mode" (Gueron and Kounavis): PSHUFB byte-reverses each
+// block, which makes the register the bit-reflected field element; one
+// Karatsuba multiply (three PCLMULQDQ: lo, hi, and (a0^a1)(b0^b1)) gives the
+// 256-bit product; it is shifted left one bit, because the product of two
+// reflected 128-bit values is reflected over 255 bits; and it is reduced
+// modulo x^128 + x^7 + x^2 + x + 1 by the paper's shift-and-xor reduction:
+// A,B,C = X0<<63, X0<<62, X0<<57, D = X1^A^B^C, then [D:X0] >> 1, 2 and 7
+// folded into the high half. Every step is data-independent: no branch and
+// no memory index depends on H or the data.
+//
+// DETECTION. `x64ClmulCaps` reads CPUID leaf 1 ECX for PCLMULQDQ (bit 1) and
+// SSSE3 (bit 9, for PSHUFB) and answers bit 1 of the `bit_rt_crypto_hwcaps`
+// mask, which `runtime/cryptohw/{linux,windows}/cryptohw.bit` report on
+// x86-64. Bits 0 (AES) and 2 (SHA2) stay clear there: they name the ARMv8
+// primitives `armaes.bit` and `armsha256.bit` run, which have no x86-64 arm.
+//
+// REGISTERS. Only xmm0..xmm5 are used: Win64 preserves xmm6..xmm15 across a
+// call, SysV preserves none, and one x64 payload serves both. `clobber` has no
+// spelling for a vector register, so the block also names r9 (caller-saved,
+// and the scratch it builds the PSHUFB mask in), which makes it a clobber
+// point that keeps every live value, a float included, out of the
+// caller-saved file (SPEC §11.6).
+//
+// ENCODING PROVENANCE. No text assembler exists in this compiler (SPEC
+// §11.6): every byte below was assembled from the mnemonic in its comment
+// with this Mac's toolchain (`clang -c -arch x86_64`) and read back with
+// `objdump -d`. The payload holds no `E8` byte and no `FF` whose ModRM reg
+// field is 2 or 3, so SPEC §11.6's call decoder reads none of it as a call.
+// The loop's back edge is a hand-computed rel32, as SPEC §11.6 allows.
+//
+// CHUNKED FOR THE COLLECTOR. The block is opaque and holds no safepoint, so
+// one call folds at most `ghashX64Chunk` blocks (64 KiB) and a large buffer
+// still reaches the Bit loop's back edge, and its safepoint, every few
+// microseconds.
+
+const ghashX64Chunk: int = 4096
+
+// CPUID leaf 1 ECX bits: PCLMULQDQ and SSSE3.
+const cpuidPclmul: u64 = 2
+const cpuidSsse3: u64 = 512
+
+// Bit 1 (carry-less multiply) of the `bit_rt_crypto_hwcaps` mask when this
+// x86-64 CPU has PCLMULQDQ and SSSE3, else 0. Called only on x86-64.
+export @symbol("bit_rt_crypto_x64_clmul_caps") fn x64ClmulCaps(): uint {
+  let want = cpuidPclmul | cpuidSsse3
+  if ((x64CpuidLeaf1Ecx() & want) != want) {
+    return 0
+  }
+  return 2
+}
+
+// CPUID leaf 1, sub-leaf 0, ECX. The arm64 arm is a placeholder that no
+// caller reaches.
+fn x64CpuidLeaf1Ecx(): u64 {
+  return asm {
+    arm64 { 0xD2800000 } // mov x0, #0
+    x64 { 0x0F, 0xA2 }   // cpuid
+    result arm64 x0 x64 rcx : u64
+    input arm64 x0 x64 rax = 1
+    input arm64 x1 x64 rcx = 0
+    clobber x64 { rbx, rdx }
+  }
+}
+
+// Fold `blocks` (> 0, <= ghashX64Chunk) 16-byte blocks at `data` into the
+// 16-byte GHASH state at `state`, under the subkey at `h`. The arm64 arm is a
+// trap: `rtGhashHwBlocks` only routes here when `onX64()`.
+fn x64GhashRun(h: int, state: int, data: int, blocks: int) {
+  asm volatile {
+    arm64 { 0xD4200000 } // brk #0
+    x64 {
+      0x49, 0xB9, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, // movabs r9, 0x8090a0b0c0d0e0f
+      0x66, 0x49, 0x0F, 0x6E, 0xE9,                               // movq xmm5, r9
+      0x49, 0xB9, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, // movabs r9, 0x1020304050607
+      0x66, 0x49, 0x0F, 0x6E, 0xD9,                               // movq xmm3, r9
+      0x66, 0x0F, 0x6C, 0xEB,                                     // punpcklqdq xmm5, xmm3
+      0xF3, 0x0F, 0x6F, 0x20,                                     // movdqu xmm4, [rax]
+      0x66, 0x0F, 0x38, 0x00, 0xE5,                               // pshufb xmm4, xmm5
+      0xF3, 0x0F, 0x6F, 0x01,                                     // movdqu xmm0, [rcx]
+      0x66, 0x0F, 0x38, 0x00, 0xC5,                               // pshufb xmm0, xmm5
+      0xF3, 0x0F, 0x6F, 0x0A,                                     // loop: movdqu xmm1, [rdx]
+      0x66, 0x0F, 0x38, 0x00, 0xCD,                               // pshufb xmm1, xmm5
+      0x66, 0x0F, 0xEF, 0xC1,                                     // pxor xmm0, xmm1
+      0x66, 0x0F, 0x6F, 0xC8, 0x66, 0x0F, 0x3A, 0x44, 0xCC, 0x00, // movdqa xmm1, xmm0; pclmulqdq xmm1, xmm4, 0x0
+      0x66, 0x0F, 0x6F, 0xD0, 0x66, 0x0F, 0x3A, 0x44, 0xD4, 0x11, // movdqa xmm2, xmm0; pclmulqdq xmm2, xmm4, 0x11
+      0x66, 0x0F, 0x70, 0xD8, 0x4E,                               // pshufd xmm3, xmm0, 0x4e
+      0x66, 0x0F, 0xEF, 0xD8,                                     // pxor xmm3, xmm0
+      0x66, 0x0F, 0x70, 0xC4, 0x4E,                               // pshufd xmm0, xmm4, 0x4e
+      0x66, 0x0F, 0xEF, 0xC4,                                     // pxor xmm0, xmm4
+      0x66, 0x0F, 0x3A, 0x44, 0xD8, 0x00,                         // pclmulqdq xmm3, xmm0, 0x0
+      0x66, 0x0F, 0xEF, 0xD9,                                     // pxor xmm3, xmm1
+      0x66, 0x0F, 0xEF, 0xDA,                                     // pxor xmm3, xmm2
+      0x66, 0x0F, 0x6F, 0xC3, 0x66, 0x0F, 0x73, 0xF8, 0x08,       // movdqa xmm0, xmm3; pslldq xmm0, 0x8
+      0x66, 0x0F, 0xEF, 0xC8,                                     // pxor xmm1, xmm0
+      0x66, 0x0F, 0x73, 0xDB, 0x08,                               // psrldq xmm3, 0x8
+      0x66, 0x0F, 0xEF, 0xD3,                                     // pxor xmm2, xmm3
+      0x66, 0x0F, 0x6F, 0xC1, 0x66, 0x0F, 0x73, 0xD0, 0x3F,       // movdqa xmm0, xmm1; psrlq xmm0, 0x3f
+      0x66, 0x0F, 0x6F, 0xDA, 0x66, 0x0F, 0x73, 0xD3, 0x3F,       // movdqa xmm3, xmm2; psrlq xmm3, 0x3f
+      0x66, 0x0F, 0x73, 0xF1, 0x01,                               // psllq xmm1, 0x1
+      0x66, 0x0F, 0x73, 0xF2, 0x01,                               // psllq xmm2, 0x1
+      0x66, 0x0F, 0x73, 0xFB, 0x08,                               // pslldq xmm3, 0x8
+      0x66, 0x0F, 0xEB, 0xD3,                                     // por xmm2, xmm3
+      0x66, 0x0F, 0x6F, 0xD8, 0x66, 0x0F, 0x73, 0xDB, 0x08,       // movdqa xmm3, xmm0; psrldq xmm3, 0x8
+      0x66, 0x0F, 0xEB, 0xD3,                                     // por xmm2, xmm3
+      0x66, 0x0F, 0x73, 0xF8, 0x08,                               // pslldq xmm0, 0x8
+      0x66, 0x0F, 0xEB, 0xC8,                                     // por xmm1, xmm0
+      0x66, 0x0F, 0x6F, 0xC1, 0x66, 0x0F, 0x73, 0xF0, 0x3F,       // movdqa xmm0, xmm1; psllq xmm0, 0x3f
+      0x66, 0x0F, 0x6F, 0xD9, 0x66, 0x0F, 0x73, 0xF3, 0x3E,       // movdqa xmm3, xmm1; psllq xmm3, 0x3e
+      0x66, 0x0F, 0xEF, 0xC3,                                     // pxor xmm0, xmm3
+      0x66, 0x0F, 0x6F, 0xD9, 0x66, 0x0F, 0x73, 0xF3, 0x39,       // movdqa xmm3, xmm1; psllq xmm3, 0x39
+      0x66, 0x0F, 0xEF, 0xC3,                                     // pxor xmm0, xmm3
+      0x66, 0x0F, 0x73, 0xF8, 0x08,                               // pslldq xmm0, 0x8
+      0x66, 0x0F, 0xEF, 0xC8,                                     // pxor xmm1, xmm0
+      0x66, 0x0F, 0x6F, 0xC1, 0x66, 0x0F, 0x73, 0xD0, 0x01,       // movdqa xmm0, xmm1; psrlq xmm0, 0x1
+      0x66, 0x0F, 0x6F, 0xD9, 0x66, 0x0F, 0x73, 0xD3, 0x02,       // movdqa xmm3, xmm1; psrlq xmm3, 0x2
+      0x66, 0x0F, 0xEF, 0xC3,                                     // pxor xmm0, xmm3
+      0x66, 0x0F, 0x6F, 0xD9, 0x66, 0x0F, 0x73, 0xD3, 0x07,       // movdqa xmm3, xmm1; psrlq xmm3, 0x7
+      0x66, 0x0F, 0xEF, 0xC3,                                     // pxor xmm0, xmm3
+      0x66, 0x0F, 0xEF, 0xD0,                                     // pxor xmm2, xmm0
+      0x66, 0x0F, 0x6F, 0xC1, 0x66, 0x0F, 0x73, 0xF0, 0x3F,       // movdqa xmm0, xmm1; psllq xmm0, 0x3f
+      0x66, 0x0F, 0x6F, 0xD9, 0x66, 0x0F, 0x73, 0xF3, 0x3E,       // movdqa xmm3, xmm1; psllq xmm3, 0x3e
+      0x66, 0x0F, 0xEF, 0xC3,                                     // pxor xmm0, xmm3
+      0x66, 0x0F, 0x6F, 0xD9, 0x66, 0x0F, 0x73, 0xF3, 0x39,       // movdqa xmm3, xmm1; psllq xmm3, 0x39
+      0x66, 0x0F, 0xEF, 0xC3,                                     // pxor xmm0, xmm3
+      0x66, 0x0F, 0x73, 0xD8, 0x08,                               // psrldq xmm0, 0x8
+      0x66, 0x0F, 0xEF, 0xD0,                                     // pxor xmm2, xmm0
+      0x66, 0x0F, 0xEF, 0xD1,                                     // pxor xmm2, xmm1
+      0x66, 0x0F, 0x6F, 0xC2, 0x48, 0x83, 0xC2, 0x10,             // movdqa xmm0, xmm2; add rdx, 0x10
+      0x49, 0xFF, 0xC8,                                           // dec r8
+      0x0F, 0x85, 0xDA, 0xFE, 0xFF, 0xFF,                         // jne loop (rel32 -294, back to the movdqu xmm1 above)
+      0x66, 0x0F, 0x38, 0x00, 0xC5,                               // pshufb xmm0, xmm5
+      0xF3, 0x0F, 0x7F, 0x01,                                     // movdqu [rcx], xmm0
+    }
+    input arm64 x0 x64 rax = h
+    input arm64 x1 x64 rcx = state
+    input arm64 x2 x64 rdx = data
+    input arm64 x3 x64 r8 = blocks
+    clobber arm64 { memory }
+    clobber x64 { r9, memory }
+  }
+}
+
+// `state` = GHASH fold of `blocks` 16-byte blocks at `data` under H at `h`,
+// at most `ghashX64Chunk` blocks per opaque asm call.
+fn x64GhashBlocks(h: int, state: int, data: int, blocks: u64) {
+  let left = int(blocks)
+  let p = data
+  while (left > 0) {
+    let n = left
+    if (n > ghashX64Chunk) {
+      n = ghashX64Chunk
+    }
+    x64GhashRun(h, state, p, n)
+    p = p + n * 16
+    left = left - n
+  }
+}
+
+// `out` = H*X for H at `h`, X at `x`: one fold of X into a zero state, so
+// `out` may alias `h` or `x`; both are read before `out` is written.
+fn x64GhashMul(h: int, x: int, out: int) {
+  let acc = []byte(16)
+  let accAddr = int(ptrOf(acc))
+  x64GhashRun(h, accAddr, x, 1)
+  let i = 0
+  while (i < 16) {
+    *ghashByteAt(out + i) = acc[i]
+    i = i + 1
+  }
+}

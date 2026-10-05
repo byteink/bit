@@ -3035,6 +3035,7 @@ defined exactly once).
 | `bit_rt_crypto_ghash_mul_hw` | `(acc0, acc1, b0, b1, h0, h1: u64, outHi: *u64) -> u64` (§21b) |
 | `bit_rt_crypto_sha256_compress_hw` | `(state: *u32, block: *byte) -> void` (§21b) |
 | `bit_rt_crypto_hwcaps` | `() -> u64` (§21c) |
+| `bit_rt_crypto_x64_clmul_caps` | `() -> u64` (§21c, x86-64 CPUID: 2 when PCLMULQDQ and SSSE3, else 0) |
 | `bit_rt_aes_hw_expand_key` | `(key: i64, keyBits: i64, roundKeys: i64) -> void` (§21d) |
 | `bit_rt_aes_hw_encrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
 | `bit_rt_aes_hw_decrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
@@ -4740,11 +4741,13 @@ because each side calls something the other cannot even compile (§19's
   1 — `hw.optional.arm.FEAT_AES`, `hw.optional.arm.FEAT_PMULL`,
   `hw.optional.arm.FEAT_SHA256`, `hw.optional.arm.FEAT_CRC32`.
 - **x86_64-linux** (shares the `linux` archive member with aarch64-linux —
-  `scripts/g2archive.sh`'s target->PLAT mapping) **and every other target**:
-  always 0. An x86-64 `AT_HWCAP` value has no relationship to ARM crypto
+  `scripts/g2archive.sh`'s target->PLAT mapping) **and x86_64-windows**: bit 1
+  only, from `bit_rt_crypto_x64_clmul_caps()` (`runtime/cryptohw/x64ghash.bit`,
+  CPUID leaf 1 ECX: PCLMULQDQ and SSSE3), which §21e's pins run as PCLMULQDQ
+  (#7385). An x86-64 `AT_HWCAP` value has no relationship to ARM crypto
   extensions, so the linux provider gates on `onX64()` (`runtime/syscalls`)
-  before reading it at all, rather than testing bits that would coincidentally
-  sometimes be set.
+  before reading it at all; bits 0, 2 and 3 stay clear there because they
+  name ARMv8 primitives with no x86-64 arm.
 
 **Computed once, cached in a module-level variable** in whichever OS provider
 is actually linked — a fresh process reads its `AT_HWCAP` word or its three
@@ -4833,11 +4836,12 @@ same recurrence `stdlib/crypto/gcm.bit`'s software `gcmAbsorb` does: `state =
 (state XOR block) * H`, once per block, in order.
 
 **PLATFORM-FREE**, same reasoning as §21d's AES pins — one source file per
-TARGET, every exported function starts `if (onX64())` and panics if reached
-there rather than silently returning (same reasoning as §21d), and
-every exported function also calls `ghashRequireHwSupport` (bit 1, PMULL, of
-`bit_rt_crypto_hwcaps()`) before issuing PMULL/PMULL2, for the same "optional
-extension, SIGILL otherwise" reason §21d documents for AES.
+TARGET. On x86-64 both pins route to `runtime/cryptohw/x64ghash.bit`, the same
+recurrence on PCLMULQDQ (Karatsuba product, bit-reflected reduction modulo
+x^128+x^7+x^2+x+1, #7385). Every exported function first calls
+`ghashRequireHwSupport` (bit 1, carry-less multiply, of
+`bit_rt_crypto_hwcaps()`) before issuing PMULL or PCLMULQDQ, for the same
+"optional extension, SIGILL otherwise" reason §21d documents for AES.
 
 **NO CALLER YET**, same as §21d — these pins exist for later work to wire
 `stdlib/crypto/gcm.bit` through.
