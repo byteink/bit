@@ -7,3 +7,4 @@
 | [Resources](resources.md) | Registering `@table` classes with `resource<T>()`, names from the class, `all`, `resourceRef`, `resourceByName`, `fieldType` |
 | [Conditions](conditions.md) | The `Cond` tree: `eq`, `ne`, `oneOf`, `lt`, `lte`, `gt`, `gte`, `and`, `or`, `not`, `evalCond` and its `Truth` answer, `validate` at startup, `fromWhere`, how NULL and CASL differ |
 | [Relationships](relationships.md) | Tuples such as `user:sara`, `editor`, `folder:launch`: declaring relations with `relation`, `relate`, `unrelate`, `related`, usersets, the `hasRelation` check with `inherit` and its bounds (`RelationLimit`), `RelationStore` and `MemoryRelationStore` |
+| [Policies](policies.md) | `Policy`, `Rules`, `Rule` and `Effect`: `can`, `cannot`, `canAll`, `cannotAll`, `rulesFor`, and `validatePolicy` at startup |
