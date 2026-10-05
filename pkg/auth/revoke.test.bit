@@ -1,0 +1,243 @@
+// pkg/auth/revoke.test.bit — #6953: every way this package signs a user in
+// files the session under `subjectIndexKey`, and `logoutEverywhere` destroys
+// it. One test per login path (password, magic link, OAuth2, OIDC, Apple,
+// bearer through `requireAuth`) over the real `App.handle` seam and a
+// `MemoryStore` the test keeps a handle on, then the call's own contract:
+// other users are left alone, `Keep.Current` spares the caller, an empty
+// subject fails, and `Session.regenerate()` carries the index.
+//
+// `App`, `Config`, `MemoryStore`, `Request`, `Response` and the per-protocol
+// fixtures (`o2App*`, `callbackApp*`, `appleApp*`, `bearerApp*`, `mlApp*`)
+// are bound module-wide by the other test files.
+
+// Two users, one password. `alice` is "u1", `bob` is "u2".
+fn twoUsers(hash: string): Lookup {
+  let l: Lookup = (username) => {
+    if (username == "alice") {
+      return LookupResult{ hash = hash, id = "u1", claims = Json.JsonNull }
+    }
+    if (username == "bob") {
+      return LookupResult{ hash = hash, id = "u2", claims = Json.JsonNull }
+    }
+    fail newError("lookup: user not found")
+  }
+  return l
+}
+
+// `/login` signs in with the password strategy, `/others` is "sign out my
+// other devices" (`Keep.Current`), `/all` is `Keep.Nobody`, `/regen` rotates
+// the session id the way any privilege change does.
+fn revokeApp(store: MemoryStore, hash: string): App {
+  let strategy = PasswordStrategy(twoUsers(hash))
+  let app = App(Config{ secret = "test-secret", sessions = store })
+  app.post("/login", (c) => {
+    let identity = strategy.authenticate(c)?
+    return c.text(identity.id)
+  })
+  app.post("/others", (c) => {
+    let n = logoutEverywhere(store, c.query("sub"), Keep.Current(c))?
+    return c.text("${n}")
+  })
+  app.post("/all", (c) => {
+    let n = logoutEverywhere(store, c.query("sub"))?
+    return c.text("${n}")
+  })
+  app.post("/regen", (c) => {
+    c.session()?.regenerate()?
+    return c.text("ok")
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+fn revokeReq(path: string, cookie: string, body: string): Request {
+  let headers = "Content-Type: application/json"
+  if (cookie != "") {
+    headers = headers + "\r\nCookie: " + cookie
+  }
+  return Request{ method = "POST", path = path, headers = headers, body = body }
+}
+
+// Signs `user` in and returns the session cookie pair ("sid=...").
+fn revokeLogin(app: App, user: string): string {
+  let res = app.handle(
+    revokeReq("/login", "", "{\"username\":\"${user}\",\"password\":\"s3cr3t\"}"),
+  )
+  assert(res.status == 200, "login ${user}: want 200, got ${res.status}")
+  return cookiePair(res.getHeader("Set-Cookie"))
+}
+
+// "sid=abc; Path=/; ..." -> "sid=abc".
+fn cookiePair(setCookie: string): string {
+  assert(len(setCookie) > 0, "the response did not set a session cookie")
+  return split(setCookie, ";")[0]
+}
+
+fn live(store: MemoryStore, pair: string): bool {
+  let found = store.load(pair[4:len(pair)]) catch e {
+    panic("load: ${e.message()}")
+  }
+  return isSome(found)
+}
+
+fn logoutOrPanic(store: MemoryStore, subject: string): int {
+  return logoutEverywhere(store, subject) catch e {
+    panic("logoutEverywhere: ${e.message()}")
+  }
+}
+
+// The login's session is in the store, `logoutEverywhere(subject)` destroys
+// exactly it, and it is gone afterwards.
+fn assertRevoked(store: MemoryStore, setCookie: string, subject: string) {
+  let pair = cookiePair(setCookie)
+  assert(live(store, pair), "the login's session '${pair}' was not stored")
+  let n = logoutOrPanic(store, subject)
+  assert(n == 1, "want 1 session destroyed for '${subject}', got ${n}")
+  assert(!live(store, pair), "the session '${pair}' survived logoutEverywhere")
+}
+
+test "logoutEverywhere destroys all 3 sessions of one user and leaves the other user's" {
+  let store = MemoryStore(1000)
+  let app = revokeApp(store, hashPassword("s3cr3t"))
+  let a1 = revokeLogin(app, "alice")
+  let a2 = revokeLogin(app, "alice")
+  let a3 = revokeLogin(app, "alice")
+  let b1 = revokeLogin(app, "bob")
+
+  let n = logoutOrPanic(store, "u1")
+  assert(n == 3, "want 3 of 3 destroyed, got ${n}")
+  assert(!live(store, a1) && !live(store, a2) && !live(store, a3), "an alice session survived")
+  assert(live(store, b1), "bob's session was destroyed")
+  assert(logoutOrPanic(store, "u1") == 0, "a second call must find nothing")
+}
+
+test "Keep.Current spares the caller's session and destroys the user's others" {
+  let store = MemoryStore(1000)
+  let app = revokeApp(store, hashPassword("s3cr3t"))
+  let phone = revokeLogin(app, "alice")
+  let laptop = revokeLogin(app, "alice")
+
+  let res = app.handle(revokeReq("/others?sub=u1", laptop, ""))
+  assert(res.status == 200 && res.body == "1", "want 1 destroyed, got ${res.status} '${res.body}'")
+  assert(!live(store, phone), "the other device's session survived")
+  assert(live(store, laptop), "the caller's own session was destroyed")
+}
+
+test "Keep.Nobody from a request of the user destroys the caller's session too" {
+  let store = MemoryStore(1000)
+  let app = revokeApp(store, hashPassword("s3cr3t"))
+  let phone = revokeLogin(app, "alice")
+  let laptop = revokeLogin(app, "alice")
+
+  let res = app.handle(revokeReq("/all?sub=u1", laptop, ""))
+  assert(res.status == 200 && res.body == "2", "want 2 destroyed, got ${res.status} '${res.body}'")
+  assert(!live(store, phone) && !live(store, laptop), "a session survived")
+}
+
+test "an empty subject fails loudly" {
+  let store = MemoryStore(1000)
+  let msg = ""
+  logoutEverywhere(store, "") catch e {
+    msg = e.message()
+  }
+  assert(contains(msg, "logoutEverywhere(): subject is empty"), "got '${msg}'")
+}
+
+test "Session.regenerate carries the index: the rotated session is still revoked by subject" {
+  let store = MemoryStore(1000)
+  let app = revokeApp(store, hashPassword("s3cr3t"))
+  let before = revokeLogin(app, "alice")
+
+  let res = app.handle(revokeReq("/regen", before, ""))
+  assert(res.status == 200, "regen: want 200, got ${res.status}")
+  let after = cookiePair(res.getHeader("Set-Cookie"))
+  assert(after != before, "regenerate() did not rotate the session id")
+  assert(live(store, after), "the rotated session was not stored")
+
+  assert(logoutOrPanic(store, "u1") == 1, "the rotated session was not found by subject")
+  assert(!live(store, after), "the rotated session survived logoutEverywhere")
+}
+
+test "bindSession refuses an Identity with no id instead of filing an unrevocable session" {
+  let store = MemoryStore(1000)
+  let nobody: Strategy = EmptyIdStrategy{}
+  let app = App(Config{ secret = "test-secret", sessions = store })
+  app.use(requireAuth([]Strategy{ nobody }))
+  app.get("/x", (c) => c.text("reached"))
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  let res = app.handle(Request{ method = "GET", path = "/x", headers = "", body = "" })
+  assert(res.status == 500, "want 500, got ${res.status}: ${res.body}")
+  assert(res.body != "reached", "the handler ran")
+}
+
+class EmptyIdStrategy {
+  export name(): string {
+    return "empty-id"
+  }
+  export authenticate(c: Ctx): Identity! {
+    return Identity{ id = "", claims = Json.JsonNull }
+  }
+}
+
+test "password login is revoked by logoutEverywhere" {
+  let store = MemoryStore(1000)
+  let app = revokeApp(store, hashPassword("s3cr3t"))
+  let res = app.handle(revokeReq("/login", "", "{\"username\":\"alice\",\"password\":\"s3cr3t\"}"))
+  assertRevoked(store, res.getHeader("Set-Cookie"), "u1")
+}
+
+test "magic link login is revoked by logoutEverywhere" {
+  let w = mlWorld()
+  let store = MemoryStore(1000)
+  let app = mlAppOn(mlStrategy(freshClock(), mlOptions(w)), store)
+  let before = mlCookie(mlAsk(app, "ada@example.com", ""))
+  let res = mlRedeem(app, w.tokens[0], before)
+  assert(res.status == 200, "want 200, got ${res.status}")
+  assertRevoked(store, mlCookie(res), "author-17")
+}
+
+test "OAuth2 login is revoked by logoutEverywhere" {
+  let box = o2Box()
+  let store = MemoryStore(1000)
+  let app = o2AppOn(o2Strategy(box, "sec", o2Opts(box)), store)
+  let b = o2Begin(app)
+  let res = app.handle(o2CallbackReq("/callback", b.cookie, o2Ok(b)))
+  assert(res.status == 200, "want 200, got ${res.status}: ${res.body}")
+  assertRevoked(store, res.getHeader("Set-Cookie"), "octocat")
+}
+
+test "OIDC login is revoked by logoutEverywhere" {
+  let box = newBox()
+  let store = MemoryStore(1000)
+  let app = callbackAppOn(callbackStrategy(), box, store)
+  let beginCookie = app.handle(authReq("/begin", "")).getHeader("Set-Cookie")
+  let stored = split(app.handle(authReq("/session", beginCookie)).body, "|")
+  box.token = roundTripToken(stored[1])
+  let res = app.handle(callbackReq(beginCookie, "test-auth-code", stored[0]))
+  assert(res.status == 200, "want 200, got ${res.status}: ${res.body}")
+  assertRevoked(store, res.getHeader("Set-Cookie"), roundTripSub)
+}
+
+test "Apple login is revoked by logoutEverywhere" {
+  let box = newBox()
+  let store = MemoryStore(1000)
+  let app = appleAppOn(appleStrategyWith(tokenFetchFor(box)), box, store)
+  let begun = beginApple_(app)
+  box.token = appleToken(begun.nonce, clientId, []JsonEntry{})
+  let res = app.handle(formPost(callbackBody(begun.state, "")))
+  assert(res.status == 200, "want 200, got ${res.status}: ${res.body}")
+  assertRevoked(store, res.getHeader("Set-Cookie"), appleSub)
+}
+
+test "a bearer token through requireAuth leaves a session logoutEverywhere destroys" {
+  let t = btTokens(hsKeySet(), hsOptions(BtClock{ t = 1000 }))
+  let store = MemoryStore(1000)
+  let app = bearerAppOn(t, store)
+  let res = app.handle(bearerReq("Bearer " + btIssue(t, "u7")))
+  assert(res.status == 200, "want 200, got ${res.status}")
+  assertRevoked(store, res.getHeader("Set-Cookie"), "u7")
+}
