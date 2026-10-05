@@ -31,14 +31,16 @@ other in the response.
 
 ## The session id is regenerated on every successful login
 
-Both `PasswordStrategy`'s strategy and `handleCallback` call
-`Session.regenerate()` (`pkg/web`) the moment they have a verified identity,
-before storing it. This closes session fixation: without it, a session id an
+Every `Strategy` in this package calls `Session.regenerate()` (`pkg/web`) the
+moment it has a verified identity, then `bindSession`, which stores the
+`Identity` and files the session under the user's id so
+[`logoutEverywhere`](logout-everywhere.md) can destroy it. This closes session fixation: without it, a session id an
 attacker set on a victim before login stays valid after login, so the
 attacker's own known id now carries an authenticated session. Regenerating
 on every privilege change, not only at login, is what the OWASP Session
 Management Cheat Sheet recommends, and every login path in this package
-follows it - there is no path that stores an `Identity` without it.
+follows it - there is no path that stores an `Identity` without it, because
+`bindSession` is the only function that does.
 
 ## Password guessing is throttled, if you ask
 

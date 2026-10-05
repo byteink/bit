@@ -20,6 +20,7 @@ The chapters below, in reading order.
 | [Bearer tokens for an API](bearer-tokens.md) | Sign in once, call the JSON API with a JWT access token: a pinned algorithm, audience and issuer checks, key rotation without logging anyone out, clock skew, and the 401 a client should get. |
 | [API keys for scripts and integrations](api-keys.md) | A long-lived key for a build server or a partner: a recognisable prefix and checksum, SHA-256 at rest, scopes, expiry, last-used, revoke, constant-time checks, and the strategy that reads it from `Authorization: Bearer` or `X-API-Key`. |
 | [Refresh tokens that notice theft](refresh-tokens.md) | Stay signed in for weeks on an opaque refresh token: rotation on every use, reuse of an old token ending the whole login, an absolute lifetime cap, a grace window for retries, revoke, and a store of your own. |
+| [Sign an author out of every device](logout-everywhere.md) | "Sign out everywhere" and "sign out my other devices" after a password change: `logoutEverywhere`, `Keep`, the index every login files its session under, and `bindSession` for a `Strategy` of your own. |
 | [Security model](security.md) | What this package checks for you, and the one thing it cannot: your token exchange TLS roots. |
 
 For install and the exported surface, see [`pkg/auth/README.md`](../README.md).

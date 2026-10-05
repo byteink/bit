@@ -75,6 +75,11 @@ protected route that is not itself doing the authenticating just reads
   and what a successful one produces.
 - `requireAuth`, `currentIdentity` - the middleware that runs a `Strategy`
   list, and the accessor a protected route reads the result with.
+- `logoutEverywhere`, `Keep`, `bindSession`, `subjectIndexKey` - destroy every
+  session of one user (`Keep.Current(c)` spares the caller's), over the index
+  every login files its session under; `bindSession` is what a `Strategy` of
+  your own calls after `Session.regenerate()`; see
+  [Sign an author out of every device](docs/logout-everywhere.md).
 - `hashPassword`, `Lookup`, `LookupResult`, `PasswordStrategy` - a
   password `Strategy` over your own user lookup, Argon2id underneath.
 - `PasswordOptions`, `AuthEvent`, `AuthEventHook` - the optional second
