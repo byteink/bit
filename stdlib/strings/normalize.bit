@@ -25,13 +25,17 @@
 // LV+T, and the Indic two-part vowels), so that case is tried before the
 // segment is closed.
 //
-// A code point in `normPlain`'s ranges has no class, no mapping and is never
-// the second half of a pair, so it skips every table lookup. The test file
-// sweeps those ranges against the tables.
+// Most text is already in the form asked for, so `normalize` first runs the
+// UAX #15 §9 quick check (#7150): one pass over the bytes, one table lookup
+// per non-ASCII code point. A string that passes is returned as is; otherwise
+// only the code points from the last starter before a failing one up to the
+// next starter that passes go through the steps above, and the stretches in
+// between are copied. The tables hold full decompositions, so step 1 never
+// recurses.
 //
-// Code points travel as plain `int`s and bytes are written by hand through
-// `writeRuneUtf8` (utf8.bit): std/strings is built by the pinned stage0, which
-// has no `string(rune)`/`[]rune(s)` this module may lean on.
+// Code points travel as plain `int`s and bytes are written by hand: std/strings
+// is built by the pinned stage0, which has no `string(rune)`/`[]rune(s)` this
+// module may lean on.
 
 // The four Unicode normalization forms (UAX #15 §1.2).
 export enum Form { Nfc, Nfd, Nfkc, Nfkd }
@@ -51,53 +55,108 @@ const normSCount: int = 11172
 // above it, so the class is looked up once per code point, not per compare.
 const normClassShift: int = 21
 const normCpMask: int = 0x1FFFFF
+const normEntryMask: int = 0x1FFFFFFF
 
 // Above this many non-starters an out-of-order run is sorted by counting, not
 // by insertion: insertion sort is quadratic and a hostile input can make a
 // run as long as the string.
 const normInsertionMax: int = 16
 
-// Whether `cp` is untouched by normalization AND cannot be the second half of
-// a composition: class 0, no canonical or compatibility mapping, not a
-// Hangul syllable or jamo. These are the stretches of the code space that are
-// far larger than every table, found by sweeping the tables; the test file
-// re-checks each range against them.
-fn normPlain(cp: int): bool {
-  if (cp < 0xA0) {
-    return true
+// The quick-check flags of each form, indexed by `Form` (gen_normalize.bit's
+// record byte 1: the `No` bits of D, KD, C, KC, then C's and KC's `Maybe`),
+// and the flag of a code point that is the second half of a primary
+// composite.
+const normQcBits: string = "\x0C\x01\x30\x02"
+const normSecond: int = 64
+
+// The code point at byte `i` of `s` (`i < len(s)`) packed with its length in
+// bytes, `used << 24 | cp`, so the hot loops pay no tuple. An ill-formed
+// sequence is `1 << 24 | 0xFFFD`, which a real U+FFFD (three bytes) never is.
+fn normDecode(s: string, i: int): int {
+  let b0 = int(s[i])
+  if (b0 < 0x80) {
+    return (1 << 24) | b0
   }
-  if (cp >= 0x3400 && cp <= 0xA66E) {
-    return true
+  let want = leadWant(b0)
+  if (want == 0 || i + want > len(s)) {
+    return (1 << 24) | 0xFFFD
   }
-  if (cp >= 0xD7A4 && cp <= 0xF8FF) {
-    return true
+  let cp = decodeContinuationBytes(s, i, want, leadCpBits(b0, want))
+  if (cp < 0 || !isValidScalar(cp, leadMinCp(want))) {
+    return (1 << 24) | 0xFFFD
   }
-  if (cp >= 0x1FBFA && cp <= 0x2F7FF) {
-    return true
-  }
-  return cp >= 0x2FA1E && cp <= 0x10FFFF
+  return (want << 24) | cp
 }
 
-// The canonical combining class of `cp`. Nothing below U+0300 has one, so
-// the Latin-1 and Latin Extended letters skip the table search.
-fn normClass(cp: int): int {
-  if (cp < 0x300) {
-    return 0
-  }
-  return ccc(rune(cp))
+// Whether the packed `normDecode` result `d` is a well-formed code point.
+fn normWellFormed(d: int): bool {
+  return d != ((1 << 24) | 0xFFFD)
 }
 
-// Whether every byte of `s` is below 0x80.
-fn normIsAscii(s: string): bool {
-  let i = 0
+// Whether the code point `d` (packed by `normDecode`), whose record is at
+// `rec`, ends a quick-check run: ill-formed, not `Yes` in the form, or a
+// non-starter out of class order after one of class `lastCc`.
+fn normQcStops(d: int, rec: int, qc: int, lastCc: int): bool {
+  let cc = int(normInfo[rec])
+  if (!normWellFormed(d) || (int(normInfo[rec + 1]) & qc) != 0) {
+    return true
+  }
+  return cc != 0 && lastCc > cc
+}
+
+// The end of the stretch of `s` from `pos` (a boundary) that is already in
+// the form whose quick-check flags are `qc`, backed up to the last starter
+// before the first code point that is not: the UAX #15 §9 quick check.
+// Returns `len(s)` when the rest is in the form. A `Maybe` counts as `No`;
+// the slow path settles it.
+fn normQuickSpan(s: string, pos: int, qc: int): int {
+  let last = pos
+  let lastCc = 0
+  let i = pos
   let n = len(s)
   while (i < n) {
-    if (s[i] >= 0x80) {
-      return false
+    if (s[i] < 0x80) {
+      i = i + 1
+      // Bounded by `n`.
+      while (i < n && s[i] < 0x80) {
+        i = i + 1
+      }
+      last = i - 1
+      lastCc = 0
+      continue
     }
-    i = i + 1
+    let d = normDecode(s, i)
+    let rec = normRec(d & normCpMask)
+    if (normQcStops(d, rec, qc, lastCc)) {
+      return last
+    }
+    lastCc = int(normInfo[rec])
+    if (lastCc == 0) {
+      last = i
+    }
+    i = i + (d >> 24)
   }
-  return true
+  return n
+}
+
+// Appends `cp` to `out` as UTF-8.
+fn normPutUtf8(out: []byte, cp: int): []byte {
+  if (cp < 0x80) {
+    out = append(out, u8(cp))
+    return out
+  }
+  if (cp < 0x800) {
+    out = append(out, u8(0xC0 | (cp >> 6)))
+  } else if (cp < 0x10000) {
+    out = append(out, u8(0xE0 | (cp >> 12)))
+    out = append(out, u8(0x80 | ((cp >> 6) & 0x3F)))
+  } else {
+    out = append(out, u8(0xF0 | (cp >> 18)))
+    out = append(out, u8(0x80 | ((cp >> 12) & 0x3F)))
+    out = append(out, u8(0x80 | ((cp >> 6) & 0x3F)))
+  }
+  out = append(out, u8(0x80 | (cp & 0x3F)))
+  return out
 }
 
 // The primary composite of `a` followed by `b`, or 0: Hangul by arithmetic
@@ -217,14 +276,15 @@ fn normFold(seg: []int): []int {
   return seg[0:kept]
 }
 
-// The working state of one `normalize` call: the open segment (a starter and
-// the non-starters after it, or just non-starters at the start of the string),
-// the one output buffer, and the form's two switches.
+// The working state of one `normalize` call's slow path: the open segment
+// (a starter and the non-starters after it, or just non-starters), the one
+// output buffer, the form's two switches and its quick-check flags.
 class NormState {
   seg: []int
-  out: Builder
+  out: []byte
   compat: bool
   fold: bool
+  qc: int
 
   // Orders the open segment and, for the C forms, folds its marks into its
   // starter.
@@ -243,101 +303,133 @@ class NormState {
   flush() {
     let i = 0
     while (i < len(this.seg)) {
-      writeRuneUtf8(this.out, this.seg[i] & normCpMask)
+      this.out = normPutUtf8(this.out, this.seg[i] & normCpMask)
       i = i + 1
     }
     this.seg = this.seg[0:0]
   }
 
-  // Adds `cp`, of combining class `cc`, to the stream. `maybePair` is false
-  // for a `normPlain` code point, which can never compose with what precedes.
-  push(cp: int, cc: int, maybePair: bool) {
-    if (cc != 0) {
-      this.seg = append(this.seg, (cc << normClassShift) | cp)
+  // Adds `e`, a code point packed as `normElem` packs it (class above bit
+  // 21, bit 30 when it can be the second half of a composite), to the stream.
+  push(e: int) {
+    let v = e & normEntryMask
+    if ((v >> normClassShift) != 0) {
+      this.seg = append(this.seg, v)
       return
     }
     this.settle()
-    if (maybePair && this.fold && len(this.seg) == 1 && (this.seg[0] >> normClassShift) == 0) {
-      let c = normPair(this.seg[0], cp)
+    if ((e >> 30) != 0 && this.fold && len(this.seg) == 1 && (this.seg[0] >> normClassShift) == 0) {
+      let c = normPair(this.seg[0], v)
       if (c != 0) {
         this.seg[0] = c
         return
       }
     }
     this.flush()
-    this.seg = append(this.seg, cp)
+    this.seg = append(this.seg, v)
   }
 
-  // Pushes the three-or-two jamo a Hangul syllable decomposes to.
+  // Pushes the three-or-two jamo a Hangul syllable decomposes to; the vowel
+  // and the trailing consonant are second halves of the arithmetic pairs.
   hangul(cp: int) {
     let s = cp - normSBase
-    this.push(normLBase + s / normNCount, 0, true)
-    this.push(normVBase + s % normNCount / normTCount, 0, true)
+    this.push(normLBase + s / normNCount)
+    this.push((1 << 30) | (normVBase + s % normNCount / normTCount))
     let t = s % normTCount
     if (t != 0) {
-      this.push(normTBase + t, 0, true)
+      this.push((1 << 30) | (normTBase + t))
     }
   }
 
-  // Pushes the full decomposition of `cp` (`cp` itself when it has none).
-  decompose(cp: int) {
-    if (normPlain(cp)) {
-      this.push(cp, 0, false)
-      return
-    }
+  // Pushes the full decomposition of `cp`, whose record is at `rec` (`cp`
+  // itself when it has none). The tables hold FULL decompositions, so this
+  // never recurses.
+  decompose(cp: int, rec: int) {
     if (cp >= normSBase && cp < normSBase + normSCount) {
       this.hangul(cp)
       return
     }
-    let d = []rune(0)
+    let e = 0
     if (this.compat) {
-      d = compatDecomp(rune(cp))
+      e = normU16(normInfo, rec + 4)
     }
-    if (len(d) == 0) {
-      d = canonicalDecomp(rune(cp))
+    if (e == 0) {
+      e = normU16(normInfo, rec + 2)
     }
-    if (len(d) == 0) {
-      this.push(cp, normClass(cp), true)
+    if (e == 0) {
+      let second = (int(normInfo[rec + 1]) & normSecond) << 24
+      this.push((int(normInfo[rec]) << normClassShift) | cp | second)
       return
     }
-    // Bounded: the mapping tables hold at most 18 runes per entry and every
-    // chain of mappings in them ends.
-    let i = 0
-    while (i < len(d)) {
-      this.decompose(int(d[i]))
+    let i = 1
+    // Bounded by the sequence length, at most 18 in UCD 17.0.0.
+    while (i <= normSeqLen(e)) {
+      this.push(normElem(e + i))
       i = i + 1
     }
+  }
+
+  // Normalizes `s` from `from` up to the next well-formed starter that is
+  // `Yes` in the form (past `from`), or the end, and returns where it
+  // stopped: nothing before such a starter can reorder or compose with
+  // anything after it.
+  run(s: string, from: int): int {
+    let i = from
+    let n = len(s)
+    while (i < n) {
+      let d = normDecode(s, i)
+      let cp = d & normCpMask
+      let rec = normRec(cp)
+      if (i > from && !normQcStops(d, rec, this.qc, 0) && normInfo[rec] == 0) {
+        break
+      }
+      this.decompose(cp, rec)
+      i = i + (d >> 24)
+    }
+    this.settle()
+    this.flush()
+    return i
   }
 }
 
 // `s` in normalization form `f`. Ill-formed UTF-8 is not preserved: each
-// rejected byte becomes U+FFFD, as in `runes`. A string with no byte at or
-// above 0x80 is already in every form and is returned as is, without
-// allocating.
+// rejected byte becomes U+FFFD, as in `runes`. Text already in the form (the
+// UAX #15 quick check says so in one pass) is returned as is, without
+// allocating; otherwise the stretches the quick check passes are copied and
+// only the rest is decomposed and recomposed.
 export fn normalize(s: string, f: Form): string {
-  if (normIsAscii(s)) {
+  let k = int(f)
+  let qc = int(normQcBits[k])
+  let n = len(s)
+  let span = normQuickSpan(s, 0, qc)
+  if (span == n) {
     return s
   }
-  let k = int(f)
-  let st = NormState{ seg = []int(0, 16), out = Builder(), compat = k >= 2, fold = k % 2 == 0 }
-  let i = 0
-  let n = len(s)
-  while (i < n) {
-    let (r, used) = decodeRune(s, i)
-    let cp = int(r)
-    st.decompose(cp)
-    i = i + used
+  let st = NormState{
+    seg = []int(0, 16),
+    out = []byte(0, n + n / 2 + 16),
+    compat = k >= 2,
+    fold = k % 2 == 0,
+    qc = qc,
   }
-  st.settle()
-  st.flush()
-  return st.out.toString()
+  let pos = 0
+  // Bounded: `run` always moves past `span`, so `pos` strictly grows.
+  while (pos < n) {
+    st.out = append(st.out, s[pos:span])
+    if (span == n) {
+      break
+    }
+    pos = st.run(s, span)
+    span = normQuickSpan(s, pos, qc)
+  }
+  return string(st.out)
 }
 
 // Whether `s` is already in normalization form `f`: well-formed UTF-8 that
-// `normalize` leaves unchanged. The tables carry no quick-check properties, so
-// a non-ASCII string is normalized and compared.
+// `normalize` leaves unchanged. The quick check answers most strings in one
+// pass; a `Maybe` is settled by normalizing and comparing.
 export fn isNormalized(s: string, f: Form): bool {
-  if (normIsAscii(s)) {
+  if (normQuickSpan(s, 0, int(normQcBits[int(f)])) == len(s)) {
     return true
   }
   return normalize(s, f) == s
