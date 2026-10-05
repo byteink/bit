@@ -10,12 +10,12 @@ text you could read back.
 
 ## Install pkg/auth
 
-`pkg/auth` requires `pkg/web` `^0.7.0`, already satisfied since
+`pkg/auth` requires `pkg/web` `^0.9.0`, already satisfied since
 [chapter 14](01-first-endpoint.md):
 
 ```text
-$ bit add bitlang.org/pkg/auth@v0.4.0
-bit add: auth -> bitlang.org/pkg/auth@0.4.0 (e226b95b834239d577cc67a44cab93305821166c)
+$ bit add bitlang.org/pkg/auth@v0.5.0
+bit add: auth -> bitlang.org/pkg/auth@0.5.0 (2b3da0ae7c8df96c4f5af1380d0160e291175655)
 ```
 
 ## Why you never store the plain password
