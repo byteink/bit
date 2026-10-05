@@ -1,0 +1,190 @@
+// pkg/mail/postmark.bit — the `Transport` `open("postmark://TOKEN@default")`
+// returns: one `POST https://api.postmarkapp.com/email` per message with the
+// server token in `X-Postmark-Server-Token`
+// (https://postmarkapp.com/developer/api/email-api). The JSON is made in
+// postmarkbody.bit; the URL and the client are shared with the other HTTPS-API
+// transports (httpapi.bit); this file is the request and what each answer means.
+//
+//   postmark://TOKEN@default                      api.postmarkapp.com
+//   postmark://TOKEN@default?stream=broadcasts    ... on message stream `broadcasts`
+//   postmark://TOKEN@host[:port]                  https://host[:port], for a proxy or a test
+//   postmark://TOKEN@host[:port]?insecureSkipVerify=true   ... without checking its certificate
+//
+// `stream` is a message stream ID (`MessageStream`): 1 to 30 of `a-z`, `0-9` and
+// `-`, `outbound`, Postmark's default transactional stream, when the URL names
+// none. The token is never in an error, a `Receipt` or the text of the transport.
+//
+// What Postmark answers, and what the caller gets. Every `ErrorCode` it sends
+// is kept in `Reply.enhanced` as `postmark:<code>`:
+//   2xx, ErrorCode 0             `Receipt.providerId` is the `MessageID` it returns
+//   401                          `Auth`
+//   429 and 5xx                  `Transient`, `Reply.retryAfter` from `Retry-After`
+//   a failed TLS handshake       `Rejected`: the same certificate is presented next time
+//   any other network failure    `Transient`
+//   422 and any other 4xx        `Rejected` with Postmark's `Message`: 300 (an
+//                                invalid address, a missing body), 406 (an inactive
+//                                recipient, so a suppressed one), 1235 (no such
+//                                stream) ...
+//
+// Postmark has no idempotency key, so a send is repeated only when the mail was
+// not taken: a refused connection, a 429 or a 5xx (which Postmark says loses the
+// message). A request cut off after it was sent may or may not have been taken;
+// it is `Transient` like every network failure, so `Options.retry` can send it
+// twice. A program that cannot take that sets `Retry{ attempts = 1 }`.
+
+import { Client as HttpClient } from "std/http"
+import { Millisecond } from "std/time"
+
+// The message stream used when the URL names none.
+const pmDefaultStream: string = "outbound"
+
+// A message stream ID is at most this many bytes.
+const pmMaxStream: int = 30
+
+fn postmarkSpec(): ApiSpec {
+  return ApiSpec{
+    scheme = "postmark://",
+    defaultHost = "api.postmarkapp.com",
+    secret = "server token",
+    placeholder = "TOKEN",
+    params = ["stream"],
+  }
+}
+
+// Whether `url` is a `postmark://` URL, whatever follows.
+fn isPostmarkUrl(url: string): bool {
+  return hasScheme(url, "postmark://")
+}
+
+// A message stream ID: `[a-z0-9-]{1,30}`.
+fn pmStreamOk(s: string): bool {
+  if (len(s) < 1 || len(s) > pmMaxStream) {
+    return false
+  }
+  for c of []byte(s) {
+    let lower = c >= 97 && c <= 122
+    let digit = c >= 48 && c <= 57
+    if (!lower && !digit && c != 45) {
+      return false
+    }
+  }
+  return true
+}
+
+// What a `postmark://` URL names: the target and its message stream.
+class PostmarkTarget {
+  t: ApiTarget,
+  stream: string,
+}
+
+// `url` as a target, or a `Config` that never repeats the token.
+fn parsePostmark(url: string): PostmarkTarget!MailError {
+  let t = parseApiUrl(postmarkSpec(), url)?
+  let stream = t.params["stream"]
+  if (stream == "") {
+    stream = pmDefaultStream
+  }
+  if (!pmStreamOk(stream)) {
+    fail apiUrlError(
+      postmarkSpec(),
+      "the stream is a message stream ID of 1 to ${pmMaxStream} lowercase letters, digits and '-'",
+    )
+  }
+  return PostmarkTarget{ t = t, stream = stream }
+}
+
+class PostmarkTransport {
+  t: ApiTarget
+  stream: string
+  from: string
+  replyTo: []string
+  timeoutMs: int
+
+  init(p: PostmarkTarget, opts: Options) {
+    this.t = p.t
+    this.stream = p.stream
+    this.from = opts.from
+    this.replyTo = []
+    if (opts.replyTo != "") {
+      this.replyTo = [opts.replyTo]
+    }
+    this.timeoutMs = opts.timeout / Millisecond
+  }
+
+  // Posts `d` as one Postmark email. See the top of this file for what each
+  // answer becomes.
+  export deliver(d: Delivery): Receipt!MailError {
+    let body = pmPayload(d, this.from, this.replyTo, this.stream)?
+    let c = apiClient(this.t.insecure)
+    defer c.close()
+    this.setHeaders(c)?
+    let res = c.requestTimeout("POST", "${this.t.base}/email", body, this.timeoutMs) catch e {
+      fail apiNetError("postmark: ${this.scrub(e.message())}", e)
+    }
+    return this.answer(res.status, res.headers, res.body, d)?
+  }
+
+  // The mail is built at Postmark, so what leaves is not `Delivery.raw`.
+  export signs(): bool {
+    return false
+  }
+
+  // Nothing is held between sends.
+  export close() {}
+
+  // `postmark://***@api.postmarkapp.com`, the token hidden.
+  export toString(): string {
+    return this.t.display
+  }
+
+  // The headers every send carries. The token was checked at `open`, so a
+  // refusal here is a bug, reported and never with the value.
+  setHeaders(c: HttpClient): ()!MailError {
+    c.setHeader("X-Postmark-Server-Token", this.t.secret) catch _ {
+      fail MailError.Config("postmark://: the server token cannot be sent as a header")
+    }
+    c.setHeader("Content-Type", "application/json") catch _ {
+      fail MailError.Config("postmark://: Content-Type cannot be set")
+    }
+    c.setHeader("Accept", "application/json") catch _ {
+      fail MailError.Config("postmark://: Accept cannot be set")
+    }
+  }
+
+  scrub(s: string): string {
+    return apiScrub(s, this.t.secret)
+  }
+
+  // The `Receipt` for a 2xx that carries no error, else the `MailError`.
+  answer(status: int, headers: string, body: string, d: Delivery): Receipt!MailError {
+    let code = apiIntField(body, "ErrorCode", 0)
+    if (status >= 200 && status < 300 && code == 0) {
+      return Receipt{
+        id = d.messageId,
+        providerId = apiField(body, "MessageID"),
+        accepted = d.envelope.to,
+      }
+    }
+    let text = apiClip(this.scrub(apiField(body, "Message")))
+    if (text == "") {
+      text = "HTTP ${status}"
+    }
+    let r = Reply{ code = status, text = text, retryAfter = apiRetryAfter(headers) }
+    if (code != 0) {
+      r.enhanced = "postmark:${code}"
+    }
+    fail postmarkError(status, r)
+  }
+}
+
+// The `MailError` for an answer that is not an acceptance; the table is at the
+// top of this file.
+fn postmarkError(status: int, r: Reply): MailError {
+  if (status == 401) {
+    return MailError.Auth(r)
+  }
+  if (status == 429 || status >= 500) {
+    return MailError.Transient(r)
+  }
+  return MailError.Rejected(r)
+}
