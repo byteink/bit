@@ -11,5 +11,6 @@ bitlang.org's sidebar reads it in.
 | [Attachments](attachments.md) | `Attachment` and `Attachment.file` on Inkwell's publish mail: a PDF to save, a logo shown inside the HTML by `cid`, the checks that tie the two together, the 25 MiB limit, the MIME type table |
 | [Sending for real](open.md) | `open` on Inkwell's production setup: `smtps://` and `smtp://` URLs, STARTTLS that is required and never optional, `tls=off` for a local catcher, `caFile` and `serverName` for a private CA, how server answers map to `MailError` |
 | [Signing your mail](dkim.md) | `Options.dkim` and `Dkim` on Inkwell's publish mail: RSA and Ed25519 keys, what is checked at startup, DMARC alignment per message, providers that sign for you |
+| [Retries and pace](retry.md) | `Options.retry`, `Retry`, `Options.rate` and `Reply.retryAfter` on Inkwell's publish mail: which failures repeat, full-jitter backoff, a server's Retry-After, a token bucket under the provider's limit |
 
 See the [package front page](../README.md) for install and a minimal example.

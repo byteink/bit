@@ -1,0 +1,292 @@
+// pkg/mail/retry.test.bit — `Options.retry` and `Options.rate`: what is
+// retried and what is not, that every try carries the same bytes, the full
+// jitter bounds, a server's `retryAfter`, the token bucket's pace and its wait
+// limit, and the setup checks. A clock that moves only when the code under test
+// sleeps stands in for time, so nothing here waits.
+
+import { contains } from "std/strings"
+import { Second, Millisecond } from "std/time"
+
+// A clock that moves only when someone sleeps on it, and remembers each sleep.
+class RtClock {
+  t: int
+  slept: []int
+
+  monotonic(): int {
+    return this.t
+  }
+
+  sleep(d: int) {
+    this.t = this.t + d
+    this.slept = append(this.slept, d)
+  }
+}
+
+// A transport that fails with `fails` in order, then accepts, and keeps the
+// bytes of every call.
+class RtScript {
+  fails: []MailError
+  raws: []string
+
+  deliver(d: Delivery): Receipt!MailError {
+    let n = len(this.raws)
+    this.raws = append(this.raws, d.raw)
+    if (n < len(this.fails)) {
+      fail this.fails[n]
+    }
+    return Receipt{ id = d.messageId, accepted = d.envelope.to }
+  }
+
+  signs(): bool {
+    return true
+  }
+
+  close() {}
+}
+
+fn rtLater(text: string): MailError {
+  return MailError.Transient(Reply{ code = 451, enhanced = "4.7.1", text = text })
+}
+
+fn rtMessage(): Message {
+  return Message{
+    from = "Inkwell <hello@inkwell.dev>",
+    to = ["Sara Ali <sara@example.com>"],
+    subject = "Welcome to Inkwell",
+    text = "Hello Sara.",
+    id = "welcome-1",
+  }
+}
+
+fn rtMailer(t: RtScript, clock: RtClock, o: Options): Mailer {
+  let m = Mailer(t, o) catch e {
+    panic("Mailer: ${e.message()}")
+  }
+  m.pace.clk = clock
+  return m
+}
+
+// The text of the failure of `m.send`, or "ok".
+fn rtSend(m: Mailer): string {
+  m.send(rtMessage()) catch e {
+    return e.message()
+  }
+  return "ok"
+}
+
+fn rtOk(m: Mailer) {
+  let got = rtSend(m)
+  assert(got == "ok", got)
+}
+
+test "Transient, Transient, success is one Receipt after 3 deliveries of the same bytes" {
+  let t = RtScript{ fails = [rtLater("a"), rtLater("b")] }
+  let m = rtMailer(t, RtClock{}, Options{})
+  let r = m.send(rtMessage()) catch e {
+    panic("send: ${e.message()}")
+  }
+  assert(r.id == "<welcome-1@inkwell.dev>", r.id)
+  assert(len(t.raws) == 3, "${len(t.raws)} deliveries")
+  assert(t.raws[0] == t.raws[1] && t.raws[1] == t.raws[2], "raw changed between tries")
+}
+
+test "a permanent answer is returned after one delivery" {
+  let answers = [
+    MailError.Rejected(Reply{ code = 550, text = "no such user" }),
+    MailError.Auth(Reply{ code = 535, text = "bad login" }),
+    MailError.Invalid("x"),
+    MailError.Config("x"),
+  ]
+  for a of answers {
+    let t = RtScript{ fails = [a, a, a] }
+    let clock = RtClock{}
+    let m = rtMailer(t, clock, Options{})
+    let gotm = rtSend(m)
+    assert(gotm == a.message(), gotm)
+    assert(len(t.raws) == 1, "${len(t.raws)} deliveries of ${a.message()}")
+  }
+}
+
+test "a 550 is delivered once, never again, and nothing sleeps" {
+  let t = RtScript{ fails = [MailError.Rejected(Reply{ code = 550, text = "no such user" })] }
+  let clock = RtClock{}
+  let m = rtMailer(t, clock, Options{})
+  let gotm = rtSend(m)
+  assert(gotm == "mail: rejected: 550 no such user", gotm)
+  assert(len(t.raws) == 1, "${len(t.raws)} deliveries")
+  assert(len(clock.slept) == 0, "slept ${len(clock.slept)} times")
+}
+
+test "attempts = 2 and two Transients return the second error" {
+  let t = RtScript{ fails = [rtLater("first"), rtLater("second"), rtLater("third")] }
+  let m = rtMailer(t, RtClock{}, Options{ retry = Retry{ attempts = 2 } })
+  let got = rtSend(m)
+  assert(got == "mail: temporary failure: 451 4.7.1 second", got)
+  assert(len(t.raws) == 2, "${len(t.raws)} deliveries")
+}
+
+test "attempts = 1 never retries" {
+  let t = RtScript{ fails = [rtLater("first")] }
+  let m = rtMailer(t, RtClock{}, Options{ retry = Retry{ attempts = 1 } })
+  let gotm = rtSend(m)
+  assert(gotm == "mail: temporary failure: 451 4.7.1 first", gotm)
+  assert(len(t.raws) == 1, "${len(t.raws)} deliveries")
+}
+
+test "each wait is a full-jitter draw below min(max, base * 2^n)" {
+  let t = RtScript{ fails = [rtLater("1"), rtLater("2"), rtLater("3"), rtLater("4"), rtLater("5")] }
+  let clock = RtClock{}
+  let o = Options{ retry = Retry{ attempts = 6, base = 1 * Second, max = 4 * Second } }
+  let m = rtMailer(t, clock, o)
+  rtOk(m)
+  let ceiling = [1 * Second, 2 * Second, 4 * Second, 4 * Second, 4 * Second]
+  assert(len(clock.slept) == 5, "${len(clock.slept)} sleeps")
+  let i = 0
+  while (i < 5) {
+    assert(clock.slept[i] >= 0 && clock.slept[i] < ceiling[i], "sleep ${i} = ${clock.slept[i]}")
+    i = i + 1
+  }
+}
+
+test "a retryAfter longer than the draw replaces it, capped at max" {
+  let slow = MailError.Transient(Reply{ code = 429, text = "slow down", retryAfter = 10 * Second })
+  let t = RtScript{ fails = [slow] }
+  let clock = RtClock{}
+  let m = rtMailer(t, clock, Options{})
+  rtOk(m)
+  assert(clock.slept[0] == 10 * Second, "slept ${clock.slept[0]}")
+
+  let huge = MailError.Transient(Reply{ code = 429, text = "come back", retryAfter = 100 * Second })
+  let t2 = RtScript{ fails = [huge] }
+  let clock2 = RtClock{}
+  let m2 = rtMailer(t2, clock2, Options{})
+  rtOk(m2)
+  assert(clock2.slept[0] == 30 * Second, "slept ${clock2.slept[0]}")
+}
+
+test "a retryAfter shorter than the draw's ceiling never shortens the wait below the draw" {
+  let quick = MailError.Transient(Reply{ code = 429, text = "soon", retryAfter = 1 })
+  let t = RtScript{ fails = [quick] }
+  let clock = RtClock{}
+  let m = rtMailer(t, clock, Options{})
+  rtOk(m)
+  assert(clock.slept[0] >= 1 && clock.slept[0] < 1 * Second, "slept ${clock.slept[0]}")
+}
+
+test "rate = 5 makes 20 sends take between 3.5 and 4.5 seconds" {
+  let t = RtScript{}
+  let clock = RtClock{ t = 1000 }
+  let m = rtMailer(t, clock, Options{ rate = 5 })
+  let i = 0
+  while (i < 20) {
+    rtOk(m)
+    i = i + 1
+  }
+  let took = clock.t - 1000
+  assert(took >= 3500 * Millisecond && took <= 4500 * Millisecond, "took ${took} ns")
+  assert(len(t.raws) == 20, "${len(t.raws)} deliveries")
+}
+
+test "an idle mailer refills up to rate and then sends a burst" {
+  let t = RtScript{}
+  let clock = RtClock{}
+  let m = rtMailer(t, clock, Options{ rate = 5 })
+  rtOk(m)
+  clock.t = clock.t + 10 * Second
+  let before = len(clock.slept)
+  let i = 0
+  while (i < 5) {
+    rtOk(m)
+    i = i + 1
+  }
+  assert(len(clock.slept) == before, "waited ${len(clock.slept) - before} times in a full bucket")
+  rtOk(m)
+  assert(len(clock.slept) == before + 1, "the sixth send did not wait")
+}
+
+test "every retry waits for a token too" {
+  let t = RtScript{ fails = [rtLater("a")] }
+  let clock = RtClock{}
+  let m = rtMailer(
+    t,
+    clock,
+    Options{ rate = 1, retry = Retry{ base = 1 * Millisecond, max = 1 * Millisecond } },
+  )
+  rtOk(m)
+  // The retry's own backoff (under 1 ms) and then a whole second for the token.
+  assert(len(clock.slept) == 2 && clock.slept[1] > 900 * Millisecond, "${len(clock.slept)} sleeps")
+}
+
+test "a rate wait longer than timeout is Transient and takes nothing" {
+  let t = RtScript{}
+  let clock = RtClock{}
+  let m = rtMailer(t, clock, Options{ rate = 1, timeout = 500 * Millisecond })
+  rtOk(m)
+  let got = rtSend(m)
+  assert(got == "mail: temporary failure: rate limit wait exceeded", got)
+  assert(
+    len(t.raws) == 1 && len(clock.slept) == 0,
+    "${len(t.raws)} deliveries, ${len(clock.slept)} sleeps",
+  )
+  clock.t = clock.t + 1 * Second
+  rtOk(m)
+}
+
+test "rate 0 never waits" {
+  let t = RtScript{}
+  let clock = RtClock{}
+  let m = rtMailer(t, clock, Options{})
+  let i = 0
+  while (i < 50) {
+    rtOk(m)
+    i = i + 1
+  }
+  assert(len(clock.slept) == 0 && clock.t == 0, "slept ${len(clock.slept)} times")
+}
+
+// The text of the failure `Mailer(Outbox(), o)` reports, or "ok".
+fn rtSetup(o: Options): string {
+  Mailer(Outbox(), o) catch e {
+    return e.message()
+  }
+  return "ok"
+}
+
+test "a Retry or rate that cannot work fails at Mailer() naming the field" {
+  let cases = [
+    Options{ retry = Retry{ attempts = 0 } },
+    Options{ retry = Retry{ attempts = -1 } },
+    Options{ retry = Retry{ attempts = 11 } },
+    Options{ retry = Retry{ base = 0 } },
+    Options{ retry = Retry{ base = 5 * Second, max = 1 * Second } },
+    Options{ rate = -1 },
+    Options{ rate = 1000001 },
+  ]
+  let fields = [
+    "Options.retry.attempts",
+    "Options.retry.attempts",
+    "Options.retry.attempts",
+    "Options.retry.base",
+    "Options.retry.max",
+    "Options.rate",
+    "Options.rate",
+  ]
+  let i = 0
+  while (i < len(cases)) {
+    let got = rtSetup(cases[i])
+    assert(contains(got, "mail: configuration: ${fields[i]} must"), got)
+    i = i + 1
+  }
+  assert(
+    rtSetup(Options{ retry = Retry{ attempts = 10 }, rate = 1000000 }) == "ok",
+    "the limits themselves are valid",
+  )
+}
+
+test "open refuses a bad retry before any connection" {
+  open("smtps://smtp.example.com", Options{ retry = Retry{ attempts = 0 } }) catch e {
+    assert(contains(e.message(), "Options.retry.attempts"), e.message())
+    return
+  }
+  assert(false, "open succeeded")
+}

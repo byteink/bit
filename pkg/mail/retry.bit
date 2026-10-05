@@ -1,0 +1,211 @@
+// pkg/mail/retry.bit — `Retry` and the `Pacer` behind `Options.retry` and
+// `Options.rate`: how a `Mailer` repeats a delivery the server only postponed,
+// and how fast it may deliver at all.
+//
+// Backoff is "full jitter" from the AWS Architecture Blog, "Exponential Backoff
+// And Jitter": before retry n (0-based) the wait is a uniform draw below
+// `min(max, base * 2^n)`, so a thousand senders that failed together do not
+// come back together. Only `MailError.Transient` (a 4xx reply, a connection
+// that could not be made) is retried; `Invalid`, `Config`, `Auth` and
+// `Rejected` are the same answer next time and return at once. A server's own
+// hint (`Reply.retryAfter`, an HTTP `Retry-After`) replaces the draw when it is
+// longer, capped at `max`.
+//
+// Pace is a token bucket (capacity `rate`, refilled `rate` per second) shared
+// by every task that sends through one `Mailer`. A new bucket holds one token,
+// so the first send is immediate and a restart never opens with a burst
+// against a provider's limit; idle time then fills it up to `rate`.
+//
+// The clock is a seam (`Clock`): the `Mailer` uses the system's, a test hands
+// the `Pacer` one that moves only when asked, so no test sleeps.
+
+import { Mutex } from "std/sync"
+import { Second, monotonic as monotonicNow, sleep as parkFor } from "std/time"
+import { randomUintBelow } from "std/crypto"
+
+// How a `Mailer` repeats a delivery that failed with `MailError.Transient`.
+export class Retry {
+  // Deliveries tried in all, the first included, 1 to 10. 1 never retries.
+  export attempts: int = 3,
+  // The first wait's ceiling, in nanoseconds. It doubles on every retry.
+  export base: int = 1 * Second,
+  // No wait is longer than this, a server's `retryAfter` included.
+  export max: int = 30 * Second,
+}
+
+const maxAttempts: int = 10
+
+// The highest `Options.rate`. Keeps the bucket's fixed-point arithmetic far from
+// overflow; no provider takes a million mails a second from one `Mailer`.
+const maxRate: int = 1000000
+
+// The bucket counts in units of a billionth of a token, so a refill of `rate`
+// units per elapsed nanosecond is exact.
+const tokenUnits: int = 1000000000
+
+// An idle time longer than this refills no more than this much, so the
+// multiplication by `rate` cannot overflow.
+const maxIdle: int = 3600 * Second
+
+// What a `Pacer` needs from time.
+interface Clock {
+  // A monotonic reading, in nanoseconds.
+  monotonic(): int,
+  // Parks the caller for `d` nanoseconds.
+  sleep(d: int),
+}
+
+// The real clock.
+class SystemClock {
+  monotonic(): int {
+    return monotonicNow().ns
+  }
+
+  sleep(d: int) {
+    parkFor(d)
+  }
+}
+
+// Refuses a `Retry` or `rate` that cannot work, naming the field.
+fn checkRetry(o: Options): ()!MailError {
+  let r = o.retry
+  if (r.attempts < 1 || r.attempts > maxAttempts) {
+    fail MailError.Config("Options.retry.attempts must be 1 to ${maxAttempts}, got ${r.attempts}")
+  }
+  if (r.base <= 0) {
+    fail MailError.Config("Options.retry.base must be positive, got ${r.base}")
+  }
+  if (r.max < r.base) {
+    fail MailError.Config("Options.retry.max must be at least Options.retry.base (${r.base}), got ${r.max}")
+  }
+  if (o.rate < 0 || o.rate > maxRate) {
+    fail MailError.Config("Options.rate must be 0 to ${maxRate} messages a second, got ${o.rate}")
+  }
+}
+
+// The ceiling of the wait before retry `n` (0-based): `base * 2^n`, never above
+// `max`, and never overflowing.
+fn backoffCeiling(r: Retry, n: int): int {
+  let c = r.base
+  let i = 0
+  while (i < n) {
+    if (c > r.max / 2) {
+      return r.max
+    }
+    c = c * 2
+    i = i + 1
+  }
+  return c
+}
+
+// The wait before retry `n`: a draw below the ceiling, raised to the server's
+// `hint` (0 = none) when that is longer, and never above `max`.
+fn retryWait(r: Retry, n: int, hint: int): int {
+  let draw = int(randomUintBelow(uint(backoffCeiling(r, n))))
+  let h = hint
+  if (h > r.max) {
+    h = r.max
+  }
+  if (h > draw) {
+    return h
+  }
+  return draw
+}
+
+// Retries and throughput for one `Mailer`. `run` is the seam: the later
+// pkg/jobs queue, which owns its own retries, calls the transport without it.
+class Pacer {
+  retry: Retry
+  rate: int
+  timeout: int
+  clk: Clock
+  mu: Mutex
+  // Tokens in billionths; negative while callers are queued for one.
+  units: int
+  last: int
+  primed: bool
+
+  init(o: Options) {
+    this.retry = o.retry
+    this.rate = o.rate
+    this.timeout = o.timeout
+    this.clk = SystemClock{}
+    this.mu = Mutex()
+    this.units = 0
+    this.last = 0
+    this.primed = false
+  }
+
+  // Delivers `d` through `t`, waiting for a token before every try and
+  // repeating after a `Transient` failure until `retry.attempts` tries are
+  // spent. Every try gets the same `d`, so the same bytes, Message-ID and
+  // signature.
+  run(t: Transport, d: Delivery): Receipt!MailError {
+    let n = 0
+    while (n < this.retry.attempts - 1) {
+      this.acquire()?
+      let r = t.deliver(d) catch e {
+        match (e) {
+          Transient(reply) => this.clk.sleep(retryWait(this.retry, n, reply.retryAfter))
+          _ => fail e
+        }
+        n = n + 1
+        continue
+      }
+      return r
+    }
+    this.acquire()?
+    return t.deliver(d)?
+  }
+
+  // Waits for a token. Fails `Transient` when the wait would pass `timeout`.
+  acquire(): ()!MailError {
+    if (this.rate == 0) {
+      return
+    }
+    let wait = this.reserve()
+    if (wait < 0) {
+      fail MailError.Transient(Reply{ text = "rate limit wait exceeded" })
+    }
+    if (wait > 0) {
+      this.clk.sleep(wait)
+    }
+  }
+
+  // Takes a token now, owed or not, and returns how long the caller must wait
+  // for it: 0 when one was there, -1 (and nothing taken) when the wait would
+  // pass `timeout`. Callers queue in order because each debt is on the books
+  // before the next asks.
+  reserve(): int {
+    this.mu.lock()
+    let now = this.clk.monotonic()
+    if (!this.primed) {
+      this.primed = true
+      this.units = tokenUnits
+      this.last = now
+    }
+    let idle = now - this.last
+    if (idle < 0) {
+      idle = 0
+    }
+    if (idle > maxIdle) {
+      idle = maxIdle
+    }
+    this.last = now
+    this.units = this.units + idle * this.rate
+    if (this.units > this.rate * tokenUnits) {
+      this.units = this.rate * tokenUnits
+    }
+    this.units = this.units - tokenUnits
+    let wait = 0
+    if (this.units < 0) {
+      wait = (0 - this.units + this.rate - 1) / this.rate
+    }
+    if (wait > this.timeout) {
+      this.units = this.units + tokenUnits
+      wait = -1
+    }
+    this.mu.unlock()
+    return wait
+  }
+}

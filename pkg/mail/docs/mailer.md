@@ -68,6 +68,9 @@ fn main(): ()! {
   transport that talks to a network enforces it; `Outbox` never waits.
 * **`dkim`** is the list of keys every message is signed with. Empty (the
   default) means unsigned. See [Signing your mail](dkim.md).
+* **`retry`** says how a delivery the server only postponed is repeated, and
+  **`rate`** how many messages a second the mailer delivers at most. See
+  [Retries and pace](retry.md).
 
 `Options{}` is a valid setup. More fields arrive with the parts of the package
 that need them, always with a default, so code written today keeps working.
@@ -302,7 +305,7 @@ fn main(): ()! {
 * **`Auth`**: the server refused the login. Nothing was sent.
 * **`Rejected`**: the server refused the message or its recipients for good.
 * **`Transient`**: the server cannot take it now. This is the only variant a
-  retry is for.
+  retry is for, and `send` already retries it; see [Retries and pace](retry.md).
 
 The first two carry text naming the field; the last three carry the server's
 `Reply`: its `code`, its `enhanced` status code (`""` when it sent none) and its
