@@ -84,7 +84,7 @@ fn word(e: Effect): string {
 }
 
 fn main() {
-  let editOwn = Policy<User, Action>("EditOwnArticles", (p, user) => {
+  let editOwn: Policy<User, Action> = Policy("EditOwnArticles", (p, user) => {
     p.can<Article>([Action.Read, Action.Update], eq("authorId", Value.Text(user.id)))
     p.cannot<Article>([Action.Update], eq("status", Value.Text("archived")))
   })
@@ -94,6 +94,10 @@ fn main() {
   }
 }
 ```
+
+The annotation on `editOwn` is what tells `Policy` its user and action types,
+so `(p, user)` needs no types of its own. Without an annotation, write them
+on the call: `Policy<User, Action>("EditOwnArticles", ...)`.
 
 This prints `allow 2 action(s)` then `deny 1 action(s)`. Listing several
 actions in one `can` makes one rule holding all of them, not one rule each.
@@ -217,22 +221,31 @@ class User {
   export roles: []string,
 }
 
-fn main(): ()! {
-  let readPublished = Policy<User, Action>("ReadPublished", (p, user) => {
+fn readPublished(): Policy<User, Action> {
+  return Policy("ReadPublished", (p, user) => {
     p.can<Article>([Action.Read], eq("status", Value.Text("published")))
   })
-  let editOwn = Policy<User, Action>("EditOwnArticles", (p, user) => {
+}
+
+fn editOwn(): Policy<User, Action> {
+  return Policy("EditOwnArticles", (p, user) => {
     p.can<Article>([Action.Read, Action.Update], eq("authorId", Value.Text(user.id)))
   })
-  let manageAll = Policy<User, Action>("ManageAll", (p, user) => {
+}
+
+fn manageAll(): Policy<User, Action> {
+  return Policy("ManageAll", (p, user) => {
     p.canAll([Action.Manage])
   })
+}
+
+fn main(): ()! {
   let authz = Authz<Action>()?
   authz.resource<Article>()?
-  authz.role<User>("reader", [readPublished])?
-  authz.role<User>("author", [readPublished, editOwn])?
+  authz.role<User>("reader", [readPublished()])?
+  authz.role<User>("author", [readPublished(), editOwn()])?
   let ada = User{ id = "ada", roles = ["admin"] }
-  authz.role<User>("admin", [manageAll], probe = Option<User>.Some(ada))?
+  authz.role<User>("admin", [manageAll()], probe = Option<User>.Some(ada))?
   println(join(authz.roleNames(), ", "))
 }
 ```
@@ -318,11 +331,13 @@ was registered. With the three roles above it passes.
 
 ## Sharp edges
 
-- Today the type arguments are written out: `Policy<User, Action>(...)`.
-  They are inferred only when the closure's parameters are annotated
-  (`(p: Rules<Action>, user: User) => ...`); with plain `(p, user)` the
-  compiler asks for them (E0068). Inferring them from an expected type is
-  tracked as #7299.
+- `Policy`'s type arguments come from the type the policy is written
+  against: an annotated `let`, a function's declared result, an argument of
+  a function or method that is not generic, or an element of a list in any of
+  those. With none of these the arguments are written out,
+  `Policy<User, Action>(...)`, or the closure's parameters are annotated
+  (`(p: Rules<Action>, user: User) => ...`); with plain `(p, user)` and no
+  type to read them from, the compiler asks for them (E0068).
 - The resource is a type argument, `p.can<Article>(...)`. `Article` must be a
   `@table` class; a plain class is refused at compile time.
 - `can` and `cannot` record rules; nothing evaluates them yet. Deny-wins and
