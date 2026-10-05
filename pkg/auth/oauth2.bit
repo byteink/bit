@@ -1,0 +1,459 @@
+// pkg/auth/oauth2.bit — OAuth2Strategy (#6942): the OAuth 2.0
+// authorization-code flow for providers that speak plain OAuth 2.0 and issue
+// no ID token (GitHub, Discord, Slack, GitLab without OIDC). `OidcStrategy`
+// (oidc_authorize.bit) covers the ones that do; this is the same flow with
+// the ID token replaced by a profile fetch that yields the `Identity`.
+//
+// What it follows, and where:
+//   - RFC 6749 §4.1: the authorization request (`response_type=code`,
+//     `client_id`, `redirect_uri`, `scope`, `state`), the response
+//     (`code`, `state`), and the token request (`grant_type=authorization_code`).
+//   - RFC 7636: PKCE, S256 only, on every flow, confidential clients included
+//     (RFC 9700 §2.1.1). The verifier and the challenge come from
+//     `newCodeVerifier`/`codeChallengeFor` (oidc_authorize.bit), shared with
+//     `OidcStrategy`: 43 characters of base64url over 32 CSPRNG bytes.
+//   - RFC 9700: `state` is single use and compared in constant time before
+//     anything else runs; `redirect_uri` is sent verbatim and must be https
+//     (loopback http excepted, RFC 8252 §7.3) with no fragment, checked when
+//     the strategy is built; no implicit grant exists here.
+//   - RFC 9207: when `OAuth2Options.issuer` is set, the callback must carry
+//     an `iss` equal to it, byte for byte. A provider that sends `iss` is a
+//     provider that advertises it, and a missing one is how a mix-up attack
+//     hides, so with an issuer configured the absence is refused too. With no
+//     issuer configured, `iss` is not looked at.
+//   - RFC 6749 §4.1.2.1 and §5.2: an `error` on the callback and an error
+//     document from the token endpoint both become an `OAuth2Error`.
+//   - RFC 6749 §5.1 and §7.1: the token response must carry `access_token`
+//     and a `token_type` of `Bearer`, compared case-insensitively; any other
+//     type is refused rather than sent as a Bearer token.
+//
+// `state` and the verifier live on `c.session()` like `OidcStrategy`'s, read
+// back with `takeAtomic` (single use, raced callbacks resolve to one winner).
+// The keys carry the strategy's `name`, so two providers signing in through
+// one browser session do not overwrite each other.
+//
+// Everything else this file uses — `basicAuthHeader`, `requireStateMatch`,
+// `takeRequired` (oidc_callback.bit), `newCodeVerifier`, `codeChallengeFor`,
+// `newAuthToken` (oidc_authorize.bit), `TokenFetch`, `Client`, `Header`,
+// `percentEncode`, `join`, `hasPrefix`, `contains`, `equalFold`, `jsonGet`,
+// `jsonAsString`, `unauthorized`, `identitySessionKey`, `encodeIdentity` —
+// is already bound module-wide (an import binds per MODULE, SPEC §17.1);
+// only `indexOf` and `lastIndexOf` are new.
+import { indexOf, lastIndexOf } from "std/strings"
+
+// Turns the provider's profile API into an `Identity`. Called with the
+// access token the token endpoint issued; the app (or a preset) makes the
+// request, because every provider's profile document differs.
+export type ProfileFetch = (string) => Identity!
+
+// Where the provider is: its authorization and token endpoints (both https)
+// and the `ProfileFetch` that yields the `Identity`.
+export class OAuth2Endpoints {
+  export authorize: string,
+  export token: string,
+  export profile: ProfileFetch,
+}
+
+// How the client authenticates to the token endpoint, RFC 6749 §2.3.1.
+// `Basic` is the HTTP Basic header the RFC makes mandatory for every server
+// to support; `Post` puts `client_id` and `client_secret` in the request body,
+// which some providers require. A client with an empty secret (a public
+// client, protected by PKCE alone) sends only `client_id`, in the body, under
+// either. `Basic` is the first variant, so it is the zero value a field of
+// this type holds when `OAuth2Options` leaves it out (a class field default
+// must be a compile-time constant, and an enum value is not one, E0064).
+export enum ClientAuth {
+  Basic,
+  Post,
+}
+
+// The optional knobs of `OAuth2Strategy(...)`. `scopes` is the `scope` request
+// (RFC 6749 §3.3); an empty list sends no `scope` parameter. `tls` is the
+// `TlsConfig` the token request runs under, required unless `tokenFetch` is
+// set, for the reason `OidcOptions.tls` is (oidc_discovery.bit); `tokenFetch`
+// is the same seam `OidcOptions.tokenFetch` is, `nil` meaning the real
+// network. `issuer` is the provider's RFC 9207 issuer identifier, empty
+// meaning the provider sends none. `name` is what `Strategy.name()` returns
+// and what keys the session entries.
+export class OAuth2Options {
+  export scopes: []string,
+  export tls: Option<TlsConfig>,
+  export tokenFetch: TokenFetch,
+  export clientAuth: ClientAuth,
+  export issuer: string,
+  export name: string = "oauth2",
+}
+
+// The `error` codes of RFC 6749 §4.1.2.1 and §5.2. `Unknown` is any other
+// code, which both sections allow a server to send.
+export enum OAuth2ErrorKind {
+  InvalidRequest,
+  InvalidClient,
+  InvalidGrant,
+  UnauthorizedClient,
+  UnsupportedGrantType,
+  InvalidScope,
+  AccessDenied,
+  UnsupportedResponseType,
+  ServerError,
+  TemporarilyUnavailable,
+  Unknown,
+}
+
+// What the provider refused with: the callback's `error` parameter or the
+// token endpoint's error document. `code` is the wire value, `description`
+// and `uri` the optional `error_description` and `error_uri`. The provider's
+// text is for a log, not a page, so `message()` never repeats it.
+export class OAuth2Error {
+  export kind: OAuth2ErrorKind,
+  export code: string,
+  export description: string,
+  export uri: string,
+
+  export message(): string {
+    if (this.kind == OAuth2ErrorKind.Unknown) {
+      return "auth: OAuth 2.0 provider refused the request"
+    }
+    return "auth: OAuth 2.0 provider refused the request: ${this.code}"
+  }
+
+  // The user said no, or the code or client was refused: 401. A provider that
+  // is down or misconfigured is not the caller's fault: 502.
+  export status(): int {
+    match (this.kind) {
+      AccessDenied => return 401
+      InvalidGrant => return 401
+      InvalidClient => return 401
+      UnauthorizedClient => return 401
+      _ => return 502
+    }
+  }
+}
+
+const oauth2ErrorCodes = [
+  "invalid_request",
+  "invalid_client",
+  "invalid_grant",
+  "unauthorized_client",
+  "unsupported_grant_type",
+  "invalid_scope",
+  "access_denied",
+  "unsupported_response_type",
+  "server_error",
+  "temporarily_unavailable",
+]
+
+fn oauth2ErrorKinds(): []OAuth2ErrorKind {
+  return [
+    OAuth2ErrorKind.InvalidRequest,
+    OAuth2ErrorKind.InvalidClient,
+    OAuth2ErrorKind.InvalidGrant,
+    OAuth2ErrorKind.UnauthorizedClient,
+    OAuth2ErrorKind.UnsupportedGrantType,
+    OAuth2ErrorKind.InvalidScope,
+    OAuth2ErrorKind.AccessDenied,
+    OAuth2ErrorKind.UnsupportedResponseType,
+    OAuth2ErrorKind.ServerError,
+    OAuth2ErrorKind.TemporarilyUnavailable,
+  ]
+}
+
+fn oauth2Error(code: string, description: string, uri: string): OAuth2Error {
+  let kinds = oauth2ErrorKinds()
+  for (let i = 0; i < len(oauth2ErrorCodes); i++) {
+    if (oauth2ErrorCodes[i] == code) {
+      return OAuth2Error{ kind = kinds[i], code = code, description = description, uri = uri }
+    }
+  }
+  return OAuth2Error{ kind = OAuth2ErrorKind.Unknown, code = code, description = description, uri = uri }
+}
+
+// Bytes of an authorization request's query: RFC 6749 §4.1.1 plus PKCE.
+fn oauth2AuthorizeUrl(s: OAuth2Strategy, state: string, challenge: string): string {
+  let sep = "?"
+  if (contains(s.endpoints.authorize, "?")) {
+    sep = "&"
+  }
+  let query = "response_type=" +
+    percentEncode("code") +
+    "&client_id=" +
+    percentEncode(s.clientId) +
+    "&redirect_uri=" +
+    percentEncode(s.redirectUri)
+  if (len(s.scopes) > 0) {
+    query = query + "&scope=" + percentEncode(join(s.scopes, " "))
+  }
+  return s.endpoints.authorize +
+    sep +
+    query +
+    "&state=" +
+    percentEncode(state) +
+    "&code_challenge=" +
+    percentEncode(challenge) +
+    "&code_challenge_method=" +
+    percentEncode("S256")
+}
+
+// The token request body (RFC 6749 §4.1.3 with RFC 7636 §4.5) and the headers
+// for the chosen `ClientAuth` — see that enum.
+fn oauth2TokenBody(s: OAuth2Strategy, code: string, verifier: string): string {
+  let body = "grant_type=" +
+    percentEncode("authorization_code") +
+    "&code=" +
+    percentEncode(code) +
+    "&redirect_uri=" +
+    percentEncode(s.redirectUri)
+  if (s.clientSecret == "" || s.clientAuth == ClientAuth.Post) {
+    body = body + "&client_id=" + percentEncode(s.clientId)
+  }
+  if (s.clientSecret != "" && s.clientAuth == ClientAuth.Post) {
+    body = body + "&client_secret=" + percentEncode(s.clientSecret)
+  }
+  return body + "&code_verifier=" + percentEncode(verifier)
+}
+
+fn oauth2TokenHeaders(s: OAuth2Strategy): []Header {
+  let headers = []Header{
+    Header{ name = "Content-Type", value = "application/x-www-form-urlencoded" },
+    Header{ name = "Accept", value = "application/json" },
+  }
+  if (s.clientSecret != "" && s.clientAuth == ClientAuth.Basic) {
+    headers = append(headers, basicAuthHeader(s.clientId, s.clientSecret))
+  }
+  return headers
+}
+
+// The token endpoint's answer to `body`: the injected `fetch`, or a real POST
+// under `tls`. An error document arrives as a 400, or a 401 for a failed
+// client authentication (RFC 6749 §5.2), so those bodies are returned for
+// `oauth2AccessToken` to read; any other status fails.
+fn oauth2Post(s: OAuth2Strategy, headers: []Header, body: string): string! {
+  let url = s.endpoints.token
+  if (s.tokenFetch != nil) {
+    let fetch = s.tokenFetch
+    return fetch(url, headers, body)?
+  }
+  let res = Client(tls = unwrap(s.tls)).requestWith("POST", url, headers, body)?
+  if (res.status == 400 || res.status == 401) {
+    return res.body
+  }
+  return checkStatus(url, res)?
+}
+
+fn oauth2Field(j: Json, key: string): string {
+  let v = jsonGet(j, key)
+  if (!isSome(v)) {
+    return ""
+  }
+  let str = jsonAsString(unwrap(v))
+  if (!isSome(str)) {
+    return ""
+  }
+  return unwrap(str)
+}
+
+// The access token in a token response (RFC 6749 §5.1), or the failure it
+// reports: an `OAuth2Error` for an error document, otherwise a malformed
+// response or a `token_type` other than Bearer.
+fn oauth2AccessToken(body: string): string! {
+  let j = jsonParse(body)?
+  let code = oauth2Field(j, "error")
+  if (code != "") {
+    fail oauth2Error(code, oauth2Field(j, "error_description"), oauth2Field(j, "error_uri"))
+  }
+  let token = oauth2Field(j, "access_token")
+  if (token == "") {
+    fail newError("auth: OAuth2Strategy: token response has no 'access_token'")
+  }
+  if (!equalFold(oauth2Field(j, "token_type"), "Bearer")) {
+    fail newError("auth: OAuth2Strategy: token response 'token_type' is not Bearer (RFC 6749 §7.1)")
+  }
+  return token
+}
+
+// The callback's own verdict before any code is spent: an `error` response
+// (RFC 6749 §4.1.2.1) and the RFC 9207 `iss` check — see the file header.
+fn oauth2CheckResponse(s: OAuth2Strategy, c: Ctx): ()! {
+  let code = c.query("error")
+  if (code != "") {
+    fail oauth2Error(code, c.query("error_description"), c.query("error_uri"))
+  }
+  if (s.issuer != "" && c.query("iss") != s.issuer) {
+    fail unauthorized("issuer mismatch")
+  }
+}
+
+// Whether `host` (an authority's host part, port stripped) is a loopback
+// name — RFC 8252 §7.3, the one place plain http is accepted.
+fn oauth2IsLoopback(host: string): bool {
+  return equalFold(host, "localhost") || host == "127.0.0.1" || host == "[::1]"
+}
+
+// The host of the authority in `rest` (a URL after `scheme://`), or "" when
+// the authority has userinfo, which would let `localhost@evil.example` pass.
+fn oauth2Host(rest: string): string {
+  let end = len(rest)
+  for sep of ["/", "?", "#"] {
+    let at = int(indexOf(rest, sep))
+    if (at >= 0 && at < end) {
+      end = at
+    }
+  }
+  let authority = rest[0:end]
+  if (contains(authority, "@")) {
+    return ""
+  }
+  if (hasPrefix(authority, "[")) {
+    return authority[0:int(indexOf(authority, "]")) + 1]
+  }
+  let colon = int(lastIndexOf(authority, ":"))
+  if (colon >= 0) {
+    return authority[0:colon]
+  }
+  return authority
+}
+
+fn oauth2CheckHttps(what: string, url: string): ()! {
+  if (!hasPrefix(url, "https://") || oauth2Host(url[8:len(url)]) == "") {
+    fail newError("auth: OAuth2Strategy(): ${what} '${url}' must be an https URL (RFC 6749 §3.1, §3.2)")
+  }
+}
+
+// RFC 9700 §2.1 and RFC 6749 §3.1.2: an absolute https URI with no fragment,
+// or http on a loopback host.
+fn oauth2CheckRedirect(uri: string): ()! {
+  if (contains(uri, "#")) {
+    fail newError("auth: OAuth2Strategy(): redirectUri '${uri}' has a fragment (RFC 6749 §3.1.2)")
+  }
+  if (hasPrefix(uri, "http://") && oauth2IsLoopback(oauth2Host(uri[7:len(uri)]))) {
+    return
+  }
+  if (!hasPrefix(uri, "https://") || oauth2Host(uri[8:len(uri)]) == "") {
+    fail newError("auth: OAuth2Strategy(): redirectUri '${uri}' must be https, or http on localhost (RFC 9700 §2.1)")
+  }
+}
+
+// RFC 6749 §3.3: each scope is a non-empty token of printable ASCII with no
+// space, double quote or backslash.
+fn oauth2CheckScopes(scopes: []string): ()! {
+  for scope of scopes {
+    if (scope == "") {
+      fail newError("auth: OAuth2Strategy(): a scope is empty (RFC 6749 §3.3)")
+    }
+    for b of []byte(scope) {
+      if (b <= 32 || b == 34 || b == 92 || b >= 127) {
+        fail newError("auth: OAuth2Strategy(): scope '${scope}' has a space, quote, backslash or non-ASCII byte (RFC 6749 §3.3)")
+      }
+    }
+  }
+}
+
+fn oauth2CheckOptions(endpoints: OAuth2Endpoints, clientId: string, opts: OAuth2Options): ()! {
+  oauth2CheckHttps("authorize endpoint", endpoints.authorize)?
+  oauth2CheckHttps("token endpoint", endpoints.token)?
+  if (endpoints.profile == nil) {
+    fail newError("auth: OAuth2Strategy(): `endpoints.profile` is not set — it turns the access token into an Identity")
+  }
+  if (clientId == "") {
+    fail newError("auth: OAuth2Strategy(): clientId is empty")
+  }
+  oauth2CheckScopes(opts.scopes)?
+  if (opts.name == "") {
+    fail newError("auth: OAuth2Strategy(): `name` is empty")
+  }
+  if (opts.issuer != "") {
+    oauth2CheckHttps("issuer", opts.issuer)?
+  }
+  if (opts.tokenFetch == nil && !isSome(opts.tls)) {
+    fail newError("auth: OAuth2Strategy(): `tls` is not set — the token request needs the TlsConfig it runs under (see OAuth2Options)")
+  }
+}
+
+// An OAuth 2.0 authorization-code `Strategy` with PKCE. `beginAuthorization`
+// is the route that sends the browser to the provider; `authenticate` is the
+// route the provider redirects back to. Built with the provider's
+// `OAuth2Endpoints`, the client's id and secret (empty for a public client)
+// and the exact `redirectUri` registered with the provider.
+//
+// Every mistake that is the developer's is an `Error` here, at construction:
+// an endpoint or issuer that is not https, a redirect that is neither https
+// nor loopback http or has a fragment, an empty client id, a missing
+// `profile`, a malformed scope, no `tls` without an injected `tokenFetch`.
+export class OAuth2Strategy {
+  endpoints: OAuth2Endpoints
+  clientId: string
+  clientSecret: string
+  redirectUri: string
+  scopes: []string
+  issuer: string
+  tls: Option<TlsConfig>
+  tokenFetch: TokenFetch
+  clientAuth: ClientAuth
+  label: string
+
+  init(
+    endpoints: OAuth2Endpoints,
+    clientId: string,
+    clientSecret: string,
+    redirectUri: string,
+    opts: OAuth2Options = OAuth2Options{},
+  )! {
+    oauth2CheckOptions(endpoints, clientId, opts)?
+    oauth2CheckRedirect(redirectUri)?
+    this.endpoints = endpoints
+    this.clientId = clientId
+    this.clientSecret = clientSecret
+    this.redirectUri = redirectUri
+    this.scopes = opts.scopes
+    this.issuer = opts.issuer
+    this.tls = opts.tls
+    this.tokenFetch = opts.tokenFetch
+    this.clientAuth = opts.clientAuth
+    this.label = opts.name
+  }
+
+  export name(): string {
+    return this.label
+  }
+
+  // Stores a fresh `state` and PKCE verifier on the session and returns the
+  // 302 to the provider's authorize endpoint carrying the S256 challenge.
+  export beginAuthorization(c: Ctx): Res! {
+    let state = newAuthToken()
+    let verifier = newCodeVerifier()
+    let session = c.session()?
+    session.set(this.key("state"), state)
+    session.set(this.key("verifier"), verifier)
+    return c.redirect(oauth2AuthorizeUrl(this, state, codeChallengeFor(verifier)))
+  }
+
+  // The callback route: checks `state` (single use, constant time) before
+  // anything else, then the provider's `error` and `iss`, exchanges the code
+  // with the verifier, fetches the profile with the access token, regenerates
+  // the session id and stores the `Identity` the way `requireAuth` does.
+  // Refusals are `unauthorized()` (401) or an `OAuth2Error`; a missing or
+  // replayed `state` and a wrong one fail the same way.
+  export authenticate(c: Ctx): Identity! {
+    let session = c.session()?
+    requireStateMatch(session, this.key("state"), c.query("state"))?
+    let verifier = takeRequired(session, this.key("verifier"), "code_verifier")?
+    oauth2CheckResponse(this, c)?
+    let code = c.query("code")
+    if (code == "") {
+      fail unauthorized("missing code")
+    }
+    let body = oauth2Post(this, oauth2TokenHeaders(this), oauth2TokenBody(this, code, verifier))?
+    let profile = this.endpoints.profile
+    let identity = profile(oauth2AccessToken(body)?)?
+    if (identity.id == "") {
+      fail newError("auth: OAuth2Strategy: profile returned an Identity with an empty id")
+    }
+    session.regenerate()?
+    session.set(identitySessionKey, encodeIdentity(identity))
+    return identity
+  }
+
+  key(what: string): string {
+    return "auth:oauth2:${this.label}:${what}"
+  }
+}
