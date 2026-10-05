@@ -1,0 +1,192 @@
+// stdlib/smtp/session.test.bit — `reset` and `noop`, the two commands that let
+// a pooled session be checked and reused (#6872).
+//
+// `fakeClient`, `startFake`, `ehloPlain`, `plainMessage` and the client surface
+// are module siblings (SPEC §19). Nothing here waits on a clock; the silent
+// server cases are in timeout.test.bit.
+
+// The error `call` fails with. Panics when it succeeds: every caller scripts a
+// refusal.
+fn sessionRefusal(c: Client, which: string): SmtpError {
+  if (which == "reset") {
+    c.reset() catch e {
+      return e
+    }
+  } else {
+    c.noop() catch e {
+      return e
+    }
+  }
+  panic("${which} succeeded against a server scripted to refuse")
+}
+
+// The lines of the transcript the fake published, without the empty tail.
+fn transcriptLines(log: chan<string>): []string {
+  let sent = <- log
+  return split(trimSpace(sent), "\r\n")
+}
+
+test "noop puts NOOP on the wire and returns after the 250" {
+  let (c, log) = fakeClient(["250 2.0.0 OK\r\n", "221 Bye\r\n"])
+  c.noop() catch e {
+    assert(false, "noop: ${e.message()}")
+    return
+  }
+  c.quit() catch e {
+    assert(false, "quit: ${e.message()}")
+    return
+  }
+  let lines = transcriptLines(log)
+  assert(len(lines) == 3, "transcript = ${join(lines, " | ")}")
+  assert(lines[1] == "NOOP", "line 1 = '${lines[1]}'")
+}
+
+test "noop is legal before ehlo" {
+  let (port, log) = startFake(["250 OK\r\n", "221 Bye\r\n"]) catch e {
+    assert(false, "startFake: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  c.noop() catch e {
+    assert(false, "noop before ehlo: ${e.message()}")
+    return
+  }
+  c.quit() catch _ {}
+  let lines = transcriptLines(log)
+  assert(lines[0] == "NOOP", "line 0 = '${lines[0]}'")
+}
+
+test "reset before ehlo fails locally and sends nothing" {
+  let (port, log) = startFake(["250 OK\r\n"]) catch e {
+    assert(false, "startFake: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  c.reset() catch e {
+    assert(e.command == "validate" && !e.transient(), "error = ${e.message()}")
+    assert(contains(e.message(), "call ehlo()"), "message = ${e.message()}")
+    c.close()
+    let sent = <- log
+    assert(!contains(sent, "RSET"), "RSET went out before ehlo: '${sent}'")
+    return
+  }
+  assert(false, "reset succeeded without a greeting")
+}
+
+test "reset after MAIL FROM clears the transaction so the next MAIL FROM is accepted" {
+  let (c, log) = fakeClient(
+    [
+      "250 OK\r\n",
+      "250 2.0.0 Reset\r\n",
+      "250 OK\r\n",
+      "250 OK\r\n",
+      "354 Go\r\n",
+      "250 Queued\r\n",
+    ],
+  )
+  c.openMail("abandoned@example.com") catch e {
+    assert(false, "openMail: ${e.message()}")
+    return
+  }
+  c.reset() catch e {
+    assert(false, "reset: ${e.message()}")
+    return
+  }
+  c.send(plainMessage()) catch e {
+    assert(false, "send after reset: ${e.message()}")
+    return
+  }
+  c.close()
+  let lines = transcriptLines(log)
+  assert(lines[1] == "MAIL FROM:<abandoned@example.com>", "line 1 = '${lines[1]}'")
+  assert(lines[2] == "RSET", "line 2 = '${lines[2]}'")
+  assert(lines[3] == "MAIL FROM:<billing@example.com>", "line 3 = '${lines[3]}'")
+}
+
+test "two sends on one Client both succeed, with a noop between them" {
+  let (c, log) = fakeClient(
+    [
+      "250 OK\r\n", "250 OK\r\n", "354 Go\r\n", "250 Queued 1\r\n", "250 OK\r\n", "250 OK\r\n",
+      "250 OK\r\n", "354 Go\r\n", "250 Queued 2\r\n", "221 Bye\r\n",
+    ],
+  )
+  let first = c.send(plainMessage()) catch e {
+    assert(false, "first send: ${e.message()}")
+    return
+  }
+  c.noop() catch e {
+    assert(false, "noop between sends: ${e.message()}")
+    return
+  }
+  let second = c.send(plainMessage()) catch e {
+    assert(false, "second send: ${e.message()}")
+    return
+  }
+  assert(
+    first.queueId == "Queued 1" && second.queueId == "Queued 2",
+    "ids: ${first.queueId}, ${second.queueId}",
+  )
+  c.quit() catch _ {}
+  let sent = <- log
+  assert(len(split(sent, "NOOP\r\n")) == 2, "want one NOOP: '${sent}'")
+  assert(len(split(sent, "MAIL FROM:")) == 3, "want two MAIL FROM: '${sent}'")
+}
+
+// Assert `again` is the refusal of reuse after a 421.
+fn assertClosedReuse(again: SmtpError, which: string) {
+  assert(again.code == 0 && !again.transient(), "reuse via ${which}: ${again.message()}")
+  assert(
+    again.message() == "smtp: the connection was closed after a 421 reply; dial again",
+    "reuse via ${which}: ${again.message()}",
+  )
+}
+
+test "a 421 on noop closes the client and reuse fails as a closed connection" {
+  let (c, log) = fakeClient(["421 4.3.2 Shutting down\r\n"])
+  let err = sessionRefusal(c, "noop")
+  assert(err.code == 421 && err.command == "NOOP", "error = ${err.message()}")
+  assert(err.transient(), "a 421 must be transient")
+  assertClosedReuse(sessionRefusal(c, "noop"), "noop")
+  assertClosedReuse(sessionRefusal(c, "reset"), "reset")
+  c.send(plainMessage()) catch e {
+    assert(contains(e.message(), "closed after a 421 reply"), "send: ${e.message()}")
+    let sent = <- log
+    assert(!contains(sent, "MAIL FROM"), "a closed client wrote to the wire: '${sent}'")
+    return
+  }
+  assert(false, "send went through a client the server had closed")
+}
+
+test "a 421 on reset closes the client" {
+  let (c, _) = fakeClient(["421 4.3.2 Shutting down\r\n"])
+  let err = sessionRefusal(c, "reset")
+  assert(err.code == 421 && err.command == "RSET", "error = ${err.message()}")
+  let again = sessionRefusal(c, "noop")
+  assert(contains(again.message(), "closed after a 421 reply"), "reuse: ${again.message()}")
+}
+
+test "a refusal other than 421 fails with the reply and leaves the client usable" {
+  let (c, _) = fakeClient(["500 5.5.1 Unrecognized\r\n", "250 OK\r\n", "503 5.5.1 Bad sequence\r\n"])
+  let bad = sessionRefusal(c, "noop")
+  assert(bad.code == 500 && bad.command == "NOOP" && !bad.transient(), "error = ${bad.message()}")
+  c.noop() catch e {
+    assert(false, "noop after a 500: ${e.message()}")
+    return
+  }
+  let seq = sessionRefusal(c, "reset")
+  assert(seq.code == 503 && seq.command == "RSET", "error = ${seq.message()}")
+  c.close()
+}
+
+test "noop on a connection the server closed fails with the typed error" {
+  let (c, _) = fakeClient([])
+  let err = sessionRefusal(c, "noop")
+  assert(err.code == 0 && err.transient(), "error = ${err.message()}")
+  c.close()
+}
