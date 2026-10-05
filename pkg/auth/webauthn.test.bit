@@ -1,0 +1,709 @@
+// pkg/auth/webauthn.test.bit — #6958's acceptance for webauthn.bit: the
+// registration ceremony of W3C Web Authentication Level 3 section 7.1.
+//
+//  - creation options: 8 of 8 members, a 32-byte challenge, `excludeCredentials`
+//    filled from the store;
+//  - a published `none` registration (webauthn_vectors.test.bit, go-webauthn's
+//    attestation_test.go: rpId webauthn.io, origin https://webauthn.io) verifies
+//    and stores the credential;
+//  - 9 of 9 required rejections (wrong type, wrong challenge, replayed challenge,
+//    wrong origin, wrong rpIdHash, UP clear, UV required but clear, duplicate
+//    credential id, unsupported algorithm) and 6 more;
+//  - user.id over 64 bytes (and empty) rejected;
+//  - 4 of 4 required invalid constructions (rp.id not a suffix of the origin,
+//    an http origin, no algorithms, an algorithm nothing verifies) and 5 more.
+//
+// Every ceremony runs inside a real `Ctx` (`App.handle`, as middleware.test.bit
+// does) because the challenge lives in the session. `App`, `Config`,
+// `MemoryStore`, `Request`, `Response`, `split` and `jsonEncode` come from
+// middleware.test.bit and strategy.bit; `waHex`, `rpSha`, `buildAd`,
+// `attObj`, `coseKeyBytes` and the `vec*` vectors from webauthn_parse.test.bit,
+// webauthn_bad.test.bit and webauthn_vectors.test.bit (one module).
+
+const regRpId = "webauthn.io"
+const regOrigin = "https://webauthn.io"
+
+fn regRp(): RelyingParty {
+  return RelyingParty{ id = regRpId, name = "WebAuthn.io", origins = [regOrigin] }
+}
+
+fn regUser(): UserEntity {
+  return UserEntity{ id = "user-1", name = "ada@example.com", displayName = "Ada" }
+}
+
+fn regWa(store: CredentialStore, opts: WebAuthnOptions = WebAuthnOptions{}): WebAuthn {
+  return WebAuthn(regRp(), store, opts) catch e {
+    panic("WebAuthn: ${e.message()}")
+  }
+}
+
+// Runs `body` inside a request's `Ctx` and returns what it answers. A panic in
+// the handler would be a 500, which fails the assertion here.
+fn inCtx(body: (Ctx) => string): string {
+  let out = "not run"
+  let app = App(Config{ secret = "test-secret", sessions = MemoryStore(1000) })
+  app.get("/x", (c) => {
+    out = body(c)
+    return c.status(200)
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  let res = app.handle(Request{ method = "GET", path = "/x", headers = "", body = "" })
+  assert(res.status == 200, "handler answered ${res.status}")
+  return out
+}
+
+// Places a pending registration where `beginRegistration` keeps it.
+fn regSeed(c: Ctx, challenge: []byte, expiresAt: i64): string {
+  let p = PendingRegistration{ challenge = challenge, expiresAt = expiresAt, userId = "user-1" }
+  let session = c.session() catch e {
+    return e.message()
+  }
+  session.set(waSessionKey, encodePending(p))
+  return ""
+}
+
+fn regChallenge(options: Json): []byte {
+  let m = jsonGet(options, "challenge")
+  assert(isSome(m), "options have no challenge")
+  return decodeBase64Url(unwrap(jsonAsString(unwrap(m)))) catch e {
+    panic("challenge: ${e.message()}")
+  }
+}
+
+fn regClientData(kind: string, challenge: []byte, origin: string): []byte {
+  return []byte("{\"type\":\"${kind}\",\"challenge\":\"${encodeBase64Url(challenge)}\",\"origin\":\"${origin}\",\"crossOrigin\":false}")
+}
+
+// The `PublicKeyCredential.toJSON()` shape for a response.
+fn regResponse(credId: []byte, clientData: []byte, att: []byte): Json {
+  let inner = Json.JsonObject(
+    [
+      JsonEntry{ key = "clientDataJSON", value = Json.JsonString(encodeBase64Url(clientData)) },
+      JsonEntry{ key = "attestationObject", value = Json.JsonString(encodeBase64Url(att)) },
+      JsonEntry{ key = "transports", value = Json.JsonArray([Json.JsonString("internal")]) },
+    ],
+  )
+  return Json.JsonObject(
+    [
+      JsonEntry{ key = "id", value = Json.JsonString(encodeBase64Url(credId)) },
+      JsonEntry{ key = "type", value = Json.JsonString("public-key") },
+      JsonEntry{ key = "response", value = inner },
+    ],
+  )
+}
+
+// One self-made registration. The zero-effort `regOk()` is accepted by
+// `regWa(MemoryCredentialStore())`; each rejection test changes one field.
+class RegCase {
+  kind: string,
+  origin: string,
+  rp: string,
+  flags: byte,
+  fmt: string,
+  credId: []byte,
+  // "" means the challenge the options issued.
+  challenge: []byte,
+  stmt: Cbor,
+}
+
+fn regOk(): RegCase {
+  return RegCase{
+    kind = "webauthn.create",
+    origin = regOrigin,
+    rp = regRpId,
+    flags = 0x45,
+    fmt = "none",
+    credId = []byte("credential-id-01"),
+    challenge = []byte(0),
+    stmt = Cbor.Map([]CborEntry(0)),
+  }
+}
+
+// begin, then a response built from `rc` over the issued challenge, then
+// finish: "" when it registered, the error message when it did not.
+fn regRun(wa: WebAuthn, c: Ctx, rc: RegCase): string {
+  let options = wa.beginRegistration(c, regUser()) catch e {
+    return "begin: ${e.message()}"
+  }
+  let challenge = regChallenge(options)
+  if (len(rc.challenge) > 0) {
+    challenge = rc.challenge
+  }
+  let key = coseKeyBytes(ecdsaGenerateKey(nistecP256()))
+  let ad = buildAd(rc.rp, rc.flags, 5, rc.credId, key)
+  let att = attObj(rc.fmt, rc.stmt, ad)
+  let response = regResponse(rc.credId, regClientData(rc.kind, challenge, rc.origin), att)
+  wa.finishRegistration(c, response) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+fn regFails(rc: RegCase, opts: WebAuthnOptions, want: string) {
+  let wa = regWa(MemoryCredentialStore(), opts)
+  let got = inCtx((c) => regRun(wa, c, rc))
+  assert(got != "", "want a failure naming '${want}', but it registered")
+  assert(contains(got, want), "want '${want}' in: ${got}")
+}
+
+test "creation options carry 8 of 8 members and a 32-byte challenge" {
+  let wa = regWa(MemoryCredentialStore())
+  let seen = inCtx((c) => {
+    let o = wa.beginRegistration(c, regUser()) catch e {
+      return "begin: ${e.message()}"
+    }
+    let names = [
+      "rp",
+      "user",
+      "challenge",
+      "pubKeyCredParams",
+      "timeout",
+      "excludeCredentials",
+      "authenticatorSelection",
+      "attestation",
+    ]
+    for n of names {
+      if (!isSome(jsonGet(o, n))) {
+        return "missing ${n}"
+      }
+    }
+    if (len(regChallenge(o)) != 32) {
+      return "challenge is ${len(regChallenge(o))} bytes"
+    }
+    return jsonEncode(o)
+  })
+  assert(
+    !hasPrefix(seen, "missing") && !hasPrefix(seen, "begin") && !hasPrefix(seen, "challenge"),
+    seen,
+  )
+  assert(contains(seen, "\"id\":\"webauthn.io\""), "rp id: ${seen}")
+  assert(
+    contains(seen, "\"alg\":-7") && contains(seen, "\"alg\":-8") && contains(seen, "\"alg\":-257"),
+    "algs: ${seen}",
+  )
+  assert(contains(seen, "\"id\":\"dXNlci0x\""), "user.id is base64url('user-1'): ${seen}")
+  assert(
+      contains(seen, "\"attestation\":\"none\"") &&
+      contains(seen, "\"userVerification\":\"preferred\""),
+    seen,
+  )
+  assert(
+      contains(seen, "\"residentKey\":\"preferred\"") &&
+      contains(seen, "\"requireResidentKey\":false"),
+    seen,
+  )
+  assert(!contains(seen, "authenticatorAttachment"), "Any attachment omits the member: ${seen}")
+  assert(contains(seen, "\"timeout\":300000") && contains(seen, "\"excludeCredentials\":[]"), seen)
+}
+
+test "options: every policy value reaches the wire" {
+  let opts = WebAuthnOptions{
+    algorithms = [-257],
+    userVerification = UserVerification.Required,
+    residentKey = ResidentKey.Required,
+    attachment = Attachment.Platform,
+    attestation = AttestationConveyance.Direct,
+    timeoutMs = 60000,
+  }
+  let wa = regWa(MemoryCredentialStore(), opts)
+  let seen = inCtx(
+    (c) => jsonEncode(
+      wa.beginRegistration(c, regUser()) catch e {
+        return e.message()
+      },
+    ),
+  )
+  assert(contains(seen, "\"userVerification\":\"required\""), seen)
+  assert(
+    contains(seen, "\"residentKey\":\"required\"") && contains(seen, "\"requireResidentKey\":true"),
+    seen,
+  )
+  assert(contains(seen, "\"authenticatorAttachment\":\"platform\""), seen)
+  assert(contains(seen, "\"attestation\":\"direct\"") && contains(seen, "\"timeout\":60000"), seen)
+  assert(!contains(seen, "\"alg\":-7"), "only -257 was offered: ${seen}")
+  assert(Attachment.CrossPlatform.wire() == "cross-platform", "cross-platform wire")
+  assert(AttestationConveyance.Enterprise.wire() == "enterprise", "enterprise wire")
+  assert(AttestationConveyance.Indirect.wire() == "indirect", "indirect wire")
+  assert(UserVerification.Discouraged.wire() == "discouraged", "discouraged wire")
+  assert(ResidentKey.Discouraged.wire() == "discouraged", "discouraged resident key wire")
+}
+
+test "a published none registration verifies and is stored" {
+  let store = MemoryCredentialStore()
+  let wa = regWa(store)
+  let att = waHex(vecAtt226())
+  let parsed = parseAttestationObject(att) catch e {
+    panic("vector: ${e.message()}")
+  }
+  let credId = unwrap(parsed.authData.attested).credentialId
+  let out = inCtx((c) => {
+    // The vector's own challenge, placed where `beginRegistration` keeps it.
+    let challenge = decodeBase64Url("-Ri5NZTzJ8b6mvW3TVScLotEoALfgBa2Bn4YSaIObHc") catch e {
+      return "challenge: ${e.message()}"
+    }
+    let seeded = regSeed(c, challenge, now().ns / Second + 300)
+    if (seeded != "") {
+      return seeded
+    }
+    let cred = wa.finishRegistration(c, regResponse(credId, waHex(vecCd115a()), att)) catch e {
+      return e.message()
+    }
+    if (cred.userId != "user-1" ||
+      cred.alg != -7 ||
+      cred.signCount != 0 ||
+      len(cred.aaguid) != 16) {
+      return "bad fields: ${cred.userId} ${cred.alg} ${cred.signCount}"
+    }
+    if (!ctEq(
+      cred.publicKey,
+      waHex("a5010203262001215820fbe9ff42f662b610f27189a789f93abcc1e2c013fa92e827d8f96c9ef92b712822582040941626d81fab32d425a793311932e81831e892dc5bd29dfae07cb6047f54d9"),
+    )) {
+      return "public key is not the COSE_Key as sent"
+    }
+    if (cred.backupEligible ||
+      cred.backupState ||
+      len(cred.transports) != 1 ||
+      cred.transports[0] != "internal") {
+      return "bad flags or transports"
+    }
+    let stored = store.byId(credId) catch e {
+      return e.message()
+    }
+    if (!isSome(stored) || unwrap(stored).userId != "user-1") {
+      return "not stored"
+    }
+    return ""
+  })
+  assert(out == "", out)
+}
+
+test "a registered credential is excluded from the user's next options" {
+  let store = MemoryCredentialStore()
+  let wa = regWa(store)
+  let first = inCtx((c) => regRun(wa, c, regOk()))
+  assert(first == "", first)
+  let seen = inCtx(
+    (c) => jsonEncode(
+      wa.beginRegistration(c, regUser()) catch e {
+        return e.message()
+      },
+    ),
+  )
+  assert(
+    contains(
+      seen,
+      "\"excludeCredentials\":[{\"type\":\"public-key\",\"id\":\"${encodeBase64Url([]byte("credential-id-01"))}\"",
+    ),
+    seen,
+  )
+  assert(contains(seen, "\"transports\":[\"internal\"]"), seen)
+  let other = inCtx(
+    (c) => jsonEncode(
+      wa.beginRegistration(c, UserEntity{ id = "user-2", name = "bob", displayName = "Bob" }) catch e {
+        return e.message()
+      },
+    ),
+  )
+  assert(contains(other, "\"excludeCredentials\":[]"), "another user excludes nothing: ${other}")
+}
+
+test "rejection: wrong clientData type" {
+  let rc = regOk()
+  rc.kind = "webauthn.get"
+  regFails(rc, WebAuthnOptions{}, "clientData type")
+}
+
+test "rejection: wrong challenge" {
+  let rc = regOk()
+  rc.challenge = randomBytes(32)
+  regFails(rc, WebAuthnOptions{}, "challenge does not match")
+}
+
+test "rejection: wrong origin" {
+  let rc = regOk()
+  rc.origin = "https://evil.example"
+  regFails(rc, WebAuthnOptions{}, "is not an allowed origin")
+}
+
+test "rejection: an origin that merely ends with the RP id" {
+  let rc = regOk()
+  rc.origin = "https://notwebauthn.io"
+  regFails(rc, WebAuthnOptions{}, "is not an allowed origin")
+}
+
+test "rejection: wrong rpIdHash" {
+  let rc = regOk()
+  rc.rp = "example.com"
+  regFails(rc, WebAuthnOptions{}, "rpIdHash")
+}
+
+test "rejection: user presence flag clear" {
+  let rc = regOk()
+  rc.flags = 0x44
+  regFails(rc, WebAuthnOptions{}, "UP flag")
+}
+
+test "rejection: user verification required but flag clear" {
+  let rc = regOk()
+  rc.flags = 0x41
+  regFails(rc, WebAuthnOptions{ userVerification = UserVerification.Required }, "UV flag")
+}
+
+test "user verification required and flag set registers" {
+  let rc = regOk()
+  let wa = regWa(
+    MemoryCredentialStore(),
+    WebAuthnOptions{ userVerification = UserVerification.Required },
+  )
+  let got = inCtx((c) => regRun(wa, c, rc))
+  assert(got == "", got)
+}
+
+test "rejection: unsupported algorithm (key is ES256, only RS256 offered)" {
+  regFails(regOk(), WebAuthnOptions{ algorithms = [-257] }, "algorithm -7")
+}
+
+test "rejection: backup state without backup eligibility" {
+  let rc = regOk()
+  rc.flags = 0x55
+  regFails(rc, WebAuthnOptions{}, "BS without BE")
+}
+
+test "rejection: attestation format other than none names the format" {
+  let rc = regOk()
+  rc.fmt = "packed"
+  regFails(rc, WebAuthnOptions{}, "'packed'")
+}
+
+test "rejection: none with a non-empty statement" {
+  let rc = regOk()
+  rc.stmt = Cbor.Map([CborEntry{ key = Cbor.Text("x"), value = Cbor.Uint(1) }])
+  regFails(rc, WebAuthnOptions{}, "empty statement")
+}
+
+test "rejection: no attested credential data" {
+  let rc = regOk()
+  rc.flags = 0x05
+  regFails(rc, WebAuthnOptions{}, "attested credential")
+}
+
+test "rejection: a replayed response, and a duplicate credential id" {
+  let store = MemoryCredentialStore()
+  let wa = regWa(store)
+  let out = inCtx((c) => {
+    let first = regRun(wa, c, regOk())
+    if (first != "") {
+      return "first: ${first}"
+    }
+    // The challenge is spent: finishing again without a new begin has none.
+    let options = wa.beginRegistration(c, regUser()) catch e {
+      return e.message()
+    }
+    let key = coseKeyBytes(ecdsaGenerateKey(nistecP256()))
+    let ad = buildAd(regRpId, 0x45, 0, []byte("credential-id-01"), key)
+    let resp = regResponse(
+      []byte("credential-id-01"),
+      regClientData("webauthn.create", regChallenge(options), regOrigin),
+      attObj("none", Cbor.Map([]CborEntry(0)), ad),
+    )
+    wa.finishRegistration(c, resp) catch e {
+      let dup = e.message()
+      wa.finishRegistration(c, resp) catch e2 {
+        return dup + " | " + e2.message()
+      }
+      return "replay accepted"
+    }
+    return "duplicate accepted"
+  })
+  assert(contains(out, "already registered"), "duplicate id: ${out}")
+  assert(contains(out, "no registration is in progress"), "replay: ${out}")
+}
+
+test "the challenge is spent by a failed attempt" {
+  let wa = regWa(MemoryCredentialStore())
+  let out = inCtx((c) => {
+    let bad = regOk()
+    bad.origin = "https://evil.example"
+    let first = regRun(wa, c, bad)
+    // The correct response to the same challenge now has nothing to match.
+    wa.finishRegistration(c, regResponse([]byte("x"), []byte("{}"), []byte{ 0xa0 })) catch e {
+      return first + " | " + e.message()
+    }
+    return "accepted"
+  })
+  assert(contains(out, "origin"), out)
+  assert(contains(out, "no registration is in progress"), out)
+}
+
+test "rejection: an expired challenge" {
+  let wa = regWa(MemoryCredentialStore())
+  let out = inCtx((c) => {
+    let seeded = regSeed(c, randomBytes(32), now().ns / Second - 1)
+    if (seeded != "") {
+      return seeded
+    }
+    wa.finishRegistration(c, regResponse([]byte("x"), []byte("{}"), []byte{ 0xa0 })) catch e {
+      return e.message()
+    }
+    return "accepted"
+  })
+  assert(contains(out, "expired"), out)
+}
+
+test "rejection: finish with no begin" {
+  let wa = regWa(MemoryCredentialStore())
+  let out = inCtx((c) => {
+    wa.finishRegistration(c, regResponse([]byte("x"), []byte("{}"), []byte{ 0xa0 })) catch e {
+      return e.message()
+    }
+    return "accepted"
+  })
+  assert(contains(out, "no registration is in progress"), out)
+}
+
+test "rejection: a credential id that differs from the one in authenticatorData" {
+  let wa = regWa(MemoryCredentialStore())
+  let out = inCtx((c) => {
+    let options = wa.beginRegistration(c, regUser()) catch e {
+      return e.message()
+    }
+    let key = coseKeyBytes(ecdsaGenerateKey(nistecP256()))
+    let ad = buildAd(regRpId, 0x45, 0, []byte("credential-id-01"), key)
+    let resp = regResponse(
+      []byte("some-other-id"),
+      regClientData("webauthn.create", regChallenge(options), regOrigin),
+      attObj("none", Cbor.Map([]CborEntry(0)), ad),
+    )
+    wa.finishRegistration(c, resp) catch e {
+      return e.message()
+    }
+    return "accepted"
+  })
+  assert(contains(out, "credential id"), out)
+}
+
+test "rejection: malformed responses are errors, not panics" {
+  let wa = regWa(MemoryCredentialStore())
+  let bad = [
+    Json.JsonNull,
+    Json.JsonString("x"),
+    Json.JsonObject([JsonEntry{ key = "response", value = Json.JsonString("x") }]),
+    Json.JsonObject(
+      [
+        JsonEntry{ key = "id", value = Json.JsonString("a=") },
+        JsonEntry{ key = "response", value = Json.JsonObject([]JsonEntry(0)) },
+      ],
+    ),
+  ]
+  for r of bad {
+    let out = inCtx((c) => {
+      wa.beginRegistration(c, regUser()) catch e {
+        return e.message()
+      }
+      wa.finishRegistration(c, r) catch e {
+        return e.message()
+      }
+      return "accepted"
+    })
+    assert(contains(out, "registration response"), out)
+  }
+}
+
+test "across two requests the session carries the challenge" {
+  let store = MemoryCredentialStore()
+  let wa = regWa(store)
+  let app = App(Config{ secret = "test-secret", sessions = MemoryStore(1000) })
+  app.get("/begin", (c) => {
+    let options = wa.beginRegistration(c, regUser()) catch e {
+      return c.text(e.message())
+    }
+    return c.text(jsonEncode(options))
+  })
+  app.post("/finish", (c) => {
+    let body = c.bodyJson() catch e {
+      return c.text(e.message())
+    }
+    let cred = wa.finishRegistration(c, body) catch e {
+      return c.text("refused: ${e.message()}")
+    }
+    return c.text("registered ${encodeBase64Url(cred.id)}")
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  let r1 = app.handle(Request{ method = "GET", path = "/begin", headers = "", body = "" })
+  assert(r1.status == 200, "begin: ${r1.status}")
+  let cookie = split(r1.getHeader("Set-Cookie"), ";")[0]
+  assert(cookie != "", "begin armed no cookie")
+  let options = jsonParse(r1.body) catch e {
+    panic("options: ${e.message()}")
+  }
+  let key = coseKeyBytes(ecdsaGenerateKey(nistecP256()))
+  let ad = buildAd(regRpId, 0x45, 0, []byte("credential-id-02"), key)
+  let resp = regResponse(
+    []byte("credential-id-02"),
+    regClientData("webauthn.create", regChallenge(options), regOrigin),
+    attObj("none", Cbor.Map([]CborEntry(0)), ad),
+  )
+  let req = Request{
+    method = "POST",
+    path = "/finish",
+    headers = "Content-Type: application/json\r\nCookie: ${cookie}",
+    body = jsonEncode(resp),
+  }
+  let r2 = app.handle(req)
+  assert(contains(r2.body, "registered"), "finish: ${r2.body}")
+  let r3 = app.handle(req)
+  assert(contains(r3.body, "no registration is in progress"), "replay: ${r3.body}")
+  // The same response from a browser that never began.
+  let r4 = app.handle(
+    Request{
+      method = "POST",
+      path = "/finish",
+      headers = "Content-Type: application/json",
+      body = jsonEncode(resp),
+    },
+  )
+  assert(contains(r4.body, "no registration is in progress"), "no session: ${r4.body}")
+}
+
+test "user.id: empty and over 64 bytes are rejected, 64 is accepted" {
+  let wa = regWa(MemoryCredentialStore())
+  let out = inCtx((c) => {
+    let long = UserEntity{ id = repeat("u", 65), name = "n", displayName = "N" }
+    wa.beginRegistration(c, long) catch e {
+      let first = e.message()
+      wa.beginRegistration(c, UserEntity{ id = "", name = "n", displayName = "N" }) catch e2 {
+        wa.beginRegistration(c, UserEntity{ id = repeat("u", 64), name = "n", displayName = "N" }) catch e3 {
+          return "64 rejected: ${e3.message()}"
+        }
+        return first + " | " + e2.message()
+      }
+      return "empty accepted"
+    }
+    return "65 accepted"
+  })
+  assert(contains(out, "user.id is 65 bytes"), out)
+  assert(contains(out, "user.id is 0 bytes"), out)
+}
+
+fn badRp(rp: RelyingParty, opts: WebAuthnOptions): string {
+  WebAuthn(rp, MemoryCredentialStore(), opts) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+test "construction: 4 of 4 required invalid configurations fail" {
+  let rp = regRp()
+  let notSuffix = RelyingParty{ id = "example.org", name = "x", origins = [regOrigin] }
+  assert(
+    contains(badRp(notSuffix, WebAuthnOptions{}), "not the host of origin"),
+    badRp(notSuffix, WebAuthnOptions{}),
+  )
+  let http = RelyingParty{ id = regRpId, name = "x", origins = ["http://webauthn.io"] }
+  assert(contains(badRp(http, WebAuthnOptions{}), "https"), badRp(http, WebAuthnOptions{}))
+  assert(
+    contains(badRp(rp, WebAuthnOptions{ algorithms = []int(0) }), "empty"),
+    badRp(rp, WebAuthnOptions{ algorithms = []int(0) }),
+  )
+  assert(
+    contains(badRp(rp, WebAuthnOptions{ algorithms = [-7, -36] }), "-36 cannot be verified"),
+    "alg -36",
+  )
+}
+
+test "construction: 5 more invalid configurations fail, valid ones build" {
+  let rp = regRp()
+  assert(
+    contains(
+      badRp(RelyingParty{ id = "", name = "x", origins = [regOrigin] }, WebAuthnOptions{}),
+      "non-empty",
+    ),
+    "empty id",
+  )
+  assert(
+    contains(
+      badRp(RelyingParty{ id = "io", name = "x", origins = ["https://io"] }, WebAuthnOptions{}),
+      "single label",
+    ),
+    "one label",
+  )
+  assert(
+    contains(
+      badRp(RelyingParty{ id = regRpId, name = "x", origins = []string(0) }, WebAuthnOptions{}),
+      "origins is empty",
+    ),
+    "no origins",
+  )
+  assert(
+    contains(
+      badRp(
+        RelyingParty{ id = regRpId, name = "x", origins = ["https://webauthn.io/path"] },
+        WebAuthnOptions{},
+      ),
+      "origin",
+    ),
+    "path",
+  )
+  assert(
+    contains(
+      badRp(
+        RelyingParty{
+          id = regRpId,
+          name = "x",
+          origins = [regOrigin],
+          topOrigins = ["http://a.example"],
+        },
+        WebAuthnOptions{},
+      ),
+      "top origin",
+    ),
+    "http top origin",
+  )
+  assert(contains(badRp(rp, WebAuthnOptions{ algorithms = [-7, -7] }), "twice"), "duplicate alg")
+  assert(contains(badRp(rp, WebAuthnOptions{ timeoutMs = 0 }), "timeoutMs"), "timeout")
+  assert(
+    contains(
+      badRp(
+        RelyingParty{ id = regRpId, name = "x", origins = ["https://webauthn.io:99999"] },
+        WebAuthnOptions{},
+      ),
+      "port",
+    ),
+    "port",
+  )
+  assert(
+    contains(
+      badRp(
+        RelyingParty{ id = regRpId, name = "x", origins = ["https://evilwebauthn.io"] },
+        WebAuthnOptions{},
+      ),
+      "not the host",
+    ),
+    "suffix without dot",
+  )
+  assert(
+      badRp(
+        RelyingParty{ id = "localhost", name = "x", origins = ["http://localhost:3000"] },
+        WebAuthnOptions{},
+      ) ==
+      "",
+    "localhost over http",
+  )
+  assert(
+      badRp(
+        RelyingParty{
+          id = "example.com",
+          name = "x",
+          origins = ["https://login.example.com", "https://example.com:8443"],
+        },
+        WebAuthnOptions{ algorithms = [-35, -37] },
+      ) ==
+      "",
+    "subdomain, port",
+  )
+  assert(badRp(rp, WebAuthnOptions{}) == "", "default options")
+}

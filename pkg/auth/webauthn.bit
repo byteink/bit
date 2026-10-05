@@ -1,0 +1,197 @@
+// pkg/auth/webauthn.bit — passkey registration (#6958, epic #3960): the
+// server side of W3C Web Authentication Level 3 section 7.1.
+//
+//   let wa = WebAuthn(
+//     RelyingParty{ id = "example.com", name = "Example", origins = ["https://example.com"] },
+//     MemoryCredentialStore(),
+//   )?
+//   let options = wa.beginRegistration(c, UserEntity{ id = "u1", name = "ada@example.com", displayName = "Ada" })?
+//   ... the browser runs navigator.credentials.create() and posts the result ...
+//   let credential = wa.finishRegistration(c, response)?
+//
+// `beginRegistration` returns the options JSON for the browser and keeps a
+// 32-byte challenge and the user in the session, single use and good for 5
+// minutes. `finishRegistration` consumes that challenge FIRST, on every
+// attempt, then runs section 7.1 on the response: the clientDataJSON type,
+// challenge (constant-time) and origin (`checkClientData`), the rpIdHash
+// (`checkRpIdHash`), the flags (UP always, UV when the policy requires it, BS
+// only with BE), the credential id, that the key's algorithm is one that was
+// offered, that no credential with that id exists, and the attestation
+// statement. Only the `none` format is accepted: an attestation statement is
+// how a relying party learns which authenticator model made the key, and this
+// package does not ask that question yet; another format fails naming it.
+//
+// Registration alone binds no session identity: the user is already signed in
+// (or just verified) when they add a passkey, so nothing here calls
+// `bindFirstFactor` (mfa.bit). A login path built on these credentials owes
+// that call.
+//
+// `coseAlg` is the one name imported here; `Ctx`, `Session`, `randomBytes`,
+// `ctEq`, `now`, `Second`, `isSome`, `unwrap`, `parseClientData`,
+// `checkClientData`, `parseAttestationObject` and `checkRpIdHash`
+// (webauthn_parse.bit) are bound module-wide (SPEC §17.1).
+import { coseAlg } from "std/crypto"
+
+// Where the pending registration lives in the session.
+const waSessionKey = "webauthn.registration"
+// Section 13.4.3: a challenge is at least 16 random bytes; 32 is what the
+// one-time tokens here use too.
+const waChallengeBytes = 32
+// How long a challenge lives, in seconds.
+const waChallengeTtl: i64 = 300
+// Section 5.4.3: the user handle is at most 64 bytes.
+const waMaxUserIdLen = 64
+
+// A relying party ready to register passkeys. `WebAuthn(rp, store, opts)`
+// fails when the configuration cannot work (see webauthn_config.bit), so a
+// mistake stops the app at startup.
+export class WebAuthn {
+  rp: RelyingParty
+  store: CredentialStore
+  opts: WebAuthnOptions
+
+  init(rp: RelyingParty, store: CredentialStore, opts: WebAuthnOptions = WebAuthnOptions{})! {
+    checkRelyingParty(rp)?
+    checkAlgorithms(opts.algorithms)?
+    if (opts.timeoutMs < 1) {
+      fail newError("auth: WebAuthn(): `timeoutMs` is ${opts.timeoutMs} — it must be positive")
+    }
+    this.rp = rp
+    this.store = store
+    this.opts = opts
+  }
+
+  // The options for `navigator.credentials.create({ publicKey })` (hand them to
+  // `PublicKeyCredential.parseCreationOptionsFromJSON`). Fails for a `user.id`
+  // that is empty or over 64 bytes, and when the session or the store is
+  // unavailable.
+  export beginRegistration(c: Ctx, user: UserEntity): Json! {
+    checkUserEntity(user)?
+    let existing = this.store.forUser(user.id)?
+    let challenge = randomBytes(waChallengeBytes)
+    let pending = PendingRegistration{
+      challenge = challenge,
+      expiresAt = now().ns / Second + waChallengeTtl,
+      userId = user.id,
+    }
+    let session = c.session()?
+    session.set(waSessionKey, encodePending(pending))
+    session.save()?
+    return creationOptions(this.rp, this.opts, user, challenge, existing)
+  }
+
+  // Verifies the browser's `PublicKeyCredential.toJSON()` and stores the
+  // credential. The challenge is spent whether this succeeds or not, so a
+  // response cannot be tried twice. Every failure is an error naming the step
+  // of section 7.1 that refused it.
+  export finishRegistration(c: Ctx, response: Json): Credential! {
+    let pending = takePending(c.session()?)?
+    let r = parseRegistrationResponse(response)?
+    let cd = parseClientData(r.clientData)?
+    checkClientData(cd, "webauthn.create", pending.challenge, this.rp.origins, this.rp.topOrigins)?
+    let att = parseAttestationObject(r.attestation)?
+    this.checkFlags(att.authData)?
+    checkNoneStatement(att)?
+    let ac = this.checkCredential(att.authData, r)?
+    let credential = Credential{
+      id = ac.credentialId,
+      userId = pending.userId,
+      publicKey = ac.publicKeyBytes,
+      alg = coseAlg(ac.publicKey),
+      signCount = att.authData.signCount,
+      aaguid = ac.aaguid,
+      backupEligible = att.authData.be,
+      backupState = att.authData.bs,
+      transports = r.transports,
+      createdAt = now().ns / Second,
+      name = "",
+    }
+    this.store.add(credential)?
+    return credential
+  }
+
+  // Section 7.1 steps 13 to 16: the rpIdHash, user presence, and user
+  // verification when the policy requires it.
+  checkFlags(ad: AuthenticatorData): ()! {
+    checkRpIdHash(ad, this.rp.id)?
+    if (!ad.up) {
+      fail newError("auth: webauthn: authenticatorData does not have the UP flag (user presence)")
+    }
+    if (this.opts.userVerification.wire() == "required" && !ad.uv) {
+      fail newError("auth: webauthn: user verification is required and authenticatorData does not have the UV flag")
+    }
+  }
+
+  // Section 7.1 steps 20 and 25: the attested credential exists, is the one
+  // the browser named, uses an offered algorithm and is not registered yet.
+  checkCredential(ad: AuthenticatorData, r: RegistrationResponse): AttestedCredential! {
+    if (!isSome(ad.attested)) {
+      fail newError("auth: webauthn: authenticatorData has no attested credential data (the AT flag is clear)")
+    }
+    let ac = unwrap(ad.attested)
+    if (!ctEq(ac.credentialId, r.id)) {
+      fail newError("auth: webauthn: the credential id in the response is not the one in authenticatorData")
+    }
+    let alg = coseAlg(ac.publicKey)
+    if (!algOffered(this.opts.algorithms, alg)) {
+      fail newError("auth: webauthn: the credential's algorithm ${alg} is not one that was offered")
+    }
+    if (isSome(this.store.byId(ac.credentialId)?)) {
+      fail newError("auth: webauthn: a credential with this id is already registered")
+    }
+    return ac
+  }
+}
+
+fn algOffered(algs: []int, alg: int): bool {
+  for a of algs {
+    if (a == alg) {
+      return true
+    }
+  }
+  return false
+}
+
+// Section 5.4.3: an empty or over-long user handle, and an empty name, are the
+// application's mistake, and an over-long handle is refused by authenticators.
+fn checkUserEntity(user: UserEntity): ()! {
+  if (len(user.id) == 0 || len([]byte(user.id)) > waMaxUserIdLen) {
+    fail newError("auth: webauthn: user.id is ${len([]byte(user.id))} bytes, want 1 to ${waMaxUserIdLen} (an opaque stable id, never an e-mail address)")
+  }
+  if (user.name == "") {
+    fail newError("auth: webauthn: user.name is empty")
+  }
+}
+
+// Reads and DELETES the pending registration, saving the session before
+// anything else happens: the session store's compare-and-set makes two
+// concurrent attempts at one challenge race here, and only one proceeds.
+fn takePending(session: Session): PendingRegistration! {
+  let raw = session.get(waSessionKey)
+  if (raw == "") {
+    fail newError("auth: webauthn: no registration is in progress for this session")
+  }
+  session.delete(waSessionKey)
+  session.save()?
+  let p = decodePending(raw)?
+  if (p.expiresAt <= now().ns / Second) {
+    fail newError("auth: webauthn: the registration challenge expired")
+  }
+  return p
+}
+
+// Section 7.1 steps 22 to 24 for format `none`: the statement is an empty map
+// and there is nothing to verify or to trust.
+fn checkNoneStatement(att: AttestationObject): ()! {
+  if (att.fmt != "none") {
+    fail newError("auth: webauthn: attestation format '${att.fmt}' is not supported yet, only 'none'")
+  }
+  match (att.attStmt) {
+    Map(entries) => {
+      if (len(entries) != 0) {
+        fail newError("auth: webauthn: attestation format 'none' must have an empty statement")
+      }
+    }
+    _ => fail newError("auth: webauthn: attestation statement is not a map")
+  }
+}
