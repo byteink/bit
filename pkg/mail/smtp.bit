@@ -1,37 +1,62 @@
 // pkg/mail/smtp.bit — the SMTP `Transport` `open` returns (open.bit parses the
-// URL). One connection per send: connect, EHLO, TLS, login, `Client.send`,
-// QUIT. Pooling is a later part of this package.
+// URL). Sessions come from a pool (smtppool.bit): connect, EHLO, TLS and login
+// happen once per session, then `Client.send` runs once per transaction, and a
+// session is quit when it is retired or the mailer is closed.
 //
 // The TLS rule: `smtps://` is TLS from the first byte; `smtp://` runs STARTTLS
 // and a server that does not offer it fails the send with a `Config` error.
 // There is no path from here to a plaintext session except `?tls=off`, which
 // open.bit only allows without credentials.
 
-import { Auth, Client, Delivery as SmtpDelivery, Raw, SmtpError, dial, dialTls } from "std/smtp"
+import { Auth, Client, Delivery as SmtpDelivery, SmtpError, dial, dialTls } from "std/smtp"
 
 class SmtpTransport {
   t: Target
   hello: string
+  sessions: SessionPool
 
-  init(t: Target, hello: string) {
+  // `opts.pool` sessions at most, `opts.timeout` for every wait. Nothing is
+  // connected until the first `deliver`.
+  init(t: Target, hello: string, opts: Options, idleAfter: int = idleProbeAfter) {
     this.t = t
     this.hello = hello
+    let dialIt: () => Client!MailError = () => {
+      return this.connect()?
+    }
+    let liftIt: (SmtpError) => MailError = (e) => {
+      return this.lift(e)
+    }
+    this.sessions = SessionPool(dialIt, liftIt, opts, idleAfter)
   }
 
-  // Sends `d` over a fresh connection. A refusal from the server maps to
+  // Sends `d` over a pooled session. A refusal from the server maps to
   // `MailError`: 535, 534 and 530 to `Auth`, a 4xx or a network failure to
   // `Transient`, a refusal made before anything was sent to `Invalid`, and any
   // other failure to `Rejected`. Recipients the server refused while taking
-  // the rest are in `Receipt.rejected`.
+  // the rest are in `Receipt.rejected`. More recipients than the server's
+  // `RCPTMAX` go in several transactions; the `Receipt` merges them, and a
+  // transaction that fails after another took the mail lists its recipients,
+  // and every later one, as rejected rather than failing the send.
   export deliver(d: Delivery): Receipt!MailError {
-    let c = this.connect()?
-    defer c.close()
-    let out = c.send(Raw(d.envelope, d.raw)) catch e {
-      fail this.lift(e)
+    let rest = d.envelope.to
+    if (len(rest) == 0) {
+      fail MailError.Invalid("the envelope has no recipients")
     }
-    // The server has the mail; a QUIT that fails does not undo that.
-    c.quit() catch _ {}
-    return this.receipt(d, out)
+    let r = Receipt{ id = d.messageId }
+    while (len(rest) > 0) {
+      let p = this.sessions.send(d.envelope, rest, d.raw) catch e {
+        if (len(r.accepted) == 0 && len(r.rejected) == 0) {
+          fail e
+        }
+        for x of rejectAll(rest, e) {
+          r.rejected = append(r.rejected, x)
+        }
+        return r
+      }
+      mergeReceipt(r, this.receipt(d, p.out))
+      rest = rest[p.n:]
+    }
+    return r
   }
 
   // The server gets `Delivery.raw` as it is.
@@ -39,8 +64,10 @@ class SmtpTransport {
     return true
   }
 
-  // One connection per send: nothing to release.
-  export close() {}
+  // Quits the idle sessions; later sends fail `Invalid("mailer is closed")`.
+  export close() {
+    this.sessions.close()
+  }
 
   // The URL with the password hidden, `smtp://user:***@host:587`.
   export toString(): string {
@@ -155,6 +182,36 @@ class SmtpTransport {
       accepted = out.accepted,
       rejected = no,
     }
+  }
+}
+
+// `to`, each with the reply `e` stands for.
+fn rejectAll(to: []string, e: MailError): []Rejection {
+  let why = Reply{ text = e.message() }
+  match (e) {
+    Auth(r) => why = r
+    Rejected(r) => why = r
+    Transient(r) => why = r
+    _ => why = Reply{ text = e.message() }
+  }
+  let out: []Rejection = []
+  for a of to {
+    out = append(out, Rejection{ address = a, reply = why })
+  }
+  return out
+}
+
+// Adds what `p`, one transaction's receipt, says to `r`; the first one's
+// provider id stands for the message.
+fn mergeReceipt(r: Receipt, p: Receipt) {
+  if (r.providerId == "") {
+    r.providerId = p.providerId
+  }
+  for a of p.accepted {
+    r.accepted = append(r.accepted, a)
+  }
+  for x of p.rejected {
+    r.rejected = append(r.rejected, x)
   }
 }
 

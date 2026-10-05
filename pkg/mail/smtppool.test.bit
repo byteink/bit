@@ -1,0 +1,522 @@
+// pkg/mail/smtppool.test.bit — `Options.pool` (smtppool.bit) against a counting
+// fake SMTP server: a real listener that speaks the commands a session needs
+// (EHLO, MAIL, RCPT, DATA, RSET, NOOP, QUIT) on as many connections as the
+// client opens, and counts what it saw per kind. Every number asserted below is
+// a server-side count, never the client's own bookkeeping.
+//
+// The fake is told how to misbehave through `PfFake` fields: `ehloExtra` adds
+// capability lines (`LIMITS`), `killAfterData` closes the socket right after it
+// answers a message (a server's idle timeout, seen by the client only on its
+// next use), `dieAtDot` closes without answering the final `.` (the outcome the
+// client cannot know), `refuseRcpt` answers RCPT with 550.
+
+import { listen, Listener, Conn as TcpConn } from "std/net"
+import { Mutex } from "std/sync"
+import { Millisecond, Second, monotonic, sleep } from "std/time"
+
+const pfMaxTurns: int = 4096
+
+class PfFake {
+  ln: Listener,
+  mu: Mutex,
+  ehloExtra: string,
+  killAfterData: bool,
+  dieAtDot: bool,
+  refuseRcpt: bool,
+  rcptMax: int,
+  conns: int,
+  mails: int,
+  msgs: int,
+  rsets: int,
+  noops: int,
+  quits: int,
+}
+
+// What one connection is in the middle of.
+class PfConn {
+  rcpts: int,
+  inData: bool,
+}
+
+fn pfStart(extra: string): (PfFake, int)! {
+  let ln = listen("127.0.0.1", 0)?
+  let port = ln.port()?
+  let f = PfFake{
+    ln = ln, mu = Mutex(), ehloExtra = extra, killAfterData = false, dieAtDot = false,
+    refuseRcpt = false, rcptMax = 0, conns = 0, mails = 0, msgs = 0, rsets = 0, noops = 0,
+    quits = 0,
+  }
+  spawn pfAccept(f)
+  return (f, port)
+}
+
+fn pfAccept(f: PfFake) {
+  let turns = 0
+  while (turns < pfMaxTurns) {
+    turns = turns + 1
+    let c = f.ln.accept() catch _ {
+      return
+    }
+    f.mu.lock()
+    f.conns = f.conns + 1
+    f.mu.unlock()
+    spawn pfServe(f, c)
+  }
+}
+
+fn pfServe(f: PfFake, c: TcpConn) {
+  c.write("220 fake.example.com ESMTP\r\n") catch _ {
+    c.close()
+    return
+  }
+  let st = PfConn{ rcpts = 0, inData = false }
+  let buf = ""
+  let turns = 0
+  while (turns < pfMaxTurns) {
+    turns = turns + 1
+    let chunk = c.read(65536)
+    if (len(chunk) == 0) {
+      break
+    }
+    buf = buf + chunk
+    let (rest, stop) = pfDrain(f, c, st, buf)
+    buf = rest
+    if (stop) {
+      break
+    }
+  }
+  c.close()
+}
+
+// Answers every complete command in `buf`; returns what is left and whether
+// the connection is over.
+fn pfDrain(f: PfFake, c: TcpConn, st: PfConn, buf: string): (string, bool) {
+  let rest = buf
+  let turns = 0
+  while (turns < pfMaxTurns) {
+    turns = turns + 1
+    let end = indexOf(rest, "\r\n")
+    if (st.inData) {
+      end = indexOf(rest, "\r\n.\r\n")
+    }
+    if (end < 0) {
+      return (rest, false)
+    }
+    let stop = false
+    if (st.inData) {
+      rest = rest[end + 5:]
+      stop = pfEndData(f, c, st)
+    } else {
+      let line = rest[0:end]
+      rest = rest[end + 2:]
+      stop = pfCommand(f, c, st, line)
+    }
+    if (stop) {
+      return (rest, true)
+    }
+  }
+  return (rest, true)
+}
+
+fn pfEndData(f: PfFake, c: TcpConn, st: PfConn): bool {
+  st.inData = false
+  f.mu.lock()
+  f.msgs = f.msgs + 1
+  let die = f.dieAtDot
+  let kill = f.killAfterData
+  f.mu.unlock()
+  if (die) {
+    return true
+  }
+  c.write("250 2.0.0 Ok: queued as 4Bx1\r\n") catch _ {
+    return true
+  }
+  return kill
+}
+
+fn pfReply(c: TcpConn, text: string): bool {
+  c.write(text) catch _ {
+    return true
+  }
+  return false
+}
+
+fn pfCommand(f: PfFake, c: TcpConn, st: PfConn, line: string): bool {
+  let verb = toLower(line)
+  if (hasPrefix(verb, "ehlo")) {
+    return pfReply(c, "250-fake.example.com\r\n${f.ehloExtra}250 SIZE 35882577\r\n")
+  }
+  if (hasPrefix(verb, "mail")) {
+    f.mu.lock()
+    f.mails = f.mails + 1
+    f.mu.unlock()
+    st.rcpts = 0
+    return pfReply(c, "250 2.1.0 OK\r\n")
+  }
+  if (hasPrefix(verb, "rcpt")) {
+    return pfRcpt(f, c, st)
+  }
+  if (verb == "data") {
+    st.inData = true
+    return pfReply(c, "354 Go ahead\r\n")
+  }
+  return pfOther(f, c, verb)
+}
+
+fn pfRcpt(f: PfFake, c: TcpConn, st: PfConn): bool {
+  st.rcpts = st.rcpts + 1
+  if (f.refuseRcpt) {
+    return pfReply(c, "550 5.1.1 No such user\r\n")
+  }
+  if (f.rcptMax > 0 && st.rcpts > f.rcptMax) {
+    return pfReply(c, "452 4.5.3 Too many recipients\r\n")
+  }
+  return pfReply(c, "250 2.1.5 OK\r\n")
+}
+
+fn pfOther(f: PfFake, c: TcpConn, verb: string): bool {
+  f.mu.lock()
+  if (verb == "rset") {
+    f.rsets = f.rsets + 1
+  }
+  if (verb == "noop") {
+    f.noops = f.noops + 1
+  }
+  if (verb == "quit") {
+    f.quits = f.quits + 1
+  }
+  f.mu.unlock()
+  if (verb == "quit") {
+    let _ = pfReply(c, "221 Bye\r\n")
+    return true
+  }
+  return pfReply(c, "250 OK\r\n")
+}
+
+// One counter, read under the lock.
+fn pfGet(f: PfFake, what: string): int {
+  f.mu.lock()
+  let n = 0
+  if (what == "conns") {
+    n = f.conns
+  } else if (what == "mails") {
+    n = f.mails
+  } else if (what == "msgs") {
+    n = f.msgs
+  } else if (what == "rsets") {
+    n = f.rsets
+  } else if (what == "noops") {
+    n = f.noops
+  } else if (what == "quits") {
+    n = f.quits
+  }
+  f.mu.unlock()
+  return n
+}
+
+// The count of `what` once it has reached `want`, or what it stayed at: a QUIT
+// is read by the fake after the client's call returned.
+fn pfAwait(f: PfFake, what: string, want: int): int {
+  let i = 0
+  while (i < 100) {
+    if (pfGet(f, what) >= want) {
+      break
+    }
+    sleep(10 * Millisecond)
+    i = i + 1
+  }
+  return pfGet(f, what)
+}
+
+fn pfOpts(pool: int): Options {
+  return Options{
+    from = "Inkwell <hello@inkwell.dev>",
+    timeout = 10 * Second,
+    retry = Retry{ attempts = 1 },
+    pool = pool,
+  }
+}
+
+fn pfMailer(port: int, pool: int, idleAfter: int): Mailer {
+  let t = parseTarget("smtp://127.0.0.1:${port}?tls=off") catch e {
+    panic("target: ${e.message()}")
+  }
+  t.tls.timeout = 10 * Second
+  return Mailer(SmtpTransport(t, "inkwell.dev", pfOpts(pool), idleAfter), pfOpts(pool)) catch e {
+    panic("mailer: ${e.message()}")
+  }
+}
+
+fn pfSend(m: Mailer, n: int) {
+  m.send(smMsg(["sara${n}@example.com"])) catch e {
+    panic("send ${n}: ${e.message()}")
+  }
+}
+
+fn pfTask(m: Mailer, n: int, done: chan<int>) {
+  let ok = 1
+  m.send(smMsg(["sara${n}@example.com"])) catch _ {
+    ok = 0
+  }
+  done <- ok
+}
+
+test "50 sequential sends through pool = 2 open exactly one connection" {
+  let (f, port) = pfStart("") catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let m = pfMailer(port, 2, 30 * Second)
+  let i = 0
+  while (i < 50) {
+    pfSend(m, i)
+    i = i + 1
+  }
+  assert(pfGet(f, "conns") == 1, "connections: ${pfGet(f, "conns")}")
+  assert(pfGet(f, "msgs") == 50, "messages: ${pfGet(f, "msgs")}")
+  m.close()
+  assert(pfAwait(f, "quits", 1) == 1, "the session was not quit on close")
+  f.ln.close()
+}
+
+test "50 concurrent sends through pool = 2 open at most two connections" {
+  let (f, port) = pfStart("") catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let m = pfMailer(port, 2, 30 * Second)
+  let done = chan<int>(50)
+  let i = 0
+  while (i < 50) {
+    spawn pfTask(m, i, done)
+    i = i + 1
+  }
+  let ok = 0
+  i = 0
+  while (i < 50) {
+    ok = ok + <- done
+    i = i + 1
+  }
+  assert(ok == 50, "sends that failed: ${50 - ok}")
+  assert(pfGet(f, "msgs") == 50, "messages: ${pfGet(f, "msgs")}")
+  assert(pfGet(f, "conns") <= 2, "connections: ${pfGet(f, "conns")}")
+  m.close()
+  f.ln.close()
+}
+
+test "LIMITS MAILMAX=10 retires a session after ten messages and quits it" {
+  let (f, port) = pfStart("250-LIMITS MAILMAX=10\r\n") catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let m = pfMailer(port, 2, 30 * Second)
+  let i = 0
+  while (i < 25) {
+    pfSend(m, i)
+    i = i + 1
+  }
+  assert(pfGet(f, "conns") == 3, "connections: ${pfGet(f, "conns")}")
+  assert(pfGet(f, "msgs") == 25, "messages: ${pfGet(f, "msgs")}")
+  assert(pfAwait(f, "quits", 2) == 2, "retired sessions quit: ${pfGet(f, "quits")}")
+  m.close()
+  assert(pfAwait(f, "quits", 3) == 3, "quits after close: ${pfGet(f, "quits")}")
+  f.ln.close()
+}
+
+test "a session idle past the threshold is probed with NOOP and kept when it answers" {
+  let (f, port) = pfStart("") catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let m = pfMailer(port, 1, 0)
+  let i = 0
+  while (i < 5) {
+    pfSend(m, i)
+    i = i + 1
+  }
+  assert(pfGet(f, "conns") == 1, "connections: ${pfGet(f, "conns")}")
+  assert(pfGet(f, "noops") == 4, "NOOPs: ${pfGet(f, "noops")}")
+  m.close()
+  f.ln.close()
+}
+
+test "a server that closed the idle socket costs a failed NOOP and a fresh session, not the send" {
+  let (f, port) = pfStart("") catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  f.killAfterData = true
+  let m = pfMailer(port, 2, 0)
+  pfSend(m, 1)
+  pfSend(m, 2)
+  pfSend(m, 3)
+  assert(pfGet(f, "conns") == 3, "connections: ${pfGet(f, "conns")}")
+  assert(pfGet(f, "msgs") == 3, "messages: ${pfGet(f, "msgs")}")
+  assert(pfGet(f, "noops") == 0, "a dead socket answered NOOP")
+  m.close()
+  f.ln.close()
+}
+
+test "a pooled session found dead at MAIL FROM is replaced and the mail is sent once" {
+  let (f, port) = pfStart("") catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  f.killAfterData = true
+  // No idle probe: the send itself finds the socket dead.
+  let m = pfMailer(port, 2, 3600 * Second)
+  pfSend(m, 1)
+  pfSend(m, 2)
+  pfSend(m, 3)
+  assert(pfGet(f, "msgs") == 3, "three sends stored ${pfGet(f, "msgs")} messages")
+  assert(pfGet(f, "conns") == 3, "connections: ${pfGet(f, "conns")}")
+  m.close()
+  f.ln.close()
+}
+
+test "a connection lost after the final dot is reported and the mail is not sent again" {
+  let (f, port) = pfStart("") catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  f.dieAtDot = true
+  let m = pfMailer(port, 2, 0)
+  m.send(smMsg(["sara@example.com"])) catch e {
+    match (e) {
+      Transient(_) => {
+        assert(pfGet(f, "msgs") == 1, "the server stored ${pfGet(f, "msgs")}")
+        assert(pfGet(f, "conns") == 1, "connections: ${pfGet(f, "conns")}")
+        m.close()
+        f.ln.close()
+        return
+      }
+      _ => assert(false, "want Transient, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "the send succeeded without an answer to the final dot")
+}
+
+test "RCPTMAX=2 with 5 recipients is three transactions on one session and one Receipt" {
+  let (f, port) = pfStart("250-LIMITS RCPTMAX=2\r\n") catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  f.rcptMax = 2
+  let m = pfMailer(port, 2, 30 * Second)
+  let to = ["a@example.com", "b@example.com", "c@example.com", "d@example.com", "e@example.com"]
+  let r = m.send(smMsg(to)) catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  assert(pfGet(f, "mails") == 3, "transactions: ${pfGet(f, "mails")}")
+  assert(pfGet(f, "conns") == 1, "connections: ${pfGet(f, "conns")}")
+  assert(len(r.accepted) == 5, "accepted: ${join(r.accepted, ",")}")
+  assert(len(r.rejected) == 0, "rejected: ${len(r.rejected)}")
+  assert(contains(r.providerId, "queued as 4Bx1"), "providerId: ${r.providerId}")
+  m.close()
+  f.ln.close()
+}
+
+test "a message the server refused leaves the session in use after RSET" {
+  let (f, port) = pfStart("") catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  f.refuseRcpt = true
+  let m = pfMailer(port, 1, 30 * Second)
+  m.send(smMsg(["nobody@example.com"])) catch e {
+    match (e) {
+      Rejected(_) => {}
+      _ => assert(false, "want Rejected, got ${e.message()}")
+    }
+    f.refuseRcpt = false
+    pfSend(m, 2)
+    assert(pfGet(f, "conns") == 1, "a refusal cost the session: ${pfGet(f, "conns")} connections")
+    assert(pfGet(f, "rsets") >= 1, "no RSET after the refusal")
+    assert(pfGet(f, "msgs") == 1, "messages: ${pfGet(f, "msgs")}")
+    m.close()
+    f.ln.close()
+    return
+  }
+  assert(false, "a refused recipient was accepted")
+}
+
+test "a send that finds every session busy fails Transient within the timeout" {
+  let (f, port) = pfStart("") catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let t = parseTarget("smtp://127.0.0.1:${port}?tls=off") catch e {
+    assert(false, "target: ${e.message()}")
+    return
+  }
+  let o = Options{
+    from = "Inkwell <hello@inkwell.dev>", timeout = 200 * Millisecond, pool = 1,
+    retry = Retry{ attempts = 1 },
+  }
+  let tr = SmtpTransport(t, "inkwell.dev", o)
+  let m = Mailer(tr, o) catch e {
+    assert(false, "mailer: ${e.message()}")
+    return
+  }
+  let held = tr.sessions.pool.acquire() catch e {
+    assert(false, "acquire: ${e.message()}")
+    return
+  }
+  let started = monotonic().ns
+  m.send(smMsg(["sara@example.com"])) catch e {
+    match (e) {
+      Transient(r) => assert(r.text == "all 1 SMTP sessions busy", r.text)
+      _ => assert(false, "want Transient, got ${e.message()}")
+    }
+    assert(monotonic().ns - started < 5 * Second, "the wait was not bounded")
+    tr.sessions.pool.release(held, true)
+    m.close()
+    f.ln.close()
+    return
+  }
+  assert(false, "a send went through with the only session held")
+}
+
+test "a closed mailer refuses later sends" {
+  let (f, port) = pfStart("") catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let m = pfMailer(port, 2, 30 * Second)
+  pfSend(m, 1)
+  m.close()
+  m.send(smMsg(["sara@example.com"])) catch e {
+    match (e) {
+      Invalid(why) => assert(why == "mailer is closed", why)
+      _ => assert(false, "want Invalid, got ${e.message()}")
+    }
+    assert(pfGet(f, "conns") == 1, "a closed mailer connected")
+    f.ln.close()
+    return
+  }
+  assert(false, "a closed mailer sent")
+}
+
+test "Options.pool outside 1 to 100 is a Config at Mailer and at open" {
+  for n of [0, -1, 101] {
+    let o = Options{ pool = n }
+    Mailer(Outbox(), o) catch e {
+      match (e) {
+        Config(why) => assert(contains(why, "Options.pool"), why)
+        _ => assert(false, "want Config, got ${e.message()}")
+      }
+      continue
+    }
+    assert(false, "Mailer took pool = ${n}")
+  }
+  open("smtp://127.0.0.1:2525?tls=off", Options{ pool = 0 }) catch e {
+    match (e) {
+      Config(why) => assert(contains(why, "Options.pool"), why)
+      _ => assert(false, "want Config, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "open took pool = 0")
+}

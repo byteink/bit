@@ -1,0 +1,251 @@
+// pkg/mail/smtppool.bit — the session pool behind `Options.pool`: an SMTP
+// connection costs a TCP handshake, TLS and a login, so a program that sends
+// ten thousand mails keeps authenticated sessions and runs one transaction
+// after another on each (RFC 5321 §3.3: a session carries many transactions).
+//
+// The pool is `std/sync`'s `Pool<Session>`, which bounds the sockets, serves
+// waiters in order, ends a wait at `Options.timeout` and retires a session past
+// its age. What this file adds is what only SMTP knows:
+//
+//   * a session idle longer than `idleAfter` is probed with NOOP (RFC 5321
+//     §4.1.1.9) before it is lent, since a server may close an idle socket
+//     whenever it likes (§4.1.4); a probe that fails discards it and the
+//     caller gets another;
+//   * a transaction the server refused leaves the session in use only when
+//     RSET (§4.1.1.5) is answered 250; a failure with no reply, a timeout and
+//     a 421 discard it;
+//   * a session ends after `LIMITS MAILMAX` transactions (RFC 9422 §4.1), 100
+//     when the server names none, and after `maxAge`, with QUIT;
+//   * a pooled session found dead when the next transaction starts is replaced
+//     and the transaction repeated, but only while the server cannot have the
+//     mail yet: a failure before the final `.` of DATA has put nothing in a
+//     queue, and one after it is reported, never repeated here (§4.1.1.4: the
+//     outcome is unknown, so a retry layer decides, knowing it may duplicate).
+
+import { Client, Delivery as SmtpDelivery, Envelope, Raw, SmtpError } from "std/smtp"
+import { Lease, Mutex, Pool, PoolOptions } from "std/sync"
+import { Millisecond, Second, monotonic } from "std/time"
+
+// Nodemailer's default, used when the server advertises no MAILMAX.
+const defaultMailMax: int = 100
+
+// A session idle for longer than this gets a NOOP before it is used.
+const idleProbeAfter: int = 30 * Second
+
+// The oldest a session gets, in milliseconds.
+const sessionMaxAgeMs: int = 300000
+
+// One authenticated connection and what the pool must know about it.
+class Session {
+  c: Client,
+  // Transactions started on it, successful or not: a server counts every MAIL.
+  uses: int,
+  // Retire after this many.
+  max: int,
+  // The monotonic ns of the last time it was opened or used.
+  last: int,
+  // Set when the connection can no longer be trusted; it is then closed, not
+  // quit.
+  bad: bool,
+}
+
+// Why `Pool` could not open a session. The pool reports a plain `error`, and a
+// `MailError` cannot be asserted back out of one (its tag 0 carries a
+// payload), so the cause rides in this.
+class DialError {
+  why: MailError
+
+  message(): string {
+    return this.why.message()
+  }
+}
+
+// What one transaction took: the server's answer and how many of the offered
+// recipients it covered.
+class Part {
+  out: SmtpDelivery,
+  n: int,
+}
+
+// How many of `have` recipients one transaction offers: all of them, or the
+// server's RCPTMAX when it advertised a smaller one.
+fn partSize(rcptMax: int, have: int): int {
+  if (rcptMax <= 0 || rcptMax >= have) {
+    return have
+  }
+  return rcptMax
+}
+
+// Whether a transaction that failed with `e` on a session that had already
+// carried `uses` transactions may be repeated on a new session: the connection
+// broke or the server said 421, and no DATA payload had been completed.
+fn deadBeforeData(e: SmtpError, uses: int): bool {
+  if (uses == 0 || (e.code != 0 && e.code != 421)) {
+    return false
+  }
+  return e.command == "MAIL FROM" || e.command == "RCPT TO" || e.command == "DATA"
+}
+
+// A bounded set of authenticated sessions to one server.
+class SessionPool {
+  pool: Pool<Session>
+  size: int
+  idleAfter: int
+  lift: (SmtpError) => MailError
+  mu: Mutex
+  shut: bool
+
+  // `dial` returns a greeted, encrypted, logged-in client; `lift` maps a
+  // server's answer to the package's error. Nothing is dialled here.
+  init(dial: () => Client!MailError, lift: (SmtpError) => MailError, o: Options, idleAfter: int) {
+    let open: () => Session! = () => {
+      let c = dial() catch e {
+        fail DialError{ why = e }
+      }
+      let max = c.limits().mailMax
+      if (max <= 0) {
+        max = defaultMailMax
+      }
+      return Session{ c = c, uses = 0, max = max, last = monotonic().ns, bad = false }
+    }
+    let closeIt: (Session) => () = (s) => {
+      if (s.bad) {
+        s.c.close()
+        return
+      }
+      // The server has what it was given; a QUIT that fails undoes nothing.
+      s.c.quit() catch _ {}
+    }
+    let healthy: (Session) => bool = (s) => {
+      return !s.bad && s.uses < s.max
+    }
+    this.lift = lift
+    this.size = o.pool
+    this.idleAfter = idleAfter
+    this.mu = Mutex()
+    this.shut = false
+    this.pool = Pool<Session>(
+      open,
+      closeIt,
+      healthy,
+      PoolOptions{
+        maxSize = o.pool,
+        maxIdleTime = 0,
+        maxLifetime = sessionMaxAgeMs,
+        acquireTimeout = o.timeout / Millisecond,
+      },
+    )
+  }
+
+  // One transaction for as many of `to` as the server takes at once, on a
+  // pooled session. `Part.n` says how many that was.
+  send(env: Envelope, to: []string, raw: string): Part!MailError {
+    let tries = 0
+    while (tries < 2) {
+      let lease = this.checkout()?
+      let s = lease.value
+      let uses = s.uses
+      let n = partSize(s.c.limits().rcptMax, len(to))
+      let e = Envelope{ from = env.from, to = to[0:n], dsn = env.dsn }
+      s.uses = s.uses + 1
+      let out = s.c.send(Raw(e, raw)) catch err {
+        this.settle(lease, err)
+        if (deadBeforeData(err, uses) && tries == 0) {
+          tries = tries + 1
+          continue
+        }
+        fail this.lift(err)
+      }
+      s.last = monotonic().ns
+      this.pool.release(lease, true)
+      return Part{ out = out, n = n }
+    }
+    fail MailError.Transient(Reply{ text = "no usable SMTP session" })
+  }
+
+  // Quits every idle session; one in use is quit when it comes back. Later
+  // sends fail.
+  close() {
+    this.mu.lock()
+    this.shut = true
+    this.mu.unlock()
+    this.pool.close()
+  }
+
+  // A session that is ready to carry a transaction: idle sessions older than
+  // `idleAfter` are probed and the dead ones dropped. Waits at most
+  // `Options.timeout` for a free one.
+  checkout(): Lease<Session>!MailError {
+    let i = 0
+    while (i <= this.size) {
+      this.requireOpen()?
+      let lease = this.pool.acquire() catch e {
+        fail this.busy(e)
+      }
+      if (this.alive(lease)) {
+        return lease
+      }
+      i = i + 1
+    }
+    fail MailError.Transient(Reply{ text = "no usable SMTP session" })
+  }
+
+  // True when `lease` may be used now; a session that fails its NOOP is
+  // released as dead.
+  alive(lease: Lease<Session>): bool {
+    let s = lease.value
+    if (s.uses == 0 || monotonic().ns - s.last <= this.idleAfter) {
+      return true
+    }
+    s.c.noop() catch _ {
+      s.bad = true
+      this.pool.release(lease, false)
+      return false
+    }
+    return true
+  }
+
+  // Hands `lease` back after a failed transaction: kept when the server
+  // refused the message and RSET shows it still answers, discarded otherwise.
+  settle(lease: Lease<Session>, e: SmtpError) {
+    let s = lease.value
+    if (e.command == "validate") {
+      this.pool.release(lease, true)
+      return
+    }
+    if (e.code == 0 || e.code == 421) {
+      s.bad = true
+      this.pool.release(lease, false)
+      return
+    }
+    s.c.reset() catch _ {
+      s.bad = true
+      this.pool.release(lease, false)
+      return
+    }
+    this.pool.release(lease, true)
+  }
+
+  requireOpen(): ()!MailError {
+    this.mu.lock()
+    let gone = this.shut
+    this.mu.unlock()
+    if (gone) {
+      fail MailError.Invalid("mailer is closed")
+    }
+  }
+
+  // The failure of `Pool.acquire`: a refused connection keeps its own
+  // `MailError`, a closed mailer says so, and a wait that ran out is
+  // `Transient` naming the pool size.
+  busy(e: error): MailError {
+    let (dialed, ok) = e.(DialError)
+    if (ok) {
+      return dialed.why
+    }
+    this.requireOpen() catch c {
+      return c
+    }
+    return MailError.Transient(Reply{ text = "all ${this.size} SMTP sessions busy" })
+  }
+}
