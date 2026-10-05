@@ -3091,12 +3091,14 @@ writes one line to fd 2 through `bit_rt_eprint` and ends the process through
 `bit_rt_os_exit`:
 
 ```
-error: module <path> failed to start: <message> (<file>:<line>)
+error: module <path> failed to start: <message> (<path>/<file>:<line>)
 ```
 
-`<path>` is the module's import path as its first importer wrote it (the module
-directory for the root), `<message>` is `error.message()`, `<file>:<line>` is the
-declaration the initializer belongs to (the line it starts on). The exit code is
+`<path>` is the module's import path as its first importer wrote it (`.` for the
+root), `<message>` is `error.message()`, `<file>` is the base name of the file of
+the declaration the initializer belongs to and `<line>` the line it starts on.
+No host path is embedded, so a binary does not depend on the directory it was
+built in. The exit code is
 **3**: `0` is success, `1` a fallible `main`'s error, `2` a panic (§12), so a
 failed start is distinguishable from both. Deferred calls do not run and `main`
 is never entered. No new runtime symbol is involved.
