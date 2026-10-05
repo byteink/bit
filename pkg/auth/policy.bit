@@ -1,0 +1,350 @@
+// pkg/auth/policy.bit — PasswordPolicy: an opt-in check of a new password
+// against NIST SP 800-63B rev 4 (#6893, epic #3960).
+//
+//   let policy = PasswordPolicy()?                      // the NIST defaults
+//   let found = policy.check(password, PolicyContext{ username = "ada" })
+//   let stored = policy.hash(password, PolicyContext{ username = "ada" })?
+//   PasswordStrategy(users, PasswordOptions{ policy = Option<PasswordPolicy>.Some(policy) })
+//
+// Nothing here runs unless the app builds a `PasswordPolicy`: `hashPassword` and
+// `PasswordStrategy(lookup)` (password.bit) are unchanged for an app that does not.
+//
+// ONE SHAPE. The policy is an object with ONE method that evaluates rules,
+// `check(password, context): []Violation`, which returns EVERY rule the password
+// breaks as a typed `Violation` (an enum with payloads, so an app renders its own
+// message in its own language). The set side is `hash`, which is `check` plus the
+// hash: it fails with `PolicyViolations` carrying that list. The policy is NOT a
+// parameter of `hashPassword`: `hashPassword` returns a `string`, and taking a
+// policy would make it fallible and break every caller. A policy given to
+// `PasswordStrategy` through `PasswordOptions.policy` is used at verify.
+//
+// NORMALIZATION IS ONE FLAG ON ONE OBJECT. NIST asks a verifier to apply NFKC (or
+// NFKD) to a password before hashing it, so the same password typed on two
+// keyboards is one password. That only works when set and verify agree. Both
+// read `PolicyOptions.normalize` from the SAME `PasswordPolicy`: `hash` hashes
+// `prepare(password)`, and `PasswordStrategy` verifies `prepare(password)`; there
+// is no second switch to forget on one side. The one way to drift is to hash a
+// password with bare `hashPassword` while the strategy has a normalizing policy,
+// which `docs/password-policy.md` names. ASCII passwords are unchanged by NFKC, so
+// the drift can only hurt a password with a non-ASCII character.
+//
+// WHAT IS NOT HERE, ON PURPOSE. NIST SP 800-63B §3.1.1.2 says verifiers SHOULD NOT
+// impose composition rules (a digit, a symbol, mixed case) and SHALL NOT require
+// passwords to be changed periodically without evidence of compromise. Both make
+// people choose worse passwords and reuse them, so the policy offers neither, and
+// there is no option that would add them.
+//
+// ALL TYPED. A policy that cannot work is refused when it is built, naming the
+// field (`minLength` under 8, `maxLength` under 64). A breach check carries its
+// failure mode IN the `BreachMode` variant: `FailOpen(checker)` and
+// `FailClosed(checker)` are the only ways to hand over a checker, so there is no
+// default to choose silently.
+//
+// COST. `check` is linear in the password: one normalization, one lower-casing,
+// one pass for each of the run rules (the repeated-block test is the
+// prefix-function, O(n)). The blocklist is a map built once in `PasswordPolicy()`,
+// so a lookup is O(1); the context words are few and short. `BreachCheck` is the
+// app's, and is called once per `check`.
+import { Form, contains, normalize, runeCount, runes, split, toLower } from "std/strings"
+
+// What a password breaks. `TooShort(min)` and `TooLong(max)` carry the limit in
+// force, in code points; `ContainsContext(word)` carries the context word found,
+// as the app supplied it. `Breached` is the checker's yes; `BreachCheckFailed`
+// is its failure under `BreachMode.FailClosed`.
+export enum Violation {
+  TooShort(int),
+  TooLong(int),
+  ContainsContext(string),
+  Blocklisted,
+  Repetitive,
+  Sequential,
+  Breached,
+  BreachCheckFailed,
+}
+
+// Asks whether a password is known to be in a breach. `true` is breached; a
+// failure is the checker not being able to say (a network error, for instance),
+// which `BreachMode` turns into a decision.
+export interface BreachCheck {
+  check(password: string): bool!,
+}
+
+// Whether to ask a `BreachCheck`, and what its failure means: `Off` asks nobody;
+// `FailOpen(c)` lets the password through when `c` fails; `FailClosed(c)` refuses
+// it with `Violation.BreachCheckFailed`. Fail-open keeps sign-up working through
+// an outage of the service; fail-closed keeps a breached password out through
+// one. That trade belongs to the app, and no variant is the default for a checker.
+export enum BreachMode {
+  Off,
+  FailOpen(BreachCheck),
+  FailClosed(BreachCheck),
+}
+
+// What the password must not contain: a person's own details. `username`,
+// the part of `email` before its `@` and every entry of `words` are compared
+// case-insensitively; any shorter than 3 code points is ignored, or a one-letter
+// username would refuse every password that has that letter.
+export class PolicyContext {
+  export username: string,
+  export email: string,
+  export words: []string,
+}
+
+// The rules, each with its NIST SP 800-63B default. `minLength` is 15, NIST's
+// figure when the password is the only factor (8 is the floor, and the least
+// `PasswordPolicy()` accepts); `maxLength` is 64, the least a verifier may allow;
+// `normalize` is NFKC; `context` refuses a password containing a `PolicyContext`
+// word; `blocklist` is the app's list of refused passwords (exact, case-
+// insensitive) and `builtinBlocklist` adds the list in policy_common.bit;
+// `maxRun` is the longest run of one repeated character or of consecutive
+// characters (`12345`, `abcde`) allowed, 0 turning the run rules off, which also
+// turns off the repeated-block test (`abcabcabc`); `breach` is `Off`.
+export class PolicyOptions {
+  export minLength: int = 15,
+  export maxLength: int = 64,
+  export normalize: bool = true,
+  export context: bool = true,
+  export blocklist: []string,
+  export builtinBlocklist: bool = true,
+  export maxRun: int = 4,
+  export breach: BreachMode,
+}
+
+// The error `hash` fails with when the password breaks a rule. `violations` is
+// what `check` returned: `let (v, ok) = e.(PolicyViolations)`.
+export class PolicyViolations {
+  export violations: []Violation
+
+  export message(): string {
+    return "auth: password refused by the policy: ${len(this.violations)} violation(s)"
+  }
+}
+
+// NIST SP 800-63B §3.1.1.2: a verifier requires at least 8 characters and SHOULD
+// permit at least 64.
+const nistMinFloor = 8
+const nistMaxFloor = 64
+// Context words shorter than this many code points are not compared.
+const contextWordMin = 3
+
+// Refuses an option set that cannot be a policy, naming the field.
+fn checkPolicyOptions(o: PolicyOptions): ()! {
+  if (o.minLength < nistMinFloor) {
+    fail newError("auth: PolicyOptions.minLength is ${o.minLength}: NIST SP 800-63B requires at least ${nistMinFloor}")
+  }
+  if (o.maxLength < nistMaxFloor) {
+    fail newError("auth: PolicyOptions.maxLength is ${o.maxLength}: NIST SP 800-63B says a verifier permits at least ${nistMaxFloor}")
+  }
+  if (o.maxRun < 0) {
+    fail newError("auth: PolicyOptions.maxRun is ${o.maxRun}: use 0 to turn the run rules off")
+  }
+  match (o.breach) {
+    Off => return
+    FailOpen(c) => policyChecker(c)?
+    FailClosed(c) => policyChecker(c)?
+  }
+}
+
+fn policyChecker(c: BreachCheck): ()! {
+  if (c == nil) {
+    fail newError("auth: PolicyOptions.breach: the BreachCheck is nil")
+  }
+}
+
+// The part of an address before its `@`, or all of it with none.
+fn emailLocal(email: string): string {
+  let parts = split(email, "@")
+  return parts[0]
+}
+
+// The longest run of code points in `rs` each `step` away from the one before it
+// (`0` is a repeated character, `1` is `abc`, `-1` is `cba`).
+fn policyRun(rs: []rune, step: int): int {
+  if (len(rs) == 0) {
+    return 0
+  }
+  let best = 1
+  let cur = 1
+  let i = 1
+  while (i < len(rs)) {
+    if (int(rs[i]) - int(rs[i - 1]) == step) {
+      cur = cur + 1
+    } else {
+      cur = 1
+    }
+    if (cur > best) {
+      best = cur
+    }
+    i = i + 1
+  }
+  return best
+}
+
+// The prefix function of `rs`: for each position, the length of the longest
+// proper prefix that is also a suffix ending there. Linear overall.
+fn prefixTable(rs: []rune): []int {
+  let table = []int{ 0 }
+  let i = 1
+  while (i < len(rs)) {
+    let k = table[i - 1]
+    while (k > 0 && rs[i] != rs[k]) {
+      k = table[k - 1]
+    }
+    if (rs[i] == rs[k]) {
+      k = k + 1
+    }
+    table = append(table, k)
+    i = i + 1
+  }
+  return table
+}
+
+// Whether `rs` is one shorter block written two or more times (`abcabc`, `aaaa`).
+fn repeatsBlock(rs: []rune): bool {
+  let n = len(rs)
+  if (n < 2) {
+    return false
+  }
+  let table = prefixTable(rs)
+  let period = n - table[n - 1]
+  return period < n && n % period == 0
+}
+
+// Splits the built-in list into a set, once.
+fn addCommon(set: map<string, bool>) {
+  for line of split(commonPasswords, "\n") {
+    for w of split(line, " ") {
+      if (w != "") {
+        set[w] = true
+      }
+    }
+  }
+}
+
+// The password rules of one app, built once and used from any request.
+export class PasswordPolicy {
+  opts: PolicyOptions
+  blocked: map<string, bool>
+
+  // Fails for an option set that cannot be a policy (`checkPolicyOptions`), so a
+  // mistake is found when the app starts. Builds the blocklist set here, so no
+  // request pays for it.
+  init(opts: PolicyOptions = PolicyOptions{})! {
+    checkPolicyOptions(opts)?
+    this.opts = opts
+    this.blocked = map<string, bool>()
+    for w of opts.blocklist {
+      this.blocked[toLower(this.prepare(w))] = true
+    }
+    if (opts.builtinBlocklist) {
+      addCommon(this.blocked)
+    }
+  }
+
+  // `password` as this policy stores and compares it: NFKC when `normalize` is
+  // on, else as given. `hash` and `PasswordStrategy` both go through this, which
+  // is how set and verify agree (see the file header).
+  export prepare(password: string): string {
+    if (!this.opts.normalize) {
+      return password
+    }
+    return normalize(password, Form.Nfkc)
+  }
+
+  // Every rule `password` breaks, in the order the rules are listed in
+  // `PolicyOptions`; empty when it passes. `context` holds the person's own
+  // details, none by default.
+  export check(password: string, context: PolicyContext = PolicyContext{}): []Violation {
+    return this.checkPrepared(this.prepare(password), context)
+  }
+
+  // The password the policy accepts, hashed: `check`, then `hashPassword` of
+  // `prepare(password)`. Fails with `PolicyViolations` when `check` is not empty.
+  export hash(password: string, context: PolicyContext = PolicyContext{}): string! {
+    let pw = this.prepare(password)
+    let found = this.checkPrepared(pw, context)
+    if (len(found) > 0) {
+      fail PolicyViolations{ violations = found }
+    }
+    return hashPassword(pw)
+  }
+
+  // `check` on a password already through `prepare`.
+  checkPrepared(pw: string, context: PolicyContext): []Violation {
+    let lower = toLower(pw)
+    let out = this.lengthRules(pw, []Violation{})
+    out = this.contextRules(lower, context, out)
+    let (_, listed) = this.blocked[lower]
+    if (listed) {
+      out = append(out, Violation.Blocklisted)
+    }
+    out = this.runRules(lower, out)
+    return this.breachRule(pw, out)
+  }
+
+  lengthRules(pw: string, out: []Violation): []Violation {
+    let n = runeCount(pw)
+    if (n < this.opts.minLength) {
+      out = append(out, Violation.TooShort(this.opts.minLength))
+    }
+    if (n > this.opts.maxLength) {
+      out = append(out, Violation.TooLong(this.opts.maxLength))
+    }
+    return out
+  }
+
+  // One `ContainsContext` for each context word found in the password.
+  contextRules(lower: string, context: PolicyContext, out: []Violation): []Violation {
+    if (!this.opts.context) {
+      return out
+    }
+    let words = []string{ context.username, emailLocal(context.email) }
+    for w of context.words {
+      words = append(words, w)
+    }
+    for w of words {
+      let needle = toLower(this.prepare(w))
+      if (runeCount(needle) >= contextWordMin && contains(lower, needle)) {
+        out = append(out, Violation.ContainsContext(w))
+      }
+    }
+    return out
+  }
+
+  runRules(lower: string, out: []Violation): []Violation {
+    let limit = this.opts.maxRun
+    if (limit == 0) {
+      return out
+    }
+    let rs = runes(lower)
+    if (policyRun(rs, 0) > limit || repeatsBlock(rs)) {
+      out = append(out, Violation.Repetitive)
+    }
+    if (policyRun(rs, 1) > limit || policyRun(rs, -1) > limit) {
+      out = append(out, Violation.Sequential)
+    }
+    return out
+  }
+
+  breachRule(pw: string, out: []Violation): []Violation {
+    match (this.opts.breach) {
+      Off => return out
+      FailOpen(c) => return askBreach(c, pw, out, false)
+      FailClosed(c) => return askBreach(c, pw, out, true)
+    }
+  }
+}
+
+// Asks `c`; its failure is `BreachCheckFailed` when `closed`, nothing when not.
+fn askBreach(c: BreachCheck, pw: string, out: []Violation, closed: bool): []Violation {
+  let hit = c.check(pw) catch _ {
+    if (closed) {
+      out = append(out, Violation.BreachCheckFailed)
+    }
+    return out
+  }
+  if (hit) {
+    out = append(out, Violation.Breached)
+  }
+  return out
+}

@@ -1,0 +1,280 @@
+// pkg/auth/policy.test.bit — #6893's acceptance: every PasswordPolicy rule on and
+// off, every violation reported from the one `check`, code-point length on a
+// non-ASCII password, normalization applied at both set (`hash`) and verify
+// (`PasswordStrategy`), the breach check's two failure modes, and an app with no
+// policy unchanged.
+//
+// A violation list is read as one string, `TooShort(15),Repetitive`, so a test
+// pins the payload and the order in a single assert. `loginApp`, `loginReq` and
+// `knownUserLookup` are password.test.bit's, and `contains`, `Request` and the
+// web types are bound module-wide there; only new names are imported here.
+import { argon2Verify } from "std/crypto"
+import { isSome } from "std/core"
+import { join, repeat, runeCount } from "std/strings"
+
+fn violationTag(v: Violation): string {
+  return match (v) {
+    TooShort(n) => "TooShort(${n})"
+    TooLong(n) => "TooLong(${n})"
+    ContainsContext(w) => "ContainsContext(${w})"
+    Blocklisted => "Blocklisted"
+    Repetitive => "Repetitive"
+    Sequential => "Sequential"
+    Breached => "Breached"
+    BreachCheckFailed => "BreachCheckFailed"
+  }
+}
+
+fn tags(found: []Violation): string {
+  let out = []string{}
+  for v of found {
+    out = append(out, violationTag(v))
+  }
+  return join(out, ",")
+}
+
+fn policyOf(o: PolicyOptions): PasswordPolicy {
+  return PasswordPolicy(o) catch e {
+    panic("PasswordPolicy: ${e.message()}")
+  }
+}
+
+// A policy with only the rule under test left on: the built-in list and the run
+// rules are off unless a test turns them on.
+fn quiet(): PolicyOptions {
+  return PolicyOptions{ builtinBlocklist = false, maxRun = 0 }
+}
+
+// A `BreachCheck` that says `hit`, or fails when `down`, and counts its calls.
+class FakeBreach {
+  hit: bool
+  down: bool
+  calls: int
+
+  check(password: string): bool! {
+    this.calls = this.calls + 1
+    if (this.down) {
+      fail newError("breach service unreachable")
+    }
+    return this.hit
+  }
+}
+
+const goodPassword = "correct horse battery staple"
+
+test "the defaults pass a long passphrase and report nothing" {
+  let policy = policyOf(PolicyOptions{})
+  let found = policy.check(goodPassword)
+  assert(len(found) == 0, "want no violations, got ${tags(found)}")
+}
+
+test "minLength: too short is reported with the limit, and the limit is configurable" {
+  let found = policyOf(PolicyOptions{}).check("tr0ub4dor")
+  assert(tags(found) == "TooShort(15)", "want TooShort(15), got ${tags(found)}")
+  let relaxed = policyOf(PolicyOptions{ minLength = 8 }).check("tr0ub4dor")
+  assert(len(relaxed) == 0, "8 is NIST's floor and 9 characters pass it, got ${tags(relaxed)}")
+}
+
+test "maxLength: too long is refused, never truncated" {
+  let long = repeat("Zq7!mP", 11)
+  let found = policyOf(quiet()).check(long)
+  assert(tags(found) == "TooLong(64)", "want TooLong(64), got ${tags(found)}")
+  let wider = policyOf(PolicyOptions{ builtinBlocklist = false, maxRun = 0, maxLength = 128 }).check(long)
+  assert(len(wider) == 0, "a higher maxLength must admit it, got ${tags(wider)}")
+}
+
+test "length counts code points, not bytes" {
+  // 8 code points, 15 bytes: a byte count would pass minLength 15.
+  let pw = "пятница!"
+  assert(runeCount(pw) == 8 && len(pw) == 15, "fixture: want 8 code points in 15 bytes")
+  let found = policyOf(quiet()).check(pw)
+  assert(tags(found) == "TooShort(15)", "want TooShort(15) for 8 code points, got ${tags(found)}")
+  let ok = policyOf(PolicyOptions{ builtinBlocklist = false, maxRun = 0, minLength = 8 }).check(pw)
+  assert(len(ok) == 0, "8 code points meet minLength 8, got ${tags(ok)}")
+  // 64 two-byte code points are 128 bytes and still fit maxLength 64.
+  let wide = policyOf(quiet()).check(repeat("пятница!", 8))
+  assert(len(wide) == 0, "64 code points must fit maxLength 64, got ${tags(wide)}")
+}
+
+test "context words: username, email local part and app words, case-insensitive; off by switch" {
+  let ctx = PolicyContext{
+    username = "Ada",
+    email = "grace@example.com",
+    words = ["inkwell", "ab"],
+  }
+  let policy = policyOf(quiet())
+  assert(
+    tags(policy.check("my-ADA-has-a-long-name", ctx)) == "ContainsContext(Ada)",
+    "username, case-insensitive",
+  )
+  assert(
+    tags(policy.check("my-Grace-has-a-long-name", ctx)) == "ContainsContext(grace)",
+    "email local part",
+  )
+  assert(
+    tags(policy.check("INKWELL-is-my-long-name", ctx)) == "ContainsContext(inkwell)",
+    "an app word",
+  )
+  assert(
+    len(policy.check("about-a-long-name-here", ctx)) == 0,
+    "a word under 3 code points is ignored",
+  )
+  let off = policyOf(PolicyOptions{ builtinBlocklist = false, maxRun = 0, context = false })
+  assert(len(off.check("my-ADA-has-a-long-name", ctx)) == 0, "context = false turns the rule off")
+}
+
+test "blocklist: the app's list is exact and case-insensitive, the built-in list is a switch" {
+  let app = policyOf(
+    PolicyOptions{ builtinBlocklist = false, maxRun = 0, blocklist = ["Inkwell Rules 2026"] },
+  )
+  assert(tags(app.check("inkwell RULES 2026")) == "Blocklisted", "want Blocklisted")
+  assert(len(app.check("inkwell RULES 2026!")) == 0, "a longer password is not the listed one")
+  let builtin = policyOf(PolicyOptions{ minLength = 8, maxRun = 0 })
+  assert(tags(builtin.check("Baseball")) == "Blocklisted", "built-in list, case-insensitive")
+  let none = policyOf(PolicyOptions{ minLength = 8, maxRun = 0, builtinBlocklist = false })
+  assert(len(none.check("baseball")) == 0, "builtinBlocklist = false turns the built-in list off")
+}
+
+test "repetitive and sequential runs, and the switch" {
+  let policy = policyOf(PolicyOptions{ builtinBlocklist = false, minLength = 8 })
+  assert(tags(policy.check("aaaaaaaa")) == "Repetitive", "aaaaaaaa")
+  assert(tags(policy.check("12345678")) == "Sequential", "12345678")
+  assert(tags(policy.check("abcdefgh")) == "Sequential", "abcdefgh")
+  assert(tags(policy.check("hgfedcba")) == "Sequential", "a descending run")
+  assert(
+    tags(policy.check("xk3-abcabcabcabc")) == "",
+    "a repeated block inside a longer password is not the whole",
+  )
+  assert(tags(policy.check("abcabcabcabc")) == "Repetitive", "a repeated block")
+  assert(len(policy.check("tr0ub4dor-1234")) == 0, "a run of 4 is allowed")
+  let lax = policyOf(PolicyOptions{ builtinBlocklist = false, minLength = 8, maxRun = 8 })
+  assert(len(lax.check("12345678")) == 0, "maxRun = 8 allows a run of 8")
+  let off = policyOf(PolicyOptions{ builtinBlocklist = false, minLength = 8, maxRun = 0 })
+  assert(
+    len(off.check("aaaaaaaa")) == 0 && len(off.check("12345678")) == 0,
+    "maxRun = 0 turns the rules off",
+  )
+}
+
+test "one check reports every violation, in rule order" {
+  let policy = policyOf(PolicyOptions{ builtinBlocklist = false })
+  let found = policy.check("ada11111", PolicyContext{ username = "ada" })
+  assert(
+    tags(found) == "TooShort(15),ContainsContext(ada),Repetitive",
+    "want TooShort(15),ContainsContext(ada),Repetitive, got ${tags(found)}",
+  )
+}
+
+test "breach check: a hit, a clean answer, and both failure modes" {
+  let fake = FakeBreach{ hit = true }
+  let hit = policyOf(PolicyOptions{ breach = BreachMode.FailClosed(fake) })
+  assert(tags(hit.check(goodPassword)) == "Breached", "want Breached")
+  fake.hit = false
+  assert(len(hit.check(goodPassword)) == 0, "a clean answer adds nothing")
+  fake.down = true
+  assert(
+    tags(hit.check(goodPassword)) == "BreachCheckFailed",
+    "fail-closed refuses when the checker is down",
+  )
+  let open = policyOf(PolicyOptions{ breach = BreachMode.FailOpen(fake) })
+  assert(len(open.check(goodPassword)) == 0, "fail-open lets it through when the checker is down")
+  let off = FakeBreach{ hit = true }
+  let none = policyOf(PolicyOptions{ breach = BreachMode.Off })
+  assert(len(none.check(goodPassword)) == 0 && off.calls == 0, "Off never asks")
+}
+
+test "a policy that cannot work is refused when built, naming the field" {
+  let bad = []PolicyOptions{
+    PolicyOptions{ minLength = 7 },
+    PolicyOptions{ maxLength = 63 },
+    PolicyOptions{ maxRun = -1 },
+    PolicyOptions{ breach = BreachMode.FailOpen(nil) },
+  }
+  let want = []string{ "minLength", "maxLength", "maxRun", "breach" }
+  let i = 0
+  while (i < len(bad)) {
+    let failed = false
+    PasswordPolicy(bad[i]) catch e {
+      assert(contains(e.message(), want[i]), "the error must name ${want[i]}: ${e.message()}")
+      failed = true
+    }
+    assert(failed, "${want[i]}: want the policy refused")
+    i = i + 1
+  }
+}
+
+test "hash refuses a failing password with the whole list and hashes a good one" {
+  let policy = policyOf(PolicyOptions{ builtinBlocklist = false })
+  policy.hash("short", PolicyContext{ username = "short" }) catch e {
+    let (v, ok) = e.(PolicyViolations)
+    assert(ok, "want PolicyViolations, got ${e.message()}")
+    assert(tags(v.violations) == "TooShort(15),ContainsContext(short)", "got ${tags(v.violations)}")
+    return
+  }
+  assert(false, "a failing password must not hash")
+}
+
+test "hash output is today's hashPassword output shape, and verifies" {
+  let policy = policyOf(PolicyOptions{})
+  let stored = policy.hash(goodPassword) catch e {
+    panic("hash: ${e.message()}")
+  }
+  assert(
+    hasPrefix(stored, "$argon2id$v=19$m=19456,t=2,p=1$"),
+    "same parameters as hashPassword, got ${stored}",
+  )
+  assert(
+    argon2Verify([]byte(goodPassword), stored),
+    "must verify against the typed ASCII password",
+  )
+}
+
+// 25 full-width letters: NFKC turns them into "correct-horse-battery".
+const fullwidth = "ｃｏｒｒｅｃｔ-ｈｏｒｓｅ-ｂａｔｔｅｒｙ"
+const ascii = "correct-horse-battery"
+
+test "normalize is applied at set and at verify through one policy" {
+  let policy = policyOf(PolicyOptions{})
+  assert(policy.prepare(fullwidth) == ascii, "NFKC must fold full-width letters")
+  let stored = policy.hash(fullwidth) catch e {
+    panic("hash: ${e.message()}")
+  }
+  let app = loginApp(
+    PasswordStrategy(
+      knownUserLookup(stored),
+      PasswordOptions{ policy = Option<PasswordPolicy>.Some(policy) },
+    ),
+  )
+  let a = app.handle(loginReq("{\"username\":\"alice\",\"password\":\"${ascii}\"}"))
+  let f = app.handle(loginReq("{\"username\":\"alice\",\"password\":\"${fullwidth}\"}"))
+  assert(a.status == 200, "the ASCII spelling must log in, got ${a.status}")
+  assert(f.status == 200, "the full-width spelling must log in, got ${f.status}")
+}
+
+test "with normalize off the policy stores and compares the password as typed" {
+  let policy = policyOf(PolicyOptions{ normalize = false })
+  assert(policy.prepare(fullwidth) == fullwidth, "prepare must not touch the password")
+  let stored = policy.hash(fullwidth) catch e {
+    panic("hash: ${e.message()}")
+  }
+  let app = loginApp(
+    PasswordStrategy(
+      knownUserLookup(stored),
+      PasswordOptions{ policy = Option<PasswordPolicy>.Some(policy) },
+    ),
+  )
+  let a = app.handle(loginReq("{\"username\":\"alice\",\"password\":\"${ascii}\"}"))
+  let f = app.handle(loginReq("{\"username\":\"alice\",\"password\":\"${fullwidth}\"}"))
+  assert(a.status == 401, "the ASCII spelling is a different password, got ${a.status}")
+  assert(f.status == 200, "the typed spelling must log in, got ${f.status}")
+}
+
+test "an app that never builds a policy verifies the password exactly as typed" {
+  let stored = hashPassword(fullwidth)
+  let app = loginApp(PasswordStrategy(knownUserLookup(stored)))
+  let a = app.handle(loginReq("{\"username\":\"alice\",\"password\":\"${ascii}\"}"))
+  let f = app.handle(loginReq("{\"username\":\"alice\",\"password\":\"${fullwidth}\"}"))
+  assert(a.status == 401, "no policy, no normalization: ASCII must not match, got ${a.status}")
+  assert(f.status == 200, "the typed spelling must log in, got ${f.status}")
+  assert(!isSome(PasswordOptions{}.policy), "PasswordOptions.policy defaults to None")
+}
