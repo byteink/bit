@@ -1,0 +1,406 @@
+// pkg/mail/ical.bit — `Invite`, a calendar event a mail carries, and the
+// iCalendar text (RFC 5545) written for it.
+//
+// A `Message` with an `invite` is sent the way RFC 6047 (iMIP) says a calendar
+// message is: the iCalendar object is the last part of the
+// `multipart/alternative`, typed `text/calendar; method=REQUEST;
+// charset=UTF-8`, and the same bytes are attached as `invite.ics`
+// (`application/ics`). Gmail and Outlook each read one of the two and show the
+// Yes / No / Maybe buttons from it. The method in the header and the one in the
+// object are the same word (RFC 6047 §2.4), taken from `Invite.method`.
+//
+// What RFC 5545 and RFC 5546 require, and where it is done:
+//   * Lines end in CRLF and are folded at 75 octets, never inside a UTF-8
+//     sequence (§3.1): `foldLine`.
+//   * TEXT values escape `\`, `;`, `,` and a line break (§3.3.11): `escapeText`.
+//   * Times are UTC, `yyyyMMddTHHmmssZ` (§3.3.5): `icsTime`.
+//   * `UID` is the caller's and the same on the REQUEST, every update and the
+//     CANCEL; `SEQUENCE` goes up on each of them (RFC 5546 §2.1.4, §3.2.5), so a
+//     CANCEL with sequence 0 is refused: it could not supersede anything.
+//   * `ORGANIZER` and each `ATTENDEE` are `mailto:` calendar addresses, an
+//     attendee asking for a reply with `PARTSTAT=NEEDS-ACTION;RSVP=TRUE`
+//     (RFC 5546 §3.2.2). A CANCEL asks for none.
+//
+// Every refusal is `MailError.Invalid` naming the field (`invite.uid`,
+// `invite.attendees[1]`) and why, at render, before any byte is built.
+
+import { Attachment as SmtpAttachment, Message as SmtpMessage } from "std/smtp"
+import { Builder, trimSpace } from "std/strings"
+import { Timestamp, now, utc } from "std/time"
+
+// The most octets one content line holds before it is folded (RFC 5545 §3.1).
+const icsLineOctets: int = 75
+
+// The CRLF and the one space that start a continuation line.
+const icsFold: string = "\r\n "
+
+// The name and the bytes of the attached copy of the object.
+const icsFileName: string = "invite.ics"
+const icsAttachType: string = "application/ics"
+
+// The characters of an addr-spec that stay as they are in a `mailto:` URI
+// (RFC 6068 §2); every other byte is written as `%XX`.
+const mailtoSafe: string = "-._~@+!$'*=/&"
+
+// What `Invite.method` is: the iTIP method (RFC 5546 §1.4) the object carries.
+export enum Method {
+  // Invite the attendees, or update an event they already have (a higher
+  // `sequence` with the same `uid`).
+  Request,
+  // Take the event back. Its `sequence` is higher than the last REQUEST's.
+  Cancel,
+}
+
+// A calendar event sent with a mail. `uid`, `start`, `end` and `summary` are
+// required; everything else has a default.
+//
+//   let standup = Invite{ uid = "standup-2026-10-12@inkwell.dev", start = at, end = at.add(30 * Minute), summary = "Editorial standup" }
+export class Invite {
+  // The event's identity, written once and kept for its whole life: the same
+  // `uid` on the invite, every update and the cancel, or each is a new event in
+  // the attendee's calendar. `<random>@<your domain>` is the usual form.
+  export uid: string,
+  // When the event begins and ends, read in UTC. `end` is after `start`.
+  export start: Timestamp,
+  export end: Timestamp,
+  export summary: string,
+  export location: string = "",
+  export description: string = "",
+  // Who runs the event, `Kim Lee <kim@inkwell.dev>`. Empty means the message's
+  // From, which is what Gmail and Outlook expect an invite to come from.
+  export organizer: string = "",
+  // Who is invited. Empty means the message's `to` and `cc`; never `bcc`, which
+  // an attendee list would show to everyone.
+  export attendees: []string = [],
+  export method: Method,
+  // 0 for the first invite; one more for each update, and for the cancel.
+  export sequence: int = 0,
+}
+
+// An invite with its addresses read and its defaults filled in.
+class Resolved {
+  organizer: Address,
+  attendees: []Address,
+}
+
+// The word `m` is written as in the header and in the object.
+fn methodName(m: Method): string {
+  match (m) {
+    Request => return "REQUEST"
+    Cancel => return "CANCEL"
+  }
+}
+
+// `n` in decimal, left-padded with zeros to `width`.
+fn zeroPad(n: int, width: int): string {
+  let s = "${n}"
+  while (len(s) < width) {
+    s = "0" + s
+  }
+  return s
+}
+
+// `t` as an iCalendar UTC DATE-TIME, `20261012T090000Z`; a fraction of a second
+// is dropped, as the format has none.
+fn icsTime(t: Timestamp): string {
+  let d = t.inZone(utc())
+  return "${zeroPad(d.year(), 4)}${zeroPad(d.month(), 2)}${zeroPad(d.day(), 2)}T${zeroPad(
+    d.hour(),
+    2,
+  )}${zeroPad(d.minute(), 2)}${zeroPad(d.second(), 2)}Z"
+}
+
+// `s` as an iCalendar TEXT value (RFC 5545 §3.3.11): backslash, semicolon and
+// comma escaped, CRLF, LF and a lone CR each written as `\n`.
+fn escapeText(s: string): string {
+  let out = Builder()
+  let i = 0
+  while (i < len(s)) {
+    let b = s[i]
+    if (b == u8(13) && i + 1 < len(s) && s[i + 1] == u8(10)) {
+      i = i + 1
+    }
+    if (b == u8(13) || b == u8(10)) {
+      out.write("\\n")
+    } else if (b == backslash || b == u8(59) || b == comma) {
+      out.writeByte(backslash).writeByte(b)
+    } else {
+      out.writeByte(b)
+    }
+    i = i + 1
+  }
+  return out.toString()
+}
+
+// Whether `b` continues a UTF-8 sequence, so a line cannot be cut before it.
+fn isContinuation(b: u8): bool {
+  return b >= u8(128) && b < u8(192)
+}
+
+// Where the piece of `line` that starts at `from` ends, at most `room` octets
+// on, and never between the bytes of one UTF-8 sequence. A sequence is at most
+// four bytes, so the cut moves back at most three. Bytes that are not UTF-8 at
+// all are cut at `room`.
+fn cutAt(line: string, from: int, room: int): int {
+  let end = from + room
+  if (end >= len(line)) {
+    return len(line)
+  }
+  let back = 0
+  while (back < 3 && end - back > from && isContinuation(line[end - back])) {
+    back = back + 1
+  }
+  if (isContinuation(line[end - back])) {
+    return end
+  }
+  return end - back
+}
+
+// `line` folded (RFC 5545 §3.1): no piece over 75 octets, counting the space
+// that starts every piece after the first. Unfolding (removing each CRLF and
+// the one space after it) gives `line` back.
+fn foldLine(line: string): string {
+  if (len(line) <= icsLineOctets) {
+    return line
+  }
+  let out = Builder()
+  let pos = 0
+  let room = icsLineOctets
+  while (pos < len(line)) {
+    let end = cutAt(line, pos, room)
+    if (pos > 0) {
+      out.write(icsFold)
+    }
+    out.write(line[pos:end])
+    pos = end
+    room = icsLineOctets - 1
+  }
+  return out.toString()
+}
+
+// One content line: `content` folded and ended with CRLF.
+fn icsLine(content: string): string {
+  return foldLine(content) + "\r\n"
+}
+
+// A parameter value (RFC 5545 §3.2): always quoted, with `"` and `^` written as
+// RFC 6868 asks (`^'`, `^^`), so a name with a quote or a colon is one value.
+fn paramValue(s: string): string {
+  let out = Builder()
+  out.writeByte(dq)
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == dq) {
+      out.write("^'")
+    } else if (s[i] == u8(94)) {
+      out.write("^^")
+    } else {
+      out.writeByte(s[i])
+    }
+    i = i + 1
+  }
+  out.writeByte(dq)
+  return out.toString()
+}
+
+// `email` as the path of a `mailto:` URI: bytes outside `mailtoSafe` are `%XX`.
+fn mailtoPath(email: string): string {
+  let out = Builder()
+  let i = 0
+  while (i < len(email)) {
+    let b = email[i]
+    if (isAlnum(b) || inSet(b, mailtoSafe)) {
+      out.writeByte(b)
+    } else {
+      out.writeByte(u8(37)).writeByte(hexDigits[int(b) / 16]).writeByte(hexDigits[int(b) % 16])
+    }
+    i = i + 1
+  }
+  return out.toString()
+}
+
+// `;CN="name"`, or nothing for an address with no name.
+fn cnParam(a: Address): string {
+  if (a.name == "") {
+    return ""
+  }
+  return ";CN=${paramValue(a.name)}"
+}
+
+// The ORGANIZER line for `a`.
+fn organizerLine(a: Address): string {
+  return icsLine("ORGANIZER${cnParam(a)}:mailto:${mailtoPath(a.email)}")
+}
+
+// The ATTENDEE line for `a`: asks for a reply on a REQUEST, not on a CANCEL.
+fn attendeeLine(a: Address, m: Method): string {
+  let rsvp = ""
+  if (m == Method.Request) {
+    rsvp = ";RSVP=TRUE"
+  }
+  return icsLine("ATTENDEE${cnParam(a)};ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION${rsvp}:mailto:${mailtoPath(a.email)}")
+}
+
+// A TEXT property line, `NAME:escaped`, or nothing when `value` is empty.
+fn textLine(name: string, value: string): string {
+  if (value == "") {
+    return ""
+  }
+  return icsLine("${name}:${escapeText(value)}")
+}
+
+// The VEVENT lines of `inv`, from UID to the last ATTENDEE.
+fn eventLines(inv: Invite, r: Resolved, stamp: Timestamp): string {
+  let status = "CONFIRMED"
+  if (inv.method == Method.Cancel) {
+    status = "CANCELLED"
+  }
+  let out = Builder()
+  out.write(icsLine("BEGIN:VEVENT"))
+  out.write(textLine("UID", inv.uid))
+  out.write(icsLine("DTSTAMP:${icsTime(stamp)}"))
+  out.write(icsLine("DTSTART:${icsTime(inv.start)}"))
+  out.write(icsLine("DTEND:${icsTime(inv.end)}"))
+  out.write(icsLine("SEQUENCE:${inv.sequence}"))
+  out.write(textLine("SUMMARY", inv.summary))
+  out.write(textLine("LOCATION", inv.location))
+  out.write(textLine("DESCRIPTION", inv.description))
+  out.write(icsLine("STATUS:${status}"))
+  out.write(organizerLine(r.organizer))
+  for a of r.attendees {
+    out.write(attendeeLine(a, inv.method))
+  }
+  out.write(icsLine("END:VEVENT"))
+  return out.toString()
+}
+
+// The whole iCalendar object for `inv`, `stamp` being its DTSTAMP, the moment
+// the object was made (RFC 5545 §3.8.7.2).
+fn buildIcs(inv: Invite, r: Resolved, stamp: Timestamp): string {
+  let out = Builder()
+  out.write(icsLine("BEGIN:VCALENDAR"))
+  out.write(icsLine("VERSION:2.0"))
+  out.write(icsLine("PRODID:-//bitlang.org//pkg mail//EN"))
+  out.write(icsLine("METHOD:${methodName(inv.method)}"))
+  out.write(eventLines(inv, r, stamp))
+  out.write(icsLine("END:VCALENDAR"))
+  return out.toString()
+}
+
+// The `Invalid` for `field` and `why`.
+fn inviteError(field: string, why: string): MailError {
+  return MailError.Invalid("invite.${field}: ${why}")
+}
+
+// Why `s` cannot be a TEXT value, or "": a control byte other than tab and a
+// line break cannot be written in one (RFC 5545 §3.3.11).
+fn textFault(s: string): string {
+  let i = 0
+  while (i < len(s)) {
+    let b = s[i]
+    if ((b < space && b != tab && b != cr && b != lf) || b == u8(127)) {
+      return "it contains the control byte ${int(b)}, which iCalendar text cannot hold"
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+// `s` refused unless it is a TEXT value.
+fn checkText(field: string, s: string): ()!MailError {
+  let why = textFault(s)
+  if (why != "") {
+    fail inviteError(field, why)
+  }
+}
+
+// The text fields of `inv`, and the UID and SUMMARY that must be set.
+fn checkTexts(inv: Invite): ()!MailError {
+  if (inv.uid == "") {
+    fail inviteError(
+      "uid",
+      "is empty; give the event a stable UID, the same on its invite, updates and cancel",
+    )
+  }
+  if (hasLineByte(inv.uid)) {
+    fail inviteError("uid", "contains a CR, LF or NUL")
+  }
+  if (trimSpace(inv.summary) == "") {
+    fail inviteError("summary", "is empty")
+  }
+  checkText("uid", inv.uid)?
+  checkText("summary", inv.summary)?
+  checkText("location", inv.location)?
+  checkText("description", inv.description)?
+}
+
+// Whether `t` can be written as a four-digit-year DATE-TIME.
+fn inIcsRange(t: Timestamp): bool {
+  let y = t.inZone(utc()).year()
+  return y >= 1 && y <= 9999
+}
+
+// The times and the sequence of `inv`.
+fn checkWhen(inv: Invite): ()!MailError {
+  if (!inIcsRange(inv.start) || !inIcsRange(inv.end)) {
+    fail inviteError("start", "start and end must be in the years 1 to 9999")
+  }
+  if (!inv.end.isAfter(inv.start)) {
+    fail inviteError("end", "is not after start (${inv.start.toString()} to ${inv.end.toString()})")
+  }
+  if (inv.sequence < 0) {
+    fail inviteError("sequence", "is ${inv.sequence}; it counts from 0")
+  }
+  if (inv.method == Method.Cancel && inv.sequence == 0) {
+    fail inviteError(
+      "sequence",
+      "is 0 on a CANCEL; a cancel must supersede the request, so give it a sequence higher than the request's",
+    )
+  }
+}
+
+// The invite's attendees as addresses: `attendees` when set, else `to` then `cc`.
+fn attendeeList(m: Message, inv: Invite): []Address!MailError {
+  if (len(inv.attendees) > 0) {
+    return parseFields("invite.attendees", inv.attendees)?
+  }
+  let out = parseFields("to", m.to)?
+  for a of parseFields("cc", m.cc)? {
+    out = append(out, a)
+  }
+  if (len(out) == 0) {
+    fail inviteError("attendees", "is empty and the message has no to or cc; list who is invited")
+  }
+  return out
+}
+
+// `inv` checked, and its organizer and attendees read. `from` is the
+// message's sender, the organizer when `Invite.organizer` is empty.
+fn resolveInvite(m: Message, inv: Invite, from: Address): Resolved!MailError {
+  checkTexts(inv)?
+  checkWhen(inv)?
+  let organizer = from
+  if (inv.organizer != "") {
+    organizer = parseField("invite.organizer", inv.organizer)?
+  }
+  return Resolved{ organizer = organizer, attendees = attendeeList(m, inv)? }
+}
+
+// Hands the calendar object for `m.invite` to `sm`: as the last alternative
+// part, and as the attached `invite.ics`. Nothing when `m` has no invite.
+// `from` is the message's sender; `stamp` the object's DTSTAMP.
+fn applyInviteAt(sm: SmtpMessage, m: Message, from: Address, stamp: Timestamp): ()!MailError {
+  match (m.invite) {
+    Some(inv) => {
+      let ics = buildIcs(inv, resolveInvite(m, inv, from)?, stamp)
+      sm.addAlternative("text/calendar; method=${methodName(inv.method)}; charset=UTF-8", ics)
+      sm.attach(SmtpAttachment(icsFileName, icsAttachType, []byte(ics)))
+    }
+    None => return
+  }
+}
+
+// `applyInviteAt` stamped with the current time.
+fn applyInvite(sm: SmtpMessage, m: Message, from: Address): ()!MailError {
+  applyInviteAt(sm, m, from, now())?
+}
