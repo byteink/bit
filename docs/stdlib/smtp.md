@@ -804,6 +804,49 @@ the reply's `code`, `enhanced` status and `text`, and `command` `RCPT TO`.
 `error.transient()` tells a mailbox that is busy (4xx) from one that does not
 exist (5xx).
 
+### `Client.reset(): ()!SmtpError`
+
+Send `RSET` (RFC 5321 section 4.1.1.5) and expect a 250: the server forgets the
+transaction in progress, so the next `send` starts clean. After a successful
+`send` nothing needs resetting, and a refused `MAIL FROM` or `DATA` already
+resets by itself; this is for a caller that abandoned a transaction on its own
+account. `ehlo` must have run, as for `send`.
+
+### `Client.noop(): ()!SmtpError`
+
+Send `NOOP` (RFC 5321 section 4.1.1.9) and expect a 250. The server does nothing
+but answer, which makes it the health check for a session that sat idle in a
+pool: if it returns, the connection is alive and ready for the next message.
+Unlike `reset` it is legal before `ehlo`.
+
+Both commands run under `Options.timeout` and fail with an `SmtpError` whose
+`command` is `RSET` or `NOOP`: the server's reply when it is not a 250, a
+transient error with no reply code when the connection is gone. A timeout and a
+`421` (the server is closing the channel, RFC 5321 section 4.2.2) both close the
+`Client`, and any later call on it fails with `smtp: the connection was closed
+after a timeout; dial again` or `smtp: the connection was closed after a 421
+reply; dial again`. Any other refusal leaves the session usable.
+
+```bit
+import { Client, Message, Delivery, SmtpError } from "std/smtp"
+
+// Send two messages over one session, checking the session answers in between
+// the way a pool does before it hands a connection out again. A session that
+// fails the check is the pool's to drop and dial afresh.
+fn sendTwice(c: Client, a: Message, b: Message): (Delivery, Delivery)!SmtpError {
+  let first = c.send(a)?
+  c.noop()?
+  let second = c.send(b)?
+  return (first, second)
+}
+
+// Abandon a transaction that was started and not finished, so the next send is
+// accepted.
+fn startOver(c: Client): ()!SmtpError {
+  c.reset()?
+}
+```
+
 ### `Client.quit(): ()!SmtpError`
 
 End the session politely: `QUIT`, then close the socket. The socket is closed
