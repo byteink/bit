@@ -61,6 +61,10 @@ export class RecordKeys {
   secret: []byte
   aead: tlsRecordAead
   iv: []byte
+  // The per-record nonce, rewritten in place before every `sealInto`/`open`
+  // (`recordNonceInto`) rather than allocated per record. A `RecordKeys` is
+  // one direction of one connection and already serialises on `seq`.
+  nonceBuf: []byte
   seq: int
   init(suite: CipherSuite, secret: []byte)! {
     let alg = tlsSuiteHash(suite)
@@ -68,6 +72,7 @@ export class RecordKeys {
     this.suite = suite
     this.secret = secret
     this.iv = trafficIV(alg, secret, suite.ivLen)
+    this.nonceBuf = []byte(len(this.iv))
     this.aead = tlsSuiteNewRecordAead(suite, key)?
     this.seq = 0
   }
@@ -111,7 +116,12 @@ export class RecordKeys {
     }
     dst[5 + n] = byte(contentType)
     let inner = dst[5:6 + n]
-    this.aead.sealInto(dst[5:total], recordNonceBytes(this.iv, this.seq), inner, dst[0:5])
+    this.aead.sealInto(
+      dst[5:total],
+      recordNonceInto(this.nonceBuf, this.iv, this.seq),
+      inner,
+      dst[0:5],
+    )
     this.seq = this.seq + 1
     return total
   }
@@ -120,6 +130,9 @@ export class RecordKeys {
   // header included) and advance this direction's sequence number. FAILS — fatally,
   // with no retry — on a truncated header, an over-long ciphertext (> 2^14 + 256),
   // a header/length mismatch, or an AEAD authentication failure (`bad_record_mac`).
+  // The AEAD decrypts straight into the one fresh slice `content` views, after
+  // the tag verifies, so `record` (often the framer's reused buffer) is never
+  // retained and the plaintext is never copied again.
   export open(record: []byte): RecordPlaintext! {
     if (len(record) < 5) {
       fail newError("tls record: truncated record header")
@@ -133,7 +146,13 @@ export class RecordKeys {
     }
     let header = record[0:5]
     let ciphertext = record[5:5 + cipherLen]
-    let inner = this.aead.open(recordNonceBytes(this.iv, this.seq), ciphertext, header) catch _ {
+    let innerLen = cipherLen - this.aead.overhead()
+    if (innerLen < 0) {
+      fail newError("tls record: bad_record_mac")
+    }
+    let inner = []byte(innerLen)
+    let nonce = recordNonceInto(this.nonceBuf, this.iv, this.seq)
+    this.aead.openInto(inner, nonce, ciphertext, header) catch _ {
       fail newError("tls record: bad_record_mac")
     }
     this.seq = this.seq + 1
@@ -161,6 +180,7 @@ export class RecordKeys {
     let key = trafficKey(alg, next, this.suite.keyLen)
     this.aead = tlsSuiteNewRecordAead(this.suite, key)?
     this.iv = trafficIV(alg, next, this.suite.ivLen)
+    this.nonceBuf = []byte(len(this.iv))
     this.secret = next
     this.seq = 0
   }
@@ -175,7 +195,7 @@ export class RecordKeys {
   // sequence number (RFC 8446 §5.3). Exposed for diagnostics and to observe nonce
   // progression across records; the layer computes it internally per operation.
   export nonce(): []byte {
-    return recordNonceBytes(this.iv, this.seq)
+    return recordNonceInto([]byte(len(this.iv)), this.iv, this.seq)
   }
 }
 
@@ -183,12 +203,12 @@ export class RecordKeys {
 // `contentType` that was hidden inside the protected record.
 export class RecordPlaintext { export content: []byte, export contentType: int }
 
-// The per-record nonce (RFC 8446 §5.3): the fixed `iv` XORed with `seq` encoded
-// big-endian and right-aligned into the low eight octets of an `iv`-length
-// buffer. The leading `len(iv) - 8` octets pass through unchanged. All TLS 1.3
-// AEADs use a 12-octet IV, so the eight-octet sequence always fits.
-fn recordNonceBytes(iv: []byte, seq: int): []byte {
-  let nonce = []byte(len(iv))
+// The per-record nonce (RFC 8446 §5.3), written into `nonce` (`len(iv)` bytes)
+// and returned: the fixed `iv` XORed with `seq` encoded big-endian and
+// right-aligned into the low eight octets. The leading `len(iv) - 8` octets
+// pass through unchanged. All TLS 1.3 AEADs use a 12-octet IV, so the
+// eight-octet sequence always fits.
+fn recordNonceInto(nonce: []byte, iv: []byte, seq: int): []byte {
   let i = 0
   while (i < len(iv)) {
     nonce[i] = iv[i]
