@@ -35,8 +35,6 @@ set -u
 . "$(dirname -- "$0")/alarmrun.sh"
 # shellcheck source=scripts/diffexit.sh
 . "$(dirname -- "$0")/diffexit.sh"
-# shellcheck source=scripts/selfhost-ir-signatures.sh
-. "$(dirname -- "$0")/selfhost-ir-signatures.sh"
 
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
@@ -388,7 +386,6 @@ for f in $(find stdlib examples _tests_/cases _tests_/stress -name '*.bit' | sor
     # order selfhost-diffruntime.sh checks its own IR mismatches in. Only an
     # UNEXPLAINED divergence fails the gate.
     sig=$(safepointSignature "$f" "$s" "$b")
-    [ -n "$sig" ] || sig=$(explainTestFunctions "$(objFnSites "$tmp/a.o")" "$(objFnSites "$tmp/b.o")" "$s" "$b")
     if [ -n "$sig" ]; then
       explained=$((explained + 1))
       echo "SAFEPOINT DIVERGENCE EXPLAINED  seed=$s self=$b  $f  (signature '$sig')"
