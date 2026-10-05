@@ -1,0 +1,202 @@
+// In-Bit self-checks for the object readers' bounds validation (#6345): one
+// malformed-header case per format, each asserting the diagnostic names the
+// archive member and the range that was out of range, not a slice panic.
+
+// The reader's message with the leading "object <name>: " removed, so the
+// older per-reader checks keep asserting on the bare error code.
+fn loStripMember(name: string, msg: string): string {
+  let prefix = loMemberError(name, "")
+  if (!arHasPrefix(msg, prefix)) {
+    return msg
+  }
+  return msg[len([]byte(prefix)):len([]byte(msg))]
+}
+
+fn obEmpty(): LoModule {
+  return LoModule{ name = "", atoms = []LoAtom(0) }
+}
+
+fn checkObjectBoundsRangeHelper() {
+  assert(loRangeOk(10, 0, 10))
+  assert(loRangeOk(10, 10, 0))
+  assert(!loRangeOk(10, 5, 6))
+  assert(!loRangeOk(10, -1, 2))
+  assert(!loRangeOk(10, 2, -1))
+  // A u64 field near 2^63 must not wrap past the comparison.
+  assert(!loRangeOk(10, 4, 0x7fffffffffffffff))
+  assert(!loRangeOk(10, 0x7fffffffffffffff, 4))
+}
+
+// An MH_OBJECT whose LC_SEGMENT_64 claims far more sections than its cmdsize holds.
+fn checkMachoBoundsSegmentSections() {
+  let b = newByteBuf()
+  appendU32(b, 0xfeedfacf)
+  appendU32(b, 0x0100000C)
+  appendU32(b, 0)
+  appendU32(b, 0x1)
+  appendU32(b, 1) // ncmds
+  appendZeros(b, 12)
+  appendU32(b, 0x19) // LC_SEGMENT_64
+  appendU32(b, 72)   // cmdsize: the segment header, no room for sections
+  appendZeros(b, 56)
+  appendU32(b, 1000) // nsects at +64
+  appendZeros(b, 4)
+  let msg = ""
+  readMachoObject("bad.o", b.bytes) catch e {
+    msg = e.message()
+    obEmpty()
+  }
+  assert(arHasPrefix(msg, "object bad.o: LC_SEGMENT_64 section headers: bytes ["))
+}
+
+// An ELF header whose section header table offset points past the file.
+fn checkElfBoundsSectionTable() {
+  let b = newByteBuf()
+  appendBytes(b, [u8(127), u8(69), u8(76), u8(70), u8(2), u8(1), u8(1), u8(0)])
+  appendZeros(b, 8)
+  appendU16(b, 1) // ET_REL
+  appendU16(b, elfMachine(ElfTarget.X86_64))
+  appendU32(b, 1)
+  appendU64(b, 0)                  // entry
+  appendU64(b, 0)                  // phoff
+  appendU64(b, 0x7fffffffffffff00) // shoff, far past the file
+  appendU32(b, 0)
+  appendU16(b, 64)
+  appendU16(b, 0)
+  appendU16(b, 0)
+  appendU16(b, 64) // shentsize
+  appendU16(b, 1)  // shnum
+  appendU16(b, 0)  // shstrndx
+  let msg = ""
+  readElf(ElfTarget.X86_64, "bad.o", b.bytes) catch e {
+    msg = e.message()
+    obEmpty()
+  }
+  assert(arHasPrefix(msg, "object bad.o: section header table: bytes ["))
+}
+
+// A COFF section whose raw-data pointer lies past the end of the file.
+fn checkCoffBoundsSectionData() {
+  let b = newByteBuf()
+  appendU16(b, 0x8664)
+  appendU16(b, 1) // sections
+  appendU32(b, 0)
+  appendU32(b, 60) // symtab offset
+  appendU32(b, 1)  // symbols
+  appendU16(b, 0)
+  appendU16(b, 0)
+  appendBytes(b, []byte(".text"))
+  appendZeros(b, 3)
+  appendZeros(b, 8)
+  appendU32(b, 100)  // SizeOfRawData
+  appendU32(b, 1000) // PointerToRawData, past the 82-byte file
+  appendZeros(b, 16)
+  appendZeros(b, 18) // one symbol
+  appendU32(b, 4)    // string table: just its own size field
+  let msg = ""
+  readCoffObject("bad.obj", b.bytes) catch e {
+    msg = e.message()
+    obEmpty()
+  }
+  assert(arHasPrefix(msg, "object bad.obj: section 0 raw data: bytes [1000, 1000+100)"))
+}
+
+// The shared atomizer rejects what a reader could not see: a symbol past its
+// section's end and a relocation whose field overruns it.
+fn checkAtomizeBoundsRejects() {
+  let secs = [loSec(".text", LoSectionKind.Text, []u8(16), 16, 4)]
+  let past = [loSym("f", 0, 17, 0, LoBinding.Global, 4)]
+  let msg = ""
+  atomizeModule("m.o", secs, past, []LoRawReloc(0)) catch e {
+    msg = e.message()
+    obEmpty()
+  }
+  assert(arHasPrefix(msg, "symbol f: offset 17 lies outside its 16-byte section .text"))
+  let rel = LoRawReloc{
+    section = 0, offset = 12, kind = LoRelocKind.Abs64,
+    target = loTargetGlobal("g"), addend = 0,
+  }
+  let msg2 = ""
+  atomizeModule("m.o", secs, []LoRawSymbol(0), [rel]) catch e {
+    msg2 = e.message()
+    obEmpty()
+  }
+  assert(arHasPrefix(msg2, "relocation: 8 bytes at offset 12 lie outside its 16-byte section .text"))
+}
+
+fn checkObjectBounds() {
+  checkObjectBoundsRangeHelper()
+  checkMachoBoundsSegmentSections()
+  checkElfBoundsSectionTable()
+  checkCoffBoundsSectionData()
+  checkAtomizeBoundsRejects()
+  checkCoffBoundsFuzz()
+}
+
+// Deterministic corruption stream (a 64-bit LCG), so a failing case replays.
+fn obNext(state: int): int {
+  return (state * 6364136223846793005 + 1442695040888963407) & 0x7fffffffffffffff
+}
+
+// A corrupted copy of `base`: mode 0 zero-fills a range, 1 truncates, 2 flips
+// eight bytes.
+fn obCorrupt(base: []u8, mode: int, seed: int): []u8 {
+  let d = []u8(len(base))
+  let i = 0
+  while (i < len(base)) {
+    d[i] = base[i]
+    i = i + 1
+  }
+  let st = obNext(seed)
+  if (mode == 1) {
+    return d[0:st % len(d)]
+  }
+  if (mode == 0) {
+    let n = 1 + (st >> 8) % 24
+    let o = (st >> 16) % (len(d) - n)
+    let z = 0
+    while (z < n) {
+      d[o + z] = u8(0)
+      z = z + 1
+    }
+    return d
+  }
+  let f = 0
+  while (f < 8) {
+    st = obNext(st)
+    d[(st >> 8) % len(d)] = u8(1 + (st >> 40) % 255)
+    f = f + 1
+  }
+  return d
+}
+
+// 3 modes x 300 corruptions of a real COFF fixture: every one either parses or
+// fails with a diagnostic that names the member. A panic would abort the
+// selfcheck, so reaching the asserts at all is the zero-panic proof.
+fn checkCoffBoundsFuzz() {
+  let base = prOvflObject(3, prSizeofHeader() + prSizeofSection() + 12)
+  let ok = 0
+  let named = 0
+  let mode = 0
+  while (mode < 3) {
+    let k = 0
+    while (k < 300) {
+      let bytes = obCorrupt(base, mode, mode * 1000 + k + 1)
+      let msg = ""
+      readCoffObject("fz.obj", bytes) catch e {
+        msg = e.message()
+        obEmpty()
+      }
+      if (msg == "") {
+        ok = ok + 1
+      } else {
+        assert(arHasPrefix(msg, "object fz.obj: "))
+        named = named + 1
+      }
+      k = k + 1
+    }
+    mode = mode + 1
+  }
+  assert(ok + named == 900)
+  assert(named > 0)
+}
