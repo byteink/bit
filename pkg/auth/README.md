@@ -83,8 +83,8 @@ protected route that is not itself doing the authenticating just reads
 - `hashPassword`, `Lookup`, `LookupResult`, `PasswordStrategy` - a
   password `Strategy` over your own user lookup, Argon2id underneath.
 - `PasswordOptions`, `AuthEvent`, `AuthEventHook` - the optional second
-  argument of `PasswordStrategy`: a `LoginThrottle` to consult and an audit
-  hook told every login.
+  argument of `PasswordStrategy`: a `LoginThrottle` to consult, an audit
+  hook told every login, and `second` (see below) for users who owe a code.
 - `PasswordPolicy`, `PolicyOptions`, `PolicyContext`, `Violation`, `PolicyViolations`,
   `BreachCheck`, `BreachMode` - the opt-in check of a new password after NIST SP
   800-63B: one `check` returning every rule broken, `hash` for the set side
@@ -145,9 +145,13 @@ protected route that is not itself doing the authenticating just reads
   (RFC 6238) two-factor codes: enrollment, the `otpauth://` QR-code URI, and
   verifying a submitted code with a skew window and caller-owned replay
   protection.
-- `BindOptions`, `SecondFactor`, `TotpFactor`, `TotpFactorOptions`,
-  `CompleteOptions`, `completeSecondFactor` - the second step of a two-factor
-  login: `bindSession(c, id, BindOptions{ second = true })` holds the session
+- `BindOptions`, `SecondFactor`, `SecondRequired`, `TotpFactor`,
+  `TotpFactorOptions`, `CompleteOptions`, `completeSecondFactor` - the second
+  step of a two-factor login: the `second` option of `PasswordOptions`,
+  `MagicLinkOptions`, `OAuth2Options` and `OidcOptions` (a `SecondRequired`,
+  asked with the verified `Identity`) binds a user who owes a code pending and
+  fails with 401 `second_factor_required`, with no full session ever made;
+  `bindSession(c, id, BindOptions{ second = true })` holds a session of your own
   pending, so `requireAuth` and `currentIdentity` answer 401
   `second_factor_required` until `completeSecondFactor` verifies a
   `SecondFactor` (`TotpFactor` for authenticator codes, which cannot be built
