@@ -804,8 +804,12 @@ streamed response.
 
 The error a request fails with once it reached the network layer: `sent`
 (`bool`) is `true` when any byte of the request may have been written, `false`
-when nothing was; `cause` (`error`) is the error underneath. `message()` is
-the cause's text.
+when nothing was; `cause` (`error`) is the error underneath.
+
+### `RequestError.message(): string`
+
+The cause's text, unchanged: a `RequestError` around a refused connect reads
+exactly as the connect error does.
 
 ### `TimeoutError`
 
