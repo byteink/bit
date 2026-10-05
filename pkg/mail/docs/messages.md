@@ -71,6 +71,8 @@ fn main(): ()! {
 * **`subject`** is required. Non-ASCII text is sent as an RFC 2047 encoded word.
 * **`text`** and **`html`**: at least one is required. Send both and mail
   clients pick the one they can show.
+* **`attachments`** are files sent with the mail, and pictures shown inside
+  its HTML; see [Attachments](attachments.md).
 * **`headers`** are extra header fields, written sorted by name. Names the
   package owns (`From`, `To`, `Date`, `Message-ID`, `Content-*` and the like)
   are refused, and so is a value holding a line break. Every message also gets
@@ -107,4 +109,5 @@ dot-atom-text: ...` or `headers["X-Post"]: the value contains a CR, LF or NUL
 
 The package front page is [README](../README.md). Addresses are in
 [Addresses](addresses.md); the mailer that sends a `Message` is in
-[The Mailer](mailer.md).
+[The Mailer](mailer.md); files and inline images are in
+[Attachments](attachments.md).
