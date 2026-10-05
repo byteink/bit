@@ -71,6 +71,8 @@ fn main(): ()! {
 * **`retry`** says how a delivery the server only postponed is repeated, and
   **`rate`** how many messages a second the mailer delivers at most. See
   [Retries and pace](retry.md).
+* **`redirect`** is for staging: every mail goes to that one address and to
+  nobody else. See [Staging mail](redirect.md).
 
 `Options{}` is a valid setup. More fields arrive with the parts of the package
 that need them, always with a default, so code written today keeps working.
