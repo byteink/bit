@@ -78,6 +78,8 @@ fn main(): ()! {
   are refused, and so is a value holding a line break. Every message also gets
   `Auto-Submitted: auto-generated` (RFC 3834), so auto-responders do not answer
   it; set `Auto-Submitted` in `headers` to send your own value instead.
+* **`unsubscribe`** is how a recipient leaves the list, one click or by mail;
+  see [Unsubscribe](unsubscribe.md).
 * **`tags`** are labels for your own bookkeeping. They are never written into
   the message.
 * **`inReplyTo`** is the Message-ID of the mail this one answers, with or

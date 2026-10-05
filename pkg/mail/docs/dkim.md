@@ -99,7 +99,7 @@ naming `Options.dkim` and the identity:
 
 * a key that does not load: not PEM, encrypted, not RSA or Ed25519, an RSA key
   under 2048 bits (RFC 8301 allows 1024; Gmail and others stop trusting it), a
-  domain or selector that is not a DNS name, a `headers` list without `From`;
+  domain or selector that is not a DNS name, a `headers` list without `From`, `List-Unsubscribe` or `List-Unsubscribe-Post`;
 * two entries with the same domain and selector, since DNS holds one key under
   one name;
 * an Ed25519 key with no RSA key for its domain, above;
@@ -148,7 +148,9 @@ so DMARC would reject the mail`.
 ## Tuning a key
 
 `Dkim.headers` replaces the list of signed headers (lower case or not; `From`
-is required, since DMARC is about From). `Dkim.expire` is the seconds a
+is required, since DMARC is about From, and so are `List-Unsubscribe` and
+`List-Unsubscribe-Post`, which RFC 8058 requires a one-click signature to
+cover; see [Unsubscribe](unsubscribe.md)). `Dkim.expire` is the seconds a
 signature stays valid; above zero it adds `x=`, so an old copy of a message
 cannot be replayed forever.
 
@@ -160,7 +162,15 @@ fn digestKey(pem: string): Dkim {
     domain = "inkwell.dev",
     selector = "digest",
     key = pem,
-    headers = ["From", "To", "Subject", "Date", "Message-ID", "List-Unsubscribe"],
+    headers = [
+      "From",
+      "To",
+      "Subject",
+      "Date",
+      "Message-ID",
+      "List-Unsubscribe",
+      "List-Unsubscribe-Post",
+    ],
     expire = 7 * 24 * 3600,
   }
 }
