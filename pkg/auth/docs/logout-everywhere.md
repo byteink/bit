@@ -117,16 +117,17 @@ session it makes.
 this is all there is to it:
 
 ```bit
-import { SessionStore } from "web"
+import { SessionStore, sessionTTLSeconds } from "web"
 import { subjectIndexKey } from "auth"
 
 fn destroyByHand(sessions: SessionStore, id: string): int! {
-  return sessions.destroyIndexed(subjectIndexKey, id, "", 86400)?
+  return sessions.destroyIndexed(subjectIndexKey, id, "", sessionTTLSeconds)?
 }
 ```
 
-Use `logoutEverywhere` and not this: it also refuses an empty id and keeps the
-tombstone as long as a session lives. The snippet matters if you write a
+Use `logoutEverywhere` and not this: it also refuses an empty id. The
+tombstone lasts `sessionTTLSeconds`, as long as a session lives, so a request
+already running with a destroyed id cannot write it back. The snippet matters if you write a
 `SessionStore` of your own, which must keep the index, as the
 [`pkg/web` security chapter](../../web/docs/security.md) describes. A
 session that rotates its id (`Session.regenerate()`) takes the index with it,

@@ -56,11 +56,13 @@ never disagrees with the data and costs no extra store round trip.
 `destroyIndexed(key, value, except, tombstoneTtl)` then destroys every live
 session holding that pair, leaving the same tombstones `destroy()` does, and
 returns how many it destroyed. `except` is the one session to keep (the
-caller's own), or `""` for none. Namespace the keys (`"auth:sub"`); both the
+caller's own), or `""` for none. `tombstoneTtl` is always
+`sessionTTLSeconds` (24 hours, exported by `web`): a tombstone must outlive the
+session it replaces, or a stale writer can bring the id back. Namespace the keys (`"auth:sub"`); both the
 key and the value must be non-empty.
 
 ```bit
-import { Ctx, Res, SessionStore } from "web"
+import { Ctx, Res, SessionStore, sessionTTLSeconds } from "web"
 
 fn markLogin(c: Ctx, userId: string): ()! {
   c.session()?.index("auth:sub", userId)
@@ -68,7 +70,7 @@ fn markLogin(c: Ctx, userId: string): ()! {
 
 fn logoutOthers(c: Ctx, store: SessionStore, userId: string): Res! {
   let s = c.session()?
-  let n = store.destroyIndexed("auth:sub", userId, s.id(), 86400)?
+  let n = store.destroyIndexed("auth:sub", userId, s.id(), sessionTTLSeconds)?
   return c.text("signed out of ${n} other session(s)")
 }
 ```
