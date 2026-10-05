@@ -694,6 +694,52 @@ Whether the server advertised `ext` in its last EHLO reply, matched
 case-insensitively against the first word of each capability line, so
 `supports("AUTH")` answers for `AUTH PLAIN LOGIN`.
 
+### `Client.limits(): Limits`
+
+The caps the server advertised in its last EHLO reply's `LIMITS` line (RFC 9422):
+`rcptMax`, the `RCPT TO` commands it accepts in one transaction, and `mailMax`,
+the `MAIL FROM` commands it accepts in one session. A cap that was not
+advertised, or whose value is not one to six digits with no leading zero
+(1..999999), is 0. It never fails: the advertisement is advice, and a malformed
+one must not stop a send. Names are matched case-insensitively, a name this
+module does not know is skipped, and a `LIMITS` parameter that breaks the basic
+`name=value` syntax (an empty word, a `;` in a value) is ignored as a whole.
+
+Like `supports`, it reads the last EHLO only: it is all zero before `ehlo`, and
+again after `startTls` until `ehlo` is re-issued.
+
+```bit
+import { Client, Limits } from "std/smtp"
+
+// The recipient lists to send one message as, so no transaction carries more
+// `RCPT TO` commands than the server accepts. A server that advertised no cap
+// gets the whole list.
+fn batches(c: Client, to: []string): [][]string {
+  let l: Limits = c.limits()
+  let out = [][]string(0)
+  if (l.rcptMax == 0) {
+    return append(out, to)
+  }
+  let i = 0
+  while (i < len(to)) {
+    let end = i + l.rcptMax
+    if (end > len(to)) {
+      end = len(to)
+    }
+    out = append(out, to[i:end])
+    i = end
+  }
+  return out
+}
+
+// Whether a session that has carried `sent` transactions should be retired
+// before the next one, so the server never has to cut it.
+fn retire(c: Client, sent: int): bool {
+  let l = c.limits()
+  return l.mailMax > 0 && sent >= l.mailMax
+}
+```
+
 ### `Client.isSecure(): bool`
 
 Whether this connection is TLS - an implicit-TLS dial, or a completed
