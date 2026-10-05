@@ -1,0 +1,240 @@
+// pkg/mail/sendgrid.bit — the `Transport` `open("sendgrid://KEY@default")`
+// returns: one `POST https://api.sendgrid.com/v3/mail/send` per message with the
+// API key as a Bearer token
+// (https://www.twilio.com/docs/sendgrid/api-reference/mail-send/mail-send). The
+// JSON is made in sendgridbody.bit; the URL and the client are shared with the
+// other HTTPS-API transports (httpapi.bit); this file is the request and what
+// each answer means.
+//
+//   sendgrid://KEY@default                      api.sendgrid.com
+//   sendgrid://KEY@eu                           api.eu.sendgrid.com, for an EU regional subuser
+//   sendgrid://KEY@host[:port]                  https://host[:port], for a proxy or a test
+//   sendgrid://KEY@host[:port]?insecureSkipVerify=true   ... without checking its certificate
+//
+// The key is never in an error, a `Receipt` or the text of the transport.
+//
+// What SendGrid answers, and what the caller gets:
+//   202                          `Receipt.providerId` is the `X-Message-Id` it returns
+//   401, 403 (but see below)     `Auth`
+//   403 for the `from` field     `Rejected`: a sender that is not a verified identity
+//                                is not a bad key
+//   429                          `Transient`, `Reply.retryAfter` from `X-RateLimit-Reset`
+//   5xx                          `Transient`
+//   a failed TLS handshake       `Rejected`: the same certificate is presented next time
+//   a request that never left     `Transient`: a refused or failed connect
+//   a request cut off after it    `Unknown`: a reset or a timeout once it was
+//   was written                   written; SendGrid may have taken the mail, so it
+//                                 is not repeated
+//   400, 413 and any other 4xx   `Rejected` with the `errors[].message` texts joined by `; `
+//
+// SendGrid has no idempotency key, so a send is repeated only when the mail was
+// not taken: a refused connection, a 429 or a 5xx. A request cut off after it was
+// written may or may not have been taken, and repeating it can send the mail
+// twice (RFC 9110 §9.2.2), so it is `Unknown` and `Options.retry` leaves it alone.
+
+import { Client as HttpClient, header as httpHeader } from "std/http"
+import { Json, jsonAsString, jsonGet } from "std/json"
+import { parseInt, trimSpace } from "std/strings"
+import { Millisecond, Second, now } from "std/time"
+
+fn sendgridSpec(): ApiSpec {
+  return ApiSpec{
+    scheme = "sendgrid://",
+    defaultHost = "api.sendgrid.com",
+    regions = { "eu": "api.eu.sendgrid.com" },
+    secret = "API key",
+    placeholder = "KEY",
+  }
+}
+
+// Whether `url` is a `sendgrid://` URL, whatever follows.
+fn isSendgridUrl(url: string): bool {
+  return hasScheme(url, "sendgrid://")
+}
+
+// `url` as a target, or a `Config` that never repeats the key.
+fn parseSendgrid(url: string): ApiTarget!MailError {
+  return parseApiUrl(sendgridSpec(), url)?
+}
+
+// The wall clock, in nanoseconds since the Unix epoch.
+fn sgWallClock(): int {
+  return now().ns
+}
+
+class SendgridTransport {
+  t: ApiTarget
+  from: string
+  replyTo: []string
+  timeoutMs: int
+  // What time it is, so the wait a 429 asks for can be read against a fixed
+  // instant in a test.
+  clock: () => int
+
+  init(t: ApiTarget, opts: Options) {
+    this.t = t
+    this.from = opts.from
+    this.replyTo = []
+    if (opts.replyTo != "") {
+      this.replyTo = [opts.replyTo]
+    }
+    this.timeoutMs = opts.timeout / Millisecond
+    this.clock = sgWallClock
+  }
+
+  // Posts `d` as one SendGrid mail. See the top of this file for what each
+  // answer becomes.
+  export deliver(d: Delivery): Receipt!MailError {
+    let body = sgPayload(d, this.from, this.replyTo)?
+    let c = apiClient(this.t.insecure)
+    defer c.close()
+    this.setHeaders(c)?
+    let res = c.requestTimeout("POST", this.endpoint(), body, this.timeoutMs) catch e {
+      fail apiNetError("sendgrid: ${this.scrub(e.message())}", e, false)
+    }
+    return this.answer(res.status, res.headers, res.body, d)?
+  }
+
+  // The URL every send is posted to.
+  endpoint(): string {
+    return "${this.t.base}/v3/mail/send"
+  }
+
+  // The mail is built at SendGrid, so what leaves is not `Delivery.raw`.
+  export signs(): bool {
+    return false
+  }
+
+  // Nothing is held between sends.
+  export close() {}
+
+  // `sendgrid://***@api.sendgrid.com`, the key hidden.
+  export toString(): string {
+    return this.t.display
+  }
+
+  // The headers every send carries. The key was checked at `open`, so a refusal
+  // here is a bug, reported and never with the value.
+  setHeaders(c: HttpClient): ()!MailError {
+    c.setHeader("Authorization", "Bearer ${this.t.secret}") catch _ {
+      fail MailError.Config("sendgrid://: the API key cannot be sent as a header")
+    }
+    c.setHeader("Content-Type", "application/json") catch _ {
+      fail MailError.Config("sendgrid://: Content-Type cannot be set")
+    }
+  }
+
+  scrub(s: string): string {
+    return apiScrub(s, this.t.secret)
+  }
+
+  // The `Receipt` for a 202, else the `MailError` for the answer.
+  answer(status: int, headers: string, body: string, d: Delivery): Receipt!MailError {
+    if (status == 202) {
+      return Receipt{
+        id = d.messageId,
+        providerId = trimSpace(httpHeader(headers, "x-message-id")),
+        accepted = d.envelope.to,
+      }
+    }
+    let errors = sgErrors(body)
+    let text = apiClip(this.scrub(sgMessages(errors)))
+    if (text == "") {
+      text = "HTTP ${status}"
+    }
+    let r = Reply{ code = status, text = text }
+    if (status == 429) {
+      r.retryAfter = sgRetryAfter(headers, this.clock())
+    }
+    fail sendgridError(status, errors, r)
+  }
+}
+
+// One entry of the `errors` list of an error answer.
+class SgError {
+  message: string,
+  field: string,
+}
+
+// The `errors` of an error answer, none when the body is not that shape.
+fn sgErrors(body: string): []SgError {
+  let out: []SgError = []
+  match (apiMember(body, "errors")) {
+    Some(list) => {
+      for item of sgItems(list) {
+        out = append(
+          out,
+          SgError{ message = sgText(item, "message"), field = sgText(item, "field") },
+        )
+      }
+    }
+    None => {}
+  }
+  return out
+}
+
+// The elements of `j` when it is an array, else none.
+fn sgItems(j: Json): []Json {
+  match (j) {
+    JsonArray(items) => return items
+    _ => return []
+  }
+}
+
+// The string member `name` of `item`, "" when absent, null or not a string.
+fn sgText(item: Json, name: string): string {
+  match (jsonGet(item, name)) {
+    Some(v) => return unwrapOr(jsonAsString(v), "")
+    None => return ""
+  }
+}
+
+// The `message` texts of `errors` joined by `; `.
+fn sgMessages(errors: []SgError): string {
+  let list: []string = []
+  for e of errors {
+    if (e.message != "") {
+      list = append(list, e.message)
+    }
+  }
+  return join(list, "; ")
+}
+
+// Whether one of `errors` names the `from` field.
+fn sgFromField(errors: []SgError): bool {
+  for e of errors {
+    if (e.field == "from") {
+      return true
+    }
+  }
+  return false
+}
+
+// How long to wait until `X-RateLimit-Reset`, the epoch second the limit
+// refreshes at, in nanoseconds; 0 when it is missing, unreadable, already past,
+// or more than a day away (a misread, as for `Retry-After`).
+fn sgRetryAfter(headers: string, nowNs: int): int {
+  let reset = parseInt(trimSpace(httpHeader(headers, "x-ratelimit-reset"))) catch _ {
+    return 0
+  }
+  let wait = reset * Second - nowNs
+  if (wait <= 0 || wait > apiMaxRetryAfter * Second) {
+    return 0
+  }
+  return wait
+}
+
+// The `MailError` for an answer that is not a 202; the table is at the top of
+// this file.
+fn sendgridError(status: int, errors: []SgError, r: Reply): MailError {
+  if (status == 403 && sgFromField(errors)) {
+    return MailError.Rejected(r)
+  }
+  if (status == 401 || status == 403) {
+    return MailError.Auth(r)
+  }
+  if (status == 429 || status >= 500) {
+    return MailError.Transient(r)
+  }
+  return MailError.Rejected(r)
+}

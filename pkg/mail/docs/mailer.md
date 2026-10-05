@@ -314,7 +314,7 @@ fn main(): ()! {
   retry is for, and `send` already retries it; see [Retries and pace](retry.md).
 * **`Unknown`**: the request reached the provider and the answer never came
   back, so the mail may have been taken. A provider without an idempotency key
-  (Postmark) reports a reset or a timeout after the write this way instead of
+  (Postmark, SendGrid) reports a reset or a timeout after the write this way instead of
   `Transient`, and `send` does not repeat it: a retry could deliver it twice.
 
 `Invalid`, `Config` and `Signature` carry text naming the field or the reason;

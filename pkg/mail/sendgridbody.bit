@@ -1,0 +1,232 @@
+// pkg/mail/sendgridbody.bit — the JSON a `sendgrid://` transport posts to
+// SendGrid's `POST /v3/mail/send`
+// (https://www.twilio.com/docs/sendgrid/api-reference/mail-send/mail-send): one
+// object with `personalizations`, `from`, `reply_to_list`, `subject`, `content`,
+// `attachments`, `headers` and `categories`, in that order, a field left out
+// when it is empty.
+//
+// A `Message` is one personalization: its `to`, `cc` and `bcc` are the
+// recipients of a single mail, each an object of `email` and, when the address
+// has one, `name`. `content` lists `text/plain` first and `text/html` after it,
+// the order SendGrid requires.
+//
+// SendGrid builds the MIME message itself, so this file maps fields and never
+// bytes: `Delivery.raw` is not sent. What the SMTP path gets from the renderer
+// is reproduced from the same functions, so both transports agree on it: the
+// text part made from the HTML (`textBody`), the threading and `Auto-Submitted`
+// headers (`extraFields`), the attachment type (`guessType`).
+//
+// `Message.tags` has names and values, SendGrid has `categories` (names only)
+// and `custom_args` (name and string value): the tag named `category` holds the
+// categories, separated by commas, and every other tag is a `custom_args` entry,
+// which SendGrid returns in its event webhooks.
+
+import { Json, JsonEntry, jsonEncode } from "std/json"
+import { encodeBase64 } from "std/crypto"
+import { keys } from "std/seq"
+import { sorted } from "std/sort"
+import { trimSpace } from "std/strings"
+
+// The `Message.tags` name that becomes SendGrid's `categories`.
+const sgCategoryKey: string = "category"
+
+// A request carries at most this many addresses across `to`, `cc` and `bcc`.
+const sgMaxRecipients: int = 1000
+
+// At most this many categories, each at most this many characters.
+const sgMaxCategories: int = 10
+
+const sgMaxCategory: int = 255
+
+// The names and values of `custom_args` together may not exceed this many bytes.
+const sgMaxArgBytes: int = 10000
+
+// Headers SendGrid refuses to take from the request, lowercase. The names the
+// renderer already owns (`From`, `To`, `Content-Type`...) cannot reach here, but
+// are listed so the set is the documented one.
+fn sgReserved(): []string {
+  return [
+    "x-sg-id",
+    "x-sg-eid",
+    "received",
+    "dkim-signature",
+    "content-type",
+    "content-transfer-encoding",
+    "to",
+    "from",
+    "subject",
+    "reply-to",
+    "cc",
+    "bcc",
+  ]
+}
+
+// `{"email", "name"}` for `a`, the name left out when it has none.
+fn sgAddress(a: Address): Json {
+  let f = ApiFields{}
+  f.put("email", Json.JsonString(a.email))
+  f.putText("name", a.name)
+  return Json.JsonObject(f.entries)
+}
+
+// `list` parsed as `field[i]`, each address as SendGrid writes it.
+fn sgAddresses(field: string, list: []string): []Json!MailError {
+  let out: []Json = []
+  for a of parseFields(field, list)? {
+    out = append(out, sgAddress(a))
+  }
+  return out
+}
+
+// The categories of `m`: the comma-separated names in its tag `category`.
+fn sgCategories(m: Message): []string!MailError {
+  let raw = m.tags[sgCategoryKey]
+  let out: []string = []
+  if (raw == "") {
+    return out
+  }
+  for part of split(raw, ",") {
+    let name = trimSpace(part)
+    if (name == "" || apiChars(name) > sgMaxCategory) {
+      fail MailError.Invalid("tags[\"category\"]: SendGrid takes categories of 1 to ${sgMaxCategory} characters separated by commas, got ${echoInput(part)}")
+    }
+    for seen of out {
+      if (seen == name) {
+        fail MailError.Invalid("tags[\"category\"]: the category ${echoInput(name)} is given twice")
+      }
+    }
+    out = append(out, name)
+  }
+  if (len(out) > sgMaxCategories) {
+    fail MailError.Invalid("${len(out)} categories in tags[\"category\"]; SendGrid takes at most ${sgMaxCategories}")
+  }
+  return out
+}
+
+// `Message.tags` but `category` as `custom_args`, sorted by name. SendGrid takes
+// at most `sgMaxArgBytes` bytes of names and values together; a set it would
+// refuse is refused here, before the request.
+fn sgArgs(m: Message): []JsonEntry!MailError {
+  let out: []JsonEntry = []
+  let bytes = 0
+  for name of sorted(keys(m.tags), (a, b) => a < b) {
+    if (name == sgCategoryKey) {
+      continue
+    }
+    bytes = bytes + len(name) + len(m.tags[name])
+    out = append(out, apiEntry(name, Json.JsonString(m.tags[name])))
+  }
+  if (bytes > sgMaxArgBytes) {
+    fail MailError.Invalid("tags: SendGrid takes at most ${sgMaxArgBytes} bytes of custom_args, got ${bytes}")
+  }
+  return out
+}
+
+// The one personalization of `m`: its recipients and its `custom_args`.
+fn sgPersonalization(m: Message): Json!MailError {
+  if (len(m.to) == 0) {
+    fail MailError.Invalid("to: SendGrid needs at least one to recipient; cc and bcc alone are not enough")
+  }
+  let f = ApiFields{}
+  f.put("to", Json.JsonArray(sgAddresses("to", m.to)?))
+  let cc = sgAddresses("cc", m.cc)?
+  if (len(cc) > 0) {
+    f.put("cc", Json.JsonArray(cc))
+  }
+  let bcc = sgAddresses("bcc", m.bcc)?
+  if (len(bcc) > 0) {
+    f.put("bcc", Json.JsonArray(bcc))
+  }
+  let args = sgArgs(m)?
+  if (len(args) > 0) {
+    f.put("custom_args", Json.JsonObject(args))
+  }
+  return Json.JsonObject(f.entries)
+}
+
+// One body part: `{"type", "value"}`.
+fn sgPart(mime: string, value: string): Json {
+  return Json.JsonObject(
+    [apiEntry("type", Json.JsonString(mime)), apiEntry("value", Json.JsonString(value))],
+  )
+}
+
+// The parts of `m`: `text/plain` first, then `text/html`, each only when there
+// is something to say. A message with only HTML has the plain text made from it.
+fn sgContent(m: Message): []Json {
+  let out: []Json = []
+  let text = textBody(m)
+  if (text != "") {
+    out = append(out, sgPart("text/plain", text))
+  }
+  if (m.html != "") {
+    out = append(out, sgPart("text/html", m.html))
+  }
+  return out
+}
+
+// One attachment. An image with a `cid` is `inline` and the HTML refers to it
+// with `cid:<content_id>`; every other file is an `attachment`.
+fn sgAttachment(a: Attachment): Json {
+  let disposition = "attachment"
+  if (a.cid != "") {
+    disposition = "inline"
+  }
+  let f = ApiFields{}
+  f.put("content", Json.JsonString(encodeBase64(a.data)))
+  f.put("type", Json.JsonString(apiAttachType(a)))
+  f.put("filename", Json.JsonString(a.name))
+  f.put("disposition", Json.JsonString(disposition))
+  f.putText("content_id", a.cid)
+  return Json.JsonObject(f.entries)
+}
+
+fn sgAttachments(m: Message): []Json {
+  let out: []Json = []
+  for a of m.attachments {
+    out = append(out, sgAttachment(a))
+  }
+  return out
+}
+
+// `Message.headers` plus the threading pair and `Auto-Submitted`, as the SMTP
+// renderer writes them, sorted by name, as the `headers` object. A name SendGrid
+// does not let a request set is refused here.
+fn sgHeaders(m: Message): []JsonEntry!MailError {
+  let out: []JsonEntry = []
+  for f of sortFields(extraFields(m)?)? {
+    for name of sgReserved() {
+      if (toLower(f.name) == name) {
+        fail MailError.Invalid("headers[${echoInput(f.name)}]: SendGrid does not let a request set the ${f.name} header")
+      }
+    }
+    out = append(out, apiEntry(f.name, Json.JsonString(f.value)))
+  }
+  return out
+}
+
+// The request body for `d`. `from` and `replyTo` are the mailer's defaults, for
+// a message that sets none.
+fn sgPayload(d: Delivery, from: string, replyTo: []string): string!MailError {
+  apiCheck(d, "SendGrid", sgMaxRecipients)?
+  let m = d.message
+  let f = ApiFields{}
+  f.put("personalizations", Json.JsonArray([sgPersonalization(m)?]))
+  f.put("from", sgAddress(parseField("from", apiSender(m, from))?))
+  let reply = sgAddresses("replyTo", apiReplyTo(m, replyTo))?
+  if (len(reply) > 0) {
+    f.put("reply_to_list", Json.JsonArray(reply))
+  }
+  f.put("subject", Json.JsonString(m.subject))
+  f.put("content", Json.JsonArray(sgContent(m)))
+  let files = sgAttachments(m)
+  if (len(files) > 0) {
+    f.put("attachments", Json.JsonArray(files))
+  }
+  let headers = sgHeaders(m)?
+  if (len(headers) > 0) {
+    f.put("headers", Json.JsonObject(headers))
+  }
+  f.putList("categories", sgCategories(m)?)
+  return jsonEncode(Json.JsonObject(f.entries))
+}
