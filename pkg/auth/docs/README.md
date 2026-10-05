@@ -10,7 +10,7 @@ The chapters below, in reading order.
 | [Other OIDC providers](providers.md) | Microsoft Entra ID, one tenant or many, and any other conformant provider. |
 | [Verifying a token directly](manual-verification.md) | A mobile or single-page client that already holds an ID token, with no redirect. |
 | [Two-factor authentication with TOTP](totp.md) | A second login step with an authenticator app: enrollment, verifying a code, skew and replay protection, recovery codes for a lost phone. |
-| [Check a new password](password-policy.md) | An opt-in policy for new passwords after NIST SP 800-63B: length in code points, normalization at set and verify, context words, blocklists, runs, an optional breach check, and why there is no composition rule or expiry. |
+| [Check a new password](password-policy.md) | An opt-in policy for new passwords after NIST SP 800-63B: length in code points, normalization recorded in the hash, context words, blocklists, runs, an optional breach check, and why there is no composition rule or expiry. |
 | [Slow down password guessing](brute-force.md) | Throttle failed logins per account and per address: backoff, lockout, reset on success, an audit trail. |
 | [One-time tokens for account emails](account-tokens.md) | The token behind password reset, email verification and magic links: hashed at rest, single use, expiring, one purpose each. |
 | [Confirm an author's email address](email-verification.md) | Email verification on one-time tokens: send a link at signup, confirm it once, resend without revealing which addresses exist, and what happens when the address changes. |

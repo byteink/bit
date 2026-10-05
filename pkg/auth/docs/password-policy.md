@@ -75,7 +75,7 @@ refused, never cut short.
 | ------ | ------- | ------------ |
 | `minLength` | 15 | The shortest password. NIST asks for 15 when the password is the only factor, and 8 at the very least, so a value under 8 is refused. |
 | `maxLength` | 64 | The longest. NIST says to allow at least 64, so a value under 64 is refused. |
-| `normalize` | on | NFKC normalization, applied when the password is set and when it is verified. |
+| `normalize` | on | NFKC normalization, applied when the password is set and recorded in the stored hash so verify repeats it. |
 | `context` | on | Refuses a password containing the username, the part of the email before its `@`, or one of your own words. |
 | `blocklist` | none | Your own list of refused passwords. |
 | `builtinBlocklist` | on | Also refuses the common passwords the package ships with. |
@@ -134,17 +134,23 @@ hash, so the author cannot log in from the second keyboard. NFKC makes both
 spellings one string before hashing. It only works if the password is normalized
 both when it is set and when it is checked.
 
-That is why the policy carries both sides. `hash` is `check` plus the hash: it
+So the stored hash says which one was done. `hash` is `check` plus the hash: it
 refuses a password that breaks a rule and otherwise hashes the normalized
-password. `PasswordStrategy` takes the same policy in `PasswordOptions.policy` and
-normalizes what the author types before it verifies. One `normalize` switch on one
-object drives both.
+password, and when `normalize` is on it writes `n=nfkc` after the Argon2
+parameters:
+
+```text
+$argon2id$v=19$m=19456,t=2,p=1,n=nfkc$<salt>$<tag>
+```
+
+`PasswordStrategy` reads that parameter and normalizes what the author typed
+exactly when it is there. It does not ask the policy, so nothing can drift: the
+check is always made the way the password was set. The strategy takes no policy.
 
 ```bit
 import { App, Config, MemoryStore } from "web"
 import {
   Lookup,
-  PasswordOptions,
   PasswordPolicy,
   PasswordStrategy,
   PolicyContext,
@@ -164,35 +170,30 @@ fn createAccount(policy: PasswordPolicy, username: string, password: string): st
   return stored
 }
 
-fn build(users: Lookup, policy: PasswordPolicy): App {
+fn build(users: Lookup): App {
   let app = App(Config{ secret = "change-me", sessions = MemoryStore(10_000) })
-  let login = PasswordStrategy(
-    users,
-    PasswordOptions{ policy = Option<PasswordPolicy>.Some(policy) },
-  )
   let guarded = app.group("/login")
-  guarded.use(requireAuth([]Strategy{ login }))
+  guarded.use(requireAuth([]Strategy{ PasswordStrategy(users) }))
   guarded.post("/", (c) => c.text("welcome"))
   return app
 }
 ```
 
 `hash` fails with a `PolicyViolations` that carries the same list `check` returns.
-`prepare` is the normalization on its own, for the rare caller that hashes
-somewhere else:
 
-```bit
-import { PasswordPolicy } from "auth"
+What follows from the hash being the source of truth:
 
-fn sameWord(policy: PasswordPolicy): bool {
-  return policy.prepare("café") == policy.prepare("café")
-}
-```
+- A hash made by bare `hashPassword` has no `n=` and verifies exactly as typed,
+  whatever the policy says now. That includes every hash stored before the
+  parameter existed.
+- Turning `normalize` on or off later changes only the passwords set from then on.
+  Nobody who enrolled earlier is locked out.
+- A hash with an `n=` value the package does not know never verifies.
 
 Passwords that are plain ASCII come out of NFKC unchanged, so only a password with
-a non-ASCII character depends on this. Hash it with bare `hashPassword` while the
-strategy has a normalizing policy and that author cannot log in. Set every password
-through the policy that verifies it.
+a non-ASCII character depends on any of this. The extra parameter is the package's
+own: another Argon2 library will not accept a string that carries it, so remove
+`,n=nfkc` before handing the hash to one, and normalize the password yourself.
 
 ## Is this password in a breach
 
@@ -251,9 +252,9 @@ change when you learn a password is stolen, not on a timer.
 
 ## Sharp edges
 
-- **Turning on normalization after accounts exist.** A non-ASCII password hashed
-  without it will not match once the strategy normalizes. Reset those authors'
-  passwords or turn `normalize` off.
+- **Turning on normalization after accounts exist.** Existing hashes keep the
+  behavior they were made with, so they still verify, but they stay un-normalized
+  until the author sets a new password through `hash`.
 - **A shorter limit than before.** A policy checks passwords when they are set.
   It never locks out an author whose stored password would fail it today.
 - **`Violation` has no text.** Every message is yours, and `check` returns

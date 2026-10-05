@@ -82,8 +82,8 @@ protected route that is not itself doing the authenticating just reads
   hook told every login.
 - `PasswordPolicy`, `PolicyOptions`, `PolicyContext`, `Violation`, `PolicyViolations`,
   `BreachCheck`, `BreachMode` - the opt-in check of a new password after NIST SP
-  800-63B: one `check` returning every rule broken, `hash` for the set side,
-  `PasswordOptions.policy` for the verify side; see
+  800-63B: one `check` returning every rule broken, `hash` for the set side
+  (it records NFKC in the stored hash, which `PasswordStrategy` follows); see
   [Check a new password](docs/password-policy.md).
 - `LoginThrottle`, `ThrottleOptions`, `Throttled`, `ThrottleEvent`,
   `ThrottleHook`, `ThrottleKind` - the brute-force defence: per-account and
