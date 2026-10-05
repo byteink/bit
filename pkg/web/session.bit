@@ -75,7 +75,32 @@ const sessionTTLSeconds: i64 = 86400
 const sessionCasMaxAttempts: int = 8
 
 // A store of session data, keyed by session id. Structural (§14.3): a type
-// satisfies this by having the three methods, with no declaration anywhere.
+// satisfies this by having the four methods, with no declaration anywhere.
+//
+// ## Revoking by subject: the index (#6928)
+//
+// A session is addressable by its id alone, so "destroy every session of user
+// X" (OWASP ASVS v5 V7: end the other sessions on a credential change) or
+// "destroy the session with OIDC `sid` S" (OIDC Back-Channel Logout 1.0 §2.7)
+// needs a second way in. A session carries an INDEX: `key` -> `value` pairs
+// set with `Session.index(key, value)`, one value per key. `compareAndSet`
+// receives the whole index with the data and `load` returns it with the data,
+// so the two are written and read in the same operation and can never
+// disagree — there is no second write, hence no extra round trip.
+// `destroyIndexed(key, value, except, tombstoneTtl)` tombstones, exactly as
+// `destroy` does, every live session whose index holds `key` = `value`,
+// except the id `except` ("" = none), and returns how many it destroyed.
+// Index keys are namespaced by the caller (pkg/auth uses "auth:sub" and
+// "auth:oidc-sid"); `key` and `value` must both be non-empty, since an empty
+// value would match every session that never set the key.
+//
+// What a SQL or Redis store must maintain: a secondary index on
+// (key, value) -> sid, rewritten inside the same transaction (or Lua script)
+// as the `compareAndSet` that replaces the session's index — drop the
+// session's old pairs, insert the new ones. Entries leave the index when the
+// session expires or is destroyed (a tombstone has no index). `destroyIndexed`
+// must cost O(sessions holding that pair), never a scan of every session;
+// an expired session is not counted and not tombstoned.
 //
 // Every write is a versioned compare-and-set (#5794, TOCTOU: two concurrent
 // requests sharing one cookie — one `destroy()`s while the other still holds
@@ -86,7 +111,7 @@ const sessionCasMaxAttempts: int = 8
 //
 // `load` answers `Option.None` for a miss — an unknown, forged, destroyed or
 // expired id is the normal case on a public endpoint, not an error — and
-// `Option.Some((data, version))` for a hit, INCLUDING a hit whose map has no
+// `Option.Some((data, version, index))` for a hit, INCLUDING a hit whose map has no
 // keys. Presence and emptiness are separate facts and the type has to keep
 // them apart: #4483, where a miss WAS the empty map, so `loadSession` could
 // not tell a stored keyless session from an id that was never written and
@@ -105,9 +130,16 @@ const sessionCasMaxAttempts: int = 8
 // timeout); reporting that as a miss would silently log every user out
 // during an outage.
 export interface SessionStore {
-  load(sid: string): Option<(map<string, string>, i64)>!,
-  compareAndSet(sid: string, expectedVersion: i64, data: map<string, string>, ttl: i64): i64!,
+  load(sid: string): Option<(map<string, string>, i64, map<string, string>)>!,
+  compareAndSet(
+    sid: string,
+    expectedVersion: i64,
+    data: map<string, string>,
+    index: map<string, string>,
+    ttl: i64,
+  ): i64!,
   destroy(sid: string, tombstoneTtl: i64): ()!,
+  destroyIndexed(key: string, value: string, except: string, tombstoneTtl: i64): int!,
 }
 
 // One request's session. Obtained from `Ctx.session()` (ctx.bit), which
@@ -122,6 +154,10 @@ export class Session {
   // never-seen id starts at, and what `persist()` sends as `compareAndSet`'s
   // `expectedVersion` for a session this object never loaded from the store.
   version: i64
+  // The session's index (see "Revoking by subject" on `SessionStore`): the
+  // WHOLE index, as loaded plus anything `index()` changed, because
+  // `compareAndSet` replaces the stored index with this map.
+  indexes: map<string, string>
   // True when this id was minted during THIS request: either no cookie
   // arrived, or the one that did missed in the store. #3884/#3885 use it to
   // decide whether the response needs a `Set-Cookie` at all.
@@ -156,6 +192,21 @@ export class Session {
   export set(key: string, value: string) {
     this.mustBeLive("set")
     this.data[key] = value
+    this.dirty = true
+  }
+
+  // Records `key` -> `value` in this session's index, replacing any earlier
+  // value for `key`, so `store.destroyIndexed(key, value, ...)` finds it.
+  // Written with the data at `save()`, never separately. Panics on an empty
+  // `key` or `value`: `destroyIndexed` refuses both, and an entry it could
+  // never be asked for is a session the caller believes is revocable and is
+  // not.
+  export index(key: string, value: string) {
+    this.mustBeLive("index")
+    if (len(key) == 0 || len(value) == 0) {
+      panic("web: session: index(key, value): both must be non-empty")
+    }
+    this.indexes[key] = value
     this.dirty = true
   }
 
@@ -208,7 +259,9 @@ export class Session {
     if (this.destroyed) {
       return
     }
-    this.version = this.store.compareAndSet(this.sid, this.version, this.data, sessionTTLSeconds)?
+    this.version = this.store.compareAndSet(
+      this.sid, this.version, this.data, this.indexes, sessionTTLSeconds,
+    )?
     this.dirty = false
   }
 
@@ -229,6 +282,7 @@ export class Session {
     }
     this.store.destroy(this.sid, sessionTTLSeconds)?
     this.data = map<string, string>()
+    this.indexes = map<string, string>()
     this.dirty = false
     this.destroyed = true
   }
@@ -261,7 +315,7 @@ export class Session {
     this.mustBeLive("regenerate")
     let oldSid = this.sid
     let newSid = randomSessionId()
-    let newVersion = this.store.compareAndSet(newSid, 0, this.data, sessionTTLSeconds)?
+    let newVersion = this.store.compareAndSet(newSid, 0, this.data, this.indexes, sessionTTLSeconds)?
     this.store.destroy(oldSid, sessionTTLSeconds)?
     this.sid = newSid
     this.version = newVersion
@@ -291,17 +345,18 @@ export class Session {
       if (!isSome(found)) {
         return Option.None
       }
-      let (data, version) = unwrap(found)
+      let (data, version, index) = unwrap(found)
       let (value, ok) = data[key]
       if (!ok) {
         return Option.None
       }
       delete(data, key)
-      let newVersion = this.store.compareAndSet(this.sid, version, data, sessionTTLSeconds) catch _ {
+      let newVersion = this.store.compareAndSet(this.sid, version, data, index, sessionTTLSeconds) catch _ {
         attempt = attempt + 1
         continue
       }
       this.data = data
+      this.indexes = index
       this.version = newVersion
       this.dirty = false
       return Option.Some(value)
@@ -361,12 +416,13 @@ fn loadSession(store: SessionStore, sid: string): Session! {
   if (len(sid) > 0) {
     let found = store.load(sid)?
     if (isSome(found)) {
-      let (data, version) = unwrap(found)
+      let (data, version, index) = unwrap(found)
       return Session{
         sid = sid,
         data = data,
         store = store,
         version = version,
+        indexes = index,
         fresh = false,
         dirty = false,
         destroyed = false,
@@ -378,6 +434,7 @@ fn loadSession(store: SessionStore, sid: string): Session! {
     data = map<string, string>(),
     store = store,
     version = 0,
+    indexes = map<string, string>(),
     fresh = true,
     dirty = false,
     destroyed = false,

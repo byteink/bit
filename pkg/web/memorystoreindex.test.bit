@@ -1,0 +1,216 @@
+// pkg/web/memorystoreindex.test.bit — the session index (#6928): per-subject
+// revocation through `SessionStore.destroyIndexed`, tested against
+// `MemoryStore` on a caller-supplied clock (`compareAndSetAt`,
+// `destroyIndexedAt`, `loadAt`) so expiry is deterministic, and through
+// `Session.index` for the three paths that must carry the index along —
+// a plain save, `takeAtomic` and `regenerate`.
+
+const idxKey = "auth:sub"
+
+fn noIndex(): map<string, string> {
+  return map<string, string>()
+}
+
+// Writes `sid` at its next version holding `idxKey` = `value`.
+fn writeIndexed(s: MemoryStore, sid: string, value: string, ttl: i64, nowNs: i64) {
+  let write = newEntry(noIndex(), storeData([]string{ idxKey, value }), ttl, nowNs)
+  s.compareAndSetAt(sid, currentVersion(s, sid, nowNs), write, nowNs) catch e {
+    panic("compareAndSetAt: ${e.message()}")
+  }
+}
+
+fn destroyIndexedAtOrPanic(s: MemoryStore, value: string, except: string, nowNs: i64): int {
+  let n = s.destroyIndexedAt(idxKey, value, except, 3600, nowNs) catch e {
+    panic("destroyIndexedAt: ${e.message()}")
+  }
+  return n
+}
+
+fn threeForOneSubject(): MemoryStore {
+  let s = MemoryStore(100)
+  let t0 = now().ns
+  writeIndexed(s, "s1", "alice", 3600, t0)
+  writeIndexed(s, "s2", "alice", 3600, t0)
+  writeIndexed(s, "s3", "alice", 3600, t0)
+  writeIndexed(s, "other", "bob", 3600, t0)
+  return s
+}
+
+test "destroyIndexed with except keeps 1 of 3 sessions and returns 2" {
+  let s = threeForOneSubject()
+  let t0 = now().ns
+  let n = destroyIndexedAtOrPanic(s, "alice", "s2", t0)
+  assert(n == 2, "want 2 destroyed, got ${n}")
+  assert(isSome(s.loadAt("s2", t0)), "the excepted session must survive")
+  assert(!isSome(s.loadAt("s1", t0)), "s1 must be destroyed")
+  assert(!isSome(s.loadAt("s3", t0)), "s3 must be destroyed")
+  assert(isSome(s.loadAt("other", t0)), "another subject's session must be untouched")
+}
+
+test "a stale compareAndSet on a destroyed session fails for 3 of 3" {
+  let s = threeForOneSubject()
+  let t0 = now().ns
+  let sids = []string{ "s1", "s2", "s3" }
+  let versions = []i64{ 1, 1, 1 }
+  let n = destroyIndexedAtOrPanic(s, "alice", "", t0)
+  assert(n == 3, "want 3 destroyed, got ${n}")
+  let refused = 0
+  let i = 0
+  while (i < len(sids)) {
+    s.compareAndSetAt(sids[i], versions[i], newEntry(noIndex(), noIndex(), 3600, t0), t0) catch _ {
+      refused = refused + 1
+    }
+    i = i + 1
+  }
+  assert(refused == 3, "a stale write must be refused on all 3, refused ${refused}")
+}
+
+test "an expired entry is neither counted nor tombstoned" {
+  let s = MemoryStore(100)
+  let t0 = now().ns
+  writeIndexed(s, "live", "alice", 3600, t0)
+  writeIndexed(s, "dead", "alice", 10, t0)
+  let later = t0 + 60 * 1_000_000_000
+  let n = destroyIndexedAtOrPanic(s, "alice", "", later)
+  assert(n == 1, "an expired session must not be counted, got ${n}")
+  assert(!s.entries["dead"].tombstone, "an expired session must not be given a tombstone")
+}
+
+test "re-indexing replaces the value, it does not add a second one" {
+  let s = MemoryStore(100)
+  let t0 = now().ns
+  writeIndexed(s, "s1", "alice", 3600, t0)
+  writeIndexed(s, "s1", "bob", 3600, t0)
+  assert(destroyIndexedAtOrPanic(s, "alice", "", t0) == 0, "the old value must no longer match")
+  assert(len(s.byIndex) == 1, "one pair must be indexed, got ${len(s.byIndex)}")
+  assert(destroyIndexedAtOrPanic(s, "bob", "", t0) == 1, "the new value must match exactly once")
+}
+
+test "the reverse index shrinks with the entries: overwrite, destroy, expiry, eviction" {
+  let s = MemoryStore(2)
+  let t0 = now().ns
+  writeIndexed(s, "a", "alice", 3600, t0)
+  s.compareAndSetAt("a", 1, newEntry(noIndex(), noIndex(), 3600, t0), t0) catch e {
+    panic("compareAndSetAt: ${e.message()}")
+  }
+  assert(len(s.byIndex) == 0, "dropping the index in a write must drop its slot")
+  writeIndexed(s, "a", "alice", 3600, t0)
+  s.destroyAt("a", 3600, t0)
+  assert(len(s.byIndex) == 0, "a tombstone carries no index")
+  writeIndexed(s, "b", "bob", 10, t0)
+  assert(!isSome(s.loadAt("b", t0 + 20 * 1_000_000_000)), "b must have expired")
+  assert(len(s.byIndex) == 0, "expiry on read must drop the slot")
+  writeIndexed(s, "c", "carol", 3600, t0)
+  writeIndexed(s, "d", "dave", 7200, t0)
+  writeIndexed(s, "e", "erin", 7200, t0)
+  assert(len(s.entries) == 2, "the cap must hold, got ${len(s.entries)}")
+  assert(len(s.byIndex) <= 2, "the reverse index must not outgrow the cap, got ${len(s.byIndex)}")
+}
+
+test "destroyIndexed refuses an empty key or value" {
+  let s = MemoryStore(10)
+  let t0 = now().ns
+  let failedValue = false
+  s.destroyIndexedAt(idxKey, "", "", 3600, t0) catch _ {
+    failedValue = true
+  }
+  assert(failedValue, "an empty value must be refused")
+  let failedKey = false
+  s.destroyIndexedAt("", "alice", "", 3600, t0) catch _ {
+    failedKey = true
+  }
+  assert(failedKey, "an empty key must be refused")
+}
+
+test "keys and values that run together do not collide in the reverse index" {
+  let s = MemoryStore(10)
+  let t0 = now().ns
+  s.compareAndSetAt("x", 0, newEntry(noIndex(), storeData([]string{ "ab", "c" }), 3600, t0), t0) catch e {
+    panic("compareAndSetAt: ${e.message()}")
+  }
+  let n = s.destroyIndexedAt("a", "bc", "", 3600, t0) catch e {
+    panic("destroyIndexedAt: ${e.message()}")
+  }
+  assert(n == 0, "(a, bc) must not match (ab, c), got ${n}")
+}
+
+fn newIndexedSession(store: MemoryStore, value: string): Session {
+  let s = loadSession(store, "") catch e {
+    panic("loadSession: ${e.message()}")
+  }
+  s.index(idxKey, value)
+  s.persist() catch e {
+    panic("persist: ${e.message()}")
+  }
+  return s
+}
+
+fn isLive(store: MemoryStore, sid: string): bool {
+  let got = store.load(sid) catch e {
+    panic("load: ${e.message()}")
+  }
+  return isSome(got)
+}
+
+fn destroyAllOf(store: MemoryStore, value: string, except: string): int {
+  let n = store.destroyIndexed(idxKey, value, except, 3600) catch e {
+    panic("destroyIndexed: ${e.message()}")
+  }
+  return n
+}
+
+test "Session.index is written with the data and reaches destroyIndexed" {
+  let store = MemoryStore(10)
+  let a = newIndexedSession(store, "alice")
+  let b = newIndexedSession(store, "alice")
+  assert(destroyAllOf(store, "alice", b.id()) == 1, "exactly the other session must be destroyed")
+  assert(!isLive(store, a.id()), "a must be gone")
+  assert(isLive(store, b.id()), "b must remain")
+}
+
+test "a later save, takeAtomic and regenerate keep the session indexed" {
+  let store = MemoryStore(10)
+  let first = newIndexedSession(store, "alice")
+  let sid = first.id()
+  first.set("otp", "123456")
+  first.persist() catch e {
+    panic("persist: ${e.message()}")
+  }
+  let sibling = loadSession(store, sid) catch e {
+    panic("loadSession: ${e.message()}")
+  }
+  sibling.set("theme", "dark")
+  sibling.save() catch e {
+    panic("save: ${e.message()}")
+  }
+  let taken = sibling.takeAtomic("otp") catch e {
+    panic("takeAtomic: ${e.message()}")
+  }
+  assert(isSome(taken), "the otp must be taken")
+  sibling.regenerate() catch e {
+    panic("regenerate: ${e.message()}")
+  }
+  assert(sibling.id() != sid, "regenerate must mint a new id")
+  assert(destroyAllOf(store, "alice", "") == 1, "the regenerated session must still be indexed")
+  assert(!isLive(store, sibling.id()), "and now destroyed")
+}
+
+test "Session.destroy takes the session out of the index" {
+  let store = MemoryStore(10)
+  let s = newIndexedSession(store, "alice")
+  s.destroy() catch e {
+    panic("destroy: ${e.message()}")
+  }
+  assert(
+    destroyAllOf(store, "alice", "") == 0,
+    "destroy must have taken the session out of the index",
+  )
+}
+
+test "testpanic_Session_index_refuses_an_empty_value" {
+  let store = MemoryStore(10)
+  let s = loadSession(store, "") catch e {
+    panic("loadSession: ${e.message()}")
+  }
+  s.index(idxKey, "")
+}
