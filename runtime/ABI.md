@@ -2952,6 +2952,7 @@ defined exactly once).
 | `bit_rt_os_arg_at`    | `(i: i64) -> *const RtBytes` (§19)                     |
 | `bit_rt_os_env`       | `(name: *const RtBytes) -> *const RtBytes` (§19)       |
 | `bit_rt_os_self_exe`  | `() -> *const RtBytes` (§19)                           |
+| `bit_rt_os_hostname`  | `(buf: *byte, room: i64) -> i64` (§19, #7192: writes the local host name NUL-terminated into the caller's `room`-byte buffer and returns its length, always `< room`; `-1` when the call fails or the name plus its NUL does not fit, never a truncated name (Darwin cannot tell a name of `room - 1` bytes from a truncated one, so it refuses that length too). Darwin `gethostname(2)`, Linux `uname(2)` `nodename`, Windows `GetComputerNameExW(ComputerNameDnsHostname)` re-encoded as UTF-8. A plain `extern fn` taking a caller buffer, not a compiler primitive: §11.7 admits no `string` return) |
 | `bit_rt_os_exit`      | `(code: i64) -> noreturn` (§19)                        |
 | `bit_rt_os_run`       | `(path: *const RtBytes, argv: *const SliceHeader) -> i64` (§19) |
 | `bit_rt_os_run_test`  | `(path: *const RtBytes, idx: i64) -> i64` (§19)        |
@@ -4142,6 +4143,7 @@ bit_rt_os_argc()           -> i64
 bit_rt_os_arg_at(i)        -> *const RtBytes   // "" when out of range
 bit_rt_os_env(name)        -> *const RtBytes   // "" when unset
 bit_rt_os_self_exe()       -> *const RtBytes   // own path, symlinks resolved; "" if unknown
+bit_rt_os_hostname(buf, room) -> i64       // local host name NUL-terminated into buf; its length (< room), or -1 (failure or does not fit)
 bit_rt_os_exit(code)       -> noreturn         // deferred calls do not run
 bit_rt_os_run(path, argv)  -> i64              // child exit code; argv ([]string) appended after path; -1 on failure, <= -100 signal-killed
 bit_rt_os_run_test(path, i) -> i64             // like os_run + BIT_TEST_INDEX=i (no argv)
