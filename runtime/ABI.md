@@ -3032,7 +3032,7 @@ defined exactly once).
 | `bit_rt_crypto_aes_encrypt_hw` | `(rk: *byte, nr: i64, block: *byte, out: *byte) -> void` (§21b) |
 | `bit_rt_crypto_aes_decrypt_hw` | `(drk: *byte, nr: i64, block: *byte, out: *byte) -> void` (§21b) |
 | `bit_rt_crypto_aes_invert_schedule_hw` | `(erk: *byte, nr: i64, out: *byte) -> void` (§21b) |
-| `bit_rt_crypto_aes_ctr32_hw` | `(rk: *byte, nr: i64, ctr: *byte, src: *byte, dst: *byte, blocks: i64) -> void` (§21b, x86-64 AES-NI counter mode) |
+| `bit_rt_crypto_aes_ctr32_hw` | `(rk: *byte, ctr: *byte, src: *byte, dst: *byte, blocks: i64) -> void` (§21b, x86-64 AES-NI counter mode) |
 | `bit_rt_crypto_ghash_mul_hw` | `(acc0, acc1, b0, b1, h0, h1: u64, outHi: *u64) -> u64` (§21b) |
 | `bit_rt_crypto_sha256_compress_hw` | `(state: *u32, block: *byte) -> void` (§21b) |
 | `bit_rt_crypto_hwcaps` | `() -> u64` (§21c) |
@@ -4658,7 +4658,7 @@ bit_rt_crypto_sha256_hw_available()   -> bool   // SHA-NI usable: SHA + AVX2 + O
 bit_rt_crypto_aes_encrypt_hw(rk: *byte, nr: i64, block: *byte, out: *byte)
 bit_rt_crypto_aes_decrypt_hw(drk: *byte, nr: i64, block: *byte, out: *byte)
 bit_rt_crypto_aes_invert_schedule_hw(erk: *byte, nr: i64, out: *byte)
-bit_rt_crypto_aes_ctr32_hw(rk: *byte, nr: i64, ctr: *byte, src: *byte, dst: *byte, blocks: i64)
+bit_rt_crypto_aes_ctr32_hw(rk: *byte, ctr: *byte, src: *byte, dst: *byte, blocks: i64)
 bit_rt_crypto_ghash_mul_hw(acc0, acc1, b0, b1, h0, h1: u64, outHi: *u64) -> u64
 bit_rt_crypto_sha256_compress_hw(state: *u32, block: *byte)
 ```
@@ -4699,9 +4699,11 @@ runs the §21d ARMv8 primitives instead. They use legacy-SSE encodings only
 AVX or XGETBV check; `BIT_CRYPTO_HW=0` forces it false, so the switch
 `stdlib/crypto/hw.bit` reads selects the software path on x86-64 too.
 `bit_rt_crypto_aes_ctr32_hw` runs `blocks` full blocks of counter mode,
-`dst` = `src` XOR AES(counter), `dst` may equal `src`, over the 16-byte
-counter block at `ctr` whose last four bytes are a big-endian count that
-wraps modulo 2^32 (GCM's inc32), and advances `ctr` past the last block. It
+`dst` = `src` XOR AES(counter), `dst` may equal `src`. `ctr` points at a
+caller-owned 24-byte block: bytes 0..15 the counter block, whose last four
+bytes are a big-endian count that wraps modulo 2^32 (GCM's inc32), and bytes
+16..23 the round count (10, 12 or 14) as a little-endian i64. The counter is
+advanced past the last block. It
 pipelines four counter blocks per round key and returns to Bit every 64 KiB
 so a large buffer still reaches a safepoint; GCM's GCTR runs on it.
 
