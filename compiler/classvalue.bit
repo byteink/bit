@@ -1,0 +1,613 @@
+// compiler/classvalue.bit — `__sameValue`, `__valueHash` and `__snapshot`: deep
+// value semantics for a class (SPEC §14.3, #7327, epic #6984).
+//
+//     class Subject { id: string, roles: []string, org: Org }
+//     a.__sameValue(b)     // true when every field is equal, slices elementwise
+//     a.__valueHash()      // u64, equal for values that are __sameValue
+//     a.__snapshot()       // a deep copy that later mutation of `a` cannot reach
+//
+// `a == b` on a class holding a slice is E0052 (§14.6: a slice has no value
+// equality), so a package could neither compare nor hash an app's own subject
+// by value. A cache keyed by id and roles alone would keep serving a user's old
+// access after any other attribute changed; these three members let it key on
+// the WHOLE value. The shape is C#'s record and Kotlin's data class: equality is
+// structural, the hash agrees with it, and a copy is deep.
+//
+// HOW IT IS BUILT. Like `__field` (classfieldread.bit) this is a synthesized
+// method written per class before the checker runs, so it sees only syntax. The
+// body is written as Bit TEXT, parsed by the ordinary parser and grafted into
+// the module's tree (`graftValueDecls`); the text is appended to the module
+// source as one synthesized word (synthtext.bit), which is what the grafted
+// spans point at. Every statement is a flat `if`/`while` over the fields:
+// equality and hash allocate nothing (a slice is walked by index, a string by
+// byte), and only `__snapshot` allocates, for the fresh slices it returns.
+//
+// WHEN IT EXISTS. Only in a program whose source names one of the three members
+// as an identifier (a call, or an interface requiring it): `collectValueDemand`
+// scans the identifier nodes, so a program that never mentions them gets no new
+// node and no new IR. The demand is project-wide, not per receiver, because the
+// receiver's class is not known before the checker: every non-generic class
+// whose fields all have value semantics owes the three.
+//
+// WHAT HAS VALUE SEMANTICS. A string, an integer, a bool, a float (compared and
+// hashed by BIT PATTERN, the rule the runtime's own composite equality takes,
+// so a NaN field equals itself and the relation stays reflexive), a payload-free
+// enum, a slice of any of those, and a nested class that itself has them.
+// Everything else (a map, an `Option`, an interface, a function, a channel, a
+// payload enum, a `decimal`, a generic class, a namespace-qualified type) does
+// not, and the class gets NO member: calling one is E0313 at the call site,
+// naming the first offending field (`vValueMemberBlame`, called from
+// `vValueMember`), never a runtime panic.
+//
+// THE HASH SEED is per process: the address of a string literal, which the
+// loader slides by ASLR. The runtime's own map hash is unseeded (`mapHash`,
+// runtime/root/maps.bit); this one is not meant to be stable across runs.
+//
+// E0312 (§14.3): a class declares one of the three names.
+const ecValueMemberDeclared = 312
+// E0313 (§14.3): `__sameValue`/`__valueHash`/`__snapshot` called on a class with
+// a field that has no value semantics.
+const ecValueNotComparable = 313
+
+const synthSameValueName = "__sameValue"
+const synthValueHashName = "__valueHash"
+const synthSnapshotName = "__snapshot"
+
+const valueMixConst = "0x9E3779B97F4A7C15"
+const valueDepthMax = 8
+
+// The kinds `vkOf` sorts a field type into.
+const vkBad = 0
+const vkWord = 1
+const vkBool = 2
+const vkFloat = 3
+const vkString = 4
+const vkEnum = 5
+const vkClass = 6
+const vkSlice = 7
+
+fn isValueMemberName(name: string): bool {
+  return name == synthSameValueName || name == synthValueHashName || name == synthSnapshotName
+}
+
+// Whether the project mentions a value member, and the two per-run tables the
+// judgement shares: the verdict per class ("<module>:<name>") and a
+// `JsonCtx` per module (its module-local type table).
+class ValueDemand {
+  wanted: bool,
+  proj: Project,
+  memo: map<string, bool>,
+  ctxs: map<int, JsonCtx>,
+}
+
+// True iff `tree` has an identifier node spelling one of the three members.
+// Identifier NODES, not text: a comment or a string literal that names them
+// (this file's own) is not a use.
+fn moduleNamesValueMember(m: SrcModule): bool {
+  for n of m.tree.nodes {
+    let size = n.span.end - n.span.start
+    if (n.tag != Tag.Ident || size < 10 || size > 11) {
+      continue
+    }
+    if (isValueMemberName(m.source[n.span.start:n.span.end])) {
+      return true
+    }
+  }
+  return false
+}
+
+fn collectValueDemand(p: Project): ValueDemand {
+  let vd = ValueDemand{
+    wanted = false, proj = p, memo = map<string, bool>{}, ctxs = map<int, JsonCtx>{},
+  }
+  for m of p.mods {
+    if (moduleNamesValueMember(m)) {
+      vd.wanted = true
+      return vd
+    }
+  }
+  return vd
+}
+
+fn valueCtxOf(vd: ValueDemand, mid: int): JsonCtx {
+  let (jx, ok) = vd.ctxs[mid]
+  if (ok) {
+    return jx
+  }
+  let made = newJsonCtx(vd.proj, vd.proj.mods[mid])
+  vd.ctxs[mid] = made
+  return made
+}
+
+// The class `name` declared in module `mid`: its decl node, or 0.
+fn valueClassDecl(vd: ValueDemand, mid: int, name: string): int {
+  let m = vd.proj.mods[mid]
+  for tc of topClassDecls(m.tree) {
+    if (identText(m.tree, m.source, kidsOf(m.tree, tc.decl)[0]) == name) {
+      return tc.decl
+    }
+  }
+  return 0
+}
+
+// The class a field type name `name` (written in module `mid`) refers to, as
+// `(module, declared name)`; `found` is false for anything that is not a class
+// reached by a local declaration or a `{ a }` import.
+fn valueClassTarget(vd: ValueDemand, mid: int, name: string): (int, string, bool) {
+  let jx = valueCtxOf(vd, mid)
+  let (mark, local) = jx.marks[name]
+  if (local) {
+    return (mid, name, mark == jmJsonClass || mark == jmPlainClass)
+  }
+  let (tmid, orig, imported) = importedClassTarget(jx, name)
+  if (!imported) {
+    return (0, "", false)
+  }
+  let (_, isClass) = targetClassMark(vd.proj.mods[tmid], orig)
+  return (tmid, orig, isClass)
+}
+
+// True iff `name`, imported by module `mid`, is a payload-free enum declared in
+// the module it came from.
+fn valueImportedEnum(vd: ValueDemand, mid: int, name: string): bool {
+  let jx = valueCtxOf(vd, mid)
+  let (tmid, orig, imported) = importedClassTarget(jx, name)
+  if (!imported) {
+    return false
+  }
+  let tm = vd.proj.mods[tmid]
+  for d0 of kidsOf(tm.tree, tm.tree.root) {
+    let d = d0
+    if (d != 0 && getNode(tm.tree, d).tag == Tag.Export) {
+      d = kidsOf(tm.tree, d)[0]
+    }
+    if (d != 0 &&
+      getNode(tm.tree, d).tag == Tag.EnumDecl &&
+      identText(tm.tree, tm.source, kidsOf(tm.tree, d)[0]) == orig) {
+      return enumIsPayloadFree(tm.tree, d)
+    }
+  }
+  return false
+}
+
+// The `vk*` of a `jk*` that needs no further look.
+fn vkOfJson(k: int): int {
+  if (k == jkInt) {
+    return vkWord
+  }
+  if (k == jkBool) {
+    return vkBool
+  }
+  if (k == jkFloat) {
+    return vkFloat
+  }
+  if (k == jkString) {
+    return vkString
+  }
+  if (k == jkEnum) {
+    return vkEnum
+  }
+  return vkBad
+}
+
+// What a field type written in module `mid` is, for value semantics, and for a
+// slice its element type node.
+fn vkOf(vd: ValueDemand, mid: int, t: int, depth: int): (int, int) {
+  let jx = valueCtxOf(vd, mid)
+  let (k, elem) = classifyJsonType(jx, t)
+  if (k == jkSlice) {
+    let (ek, _) = vkOf(vd, mid, elem, depth + 1)
+    if (ek == vkBad || depth > valueDepthMax) {
+      return (vkBad, 0)
+    }
+    return (vkSlice, elem)
+  }
+  if (k != jkNested || getNode(jx.tree, t).tag != Tag.Ident) {
+    return (vkOfJson(k), 0)
+  }
+  let name = jsonNodeText(jx, t)
+  if (valueImportedEnum(vd, mid, name)) {
+    return (vkEnum, 0)
+  }
+  if (valueClassOk(vd, mid, name, depth + 1)) {
+    return (vkClass, 0)
+  }
+  return (vkBad, 0)
+}
+
+// The class field nodes of class decl `d`.
+fn valueFieldNodes(tree: Tree, d: int): []int {
+  let out = []int(0)
+  for m0 of kidsOf(tree, kidsOf(tree, d)[2]) {
+    let (f, _) = getterMemberField(tree, m0)
+    if (f != 0) {
+      out = append(out, f)
+    }
+  }
+  return out
+}
+
+// Whether the class `name` as seen from module `mid` owes the members: it is
+// not generic and every field has value semantics.
+fn valueClassOk(vd: ValueDemand, mid: int, name: string, depth: int): bool {
+  let (tmid, orig, found) = valueClassTarget(vd, mid, name)
+  if (!found || depth > valueDepthMax) {
+    return false
+  }
+  let key = "${tmid}:${orig}"
+  let (known, hit) = vd.memo[key]
+  if (hit) {
+    return known
+  }
+  let d = valueClassDecl(vd, tmid, orig)
+  let ok = d != 0 && kidsOf(vd.proj.mods[tmid].tree, d)[1] == 0
+  if (ok) {
+    for f of valueFieldNodes(vd.proj.mods[tmid].tree, d) {
+      let (k, _) = vkOf(vd, tmid, kidsOf(vd.proj.mods[tmid].tree, f)[1], depth)
+      ok = ok && k != vkBad
+    }
+  }
+  vd.memo[key] = ok
+  return ok
+}
+
+// ---- the text ---------------------------------------------------------------
+
+// The method text being built for ONE class: the module it is written in, the
+// fresh-name counter and the output.
+class ValueGen {
+  vd: ValueDemand,
+  mid: int,
+  n: int,
+  buf: []u8,
+}
+
+fn vgLine(g: ValueGen, s: string) {
+  g.buf = append(g.buf, s)
+  g.buf = append(g.buf, "\n")
+}
+
+fn vgFresh(g: ValueGen, prefix: string): string {
+  g.n = g.n + 1
+  return "${prefix}${g.n}"
+}
+
+// The source spelling of type node `t` (a slice is rebuilt, since an interior
+// node's span does not cover its own `[]`).
+fn vgTypeText(g: ValueGen, t: int): string {
+  let jx = valueCtxOf(g.vd, g.mid)
+  if (getNode(jx.tree, t).tag == Tag.SliceType) {
+    return "[]" + vgTypeText(g, kidsOf(jx.tree, t)[0])
+  }
+  return jsonNodeText(jx, t)
+}
+
+// `<a> != <b>` as one early return, for the kinds `!=` compares by value.
+fn vgEqLeaf(g: ValueGen, kind: int, a: string, b: string) {
+  if (kind == vkFloat) {
+    vgLine(g, "if (floatBits(f64(${a})) != floatBits(f64(${b}))) { return false }")
+    return
+  }
+  if (kind == vkClass) {
+    vgLine(g, "if (!${a}.__sameValue(${b})) { return false }")
+    return
+  }
+  vgLine(g, "if (${a} != ${b}) { return false }")
+}
+
+// The equality statements for value `a` against `b`, whose type is `t`.
+fn vgEq(g: ValueGen, a: string, b: string, t: int) {
+  let (kind, elem) = vkOf(g.vd, g.mid, t, 0)
+  if (kind != vkSlice) {
+    vgEqLeaf(g, kind, a, b)
+    return
+  }
+  let i = vgFresh(g, "__vi")
+  vgLine(g, "if (len(${a}) != len(${b})) { return false }")
+  vgLine(g, "let ${i} = 0")
+  vgLine(g, "while (${i} < len(${a})) {")
+  vgEq(g, "${a}[${i}]", "${b}[${i}]", elem)
+  vgLine(g, "${i} = ${i} + 1")
+  vgLine(g, "}")
+}
+
+// One mixing step of the running hash `__vh` with u64 expression `v`.
+fn vgStep(g: ValueGen, v: string) {
+  vgLine(g, "__vh = (__vh ^ (${v})) * ${valueMixConst}")
+  vgLine(g, "__vh = __vh ^ (__vh >> 29)")
+}
+
+fn vgHashLeaf(g: ValueGen, kind: int, a: string) {
+  if (kind == vkBool) {
+    vgLine(g, "if (${a}) {")
+    vgStep(g, "u64(1)")
+    vgLine(g, "} else {")
+    vgStep(g, "u64(0)")
+    vgLine(g, "}")
+    return
+  }
+  if (kind == vkFloat) {
+    vgStep(g, "floatBits(f64(${a}))")
+    return
+  }
+  if (kind == vkEnum) {
+    vgStep(g, "u64(int(${a}))")
+    return
+  }
+  if (kind == vkClass) {
+    vgStep(g, "${a}.__valueHash()")
+    return
+  }
+  vgStep(g, "u64(${a})")
+}
+
+// The hash statements folding value `a`, whose type is `t`, into `__vh`: the
+// length first for a string or slice, so `["a","b"]` and `["ab"]` differ.
+fn vgHash(g: ValueGen, a: string, t: int) {
+  let (kind, elem) = vkOf(g.vd, g.mid, t, 0)
+  if (kind != vkSlice && kind != vkString) {
+    vgHashLeaf(g, kind, a)
+    return
+  }
+  let i = vgFresh(g, "__vi")
+  vgStep(g, "u64(len(${a}))")
+  vgLine(g, "let ${i} = 0")
+  vgLine(g, "while (${i} < len(${a})) {")
+  if (kind == vkString) {
+    vgStep(g, "u64(${a}[${i}])")
+  } else {
+    vgHash(g, "${a}[${i}]", elem)
+  }
+  vgLine(g, "${i} = ${i} + 1")
+  vgLine(g, "}")
+}
+
+// The expression for a deep copy of `a` (type `t`), after the statements that
+// build any fresh slice it needs.
+fn vgSnap(g: ValueGen, a: string, t: int): string {
+  let (kind, elem) = vkOf(g.vd, g.mid, t, 0)
+  if (kind == vkClass) {
+    return "${a}.__snapshot()"
+  }
+  if (kind != vkSlice) {
+    return a
+  }
+  let acc = vgFresh(g, "__vs")
+  let it = vgFresh(g, "__ve")
+  vgLine(g, "let ${acc} = ${vgTypeText(g, t)}(0)")
+  vgLine(g, "for ${it} of ${a} {")
+  let inner = vgSnap(g, it, elem)
+  vgLine(g, "${acc} = append(${acc}, ${inner})")
+  vgLine(g, "}")
+  return acc
+}
+
+// The three methods of class `cname` (fields `fields`) as source text: a class
+// shell holding just them, which is what the parser can build a receiver in.
+fn valueMembersText(
+  vd: ValueDemand,
+  mid: int,
+  cname: string,
+  exported: bool,
+  fields: []int,
+): string {
+  let tree = vd.proj.mods[mid].tree
+  let src = vd.proj.mods[mid].source
+  let g = ValueGen{ vd = vd, mid = mid, n = 0, buf = []u8(0) }
+  let head = ""
+  if (exported) {
+    head = "export "
+  }
+  vgLine(g, "class ${cname} {")
+  vgLine(g, "${head}${synthSameValueName}(other: ${cname}): bool {")
+  for f of fields {
+    let nm = identText(tree, src, kidsOf(tree, f)[0])
+    vgEq(g, "this.${nm}", "other.${nm}", kidsOf(tree, f)[1])
+  }
+  vgLine(g, "return true")
+  vgLine(g, "}")
+  vgLine(g, "${head}${synthValueHashName}(): u64 {")
+  vgLine(g, "let __vsd: string = \"bit.valueHash\"")
+  vgLine(g, "let __vh = u64(int(ptrOf(__vsd)))")
+  for f of fields {
+    vgHash(g, "this.${identText(tree, src, kidsOf(tree, f)[0])}", kidsOf(tree, f)[1])
+  }
+  vgLine(g, "return __vh")
+  vgLine(g, "}")
+  vgLine(g, "${head}${synthSnapshotName}(): ${cname} {")
+  let inits = []string(0)
+  for f of fields {
+    let nm = identText(tree, src, kidsOf(tree, f)[0])
+    inits = append(inits, "${nm} = ${vgSnap(g, "this.${nm}", kidsOf(tree, f)[1])}")
+  }
+  vgLine(g, "return ${cname}{ ${valueJoin(inits, ", ")} }")
+  vgLine(g, "}")
+  vgLine(g, "}")
+  return string(g.buf)
+}
+
+fn valueJoin(parts: []string, sep: string): string {
+  let buf = []u8(0)
+  for p of parts {
+    if (len(buf) != 0) {
+      buf = append(buf, sep)
+    }
+    buf = append(buf, p)
+  }
+  return string(buf)
+}
+
+// One class that owes the members: its name node (for the synthesized file id)
+// and the text of its three methods.
+class ValueClass {
+  className: int,
+  text: string,
+}
+
+// Every non-generic top-level class of module `mid` with value semantics, when
+// the project asked. A class that declares a member itself is E0312 and skipped.
+fn collectValueClasses(vd: ValueDemand, m: SrcModule, mid: int): []ValueClass {
+  let out = []ValueClass(0)
+  if (!vd.wanted) {
+    return out
+  }
+  for tc of topClassDecls(m.tree) {
+    let k = kidsOf(m.tree, tc.decl)
+    let name = identText(m.tree, m.source, k[0])
+    if (!valueClassOk(vd, mid, name, 0) || valueDeclaredMember(m.tree, m.source, k[2]) != 0) {
+      continue
+    }
+    let text = valueMembersText(vd, mid, name, tc.exported, valueFieldNodes(m.tree, tc.decl))
+    out = append(out, ValueClass{ className = k[0], text = text })
+  }
+  return out
+}
+
+// The words the members need spelled in the module's synthesized text: each
+// class's whole method text, as one word.
+fn valueSynthWords(classes: []ValueClass): []string {
+  let out = []string(0)
+  for c of classes {
+    out = append(out, c.text)
+  }
+  return out
+}
+
+// Copies the subtree of `src` under `node` (a tree parsed from a snippet that
+// now sits at offset `base` of the module source) into `dst`, re-spanned into
+// the module's synthesized text, and returns its new index (0 stays 0).
+fn graftValueNode(dst: Tree, src: Tree, node: int, at: Span): int {
+  if (node == 0) {
+    return 0
+  }
+  let n = getNode(src, node)
+  let kids = []int(0)
+  for k of kidsOf(src, node) {
+    kids = append(kids, graftValueNode(dst, src, k, at))
+  }
+  let sp = Span{ file = at.file, start = n.span.start + at.start, end = n.span.end + at.start }
+  return markSynth(dst, addNode(dst, n.tag, sp, n.main, kids))
+}
+
+// The METHODS of the snippet's one class, grafted into `dst`: the parser builds
+// a method's receiver only inside a class body, and the checker takes the same
+// method as a top-level declaration (`synthFieldRead`). Only the method subtrees
+// are copied, so no second declaration of the class is left in the tree for a
+// by-name lookup to find. `at.start` is where the snippet sits in the source.
+fn graftValueDecls(dst: Tree, src: Tree, at: Span): []int {
+  let out = []int(0)
+  let decl = kidsOf(src, src.root)[0]
+  for member of kidsOf(src, kidsOf(src, decl)[2]) {
+    out = append(out, graftValueNode(dst, src, member, at))
+  }
+  return out
+}
+
+// Every class's three methods, grafted. A snippet that does not parse is a
+// COMPILER bug, so it fails loudly instead of building a wrong program.
+fn injectValueDecls(m: SrcModule, st: SynthText, classes: []ValueClass): []int {
+  let out = []int(0)
+  for c of classes {
+    let diags = newDiagnostics(newSourceManager())
+    let tree = parseSourceD(c.text, st.file, diags)
+    if (len(diags.list) != 0) {
+      panic("classvalue: synthesized members do not parse:\n${c.text}")
+    }
+    out = appendAllInts(out, graftValueDecls(m.tree, tree, synthSpan(st, c.text)))
+  }
+  return out
+}
+
+fn valueDeclaredMember(tree: Tree, source: string, body: int): int {
+  for name of [synthSameValueName, synthValueHashName, synthSnapshotName] {
+    let own = declaredMember(tree, source, body, name)
+    if (own != 0) {
+      return own
+    }
+  }
+  return 0
+}
+
+// E0312 (§14.3): a class declares one of the three names, on every class,
+// demand or not, for `__field`'s reason (classfieldread.bit): a hand-written one
+// would satisfy an interface requiring it by name alone.
+fn vReservedValueName(tree: Tree, source: string, diags: Diagnostics) {
+  for tc of topClassDecls(tree) {
+    let own = valueDeclaredMember(tree, source, kidsOf(tree, tc.decl)[2])
+    if (own != 0) {
+      report(
+        diags, ecValueMemberDeclared, getNode(tree, own).span,
+        "class '${identText(tree, source, kidsOf(tree, tc.decl)[0])}' declares '${identText(
+          tree,
+          source,
+          own,
+        )}', a name the compiler reserves for deep value semantics",
+        "rename this method — '__sameValue', '__valueHash' and '__snapshot' are synthesized for every class whose fields have value semantics (SPEC §14.3), and a hand-written one would satisfy an interface requiring it by name alone",
+      )
+    }
+  }
+}
+
+// ---- the call-site error ------------------------------------------------------
+
+// Why type `ty` has no value semantics, "" when it has (or cannot be judged:
+// the same permissive answer `vComparable` gives an unresolved type).
+fn vValueTypeBlame(c: Checker, ty: int, depth: int): string {
+  let t = c.ctx.types[ty]
+  if (depth > valueDepthMax || t.kind == TypeKind.Invalid) {
+    return ""
+  }
+  if (t.kind == TypeKind.Slice) {
+    return vValueTypeBlame(c, t.elem, depth + 1)
+  }
+  if (t.kind == TypeKind.Struct) {
+    return vValueClassBlame(c, ty, depth + 1)
+  }
+  if (t.kind == TypeKind.Prim && isDecimalPrim(c.ctx, ty)) {
+    return "a 'decimal' compares by value but stores its scale"
+  }
+  if (t.kind == TypeKind.Prim || (t.kind == TypeKind.Enum && !t.enumBoxed)) {
+    return ""
+  }
+  return "its type has no value equality"
+}
+
+// The FIRST field of class `ty`, in declaration order, without value semantics.
+fn vValueClassBlame(c: Checker, ty: int, depth: int): string {
+  let decl = structDeclOf(c, ty)
+  if (decl == 0) {
+    return ""
+  }
+  let oc = typeOwner(c, ty)
+  for f of structFieldNodes(oc, decl) {
+    let fn0 = getNode(oc.tree, kidsOf(oc.tree, f)[0])
+    let name = oc.source[fn0.span.start:fn0.span.end]
+    let fty = structFieldLookup(c, "${ty}.${name}")
+    let why = ""
+    if (fty != 0) {
+      why = vValueTypeBlame(c, fty, depth)
+    }
+    if (why != "") {
+      return "field '${name}' of type '${typeName(c.ctx, fty)}': ${why}"
+    }
+  }
+  return ""
+}
+
+// E0313 (§14.3): `recv.<member>` where the member is one of the three and the
+// class has a field without value semantics. True when it reported.
+fn vValueMemberBlame(c: Checker, rt: int, mname: string, nameNode: int): bool {
+  if (!isValueMemberName(mname) || c.ctx.types[rt].kind != TypeKind.Struct) {
+    return false
+  }
+  let why = vValueClassBlame(c, rt, 0)
+  if (why == "") {
+    return false
+  }
+  report(
+    c.diags, ecValueNotComparable, vSpan(c, nameNode),
+    "'${mname}' is not available on '${typeName(c.ctx, rt)}': ${why}",
+    "deep value semantics need every field to be a string, number, bool, float, payload-free enum, slice of those or a class that has them (SPEC §14.3)",
+  )
+  return true
+}
