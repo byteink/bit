@@ -77,8 +77,7 @@ refused, never cut short.
 | `maxLength` | 64 | The longest. NIST says to allow at least 64, so a value under 64 is refused. |
 | `normalize` | on | NFKC normalization, applied when the password is set and recorded in the stored hash so verify repeats it. |
 | `context` | on | Refuses a password containing the username, the part of the email before its `@`, or one of your own words. |
-| `blocklist` | none | Your own list of refused passwords. |
-| `builtinBlocklist` | on | Also refuses the common passwords the package ships with. |
+| `blocklist` | none | Your own list of refused passwords, compared exactly and without regard to case. |
 | `maxRun` | 4 | The longest run of one character (`aaaaa`) or of consecutive characters (`12345`, `abcde`), and a password that is one block repeated (`abcabcabc`). 0 turns these rules off. |
 | `breach` | off | Asks a `BreachCheck`, see below. |
 
@@ -91,18 +90,14 @@ fn relaxed(): PasswordPolicy! {
       minLength = 8,
       maxLength = 128,
       maxRun = 0,
-      builtinBlocklist = false,
       blocklist = ["inkwell2026", "writeaway"],
     },
   )?
 }
 ```
 
-The built-in list is the passwords of eight characters or more among the 10,000
-most common in public breach data, from the SecLists project
-(`Passwords/Common-Credentials/10k-most-common.txt`). It is a floor. A password
-that appears in no list can still have been stolen, which is what the breach check
-is for.
+The package ships no list of passwords. NIST asks for one, and the next two
+sections show the two ways to give the policy one.
 
 ## Words the password must not contain
 
@@ -195,14 +190,48 @@ a non-ASCII character depends on any of this. The extra parameter is the package
 own: another Argon2 library will not accept a string that carries it, so remove
 `,n=nfkc` before handing the hash to one, and normalize the password yourself.
 
-## Is this password in a breach
+## Refuse passwords known from breaches
 
-NIST asks a verifier to refuse passwords known from breaches. The package ships no
-such list, since one that is current is millions of entries. It asks a
-`BreachCheck`: a type with one method, `check(password): bool!`, that answers true
-when the password is breached. You write it over whatever you trust, an in-house
-list or a service, or you use the one the package ships, [the Have I Been Pwned
-range check](#check-against-have-i-been-pwned).
+NIST SP 800-63B (section 3.1.1.2) says a verifier SHALL compare a new password
+against a list of values known to be commonly used, expected or compromised:
+passwords from earlier breaches, dictionary words, and words specific to the
+service. A password that appears in no such list can still be one an attacker
+tries first, which is why this is the one rule the length and run rules do not
+replace.
+
+The package carries no such list: a current one is millions of entries, and a
+short one in the source gives a false sense of cover. You meet the requirement in
+one of two ways, and an app can use both.
+
+- **Ask Have I Been Pwned** with the opt-in check below. It holds billions of
+  leaked passwords and is the closest to what NIST describes. It needs the
+  network, and only the first 5 hex digits of the password's SHA-1 leave your
+  server.
+- **Give the policy your own list** in `blocklist`. Nothing leaves the server and
+  it works offline, but the list is only as good as what you put in it: a
+  downloaded breach list, your product's name, the words your authors would try.
+
+Your own list is one option away. Read a downloaded list of leaked passwords
+once when the app starts and hand its lines over:
+
+```bit
+import { PasswordPolicy, PolicyOptions } from "auth"
+
+fn withOwnList(leaked: []string): PasswordPolicy! {
+  return PasswordPolicy(PolicyOptions{ blocklist = leaked })?
+}
+```
+
+The list is held in memory as a set, built when the policy is, so a check is one
+lookup however long the list is. The two sections after this one cover the
+Have I Been Pwned way: the `BreachCheck` type it fits, then the check itself.
+
+## The breach check and its failure mode
+
+A `BreachCheck` is a type with one method, `check(password): bool!`, that answers
+true when the password is breached. You write it over whatever you trust, an
+in-house list or a service, or you use the one the package ships, [the Have I Been
+Pwned range check](#check-against-have-i-been-pwned).
 
 When the checker cannot answer, the service being down for instance, someone has
 to choose between letting the password through and refusing it. That choice is
