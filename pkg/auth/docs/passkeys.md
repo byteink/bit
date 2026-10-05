@@ -80,9 +80,9 @@ fn passkeyRoutes(app: App, wa: WebAuthn) {
 ```
 
 `user.id` is your own stable identifier for the author: the same value you
-use everywhere else, at most 64 bytes, never an email address and never
-something that changes. It is also what `Credential.userId` holds. An empty
-or longer id fails with `user.id is 65 bytes, want 1 to 64`. `name` and
+use everywhere else. It is what `Credential.userId` holds and what the store
+looks passkeys up by, and it is never sent to the browser (see "The user
+handle" below). An empty id fails with `user.id is empty`. `name` and
 `displayName` are only what the browser shows when the author picks an
 account.
 
@@ -149,6 +149,37 @@ key, which is what almost every site wants. A response in another format
 (`packed`, `fido-u2f`, `tpm`) fails with
 `attestation format 'packed' is not supported yet, only 'none'`.
 
+## The user handle
+
+A passkey keeps a "user handle" next to the key, and the authenticator can
+hand it back to any page that asks. So the handle must say nothing about the
+author: your user id may be an email address or a counter somebody could
+guess. The store gives each author a handle of 64 random bytes the first time
+they register a passkey, and `beginRegistration` sends that as `user.id` in
+the options. Your own id never leaves the server.
+
+The handle is kept only when the registration succeeds, and every later
+registration for the same author sends the same one. Signing in will need to
+go the other way: the authenticator answers with the handle, and the store
+says which author it belongs to. `CredentialStore.handleFor(userId)` and
+`userForHandle(handle)` do those two lookups:
+
+```bit
+import { CredentialStore } from "auth"
+
+fn handleRoundTrip(store: CredentialStore, userId: string): string! {
+  let handle = store.handleFor(userId)?
+  if (!isSome(handle)) {
+    return "${userId} has no passkey yet"
+  }
+  let back = store.userForHandle(unwrap(handle))?
+  return "${len(unwrap(handle))}-byte handle belongs to ${unwrap(back)}"
+}
+```
+
+`handleFor` and `userForHandle` answer `Option.None` for a user or a handle
+the store does not know. Compare handles with `ctEq`, never `==`.
+
 ## What is stored
 
 `finishRegistration` gives back the `Credential` it handed to the store:
@@ -174,7 +205,8 @@ with `update`.
 ## Your own store
 
 `CredentialStore` is an interface, so a database table is a store with no
-registration step. Five methods:
+registration step. Eight methods, the five for credentials and three for the
+user handle:
 
 ```bit
 import { Credential, CredentialStore } from "auth"
@@ -218,6 +250,18 @@ class InkwellPasskeys {
   export remove(id: []byte): ()! {
     return
   }
+
+  export handleFor(userId: string): Option<[]byte>! {
+    return Option<[]byte>.None
+  }
+
+  export userForHandle(handle: []byte): Option<string>! {
+    return Option<string>.None
+  }
+
+  export bindHandle(userId: string, handle: []byte): []byte! {
+    return handle
+  }
 }
 
 fn asStore(p: InkwellPasskeys): CredentialStore {
@@ -228,6 +272,13 @@ fn asStore(p: InkwellPasskeys): CredentialStore {
 `add` must be one atomic step that fails when the id is already stored (a
 `UNIQUE` index does it): two requests racing to store one credential must not
 both win. `update` and `remove` fail for an id that is not stored.
+
+`bindHandle(userId, handle)` is the same kind of step for the handle: it
+stores `handle` when the user has none and answers the handle the user now
+has, so two first registrations racing leave one handle, not two (the
+`UNIQUE` index on the user id and on the handle does it). It fails for a handle
+that is empty, over 64 bytes, or already bound to another user. The class
+above is a stub; yours keeps the pairs.
 
 ## Policy
 
