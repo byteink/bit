@@ -300,7 +300,19 @@ let smBoundsMsg: [8]i64
 // entries and this check refuses, by name, the moment it reaches one —
 // exactly the loud failure this ticket exists to produce instead of #1927's
 // silent bus error.
-export const smFormatVersion = 1
+//
+// 2 (#7303): each entry ends in a live-register trailer for its back-edge
+// polls; the records are version 1's. The reader also accepts
+// `smFormatVersionV1`, because the pinned stage0 that builds `libbitrt.a`
+// keeps stamping 1 until a repin, so one image carries both; a version-1
+// entry's masks read as `smLiveUnknown`.
+export const smFormatVersion = 2
+export const smFormatVersionV1 = 1
+
+// `smLiveRegsAt`'s answer when no mask is recorded: `pc` is in no Bit
+// function, is no poll, or its entry predates version 2. Every register may
+// be live.
+export const smLiveUnknown = -1
 
 // Renders `v` as decimal ASCII into `buf` starting at byte `pos`, returning
 // the position just past the last digit. Every caller passes a u16 blob
@@ -431,7 +443,8 @@ const smBadVersion = -2
   }
   // Checked before any count-driven read (numSaved is the first): after a
   // version mismatch every offset past this point is meaningless.
-  if (blobU16(base, off + 8) != smFormatVersion) {
+  let version = blobU16(base, off + 8)
+  if (version != smFormatVersion && version != smFormatVersionV1) {
     return smBadVersion
   }
   // The WHOLE saved-register span (u16 reg + i32 fp_off each) at once, so
@@ -445,6 +458,25 @@ const smBadVersion = -2
     return smBadBounds
   }
   return p + 2
+}
+
+// #7303: the offset just past the live-register trailer at `p`, right after
+// the last safepoint record of the entry at `off`: version 2's `u16 num_live`
+// x `{u16 sp_index, u32 live_regs}`, nothing in version 1. The caller has
+// proven the header through `smSpsStart`, which admits only those two; else
+// `smBadBounds`.
+@nosplit fn smLiveEnd(base: int, tblLen: int, off: int, p: int): int {
+  if (blobU16(base, off + 8) == smFormatVersionV1) {
+    return p
+  }
+  if (!inBlob(p, 2, tblLen)) {
+    return smBadBounds
+  }
+  let numLive = blobU16(base, p)
+  if (!inBlob(p + 2, numLive * 6, tblLen)) {
+    return smBadBounds
+  }
+  return p + 2 + numLive * 6
 }
 
 // The offset just past the safepoint record at `sp` (u32 ret_off, u16
@@ -472,7 +504,7 @@ const smBadVersion = -2
 
 // The offset of the entry after the one at `off`, the whole entry proven in
 // bounds; else a refusal code.
-@nosplit fn smEntryEnd(base: int, tblLen: int, off: int): int {
+export @nosplit fn smEntryEnd(base: int, tblLen: int, off: int): int {
   let p = smSpsStart(base, tblLen, off)
   if (p < 0) {
     return p
@@ -486,6 +518,10 @@ const smBadVersion = -2
       return p
     }
     si = si + 1
+  }
+  p = smLiveEnd(base, tblLen, off, p)
+  if (p < 0) {
+    return p
   }
   // Round up past this entry's trailing pad (#1927, ABI.md §4): the writer
   // pads every entry to a multiple of 8 bytes, and the walk must round by the
@@ -604,6 +640,75 @@ export @nosplit fn smLinearFind(pc: int): int {
     si = si + 1
   }
   smRestoreSaved(base, off, fp)
+}
+
+// #7303: the live-register mask of the poll at `pc` in the entry at `off` of
+// the table `[base, base + tblLen)`: bit n set when physical register n holds
+// a value the code after `pc` still needs. `smLiveUnknown` for a version-1
+// entry, a call safepoint, or a `pc` the entry records no safepoint at. A
+// malformed entry is refused by name, as `scanEntry` refuses it.
+export @nosplit fn smLiveRegsIn(base: int, tblLen: int, off: int, pc: int): int {
+  let p = smSpsStart(base, tblLen, off)
+  if (p < 0) {
+    smRefuse(base, off, p)
+    return smLiveUnknown
+  }
+  let codeAddr = blobU64(base, off)
+  let numSps = blobU16(base, p - 2)
+  let found = -1
+  let si = 0
+  // Bounded: this entry's safepoint count. Walks every record, because the
+  // trailer starts after the last one.
+  while (si < numSps) {
+    let next = smSpEnd(base, tblLen, p)
+    if (next < 0) {
+      smRefuse(base, off, next)
+      return smLiveUnknown
+    }
+    if (found < 0 && codeAddr + blobU32(base, p) == pc) {
+      found = si
+    }
+    p = next
+    si = si + 1
+  }
+  if (found < 0) {
+    return smLiveUnknown
+  }
+  return smLiveFind(base, tblLen, off, p, found)
+}
+
+// The `live_regs` the trailer at `p` of the entry at `off` records for its
+// safepoint record `si`; `smLiveUnknown` when it records none.
+@nosplit fn smLiveFind(base: int, tblLen: int, off: int, p: int, si: int): int {
+  let end = smLiveEnd(base, tblLen, off, p)
+  if (end < 0) {
+    smRefuse(base, off, end)
+    return smLiveUnknown
+  }
+  if (end == p) {
+    return smLiveUnknown // version 1: no trailer
+  }
+  let numLive = blobU16(base, p)
+  let k = 0
+  // Bounded: this entry's poll count, the whole span proven by smLiveEnd.
+  while (k < numLive) {
+    let rec = p + 2 + k * 6
+    if (blobU16(base, rec) == si) {
+      return blobU32(base, rec + 2)
+    }
+    k = k + 1
+  }
+  return smLiveUnknown
+}
+
+// #7303: `smLiveRegsIn` over the linked table, for the frame-0 register scan
+// of a task stopped at `pc`. `smLiveUnknown` when `pc` is in no Bit function.
+export @nosplit fn smLiveRegsAt(pc: int): int {
+  let off = smFindEntry(pc)
+  if (off < 0) {
+    return smLiveUnknown
+  }
+  return smLiveRegsIn(smTblBase(), smTblLen(), off, pc)
 }
 
 // ---------------------------------------------------------------------------

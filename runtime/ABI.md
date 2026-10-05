@@ -991,10 +991,10 @@ guaranteed 8-aligned, only the entry boundaries are):
 ```
 per function (repeated to the end of the extent):
   u64 code_addr        # abs reloc -> the function's code symbol
-  u16 version           # format-version stamp; must equal
-                         # smFormatVersion (1) in both compiler/codegen.bit
-                         # and runtime/gc/stackmap.bit, checked before any
-                         # count-driven field below is trusted
+  u16 version           # format-version stamp: smFormatVersion (2) in both
+                         # compiler/codegen.bit and runtime/gc/stackmap.bit;
+                         # the reader also accepts 1 (smFormatVersionV1),
+                         # checked before any count-driven field is trusted
   u32 code_size        # bytes; the function spans [code_addr, code_addr+code_size)
   u16 num_saved
   per saved (num_saved times):
@@ -1007,10 +1007,26 @@ per function (repeated to the end of the extent):
     i32 slot_fp_off[num_slots]   # live-reference stack slots, fp-relative
     u16 num_regs
     u16 reg[num_regs]            # physical registers holding a live reference
+  u16 num_live          # version 2 only (#7303): one per back-edge poll
+  per poll (num_live times):
+    u16 sp_index                 # the poll's record, by position in this entry
+    u32 live_regs                # bit n set when physical register n holds a
+                                 # value of any type the code after it still needs
   u8 pad[0..7]          # zero bytes bringing this entry's total length to a
                          # multiple of 8; the walker recomputes the count by
                          # rounding its cursor up, not by reading a length field
 ```
+
+**Two versions, one image (#7303).** Version 2 keeps version 1's safepoint
+records and appends a trailer carrying `live_regs` for each back-edge poll
+only: a call record's mask would be a superset nothing reads, and four bytes
+on every record grew `__bit_gc` by 14% on the json benchmark. The pinned
+stage0 that builds `libbitrt.a` keeps stamping version 1 until a repin, so a
+default build links both, and the reader parses each entry by its own stamp.
+`smLiveRegsAt(pc)` answers `smLiveUnknown` (-1) for a version-1 entry, a call
+safepoint, or a `pc` with no record, which a consumer must treat as "every
+saved register may be live". The mask covers only the allocatable integer
+file; a register outside it is never named.
 
 **The producer and the reader are separate build inputs, and this format's
 correctness depends on them agreeing.** The padding above is written by
@@ -1050,7 +1066,7 @@ before any count-driven field (`num_saved`, `num_safepoints`, ...) is
 trusted. A mismatch panics by name with both versions, using the same idiom
 as `panicStackMapBounds` above rather than a fixed literal message, since the
 two numbers are runtime values read off the blob. `compiler/codegen.bit`'s
-`writeStackMaps` stamps `smFormatVersion` (currently 1) into every entry it
+`writeStackMaps` stamps `smFormatVersion` (currently 2) into every entry it
 writes, and `runtime/gc/stackmap.bit` carries the matching reader half
 (`smFormatVersion`, `panicStackMapVersion`, `appendDecimal`), wired into
 `scanFrame`'s live parse: the fixed-header bounds check widened 14 -> 16
