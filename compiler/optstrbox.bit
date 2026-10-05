@@ -267,10 +267,10 @@ fn argWordsAreHandle(ctx: TypeContext, fs: StrBoxFn, a0: int, a1: int, a2: int):
   return boxWordsAreOwnHandle(fs, a0, a1, a2) || paramWordsBase(ctx, fs, a0, a1, a2) >= 0
 }
 
-// Whether the call at `c` in `fs.f` resolves to a `string` function in
+// Whether the call at `c` in `fs.f` resolves to `string` functions in
 // `x.snap` whose every `ret` has an answer in `retReuseVerdict` and at least
-// one succeeds. An unresolvable target — a `call_value`, an interface
-// dispatch, an `rt_call`, or a name this module does not hold — refuses.
+// one succeeds. An unresolvable target — a `call_value`, an `rt_call`, or a
+// name this module does not hold — refuses.
 //
 // One unanswerable `ret` refuses the whole function: `return s[lo:hi]` hands
 // back a fresh view whose word 2 is its source, and #4648 measured what a
@@ -290,27 +290,82 @@ fn argWordsAreHandle(ctx: TypeContext, fs: StrBoxFn, a0: int, a1: int, a2: int):
 // the question recurses through a chain of forwarders, a recursive one
 // included. `fs.depth` counts the calls already followed and refuses at
 // `strBoxForwardDepth`, which bounds the walk whatever the call graph.
+//
+// #7178: an interface dispatch is asked the same question of EVERY method it
+// can land on, their `ret`s pooled as one function's would be: once #7146
+// returned `use<T>`'s result in words and the inliner spliced it into `main`,
+// the `call_iface` was the only call left to ask, and refusing it cost one
+// header per call that the return-site diamond had reused before.
 fn callReturnsReusable(x: StrBoxScan, fs: StrBoxFn, c: int): bool {
-  let call = fs.f.instrs[c]
-  let gi = call.op == Op.Call ? funcIndexByName(x.snap, call.name) : -1
-  if (fs.depth >= strBoxForwardDepth || gi < 0 || x.snap[gi].result != primType(x.ctx, 11)) {
+  if (fs.depth >= strBoxForwardDepth) {
     return false
   }
-  if (len(x.snap[gi].blocks) == 0) {
-    return false
-  }
-  let gs = StrBoxFn{ f = x.snap[gi], rep = []int(0), depth = fs.depth + 1 }
+  let targets = callTargetsOf(x, fs.f.instrs[c])
   let pays = false
-  let i = 0
-  while (i < len(gs.f.instrs)) {
-    if (gs.f.instrs[i].op == Op.Ret) {
-      let v = retReuseVerdict(x, fs, gs, c, gs.f.instrs[i])
-      if (v < 0) {
-        return false
-      }
-      pays = pays || v == 1
+  for gi of targets {
+    let v = targetReuseVerdict(x, fs, c, gi)
+    if (v < 0) {
+      return false
     }
-    i = i + 1
+    pays = pays || v == 1
+  }
+  return pays
+}
+
+// The `x.snap` index of every function the call `call` can run, or an empty
+// list when one of them is unknown — which `callReturnsReusable` refuses.
+//
+// A `call_iface` reaches exactly the methods whose slot in `x.tables` carries
+// its id, the enumeration `calmIfaceTargets` (optappendfield.bit) rests on:
+// `bit_rt_iface_lookup` resolves an id only through a receiver's TypeInfo,
+// every TypeInfo with methods is one of those tables, and the module is the
+// whole program. #5945's passthrough answer cannot misread such a method's
+// parameters: `call.args` omits the receiver its entry block counts, so
+// `retReuseVerdict`'s arity test refuses the site instead.
+fn callTargetsOf(x: StrBoxScan, call: IrInstr): []int {
+  let out = []int(0)
+  if (call.op == Op.Call) {
+    let gi = funcIndexByName(x.snap, call.name)
+    return gi < 0 ? out : [gi]
+  }
+  if (call.op != Op.CallIface) {
+    return out
+  }
+  for t of x.tables {
+    for s of t.methods {
+      if (s.id != call.ival) {
+        continue
+      }
+      let gi = funcIndexByName(x.snap, s.func)
+      if (gi < 0) {
+        return []int(0)
+      }
+      out = append(out, gi)
+    }
+  }
+  return out
+}
+
+// How the caller's reuse test fares on the target `x.snap[gi]` of the call `c`
+// in `fs.f`: -1 when it is not a `string` function with a body or one of its
+// `ret`s has no answer in `retReuseVerdict`, else 1 when one `ret` succeeds
+// and 0 when none does.
+fn targetReuseVerdict(x: StrBoxScan, fs: StrBoxFn, c: int, gi: int): int {
+  let g = x.snap[gi]
+  if (g.result != primType(x.ctx, 11) || len(g.blocks) == 0) {
+    return -1
+  }
+  let gs = StrBoxFn{ f = g, rep = []int(0), depth = fs.depth + 1 }
+  let pays = 0
+  for r of g.instrs {
+    if (r.op != Op.Ret) {
+      continue
+    }
+    let v = retReuseVerdict(x, fs, gs, c, r)
+    if (v < 0) {
+      return -1
+    }
+    pays = v == 1 ? 1 : pays
   }
   return pays
 }
@@ -540,11 +595,13 @@ fn isReuseTestOf(f: IrFunc, c: int, box: int): bool {
   return loadsFieldOf(f, ins.lhs, w2, 8) && ins.rhs == f.instrs[box + 2].rhs
 }
 
-// The two module-wide facts the scan consults, bundled so the walk stays inside
-// E0202's five-parameter limit. Both are READ-ONLY for the whole pass.
+// The module-wide facts the scan consults, bundled so the walk stays inside
+// E0202's five-parameter limit. All are READ-ONLY for the whole pass.
+// `tables` is `m.methodTables`, the targets of a `call_iface` (#7178).
 class StrBoxScan {
   ctx: TypeContext,
   snap: []IrFunc,
+  tables: []MethodTable,
 }
 
 // The function one scan walks, its representative map once `strBoxRepOf` has
@@ -757,7 +814,7 @@ fn reuseStringBoxesInModule(m: IrModule, debug: bool) {
     snap = append(snap, m.funcs[i])
     i = i + 1
   }
-  let x = StrBoxScan{ ctx = m.ctx, snap = snap }
+  let x = StrBoxScan{ ctx = m.ctx, snap = snap, tables = m.methodTables }
   i = 0
   while (i < len(m.funcs)) {
     m.funcs[i] = reuseStringBoxes(x, m.funcs[i], debug)
