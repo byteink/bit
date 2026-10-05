@@ -10,5 +10,6 @@ bitlang.org's sidebar reads it in.
 | [The Mailer](mailer.md) | `Mailer`, `Options`, `send` and `render` on Inkwell's welcome mail: startup checks, the `Outbox` test transport, writing a `Transport`, `Receipt`, `MailError` |
 | [Attachments](attachments.md) | `Attachment` and `Attachment.file` on Inkwell's publish mail: a PDF to save, a logo shown inside the HTML by `cid`, the checks that tie the two together, the 25 MiB limit, the MIME type table |
 | [Sending for real](open.md) | `open` on Inkwell's production setup: `smtps://` and `smtp://` URLs, STARTTLS that is required and never optional, `tls=off` for a local catcher, `caFile` and `serverName` for a private CA, how server answers map to `MailError` |
+| [Webhooks](webhooks.md) | `parseEvents`, `Event`, `EventKind` and `Provider` on Inkwell's suppression list: Resend's Svix signature, the 5 minute window, de-duplicating on `deliveryId`, what each Resend event becomes |
 
 See the [package front page](../README.md) for install and a minimal example.
