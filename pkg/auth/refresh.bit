@@ -1,0 +1,452 @@
+// pkg/auth/refresh.bit — opaque refresh tokens with rotation and reuse
+// detection (#6948, epic #3960).
+//
+//   let tokens = RefreshTokens(MemoryRefreshStore())?
+//   let first = tokens.issue("u1")?          // set this as the cookie at login
+//   let next = tokens.rotate(first)?         // the client came back with it
+//   // next.token replaces the cookie; next.subject == "u1"
+//
+// STANDARDS. RFC 9700 (OAuth 2.0 Security BCP) section 4.14: a public client's
+// refresh token is protected by rotation with reuse detection, and a rotated
+// token that is presented again revokes the whole family of tokens descended
+// from the same login. RFC 6749 sections 6 and 10.4, and the OAuth 2.1 draft.
+//
+// ## What is guaranteed
+//
+//  - The token is 32 bytes from the OS CSPRNG (256 bits), base64url, 43 chars.
+//  - The store only ever sees the SHA-256 of the token, in hex. A stolen store
+//    yields nothing a client can present. The token is uniformly random, so a
+//    plain hash needs no salt or stretching. The hash read back from the store
+//    is compared with `ctEq` before the record is trusted.
+//  - Every `rotate` consumes the token it is given and returns a new one in the
+//    same family. `RefreshStore.rotate` is one atomic step, so of any number of
+//    simultaneous rotations of one token exactly one wins.
+//  - A rotated token that is presented again is a stolen one: the thief or the
+//    victim holds a copy, and the server cannot tell which. The whole family is
+//    revoked, so the token the winner holds dies too and both parties sign in
+//    again. The only exception is `graceSeconds`, below.
+//  - A family dies at `absoluteTtl` seconds after login whatever its activity,
+//    so a stolen token that is kept alive by rotating cannot outlive it.
+//  - Every failure, whether the token is malformed, unknown, expired, revoked,
+//    past the absolute cap or reused, is the same `InvalidRefreshToken`. A
+//    client probing learns nothing about which.
+//
+// ## Grace
+//
+// A response can be lost on the way back, and a client then retries with the
+// token it still holds; two tabs can also refresh at the same instant. With
+// `graceSeconds = 0` (the default) both are reuse and cost the family. A
+// positive value excuses a second presentation that comes less than that many
+// seconds after the rotation: it still fails, because the new token cannot be
+// handed out twice (only its hash is stored), but the family survives and the
+// winner's token stays valid.
+//
+// ## Timing
+//
+// The store is looked up by the SHA-256 of the presented token, so how long a
+// lookup takes reveals nothing about the token itself.
+import { Mutex } from "std/sync"
+import { isSome, unwrap } from "std/core"
+import { now, Second } from "std/time"
+import { randomBytes, encodeBase64Url, ctEq } from "std/crypto"
+
+// What a store keeps for one token, under the token's hash. A record is
+// never edited by the caller: `RefreshStore` methods change it.
+export class RefreshRecord {
+  // SHA-256 of the token, in hex. Never the token.
+  export hash: string,
+  // The login this token descends from. Every token of one login shares it, and
+  // reuse of any rotated one revokes all of them.
+  export family: string,
+  // Whom it is for: a user id, usually.
+  export subject: string,
+  // Seconds since the epoch; this token is dead from this instant.
+  export expiresAt: i64,
+  // Seconds since the epoch at which the whole family dies, however often it
+  // rotates. The same value on every record of a family.
+  export familyExpiresAt: i64,
+  // Seconds since the epoch at which this token was exchanged for the next, 0
+  // while it has not been.
+  export rotatedAt: i64,
+  // Set when the family or the subject was revoked.
+  export revoked: bool,
+  // Whatever the app needs back at rotation, for example a device name or the
+  // granted scopes. Carried forward unchanged to each new token. Keep secrets
+  // out of it.
+  export data: string,
+}
+
+// Where records live. Structural (§14.3): any type with these five methods is
+// a store, so a database table or Redis fits with no declaration.
+//
+// `hash` is the SHA-256 hex of the token, never the token.
+//
+// `rotate` MUST be one atomic step (an `UPDATE ... WHERE rotated_at = 0 AND
+// NOT revoked` and an `INSERT` in one transaction, a Lua script). If `oldHash`
+// exists, is not revoked and has `rotatedAt == 0`, it sets that record's
+// `rotatedAt` to `at`, stores `next` and answers `true`; otherwise it changes
+// nothing and answers `false`. Two callers rotating one hash must never both
+// get `true`: that is the exactly-one-winner guarantee, and without it a
+// token can be exchanged twice.
+//
+// `revokeFamily` and `revokeSubject` mark every matching record `revoked`, in
+// one step, and answer `()` when nothing matches. A record that is revoked
+// stays findable, so a store may drop it only when it has expired.
+export interface RefreshStore {
+  insert(rec: RefreshRecord): ()!,
+  findByHash(hash: string): Option<RefreshRecord>!,
+  rotate(oldHash: string, next: RefreshRecord, at: i64): bool!,
+  revokeFamily(family: string): ()!,
+  revokeSubject(subject: string): ()!,
+}
+
+// The one failure `rotate` gives for a token it will not honour.
+export class InvalidRefreshToken {
+  export message(): string {
+    return "auth: invalid or expired refresh token"
+  }
+}
+
+// The default number of records a `MemoryRefreshStore` holds.
+const memoryRefreshCapacity: int = 100_000
+
+// An in-process store, for tests, development and a single-process app. Its
+// records die with the process, so a restart signs everyone out.
+//
+// Bounded: at `capacity` records an insert drops the one expiring soonest, so
+// memory cannot be exhausted by logging in many times. A rotated record is kept
+// until it is evicted this way, since reuse detection needs it.
+export class MemoryRefreshStore {
+  entries: map<string, RefreshRecord>
+  capacity: int
+  mu: Mutex
+
+  // A capacity below 1 could hold no token at all, so it panics, as
+  // `MemoryOneTimeStore` does: a mistake at startup, not a runtime condition.
+  init(capacity: int = memoryRefreshCapacity) {
+    if (capacity < 1) {
+      panic("auth: MemoryRefreshStore(): `capacity` is ${capacity} — it must be at least 1")
+    }
+    this.entries = map<string, RefreshRecord>()
+    this.capacity = capacity
+    this.mu = Mutex()
+  }
+
+  export insert(rec: RefreshRecord): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.store(rec)
+  }
+
+  // Records are copied in and out, so a caller holding one cannot edit the
+  // store behind its lock.
+  export findByHash(hash: string): Option<RefreshRecord>! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (rec, ok) = this.entries[hash]
+    if (!ok) {
+      return Option.None
+    }
+    return Option.Some(copyRefresh(rec))
+  }
+
+  // The check, the mark and the store under one lock hold: the atomic step
+  // `RefreshStore.rotate` demands.
+  export rotate(oldHash: string, next: RefreshRecord, at: i64): bool! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (old, ok) = this.entries[oldHash]
+    if (!ok || old.revoked || old.rotatedAt != 0) {
+      return false
+    }
+    old.rotatedAt = at
+    this.store(next)
+    return true
+  }
+
+  // A scan, O(n): the honest cost of no second index in a store meant for one
+  // process. A database store answers it with one indexed UPDATE.
+  export revokeFamily(family: string): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    for (_, rec) of this.entries {
+      if (rec.family == family) {
+        rec.revoked = true
+      }
+    }
+  }
+
+  export revokeSubject(subject: string): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    for (_, rec) of this.entries {
+      if (rec.subject == subject) {
+        rec.revoked = true
+      }
+    }
+  }
+
+  // The lock is held by the callers; `Mutex` is not reentrant.
+  store(rec: RefreshRecord) {
+    let (_, present) = this.entries[rec.hash]
+    if (!present && len(this.entries) >= this.capacity) {
+      this.evictSoonestExpiring()
+    }
+    this.entries[rec.hash] = copyRefresh(rec)
+  }
+
+  // The lock is held by `store`.
+  evictSoonestExpiring() {
+    let victim = ""
+    let victimAt: i64 = 0
+    let found = false
+    for (hash, rec) of this.entries {
+      if (!found || rec.expiresAt < victimAt) {
+        victim = hash
+        victimAt = rec.expiresAt
+        found = true
+      }
+    }
+    if (found) {
+      delete(this.entries, victim)
+    }
+  }
+}
+
+fn copyRefresh(rec: RefreshRecord): RefreshRecord {
+  return RefreshRecord{
+    hash = rec.hash,
+    family = rec.family,
+    subject = rec.subject,
+    expiresAt = rec.expiresAt,
+    familyExpiresAt = rec.familyExpiresAt,
+    rotatedAt = rec.rotatedAt,
+    revoked = rec.revoked,
+    data = rec.data,
+  }
+}
+
+// The optional second argument of `RefreshTokens`.
+export class RefreshOptions {
+  // Seconds since the epoch. The zero value, `nil`, is the wall clock; a test
+  // passes its own and moves it by hand.
+  export clock: () => i64,
+  // How long one token lives, in seconds: 30 days. Each rotation starts it
+  // again, so an active client never expires.
+  export ttl: i64 = 2_592_000,
+  // How long a family lives from the login, in seconds: 90 days. The hard cap
+  // on a stolen token that is kept alive by rotating it.
+  export absoluteTtl: i64 = 7_776_000,
+  // How long after a rotation the old token may be presented again without
+  // that counting as reuse. See the file header. 0 turns the excuse off.
+  export graceSeconds: i64 = 0,
+}
+
+// What `rotate` returns: the new token and what it was issued with.
+export class RefreshRotation {
+  // The new token. It replaces the one that was presented, which is now dead.
+  export token: string,
+  export subject: string,
+  // The `data` given to `issue`, unchanged.
+  export data: string,
+  // When the new token dies, in seconds since the epoch, for a cookie's
+  // `Max-Age`.
+  export expiresAt: i64,
+}
+
+// Random bytes in a token: 256 bits, past the 128 this package asks of itself.
+// The hash and the shape check are the one-time tokens' (`oneTimeHash`,
+// `oneTimeWellFormed`, onetime.bit): the same 43-character token.
+const refreshTokenBytes: int = 32
+
+// Issues, rotates and revokes refresh tokens over a `RefreshStore`. Stateless
+// apart from the store, so one value is shared by every request.
+export class RefreshTokens {
+  store: RefreshStore
+  opts: RefreshOptions
+
+  // Fails for a missing store or an option that cannot work, so the mistake
+  // shows when the app starts.
+  init(store: RefreshStore, opts: RefreshOptions = RefreshOptions{})! {
+    if (store == nil) {
+      fail newError("auth: RefreshTokens(): no store — pass one, for example `RefreshTokens(MemoryRefreshStore())`")
+    }
+    if (opts.ttl < 1) {
+      fail newError("auth: RefreshTokens(): `ttl` is ${opts.ttl} second(s) — it must be at least 1")
+    }
+    if (opts.absoluteTtl < opts.ttl) {
+      fail newError("auth: RefreshTokens(): `absoluteTtl` is ${opts.absoluteTtl} second(s) — it must be at least `ttl` (${opts.ttl})")
+    }
+    if (opts.graceSeconds < 0) {
+      fail newError("auth: RefreshTokens(): `graceSeconds` is ${opts.graceSeconds} — it must not be negative")
+    }
+    this.store = store
+    this.opts = opts
+  }
+
+  // A token for `subject`, starting a new family: one login. The string
+  // returned is the only copy of the token: it goes to the client and nowhere
+  // else; the store gets its hash. `data` comes back from every `rotate`.
+  //
+  // Fails, loudly, for an empty `subject` or a store that refuses the record.
+  export issue(subject: string, data: string = ""): string! {
+    if (subject == "") {
+      fail newError("auth: RefreshTokens.issue(): `subject` is empty — name whom the token is for")
+    }
+    let token = refreshMint()?
+    let family = refreshMint()?
+    let t = this.nowSec()
+    let rec = RefreshRecord{
+      hash = oneTimeHash(token),
+      family = family,
+      subject = subject,
+      expiresAt = t + this.opts.ttl,
+      familyExpiresAt = t + this.opts.absoluteTtl,
+      data = data,
+    }
+    this.store.insert(rec)?
+    return token
+  }
+
+  // Exchanges `token` for a new one in the same family. Fails with
+  // `InvalidRefreshToken` for every reason it cannot: malformed, unknown,
+  // expired, revoked, past `absoluteTtl`, or already rotated. Presenting a
+  // rotated token revokes the whole family (unless it is inside
+  // `graceSeconds`), so the token its rotation produced dies as well.
+  //
+  // A store failure is returned as it came, since it is the operator's to see
+  // and nothing a client can cause. It fails closed: nothing is issued.
+  export rotate(token: string): RefreshRotation! {
+    let found = this.lookup(token)?
+    if (!isSome(found)) {
+      fail InvalidRefreshToken{}
+    }
+    let rec = unwrap(found)
+    let t = this.nowSec()
+    this.admit(rec, t)?
+    let raw = refreshMint()?
+    let next = RefreshRecord{
+      hash = oneTimeHash(raw),
+      family = rec.family,
+      subject = rec.subject,
+      expiresAt = this.expiry(rec, t),
+      familyExpiresAt = rec.familyExpiresAt,
+      data = rec.data,
+    }
+    let won = this.store.rotate(rec.hash, next, t)?
+    if (!won) {
+      this.lost(rec.hash, t)?
+      fail InvalidRefreshToken{}
+    }
+    return RefreshRotation{
+      token = raw,
+      subject = rec.subject,
+      data = rec.data,
+      expiresAt = next.expiresAt,
+    }
+  }
+
+  // Ends the login `token` belongs to: its whole family, so the token a client
+  // holds now stops working whichever one it presents. A token that is
+  // malformed or unknown is already dead, so it is not an error: a sign-out
+  // with a stale cookie succeeds.
+  export revoke(token: string): ()! {
+    let found = this.lookup(token)?
+    if (!isSome(found)) {
+      return
+    }
+    this.store.revokeFamily(unwrap(found).family)?
+  }
+
+  // Ends every login of `subject`, for "sign out everywhere", a password
+  // change or a banned account. Fails for an empty `subject`.
+  export revokeSubject(subject: string): ()! {
+    if (subject == "") {
+      fail newError("auth: RefreshTokens.revokeSubject(): `subject` is empty — name whose logins to end")
+    }
+    this.store.revokeSubject(subject)?
+  }
+
+  // The record `token` names, or None for a token that is malformed or that
+  // the store does not hold. The hash read back is compared in constant time:
+  // a store that answers with another record is a bug that must not log
+  // someone in as a stranger.
+  lookup(token: string): Option<RefreshRecord>! {
+    if (!oneTimeWellFormed(token)) {
+      return Option.None
+    }
+    let hash = oneTimeHash(token)
+    let found = this.store.findByHash(hash)?
+    if (!isSome(found)) {
+      return Option.None
+    }
+    if (!ctEq([]byte(unwrap(found).hash), []byte(hash))) {
+      return Option.None
+    }
+    return found
+  }
+
+  // Fails unless `rec` may be rotated at `t`.
+  admit(rec: RefreshRecord, t: i64): ()! {
+    if (rec.revoked || rec.familyExpiresAt <= t) {
+      fail InvalidRefreshToken{}
+    }
+    if (rec.rotatedAt != 0) {
+      this.reuse(rec, t)?
+      fail InvalidRefreshToken{}
+    }
+    if (rec.expiresAt <= t) {
+      fail InvalidRefreshToken{}
+    }
+  }
+
+  // A rotated token came back. Inside the grace window it is a retry or a
+  // second tab; outside, a stolen copy, and the family goes.
+  reuse(rec: RefreshRecord, t: i64): ()! {
+    if (t - rec.rotatedAt < this.opts.graceSeconds) {
+      return
+    }
+    this.store.revokeFamily(rec.family)?
+  }
+
+  // `rotate` lost the store's atomic step to a concurrent rotation of the same
+  // token. Read the winner's stamp back and judge the loser as any other reuse.
+  lost(hash: string, t: i64): ()! {
+    let found = this.store.findByHash(hash)?
+    if (!isSome(found)) {
+      return
+    }
+    let rec = unwrap(found)
+    if (rec.revoked || rec.rotatedAt == 0) {
+      return
+    }
+    this.reuse(rec, t)?
+  }
+
+  // `ttl` from `t`, but never past the family's end.
+  expiry(rec: RefreshRecord, t: i64): i64 {
+    let at = t + this.opts.ttl
+    if (at > rec.familyExpiresAt) {
+      return rec.familyExpiresAt
+    }
+    return at
+  }
+
+  nowSec(): i64 {
+    let clock = this.opts.clock
+    if (clock == nil) {
+      return now().ns / Second
+    }
+    return clock()
+  }
+}
+
+// A fresh 256-bit value from the CSPRNG, base64url. A token and a family id
+// are both this; the family id is merely not secret.
+fn refreshMint(): string! {
+  let raw = randomBytes(refreshTokenBytes)
+  if (len(raw) != refreshTokenBytes) {
+    fail newError("auth: RefreshTokens: the system random source returned ${len(raw)} bytes, wanted ${refreshTokenBytes}")
+  }
+  return encodeBase64Url(raw)
+}

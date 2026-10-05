@@ -131,6 +131,13 @@ protected route that is not itself doing the authenticating just reads
   for every address, `authenticate` spends it once, refuses another browser's
   copy, and regenerates the session id; optionally throttled with a
   `LoginThrottle`; see [Sign in with a link in an email](docs/magic-link.md).
+- `RefreshTokens`, `RefreshStore`, `RefreshRecord`, `RefreshOptions`,
+  `RefreshRotation`, `MemoryRefreshStore`, `InvalidRefreshToken` - opaque refresh
+  tokens (RFC 9700): 256 random bits stored only as a SHA-256 hash, rotated on
+  every use, with reuse of a rotated token revoking the whole login, an
+  absolute lifetime cap, an optional grace window, `revoke` and `revokeSubject`,
+  and a pluggable store whose `rotate` is atomic; see
+  [Refresh tokens that notice theft](docs/refresh-tokens.md).
 - `AccessTokens`, `KeySet`, `TokenOptions`, `BearerStrategy`, `BearerChallenge` -
   JWT bearer access tokens for an API (RFC 9068): `issue` signs one with a
   pinned algorithm, `kid` and a random `jti`, `verify` refuses `none`, a wrong
