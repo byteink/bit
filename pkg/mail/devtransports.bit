@@ -1,0 +1,349 @@
+// pkg/mail/devtransports.bit — the two transports for the development loop,
+// `open("log://")` and `open("file:///dir")`. Neither talks to a network, so a
+// program can send mail on a laptop with no account anywhere and a person can
+// still see what would have gone out.
+//
+//   log://                 prints each mail to standard output, readably
+//   file:///abs/dir        writes each mail to /abs/dir as one .eml file
+//   file://./rel/dir       the same, for a directory relative to the working directory
+//
+// Both take the finished bytes of `Delivery.raw`, so `Options.dkim` signs the
+// mail exactly as it would for SMTP and the dev loop shows the real wire
+// message. Neither takes a query parameter: there is nothing to set. Every
+// refusal is `MailError.Config` and happens at `open`.
+
+import { cwd, exists, isDir, isSymlink, remove, rename } from "std/fs"
+import { createExclusive } from "std/fs/secure"
+import { join as joinPath, isAbs } from "std/path"
+import { Mutex } from "std/sync"
+import { hasPrefix, indexOf, join, split, trimSpace, repeat } from "std/strings"
+import { Timestamp, now } from "std/time"
+
+// Permission bits of a written message: its owner reads it. A message is
+// private to whoever it was sent to, a dev directory is no exception.
+const dvMode: int = 0o600
+
+// The most names tried for one message before giving up. A directory holding
+// this many messages with one Message-ID in one second is not a dev loop.
+const dvMaxNames: int = 1000
+
+// The longest sanitized Message-ID in a file name, so the name stays far
+// below the 255-byte limit of common file systems.
+const dvMaxIdBytes: int = 100
+
+// The width of the rule line around a printed mail.
+const dvRuleWidth: int = 60
+
+fn isLogUrl(url: string): bool {
+  return hasScheme(url, "log://")
+}
+
+fn isFileUrl(url: string): bool {
+  return hasScheme(url, "file://")
+}
+
+// `log://` is the whole form: it prints to standard output and has nothing to
+// configure.
+fn parseLog(url: string): ()!MailError {
+  let rest = url[len("log://"):]
+  if (indexOf(rest, "?") >= 0) {
+    fail urlError("log:// takes no query parameters; it prints to standard output")
+  }
+  if (rest != "") {
+    fail urlError("log:// takes nothing after the scheme; it prints to standard output")
+  }
+}
+
+// The directory `file://` names, absolute and checked at `open`: it must exist
+// and accept a new file. A relative one is made absolute now, so a later
+// change of the working directory does not move it.
+fn parseFile(url: string): string!MailError {
+  let rest = url[len("file://"):]
+  if (indexOf(rest, "?") >= 0) {
+    fail urlError("file:// takes no query parameters; the directory is the whole URL")
+  }
+  if (rest == "") {
+    fail urlError("file:// needs a directory: file:///var/mail or file://./outbox")
+  }
+  if (!isAbs(rest) && !hasPrefix(rest, "./") && !hasPrefix(rest, "../")) {
+    fail urlError("file:// needs an absolute directory (file:///var/mail) or one starting with ./ (file://./outbox)")
+  }
+  let dir = pctDecode(rest, "the directory")?
+  if (!isAbs(dir)) {
+    dir = joinPath(cwd() catch ".", dir)
+  }
+  dvProbe(dir)?
+  return dir
+}
+
+// Refuses a directory that is missing or cannot take a file, by creating and
+// deleting one, so the answer is the real one and not a permission guess.
+fn dvProbe(dir: string): ()!MailError {
+  if (!isDir(dir)) {
+    fail urlError("file://${dir}: not an existing directory; create it first")
+  }
+  let probe = joinPath(dir, ".bit-mail-probe-${now().ns}")
+  let made = createExclusive(probe, dvMode) catch e {
+    fail urlError("file://${dir}: the directory is not writable: ${e.message()}")
+  }
+  if (isNone(made)) {
+    fail urlError("file://${dir}: the directory is not writable: ${probe} exists")
+  }
+  unwrap(made).close()
+  remove(probe) catch e {
+    fail urlError("file://${dir}: cannot delete the probe file ${probe}: ${e.message()}")
+  }
+}
+
+fn dvFail(what: string, why: string): MailError {
+  return MailError.Rejected(Reply{ text = "${what}: ${why}" })
+}
+
+// --- log:// ------------------------------------------------------------------
+
+// Prints each mail as a block of headers and the text part, never the raw bytes
+// (no base64 attachments, no DKIM `b=`). Nothing of `Options` reaches it: the
+// keys and secrets are not in a `Delivery`.
+class LogTransport {
+  mu: Mutex
+
+  init() {
+    this.mu = Mutex()
+  }
+
+  // Prints `block(d)` as one write, so mail sent from many tasks does not
+  // interleave.
+  export deliver(d: Delivery): Receipt!MailError {
+    let text = this.block(d)
+    this.mu.lock()
+    print(text)
+    this.mu.unlock()
+    return Receipt{ id = d.messageId, providerId = "log", accepted = d.envelope.to }
+  }
+
+  // The bytes are the ones a real transport would send, only not shown.
+  export signs(): bool {
+    return true
+  }
+
+  // Standard output is not ours to close.
+  export close() {}
+
+  export toString(): string {
+    return "log://"
+  }
+
+  // The text printed for `d`: a rule, the headers a person looks for, the
+  // attachments by name and size, the text part, a rule.
+  block(d: Delivery): string {
+    let m = d.message
+    let rule = repeat("-", dvRuleWidth)
+    let lines: []string = [rule]
+    lines = append(lines, "From: ${dvFrom(d)}")
+    lines = append(lines, "To: ${join(m.to, ", ")}")
+    if (len(m.cc) > 0) {
+      lines = append(lines, "Cc: ${join(m.cc, ", ")}")
+    }
+    if (len(m.bcc) > 0) {
+      lines = append(lines, "Bcc: ${join(m.bcc, ", ")}")
+    }
+    lines = append(lines, "Subject: ${m.subject}")
+    lines = append(lines, "Message-ID: ${d.messageId}")
+    for a of m.attachments {
+      lines = append(lines, "Attachment: ${a.name} (${len(a.data)} bytes)")
+    }
+    for s of dvSignatures(d.raw) {
+      lines = append(lines, "DKIM-Signature: ${s}")
+    }
+    lines = append(lines, "")
+    lines = append(lines, textBody(m))
+    lines = append(lines, rule)
+    return "${join(lines, "\n")}\n"
+  }
+}
+
+// The sender as the mail goes out: the message's own, else the envelope's (the
+// mailer's default From).
+fn dvFrom(d: Delivery): string {
+  if (d.message.from != "") {
+    return d.message.from
+  }
+  return d.envelope.from
+}
+
+// `d=example.com s=sel` for each DKIM-Signature in the header block of `raw`.
+fn dvSignatures(raw: string): []string {
+  let out: []string = []
+  for line of dvHeaderLines(raw) {
+    if (hasPrefix(line, "DKIM-Signature:")) {
+      out = append(out, dvSigTags(line))
+    }
+  }
+  return out
+}
+
+// The header lines of `raw`, each folded header joined back into one line.
+fn dvHeaderLines(raw: string): []string {
+  let end = indexOf(raw, "\r\n\r\n")
+  let head = raw
+  if (end >= 0) {
+    head = raw[0:end]
+  }
+  let out: []string = []
+  for line of split(head, "\r\n") {
+    if ((hasPrefix(line, " ") || hasPrefix(line, "\t")) && len(out) > 0) {
+      out[len(out) - 1] = out[len(out) - 1] + line
+    } else {
+      out = append(out, line)
+    }
+  }
+  return out
+}
+
+// The `d=` and `s=` tags of one DKIM-Signature line: the identity a developer
+// checks. The signature value itself is not shown.
+fn dvSigTags(line: string): string {
+  let shownTags: []string = []
+  for part of split(line[len("DKIM-Signature:"):], ";") {
+    let tag = trimSpace(part)
+    if (hasPrefix(tag, "d=") || hasPrefix(tag, "s=")) {
+      shownTags = append(shownTags, tag)
+    }
+  }
+  return join(shownTags, " ")
+}
+
+// --- file:// -----------------------------------------------------------------
+
+// Writes each mail to `dir` as `<UTC yyyyMMdd-HHmmss>-<message id>.eml`, so a
+// listing sorts by send time. Every file appears whole or not at all: it is
+// written under a dot name in the same directory and renamed into place.
+class FileTransport {
+  dir: string
+
+  init(dir: string) {
+    this.dir = dir
+  }
+
+  // Writes `d.raw` as one new file and reports its name as `providerId`.
+  export deliver(d: Delivery): Receipt!MailError {
+    let name = dvStore(this.dir, dvStamp(now()), dvSafeId(d.messageId), d.raw)?
+    return Receipt{ id = d.messageId, providerId = name, accepted = d.envelope.to }
+  }
+
+  // The file holds the bytes a real transport would send.
+  export signs(): bool {
+    return true
+  }
+
+  // Nothing is held between sends.
+  export close() {}
+
+  export toString(): string {
+    return "file://${this.dir}"
+  }
+}
+
+// `yyyyMMdd-HHmmss` of the instant `t`, in UTC. `Timestamp.toString` is RFC 3339
+// in UTC, so its first fourteen digits are the date and the time.
+fn dvStamp(t: Timestamp): string {
+  let digits: []byte = []
+  for c of []byte(t.toString()) {
+    if (c >= 48 && c <= 57 && len(digits) < 14) {
+      digits = append(digits, c)
+    }
+  }
+  let s = string(digits)
+  return "${s[0:8]}-${s[8:]}"
+}
+
+// `id` as a file name part: the angle brackets go, every byte outside
+// `[A-Za-z0-9._-]` becomes `_`, and a long id is cut. A Message-ID is
+// attacker-influenced (`Message.id` is the caller's text), so no `/`, `..` or
+// NUL ever reaches a path.
+fn dvSafeId(id: string): string {
+  let out: []byte = []
+  for c of []byte(id) {
+    if (c == 60 || c == 62) {
+      continue
+    }
+    if (len(out) >= dvMaxIdBytes) {
+      break
+    }
+    out = append(out, dvSafeByte(c))
+  }
+  if (len(out) == 0) {
+    return "mail"
+  }
+  return string(out)
+}
+
+fn dvSafeByte(c: byte): byte {
+  let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+  if (ok || c == 46 || c == 45 || c == 95) {
+    return c
+  }
+  return 95
+}
+
+// The `n`th candidate name: the first is plain, a later one carries its number.
+fn dvName(stamp: string, id: string, n: int): string {
+  if (n == 1) {
+    return "${stamp}-${id}.eml"
+  }
+  return "${stamp}-${id}-${n}.eml"
+}
+
+// Writes `raw` to the first free `dvName` in `dir` and returns that name. A
+// name is never overwritten: see `dvPlace`.
+fn dvStore(dir: string, stamp: string, id: string, raw: string): string!MailError {
+  let n = 1
+  while (n <= dvMaxNames) {
+    let name = dvName(stamp, id, n)
+    if (dvPlace(dir, name, raw)?) {
+      return name
+    }
+    n = n + 1
+  }
+  fail dvFail("file://${dir}", "${dvMaxNames} files already carry the name ${dvName(stamp, id, 1)}")
+}
+
+// Puts `raw` at `dir/name` and returns true, or returns false when the name is
+// taken. The dot file `.name.part` is created exclusively and without following
+// a symlink, which is also the claim on `name`: two senders, in this process or
+// another, cannot hold it together. `name` is checked free (a dangling symlink
+// counts as taken) while the claim is held, then the finished file is renamed
+// onto it, so a reader sees the whole message or none, and a link planted at
+// `name` is replaced, never written through.
+fn dvPlace(dir: string, name: string, raw: string): bool!MailError {
+  let part = joinPath(dir, ".${name}.part")
+  let final = joinPath(dir, name)
+  let made = createExclusive(part, dvMode) catch e {
+    fail dvFail("file://${dir}", e.message())
+  }
+  if (isNone(made)) {
+    return false
+  }
+  let f = unwrap(made)
+  if (exists(final) || isSymlink(final)) {
+    f.close()
+    dvDrop(part)
+    return false
+  }
+  f.write(raw) catch e {
+    f.close()
+    dvDrop(part)
+    fail dvFail("file://${dir}: writing ${name}", e.message())
+  }
+  f.close()
+  rename(part, final) catch e {
+    dvDrop(part)
+    fail dvFail("file://${dir}: renaming ${name} into place", e.message())
+  }
+  return true
+}
+
+// Removes a leftover part file; the failure it reports is the earlier one.
+fn dvDrop(part: string) {
+  remove(part) catch _ {}
+}

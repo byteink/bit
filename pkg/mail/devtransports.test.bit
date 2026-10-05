@@ -1,0 +1,360 @@
+// pkg/mail/devtransports.test.bit — `log://` and `file://`: what each writes,
+// that the file bytes are the bytes `Mailer.render` makes, that a name never
+// collides and a symlink is never written through, and that every mistake in
+// the URL fails at `open`.
+
+import { isDir, mkdir, readDir, readFile, remove, writeFile } from "std/fs"
+import { createExclusive } from "std/fs/secure"
+import { envOr } from "std/os"
+import { run } from "std/process"
+import { contains, hasPrefix, hasSuffix, join, split } from "std/strings"
+import { Envelope } from "std/smtp"
+import { Timestamp, now, parseRfc3339 } from "std/time"
+
+const dvSubject: string = "Welcome to Inkwell"
+
+fn dvMessage(): Message {
+  return Message{
+    to = ["Sara Ali <sara@example.com>"],
+    cc = ["Omar <omar@example.com>"],
+    bcc = ["audit@inkwell.dev"],
+    subject = dvSubject,
+    text = "Hello Sara.\nWrite your first note at https://inkwell.dev/new",
+    id = "welcome-1",
+  }
+}
+
+const dvInkwell: string = "Inkwell <hello@inkwell.dev>"
+
+// A fresh directory under $TMPDIR, made for this test.
+fn dvTmpDir(tag: string): string {
+  let dir = "${envOr("TMPDIR", "/tmp")}/t6903-${tag}-${now().ns}"
+  mkdir(dir) catch e {
+    panic("mkdir ${dir}: ${e.message()}")
+  }
+  return dir
+}
+
+fn dvAt(s: string): Timestamp {
+  return parseRfc3339(s) catch e {
+    panic(e.message())
+  }
+}
+
+fn dvRef(o: Options): Mailer {
+  return Mailer(Outbox(), o) catch e {
+    panic(e.message())
+  }
+}
+
+fn dvOpen(url: string, o: Options): Mailer {
+  return open(url, o) catch e {
+    panic("open ${url}: ${e.message()}")
+  }
+}
+
+fn dvListing(dir: string): []string {
+  return readDir(dir) catch e {
+    panic("readDir: ${e.message()}")
+  }
+}
+
+fn dvRead(path: string): string {
+  return readFile(path) catch e {
+    panic("readFile ${path}: ${e.message()}")
+  }
+}
+
+// The text of the failure `open(url)` reports, or "ok".
+fn dvRefusal(url: string): string {
+  open(url) catch e {
+    match (e) {
+      Config(_) => {}
+      _ => assert(false, "want Config, got ${e.message()}")
+    }
+    return e.message()
+  }
+  return "ok"
+}
+
+fn dvNoDate(s: string): string {
+  let out: []string = []
+  for line of split(s, "\r\n") {
+    if (!hasPrefix(line, "Date: ")) {
+      out = append(out, line)
+    }
+  }
+  return join(out, "\r\n")
+}
+
+fn dvDelivery(m: Message, raw: string): Delivery {
+  return Delivery{
+    message = m,
+    envelope = Envelope{ from = "hello@inkwell.dev", to = ["sara@example.com"] },
+    messageId = "<welcome-1@inkwell.dev>",
+    raw = raw,
+  }
+}
+
+test "log:// prints the headers and the text part, and no raw bytes" {
+  let m = dvMessage()
+  m.from = dvInkwell
+  m.attachments = [Attachment{ name = "invoice.pdf", data = []byte(2048) }]
+  let box = dvRef(Options{ from = dvInkwell })
+  let raw = box.render(m) catch e {
+    panic(e.message())
+  }
+  let block = LogTransport().block(dvDelivery(m, raw))
+  assert(contains(block, "From: ${dvInkwell}\n"), block)
+  assert(contains(block, "To: Sara Ali <sara@example.com>\n"), block)
+  assert(contains(block, "Cc: Omar <omar@example.com>\n"), block)
+  assert(contains(block, "Bcc: audit@inkwell.dev\n"), block)
+  assert(contains(block, "Subject: ${dvSubject}\n"), block)
+  assert(contains(block, "Message-ID: <welcome-1@inkwell.dev>\n"), block)
+  assert(contains(block, "Attachment: invoice.pdf (2048 bytes)\n"), block)
+  assert(contains(block, "Write your first note at https://inkwell.dev/new\n"), block)
+  assert(!contains(block, "base64"), "the block shows the raw MIME:\n${block}")
+  assert(!contains(block, "AAAAAAAA"), "the block shows an attachment's base64:\n${block}")
+  assert(hasSuffix(block, "\n"), "the block ends without a newline")
+  assert(
+    split(block, "\n")[0] == split(block, "\n")[len(split(block, "\n")) - 2],
+    "no closing rule",
+  )
+}
+
+test "log:// shows the generated text part when only html was written" {
+  let m = Message{ to = ["sara@example.com"], subject = "Hi", html = "<p>Hello <b>Sara</b></p>" }
+  let block = LogTransport().block(dvDelivery(m, ""))
+  assert(contains(block, "Hello Sara"), block)
+  assert(!contains(block, "<b>"), block)
+}
+
+test "log:// names a DKIM signature by d= and s= and never prints its value" {
+  let m = dvMessage()
+  let raw = "From: a@inkwell.dev\r\nDKIM-Signature: v=1; a=rsa-sha256; d=inkwell.dev; s=mail1;\r\n\th=from:to; bh=AAAA; b=SECRETSIGNATUREBYTES\r\nTo: b@c.d\r\n\r\nbody\r\n"
+  let block = LogTransport().block(dvDelivery(m, raw))
+  assert(contains(block, "DKIM-Signature: d=inkwell.dev s=mail1\n"), block)
+  assert(!contains(block, "SECRETSIGNATUREBYTES"), block)
+}
+
+test "log:// delivers: providerId is log, it signs, and a send through the mailer works" {
+  let mailer = dvOpen("log://", Options{ from = dvInkwell })
+  let r = mailer.send(dvMessage()) catch e {
+    panic(e.message())
+  }
+  assert(r.providerId == "log", r.providerId)
+  assert(r.id == "<welcome-1@inkwell.dev>", r.id)
+  assert(LogTransport().signs(), "log:// must report signs()")
+  mailer.close()
+}
+
+test "file:// writes one .eml per send holding the bytes Mailer.render makes" {
+  let dir = dvTmpDir("one")
+  let o = Options{ from = dvInkwell }
+  let mailer = dvOpen("file://${dir}", o)
+  let ref = dvRef(o)
+  mailer.send(dvMessage()) catch e {
+    panic(e.message())
+  }
+  let want = ref.render(dvMessage()) catch e {
+    panic(e.message())
+  }
+  let names = dvListing(dir)
+  assert(len(names) == 1, "want one file, got ${join(names, ",")}")
+  let name = names[0]
+  assert(hasSuffix(name, "-welcome-1_inkwell.dev.eml"), name)
+  assert(len(name) == len("20260101-000000-welcome-1_inkwell.dev.eml"), name)
+  assert(dvNoDate(dvRead("${dir}/${name}")) == dvNoDate(want), "the file is not the rendered mail")
+  mailer.close()
+}
+
+test "both transports sign with Options.dkim, and the file holds the signed bytes" {
+  let dir = dvTmpDir("dkim")
+  let o = Options{
+    from = dvInkwell,
+    dkim = [Dkim{ domain = "inkwell.dev", selector = "dev", key = rsaPkcs8Pem }],
+  }
+  let mailer = dvOpen("file://${dir}", o)
+  mailer.send(dvMessage()) catch e {
+    panic(e.message())
+  }
+  let raw = dvRead("${dir}/${dvListing(dir)[0]}")
+  assert(contains(raw, "DKIM-Signature: v=1; a=rsa-sha256;"), "the file carries no signature")
+  let block = LogTransport().block(dvDelivery(dvMessage(), raw))
+  assert(contains(block, "DKIM-Signature: d=inkwell.dev s=dev\n"), block)
+  assert(!contains(block, "PRIVATE KEY") && !contains(block, "bh="), block)
+  dvOpen("log://", o).close()
+}
+
+test "file:// names sort by send time" {
+  assert(dvStamp(dvAt("2026-10-06T07:08:09Z")) == "20261006-070809", "stamp")
+  let a = dvName(dvStamp(dvAt("2026-10-06T07:08:09Z")), "x", 1)
+  let b = dvName(dvStamp(dvAt("2026-10-06T07:08:10Z")), "a", 1)
+  assert(a < b, "${a} should sort before ${b}")
+  assert(a == "20261006-070809-x.eml", a)
+}
+
+test "a Message-ID is made a safe file name" {
+  assert(
+    dvSafeId("<welcome-7@inkwell.dev>") == "welcome-7_inkwell.dev",
+    dvSafeId("<welcome-7@inkwell.dev>"),
+  )
+  assert(dvSafeId("<../../etc/passwd@x>") == ".._.._etc_passwd_x", dvSafeId("<../../etc/passwd@x>"))
+  assert(dvSafeId("a\u{0}b c") == "a_b_c", "NUL and space")
+  assert(dvSafeId("<>") == "mail", "empty")
+  assert(len(dvSafeId(repeatStr("a", 500))) == 100, "long id is cut")
+}
+
+fn repeatStr(s: string, n: int): string {
+  let out = ""
+  let i = 0
+  while (i < n) {
+    out = out + s
+    i = i + 1
+  }
+  return out
+}
+
+test "two sends of one message id in one second never overwrite" {
+  let dir = dvTmpDir("two")
+  let first = dvStore(dir, "20261006-070809", "same", "one") catch e {
+    panic(e.message())
+  }
+  let second = dvStore(dir, "20261006-070809", "same", "two") catch e {
+    panic(e.message())
+  }
+  assert(first == "20261006-070809-same.eml", first)
+  assert(second == "20261006-070809-same-2.eml", second)
+  assert(dvRead("${dir}/${first}") == "one", "the first file was overwritten")
+  assert(dvRead("${dir}/${second}") == "two", "the second file is wrong")
+  assert(len(dvListing(dir)) == 2, "a part file was left: ${join(dvListing(dir), ",")}")
+}
+
+test "a held part file takes the next name, so concurrent senders cannot both have one" {
+  let dir = dvTmpDir("held")
+  let held = createExclusive("${dir}/.20261006-070809-m.eml.part", dvMode) catch e {
+    panic(e.message())
+  }
+  assert(isSome(held), "could not hold the part file")
+  unwrap(held).close()
+  let name = dvStore(dir, "20261006-070809", "m", "x") catch e {
+    panic(e.message())
+  }
+  assert(name == "20261006-070809-m-2.eml", name)
+}
+
+test "a symlink planted at the target name is never written through" {
+  let dir = dvTmpDir("link")
+  let outside = "${dvTmpDir("outside")}/victim"
+  writeFile(outside, "precious") catch e {
+    panic(e.message())
+  }
+  dvSymlink(outside, "${dir}/20261006-070809-m.eml")
+  let name = dvStore(dir, "20261006-070809", "m", "mail") catch e {
+    panic(e.message())
+  }
+  assert(name == "20261006-070809-m-2.eml", name)
+  assert(dvRead(outside) == "precious", "the symlink target was overwritten")
+}
+
+test "a symlink planted at the part name is refused, not followed" {
+  let dir = dvTmpDir("partlink")
+  let outside = "${dvTmpDir("outside2")}/victim"
+  writeFile(outside, "precious") catch e {
+    panic(e.message())
+  }
+  dvSymlink(outside, "${dir}/.20261006-070809-m.eml.part")
+  let name = dvStore(dir, "20261006-070809", "m", "mail") catch e {
+    panic(e.message())
+  }
+  assert(name == "20261006-070809-m-2.eml", name)
+  assert(dvRead(outside) == "precious", "the symlink target was overwritten")
+}
+
+test "a missing or non-directory target fails at open as Config" {
+  let dir = dvTmpDir("missing")
+  assert(
+    contains(dvRefusal("file://${dir}/nope"), "not an existing directory"),
+    dvRefusal("file://${dir}/nope"),
+  )
+  let f = "${dir}/plain"
+  writeFile(f, "x") catch e {
+    panic(e.message())
+  }
+  assert(contains(dvRefusal("file://${f}"), "not an existing directory"), dvRefusal("file://${f}"))
+}
+
+test "a directory that is not writable fails at open as Config" {
+  let dir = dvTmpDir("ro")
+  dvChmod(dir, "555")
+  if (dvCanWrite(dir)) {
+    // Running as a user the mode does not bind (root): nothing to prove here.
+    dvChmod(dir, "755")
+    return
+  }
+  let got = dvRefusal("file://${dir}")
+  dvChmod(dir, "755")
+  assert(contains(got, "not writable"), got)
+  assert(len(dvListing(dir)) == 0, "the probe was left behind")
+}
+
+test "an open directory leaves no probe file" {
+  let dir = dvTmpDir("probe")
+  assert(dvRefusal("file://${dir}") == "ok", "open failed")
+  assert(len(dvListing(dir)) == 0, "the probe was left: ${join(dvListing(dir), ",")}")
+}
+
+test "a relative directory is made absolute at open" {
+  let t = parseFile("file://./") catch e {
+    assert(false, e.message())
+    return
+  }
+  assert(hasPrefix(t, "/"), t)
+}
+
+test "any query parameter, a bare host and an empty directory are refused at open" {
+  let dir = dvTmpDir("query")
+  assert(contains(dvRefusal("file://${dir}?x=1"), "takes no query parameters"), "file query")
+  assert(contains(dvRefusal("log://?x=1"), "takes no query parameters"), "log query")
+  assert(contains(dvRefusal("log://stdout"), "takes nothing after the scheme"), "log rest")
+  assert(contains(dvRefusal("file://"), "needs a directory"), "empty")
+  assert(contains(dvRefusal("file://outbox"), "absolute directory"), "bare")
+  assert(contains(dvRefusal("file://host/dir"), "absolute directory"), "host")
+  assert(contains(dvRefusal("file://${dir}%0a"), "control byte"), "control")
+  assert(contains(dvRefusal("file://${dir}%zz"), "bad percent-escape"), "escape")
+  assert(isDir(dir), "dir")
+}
+
+test "an Options mistake still fails at open for both schemes" {
+  for url of ["log://", "file://${dvTmpDir("opts")}"] {
+    open(url, Options{ timeout = 0 }) catch e {
+      match (e) {
+        Config(why) => assert(contains(why, "Options.timeout"), why)
+        _ => assert(false, "want Config, got ${e.message()}")
+      }
+      continue
+    }
+    assert(false, "${url} accepted a zero timeout")
+  }
+}
+
+fn dvSymlink(target: string, link: string) {
+  let rc = run("/bin/ln", ["-s", target, link])
+  assert(rc == 0, "ln -s exit ${rc}")
+}
+
+fn dvChmod(path: string, mode: string) {
+  let rc = run("/bin/chmod", [mode, path])
+  assert(rc == 0, "chmod exit ${rc}")
+}
+
+// Whether a new file can be made in `dir`: false under a read-only mode, true
+// for a user the mode does not bind.
+fn dvCanWrite(dir: string): bool {
+  let p = "${dir}/.canwrite"
+  writeFile(p, "x") catch _ {
+    return false
+  }
+  remove(p) catch _ {}
+  return true
+}
