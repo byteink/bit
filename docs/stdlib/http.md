@@ -792,6 +792,13 @@ As `Client.post`, bounded by one deadline.
 
 As `Client.request`, bounded by one deadline.
 
+### `Client.requestBytes(method: string, url: string, body: []byte, timeoutMs: int = 0): Response!`
+
+As `Client.requestTimeout`, or `Client.request` when `timeoutMs` is 0, with a
+`[]byte` body sent as it is: no copy is made, so a large upload such as a
+`FormBody.body` costs no memory beyond itself. `body` must not change until
+the call returns.
+
 ### `ClientRequest`
 
 A request for `Client.send`: `method` (`"GET"` by default), `url`, `headers`
@@ -1378,7 +1385,8 @@ copied into it, not concatenated. Fails when nothing was added.
 ### `FormBody`
 
 What `build` returns: `contentType`, the value of the request's
-`Content-Type` header with the boundary in it, and `body`.
+`Content-Type` header with the boundary in it, and `body`, a `[]byte` that
+`Client.requestBytes` sends as it is.
 
 ```bit
 import { Client, FormBuilder, Response, Form, parseMultipart, defaultLimits } from "std/http"
@@ -1391,7 +1399,7 @@ fn upload(url: string, avatar: []byte): Response! {
   let out = form.build()?
   let c = Client()
   c.setHeader("Content-Type", out.contentType)?
-  return c.request("POST", url, out.body)?
+  return c.requestBytes("POST", url, out.body)?
 }
 
 // The server's side of the same body: `boundary=` is the last part of
@@ -1401,7 +1409,7 @@ fn readBack(avatar: []byte): Form! {
   form.file("avatar", "ada.png", "image/png", avatar)?
   let out = form.build()?
   let at = indexOf(out.contentType, "boundary=")
-  return parseMultipart([]byte(out.body), out.contentType[at + 9:], defaultLimits())?
+  return parseMultipart(out.body, out.contentType[at + 9:], defaultLimits())?
 }
 ```
 
