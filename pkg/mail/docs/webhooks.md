@@ -39,10 +39,9 @@ Resend sent, and a different spacing or key order makes it fail.
 
 One webhook can name several recipients, and you get one `Event` for each. The
 provider is a value, `Provider.Resend`, and not a different function, so
-the day Inkwell adds a second provider only that argument changes. Postmark,
-SES, SendGrid and Mailgun are listed in `Provider` and fail with
-`MailError.Invalid` ("Postmark webhooks are not supported yet", and so on)
-until their parsers land.
+the day Inkwell adds a second provider only that argument changes. `Provider`
+lists only the providers whose webhooks `parseEvents` can read; a new one is
+added in the same release as its parser.
 
 ## What an Event says
 
@@ -89,7 +88,7 @@ fn wasSeen(id: string): bool {
 fn handle(header: (string) => string, body: string, secret: string): int {
   let events = parseEvents(Provider.Resend, header, body, secret) catch e {
     match (e) {
-      Auth(reply) => return reply.code
+      Signature(_) => return 401
       Config(why) => {
         println("webhook setup: ${why}")
         return 500
@@ -127,11 +126,12 @@ JSON:
   HMAC-SHA256 of `<id>.<timestamp>.<body>`. Entries of another version are
   skipped. The tags are compared in constant time.
 
-A request that fails any of them returns `MailError.Auth`. The `Reply` inside
-has `code` 401, the status to answer with, and a `text` that names the reason:
-`the webhook signature does not match`, `the svix-signature header is missing`,
-`the webhook timestamp is more than 5 minutes from now`. It never contains the
-secret or the body. A body over 1 MiB is `MailError.Invalid` before it is
+A request that fails any of them returns `MailError.Signature`. Its text names
+the reason: `signature does not match`, `svix-signature header is missing`,
+`timestamp is more than 5 minutes from now`, and `message()` reads `mail:
+webhook rejected: signature does not match`. It never contains the secret or the
+body. Answer such a request with 401; it is not a sending failure, so it has no
+`Reply`. A body over 1 MiB is `MailError.Invalid` before it is
 hashed, and so is a signed body that is not Resend's JSON.
 
 ```bit
@@ -141,7 +141,7 @@ fn rejects(): string {
   let none = (name: string) => ""
   parseEvents(Provider.Resend, none, "{}", "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw") catch e {
     match (e) {
-      Auth(reply) => return "${reply.code} ${reply.text}"
+      Signature(why) => return "401 ${why}"
       _ => return e.message()
     }
   }
@@ -149,7 +149,7 @@ fn rejects(): string {
 }
 ```
 
-`rejects()` returns `401 the svix-id header is missing`.
+`rejects()` returns `401 svix-id header is missing`.
 
 ## A wrong secret is found by the first request
 
