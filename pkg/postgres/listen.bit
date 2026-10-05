@@ -1,0 +1,328 @@
+// pkg/postgres/listen.bit — LISTEN/NOTIFY: a `Listener` on its own connection,
+// and `notify` on any `Executor` (#6994).
+//
+//     let l = listen(env("DATABASE_URL"), ["policy_changed"])?
+//     while (running) {
+//       let ev = l.next(1000)?
+//       ...
+//     }
+//
+// WHY A CONNECTION OF ITS OWN. A notification is delivered to the SESSION that
+// ran `LISTEN`, and a pooled connection is lent to whoever asks next — the
+// subscription would follow the socket, not the caller. The listener opens one
+// connection through the same adapter a pool uses (TLS ladder, authentication,
+// warnings), never borrows one, and holds it until `close`.
+//
+// A NOTIFICATION CAN ARRIVE AT ANY MESSAGE BOUNDARY, including between a
+// CommandComplete and its ReadyForQuery during one of the listener's own
+// LISTEN statements. `pgReader.next` (wire.bit) keeps every one it sees on a
+// connection that asked for them, so none is lost to the statement that
+// happened to be reading when it came.
+//
+// A DROPPED CONNECTION LOSES NOTIFICATIONS. The server queues them per
+// session, and the session is gone. `next` therefore reconnects, issues every
+// LISTEN again BEFORE it returns anything from the new session, and then
+// delivers `Event.Reconnected` exactly once, ahead of the new session's first
+// notification: the caller cannot tell what it missed, so it must resync from
+// the source of truth when it sees that event. Notifications read before the
+// drop are still delivered, ahead of the event.
+//
+// CHANNEL NAMES ARE IDENTIFIERS, never text spliced into a statement:
+// `quoteIdent` double-quotes them and doubles any embedded quote, so a name is
+// one identifier whatever it contains. A name the server could not keep
+// intact is refused up front: empty, NUL (not representable in a statement),
+// or longer than 63 bytes (the server truncates silently, after which the
+// name in a delivered notification is not the name the caller asked for).
+
+import { Executor } from "std/sql"
+import { replace } from "std/strings"
+import { sleepUntil, Millisecond } from "std/time"
+
+// `NAMEDATALEN` - 1, the longest identifier the server stores.
+const maxChannelBytes: int = 63
+
+// A payload must be shorter than 8000 bytes in the default configuration
+// (PostgreSQL, NOTIFY).
+const maxPayloadBytes: int = 7999
+
+// The wait between failed reconnect attempts: 100 ms, doubling, capped at 5 s.
+// The first attempt after a drop is immediate.
+const backoffFirstMs: int = 100
+const backoffCapMs: int = 5000
+
+// One NOTIFY as the listening session received it. `pid` is the notifying
+// backend's process ID — a listener that also notifies compares it with
+// `select pg_backend_pid()` on its own session to skip its own messages.
+export class Notification {
+  export pid: int,
+  export channel: string,
+  export payload: string,
+}
+
+// What `Listener.next` hands back.
+//
+// `Notify`: one notification.
+// `Reconnected`: the connection dropped and was re-established with every
+// channel listened again. Notifications sent while it was down were never
+// delivered and cannot be recovered; resync from the source of truth.
+export enum Event { Notify(Notification), Reconnected }
+
+// A session that is LISTENing on a fixed set of channels. One thread calls
+// `next` and `close`; there is no concurrent use.
+export class Listener {
+  dial: () => pgConn!
+  channels: []string
+  c: pgConn
+  up: bool
+  closed: bool
+  queue: []Event
+  delayMs: int
+  retryAtNs: int
+  // The next event, waiting at most `timeoutMs` milliseconds, or `None` if
+  // nothing arrived. `0` polls. Reconnects, with backoff, while the connection
+  // is down, inside the same budget: a long outage reads as `None`, not as a
+  // failure. It fails only if the listener is closed, if a server refuses the
+  // reconnect for a reason that retrying cannot fix (bad credentials, no such
+  // database), or if `timeoutMs` is negative. A failure closes the listener.
+  export next(timeoutMs: int): Option<Event>! {
+    if (this.closed) {
+      fail newError("postgres: next on a closed Listener")
+    }
+    if (timeoutMs < 0) {
+      fail newError("postgres: Listener.next: timeoutMs is ${timeoutMs}, want 0 or more")
+    }
+    let deadline = monotonic().ns + timeoutMs * Millisecond
+    let first = true
+    while (first || monotonic().ns < deadline) {
+      first = false
+      if (len(this.queue) > 0) {
+        return this.pop()
+      }
+      this.step(deadline)?
+    }
+    if (len(this.queue) > 0) {
+      return this.pop()
+    }
+    return Option.None
+  }
+
+  // Release the connection. Idempotent. A thread blocked in `next` is not
+  // woken: have it poll with a short `timeoutMs` and stop on its own flag.
+  export close() {
+    this.closed = true
+    this.up = false
+    this.c.close()
+  }
+
+  // One unit of progress: read one message, or make one reconnect attempt.
+  step(deadline: int): ()! {
+    if (this.up) {
+      return this.receive(deadline)?
+    }
+    this.reconnect(deadline)?
+  }
+
+  pop(): Option<Event> {
+    let ev = this.queue[0]
+    this.queue = this.queue[1:len(this.queue)]
+    return Option.Some(ev)
+  }
+
+  // Move the notifications the reader kept into the queue, in arrival order.
+  drain() {
+    for n of this.c.r.notes {
+      this.queue = append(this.queue, Event.Notify(n))
+    }
+    this.c.r.notes = []Notification(0)
+  }
+
+  // One message from the live connection. A closed or failed socket, or an
+  // ErrorResponse (the server's own FATAL on shutdown or on
+  // `pg_terminate_backend`), is a lost connection; everything else a listening
+  // session is sent — notifications, `ParameterStatus`, notices — is either
+  // kept by the reader or ignored.
+  receive(deadline: int): ()! {
+    let m = this.c.r.nextWithin(deadline) catch _ {
+      this.lose()
+      return
+    }
+    match (m) {
+      None => return
+      Some(msg) => {
+        this.drain()
+        if (msg.tag == "E") {
+          this.lose()
+        }
+      }
+    }
+  }
+
+  // The connection is gone: keep what it delivered, and schedule an
+  // immediate reconnect.
+  lose() {
+    this.drain()
+    this.c.close()
+    this.up = false
+    this.delayMs = 0
+    this.retryAtNs = 0
+  }
+
+  // Wait out the backoff, or make one attempt. A refusal retrying cannot fix
+  // closes the listener and fails; any other failure schedules the next try.
+  reconnect(deadline: int): ()! {
+    let now = monotonic().ns
+    if (now < this.retryAtNs) {
+      sleepUntil(minInt(this.retryAtNs, deadline))
+      return
+    }
+    let c = this.dial() catch e {
+      return this.refused(e)?
+    }
+    this.c = c
+    this.up = true
+    this.queue = append(this.queue, Event.Reconnected)
+    this.drain()
+  }
+
+  // A failed attempt: fatal for a server refusal that is not transient,
+  // otherwise back off.
+  refused(e: error): ()! {
+    if (!retryable(e)) {
+      this.close()
+      fail e
+    }
+    this.delayMs = nextDelayMs(this.delayMs)
+    this.retryAtNs = monotonic().ns + this.delayMs * Millisecond
+  }
+}
+
+// Open a listener on `uri` (the same URI `pool` takes), already LISTENing on
+// every channel. The first connect fails loudly: a wrong URI or a bad name is
+// a mistake to see now, not a loop of silent retries.
+export fn listen(uri: string, channels: []string): Listener! {
+  if (len(channels) == 0) {
+    fail newError("postgres: listen needs at least one channel")
+  }
+  for ch of channels {
+    checkChannel(ch)?
+  }
+  let cfg = Datasource{ uri = uri }
+  cfg.validate()?
+  let a = newPgAdapter()
+  let dial = () => dialListener(a, cfg, channels)
+  return startListener(dial, channels)?
+}
+
+// A `Listener` over `dial`'s first connection. Split from `listen` so the
+// tests drive the same state machine over scripted streams.
+fn startListener(dial: () => pgConn!, channels: []string): Listener! {
+  let l = Listener{
+    dial = dial, channels = channels, c = dial()?, up = true, closed = false,
+    queue = []Event(0), delayMs = 0, retryAtNs = 0,
+  }
+  l.drain()
+  return l
+}
+
+// A connection that keeps notifications, with every channel listened. Closed
+// again if any LISTEN fails.
+fn dialListener(a: pgAdapter, cfg: Datasource, channels: []string): pgConn! {
+  let c = a.open(cfg)?
+  c.r.keep = true
+  subscribe(c, channels) catch e {
+    c.close()
+    fail e
+  }
+  return c
+}
+
+// `LISTEN` on every channel, in order, one statement each. A notification that
+// arrives while one runs is kept by the reader, not lost to it.
+fn subscribe(c: pgConn, channels: []string): ()! {
+  for ch of channels {
+    c.exec("LISTEN " + quoteIdent(ch), []Value(0))?
+  }
+}
+
+// Send `payload` on `channel` to every session listening: `select
+// pg_notify($1, $2)`, both values bound as parameters. Inside a transaction
+// the notification is delivered only if it commits. The payload must be
+// shorter than 8000 bytes and may not contain NUL.
+export fn notify(db: Executor, channel: string, payload: string): ()! {
+  checkChannel(channel)?
+  if (len(payload) > maxPayloadBytes) {
+    fail newError("postgres: notify payload is ${len(payload)} bytes, want fewer than 8000")
+  }
+  if (hasNul(payload)) {
+    fail newError("postgres: notify payload contains a NUL byte")
+  }
+  db.exec("select pg_notify($1, $2)", []Value{ Value.Text(channel), Value.Text(payload) })?
+}
+
+// A channel the server will keep exactly as given. Quoting makes any such name
+// safe to put in a statement; this refuses the ones that cannot be.
+fn checkChannel(ch: string): ()! {
+  if (ch == "") {
+    fail newError("postgres: channel name is empty")
+  }
+  if (len(ch) > maxChannelBytes) {
+    fail newError("postgres: channel name is ${len(ch)} bytes, the server keeps at most 63")
+  }
+  if (hasNul(ch)) {
+    fail newError("postgres: channel name contains a NUL byte")
+  }
+}
+
+// Whether `s` holds a zero byte.
+fn hasNul(s: string): bool {
+  for b of []byte(s) {
+    if (b == 0) {
+      return true
+    }
+  }
+  return false
+}
+
+// A SQL identifier, double-quoted with every embedded `"` doubled: the
+// standard escape, which makes any name one identifier and never a second
+// statement.
+fn quoteIdent(name: string): string {
+  return "\"" + replace(name, "\"", "\"\"") + "\""
+}
+
+// Whether a failed reconnect is worth another try. Anything that is not a
+// server error (the socket, DNS, the TLS handshake, a mid-message close) is.
+// A server error is when the SQLSTATE says the server is going or
+// not yet up: class 08 (connection exception), 57P (shutdown, crash, startup)
+// and 53300 (too many connections). The rest — 28 invalid authorization, 3D000
+// no such database, 42501 no permission — will fail the same way next time.
+fn retryable(e: error): bool {
+  let (pg, ok) = e.(sqlStateError)
+  if (!ok) {
+    return true
+  }
+  let st = pg.sqlState()
+  return hasPrefix(st, "08") || hasPrefix(st, "57P") || st == "53300"
+}
+
+// The shape of `pgError` that `retryable` reads; `message` is there because an
+// assertion from `error` needs the target to satisfy `error`.
+interface sqlStateError {
+  message(): string,
+  sqlState(): string,
+}
+
+// The wait after a failed attempt: 100 ms first, doubling, capped at 5 s.
+fn nextDelayMs(cur: int): int {
+  if (cur < backoffFirstMs) {
+    return backoffFirstMs
+  }
+  return minInt(cur * 2, backoffCapMs)
+}
+
+fn minInt(a: int, b: int): int {
+  if (a < b) {
+    return a
+  }
+  return b
+}

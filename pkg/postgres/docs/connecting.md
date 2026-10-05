@@ -1,7 +1,8 @@
 # Connecting
 
-`adapter(): Adapter` is the only symbol this package exports - nothing else.
-URI parsing, TLS, authentication and the wire protocol all live behind the
+`adapter(): Adapter` is the only symbol that opens a pool. (`listen` and
+`notify` are the other two exports; see
+[Listening for changes](listen-notify.md).) URI parsing, TLS, authentication and the wire protocol all live behind the
 `Adapter` interface rather than beside it, because the one-line driver swap
 is the whole point of `std/sql`: a program that imported a second symbol from
 here could not change one line and be on a different database. Call

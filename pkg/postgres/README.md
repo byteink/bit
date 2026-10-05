@@ -1,9 +1,10 @@
 # bitlang.org/pkg/postgres
 
-A PostgreSQL driver for `std/sql`. It exports one symbol, `adapter()`: a
-fresh `Adapter` per pool, with URI parsing, TLS, authentication and the wire
-protocol behind it, so swapping this package for another database's driver
-changes one line.
+A PostgreSQL driver for `std/sql`. `adapter()` is a fresh `Adapter` per pool,
+with URI parsing, TLS, authentication and the wire protocol behind it, so
+swapping this package for another database's driver changes one line.
+`listen` and `notify` add `LISTEN`/`NOTIFY`, which `std/sql` has no shape
+for.
 
 Install with `bit add bitlang.org/pkg/postgres@v0.1.4`.
 
@@ -28,6 +29,8 @@ fn run(): ()! {
   and channel binding are absent
 - [Queries](docs/queries.md) - the extended protocol, parameter binding,
   result values, the statement cache
+- [Listening for changes](docs/listen-notify.md) - `notify`, a `Listener`
+  on its own connection, and the `Reconnected` event after a drop
 - [Errors](docs/errors.md) - the SQLSTATE surface and retrying
 - [Limitations](docs/limitations.md) - what this driver does not do yet
 - [Testing](docs/testing.md) - running the package's own test suite

@@ -17,6 +17,10 @@ the end of a chapter.
   form differs from its raw form would derive a different key here than
   libpq derives.
 - **`SCRAM-SHA-256-PLUS` (channel binding) is not offered.**
+- **A `Listener` listens on the channels it was opened with.** There is no
+  `UNLISTEN` and no adding a channel later; open another listener. It takes a
+  URI, not the individual-field form, and applies no connect timeout of its
+  own.
 - **TLS client certificates are not sent.** `std/tls` does not request or
   present them.
 

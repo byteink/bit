@@ -5,10 +5,11 @@ builds on the last.
 
 | Chapter | Covers |
 | ------- | ------ |
-| [Connecting](connecting.md) | the one exported symbol, a first query through the pool, the connection URI and its individual-field form |
+| [Connecting](connecting.md) | `adapter`, a first query through the pool, the connection URI and its individual-field form |
 | [TLS](tls.md) | the SSLRequest ladder, pinning a mode with an explicit `sslmode`, exactly what `verify-ca` checks and does not check |
 | [Authentication](authentication.md) | SCRAM-SHA-256, `md5`/cleartext `password`/`trust`, and why SASLPrep and channel binding are absent |
 | [Queries](queries.md) | the extended query protocol, parameter binding, the text-format result values, the per-connection statement cache |
+| [Listening for changes](listen-notify.md) | `LISTEN`/`NOTIFY`: sending with `notify`, receiving with a `Listener`, and what a dropped connection costs |
 | [Errors](errors.md) | the SQLSTATE surface and telling a retryable failure from one that is not |
 | [Limitations](limitations.md) | what this driver does not do yet, and where each gap is tracked |
 | [Testing](testing.md) | running the package's own test suite, including the cases that need a real server |
