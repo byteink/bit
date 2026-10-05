@@ -1,0 +1,469 @@
+// pkg/auth/refresh.test.bit — #6948's acceptance: RefreshTokens issue, rotate
+// and revoke; reuse of a rotated token revoking its family (RFC 9700 4.14);
+// the identical failure for every cause; exactly one winner among concurrent
+// rotations; the absolute cap; hashing at rest; the grace window; and the
+// memory store's bounds.
+import { WaitGroup } from "std/sync"
+
+// The hand-moved clock the tokens share.
+class RtClock {
+  t: i64,
+}
+
+const rtStart: i64 = 1_000_000
+
+fn rtTokens(store: RefreshStore, clock: RtClock, opts: RefreshOptions): RefreshTokens {
+  let read: () => i64 = () => clock.t
+  opts.clock = read
+  return RefreshTokens(store, opts) catch e {
+    panic("RefreshTokens: ${e.message()}")
+  }
+}
+
+fn rtDefault(clock: RtClock): RefreshTokens {
+  return rtTokens(MemoryRefreshStore(), clock, RefreshOptions{})
+}
+
+fn rtIssue(t: RefreshTokens, subject: string, data: string): string {
+  return t.issue(subject, data) catch e {
+    panic("issue: ${e.message()}")
+  }
+}
+
+fn rtRotate(t: RefreshTokens, token: string): RefreshRotation {
+  return t.rotate(token) catch e {
+    panic("rotate: ${e.message()}")
+  }
+}
+
+// The text `rotate` fails with, "" when it succeeds. Anything but an
+// `InvalidRefreshToken` fails the test.
+fn rtFailure(t: RefreshTokens, token: string): string {
+  t.rotate(token) catch e {
+    let (_, ok) = e.(InvalidRefreshToken)
+    assert(ok, "rotate failed with something other than InvalidRefreshToken: ${e.message()}")
+    return e.message()
+  }
+  return ""
+}
+
+fn rtDead(t: RefreshTokens, token: string): bool {
+  return rtFailure(t, token) != ""
+}
+
+test "a chain of 3 rotations each yields a new token with the same subject and data" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtDefault(clock)
+  let t0 = rtIssue(t, "u1", "device=phone")
+  let r1 = rtRotate(t, t0)
+  let r2 = rtRotate(t, r1.token)
+  let r3 = rtRotate(t, r2.token)
+  assert(
+    len(t0) == 43 && len(r1.token) == 43 && len(r3.token) == 43,
+    "tokens are not 43 characters",
+  )
+  assert(
+    t0 != r1.token && r1.token != r2.token && r2.token != r3.token,
+    "a rotation returned the token it was given",
+  )
+  assert(r3.subject == "u1", "subject is '${r3.subject}', want u1")
+  assert(r3.data == "device=phone", "data is '${r3.data}', want device=phone")
+}
+
+test "the newest token of a chain keeps working after the chain is built" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtDefault(clock)
+  let r1 = rtRotate(t, rtIssue(t, "u1", ""))
+  let r2 = rtRotate(t, r1.token)
+  let r3 = rtRotate(t, r2.token)
+  let r4 = rtRotate(t, r3.token)
+  assert(len(r4.token) == 43, "the fourth rotation returned '${r4.token}'")
+}
+
+test "reuse of token 1 after token 2 was issued revokes the family, so token 3 fails too" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtDefault(clock)
+  let t1 = rtIssue(t, "u1", "")
+  let t2 = rtRotate(t, t1).token
+  let t3 = rtRotate(t, t2).token
+  // The thief replays the very first token.
+  assert(rtDead(t, t1), "the replayed token 1 was honoured")
+  assert(rtDead(t, t3), "token 3 survived the reuse of token 1")
+  assert(rtDead(t, t2), "token 2 was honoured")
+}
+
+test "reuse revokes only its own family" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtDefault(clock)
+  let a1 = rtIssue(t, "u1", "")
+  let a2 = rtRotate(t, a1).token
+  let other = rtIssue(t, "u1", "")
+  let bob = rtIssue(t, "u2", "")
+  assert(rtDead(t, a1), "reuse was honoured")
+  assert(rtDead(t, a2), "the family survived reuse")
+  assert(!rtDead(t, other), "a second login of the same subject died")
+  assert(!rtDead(t, bob), "another subject's token died")
+}
+
+test "5 of 5 failure causes give the identical error" {
+  let clock = RtClock{ t = rtStart }
+  let opts = RefreshOptions{ ttl = 100, absoluteTtl = 300 }
+  let t = rtTokens(MemoryRefreshStore(), clock, opts)
+  let unknown = rtIssue(rtDefault(RtClock{ t = rtStart }), "u9", "")
+  let expired = rtIssue(t, "u1", "")
+  let revoked = rtIssue(t, "u2", "")
+  t.revoke(revoked) catch e {
+    panic("revoke: ${e.message()}")
+  }
+  let reused = rtIssue(t, "u3", "")
+  let _ = rtRotate(t, reused)
+  let capped = rtIssue(t, "u4", "")
+  clock.t = rtStart + 90
+  capped = rtRotate(t, capped).token
+  clock.t = rtStart + 180
+  capped = rtRotate(t, capped).token
+  clock.t = rtStart + 270
+  capped = rtRotate(t, capped).token
+  clock.t = rtStart + 101
+  // `expired` is 101 seconds old against a ttl of 100.
+  let want = "auth: invalid or expired refresh token"
+  assert(rtFailure(t, "not a token") == want, "malformed: '${rtFailure(t, "not a token")}'")
+  assert(rtFailure(t, unknown) == want, "unknown")
+  assert(rtFailure(t, expired) == want, "expired")
+  assert(rtFailure(t, revoked) == want, "revoked")
+  assert(rtFailure(t, reused) == want, "reused")
+  clock.t = rtStart + 301
+  assert(rtFailure(t, capped) == want, "past the absolute cap")
+}
+
+fn rtRotateWorker(t: RefreshTokens, token: string, wins: chan<string>, wg: WaitGroup) {
+  defer wg.done()
+  let r = t.rotate(token) catch _ {
+    wins <- ""
+    return
+  }
+  wins <- r.token
+}
+
+fn rtRace(t: RefreshTokens, token: string, n: int): []string {
+  let wins = chan<string>(n)
+  let wg = WaitGroup()
+  wg.add(n)
+  let i = 0
+  while (i < n) {
+    spawn rtRotateWorker(t, token, wins, wg)
+    i = i + 1
+  }
+  wg.wait()
+  let won = []string(0)
+  let k = 0
+  while (k < n) {
+    let tok = <- wins
+    if (tok != "") {
+      won = append(won, tok)
+    }
+    k = k + 1
+  }
+  return won
+}
+
+test "50 concurrent rotates of one token yield exactly 1 success" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtDefault(clock)
+  let token = rtIssue(t, "u1", "")
+  let won = rtRace(t, token, 50)
+  assert(len(won) == 1, "${len(won)} of 50 concurrent rotations succeeded, want 1")
+}
+
+test "with no grace the 49 losers of a race count as reuse and kill the winner's token" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtDefault(clock)
+  let won = rtRace(t, rtIssue(t, "u1", ""), 50)
+  assert(len(won) == 1, "${len(won)} winners")
+  assert(rtDead(t, won[0]), "the winner's token survived 49 reuses")
+}
+
+test "inside the grace window the losers fail but the winner's token lives" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtTokens(MemoryRefreshStore(), clock, RefreshOptions{ graceSeconds = 10 })
+  let won = rtRace(t, rtIssue(t, "u1", ""), 50)
+  assert(len(won) == 1, "${len(won)} winners")
+  assert(!rtDead(t, won[0]), "a retry inside the grace window cost the family")
+}
+
+test "a retry inside grace fails, one outside revokes the family" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtTokens(MemoryRefreshStore(), clock, RefreshOptions{ graceSeconds = 10 })
+  let t1 = rtIssue(t, "u1", "")
+  let t2 = rtRotate(t, t1).token
+  clock.t = rtStart + 9
+  assert(rtDead(t, t1), "the retry at 9s was honoured")
+  clock.t = rtStart + 10
+  assert(rtDead(t, t1), "the retry at 10s was honoured")
+  assert(rtDead(t, t2), "reuse at the 10s edge left the family alive")
+}
+
+test "a retry inside grace leaves the winner's token usable" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtTokens(MemoryRefreshStore(), clock, RefreshOptions{ graceSeconds = 10 })
+  let t1 = rtIssue(t, "u1", "")
+  let t2 = rtRotate(t, t1).token
+  clock.t = rtStart + 5
+  assert(rtDead(t, t1), "the retry was honoured")
+  let t3 = rtRotate(t, t2)
+  assert(len(t3.token) == 43, "the winner could not rotate after a retry")
+}
+
+test "a token expires after ttl and each rotation starts the ttl again" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtTokens(MemoryRefreshStore(), clock, RefreshOptions{ ttl = 100, absoluteTtl = 10_000 })
+  let t1 = rtIssue(t, "u1", "")
+  clock.t = rtStart + 99
+  let r = rtRotate(t, t1)
+  assert(r.expiresAt == rtStart + 99 + 100, "expiresAt is ${r.expiresAt}, want ${rtStart + 199}")
+  clock.t = rtStart + 198
+  let r2 = rtRotate(t, r.token)
+  clock.t = rtStart + 198 + 100
+  assert(rtDead(t, r2.token), "a token past its ttl was honoured")
+}
+
+test "the absolute cap ends a family that keeps rotating, and clamps the last expiry" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtTokens(MemoryRefreshStore(), clock, RefreshOptions{ ttl = 100, absoluteTtl = 250 })
+  let tok = rtIssue(t, "u1", "")
+  clock.t = rtStart + 90
+  tok = rtRotate(t, tok).token
+  clock.t = rtStart + 180
+  let last = rtRotate(t, tok)
+  assert(
+    last.expiresAt == rtStart + 250,
+    "expiresAt is ${last.expiresAt}, want the family end ${rtStart + 250}",
+  )
+  clock.t = rtStart + 250
+  assert(rtDead(t, last.token), "a token was honoured at the absolute cap")
+}
+
+// A store that remembers every record it was handed, then delegates.
+class RtRecordingStore {
+  inner: MemoryRefreshStore
+  seen: []RefreshRecord
+
+  export insert(rec: RefreshRecord): ()! {
+    this.seen = append(this.seen, rec)
+    this.inner.insert(rec)?
+  }
+
+  export findByHash(hash: string): Option<RefreshRecord>! {
+    return this.inner.findByHash(hash)?
+  }
+
+  export rotate(oldHash: string, next: RefreshRecord, at: i64): bool! {
+    this.seen = append(this.seen, next)
+    return this.inner.rotate(oldHash, next, at)?
+  }
+
+  export revokeFamily(family: string): ()! {
+    this.inner.revokeFamily(family)?
+  }
+
+  export revokeSubject(subject: string): ()! {
+    this.inner.revokeSubject(subject)?
+  }
+}
+
+test "the store holds 0 of 20 plaintext tokens, only their SHA-256" {
+  let clock = RtClock{ t = rtStart }
+  let rs = RtRecordingStore{ inner = MemoryRefreshStore(), seen = []RefreshRecord(0) }
+  let t = rtTokens(rs, clock, RefreshOptions{})
+  let tokens = []string(0)
+  let i = 0
+  while (i < 10) {
+    let first = rtIssue(t, "u1", "")
+    tokens = append(tokens, first)
+    tokens = append(tokens, rtRotate(t, first).token)
+    i = i + 1
+  }
+  let plaintext = 0
+  for tok of tokens {
+    for rec of rs.seen {
+      if (rec.hash == tok || rec.family == tok || rec.subject == tok || rec.data == tok) {
+        plaintext = plaintext + 1
+      }
+    }
+  }
+  assert(plaintext == 0, "${plaintext} of 20 tokens appeared in plaintext")
+  let want = encodeHex(digest(Sha256(), []byte(tokens[0])))
+  assert(rs.seen[0].hash == want && len(want) == 64, "stored '${rs.seen[0].hash}', want '${want}'")
+}
+
+test "revoke ends the whole family from any of its tokens" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtDefault(clock)
+  let t1 = rtIssue(t, "u1", "")
+  let t2 = rtRotate(t, t1).token
+  t.revoke(t2) catch e {
+    panic("revoke: ${e.message()}")
+  }
+  assert(rtDead(t, t2), "the revoked token was honoured")
+}
+
+test "revoke of a malformed or unknown token is not an error" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtDefault(clock)
+  let stranger = rtIssue(rtDefault(RtClock{ t = rtStart }), "u9", "")
+  t.revoke("") catch e {
+    panic("revoke of empty: ${e.message()}")
+  }
+  t.revoke(stranger) catch e {
+    panic("revoke of unknown: ${e.message()}")
+  }
+}
+
+test "revokeSubject ends every login of that subject and no other" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtDefault(clock)
+  let a = rtIssue(t, "u1", "")
+  let b = rtRotate(t, rtIssue(t, "u1", "")).token
+  let other = rtIssue(t, "u2", "")
+  t.revokeSubject("u1") catch e {
+    panic("revokeSubject: ${e.message()}")
+  }
+  assert(rtDead(t, a) && rtDead(t, b), "a login of the revoked subject survived")
+  assert(!rtDead(t, other), "another subject's login died")
+}
+
+test "issue and revokeSubject refuse an empty subject" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtDefault(clock)
+  let issued = t.issue("") catch _ {
+    ""
+  }
+  assert(issued == "", "issue accepted an empty subject")
+  let failed = false
+  t.revokeSubject("") catch _ {
+    failed = true
+  }
+  assert(failed, "revokeSubject accepted an empty subject")
+}
+
+test "RefreshTokens fails at construction for a missing store or an impossible option" {
+  let bad = []RefreshOptions(0)
+  bad = append(bad, RefreshOptions{ ttl = 0 })
+  bad = append(bad, RefreshOptions{ ttl = 100, absoluteTtl = 99 })
+  bad = append(bad, RefreshOptions{ graceSeconds = -1 })
+  for opts of bad {
+    let failed = false
+    RefreshTokens(MemoryRefreshStore(), opts) catch _ {
+      failed = true
+    }
+    assert(
+      failed,
+      "RefreshTokens accepted ttl=${opts.ttl} absoluteTtl=${opts.absoluteTtl} grace=${opts.graceSeconds}",
+    )
+  }
+  let failed = false
+  RefreshTokens(nil) catch _ {
+    failed = true
+  }
+  assert(failed, "RefreshTokens accepted a nil store")
+}
+
+// A store whose every call fails, to prove the failure is the operator's.
+class RtBrokenStore {
+  export insert(rec: RefreshRecord): ()! {
+    fail newError("db down")
+  }
+
+  export findByHash(hash: string): Option<RefreshRecord>! {
+    fail newError("db down")
+  }
+
+  export rotate(oldHash: string, next: RefreshRecord, at: i64): bool! {
+    fail newError("db down")
+  }
+
+  export revokeFamily(family: string): ()! {
+    fail newError("db down")
+  }
+
+  export revokeSubject(subject: string): ()! {
+    fail newError("db down")
+  }
+}
+
+test "a store failure is returned as it came, never as InvalidRefreshToken" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtTokens(RtBrokenStore{}, clock, RefreshOptions{})
+  let token = rtIssue(rtDefault(RtClock{ t = rtStart }), "u1", "")
+  let msg = ""
+  t.rotate(token) catch e {
+    let (_, invalid) = e.(InvalidRefreshToken)
+    assert(!invalid, "a store failure was reported as an invalid token")
+    msg = e.message()
+  }
+  assert(msg == "db down", "rotate failed with '${msg}', want 'db down'")
+}
+
+// A store that answers every lookup with a record for another hash.
+class RtLyingStore {
+  inner: MemoryRefreshStore
+  other: string
+
+  export insert(rec: RefreshRecord): ()! {
+    this.inner.insert(rec)?
+  }
+
+  export findByHash(hash: string): Option<RefreshRecord>! {
+    return this.inner.findByHash(this.other)?
+  }
+
+  export rotate(oldHash: string, next: RefreshRecord, at: i64): bool! {
+    return this.inner.rotate(oldHash, next, at)?
+  }
+
+  export revokeFamily(family: string): ()! {
+    this.inner.revokeFamily(family)?
+  }
+
+  export revokeSubject(subject: string): ()! {
+    this.inner.revokeSubject(subject)?
+  }
+}
+
+test "a record whose hash is not the one asked for is not trusted" {
+  let clock = RtClock{ t = rtStart }
+  let mem = MemoryRefreshStore()
+  let honest = rtTokens(mem, clock, RefreshOptions{})
+  let victim = rtIssue(honest, "victim", "")
+  let lying = RtLyingStore{ inner = mem, other = encodeHex(digest(Sha256(), []byte(victim))) }
+  let t = rtTokens(lying, clock, RefreshOptions{})
+  let attacker = rtIssue(rtDefault(RtClock{ t = rtStart }), "u9", "")
+  assert(rtDead(t, attacker), "a record for another hash was accepted")
+}
+
+test "MemoryRefreshStore keeps at most its capacity, dropping the soonest-expiring" {
+  let clock = RtClock{ t = rtStart }
+  let mem = MemoryRefreshStore(3)
+  let t = rtTokens(mem, clock, RefreshOptions{})
+  let first = rtIssue(t, "u1", "")
+  clock.t = rtStart + 10
+  let i = 0
+  while (i < 3) {
+    let _ = rtIssue(t, "u${i + 2}", "")
+    i = i + 1
+  }
+  assert(len(mem.entries) == 3, "${len(mem.entries)} records, want 3")
+  assert(rtDead(t, first), "the soonest-expiring token was kept")
+}
+
+test "100 issued tokens are all distinct" {
+  let clock = RtClock{ t = rtStart }
+  let t = rtDefault(clock)
+  let seen = map<string, bool>()
+  let i = 0
+  while (i < 100) {
+    seen[rtIssue(t, "u1", "")] = true
+    i = i + 1
+  }
+  assert(len(seen) == 100, "${len(seen)} distinct tokens of 100")
+}

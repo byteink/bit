@@ -240,7 +240,7 @@ the header does not get a vote.
 
 A token cannot be taken back before it expires: nothing here keeps a list of
 revoked ones. Keep `ttl` short and issue a longer-lived opaque refresh token
-beside it. If you need to cut a session off the moment a user signs out, use a
+beside it, [one that notices theft](refresh-tokens.md). If you need to cut a session off the moment a user signs out, use a
 cookie session.
 
 Where next: [Security model](security.md) for what the package checks for you
