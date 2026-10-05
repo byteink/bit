@@ -16,8 +16,8 @@ an ID token and verifying it. Both take the `OidcStrategy` built for a
 ```bit
 import { App, Config, MemoryStore, unauthorized } from "web"
 import {
-  Identity, Lookup, LookupResult, OidcOptions, OidcStrategy, Provider, Strategy,
-  beginAuthorization, currentIdentity, handleCallback,
+  Identity, Lookup, LookupResult, LogoutOptions, OidcOptions, OidcStrategy, Provider, Strategy,
+  beginAuthorization, currentIdentity, endSession, handleCallback, handleLogoutCallback,
   PasswordStrategy, requireAuth,
 } from "auth"
 import { TlsConfig } from "std/tls"
@@ -44,7 +44,11 @@ fn google(rootsPem: string): OidcStrategy! {
     "your-client-id.apps.googleusercontent.com",
     "your-client-secret",
     "https://app.example.com/auth/google/callback",
-    OidcOptions{ tls = Option.Some(tls), scopes = ["openid", "email"] },
+    OidcOptions{
+      tls = Option.Some(tls),
+      scopes = ["openid", "email"],
+      postLogoutRedirectUris = ["https://app.example.com/signed-out"],
+    },
   )?
 }
 
@@ -62,6 +66,15 @@ fn build(rootsPem: string): App! {
     let identity: Identity = handleCallback(oidc, c)?
     return c.redirect("/me")
   })
+
+  app.get("/logout", (c) => {
+    return endSession(
+      oidc,
+      c,
+      LogoutOptions{ postLogoutRedirectUri = "https://app.example.com/signed-out" },
+    )?
+  })
+  app.get("/signed-out", (c) => handleLogoutCallback(c, c.text("You are signed out"))?)
 
   app.get("/me", (c) => {
     let identity: Identity = currentIdentity(c) catch _ {
@@ -105,6 +118,61 @@ fn scopesMustIncludeOpenid(tls: TlsConfig): bool {
   return false
 }
 ```
+
+## Signing out
+
+`Session.destroy()` alone signs the user out of your app, not out of Google.
+Google's own session survives, so the next "Sign in with Google" click logs
+the user straight back in with no prompt. OpenID Connect RP-Initiated Logout
+1.0 closes that gap: the app sends the browser to the provider's
+`end_session_endpoint`, and the provider ends its session too.
+
+`endSession` does it in one call, as the `/logout` route above shows. It
+destroys your local session first, so a failure after that point never leaves
+the user signed in, then redirects with the four parameters the specification
+defines: `id_token_hint` (the ID token `handleCallback` kept in the session),
+`client_id`, `post_logout_redirect_uri` and `state`. Pass nothing, `endSession(oidc,
+c)`, to leave the landing page to the provider; then neither
+`post_logout_redirect_uri` nor `state` is sent.
+
+`post_logout_redirect_uri` must be one of the values you registered, byte for
+byte, in `OidcOptions.postLogoutRedirectUris` (and with the provider). Anything
+else, another host, `http://` instead of `https://`, a trick like
+`https://app.example.com@evil.example/`, makes `endSession` fail with an
+`Error` before it destroys anything, so no request of yours can turn the
+provider into an open redirect. Registrations are checked when the strategy is
+built: each must be `https` (`http` is accepted only for `localhost`,
+`127.0.0.1` and `[::1]`) and carry no userinfo and no fragment.
+
+When the provider sends the browser back, `handleLogoutCallback` checks the
+returned `state` against the one this browser was issued, in constant time and
+once, and hands back the response you give it, here the "You are signed out"
+text, or fails with 401. The `state` rides in a short-lived `HttpOnly`,
+`Secure`, `SameSite=Lax` cookie, because the session it would otherwise live in
+was just destroyed. `LogoutOptions` also takes `logoutHint` and `uiLocales`
+(`logout_hint` and `ui_locales`) for providers that use them.
+
+### When the provider has no `end_session_endpoint`
+
+Not every provider publishes one, and Google does not (its discovery document
+has no `end_session_endpoint`, checked 2026-10-05), while Microsoft Entra ID
+does. Where it is missing, `OidcConfig.endSessionEndpoint` is `None` and
+`endSession` can only log out locally: it destroys your session and sends the
+browser straight to `postLogoutRedirectUri` (or `/`). **The provider session
+stays alive**, and the next sign-in may succeed without a password prompt. Check
+at startup if that matters to you:
+
+```bit
+fn endsProviderSession(oidc: OidcStrategy): bool {
+  match (oidc.config.endSessionEndpoint) {
+    Some(_) => return true
+    None => return false
+  }
+}
+```
+
+An app that needs the provider session gone for such a provider has to link
+users to that provider's own sign-out page.
 
 Next: [Other OIDC providers](providers.md), for Microsoft Entra ID and any
 other conformant provider.

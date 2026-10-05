@@ -105,6 +105,13 @@ protected route that is not itself doing the authenticating just reads
   `ProfileFetch` you supply turns the access token into an `Identity`, and a
   provider's refusal arrives as a typed `OAuth2Error`; see
   [Sign in with GitHub](docs/oauth2.md).
+- `endSession`, `handleLogoutCallback`, `LogoutOptions`,
+  `OidcOptions.postLogoutRedirectUris`, `OidcConfig.endSessionEndpoint` - OpenID
+  Connect RP-Initiated Logout 1.0: `endSession` destroys the local session, then
+  sends the browser to the provider's `end_session_endpoint` with `id_token_hint`,
+  `client_id`, `post_logout_redirect_uri` and `state`; the redirect target must be
+  registered, and a provider with no endpoint gets a local-only logout; see
+  [Signing out](docs/oidc.md#signing-out).
 - `OidcConfig`, `discover`, `JwksCache`, `JwksSource`, `verifyIdToken` - the
   discovery document and key set `OidcStrategy` is built from, and the ID
   token verifier, for a client that already holds a token and skips the
