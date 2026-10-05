@@ -1,0 +1,302 @@
+// pkg/mail/open.bit — `open(url, opts)`: a `Mailer` from one connection URL.
+//
+//   smtps://[user[:pass]@]host[:465]   implicit TLS (RFC 8314)
+//   smtp://[user[:pass]@]host[:587]    STARTTLS, required (RFC 3207)
+//   smtp://host[:port]?tls=off         plaintext, for a local test server
+//
+// TLS is never optional. `smtp://` upgrades with STARTTLS or the send fails;
+// a server that does not offer it is a `Config` error, never a quiet fall back
+// to plaintext, and no option makes it one. `tls=off` is the only way to get a
+// cleartext session, and it refuses credentials, so a password cannot cross a
+// connection that is not TLS.
+//
+// Query parameters: `serverName` (the name the certificate must match),
+// `caFile` (trust only the PEM roots in that file, read at open),
+// `insecureSkipVerify=true` (skip verification, the only way to) and `tls=off`.
+// Anything else in a URL is a `Config` naming it. Userinfo and values are
+// percent-decoded.
+//
+// Every refusal here is `MailError.Config` and happens at `open`, before a
+// connection exists. The password is kept out of every error text: a message
+// names the URL as `smtp://user:***@host:587`, and the parser never echoes a
+// part of the URL that could be the password.
+
+import { parseInt, replace } from "std/strings"
+import { readFile } from "std/fs"
+import { fromPem } from "std/crypto"
+import { Options as SmtpOptions } from "std/smtp"
+
+const urlHint: string = "smtps://user:pass@smtp.example.com"
+
+// What a connection URL names.
+class Target {
+  implicit: bool = false,
+  host: string = "",
+  port: int = 0,
+  user: string = "",
+  pass: string = "",
+  hasUser: bool = false,
+  // `tls=off`.
+  plain: bool = false,
+  // The first TLS-only parameter the URL set ("" when none), so `tls=off` can
+  // refuse it.
+  tlsParam: string = "",
+  // The URL as an error shows it: `smtp://user:***@host:587`.
+  display: string = "",
+  // `user` or `user:***`, the userinfo as written with the password hidden.
+  shown: string = "",
+  tls: SmtpOptions,
+}
+
+// A mailer that sends through the server `url` names. `url` is `smtps://` (TLS
+// from the first byte) or `smtp://` (STARTTLS, required); see the top of this
+// file for the whole form. `opts` is what `Mailer(...)` takes. Nothing is
+// connected here: the first `send` connects, so a URL that parses but names a
+// dead host fails there.
+export fn open(url: string, opts: Options = Options{}): Mailer!MailError {
+  let t = parseTarget(url)?
+  t.tls.timeout = opts.timeout
+  return Mailer(SmtpTransport(t, helloName(opts.from)), opts)?
+}
+
+// The name EHLO announces: the domain of the default From, else `localhost`.
+fn helloName(from: string): string {
+  let a = parseAddress(from) catch _ {
+    return "localhost"
+  }
+  let at = lastIndexOf(a.email, "@")
+  if (at < 0) {
+    return "localhost"
+  }
+  return a.email[at + 1:]
+}
+
+fn urlError(why: string): MailError {
+  return MailError.Config(why)
+}
+
+// The scheme as an error may show it: only a short run of letters, so a
+// mistyped URL cannot put its userinfo into the message.
+fn schemeShown(s: string): string {
+  if (len(s) == 0 || len(s) > 12) {
+    return "?"
+  }
+  for c of []byte(s) {
+    if (c < 97 || c > 122) {
+      return "?"
+    }
+  }
+  return s
+}
+
+fn parseTarget(url: string): Target!MailError {
+  if (url == "") {
+    fail urlError("open needs a URL like ${urlHint}; got an empty string")
+  }
+  let at = indexOf(url, "://")
+  if (at < 0) {
+    fail urlError("open needs a URL like ${urlHint}; the URL has no scheme")
+  }
+  let scheme = toLower(url[0:at])
+  if (scheme != "smtp" && scheme != "smtps") {
+    fail urlError("unknown URL scheme '${schemeShown(scheme)}'; open takes smtp:// and smtps://")
+  }
+  let t = Target{ implicit = scheme == "smtps", tls = SmtpOptions() }
+  t.port = 587
+  if (t.implicit) {
+    t.port = 465
+  }
+  let rest = url[at + 3:]
+  let q = indexOf(rest, "?")
+  let query = ""
+  if (q >= 0) {
+    query = rest[q + 1:]
+    rest = rest[0:q]
+  }
+  let slash = indexOf(rest, "/")
+  if (slash >= 0) {
+    if (rest[slash:] != "/") {
+      fail urlError("the URL has a path; an smtp URL is ${scheme}://[user:pass@]host[:port][?options]")
+    }
+    rest = rest[0:slash]
+  }
+  applyAuthority(t, rest)?
+  applyQuery(t, query)?
+  t.display = "${scheme}://${shownUser(t)}${t.host}:${t.port}"
+  checkPlain(t)?
+  return t
+}
+
+// `user:***@`, `user@` or "".
+fn shownUser(t: Target): string {
+  if (!t.hasUser) {
+    return ""
+  }
+  return "${t.shown}@"
+}
+
+// `tls=off` is the one cleartext form: it takes neither credentials, nor the
+// `smtps://` scheme, nor a TLS parameter that would have no effect.
+fn checkPlain(t: Target): ()!MailError {
+  if (!t.plain) {
+    return
+  }
+  if (t.implicit) {
+    fail urlError("${t.display}: tls=off is for smtp:// only; smtps:// is always TLS")
+  }
+  if (t.hasUser) {
+    fail urlError("${t.display} carries credentials with tls=off; a password is never sent over a connection that is not TLS")
+  }
+  if (t.tlsParam != "") {
+    fail urlError("${t.display}: ${t.tlsParam} has no effect with tls=off")
+  }
+}
+
+fn applyAuthority(t: Target, authority: string): ()!MailError {
+  let at = lastIndexOf(authority, "@")
+  let hostport = authority
+  if (at >= 0) {
+    applyUserinfo(t, authority[0:at])?
+    hostport = authority[at + 1:]
+  }
+  applyHostPort(t, hostport)?
+}
+
+fn applyUserinfo(t: Target, info: string): ()!MailError {
+  t.hasUser = true
+  let user = info
+  t.shown = info
+  let colon = indexOf(info, ":")
+  if (colon >= 0) {
+    user = info[0:colon]
+    t.shown = "${user}:***"
+    t.pass = pctDecode(info[colon + 1:], "the password")?
+  }
+  t.user = pctDecode(user, "the username")?
+  if (t.user == "") {
+    fail urlError("the URL has an empty username before '@'")
+  }
+}
+
+fn applyHostPort(t: Target, hostport: string): ()!MailError {
+  if (indexOf(hostport, "[") >= 0) {
+    fail urlError("the host is a bracketed address; give a host name")
+  }
+  let host = hostport
+  let colon = lastIndexOf(hostport, ":")
+  if (colon >= 0) {
+    host = hostport[0:colon]
+    t.port = parsePort(hostport[colon + 1:])?
+  }
+  if (host == "") {
+    fail urlError("the URL names no host; open needs a URL like ${urlHint}")
+  }
+  t.host = pctDecode(host, "the host")?
+}
+
+fn parsePort(text: string): int!MailError {
+  let n = parseInt(text) catch _ {
+    fail urlError("the port is not a number")
+  }
+  if (n < 1 || n > 65535) {
+    fail urlError("the port ${n} is outside 1..65535")
+  }
+  return n
+}
+
+fn applyQuery(t: Target, query: string): ()!MailError {
+  if (query == "") {
+    return
+  }
+  let seen: []string = []
+  for part of split(query, "&") {
+    let eq = indexOf(part, "=")
+    let key = part
+    let value = ""
+    if (eq >= 0) {
+      key = part[0:eq]
+      value = part[eq + 1:]
+    }
+    if (key == "") {
+      fail urlError("the URL query has an empty parameter")
+    }
+    for k of seen {
+      if (k == key) {
+        fail urlError("the query parameter '${key}' is given twice")
+      }
+    }
+    seen = append(seen, key)
+    applyParam(t, key, value)?
+  }
+}
+
+fn applyParam(t: Target, key: string, value: string): ()!MailError {
+  if (key == "tls") {
+    if (value != "off") {
+      fail urlError("tls must be 'off' (TLS is the default and the only other mode); got '${value}'")
+    }
+    t.plain = true
+    return
+  }
+  if (key == "serverName" || key == "caFile" || key == "insecureSkipVerify") {
+    if (t.tlsParam == "") {
+      t.tlsParam = key
+    }
+    applyTlsParam(t, key, pctDecode(value, key)?)?
+    return
+  }
+  fail urlError("unknown query parameter '${key}'; an smtp URL takes tls, serverName, caFile and insecureSkipVerify")
+}
+
+fn applyTlsParam(t: Target, key: string, value: string): ()!MailError {
+  if (value == "") {
+    fail urlError("the query parameter '${key}' has no value")
+  }
+  if (key == "serverName") {
+    t.tls.serverName = value
+    return
+  }
+  if (key == "caFile") {
+    let pem = readFile(value) catch e {
+      fail urlError("caFile ${value} cannot be read: ${e.message()}")
+    }
+    t.tls.roots = fromPem(pem) catch e {
+      fail urlError("caFile ${value} holds no usable certificate: ${e.message()}")
+    }
+    return
+  }
+  if (value != "true" && value != "false") {
+    fail urlError("insecureSkipVerify must be 'true' or 'false'; got '${value}'")
+  }
+  t.tls.insecureSkipVerify = value == "true"
+}
+
+// RFC 3986 §2.1 percent-decoding. An escape that is cut short or not hex is
+// refused, as is a decoded control byte (a CR or LF in a credential would end
+// its AUTH line). `what` names the part; the text never repeats it.
+fn pctDecode(s: string, what: string): string!MailError {
+  let src = []byte(s)
+  let out = []byte(0)
+  let i = 0
+  while (i < len(src)) {
+    let c = src[i]
+    if (c == 37) {
+      if (i + 2 >= len(src)) {
+        fail urlError("${what} has a cut-short percent-escape")
+      }
+      let hi = hexDigit(src[i + 1])
+      let lo = hexDigit(src[i + 2])
+      if (hi < 0 || lo < 0) {
+        fail urlError("${what} has a bad percent-escape")
+      }
+      c = byte(hi * 16 + lo)
+      i = i + 2
+    }
+    if (c < 32 || c == 127) {
+      fail urlError("${what} has a control byte")
+    }
+    out = append(out, c)
+    i = i + 1
+  }
+  return string(out)
+}

@@ -823,6 +823,33 @@ when the server did not advertise it.
 Whether this connection is TLS - an implicit-TLS dial, or a completed
 `startTls`.
 
+### `Client.authMechanisms(): []string`
+
+The SASL mechanisms the server advertised in its last EHLO reply's `AUTH` line
+(and its legacy `AUTH=` spelling), upper-case and in the server's order, for
+example `["PLAIN", "LOGIN"]`. Empty when it advertised none, before `ehlo`, and
+again after `startTls` until `ehlo` is re-issued. It is how a caller picks the
+`Auth` variant to pass to `auth`, or names what a server offers when none of
+them fits.
+
+```bit
+import { Auth, Client, SmtpError } from "std/smtp"
+
+// Log in with PLAIN when the relay offers it, else LOGIN; say so when it
+// offers neither.
+fn login(c: Client, user: string, pass: string): ()!SmtpError {
+  for m of c.authMechanisms() {
+    if (m == "PLAIN") {
+      return c.auth(Auth.Plain(user, pass))?
+    }
+    if (m == "LOGIN") {
+      return c.auth(Auth.Login(user, pass))?
+    }
+  }
+  println("the relay offers neither PLAIN nor LOGIN")
+}
+```
+
 ### `Client.auth(a: Auth): ()!SmtpError`
 
 Authenticate with the mechanism `a` selects. Before a credential byte exists

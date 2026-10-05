@@ -1,0 +1,163 @@
+// pkg/mail/smtp.bit — the SMTP `Transport` `open` returns (open.bit parses the
+// URL). One connection per send: connect, EHLO, TLS, login, `Client.send`,
+// QUIT. Pooling is a later part of this package.
+//
+// The TLS rule: `smtps://` is TLS from the first byte; `smtp://` runs STARTTLS
+// and a server that does not offer it fails the send with a `Config` error.
+// There is no path from here to a plaintext session except `?tls=off`, which
+// open.bit only allows without credentials.
+
+import { Auth, Client, Delivery as SmtpDelivery, Raw, SmtpError, dial, dialTls } from "std/smtp"
+
+class SmtpTransport {
+  t: Target
+  hello: string
+
+  init(t: Target, hello: string) {
+    this.t = t
+    this.hello = hello
+  }
+
+  // Sends `d` over a fresh connection. A refusal from the server maps to
+  // `MailError`: 535, 534 and 530 to `Auth`, a 4xx or a network failure to
+  // `Transient`, a refusal made before anything was sent to `Invalid`, and any
+  // other failure to `Rejected`. Recipients the server refused while taking
+  // the rest are in `Receipt.rejected`.
+  export deliver(d: Delivery): Receipt!MailError {
+    let c = this.connect()?
+    defer c.close()
+    let out = c.send(Raw(d.envelope, d.raw)) catch e {
+      fail this.lift(e)
+    }
+    // The server has the mail; a QUIT that fails does not undo that.
+    c.quit() catch _ {}
+    return this.receipt(d, out)
+  }
+
+  // One connection per send: nothing to release.
+  export close() {}
+
+  // The URL with the password hidden, `smtp://user:***@host:587`.
+  export toString(): string {
+    return this.t.display
+  }
+
+  // A connection that is greeted, encrypted and logged in, or an error with
+  // the socket closed.
+  connect(): Client!MailError {
+    let c = this.dialServer()?
+    this.prepare(c) catch e {
+      c.close()
+      fail e
+    }
+    return c
+  }
+
+  dialServer(): Client!MailError {
+    if (this.t.implicit) {
+      return dialTls(this.t.host, this.t.port, this.t.tls) catch e {
+        fail this.lift(e)
+      }
+    }
+    return dial(this.t.host, this.t.port, this.t.tls) catch e {
+      fail this.lift(e)
+    }
+  }
+
+  // EHLO, STARTTLS (required unless `tls=off`), EHLO again, login.
+  prepare(c: Client): ()!MailError {
+    c.ehlo(this.hello) catch e {
+      fail this.lift(e)
+    }
+    if (!this.t.implicit && !this.t.plain) {
+      this.upgrade(c)?
+    }
+    if (this.t.hasUser) {
+      let a = this.chooseAuth(c.authMechanisms())?
+      c.auth(a) catch e {
+        fail this.lift(e)
+      }
+    }
+  }
+
+  upgrade(c: Client): ()!MailError {
+    if (!c.supports("STARTTLS")) {
+      fail MailError.Config("${this.t.display} does not offer STARTTLS; for a local test server use smtp://${this.t.host}:${this.t.port}?tls=off")
+    }
+    c.startTls(this.t.tls) catch e {
+      fail this.lift(e)
+    }
+    c.ehlo(this.hello) catch e {
+      fail this.lift(e)
+    }
+  }
+
+  // PLAIN when the server offers it, else LOGIN.
+  chooseAuth(offered: []string): Auth!MailError {
+    if (hasMech(offered, "PLAIN")) {
+      return Auth.Plain(this.t.user, this.t.pass)
+    }
+    if (hasMech(offered, "LOGIN")) {
+      return Auth.Login(this.t.user, this.t.pass)
+    }
+    let list = "nothing"
+    if (len(offered) > 0) {
+      list = join(offered, " ")
+    }
+    fail MailError.Config("${this.t.display}: the server offers AUTH ${list}; this package logs in with PLAIN or LOGIN")
+  }
+
+  // `e` as a `MailError`. The text carries no password even if a server echoed
+  // one.
+  lift(e: SmtpError): MailError {
+    let r = this.reply(e)
+    if (e.command == "validate") {
+      return MailError.Invalid(r.text)
+    }
+    if (e.code == 535 || e.code == 534 || e.code == 530) {
+      return MailError.Auth(r)
+    }
+    if (e.transient()) {
+      return MailError.Transient(r)
+    }
+    return MailError.Rejected(r)
+  }
+
+  // The `Reply` for `e`; with no reply code the text names the step that failed.
+  reply(e: SmtpError): Reply {
+    let text = e.text
+    if (e.code == 0 && e.command != "validate") {
+      text = "${e.command}: ${e.text}"
+    }
+    return Reply{ code = e.code, enhanced = e.enhanced, text = this.scrub(text) }
+  }
+
+  scrub(s: string): string {
+    if (this.t.pass == "") {
+      return s
+    }
+    return replace(s, this.t.pass, "***")
+  }
+
+  receipt(d: Delivery, out: SmtpDelivery): Receipt {
+    let no: []Rejection = []
+    for r of out.rejected {
+      no = append(no, Rejection{ address = r.address, reply = this.reply(r.error) })
+    }
+    return Receipt{
+      id = d.messageId,
+      providerId = out.queueId,
+      accepted = out.accepted,
+      rejected = no,
+    }
+  }
+}
+
+fn hasMech(offered: []string, want: string): bool {
+  for m of offered {
+    if (m == want) {
+      return true
+    }
+  }
+  return false
+}
