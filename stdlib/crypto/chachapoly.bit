@@ -13,7 +13,7 @@
 //      le64(len ct)` under the OTK, where `pad16` zero-fills each part up to a
 //      16-byte boundary. Output is `ciphertext ‖ tag`.
 //   `open` recomputes the tag and verifies it in constant time
-//   (`poly1305Verify` → `ctEq`); on any mismatch it FAILS and never returns the
+//   (`poly1305Aead` → `ctEq`); on any mismatch it FAILS and never returns the
 //   unauthenticated plaintext — the whole point of authenticated encryption.
 //   The nonce is 12 bytes and, like every stream cipher, MUST be unique per key.
 //
@@ -24,20 +24,8 @@
 // negligible, so it tolerates random nonces where the 96-bit variant cannot.
 //
 // This module holds no cipher math of its own — it composes `chacha20`,
-// `hchacha20`, `poly1305`, and `poly1305Verify`. Every loop is bounded by a
+// `chacha20Into`, `hchacha20`, and `poly1305Aead`. Every loop is bounded by a
 // public length, so it inherits their constant-time-by-construction property.
-
-// Write `v` as eight little-endian bytes of `b` at `off` (RFC 8439's le64).
-fn chachapolyPutLe64(b: []byte, off: int, v: u64) {
-  b[off] = byte(v)
-  b[off + 1] = byte(v >> 8)
-  b[off + 2] = byte(v >> 16)
-  b[off + 3] = byte(v >> 24)
-  b[off + 4] = byte(v >> 32)
-  b[off + 5] = byte(v >> 40)
-  b[off + 6] = byte(v >> 48)
-  b[off + 7] = byte(v >> 56)
-}
 
 // A fresh 32-byte copy of `key`, so a cipher owns its key material rather than
 // aliasing the caller's slice (which the caller may later wipe or reuse).
@@ -59,52 +47,29 @@ fn chachapolyOtk(key: []byte, nonce: []byte): []byte {
   return chacha20(key, nonce, 0, zeros)
 }
 
-// Build the Poly1305 MAC input for `aad` and ciphertext `ct` (RFC 8439 §2.8):
-// `aad ‖ pad16(aad) ‖ ct ‖ pad16(ct) ‖ le64(len aad) ‖ le64(len ct)`. The buffer
-// is zero-initialized, so each `pad16` (zeros up to a 16-byte boundary) is free.
-fn chachapolyMacData(aad: []byte, ct: []byte): []byte {
-  let la = len(aad)
-  let lc = len(ct)
-  let pad1 = (16 - la % 16) % 16
-  let pad2 = (16 - lc % 16) % 16
-  let m = []byte(la + pad1 + lc + pad2 + 16)
-
+// The AEAD seal under a 12-byte nonce: encrypt, then authenticate, writing
+// `ciphertext ‖ tag` (16-byte tag) into `dst`, which is exactly
+// `len(plaintext) + 16` bytes. `plaintext` may be `dst[0:len(plaintext)]`
+// itself — the cipher is applied in place. `key` is 32 bytes; `chacha20Into`
+// validates the nonce length.
+fn chachapolySealInto(dst: []byte, key: []byte, nonce: []byte, plaintext: []byte, aad: []byte) {
+  let n = len(plaintext)
+  assert(len(dst) == n + 16, "chaChaPoly.sealInto: dst must be len(plaintext) + 16 bytes")
+  let otk = chachapolyOtk(key, nonce)
+  let ct = dst[0:n]
+  chacha20Into(ct, key, nonce, 1, plaintext)
+  let tag = poly1305Aead(otk, aad, ct)
   let i = 0
-  while (i < la) {
-    m[i] = aad[i]
+  while (i < 16) {
+    dst[n + i] = tag[i]
     i = i + 1
   }
-  let base = la + pad1
-  i = 0
-  while (i < lc) {
-    m[base + i] = ct[i]
-    i = i + 1
-  }
-  let tail = base + lc + pad2
-  chachapolyPutLe64(m, tail, u64(la))
-  chachapolyPutLe64(m, tail + 8, u64(lc))
-  return m
 }
 
-// The AEAD seal under a 12-byte nonce: encrypt, then authenticate, returning
-// `ciphertext ‖ tag` (16-byte tag). `key` is 32 bytes; `chacha20` validates the
-// nonce length.
+// `chachapolySealInto` into a fresh `len(plaintext) + 16`-byte slice.
 fn chachapolySeal(key: []byte, nonce: []byte, plaintext: []byte, aad: []byte): []byte {
-  let otk = chachapolyOtk(key, nonce)
-  let ct = chacha20(key, nonce, 1, plaintext)
-  let tag = poly1305(otk, chachapolyMacData(aad, ct))
-
-  let out = []byte(len(ct) + 16)
-  let i = 0
-  while (i < len(ct)) {
-    out[i] = ct[i]
-    i = i + 1
-  }
-  i = 0
-  while (i < 16) {
-    out[len(ct) + i] = tag[i]
-    i = i + 1
-  }
+  let out = []byte(len(plaintext) + 16)
+  chachapolySealInto(out, key, nonce, plaintext, aad)
   return out
 }
 
@@ -119,7 +84,7 @@ fn chachapolyOpen(key: []byte, nonce: []byte, ciphertext: []byte, aad: []byte): 
   let ct = ciphertext[0:n]
   let tag = ciphertext[n:len(ciphertext)]
   let otk = chachapolyOtk(key, nonce)
-  if (!poly1305Verify(otk, chachapolyMacData(aad, ct), tag)) {
+  if (!ctEq(poly1305Aead(otk, aad, ct), tag)) {
     fail newError("chachaPoly.open: authentication failed")
   }
   return chacha20(key, nonce, 1, ct)
@@ -180,6 +145,15 @@ export class ChaChaPoly {
   export seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte {
     assert(len(nonce) == 12, "chaChaPoly.seal: nonce must be 12 bytes")
     return chachapolySeal(this.key, nonce, plaintext, aad)
+  }
+
+  // `seal` writing `ciphertext ‖ tag` into the caller's `dst`, which must be
+  // exactly `len(plaintext) + 16` bytes, instead of a fresh slice; `plaintext`
+  // may be `dst[0:len(plaintext)]` to seal in place. Same nonce rules and
+  // panics as `seal`.
+  export sealInto(dst: []byte, nonce: []byte, plaintext: []byte, aad: []byte) {
+    assert(len(nonce) == 12, "chaChaPoly.sealInto: nonce must be 12 bytes")
+    chachapolySealInto(dst, this.key, nonce, plaintext, aad)
   }
 
   // Verify the tag over `ciphertext` and `aad`, then decrypt. Returns the
