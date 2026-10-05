@@ -49,11 +49,9 @@ export class Authz<A: ActionEnum> {
   store: Option<PolicyStore>
   wildcard: bool
   export crud: CrudActions
-  resources: []ResourceInfo
   relations: RelationStore
   decls: []RelationDecl
   limits: Limits
-  roles: []RoleDef<A>
   state: DecideState<A>
 
   // One handle per app, built at startup. Empty `store` means in-memory.
@@ -72,10 +70,8 @@ export class Authz<A: ActionEnum> {
     if (store != "") {
       this.store = Option<PolicyStore>.Some(openStore(store)?)
     }
-    this.resources = []ResourceInfo(0)
     this.relations = MemoryRelationStore()
     this.decls = []RelationDecl(0)
-    this.roles = []RoleDef<A>(0)
     this.state = DecideState<A>()
     this.wildcard = hasName(names, "Manage")
     this.crud = CrudActions{
@@ -98,10 +94,10 @@ export class Authz<A: ActionEnum> {
   // Each step carries its own `?`: one trailing `?` over the whole chain does
   // not compile today (#7185). The same class twice is an InvalidPolicy.
   export resource<T: Tabled>(): Authz<A>! {
-    let info = newResource<T>(this.resources)?
-    this.resources = append(this.resources, info)
-    this.state.noteResource(info)
-    this.state.cache.bump()
+    let info = describe<T>()
+    if (!this.state.cache.addResource(info)) {
+      fail InvalidPolicy{ detail = "resource ${info.name} registered twice" }
+    }
     return this
   }
 
@@ -112,7 +108,10 @@ export class Authz<A: ActionEnum> {
   // only use declared relations, so a typo fails at the call. Declaring one
   // twice is an InvalidPolicy.
   export relation<T: Tabled>(name: string, inherit: string = ""): Authz<A>! {
-    this.decls = append(this.decls, newDecl<T>(this.resources, this.decls, name, inherit)?)
+    this.decls = append(
+      this.decls,
+      newDecl<T>(this.registered().resources, this.decls, name, inherit)?,
+    )
     return this
   }
 
@@ -122,19 +121,25 @@ export class Authz<A: ActionEnum> {
   // (relation.bit) and a bad one is an InvalidPolicy. Writing a tuple that
   // already exists is a no-op.
   export relate(subject: string, relation: string, object: string): ()! {
-    this.relations.write(checkTuple(this.resources, this.decls, subject, relation, object)?)?
+    this.relations.write(
+      checkTuple(this.registered().resources, this.decls, subject, relation, object)?,
+    )?
   }
 
   // Removes the tuple `relate` wrote; removing one that is not there is a
   // no-op. The same validation applies.
   export unrelate(subject: string, relation: string, object: string): ()! {
-    this.relations.delete(checkTuple(this.resources, this.decls, subject, relation, object)?)?
+    this.relations.delete(
+      checkTuple(this.registered().resources, this.decls, subject, relation, object)?,
+    )?
   }
 
   // Whether that exact tuple was written. Direct only: a userset subject is
   // matched as the literal "team:eng#member", never expanded.
   export related(subject: string, relation: string, object: string): bool! {
-    return this.relations.has(checkTuple(this.resources, this.decls, subject, relation, object)?)?
+    return this.relations.has(
+      checkTuple(this.registered().resources, this.decls, subject, relation, object)?,
+    )?
   }
 
   // Whether `subject` holds `relation` on `object` through any chain of
@@ -143,24 +148,24 @@ export class Authz<A: ActionEnum> {
   // `Authz<A>(maxDepth = ...)`) stops it before it can answer; that is NOT
   // related, so callers treat it as `false`. A store failure is returned too.
   export hasRelation(subject: string, relation: string, object: string): bool! {
-    let t = checkTuple(this.resources, this.decls, subject, relation, object)?
+    let t = checkTuple(this.registered().resources, this.decls, subject, relation, object)?
     return walk(this.relations, this.decls, this.limits, t)?
   }
 
   // The registered resource stored policies call `name`, or None.
   export resourceByName(name: string): Option<ResourceInfo> {
-    return findResource(this.resources, name)
+    return findResource(this.registered().resources, name)
   }
 
   // The declared type ("i64", "string") of `field` on the resource called
   // `resource`, or None when the resource or the field is unknown.
   export fieldType(resource: string, field: string): Option<string> {
-    return fieldTypeIn(this.resources, resource, field)
+    return fieldTypeIn(this.registered().resources, resource, field)
   }
 
   // Registered class names, sorted, for "unknown resource" messages.
   export resourceNames(): []string {
-    return namesIn(this.resources)
+    return namesIn(this.registered().resources)
   }
 
   // Checks `c` against `resource` as a policy is registered: every field it
@@ -170,7 +175,7 @@ export class Authz<A: ActionEnum> {
   // since the resources it covers do not share one; the resource must be
   // registered.
   export validate(resource: ResourceRef, c: Cond): ()! {
-    return validateIn(this.resources, resource, c)?
+    return validateIn(this.registered().resources, resource, c)?
   }
 
   // Checks policy `p` as it is registered, against what `probe` makes it say:
@@ -180,7 +185,7 @@ export class Authz<A: ActionEnum> {
   // is any subject of the app's user class; a policy that branches on the
   // subject is checked for the branch `probe` takes.
   export validatePolicy<S: Subject>(p: Policy<S, A>, probe: S): ()! {
-    return validateRulesIn<A>(this.resources, p.name, p.rulesFor(probe))?
+    return validateRulesIn<A>(this.registered().resources, p.name, p.rulesFor(probe))?
   }
 
   // Defines role `name` as the policies listed, in that order:
@@ -200,27 +205,33 @@ export class Authz<A: ActionEnum> {
   ): Authz<A>! {
     let empty: S
     let sample = unwrapOr(probe, empty)
-    let def = buildRole<S, A>(this.resources, name, policies, sample)?
-    checkNewRole<A>(this.roles, def)?
-    this.roles = append(this.roles, def)
+    let def = buildRole<S, A>(this.registered().resources, name, policies, sample)?
+    checkRoleName(name)?
+    let guest = []Rule<A>(0)
     if (name == guestRole) {
-      this.state.setGuest(guestRules<S, A>(policies, sample))
+      guest = guestRules<S, A>(policies, sample)
     }
-    this.state.cache.addKind(kindFor<S>())
-    this.state.cache.bump()
+    if (!this.state.cache.addRole(def, kindFor<S>(), guest)) {
+      fail InvalidPolicy{ detail = "role ${name} defined twice" }
+    }
     return this
+  }
+
+  // What `role` and `resource` have published, read under the cache's lock.
+  registered(): Registry<A> {
+    return this.state.cache.registry()
   }
 
   // The defined role names, sorted.
   export roleNames(): []string {
-    return roleNamesIn<A>(this.roles)
+    return roleNamesIn<A>(this.registered().roles)
   }
 
   // Fails with an InvalidPolicy naming the first of `names` that no role
   // defines. Call it at startup with every role your identity provider can
   // issue, so one nothing defines stops the app instead of granting nothing.
   export checkRoles(names: []string): ()! {
-    return checkRolesIn<A>(this.roles, names)?
+    return checkRolesIn<A>(this.registered().roles, names)?
   }
 
   // The rules `s` has through its `roles`: each role's policies, each policy
@@ -228,7 +239,7 @@ export class Authz<A: ActionEnum> {
   // policy written for another subject class add no rules and a line to
   // `skipped`, so a subject can only lose access to a mistake.
   export rolesOf(s: Subject): Resolved<A> {
-    return resolveRoles<A>(this.roles, s, this.state.cache.none.held, false)
+    return resolveRoles<A>(this.registered().roles, s, this.state.cache.none.held, false)
   }
 
   // Fails with a `NotFilterable` naming the policy and label when a rule that
@@ -238,7 +249,12 @@ export class Authz<A: ActionEnum> {
   // (a policy that branches on the subject is checked for that branch), and
   // includes the guest role.
   export validateFilterable<T: Tabled>(action: A): ()! {
-    return checkRolesFilterable<A>(this.roles, T.__className(), actionName(action), this.wildcard)?
+    return checkRolesFilterable<A>(
+      this.registered().roles,
+      T.__className(),
+      actionName(action),
+      this.wildcard,
+    )?
   }
 
   // Sends one line per decision, and one per startup mistake met at request
