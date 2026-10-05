@@ -483,7 +483,7 @@ class User {
 
 fn publishing(): Policy<User, Action> {
   return Policy("Publishing", (p, user) => {
-    p.canIf<Article>([Action.Publish], "PublishWindowOpen", (a: Article) => a.views < 100)
+    p.canIf<Article>([Action.Publish], "PublishWindowOpen", (a) => a.views < 100)
   })
 }
 
@@ -497,7 +497,7 @@ fn main(): ()! {
   println("${authz.can(Option<Subject>.Some(sara), Action.Publish, early)}")
   println("${authz.can(Option<Subject>.Some(sara), Action.Publish, late)}")
 
-  let nested = Cond.Not(custom<Article>("Quiet", (a: Article) => a.views == 0))
+  let nested = Cond.Not(custom<Article>("Quiet", (a) => a.views == 0))
   println(unwrapOr(filterable(nested), "none"))
   println(unwrapOr(filterable(eq("authorId", Value.Text("sara"))), "none"))
 
