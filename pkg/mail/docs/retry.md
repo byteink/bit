@@ -49,6 +49,8 @@ class Greylist {
     return true
   }
 
+  check(): ()!MailError {}
+
   close() {}
 }
 
@@ -127,6 +129,8 @@ class Busy {
   signs(): bool {
     return true
   }
+
+  check(): ()!MailError {}
 
   close() {}
 }

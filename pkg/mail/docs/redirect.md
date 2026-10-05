@@ -91,6 +91,8 @@ class Api {
     return false
   }
 
+  check(): ()!MailError {}
+
   close() {}
 }
 
