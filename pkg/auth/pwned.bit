@@ -1,0 +1,227 @@
+// pkg/auth/pwned.bit — the Have I Been Pwned "Pwned Passwords" range check as a
+// `BreachCheck` (#6895, epic #3960), for `PolicyOptions.breach` (policy.bit).
+//
+//   let checker = PwnedPasswords(PwnedOptions{ userAgent = "inkwell/1.0" })?
+//   PasswordPolicy(PolicyOptions{ breach = BreachMode.FailOpen(checker) })?
+//
+// THE PROTOCOL (https://haveibeenpwned.com/API/v3#PwnedPasswords). The password's
+// SHA-1, as 40 upper-case hex digits, is split in two: the first 5 digits go to
+// the service as `GET {endpoint}{prefix}`, and the service answers with every
+// known suffix under that prefix, one `SUFFIX:COUNT` per line. The 35-digit rest
+// is compared HERE. So the service sees 5 hex digits (20 bits, shared by many
+// unrelated passwords: it answers with hundreds of lines for each prefix), never
+// the password and never the hash.
+// With `padding` on, the request carries `Add-Padding: true` and the service adds
+// fake suffixes with a count of 0 until the response is a constant size, so the
+// response length does not tell an observer how many real hashes share the
+// prefix; a count of 0 is never a hit (and is below any `threshold`, which is at
+// least 1).
+//
+// FAILURES ARE ERRORS. A timeout, a status other than 200, a body with a line
+// that is not `35 hex digits:count`, or a padded response with no lines at all,
+// makes `check` fail, so `BreachMode.FailOpen`/`FailClosed` (policy.bit) decides.
+// Nothing answers "not breached" because it could not tell. No error text and no
+// log line holds the password, its hash or the suffix.
+//
+// SEAM. `RangeFetch` is the one seam to the network, in the shape of
+// `HttpFetch`/`TokenFetch` (oidc_discovery.bit, oidc_callback.bit): `nil` is the
+// real GET through `std/http`'s `Client`, and a test passes a fake that serves a
+// range from memory and records what it was asked.
+import { Client, Header } from "std/http"
+import { Sha1, digest, encodeHexUpper } from "std/crypto"
+import { hasPrefix, hasSuffix, parseInt, split, toUpper, trimSpace } from "std/strings"
+import { Millisecond, Second } from "std/time"
+
+// One range request: `(url, headers, timeoutMs)` to the response body of a 200.
+// A status other than 200 is the fake's failure to return, as `checkStatus`
+// (oidc_discovery.bit) does for the real path.
+export type RangeFetch = (string, []Header, int) => string!
+
+// The service the owner of the dataset runs. A self-hosted copy replaces it.
+const pwnedDefaultEndpoint = "https://api.pwnedpasswords.com/range/"
+// The hex digits sent: 5, which is the service's own contract.
+const pwnedPrefixLen = 5
+// A SHA-1 is 40 hex digits, so the suffix is the other 35.
+const pwnedSuffixLen = 35
+// A padded range is about 1000 lines of under 50 bytes. A body past this is not
+// one, so the client refuses it rather than buffering what a bad endpoint sends.
+const pwnedMaxBody = 1048576
+// The most digits a count may have; 18 fits an `int`.
+const pwnedCountDigits = 18
+
+// How `PwnedPasswords` asks. `userAgent` has no default because the service
+// refuses a request without one and asks that it name the app; `PwnedPasswords`
+// fails when it is empty. `endpoint` is the base the 5-digit prefix is appended
+// to (a missing trailing `/` is added): the default is the public service, and a
+// self-hosted copy of the dataset (docs/password-policy.md) is another URL.
+// `timeout` is the whole request, in nanoseconds (`5 * Second`), and must be
+// positive. `padding` sends `Add-Padding: true`. `threshold` is the fewest
+// appearances in breaches that count as breached, at least 1. `fetch` is `nil`
+// for the real network.
+export class PwnedOptions {
+  export endpoint: string = pwnedDefaultEndpoint,
+  export timeout: int = 5 * Second,
+  export padding: bool = true,
+  export userAgent: string,
+  export threshold: int = 1,
+  export fetch: RangeFetch,
+}
+
+// Refuses an option set that cannot work, naming the field.
+fn checkPwnedOptions(o: PwnedOptions): ()! {
+  if (trimSpace(o.userAgent) == "") {
+    fail newError("auth: PwnedOptions.userAgent is empty: the service requires one naming your app")
+  }
+  if (!hasPrefix(o.endpoint, "https://") && !hasPrefix(o.endpoint, "http://")) {
+    fail newError("auth: PwnedOptions.endpoint must be an http:// or https:// URL")
+  }
+  if (o.timeout < Millisecond) {
+    fail newError("auth: PwnedOptions.timeout is ${o.timeout} ns: it must be at least 1 ms")
+  }
+  if (o.threshold < 1) {
+    fail newError("auth: PwnedOptions.threshold is ${o.threshold}: it must be at least 1")
+  }
+}
+
+// The upper-case hex SHA-1 of the UTF-8 password: 40 digits.
+fn pwnedHash(password: string): string {
+  return encodeHexUpper(digest(Sha1(), []byte(password)))
+}
+
+fn pwnedHexDigit(c: byte): bool {
+  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F')
+}
+
+fn isDigit(c: byte): bool {
+  return c >= '0' && c <= '9'
+}
+
+// Whether `s` is `n` upper-case hex digits.
+fn isHexOf(s: string, n: int): bool {
+  if (len(s) != n) {
+    return false
+  }
+  let i = 0
+  while (i < n) {
+    if (!pwnedHexDigit(s[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `s` as a count: one to `pwnedCountDigits` decimal digits and nothing else.
+fn pwnedCount(s: string): int! {
+  if (len(s) == 0 || len(s) > pwnedCountDigits) {
+    fail newError("count is not 1 to ${pwnedCountDigits} digits")
+  }
+  let i = 0
+  while (i < len(s)) {
+    if (!isDigit(s[i])) {
+      fail newError("count is not a decimal number")
+    }
+    i = i + 1
+  }
+  return parseInt(s)?
+}
+
+// A range line, `SUFFIX:COUNT`, read as its upper-cased suffix and count. The
+// error names nothing of the line.
+fn parseRangeLine(line: string): (string, int)! {
+  let parts = split(line, ":")
+  if (len(parts) != 2) {
+    fail newError("line is not SUFFIX:COUNT")
+  }
+  let suffix = toUpper(parts[0])
+  if (!isHexOf(suffix, pwnedSuffixLen)) {
+    fail newError("suffix is not ${pwnedSuffixLen} hex digits")
+  }
+  return (suffix, pwnedCount(parts[1])?)
+}
+
+// The real GET: `Client` with the headers set, bounded by `timeoutMs` for the
+// whole request, a body no larger than `pwnedMaxBody`, and a 200 or a failure.
+// The failure names the status and not the URL, which holds the prefix.
+fn pwnedGet(url: string, headers: []Header, timeoutMs: int): string! {
+  let c = Client()
+  c.setMaxBodyBytes(pwnedMaxBody)
+  for h of headers {
+    c.setHeader(h.name, h.value)?
+  }
+  let res = c.getTimeout(url, timeoutMs)?
+  if (res.status != 200) {
+    fail newError("HTTP ${res.status}")
+  }
+  return res.body
+}
+
+// A `BreachCheck` over the Pwned Passwords range API, or a copy of its data.
+// Safe to share between requests: it holds only its options.
+export class PwnedPasswords {
+  opts: PwnedOptions
+
+  // Fails when `opts` cannot work (`checkPwnedOptions`), so a mistake shows when
+  // the app starts and not on the first sign-up.
+  init(opts: PwnedOptions)! {
+    checkPwnedOptions(opts)?
+    this.opts = opts
+    if (!hasSuffix(opts.endpoint, "/")) {
+      this.opts.endpoint = opts.endpoint + "/"
+    }
+  }
+
+  // Whether `password` appears in the dataset at least `threshold` times. Sends
+  // only the first 5 hex digits of its SHA-1. Fails, and so never answers false
+  // for a password it could not look up, on a timeout, a status other than 200
+  // or a body that is not a range.
+  export check(password: string): bool! {
+    let hash = pwnedHash(password)
+    let body = this.fetchRange(hash[0:pwnedPrefixLen]) catch e {
+      fail newError("auth: pwned passwords: ${e.message()}")
+    }
+    let hit = this.scan(body, hash[pwnedPrefixLen:len(hash)]) catch e {
+      fail newError("auth: pwned passwords: malformed range response: ${e.message()}")
+    }
+    return hit
+  }
+
+  headers(): []Header {
+    let hs = []Header{ Header{ name = "User-Agent", value = this.opts.userAgent } }
+    if (this.opts.padding) {
+      hs = append(hs, Header{ name = "Add-Padding", value = "true" })
+    }
+    return hs
+  }
+
+  fetchRange(prefix: string): string! {
+    let url = this.opts.endpoint + prefix
+    let ms = this.opts.timeout / Millisecond
+    if (this.opts.fetch == nil) {
+      return pwnedGet(url, this.headers(), ms)?
+    }
+    return this.opts.fetch(url, this.headers(), ms)?
+  }
+
+  // Reads every line of `body`, so a malformed one fails even after the match,
+  // and answers whether `suffix` is on a line whose count reaches the threshold.
+  scan(body: string, suffix: string): bool! {
+    let hit = false
+    let lines = 0
+    for raw of split(body, "\n") {
+      let line = trimSpace(raw)
+      if (line == "") {
+        continue
+      }
+      let (found, count) = parseRangeLine(line)?
+      lines = lines + 1
+      if (found == suffix && count >= this.opts.threshold) {
+        hit = true
+      }
+    }
+    if (lines == 0 && this.opts.padding) {
+      fail newError("a padded response has no lines")
+    }
+    return hit
+  }
+}

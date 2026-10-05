@@ -201,7 +201,8 @@ NIST asks a verifier to refuse passwords known from breaches. The package ships 
 such list, since one that is current is millions of entries. It asks a
 `BreachCheck`: a type with one method, `check(password): bool!`, that answers true
 when the password is breached. You write it over whatever you trust, an in-house
-list or a service that uses the k-anonymity range API.
+list or a service, or you use the one the package ships, [the Have I Been Pwned
+range check](#check-against-have-i-been-pwned).
 
 When the checker cannot answer, the service being down for instance, someone has
 to choose between letting the password through and refusing it. That choice is
@@ -239,6 +240,105 @@ fn forgiving(checker: BreachCheck): PasswordPolicy! {
 The checker runs once per `check`, for every password, so a slow one slows every
 sign-up. It is called even when another rule has already refused the password,
 so the person sees every problem in one go.
+
+## Check against Have I Been Pwned
+
+Inkwell does not want to keep its own list of leaked passwords, so it asks
+Have I Been Pwned, which holds billions of them. `PwnedPasswords` is a
+`BreachCheck` over its Pwned Passwords range API. It never sends the password or
+its hash. It hashes the password with SHA-1, sends the first 5 hex digits of that
+hash, gets back every known hash that starts the same way, and looks for the other
+35 digits in the answer on your own machine. See [the security
+model](security.md#what-leaves-your-server-when-you-check-for-breaches) for exactly
+what that exposes.
+
+```bit
+import { BreachMode, PasswordPolicy, PolicyOptions, PwnedOptions, PwnedPasswords } from "auth"
+
+fn inkwellPolicy(): PasswordPolicy! {
+  let pwned = PwnedPasswords(PwnedOptions{ userAgent = "inkwell/1.0 (ops@inkwell.example)" })?
+  return PasswordPolicy(PolicyOptions{ breach = BreachMode.FailOpen(pwned) })?
+}
+```
+
+`userAgent` is the one option with no default. The service requires one and asks
+that it name your app and a way to reach you; `PwnedPasswords` fails when it is
+empty, so the mistake shows when Inkwell starts and not on the first sign-up.
+The others:
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `endpoint` | `https://api.pwnedpasswords.com/range/` | Where the 5 digits are sent. See "Host the data yourself". |
+| `timeout` | `5 * Second` | The whole request, in nanoseconds, at least 1 millisecond. |
+| `padding` | on | Sends `Add-Padding: true`, so every answer is the same size whatever the prefix. The padding lines have a count of 0 and are never a hit. |
+| `threshold` | 1 | The fewest appearances in breaches that count as breached. |
+| `userAgent` | none | Required. |
+| `fetch` | the network | A `RangeFetch`, for tests. |
+
+A password is breached when its line in the answer has a count of at least
+`threshold`. Raise it to let through a password seen a handful of times and still
+refuse the famous ones; the default refuses any password that appears at all.
+
+`check` fails, and does not say "not breached", when the request times out, the
+service answers with anything but 200, or the body has a line that is not 35 hex
+digits, a colon and a count. That is the failure `BreachMode` decides: with
+`FailOpen` Inkwell lets the password through while Have I Been Pwned is down, with
+`FailClosed` it refuses with `Violation.BreachCheckFailed`. Nothing in an error
+message or a log line holds the password, its hash or the 35 digits.
+
+### Host the data yourself
+
+Some apps cannot send even 5 digits to a third party. Have I Been Pwned publishes
+the whole dataset for download (the Pwned Passwords downloader fetches it as one
+file per 5-digit prefix). Serve those files at `{endpoint}{PREFIX}` from a server
+you run, each answering with the lines of that prefix, and point `endpoint` at it:
+
+```bit
+import { BreachMode, PasswordPolicy, PolicyOptions, PwnedOptions, PwnedPasswords } from "auth"
+import { Second } from "std/time"
+
+fn inkwellOnPremises(): PasswordPolicy! {
+  let pwned = PwnedPasswords(
+    PwnedOptions{
+      userAgent = "inkwell/1.0",
+      endpoint = "https://pwned.inkwell.internal/range/",
+      timeout = 2 * Second,
+      padding = false,
+    },
+  )?
+  return PasswordPolicy(PolicyOptions{ breach = BreachMode.FailClosed(pwned) })?
+}
+```
+
+A missing trailing `/` on `endpoint` is added. Turn `padding` off when your server
+does not pad. A `http://` endpoint is accepted for a server on a network you
+trust; over an untrusted network use `https://`, because whoever can change the
+answer can make every password look clean.
+
+### Test the sign-up without the network
+
+`fetch` takes a `RangeFetch`, a function from `(url, headers, timeoutMs)` to the
+response body of a 200, and replaces the network. A test serves a range from
+memory, and can read the URL to prove that only the prefix is sent:
+
+```bit
+import { PwnedOptions, PwnedPasswords, RangeFetch } from "auth"
+
+fn leakedPassword(): bool {
+  // The SHA-1 of "password" is 5BAA61E4C9B93F3F0682250B6CF8331B7EE68FD8.
+  let range: RangeFetch = (url, headers, timeoutMs) => {
+    return "1E4C9B93F3F0682250B6CF8331B7EE68FD8:9545824\r\n"
+  }
+  let pwned = PwnedPasswords(PwnedOptions{ userAgent = "inkwell-tests", fetch = range }) catch _ {
+    return false
+  }
+  return pwned.check("password") catch _ {
+    return false
+  }
+}
+```
+
+A fake that returns an error stands in for a timeout or a 503.
 
 ## What the policy does not do, and why
 

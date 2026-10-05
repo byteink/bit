@@ -1,0 +1,290 @@
+// pkg/auth/pwned.test.bit — #6895's acceptance: the range check against a fake
+// range service behind `RangeFetch` (hit, miss, a padded zero-count line, a
+// malformed line, a 503, a timeout), the request carrying exactly the 5-digit
+// prefix and nothing else derived from the password, and the check inside a
+// `PasswordPolicy` under both failure modes.
+//
+// The fixture is the best-known pwned password, `password`, whose SHA-1 is
+// 5BAA61E4C9B93F3F0682250B6CF8331B7EE68FD8: asserting the prefix on the wire
+// asserts the hash too. `contains` is bound module-wide by policy.bit and
+// `Header` by oidc_callback.bit; only new names are imported here.
+import { hasPrefix } from "std/strings"
+
+const fixturePassword = "password"
+const fixturePrefix = "5BAA6"
+const fixtureSuffix = "1E4C9B93F3F0682250B6CF8331B7EE68FD8"
+const fixtureHash = fixturePrefix + fixtureSuffix
+const otherSuffix = "0018A45C4D1DEF81644B54AB7F969B88D65"
+
+// The range service: serves `body`, or fails with `failure` when that is set,
+// and records every request it was asked.
+class RangeBox {
+  body: string,
+  failure: string,
+  calls: int,
+  urls: []string,
+  headers: []Header,
+  timeoutMs: int,
+}
+
+fn rangeFetchFor(box: RangeBox): RangeFetch {
+  let f: RangeFetch = (url, headers, timeoutMs) => {
+    box.calls = box.calls + 1
+    box.urls = append(box.urls, url)
+    box.headers = headers
+    box.timeoutMs = timeoutMs
+    if (box.failure != "") {
+      fail newError(box.failure)
+    }
+    return box.body
+  }
+  return f
+}
+
+fn rangeBox(body: string): RangeBox {
+  return RangeBox{ body = body }
+}
+
+fn pwned(box: RangeBox, o: PwnedOptions): PwnedPasswords {
+  o.fetch = rangeFetchFor(box)
+  return PwnedPasswords(o) catch e {
+    panic("PwnedPasswords: ${e.message()}")
+  }
+}
+
+fn pwnedUA(box: RangeBox): PwnedPasswords {
+  return pwned(box, PwnedOptions{ userAgent = "inkwell/1.0" })
+}
+
+fn sentHeader(box: RangeBox, name: string): string {
+  for h of box.headers {
+    if (h.name == name) {
+      return h.value
+    }
+  }
+  return "<none>"
+}
+
+// Whether `check` failed, and the message it failed with.
+fn failure(p: PwnedPasswords, pw: string): string {
+  p.check(pw) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+const rangeLines = otherSuffix +
+  ":3\r\n" +
+  fixtureSuffix +
+  ":9545824\r\n" +
+  "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF:0\r\n"
+
+test "a suffix in the range is breached; the lines and their case do not matter" {
+  let p = pwnedUA(rangeBox(rangeLines))
+  assert(
+    p.check(fixturePassword) catch _ {
+      panic("check failed")
+    },
+    "want breached",
+  )
+  let lower = rangeBox("fffffffffffffffffffffffffffffffffff:1\n" + "1e4c9b93f3f0682250b6cf8331b7ee68fd8:2")
+  assert(
+    pwnedUA(lower).check(fixturePassword) catch _ {
+      panic("check failed")
+    },
+    "a lower-case suffix matches",
+  )
+}
+
+test "a suffix not in the range is not breached" {
+  let box = rangeBox(otherSuffix + ":3\n")
+  let p = pwnedUA(box)
+  assert(
+    !(p.check(fixturePassword) catch _ {
+      panic("check failed")
+    }),
+    "want not breached",
+  )
+  assert(box.calls == 1, "want one request, got ${box.calls}")
+}
+
+test "a padded zero-count line is ignored, and the threshold is the least count that counts" {
+  let zero = rangeBox(fixtureSuffix + ":0\n")
+  assert(
+    !(pwnedUA(zero).check(fixturePassword) catch _ {
+      panic("check failed")
+    }),
+    "a count of 0 is padding, not a hit",
+  )
+  let few = rangeBox(fixtureSuffix + ":3\n")
+  let strict = pwned(few, PwnedOptions{ userAgent = "inkwell/1.0", threshold = 5 })
+  assert(
+    !(strict.check(fixturePassword) catch _ {
+      panic("check failed")
+    }),
+    "3 appearances are under threshold 5",
+  )
+  let exact = pwned(few, PwnedOptions{ userAgent = "inkwell/1.0", threshold = 3 })
+  assert(
+    exact.check(fixturePassword) catch _ {
+      panic("check failed")
+    },
+    "3 appearances meet threshold 3",
+  )
+}
+
+test "the request carries exactly the 5-digit prefix and nothing else of the password" {
+  let box = rangeBox(rangeLines)
+  let p = pwnedUA(box)
+  p.check(fixturePassword) catch _ {
+    panic("check failed")
+  }
+  assert(len(box.urls) == 1, "want one request, got ${len(box.urls)}")
+  let want = "https://api.pwnedpasswords.com/range/" + fixturePrefix
+  assert(box.urls[0] == want, "want ${want}, got ${box.urls[0]}")
+  assert(!contains(box.urls[0], fixtureSuffix[0:6]), "no digit past the prefix may leave")
+  assert(!contains(box.urls[0], "/" + fixturePassword), "the password must not leave")
+  for h of box.headers {
+    assert(
+      !contains(h.value, fixturePrefix) && !contains(h.value, fixturePassword),
+      "header ${h.name} derives from the password",
+    )
+  }
+  assert(len(box.headers) == 2, "want User-Agent and Add-Padding only, got ${len(box.headers)}")
+  assert(sentHeader(box, "User-Agent") == "inkwell/1.0", "User-Agent")
+  assert(sentHeader(box, "Add-Padding") == "true", "Add-Padding")
+  assert(box.timeoutMs == 5000, "want the default 5000 ms, got ${box.timeoutMs}")
+}
+
+test "padding off sends no Add-Padding, and the timeout reaches the request in milliseconds" {
+  let box = rangeBox(otherSuffix + ":3\n")
+  let p = pwned(
+    box,
+    PwnedOptions{ userAgent = "inkwell/1.0", padding = false, timeout = 250 * Millisecond },
+  )
+  p.check(fixturePassword) catch _ {
+    panic("check failed")
+  }
+  assert(sentHeader(box, "Add-Padding") == "<none>", "no Add-Padding when padding is off")
+  assert(box.timeoutMs == 250, "want 250 ms, got ${box.timeoutMs}")
+}
+
+test "the endpoint is where the prefix goes: a self-hosted copy, with or without a trailing slash" {
+  let box = rangeBox(otherSuffix + ":3\n")
+  pwned(
+    box,
+    PwnedOptions{ userAgent = "inkwell/1.0", endpoint = "https://pwned.corp.example/range" },
+  ).check(fixturePassword) catch _ {
+    panic("check failed")
+  }
+  pwned(box, PwnedOptions{ userAgent = "inkwell/1.0", endpoint = "http://10.0.0.7:8080/r/" }).check(fixturePassword) catch _ {
+    panic("check failed")
+  }
+  assert(box.urls[0] == "https://pwned.corp.example/range/" + fixturePrefix, "got ${box.urls[0]}")
+  assert(box.urls[1] == "http://10.0.0.7:8080/r/" + fixturePrefix, "got ${box.urls[1]}")
+}
+
+test "a malformed response is an error, never a pass, even after the match" {
+  let bodies = []string{
+    "no colon here\n",
+    "1E4C9B93F3F0682250B6CF8331B7EE68FD:5\n",
+    "ZE4C9B93F3F0682250B6CF8331B7EE68FD8:5\n",
+    fixtureSuffix + ":many\n",
+    fixtureSuffix + ":\n",
+    fixtureSuffix + ":5:6\n",
+    fixtureSuffix + ":9999999999999999999\n",
+    fixtureSuffix + ":5\nnot a line\n",
+    "",
+  }
+  for b of bodies {
+    let msg = failure(pwnedUA(rangeBox(b)), fixturePassword)
+    assert(hasPrefix(msg, "auth: pwned passwords:"), "want an error for body '${b}', got '${msg}'")
+  }
+}
+
+test "an empty body is an error when padded, and a miss when not" {
+  let box = rangeBox("")
+  assert(failure(pwnedUA(box), fixturePassword) != "", "a padded response always has lines")
+  let bare = pwned(box, PwnedOptions{ userAgent = "inkwell/1.0", padding = false })
+  assert(
+    !(bare.check(fixturePassword) catch _ {
+      panic("check failed")
+    }),
+    "an empty bucket is a miss",
+  )
+}
+
+test "a 503 and a timeout are errors that name neither the password nor its hash" {
+  let down = RangeBox{ failure = "HTTP 503" }
+  let msg = failure(pwnedUA(down), fixturePassword)
+  assert(msg == "auth: pwned passwords: HTTP 503", "got '${msg}'")
+  let slow = RangeBox{ failure = "request timed out" }
+  let late = failure(pwnedUA(slow), fixturePassword)
+  assert(hasPrefix(late, "auth: pwned passwords: request timed out"), "got '${late}'")
+  let bad = failure(pwnedUA(rangeBox(fixtureSuffix + ":x\n")), fixturePassword)
+  for m of []string{ msg, late, bad } {
+    assert(
+      !contains(m, fixtureSuffix) && !contains(m, fixtureHash) && !contains(m, fixturePrefix),
+      "error text leaks: ${m}",
+    )
+  }
+}
+
+test "options that cannot work are refused when the checker is built, naming the field" {
+  let cases = []PwnedOptions{
+    PwnedOptions{},
+    PwnedOptions{ userAgent = "  " },
+    PwnedOptions{ userAgent = "a", endpoint = "ftp://x/" },
+    PwnedOptions{ userAgent = "a", timeout = 0 },
+    PwnedOptions{ userAgent = "a", threshold = 0 },
+  }
+  let fields = []string{ "userAgent", "userAgent", "endpoint", "timeout", "threshold" }
+  let i = 0
+  while (i < len(cases)) {
+    let msg = ""
+    PwnedPasswords(cases[i]) catch e {
+      msg = e.message()
+    }
+    assert(
+      contains(msg, "PwnedOptions." + fields[i]),
+      "case ${i}: want the field ${fields[i]} named, got '${msg}'",
+    )
+    i = i + 1
+  }
+}
+
+test "inside a PasswordPolicy: a hit is Breached, an outage follows the mode" {
+  let hit = rangeBox(rangeLines)
+  let checker: BreachCheck = pwnedUA(hit)
+  let open = policyOf(
+    PolicyOptions{
+      builtinBlocklist = false,
+      maxRun = 0,
+      minLength = 8,
+      breach = BreachMode.FailOpen(checker),
+    },
+  )
+  assert(
+    tags(open.check(fixturePassword)) == "Breached",
+    "want Breached, got ${tags(open.check(fixturePassword))}",
+  )
+  let down: BreachCheck = pwnedUA(RangeBox{ failure = "HTTP 503" })
+  let o = policyOf(
+    PolicyOptions{
+      builtinBlocklist = false,
+      maxRun = 0,
+      minLength = 8,
+      breach = BreachMode.FailOpen(down),
+    },
+  )
+  assert(len(o.check(fixturePassword)) == 0, "fail-open lets it through")
+  let c = policyOf(
+    PolicyOptions{
+      builtinBlocklist = false,
+      maxRun = 0,
+      minLength = 8,
+      breach = BreachMode.FailClosed(down),
+    },
+  )
+  assert(tags(c.check(fixturePassword)) == "BreachCheckFailed", "fail-closed refuses it")
+}
