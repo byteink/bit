@@ -154,8 +154,6 @@ run_cap() {
 # fails the run as RETIRED, so the list empties itself at the next repin; this
 # is the same contract as diffruntime's RELOC_DECLARED.
 FALSEPOS_DECLARED="
-_tests_/cases/class_arg_bare_class.bit E0041 #7005
-_tests_/cases/class_arg_not_class.bit E0041 #7005
 "
 declaredCode() {
   printf '%s\n' "$FALSEPOS_DECLARED" | awk -v f="$1" '$1 == f { print $2 }'

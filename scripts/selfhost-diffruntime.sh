@@ -296,7 +296,7 @@ relocSignature() { # <objfile>  -> one "TYPE SYMBOL" line per relocation record
 MIN_RELOC_SITES=${DIFFRUNTIME_MIN_RELOC_SITES:-12000}
 reloc_sites_seen=0
 
-# DECLARED CROSS-OBJECT REFERENCE CHANGES — one per line:
+# DECLARED CROSS-OBJECT REFERENCE CHANGES — one per line, EMPTY TODAY:
 #
 #   <module dir> <-|+> <RELOC TYPE> <SYMBOL>
 #
@@ -315,14 +315,7 @@ reloc_sites_seen=0
 # too, which is what empties the table at the next stage0 repin instead of
 # leaving a stale entry masking a later regression on that exact symbol.
 #
-# #6558 (8c0917586): `string(b[lo:hi])` is one string_from_byte_range call, no
-# longer a slice_slice call plus string_from_bytes, so runtime/root gains the
-# one reference and loses the other. The pinned 0.36.0 predates it. The lines
-# are this host's (Mach-O arm64) spelling, as every entry here has been.
-# Empties at the next repin after 0.36.0.
 RELOC_DECLARED="
-runtime/root + ARM64_RELOC_BRANCH26 _bit_rt_string_from_byte_range
-runtime/root - ARM64_RELOC_BRANCH26 _bit_rt_slice_slice
 "
 
 # Same (rel, label) expansion g2archive.sh applies to the same two variables —

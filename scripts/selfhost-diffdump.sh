@@ -586,9 +586,6 @@ run_ir() {
       # regression — this is the #3125 fix, so a real lowering improvement
       # like #3107's no longer fails this gate by construction.
       sig=$(explainMismatch "$want" "$b2" "$NAME" "$f")
-      # #7074: the post-opt arm of 7058-switch-case-range holds no text
-      # identity and is decided from both pre-opt dumps (see its header).
-      if [ -z "$sig" ] && [ "$NAME" = iropt ]; then sig=$(explainSwitchPostOpt "$f" "$want" "$b2"); fi
       if [ -n "$sig" ]; then
         echo "$f${sep}explained by declared signature '$sig'" >>"$work/explained"
       else

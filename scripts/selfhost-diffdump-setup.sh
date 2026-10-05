@@ -87,18 +87,4 @@ diffdump_setup() {
   # GENERIC_EXPLODE, DCE_PARAMS and DCE_METHODS since the 0.33.0 repin (#6245).
   # So are CONST_STRING_FOLD, MAP_PRESENCE and STRBOX_JOIN since the 0.35.0
   # repin (#6527).
-  #
-  # #6562's error word is on by default in the tree and absent from the pinned
-  # oracle, which still returns a fallible result's error through the per-task
-  # slot (`err_set`/`err_get`), so the two IR dumps would differ on every
-  # fallible function. Pin the tree to the slot here, for the `ir` and `iropt`
-  # rows this file feeds. Delete this line at the repin that carries #6693,
-  # together with `errRegEnabled` (compiler/lowerfail.bit).
-  #
-  # Deliberately NOT pinned elsewhere: diffexamples, difftests and
-  # diffexamples-x64 compare program OUTPUT, which the flip must not change, so
-  # they run the new convention and are the oracle for it; diffsafepoints counts
-  # `bit_rt_safepoint` sites and no block or loop changes; diffruntime walks
-  # runtime/**, which declares no fallible function.
-  export BIT_ERR_REG=0
 }

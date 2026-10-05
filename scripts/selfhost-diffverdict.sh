@@ -87,7 +87,6 @@ missing_list="" falsepos_list="" timeout_list="" hit_declared=""
 # the run as RETIRED, so the list empties itself at the next stage0 repin. Same
 # contract as FALSEPOS_DECLARED in scripts/selfhost-diffcheck.sh (#7109).
 MISSING_DECLARED="
-string(x) where x: i32 #7101
 "
 declared_ticket() {
   printf '%s\n' "$MISSING_DECLARED" | awk -v k="$1" '
