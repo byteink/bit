@@ -1338,6 +1338,72 @@ fn handleUpload(body: []byte, boundary: string): Form! {
 }
 ```
 
+## Writing a multipart form
+
+Uploading a file, or posting a form that carries one, needs a
+`multipart/form-data` body: parts separated by a boundary that must not
+occur in any of them. `FormBuilder` writes that body and the `Content-Type`
+that names the boundary, and what it writes is what `parseMultipart` reads
+back byte for byte.
+
+### `FormBuilder`
+
+A body being assembled. `FormBuilder()` is empty. Parts are written in the
+order they are added and a name may repeat, as the wire format allows.
+
+### `FormBuilder.field(name: string, value: string): ()!`
+
+Adds a text field. Inside the quoted `name`, a `"` and a `\` are written
+behind a `\` (RFC 7578 section 4.2, the quoted-pair the parser reads). A CR, a
+LF or a NUL in `name` cannot be quoted and would end the header line, so
+`field` fails on one.
+
+### `FormBuilder.file(name: string, filename: string, contentType: string, content: []byte): ()!`
+
+Adds a file part announced as `filename` and declared as `contentType`
+(`application/octet-stream` when empty), holding `content` exactly. `name`
+and `filename` are quoted as in `field`; `file` fails on a CR, a LF or a NUL
+in `name`, `filename` or `contentType`.
+
+### `FormBuilder.build(): FormBody!`
+
+Returns the body and its `Content-Type`. The boundary is `bit-form-` and 128
+bits from the system CSPRNG in hex, drawn again for every `build`, and it is
+searched for in every part's headers and content: a candidate that occurs in
+a part is dropped for the next, and eight in a row fail the build. The body
+is written into one buffer allocated at its final size, so a large file is
+copied into it, not concatenated. Fails when nothing was added.
+
+### `FormBody`
+
+What `build` returns: `contentType`, the value of the request's
+`Content-Type` header with the boundary in it, and `body`.
+
+```bit
+import { Client, FormBuilder, Response, Form, parseMultipart, defaultLimits } from "std/http"
+import { indexOf } from "std/strings"
+
+fn upload(url: string, avatar: []byte): Response! {
+  let form = FormBuilder()
+  form.field("user", "ada")?
+  form.file("avatar", "ada.png", "image/png", avatar)?
+  let out = form.build()?
+  let c = Client()
+  c.setHeader("Content-Type", out.contentType)?
+  return c.request("POST", url, out.body)?
+}
+
+// The server's side of the same body: `boundary=` is the last part of
+// `contentType`.
+fn readBack(avatar: []byte): Form! {
+  let form = FormBuilder()
+  form.file("avatar", "ada.png", "image/png", avatar)?
+  let out = form.build()?
+  let at = indexOf(out.contentType, "boundary=")
+  return parseMultipart([]byte(out.body), out.contentType[at + 9:], defaultLimits())?
+}
+```
+
 ## Where to go next
 
 - Building routes, JSON bodies and middleware on top of this: [pkg/web](/packages/web) and [the Book's web course](/book/14-first-endpoint).
