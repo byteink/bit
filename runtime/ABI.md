@@ -2080,6 +2080,7 @@ Read once at startup by `configFromEnv`. Knobs tune policy, never correctness.
 | `BIT_GC_ALLOCCACHE` | off     | `1`, `on`, `0`, `off`                              | `1`/`on` arms the per-OS-thread slot cache at boot instead of on first lock contention |
 | `BIT_WORKERS`       | 1       | integer 1 to 32                                    | Boot worker thread count (§9 step 2)               |
 | `BIT_VDSO`          | on      | `1`, `on`, `0`, `off`                              | `0`/`off` keeps the Linux clock on the raw syscall |
+| `BIT_HASH_SEED`     | drawn   | integer 0 to 1099511627776                         | Fixes the map hash seed, to reproduce a run whose behaviour followed map slot order |
 
 **A set value outside its valid values is fatal, never clamped and never
 ignored** (#6060). At startup, before the first allocation-bearing boot step,
@@ -2095,6 +2096,13 @@ size, so the heap is never allowed to grow and every allocation would collect
 (a 1.2 MB `pkg/yaml` parse ran 3.3T instructions at `100` against 2.2G at the
 default). Validation lives in `gcEnvCheckAll` (`runtime/root/rootconfig.bit`),
 reached from the first environment read of every platform's `boot`.
+
+`BIT_HASH_SEED` is not `configFromEnv`'s either (#7379). Unset, every platform's
+`boot` draws the map hash seed from the OS CSPRNG (§21's source) before
+`bit_main`, so map slot order, and with it `for k in m` order, differs between
+processes and a peer cannot precompute colliding keys. A failed draw with the
+variable unset is fatal: `bit: cannot seed the map hash: the OS CSPRNG failed`,
+status 64. `0` is the fixed seed every process used before #7379.
 
 `BIT_GC_ALLOCCACHE` is the one row that is NOT `configFromEnv`'s: it names this
 port's own allocator (`runtime/gc/gcheap.bit`), it selects which of two paths a
@@ -2936,7 +2944,7 @@ defined exactly once).
 | `bit_rt_map_slot_str` | `(m: ?*MapHeader, ptr: *const u8, len: usize) -> i64` (§15; `bit_rt_map_slot` for a `string` key passed as its bytes, not a header) |
 | `bit_rt_map_delete`   | `(m: ?*MapHeader, key: u64) -> void` (§15)              |
 | `bit_rt_map_len`      | `(m: ?*MapHeader) -> i64` (§15)                         |
-| `bit_rt_map_hash_seed`| `() -> u64` (§15; the seed every map hash starts from, `0` until #7379 draws it per process. The compiler's synthesized `__valueHash` (SPEC §14.3) starts from the same value) |
+| `bit_rt_map_hash_seed`| `() -> u64` (§15; the seed every map hash starts from, drawn per process at boot, #7379, §7 `BIT_HASH_SEED`. The compiler's synthesized `__valueHash` (SPEC §14.3) starts from the same value) |
 | `bit_rt_map_iter_init`| `(m: ?*MapHeader) -> i64` (§15)                         |
 | `bit_rt_map_iter_next`| `(m: ?*MapHeader, prev: i64) -> i64` (§15)              |
 | `bit_rt_map_key_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
@@ -3940,6 +3948,10 @@ the handle of a string CONSTANT, which is static for the life of the process.
   splitmix64 finalizer (so low-entropy integer keys avalanche) and compares by
   word; `1` Wyhashes a string key over its bytes and compares byte-wise; anything
   else is a composite key hashed and compared through its descriptor (§15.1).
+- **Seed.** Every hash is keyed by one per-process seed (#7379, §7
+  `BIT_HASH_SEED`), drawn at boot and never changed after, so slot order and
+  iteration order differ between processes. `bit_rt_map_hash_seed() -> u64` returns
+  it, for a hash computed outside this module to agree with these.
 - **Growth.** At `(used+1)*8 >= cap*7` the table doubles and rehashes, dropping
   tombstones (`used` resets to `len`). This keeps an EMPTY slot present at all
   times, so every probe terminates in `<= cap` steps (a statically bounded loop).
