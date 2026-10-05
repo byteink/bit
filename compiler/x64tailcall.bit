@@ -1,0 +1,119 @@
+// #7241: the x86-64 frameless mode and its tail calls, the twin of #2929's
+// arm64 frameless leaf and #6676's `b f` (compiler/tailcall.bit). Same module
+// as compiler/x64compile.bit, so nothing here is imported.
+//
+// A frameless function emits no `push rbp; mov rbp, rsp` and no epilogue: rsp
+// holds the caller's return address from entry to the `ret` or the `jmp`, and
+// rbp is the caller's throughout. That is sound only when nothing in the body
+// needs this function's own frame: no slot (every one is rbp-relative), no
+// saved register, and no call, since a call from here would leave rsp 8 off
+// the 16 a callee is owed and would need a return address of its own. A
+// planned tail call is not a call in that sense: the `jmp` hands the callee
+// this function's own entry state, the caller's return address on top and, on
+// Win64, the caller's 32-byte home area above it, exactly as a direct call
+// from the caller would have. With no prologue a Win64 unwinder reads the
+// function as a leaf (return address at [rsp]), which is what it is.
+
+// Whether `f` may take the frameless path, before its frame is laid out:
+// every condition but the frame's own contents, which xBuildFrameSetup checks.
+// A parameter past the argument registers is read at [rbp+16+...]
+// (xBindIncomingArgs), which only a frame makes this function's own.
+fn xFramelessCandidate(
+  regs: XFrameRegs, f: IrFunc, safepoints: []int, tails: []bool, debug: bool,
+): bool {
+  if (f.isNaked ||
+    hasFramedSafepoint(safepoints, tails) ||
+    !xParamsAllInRegs(regs.ctx, f, regs.cc)) {
+    return false
+  }
+  return !asmNamesRbp(regs.module, f) && !xHasHiddenCall(regs.module, f, tails, debug)
+}
+
+fn xParamsAllInRegs(ctx: TypeContext, f: IrFunc, cc: XCallConv): bool {
+  let entry = f.blocks[0]
+  let params = []int(0)
+  let p = 0
+  while (p < entry.paramCount) {
+    params = append(params, entry.instsStart + p)
+    p = p + 1
+  }
+  return xArgsAllInRegs(ctx, f, cc, params)
+}
+
+// Whether any instruction of `f` that is not a planned tail call may emit a
+// `call`: the ops xNeedsCallAlign (x64frame.bit) counts, with an `asm` block
+// judged by its bytes rather than refused outright.
+fn xHasHiddenCall(module: IrModule, f: IrFunc, tails: []bool, debug: bool): bool {
+  for b of f.blocks {
+    let i = b.instsStart + b.paramCount
+    while (i < b.instsStart + b.instsLen) {
+      if (!tails[i] && xInstMayCall(module, f.instrs[i], debug)) {
+        return true
+      }
+      i = i + 1
+    }
+  }
+  return false
+}
+
+fn xInstMayCall(module: IrModule, ins: IrInstr, debug: bool): bool {
+  if (ins.op == Op.Asm) {
+    return xAsmMayCall(module.asmBlocks[ins.ival])
+  }
+  return xOpAlwaysCalls(ins.op) || (debug && xOpCallsWhenDebug(ins.op))
+}
+
+// Loose on purpose, as asmBlockNamesRbp is: any `call rel32` (0xE8), group-5
+// (0xFF: `call`/`jmp` r/m) or far-call (0x9A) byte counts. A false positive
+// only keeps a frame.
+fn xAsmMayCall(blk: AsmBlock): bool {
+  for b of blk.x64Bytes {
+    if (b == 0xE8 || b == 0xFF || b == 0x9A) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether instruction `i` is a call `fr`'s function emits as a tail call.
+fn xIsTailCall(fr: XFrame, i: int): bool {
+  return i >= 0 && i < len(fr.tailCalls) && fr.tailCalls[i]
+}
+
+// A direct `Op.Call` with a one-word or void result: as a tail call when the
+// frameless plan holds one at `i`, else the ordinary call.
+fn xEmitDirectCall(cx: XCtx, i: int, ins: IrInstr) {
+  if (xIsTailCall(cx.frame, i)) {
+    xEmitTailCall(cx, ins.name, ins.args)
+    return
+  }
+  xEmitCallLike(cx, ins.name, ins.args, ins.ty != cx.ctx.voidId, i, ins.ty, true)
+}
+
+// `ret` of `vals`, unless the instruction before it was a tail call: that
+// `jmp` already left, and the callee's own `ret` returns to this caller.
+fn xEmitRetAt(cx: XCtx, i: int, vals: []int): bool {
+  if (xIsTailCall(cx.frame, i - 1)) {
+    return true
+  }
+  return xEmitRet(cx, vals)
+}
+
+// The call at the end of a frameless function, as `jmp rel32` with the same
+// Branch relocation a `call` carries (Pc32, addend -4: the field sits at the
+// same place in both encodings). No return address lands here, so no
+// safepoint is recorded; the allocator's stack map for this point is consumed
+// unread and must be empty, since nothing outlives a call whose result is
+// returned at once. xBuildFuncCode drops its table entry.
+fn xEmitTailCall(cx: XCtx, symbol: string, args: []int) {
+  assert(cx.frame.frameless, "#7241: a tail call out of a framed function")
+  let reserve = xMarshalArgs(cx, args, 0, 0, 0)
+  assert(reserve == 0, "#7241: a tail call with a stack argument")
+  xEmitByte(cx.buf, 0xE9) // jmp rel32
+  let off = len(cx.buf.code)
+  xEmitU32(cx.buf, 0)
+  cx.relocs = append(cx.relocs, Reloc{ offset = off, symbol = symbol, kind = RelocKind.Branch })
+  let sm = cx.alloc.stackMaps[cx.nextSafepointIdx]
+  assert(len(sm.regs) == 0 && len(sm.slots) == 0, "#7241: a value outlives a tail call")
+  cx.nextSafepointIdx = cx.nextSafepointIdx + 1
+}
