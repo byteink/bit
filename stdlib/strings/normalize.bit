@@ -62,6 +62,10 @@ const normEntryMask: int = 0x1FFFFFFF
 // run as long as the string.
 const normInsertionMax: int = 16
 
+// Up to this many bytes, `normCopy` copies a passing stretch by hand rather
+// than append a boxed substring.
+const normCopyMin: int = 32
+
 // The quick-check flags of each form, indexed by `Form` (gen_normalize.bit's
 // record byte 1: the `No` bits of D, KD, C, KC, then C's and KC's `Maybe`),
 // and the flag of a code point that is the second half of a primary
@@ -72,11 +76,35 @@ const normSecond: int = 64
 // The code point at byte `i` of `s` (`i < len(s)`) packed with its length in
 // bytes, `used << 24 | cp`, so the hot loops pay no tuple. An ill-formed
 // sequence is `1 << 24 | 0xFFFD`, which a real U+FFFD (three bytes) never is.
+// Well-formed two- and three-byte sequences are decoded here without a call;
+// `normDecodeAny` checks everything else. In the three-byte check, bit `k` of
+// `0xF7FFFFFE` says whether code points `k << 11` up are allowed: 0 is
+// overlong, 0x1B is the surrogates.
 fn normDecode(s: string, i: int): int {
   let b0 = int(s[i])
   if (b0 < 0x80) {
     return (1 << 24) | b0
   }
+  let n = len(s)
+  if (b0 < 0xE0) {
+    if (b0 >= 0xC2 && i + 1 < n && (int(s[i + 1]) & 0xC0) == 0x80) {
+      return (2 << 24) | ((b0 & 0x1F) << 6) | (int(s[i + 1]) & 0x3F)
+    }
+    return normDecodeAny(s, i, b0)
+  }
+  if (b0 < 0xF0 && i + 2 < n) {
+    let b1 = int(s[i + 1])
+    let b2 = int(s[i + 2])
+    let cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+    if (((b1 & 0xC0) | ((b2 & 0xC0) << 8)) == 0x8080 && ((0xF7FFFFFE >> (cp >> 11)) & 1) != 0) {
+      return (3 << 24) | cp
+    }
+  }
+  return normDecodeAny(s, i, b0)
+}
+
+// `normDecode` for any sequence whose lead byte `b0` (not ASCII) is at `i`.
+fn normDecodeAny(s: string, i: int, b0: int): int {
   let want = leadWant(b0)
   if (want == 0 || i + want > len(s)) {
     return (1 << 24) | 0xFFFD
@@ -86,6 +114,18 @@ fn normDecode(s: string, i: int): int {
     return (1 << 24) | 0xFFFD
   }
   return (want << 24) | cp
+}
+
+// `normRec(cp)` for a decoded code point, its two `normU16` calls written
+// out: the hot loops pay one call per code point for the record, not three.
+fn normRecOf(cp: int): int {
+  if (cp >= normTrieLimit) {
+    return 0
+  }
+  let k = (cp >> normTrieShift) * 2
+  let blk = (int(normStage1[k]) << 8) | int(normStage1[k + 1])
+  let j = ((blk << normTrieShift) | (cp & normTrieMask)) * 2
+  return ((int(normStage2[j]) << 8) | int(normStage2[j + 1])) * 8
 }
 
 // Whether the packed `normDecode` result `d` is a well-formed code point.
@@ -126,7 +166,7 @@ fn normQuickSpan(s: string, pos: int, qc: int): int {
       continue
     }
     let d = normDecode(s, i)
-    let rec = normRec(d & normCpMask)
+    let rec = normRecOf(d & normCpMask)
     if (normQcStops(d, rec, qc, lastCc)) {
       return last
     }
@@ -137,6 +177,21 @@ fn normQuickSpan(s: string, pos: int, qc: int): int {
     i = i + (d >> 24)
   }
   return n
+}
+
+// Appends `s[lo:hi]` to `out`. Slicing `s` boxes the substring, one
+// allocation, so a short stretch is copied a byte at a time instead.
+fn normCopy(out: []byte, s: string, lo: int, hi: int): []byte {
+  if (hi - lo > normCopyMin) {
+    out = append(out, s[lo:hi])
+    return out
+  }
+  let i = lo
+  while (i < hi) {
+    out = append(out, s[i])
+    i = i + 1
+  }
+  return out
 }
 
 // Appends `cp` to `out` as UTF-8.
@@ -178,10 +233,10 @@ fn normPair(a: int, b: int): int {
   return int(compose(rune(a), rune(b)))
 }
 
-// Whether the packed entries `seg[lo:]` are already in class order.
-fn normSorted(seg: []int, lo: int): bool {
+// Whether the packed entries `seg[lo:hi]` are already in class order.
+fn normSorted(seg: []int, lo: int, hi: int): bool {
   let i = lo + 1
-  while (i < len(seg)) {
+  while (i < hi) {
     if ((seg[i - 1] >> normClassShift) > (seg[i] >> normClassShift)) {
       return false
     }
@@ -190,10 +245,10 @@ fn normSorted(seg: []int, lo: int): bool {
   return true
 }
 
-// Stable insertion sort of `seg[lo:]` by class.
-fn normInsertion(seg: []int, lo: int) {
+// Stable insertion sort of `seg[lo:hi]` by class.
+fn normInsertion(seg: []int, lo: int, hi: int) {
   let i = lo + 1
-  while (i < len(seg)) {
+  while (i < hi) {
     let v = seg[i]
     let k = i - 1
     while (k >= lo && (seg[k] >> normClassShift) > (v >> normClassShift)) {
@@ -205,12 +260,13 @@ fn normInsertion(seg: []int, lo: int) {
   }
 }
 
-// Stable counting sort of `seg[lo:]` by class: O(n + 256), whatever the run.
-fn normCounting(seg: []int, lo: int) {
-  let m = len(seg) - lo
+// Stable counting sort of `seg[lo:hi]` by class: O(n + 256), whatever the
+// run.
+fn normCounting(seg: []int, lo: int, hi: int) {
+  let m = hi - lo
   let start = []int(257)
   let i = lo
-  while (i < len(seg)) {
+  while (i < hi) {
     let bin = (seg[i] >> normClassShift) + 1
     start[bin] = start[bin] + 1
     i = i + 1
@@ -222,7 +278,7 @@ fn normCounting(seg: []int, lo: int) {
   }
   let tmp = []int(m)
   i = lo
-  while (i < len(seg)) {
+  while (i < hi) {
     let cls = seg[i] >> normClassShift
     tmp[start[cls]] = seg[i]
     start[cls] = start[cls] + 1
@@ -235,28 +291,29 @@ fn normCounting(seg: []int, lo: int) {
   }
 }
 
-// Puts the non-starters `seg[lo:]` into canonical order (stable by class).
-fn normOrder(seg: []int, lo: int) {
-  if (len(seg) - lo < 2 || normSorted(seg, lo)) {
+// Puts the non-starters `seg[lo:hi]` into canonical order (stable by class).
+fn normOrder(seg: []int, lo: int, hi: int) {
+  if (hi - lo < 2 || normSorted(seg, lo, hi)) {
     return
   }
-  if (len(seg) - lo <= normInsertionMax) {
-    normInsertion(seg, lo)
+  if (hi - lo <= normInsertionMax) {
+    normInsertion(seg, lo, hi)
     return
   }
-  normCounting(seg, lo)
+  normCounting(seg, lo, hi)
 }
 
-// Folds the ordered non-starters of `seg` into `seg[0]`, the starter, with the
-// blocked-by rule: a mark composes only when the class of the last mark left
-// behind is lower than its own (so an equal class, or any starter between,
-// blocks it). Returns the segment with the folded marks removed.
-fn normFold(seg: []int): []int {
+// Folds the ordered non-starters of `seg[0:n]` into `seg[0]`, the starter,
+// with the blocked-by rule: a mark composes only when the class of the last
+// mark left behind is lower than its own (so an equal class, or any starter
+// between, blocks it). Returns how many entries are left, the folded marks
+// removed. Works in place: a reslice would allocate a slice per segment.
+fn normFold(seg: []int, n: int): int {
   let starter = seg[0]
   let kept = 1
   let last = 0
   let r = 1
-  while (r < len(seg)) {
+  while (r < n) {
     let m = seg[r]
     let cls = m >> normClassShift
     let c = 0
@@ -273,40 +330,60 @@ fn normFold(seg: []int): []int {
     r = r + 1
   }
   seg[0] = starter
-  return seg[0:kept]
+  return kept
 }
 
 // The working state of one `normalize` call's slow path: the open segment
-// (a starter and the non-starters after it, or just non-starters), the one
-// output buffer, the form's two switches and its quick-check flags.
+// (a starter and the non-starters after it, or just non-starters) in
+// `seg[0:segN]`, the one output buffer, the form's two switches and its
+// quick-check flags. The segment keeps an explicit length so that emptying
+// or folding it never reslices: each reslice allocates.
 class NormState {
   seg: []int
+  segN: int
   out: []byte
   compat: bool
   fold: bool
   qc: int
 
+  // Appends `v` to the open segment, doubling its buffer when full: only a
+  // run of non-starters longer than 16 grows it.
+  add(v: int) {
+    if (this.segN == len(this.seg)) {
+      let grown = []int(2 * len(this.seg))
+      let i = 0
+      while (i < this.segN) {
+        grown[i] = this.seg[i]
+        i = i + 1
+      }
+      this.seg = grown
+    }
+    this.seg[this.segN] = v
+    this.segN = this.segN + 1
+  }
+
   // Orders the open segment and, for the C forms, folds its marks into its
   // starter.
   settle() {
+    let n = this.segN
     let lo = 0
-    if (len(this.seg) > 0 && (this.seg[0] >> normClassShift) == 0) {
+    if (n > 0 && (this.seg[0] >> normClassShift) == 0) {
       lo = 1
     }
-    normOrder(this.seg, lo)
-    if (this.fold && lo == 1 && len(this.seg) > 1) {
-      this.seg = normFold(this.seg)
+    normOrder(this.seg, lo, n)
+    if (this.fold && lo == 1 && n > 1) {
+      this.segN = normFold(this.seg, n)
     }
   }
 
   // Writes the open segment to the output and empties it, keeping its buffer.
   flush() {
     let i = 0
-    while (i < len(this.seg)) {
+    while (i < this.segN) {
       this.out = normPutUtf8(this.out, this.seg[i] & normCpMask)
       i = i + 1
     }
-    this.seg = this.seg[0:0]
+    this.segN = 0
   }
 
   // Adds `e`, a code point packed as `normElem` packs it (class above bit
@@ -314,11 +391,11 @@ class NormState {
   push(e: int) {
     let v = e & normEntryMask
     if ((v >> normClassShift) != 0) {
-      this.seg = append(this.seg, v)
+      this.add(v)
       return
     }
     this.settle()
-    if ((e >> 30) != 0 && this.fold && len(this.seg) == 1 && (this.seg[0] >> normClassShift) == 0) {
+    if ((e >> 30) != 0 && this.fold && this.segN == 1 && (this.seg[0] >> normClassShift) == 0) {
       let c = normPair(this.seg[0], v)
       if (c != 0) {
         this.seg[0] = c
@@ -326,7 +403,7 @@ class NormState {
       }
     }
     this.flush()
-    this.seg = append(this.seg, v)
+    this.add(v)
   }
 
   // Pushes the three-or-two jamo a Hangul syllable decomposes to; the vowel
@@ -379,7 +456,7 @@ class NormState {
     while (i < n) {
       let d = normDecode(s, i)
       let cp = d & normCpMask
-      let rec = normRec(cp)
+      let rec = normRecOf(cp)
       if (i > from && !normQcStops(d, rec, this.qc, 0) && normInfo[rec] == 0) {
         break
       }
@@ -389,6 +466,18 @@ class NormState {
     this.settle()
     this.flush()
     return i
+  }
+}
+
+// The slow-path state for form number `k`, its output pre-sized to `size`.
+fn normState(k: int, size: int): NormState {
+  return NormState{
+    seg = []int(16),
+    segN = 0,
+    out = []byte(0, size),
+    compat = k >= 2,
+    fold = k % 2 == 0,
+    qc = int(normQcBits[k]),
   }
 }
 
@@ -405,17 +494,11 @@ export fn normalize(s: string, f: Form): string {
   if (span == n) {
     return s
   }
-  let st = NormState{
-    seg = []int(0, 16),
-    out = []byte(0, n + n / 2 + 16),
-    compat = k >= 2,
-    fold = k % 2 == 0,
-    qc = qc,
-  }
+  let st = normState(k, n + n / 2 + 16)
   let pos = 0
   // Bounded: `run` always moves past `span`, so `pos` strictly grows.
   while (pos < n) {
-    st.out = append(st.out, s[pos:span])
+    st.out = normCopy(st.out, s, pos, span)
     if (span == n) {
       break
     }
