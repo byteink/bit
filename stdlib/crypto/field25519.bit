@@ -12,18 +12,22 @@
 // the schoolbook multiply run without a bignum.
 //
 // The hard part is the multiply. A product of two 51-bit limbs is up to 102
-// bits, and Bit has no u128, so each 64x64->128 partial product is formed by
-// splitting the operands into 32-bit halves and reassembling with exact carry
-// math (`fe25519MulAdd`); the five column sums are accumulated in 128-bit
-// (lo, hi) pairs and then carry-propagated back down to 51-bit limbs. The
+// bits, and Bit has no u128, so `fe25519MulCore` splits every limb into 26-bit
+// halves and sums each output column as three u64 partial sums that cannot
+// overflow, then carry-propagates them back down to 51-bit limbs. The
 // wrap-around fold uses 2^255 = 19 (mod p): any bit that carries past 2^255
 // re-enters limb 0 multiplied by 19.
+//
+// Every `...To` operation writes the caller's element in place and allocates
+// nothing, so a whole scalar multiplication runs on preallocated elements
+// (`ed25519point.bit`); the exported value-returning forms allocate only
+// their result.
 //
 // Everything here is constant-time by construction: there is no branch or memory
 // index that depends on a field value. The canonical reduction in `ToBytes`
 // makes its "is this >= p" decision with a bias-and-mask trick, not an `if`, so
 // even the final freeze leaks nothing through timing.
-// bit:lint max-fn-lines=92 -- fe25519MulCore and fe25519ToBytes are unrolled
+// bit:lint max-fn-lines=92 -- fe25519MulCore and fe25519PutBytes are unrolled
 // limb arithmetic over the 2^255-19 field, straight-line by construction and
 // constant-time. Splitting either means carrying a large set of limbs across
 // a boundary or recomputing them. Raised rather than disabled so the file's
@@ -54,6 +58,18 @@ fn fe25519Load64(b: []byte, off: int): u64 {
     (u64(b[off + 7]) << 56)
 }
 
+// Write `v` into eight bytes of `b` at `off`, little-endian.
+fn fe25519Store64(b: []byte, off: int, v: u64) {
+  b[off] = byte(v)
+  b[off + 1] = byte(v >> 8)
+  b[off + 2] = byte(v >> 16)
+  b[off + 3] = byte(v >> 24)
+  b[off + 4] = byte(v >> 32)
+  b[off + 5] = byte(v >> 40)
+  b[off + 6] = byte(v >> 48)
+  b[off + 7] = byte(v >> 56)
+}
+
 // Fused multiply-add on a 128-bit accumulator held as `acc[0]`=low, `acc[1]`=high:
 // acc += a * b, in place. The 64x64->128 product is built from 32-bit halves,
 // with no u128: `t2` folds the two cross terms so no intermediate overflows a
@@ -75,15 +91,8 @@ fn fe25519MulAdd(acc: []u64, a: u64, b: u64) {
   acc[0] = nlo
 }
 
-// Add the 64-bit carry `c` into the 128-bit column (`tLo[i]`, `tHi[i]`) in place.
-fn fe25519Carry(tLo: []u64, tHi: []u64, i: int, c: u64) {
-  let nlo = tLo[i] + c
-  tHi[i] = tHi[i] + (((tLo[i] & c) | ((tLo[i] | c) & ~nlo)) >> 63)
-  tLo[i] = nlo
-}
-
 // One carry pass over five limbs holding a value below 2^53 per limb, folding
-// the top carry back through 2^255 = 19. Leaves every limb below 2^52. Used to
+// the top carry back through 2^255 = 19. Leaves every limb at most 2^51. Used to
 // re-normalize the plain limb sums produced by `Add` and `Sub`.
 fn fe25519WeakReduce(h: []u64) {
   let c = h[0] >> 51
@@ -106,114 +115,194 @@ fn fe25519WeakReduce(h: []u64) {
   h[1] = h[1] + c
 }
 
-// The schoolbook multiply h = f * g mod p, shared by `fe25519Mul` and
-// `fe25519Sqr`. Inputs must be weakly reduced (limbs < 2^52), as every field
-// operation here leaves them. Each of the five output columns is a sum of five
-// limb products; the terms that would land above 2^255 are pre-scaled by 19
-// (`g1_19`..`g4_19`) so the fold is already applied. Column sums live in 128-bit
-// (lo, hi) pairs, then a single carry chain brings them back to 51-bit limbs.
-fn fe25519MulCore(f: []u64, g: []u64): []u64 {
-  let g1_19 = 19 * g[1]
-  let g2_19 = 19 * g[2]
-  let g3_19 = 19 * g[3]
-  let g4_19 = 19 * g[4]
-
-  let tLo = []u64(5)
-  let tHi = []u64(5)
-  let acc = []u64(2)
+// The schoolbook multiply h = f * g mod p, written in place and allocation-free;
+// `h` may alias `f` or `g` (every input limb is read before `h` is written).
+// Inputs must have limbs below 2^52, as every field operation here leaves them.
+//
+// Bit has no u128, so each 51-bit limb is split into a 26-bit low half (`fl`,
+// `gl`) and a high half below 2^26 (`fh`, `gh`), and the terms that wrap past
+// 2^255 use g scaled by 19 (`q`, below 2^56.3, high half below 2^30.3). A column
+// is then three plain u64 sums: s0 of low*low (< 2^54.4), s1 of the cross terms
+// (< 2^59.6) and s2 of high*high (< 2^58.6), worth s0 + s1*2^26 + s2*2^52. The
+// carry out of a column stays below 2^60, so no sum can wrap. The top carry is
+// folded through 2^255 = 19 in two halves so that 19*carry cannot overflow.
+fn fe25519MulCore(h: []u64, f: []u64, g: []u64) {
+  let m26 = u64(0x3ffffff)
+  let m25 = u64(0x1ffffff)
+  let fl0 = f[0] & m26
+  let fh0 = f[0] >> 26
+  let fl1 = f[1] & m26
+  let fh1 = f[1] >> 26
+  let fl2 = f[2] & m26
+  let fh2 = f[2] >> 26
+  let fl3 = f[3] & m26
+  let fh3 = f[3] >> 26
+  let fl4 = f[4] & m26
+  let fh4 = f[4] >> 26
+  let gl0 = g[0] & m26
+  let gh0 = g[0] >> 26
+  let gl1 = g[1] & m26
+  let gh1 = g[1] >> 26
+  let gl2 = g[2] & m26
+  let gh2 = g[2] >> 26
+  let gl3 = g[3] & m26
+  let gh3 = g[3] >> 26
+  let gl4 = g[4] & m26
+  let gh4 = g[4] >> 26
+  let ql1 = (19 * g[1]) & m26
+  let qh1 = (19 * g[1]) >> 26
+  let ql2 = (19 * g[2]) & m26
+  let qh2 = (19 * g[2]) >> 26
+  let ql3 = (19 * g[3]) & m26
+  let qh3 = (19 * g[3]) >> 26
+  let ql4 = (19 * g[4]) & m26
+  let qh4 = (19 * g[4]) >> 26
 
   // h0 = f0*g0 + 19*(f1*g4 + f2*g3 + f3*g2 + f4*g1)
-  acc[0] = 0
-  acc[1] = 0
-  fe25519MulAdd(acc, f[0], g[0])
-  fe25519MulAdd(acc, f[1], g4_19)
-  fe25519MulAdd(acc, f[2], g3_19)
-  fe25519MulAdd(acc, f[3], g2_19)
-  fe25519MulAdd(acc, f[4], g1_19)
-  tLo[0] = acc[0]
-  tHi[0] = acc[1]
+  let s0 = fl0 * gl0 + fl1 * ql4 + fl2 * ql3 + fl3 * ql2 + fl4 * ql1
+  let s1 = fl0 * gh0 + fh0 * gl0 + fl1 * qh4 + fh1 * ql4 + fl2 * qh3
+  s1 = s1 + fh2 * ql3 + fl3 * qh2 + fh3 * ql2 + fl4 * qh1 + fh4 * ql1
+  let s2 = fh0 * gh0 + fh1 * qh4 + fh2 * qh3 + fh3 * qh2 + fh4 * qh1
+  let lo = s0 + ((s1 & m25) << 26)
+  let r0 = lo & fe25519Mask()
+  let c = (lo >> 51) + (s1 >> 25) + (s2 << 1)
 
   // h1 = f0*g1 + f1*g0 + 19*(f2*g4 + f3*g3 + f4*g2)
-  acc[0] = 0
-  acc[1] = 0
-  fe25519MulAdd(acc, f[0], g[1])
-  fe25519MulAdd(acc, f[1], g[0])
-  fe25519MulAdd(acc, f[2], g4_19)
-  fe25519MulAdd(acc, f[3], g3_19)
-  fe25519MulAdd(acc, f[4], g2_19)
-  tLo[1] = acc[0]
-  tHi[1] = acc[1]
+  s0 = fl0 * gl1 + fl1 * gl0 + fl2 * ql4 + fl3 * ql3 + fl4 * ql2
+  s1 = fl0 * gh1 + fh0 * gl1 + fl1 * gh0 + fh1 * gl0 + fl2 * qh4
+  s1 = s1 + fh2 * ql4 + fl3 * qh3 + fh3 * ql3 + fl4 * qh2 + fh4 * ql2
+  s2 = fh0 * gh1 + fh1 * gh0 + fh2 * qh4 + fh3 * qh3 + fh4 * qh2
+  lo = s0 + ((s1 & m25) << 26) + c
+  let r1 = lo & fe25519Mask()
+  c = (lo >> 51) + (s1 >> 25) + (s2 << 1)
 
   // h2 = f0*g2 + f1*g1 + f2*g0 + 19*(f3*g4 + f4*g3)
-  acc[0] = 0
-  acc[1] = 0
-  fe25519MulAdd(acc, f[0], g[2])
-  fe25519MulAdd(acc, f[1], g[1])
-  fe25519MulAdd(acc, f[2], g[0])
-  fe25519MulAdd(acc, f[3], g4_19)
-  fe25519MulAdd(acc, f[4], g3_19)
-  tLo[2] = acc[0]
-  tHi[2] = acc[1]
+  s0 = fl0 * gl2 + fl1 * gl1 + fl2 * gl0 + fl3 * ql4 + fl4 * ql3
+  s1 = fl0 * gh2 + fh0 * gl2 + fl1 * gh1 + fh1 * gl1 + fl2 * gh0
+  s1 = s1 + fh2 * gl0 + fl3 * qh4 + fh3 * ql4 + fl4 * qh3 + fh4 * ql3
+  s2 = fh0 * gh2 + fh1 * gh1 + fh2 * gh0 + fh3 * qh4 + fh4 * qh3
+  lo = s0 + ((s1 & m25) << 26) + c
+  let r2 = lo & fe25519Mask()
+  c = (lo >> 51) + (s1 >> 25) + (s2 << 1)
 
   // h3 = f0*g3 + f1*g2 + f2*g1 + f3*g0 + 19*f4*g4
-  acc[0] = 0
-  acc[1] = 0
-  fe25519MulAdd(acc, f[0], g[3])
-  fe25519MulAdd(acc, f[1], g[2])
-  fe25519MulAdd(acc, f[2], g[1])
-  fe25519MulAdd(acc, f[3], g[0])
-  fe25519MulAdd(acc, f[4], g4_19)
-  tLo[3] = acc[0]
-  tHi[3] = acc[1]
+  s0 = fl0 * gl3 + fl1 * gl2 + fl2 * gl1 + fl3 * gl0 + fl4 * ql4
+  s1 = fl0 * gh3 + fh0 * gl3 + fl1 * gh2 + fh1 * gl2 + fl2 * gh1
+  s1 = s1 + fh2 * gl1 + fl3 * gh0 + fh3 * gl0 + fl4 * qh4 + fh4 * ql4
+  s2 = fh0 * gh3 + fh1 * gh2 + fh2 * gh1 + fh3 * gh0 + fh4 * qh4
+  lo = s0 + ((s1 & m25) << 26) + c
+  let r3 = lo & fe25519Mask()
+  c = (lo >> 51) + (s1 >> 25) + (s2 << 1)
 
   // h4 = f0*g4 + f1*g3 + f2*g2 + f3*g1 + f4*g0
-  acc[0] = 0
-  acc[1] = 0
-  fe25519MulAdd(acc, f[0], g[4])
-  fe25519MulAdd(acc, f[1], g[3])
-  fe25519MulAdd(acc, f[2], g[2])
-  fe25519MulAdd(acc, f[3], g[1])
-  fe25519MulAdd(acc, f[4], g[0])
-  tLo[4] = acc[0]
-  tHi[4] = acc[1]
+  s0 = fl0 * gl4 + fl1 * gl3 + fl2 * gl2 + fl3 * gl1 + fl4 * gl0
+  s1 = fl0 * gh4 + fh0 * gl4 + fl1 * gh3 + fh1 * gl3 + fl2 * gh2
+  s1 = s1 + fh2 * gl2 + fl3 * gh1 + fh3 * gl1 + fl4 * gh0 + fh4 * gl0
+  s2 = fh0 * gh4 + fh1 * gh3 + fh2 * gh2 + fh3 * gh1 + fh4 * gh0
+  lo = s0 + ((s1 & m25) << 26) + c
+  let r4 = lo & fe25519Mask()
+  c = (lo >> 51) + (s1 >> 25) + (s2 << 1)
 
-  // Carry the five 128-bit columns down to 51-bit limbs. The carry out of the
-  // top column re-enters limb 0 scaled by 19 (2^255 = 19 mod p).
-  let h = []u64(5)
-  let c = (tLo[0] >> 51) | (tHi[0] << 13)
-  h[0] = tLo[0] & fe25519Mask()
-  fe25519Carry(tLo, tHi, 1, c)
-  c = (tLo[1] >> 51) | (tHi[1] << 13)
-  h[1] = tLo[1] & fe25519Mask()
-  fe25519Carry(tLo, tHi, 2, c)
-  c = (tLo[2] >> 51) | (tHi[2] << 13)
-  h[2] = tLo[2] & fe25519Mask()
-  fe25519Carry(tLo, tHi, 3, c)
-  c = (tLo[3] >> 51) | (tHi[3] << 13)
-  h[3] = tLo[3] & fe25519Mask()
-  fe25519Carry(tLo, tHi, 4, c)
-  c = (tLo[4] >> 51) | (tHi[4] << 13)
-  h[4] = tLo[4] & fe25519Mask()
-
-  h[0] = h[0] + 19 * c
-  c = h[0] >> 51
-  h[0] = h[0] & fe25519Mask()
-  h[1] = h[1] + c
-  c = h[1] >> 51
-  h[1] = h[1] & fe25519Mask()
-  h[2] = h[2] + c
-  return h
+  // c < 2^60 carries past 2^255: 19*c wraps a u64, so its low 51 bits enter
+  // limb 0 and its high bits (times 2^51) enter limb 1, each scaled by 19.
+  r0 = r0 + 19 * (c & fe25519Mask())
+  r1 = r1 + 19 * (c >> 51)
+  r1 = r1 + (r0 >> 51)
+  r0 = r0 & fe25519Mask()
+  r2 = r2 + (r1 >> 51)
+  r1 = r1 & fe25519Mask()
+  h[0] = r0
+  h[1] = r1
+  h[2] = r2
+  h[3] = r3
+  h[4] = r4
 }
 
-// Square `f` `n` times: f^(2^n) mod p.
-fn fe25519SqN(f: []u64, n: int): []u64 {
-  let r = f
+// h = f * g mod p in place (`h` may alias either input).
+fn fe25519MulTo(h: []u64, f: []u64, g: []u64) { fe25519MulCore(h, f, g) }
+
+// h = f^2 mod p in place (`h` may alias `f`).
+fn fe25519SqrTo(h: []u64, f: []u64) { fe25519MulCore(h, f, f) }
+
+// h = (f + g) mod p in place, weakly reduced (`h` may alias either input).
+fn fe25519AddTo(h: []u64, f: []u64, g: []u64) {
+  h[0] = f[0] + g[0]
+  h[1] = f[1] + g[1]
+  h[2] = f[2] + g[2]
+  h[3] = f[3] + g[3]
+  h[4] = f[4] + g[4]
+  fe25519WeakReduce(h)
+}
+
+// h = (f - g) mod p in place, weakly reduced (`h` may alias either input). Each
+// limb of 2*p is added before subtracting `g` so the u64 arithmetic never
+// underflows; 2*p is a multiple of p, so the result is unchanged mod p.
+fn fe25519SubTo(h: []u64, f: []u64, g: []u64) {
+  h[0] = f[0] + fe25519TwoP0() - g[0]
+  h[1] = f[1] + fe25519TwoPn() - g[1]
+  h[2] = f[2] + fe25519TwoPn() - g[2]
+  h[3] = f[3] + fe25519TwoPn() - g[3]
+  h[4] = f[4] + fe25519TwoPn() - g[4]
+  fe25519WeakReduce(h)
+}
+
+// h = f, limb by limb.
+fn fe25519Copy(h: []u64, f: []u64) {
+  h[0] = f[0]
+  h[1] = f[1]
+  h[2] = f[2]
+  h[3] = f[3]
+  h[4] = f[4]
+}
+
+// h = h^(2^n) mod p in place: `n` successive squarings.
+fn fe25519SqNTo(h: []u64, n: int) {
   let i = 0
   while (i < n) {
-    r = fe25519Sqr(r)
+    fe25519MulCore(h, h, h)
     i = i + 1
   }
-  return r
+}
+
+// The shared prefix of the inversion and square-root exponents: out =
+// z^(2^250 - 1) and z11 = z^11, by the standard Curve25519 addition chain.
+// `out`, `z11`, `t1` and `t2` are written; all five arguments must be distinct.
+fn fe25519Pow22501(out: []u64, z11: []u64, t1: []u64, t2: []u64, z: []u64) {
+  fe25519SqrTo(out, z)       // z^2
+  fe25519SqrTo(t1, out)      // z^4
+  fe25519SqrTo(t1, t1)       // z^8
+  fe25519MulTo(t1, z, t1)    // z^9
+  fe25519MulTo(out, out, t1) // z^11
+  fe25519Copy(z11, out)
+  fe25519SqrTo(out, out)     // z^22
+  fe25519MulTo(out, t1, out) // 2^5 - 1
+  fe25519SqrTo(t1, out)
+  fe25519SqNTo(t1, 4)        // 2^10 - 2^5
+  fe25519MulTo(out, t1, out) // 2^10 - 1
+  fe25519SqrTo(t1, out)
+  fe25519SqNTo(t1, 9)       // 2^20 - 2^10
+  fe25519MulTo(t1, t1, out) // 2^20 - 1
+  fe25519SqrTo(t2, t1)
+  fe25519SqNTo(t2, 19)       // 2^40 - 2^20
+  fe25519MulTo(t1, t2, t1)   // 2^40 - 1
+  fe25519SqNTo(t1, 10)       // 2^50 - 2^10
+  fe25519MulTo(out, t1, out) // 2^50 - 1
+  fe25519SqrTo(t1, out)
+  fe25519SqNTo(t1, 49)      // 2^100 - 2^50
+  fe25519MulTo(t1, t1, out) // 2^100 - 1
+  fe25519SqrTo(t2, t1)
+  fe25519SqNTo(t2, 99)       // 2^200 - 2^100
+  fe25519MulTo(t1, t2, t1)   // 2^200 - 1
+  fe25519SqNTo(t1, 50)       // 2^250 - 2^50
+  fe25519MulTo(out, t1, out) // 2^250 - 1
+}
+
+// out = z^(-1) = z^(p-2) = z^(2^255 - 21) mod p, allocation-free. `t1`..`t3`
+// are scratch; all five arguments must be distinct. The inverse of 0 is 0.
+fn fe25519InvertTo(out: []u64, z: []u64, t1: []u64, t2: []u64, t3: []u64) {
+  fe25519Pow22501(out, t1, t2, t3, z)
+  fe25519SqNTo(out, 5)       // 2^255 - 2^5
+  fe25519MulTo(out, out, t1) // 2^255 - 21
 }
 
 // Decode 32 little-endian bytes into a field element. Bit 255 of the input is
@@ -222,12 +311,17 @@ fn fe25519SqN(f: []u64, n: int): []u64 {
 // `s` must be at least 32 bytes.
 export fn fe25519FromBytes(s: []byte): []u64 {
   let h = []u64(5)
+  fe25519FromBytesTo(h, s)
+  return h
+}
+
+// `fe25519FromBytes` into the caller's element `h`, allocation-free.
+fn fe25519FromBytesTo(h: []u64, s: []byte) {
   h[0] = fe25519Load64(s, 0) & fe25519Mask()
   h[1] = (fe25519Load64(s, 6) >> 3) & fe25519Mask()
   h[2] = (fe25519Load64(s, 12) >> 6) & fe25519Mask()
   h[3] = (fe25519Load64(s, 19) >> 1) & fe25519Mask()
   h[4] = (fe25519Load64(s, 24) >> 12) & fe25519Mask()
-  return h
 }
 
 // Fully reduce `f` mod p and serialize it as 32 little-endian bytes — the unique
@@ -238,6 +332,13 @@ export fn fe25519FromBytes(s: []byte): []u64 {
 // bias of 2^51) either does or does not set the 2^255 bit; masking that bit off
 // leaves exactly the representative in [0, p). No branch depends on the value.
 export fn fe25519ToBytes(f: []u64): []byte {
+  let out = []byte(32)
+  fe25519PutBytes(out, f)
+  return out
+}
+
+// `fe25519ToBytes` into the caller's 32-byte `out`, allocation-free.
+fn fe25519PutBytes(out: []byte, f: []u64) {
   let t0 = f[0]
   let t1 = f[1]
   let t2 = f[2]
@@ -299,68 +400,39 @@ export fn fe25519ToBytes(f: []u64): []byte {
   t3 = t3 & fe25519Mask()
   t4 = t4 & fe25519Mask()
 
-  // Repack the five 51-bit limbs as 32 little-endian bytes with a sliding
-  // window: `acc` holds `bits` pending low bits, emitted a byte at a time.
-  let limbs = []u64(5)
-  limbs[0] = t0
-  limbs[1] = t1
-  limbs[2] = t2
-  limbs[3] = t3
-  limbs[4] = t4
-  let out = []byte(32)
-  let acc: u64 = 0
-  let bits: u64 = 0
-  let idx = 0
-  let i = 0
-  while (i < 5) {
-    acc = acc | (limbs[i] << bits)
-    bits = bits + 51
-    while (bits >= 8) {
-      out[idx] = byte(acc)
-      idx = idx + 1
-      acc = acc >> 8
-      bits = bits - 8
-    }
-    i = i + 1
-  }
-  out[idx] = byte(acc)
-  return out
+  // Repack the five 51-bit limbs as four little-endian 64-bit words.
+  fe25519Store64(out, 0, t0 | (t1 << 51))
+  fe25519Store64(out, 8, (t1 >> 13) | (t2 << 38))
+  fe25519Store64(out, 16, (t2 >> 26) | (t3 << 25))
+  fe25519Store64(out, 24, (t3 >> 39) | (t4 << 12))
 }
 
 // Field addition: (f + g) mod p, returned weakly reduced.
 export fn fe25519Add(f: []u64, g: []u64): []u64 {
   let h = []u64(5)
-  h[0] = f[0] + g[0]
-  h[1] = f[1] + g[1]
-  h[2] = f[2] + g[2]
-  h[3] = f[3] + g[3]
-  h[4] = f[4] + g[4]
-  fe25519WeakReduce(h)
+  fe25519AddTo(h, f, g)
   return h
 }
 
-// Field subtraction: (f - g) mod p, returned weakly reduced. Each limb of 2*p is
-// added before subtracting `g` so the u64 arithmetic never underflows; 2*p is a
-// multiple of p, so the result is unchanged mod p.
+// Field subtraction: (f - g) mod p, returned weakly reduced.
 export fn fe25519Sub(f: []u64, g: []u64): []u64 {
   let h = []u64(5)
-  h[0] = f[0] + fe25519TwoP0() - g[0]
-  h[1] = f[1] + fe25519TwoPn() - g[1]
-  h[2] = f[2] + fe25519TwoPn() - g[2]
-  h[3] = f[3] + fe25519TwoPn() - g[3]
-  h[4] = f[4] + fe25519TwoPn() - g[4]
-  fe25519WeakReduce(h)
+  fe25519SubTo(h, f, g)
   return h
 }
 
 // Field multiplication: (f * g) mod p.
 export fn fe25519Mul(f: []u64, g: []u64): []u64 {
-  return fe25519MulCore(f, g)
+  let h = []u64(5)
+  fe25519MulCore(h, f, g)
+  return h
 }
 
 // Field squaring: (f * f) mod p.
 export fn fe25519Sqr(f: []u64): []u64 {
-  return fe25519MulCore(f, f)
+  let h = []u64(5)
+  fe25519MulCore(h, f, f)
+  return h
 }
 
 // Multiply by the curve constant 121666 (used by the X25519 Montgomery ladder):
@@ -386,40 +458,11 @@ export fn fe25519Mul121666(f: []u64): []u64 {
   return h
 }
 
-// Field inverse: z^(-1) mod p, computed as z^(p-2) by Fermat's little theorem.
-// The exponent p-2 = 2^255 - 21 is reached with the standard Curve25519
-// addition chain (11 multiplies, 254 squarings). `z` must be nonzero; the
-// inverse of 0 is 0 (there is no branch to reject it).
+// Field inverse: z^(-1) mod p, computed as z^(p-2) by Fermat's little theorem
+// (`fe25519InvertTo`). `z` must be nonzero; the inverse of 0 is 0 (there is no
+// branch to reject it).
 export fn fe25519Invert(z: []u64): []u64 {
-  let t0 = fe25519Sqr(z)  // z^2
-  let t1 = fe25519Sqr(t0) // z^4
-  t1 = fe25519Sqr(t1)     // z^8
-  t1 = fe25519Mul(z, t1)  // z^9
-  t0 = fe25519Mul(t0, t1) // z^11
-  let t2 = fe25519Sqr(t0) // z^22
-  t1 = fe25519Mul(t1, t2) // 2^5 - 1
-  t2 = fe25519Sqr(t1)
-  t2 = fe25519SqN(t2, 4)  // 2^10 - 2^5
-  t1 = fe25519Mul(t2, t1) // 2^10 - 1
-  t2 = fe25519Sqr(t1)
-  t2 = fe25519SqN(t2, 9)  // 2^20 - 2^10
-  t2 = fe25519Mul(t2, t1) // 2^20 - 1
-  let t3 = fe25519Sqr(t2)
-  t3 = fe25519SqN(t3, 19) // 2^40 - 2^20
-  t2 = fe25519Mul(t3, t2) // 2^40 - 1
-  t2 = fe25519Sqr(t2)
-  t2 = fe25519SqN(t2, 9)  // 2^50 - 2^10
-  t1 = fe25519Mul(t2, t1) // 2^50 - 1
-  t2 = fe25519Sqr(t1)
-  t2 = fe25519SqN(t2, 49) // 2^100 - 2^50
-  t2 = fe25519Mul(t2, t1) // 2^100 - 1
-  t3 = fe25519Sqr(t2)
-  t3 = fe25519SqN(t3, 99) // 2^200 - 2^100
-  t2 = fe25519Mul(t3, t2) // 2^200 - 1
-  t2 = fe25519Sqr(t2)
-  t2 = fe25519SqN(t2, 49) // 2^250 - 2^50
-  t1 = fe25519Mul(t2, t1) // 2^250 - 1
-  t1 = fe25519Sqr(t1)
-  t1 = fe25519SqN(t1, 4)    // 2^255 - 2^5
-  return fe25519Mul(t1, t0) // 2^255 - 21 = z^(p-2)
+  let out = []u64(5)
+  fe25519InvertTo(out, z, []u64(5), []u64(5), []u64(5))
+  return out
 }
