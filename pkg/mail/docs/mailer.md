@@ -293,6 +293,7 @@ fn advice(e: MailError): string {
     Rejected(r) => return "do not retry: ${r.toString()}"
     Signature(why) => return "answer 401: ${why}"
     Transient(r) => return "retry later: ${r.toString()}"
+    Unknown(r) => return "may have been delivered, check first: ${r.toString()}"
   }
 }
 
@@ -311,9 +312,13 @@ fn main(): ()! {
   check; see [Webhooks](webhooks.md). It is not about a send.
 * **`Transient`**: the server cannot take it now. This is the only variant a
   retry is for, and `send` already retries it; see [Retries and pace](retry.md).
+* **`Unknown`**: the request reached the provider and the answer never came
+  back, so the mail may have been taken. A provider without an idempotency key
+  (Postmark) reports a reset or a timeout after the write this way instead of
+  `Transient`, and `send` does not repeat it: a retry could deliver it twice.
 
 `Invalid`, `Config` and `Signature` carry text naming the field or the reason;
-`Auth`, `Rejected` and `Transient` carry the server's `Reply`: its `code`, its
+`Auth`, `Rejected`, `Transient` and `Unknown` carry the server's `Reply`: its `code`, its
 `enhanced` status code (`""` when it sent none) and its `text`.
 
 ## Where to go next

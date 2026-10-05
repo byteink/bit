@@ -15,10 +15,13 @@ first place.
 
 A `send` that fails with `MailError.Transient` is tried again. That is the
 server's temporary answer: a 4xx reply, or a connection that could not be made
-or broke. The other four kinds return at once, because the same mail gets the
+or broke. The other five kinds return at once, because the same mail gets the
 same answer: `Invalid` and `Config` are mistakes in the program, `Auth` is a
 refused login, and `Rejected` is a 5xx, a refusal for good. A 550 is never sent
-twice.
+twice. `Unknown` is the odd one: the request was written to a provider with no
+idempotency key and then cut off, so the mail may already be delivered and a
+repeat could send it twice. It is for you to decide, not the retry loop; see
+[Sending through Postmark](postmark.md).
 
 The defaults retry twice (three tries in all), so `Options{}` already does the
 right thing. This mailer retries harder, and waits less:
