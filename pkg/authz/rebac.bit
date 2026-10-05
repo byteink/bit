@@ -1,0 +1,302 @@
+// pkg/authz/rebac.bit — ReBAC: declaring the relations a type has, and the
+// check that walks relationship tuples (relation.bit) to answer "is this
+// subject an `editor` of that folder?".
+//
+//   authz.resource<Folder>()?.resource<Team>()?
+//   authz.relation<Team>("member")?
+//   authz.relation<Folder>("parent")?.relation<Folder>("editor", inherit = "parent")?
+//   authz.relate("team:eng#member", "editor", "folder:launch")?
+//   authz.hasRelation("user:sara", "editor", "folder:launch")?
+//
+// DECLARATIONS. A tuple names a relation, and a relation nobody declared is
+// a typo that would silently never match, so `relation<T>(name)` declares
+// what each type has and `relate`, `unrelate`, `related` and `hasRelation`
+// refuse the rest with an InvalidPolicy (OpenFGA and SpiceDB both make the
+// model say so). `inherit = "parent"` is the one rewrite there is, SpiceDB's
+// `editor = editor + parent->editor`: whoever is `editor` of an object's
+// `parent` is `editor` of the object too. There is no general rewrite
+// language.
+//
+// THE CHECK is Zanzibar's, breadth first and iterative, starting at
+// `object#relation`. At each node it reads the node's direct subjects: the
+// asked-for subject is a hit; a userset `type:id#rel` becomes the node
+// `type:id#rel`; and if the relation inherits, each object in the `via`
+// relation becomes the node `object#relation`. A node is visited once, so a
+// cycle ends instead of looping.
+//
+// BOUNDS. Every one is an option on `Authz<A>(...)` and every one fails
+// closed:
+//
+//  - maxDepth (8): the most hops from the start node. A direct tuple is 0
+//    hops, `team:eng#member` reaching it is 1.
+//  - maxVisited (10_000): the most distinct nodes.
+//  - maxFanout (10_000): the most subjects read from one node. A store is
+//    read in pages of at most `relationPage`.
+//
+// Reaching a bound with no answer is a RelationLimit, which is NOT related;
+// a hit found before or beside it still answers true.
+
+import { indexOf, join } from "std/strings"
+import { sorted } from "std/sort"
+import { Tabled } from "orm"
+
+const defaultMaxDepth: int = 8
+const defaultMaxVisited: int = 10_000
+const defaultMaxFanout: int = 10_000
+
+// The most subjects asked of a store in one call.
+const relationPage: int = 1000
+
+// One declared relation of a type: `typ` as tuples spell it ("folder").
+// `inherit` is "" or the relation whose objects' same-named relation also
+// counts.
+class RelationDecl {
+  typ: string,
+  name: string,
+  inherit: string,
+}
+
+class Limits {
+  maxDepth: int,
+  maxVisited: int,
+  maxFanout: int,
+}
+
+// The three bounds, each of which must allow at least one.
+fn newLimits(maxDepth: int, maxVisited: int, maxFanout: int): Limits! {
+  if (maxDepth < 1 || maxVisited < 1 || maxFanout < 1) {
+    refuse("maxDepth, maxVisited and maxFanout must each be at least 1")?
+  }
+  return Limits{ maxDepth = maxDepth, maxVisited = maxVisited, maxFanout = maxFanout }
+}
+
+fn declNamed(decls: []RelationDecl, typ: string, name: string): Option<RelationDecl> {
+  for d of decls {
+    if (d.typ == typ && d.name == name) {
+      return Option<RelationDecl>.Some(d)
+    }
+  }
+  return Option<RelationDecl>.None
+}
+
+// The relation `name` of `typ` inherits through, or "".
+fn inheritOf(decls: []RelationDecl, typ: string, name: string): string {
+  return match (declNamed(decls, typ, name)) {
+    Some(d) => d.inherit
+    None => ""
+  }
+}
+
+fn declaredNames(decls: []RelationDecl, typ: string): []string {
+  let names = []string(0)
+  for d of decls {
+    if (d.typ == typ) {
+      names = append(names, d.name)
+    }
+  }
+  return sorted(names, (a, b) => a < b)
+}
+
+// The type of a `type:id` reference, or "" for one with no ':'.
+fn typeOfRef(ref: string): string {
+  let colon = indexOf(ref, ":")
+  if (colon < 0) {
+    return ""
+  }
+  return ref[0:colon]
+}
+
+// `role` must be a relation `typ` declares, or an InvalidPolicy that lists
+// the ones it does.
+fn checkDeclared(decls: []RelationDecl, typ: string, name: string, role: string): ()! {
+  if (isSome(declNamed(decls, typ, name))) {
+    return
+  }
+  let have = declaredNames(decls, typ)
+  let listed = "none"
+  if (len(have) > 0) {
+    listed = join(have, ", ")
+  }
+  refuse("${role} is not declared on ${typ} (declared: ${listed})")?
+}
+
+// `inherit` must be another relation `typ` already declares.
+fn checkInherit(decls: []RelationDecl, typ: string, name: string, inherit: string): ()! {
+  checkRelation("inherit", inherit)?
+  if (inherit == name) {
+    refuse("relation ${name} cannot inherit through itself")?
+  }
+  if (!isSome(declNamed(decls, typ, inherit))) {
+    refuse("relation ${name} inherits through ${inherit}, which ${typ} does not declare (declare it first)")?
+  }
+}
+
+// The declaration of relation `name` on T, which must be registered, must
+// not have it yet and, when it inherits, must declare `inherit` first.
+fn newDecl<T: Tabled>(
+  resources: []ResourceInfo,
+  decls: []RelationDecl,
+  name: string,
+  inherit: string,
+): RelationDecl! {
+  checkRelation("relation", name)?
+  let cls = T.__className()
+  let found = findResource(resources, cls)
+  if (!isSome(found)) {
+    refuse("${cls} is not registered; call resource<${cls}>() first")?
+  }
+  let typ = typeNameOf(cls)
+  if (isSome(declNamed(decls, typ, name))) {
+    refuse("relation ${name} is declared twice on ${cls}")?
+  }
+  if (inherit != "") {
+    checkInherit(decls, typ, name, inherit)?
+  }
+  return RelationDecl{ typ = typ, name = name, inherit = inherit }
+}
+
+// A node the walk will read: `object#relation`, `depth` hops from the start.
+class Node {
+  object: string,
+  relation: string,
+  depth: int,
+}
+
+// One check in flight. `hit` is the first bound reached ("" if none) and
+// `bound` its value.
+class Walk {
+  store: RelationStore,
+  decls: []RelationDecl,
+  limits: Limits,
+  queue: []Node,
+  visited: map<string, bool>,
+  hit: string,
+  bound: int,
+}
+
+fn note(w: Walk, limit: string, bound: int) {
+  if (w.hit == "") {
+    w.hit = limit
+    w.bound = bound
+  }
+}
+
+// Queues `object#relation` unless it was visited (a cycle: silent) or a
+// bound forbids it (noted).
+fn push(w: Walk, object: string, relation: string, depth: int) {
+  let key = slotKey(object, relation)
+  let (_, seen) = w.visited[key]
+  if (seen) {
+    return
+  }
+  if (depth > w.limits.maxDepth) {
+    note(w, "maxDepth", w.limits.maxDepth)
+    return
+  }
+  if (len(w.visited) >= w.limits.maxVisited) {
+    note(w, "maxVisited", w.limits.maxVisited)
+    return
+  }
+  w.visited[key] = true
+  w.queue = append(w.queue, Node{ object = object, relation = relation, depth = depth })
+}
+
+// A direct subject of a node: the asked-for one is a hit, a userset is
+// another node.
+fn visitDirect(w: Walk, node: Node, s: string, subject: string): bool {
+  if (s == subject) {
+    return true
+  }
+  let hash = indexOf(s, "#")
+  if (hash >= 0) {
+    push(w, s[0:hash], s[hash + 1:], node.depth + 1)
+  }
+  return false
+}
+
+// An object in the `via` relation of a node: its same-named relation counts.
+// A userset there is not an object and is ignored.
+fn visitParent(w: Walk, node: Node, s: string) {
+  if (indexOf(s, "#") < 0) {
+    push(w, s, node.relation, node.depth + 1)
+  }
+}
+
+fn visit(w: Walk, node: Node, s: string, subject: string, via: bool): bool {
+  if (via) {
+    visitParent(w, node, s)
+    return false
+  }
+  return visitDirect(w, node, s, subject)
+}
+
+// Reads `relation` of the node's object a page at a time, and stops at the
+// maxFanout-th subject. One subject past it is read to know there is more.
+fn scan(w: Walk, node: Node, relation: string, subject: string, via: bool): bool! {
+  let fanout = w.limits.maxFanout
+  let offset = 0
+  while (offset <= fanout) {
+    let want = fanout + 1 - offset
+    if (want > relationPage) {
+      want = relationPage
+    }
+    let subs = w.store.direct(node.object, relation, offset, want)?
+    if (len(subs) > want) {
+      fail newError("authz: RelationStore.direct() returned ${len(subs)} subjects for a limit of ${want}")
+    }
+    let i = 0
+    while (i < len(subs)) {
+      if (offset + i >= fanout) {
+        note(w, "maxFanout", fanout)
+        return false
+      }
+      if (visit(w, node, subs[i], subject, via)) {
+        return true
+      }
+      i = i + 1
+    }
+    if (len(subs) < want) {
+      return false
+    }
+    offset = offset + want
+  }
+  return false
+}
+
+// Reads one node: its direct subjects, then its `inherit` relation's objects.
+fn expand(w: Walk, node: Node, subject: string): bool! {
+  if (scan(w, node, node.relation, subject, false)?) {
+    return true
+  }
+  let via = inheritOf(w.decls, typeOfRef(node.object), node.relation)
+  if (via == "") {
+    return false
+  }
+  return scan(w, node, via, subject, true)?
+}
+
+// Whether `t.subject` holds `t.relation` on `t.object`, for a validated
+// tuple. A store failure is returned as it is: the check fails closed.
+fn walk(store: RelationStore, decls: []RelationDecl, limits: Limits, t: Tuple): bool! {
+  let w = Walk{
+    store = store,
+    decls = decls,
+    limits = limits,
+    queue = []Node(0),
+    visited = map<string, bool>(),
+    hit = "",
+    bound = 0,
+  }
+  push(w, t.object, t.relation, 0)
+  let head = 0
+  while (head < len(w.queue)) {
+    if (expand(w, w.queue[head], t.subject)?) {
+      return true
+    }
+    head = head + 1
+  }
+  if (w.hit != "") {
+    fail RelationLimit{ limit = w.hit, bound = w.bound }
+  }
+  return false
+}
