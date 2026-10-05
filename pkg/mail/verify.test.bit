@@ -1,0 +1,423 @@
+// pkg/mail/verify.test.bit — `Mailer.verify` (verify.bit): every transport
+// proves itself without a message, every DKIM key is compared with the record a
+// fake DNS serves, and every problem comes back in one error.
+//
+// The transports are the same in-test servers the other test files use: the
+// SMTP fakes of smtp.test.bit (`smStartTls`) and the HTTPS fake of
+// resend.test.bit (`rsStart`, one scripted answer per connection), so a test
+// reads the exact request a `check` made. DNS is a script handed to
+// `Mailer.lookup`: std/net's own seam, `lookupTxtVia`, is not exported, and its
+// join of a split record is tested in stdlib/net/txt.test.bit.
+
+import { remove } from "std/fs"
+import { Second } from "std/time"
+
+// The public half of `rsaPkcs8Pem` (dkim.test.bit) as `openssl pkey -pubout`
+// writes it: the SubjectPublicKeyInfo DER, base64.
+const vfRsaP: string = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtCwjaMR+WfDbpeb2I++bfhZA+8WC0l0AMhZHF+eFDhnH2s0V8m8vbbC4YHA+G1IAW1WUpttaW9sg49t/pKwUEVhDwx4ay1rKel/f4SDKEqapEOCrVBLC+eKtH+bdXhqhHfIav3qteDY0Ke1Yq810qnL8bT7/PWkayAjtwm9VUkoXu3VqSfBOOfoTUJjNkzxOeG0ProWwdhAROnjMWEhlzYprMPZqGxqEqTtGy16oZ9Jupt+FpYBw7ouTh+7tPp/+jcp/lGMgur0mcbh6GLmvQWOiKc+EQLWhvOf8SQzuUON51X3ifbyGSHzWmX4hRktOJtmQgrZcs+i3UaqNgrcr8QIDAQAB"
+
+const vfRsaName: string = "rsa1._domainkey.inkwell.dev"
+const vfEdName: string = "ed1._domainkey.inkwell.dev"
+
+fn vfRsaTxt(): string {
+  return "v=DKIM1; k=rsa; p=${vfRsaP}"
+}
+
+fn vfEdTxt(): string {
+  return "v=DKIM1; k=ed25519; p=${rfcEdPublic}"
+}
+
+// The two keys of Inkwell's setup: RSA, and Ed25519 beside it.
+fn vfKeys(): []Dkim {
+  return [
+    Dkim{ domain = "inkwell.dev", selector = "rsa1", key = rsaPkcs8Pem },
+    Dkim{ domain = "inkwell.dev", selector = "ed1", key = rfcEdPem },
+  ]
+}
+
+// A fake DNS: the records it serves by name, the names it was asked for, and
+// the names it fails for.
+class VfDns {
+  records: map<string, []string>
+  asked: []string
+  broken: string = ""
+
+  answer(name: string): []string! {
+    this.asked = append(this.asked, name)
+    if (name == this.broken) {
+      fail newError("lookupTxt ${name}: no answer (timeout or server failure)")
+    }
+    return this.records[name]
+  }
+}
+
+fn vfDns(rsa: []string, ed: []string): VfDns {
+  return VfDns{ records = { vfRsaName: rsa, vfEdName: ed }, asked = [] }
+}
+
+// `m` reads its DKIM records from `dns`.
+fn vfServe(m: Mailer, dns: VfDns) {
+  let f: TxtLookup = (name) => {
+    return dns.answer(name)?
+  }
+  m.lookup = f
+}
+
+fn vfOpts(): Options {
+  return Options{
+    from = "Inkwell <hello@inkwell.dev>",
+    timeout = 10 * Second,
+    retry = Retry{ attempts = 1 },
+    dkim = vfKeys(),
+  }
+}
+
+// A `Mailer` through `url`.
+fn vfOpen(url: string, opts: Options): Mailer {
+  return open(url, opts) catch e {
+    panic("open: ${e.message()}")
+  }
+}
+
+// What `verify` fails with; panics when it passes.
+fn vfFail(m: Mailer): string {
+  m.verify() catch e {
+    assert(
+      contains(e.message(), "mail: configuration: verify found"),
+      "not a Config: ${e.message()}",
+    )
+    return e.message()
+  }
+  panic("verify passed against a setup scripted to fail")
+}
+
+// The problem lines of a `verify` failure, one per line after the first.
+fn vfLines(msg: string): []string {
+  let lines = split(msg, "\n")
+  return lines[1:]
+}
+
+fn vfOk(m: Mailer) {
+  m.verify() catch e {
+    assert(false, "verify: ${e.message()}")
+  }
+}
+
+fn vfMailerOutbox(dns: VfDns): Mailer {
+  let m = Mailer(Outbox(), vfOpts()) catch e {
+    panic("Mailer: ${e.message()}")
+  }
+  vfServe(m, dns)
+  return m
+}
+
+test "a correct setup verifies, asks DNS for each selector and sends nothing" {
+  let box = Outbox()
+  let m = Mailer(box, vfOpts()) catch e {
+    panic("Mailer: ${e.message()}")
+  }
+  let dns = vfDns([vfRsaTxt()], [vfEdTxt()])
+  vfServe(m, dns)
+  vfOk(m)
+  assert(len(dns.asked) == 2, "asked ${len(dns.asked)} names")
+  assert(dns.asked[0] == vfRsaName && dns.asked[1] == vfEdName, "asked ${join(dns.asked, ",")}")
+  assert(len(box.sent()) == 0, "verify sent ${len(box.sent())} mails")
+}
+
+test "a mailer without DKIM keys verifies without asking DNS" {
+  let m = Mailer(Outbox(), Options{ from = "Inkwell <hello@inkwell.dev>" }) catch e {
+    panic("Mailer: ${e.message()}")
+  }
+  let dns = vfDns([], [])
+  vfServe(m, dns)
+  vfOk(m)
+  assert(len(dns.asked) == 0, "asked ${join(dns.asked, ",")}")
+}
+
+test "a record whose p= is another key fails with the TXT value to publish" {
+  let other = "v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDwIRP/UC3SBsEmGqZ9ZJW3/DkMoGeLnQg1fWn7/zYtIxN2SnFCjxOCKG9v3b4jYfcTNh5ijSsq631uBItLa7od+v/RtdC2UzJ1lWT947Qsp0DoxM6DnkXOZEdWCKDQ10Lc3SPHnZWSpLidMvIHBnfCPPm6zLyBo/XGAhhPpv+FAQIDAQAB"
+  let m = vfMailerOutbox(vfDns([other], [vfEdTxt()]))
+  let lines = vfLines(vfFail(m))
+  assert(len(lines) == 1, "lines: ${join(lines, "|")}")
+  assert(hasPrefix(lines[0], "  ${vfRsaName}: p= is a different key"), lines[0])
+  assert(
+    hasSuffix(lines[0], "publish this TXT value: ${vfRsaTxt()}"),
+    "the expected TXT is not printed: ${lines[0]}",
+  )
+}
+
+test "an Ed25519 key is compared on its raw 32 bytes" {
+  let m = vfMailerOutbox(vfDns([vfRsaTxt()], ["v=DKIM1; k=ed25519; p=AAAA"]))
+  let lines = vfLines(vfFail(m))
+  assert(len(lines) == 1, "lines: ${join(lines, "|")}")
+  assert(contains(lines[0], vfEdName), lines[0])
+  assert(hasSuffix(lines[0], "publish this TXT value: ${vfEdTxt()}"), lines[0])
+}
+
+test "a record split into two TXT strings, joined as lookupTxt joins them, passes" {
+  let cut = 120
+  let joined = "v=DKIM1; k=rsa; p=${vfRsaP[0:cut]}" + vfRsaP[cut:]
+  let m = vfMailerOutbox(vfDns([joined], [vfEdTxt()]))
+  vfOk(m)
+}
+
+test "a p= folded across lines and padded with white space passes" {
+  let folded = "v=DKIM1;\t k=rsa;\r\n p=${vfRsaP[0:100]}\r\n\t${vfRsaP[100:200]} ${vfRsaP[200:]} ;"
+  let m = vfMailerOutbox(vfDns([folded], [vfEdTxt()]))
+  vfOk(m)
+}
+
+test "a record with no k= is an RSA record, so an Ed25519 key needs its own k=" {
+  let m = vfMailerOutbox(vfDns(["p=${vfRsaP}"], ["v=DKIM1; p=${rfcEdPublic}"]))
+  let lines = vfLines(vfFail(m))
+  assert(len(lines) == 1, "lines: ${join(lines, "|")}")
+  assert(contains(lines[0], "${vfEdName}: k=rsa but the configured key is ed25519"), lines[0])
+}
+
+test "each way a record can be wrong names its reason" {
+  let none: []string = []
+  let cases = [
+    (none, "no TXT record is published"),
+    ([vfRsaTxt(), vfRsaTxt()], "2 TXT records are published"),
+    (["v=DKIM1; k=rsa; p="], "the key is revoked: p= is empty"),
+    (["v=DKIM1; k=rsa"], "the record has no p= tag"),
+    (["v=DKIM2; k=rsa; p=${vfRsaP}"], "v=DKIM2 where DKIM1 is required"),
+    (["v=DKIM1; k=ed25519; p=${vfRsaP}"], "k=ed25519 but the configured key is rsa"),
+    (["v=DKIM1; k=rsa; p=!!!"], "p= is not base64"),
+    (["not a tag list"], "the record is not a list of name=value tags"),
+    (["v=DKIM1; p=${vfRsaP}; p=${vfRsaP}"], "the tag p is empty or given twice"),
+  ]
+  for c of cases {
+    let m = vfMailerOutbox(vfDns(c.0, [vfEdTxt()]))
+    let lines = vfLines(vfFail(m))
+    assert(len(lines) == 1, "${c.1}: lines ${join(lines, "|")}")
+    assert(contains(lines[0], "${vfRsaName}: ${c.1}"), "want '${c.1}': ${lines[0]}")
+  }
+}
+
+test "a failed DNS lookup is a problem line without a TXT value" {
+  let dns = vfDns([vfRsaTxt()], [vfEdTxt()])
+  dns.broken = vfEdName
+  let m = vfMailerOutbox(dns)
+  let lines = vfLines(vfFail(m))
+  assert(len(lines) == 1, "lines: ${join(lines, "|")}")
+  assert(contains(lines[0], "${vfEdName}: the DNS lookup failed:"), lines[0])
+  assert(!contains(lines[0], "publish this TXT"), lines[0])
+}
+
+test "a 535 from the SMTP server fails naming the transport, and no mail is started" {
+  let ca = smCaFile() catch e {
+    assert(false, "ca file: ${e.message()}")
+    return
+  }
+  let (port, log) = smStartTls(
+    [smEhlo("250-AUTH PLAIN\r\n"), "535 5.7.8 Authentication failed for ${smPass}\r\n"],
+  ) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let m = vfOpen(smTlsUrl(port, ca, "hello:${smPass}@"), vfOpts())
+  vfServe(m, vfDns([vfRsaTxt()], [vfEdTxt()]))
+  let msg = vfFail(m)
+  remove(ca) catch _ {}
+  let sent = <- log
+  let lines = vfLines(msg)
+  assert(len(lines) == 1, "lines: ${join(lines, "|")}")
+  assert(contains(lines[0], "127.0.0.1:${port}: login refused: 535 5.7.8"), lines[0])
+  assert(!contains(msg, smPass), "the password is in the report: ${msg}")
+  assert(!contains(sent, "MAIL FROM"), "a mail was started: ${sent}")
+}
+
+test "SMTP connects, logs in, quits and never starts a mail" {
+  let ca = smCaFile() catch e {
+    assert(false, "ca file: ${e.message()}")
+    return
+  }
+  let (port, log) = smStartTls(
+    [smEhlo("250-AUTH PLAIN\r\n"), "235 2.7.0 Authenticated\r\n", "221 Bye\r\n"],
+  ) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let m = vfOpen(smTlsUrl(port, ca, "hello:${smPass}@"), vfOpts())
+  vfServe(m, vfDns([vfRsaTxt()], [vfEdTxt()]))
+  vfOk(m)
+  remove(ca) catch _ {}
+  let sent = <- log
+  assert(contains(sent, "AUTH PLAIN "), "no login: ${sent}")
+  assert(contains(sent, "QUIT\r\n"), "no QUIT: ${sent}")
+  assert(!contains(sent, "MAIL FROM") && !contains(sent, "DATA"), "a mail was started: ${sent}")
+}
+
+// A transport and the setup that goes with it, for the provider tests below.
+fn vfApi(url: string): Mailer {
+  return vfOpen(url, Options{ from = "Inkwell <hello@inkwell.dev>", timeout = 10 * Second })
+}
+
+test "Resend reads GET /domains with the key; a send-only key is a working key" {
+  let (port, log) = rsStart([rsReply(200, "", "{\"data\":[]}")]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  vfOk(vfApi(rsUrl(port)))
+  let seen = <- log
+  assert(hasPrefix(seen, "GET /domains?limit=1 HTTP/1.1\r\n"), "request: ${seen}")
+  assert(contains(seen, "Authorization: Bearer ${rsKey}\r\n"), "no Bearer key: ${seen}")
+  let (p2, _) = rsStart(
+    [
+      rsReply(
+        401,
+        "",
+        "{\"name\":\"restricted_api_key\",\"message\":\"This API key is restricted to only send emails.\"}",
+      ),
+    ],
+  ) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  vfOk(vfApi(rsUrl(p2)))
+}
+
+test "Resend refuses a key it does not know, without repeating the key" {
+  let (port, _) = rsStart(
+    [rsReply(403, "", "{\"name\":\"validation_error\",\"message\":\"API key is invalid ${rsKey}\"}")],
+  ) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let lines = vfLines(vfFail(vfApi(rsUrl(port))))
+  assert(len(lines) == 1, "lines: ${join(lines, "|")}")
+  assert(contains(lines[0], "resend://***@127.0.0.1:${port}: login refused: 403"), lines[0])
+  assert(contains(lines[0], "login refused: 403"), lines[0])
+  assert(!contains(lines[0], rsKey), "the key is in the report: ${lines[0]}")
+}
+
+test "Postmark reads GET /server with the token" {
+  let (port, log) = rsStart([rsReply(200, "", "{\"Name\":\"Inkwell\"}")]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  vfOk(vfApi(pmUrl(port, "")))
+  let seen = <- log
+  assert(hasPrefix(seen, "GET /server HTTP/1.1\r\n"), "request: ${seen}")
+  assert(contains(seen, "X-Postmark-Server-Token: ${pmToken}\r\n"), "no token: ${seen}")
+  let (p2, _) = rsStart(
+    [pmError(401, "", 10, "No Account or Server API tokens were supplied in the HTTP headers.")],
+  ) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let lines = vfLines(vfFail(vfApi(pmUrl(p2, ""))))
+  assert(contains(lines[0], "login refused: 401 No Account or Server API tokens"), lines[0])
+}
+
+test "SendGrid reads GET /v3/scopes with the key" {
+  let (port, log) = rsStart([rsReply(200, "", "{\"scopes\":[\"mail.send\"]}")]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  vfOk(vfApi(sgUrl(port)))
+  let seen = <- log
+  assert(hasPrefix(seen, "GET /v3/scopes HTTP/1.1\r\n"), "request: ${seen}")
+  assert(contains(seen, "Authorization: Bearer ${sgKey}\r\n"), "no Bearer key: ${seen}")
+  let (p2, _) = rsStart(
+    [
+      sgError(
+        401,
+        "",
+        "{\"message\":\"The provided authorization grant is invalid, expired, or revoked\",\"field\":null}",
+      ),
+    ],
+  ) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let lines = vfLines(vfFail(vfApi(sgUrl(p2))))
+  assert(contains(lines[0], "login refused: 401 The provided authorization grant"), lines[0])
+}
+
+test "Mailgun reads GET /v4/domains/<domain> with basic auth" {
+  let (port, log) = rsStart([rsReply(200, "", "{\"domain\":{\"name\":\"mg.inkwell.dev\"}}")]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  vfOk(vfApi(mgUrl(port)))
+  let seen = <- log
+  assert(hasPrefix(seen, "GET /v4/domains/${mgDomain} HTTP/1.1\r\n"), "request: ${seen}")
+  let login = encodeBase64([]byte("api:${mgKey}"))
+  assert(contains(seen, "Authorization: Basic ${login}\r\n"), "no basic auth: ${seen}")
+  let (p2, _) = rsStart([rsReply(404, "", "{\"message\":\"Domain not found\"}")]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let lines = vfLines(vfFail(vfApi(mgUrl(p2))))
+  assert(contains(lines[0], "rejected: 404 Domain not found"), lines[0])
+}
+
+test "an unreachable provider is a temporary failure, not a hang" {
+  let m = vfApi("resend://${rsKey}@127.0.0.1:1?insecureSkipVerify=true")
+  let lines = vfLines(vfFail(m))
+  assert(len(lines) == 1, "lines: ${join(lines, "|")}")
+  assert(contains(lines[0], "temporary failure"), lines[0])
+  assert(!contains(lines[0], rsKey), "the key is in the report: ${lines[0]}")
+}
+
+test "Failover checks every listed transport and names each one that fails" {
+  let (p1, _) = rsStart(
+    [rsReply(401, "", "{\"name\":\"missing_api_key\",\"message\":\"Missing API key\"}")],
+  ) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let (p2, _) = rsStart([sgError(401, "", "{\"message\":\"revoked\"}")]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let (p3, _) = rsStart([rsReply(200, "", "{\"Name\":\"Inkwell\"}")]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let opts = Options{
+    from = "Inkwell <hello@inkwell.dev>",
+    timeout = 10 * Second,
+    fallback = [sgUrl(p2), pmUrl(p3, "")],
+  }
+  let lines = vfLines(vfFail(vfOpen(rsUrl(p1), opts)))
+  assert(len(lines) == 2, "lines: ${join(lines, "|")}")
+  assert(
+    contains(lines[0], "resend://***@127.0.0.1:${p1}: login refused: 401 Missing API key"),
+    lines[0],
+  )
+  assert(
+    contains(lines[1], "sendgrid://***@127.0.0.1:${p2}: login refused: 401 revoked"),
+    lines[1],
+  )
+}
+
+test "every problem of every transport and every key comes back in one error, one line each" {
+  let (port, _) = rsStart(
+    [rsReply(401, "", "{\"name\":\"missing_api_key\",\"message\":\"Missing API key\"}")],
+  ) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let m = vfOpen(mgUrl(port), vfOpts())
+  vfServe(m, vfDns([], ["v=DKIM1; k=ed25519; p="]))
+  let msg = vfFail(m)
+  let lines = vfLines(msg)
+  assert(hasPrefix(msg, "mail: configuration: verify found 3 problems:\n"), msg)
+  assert(len(lines) == 3, "lines: ${join(lines, "|")}")
+  assert(contains(lines[0], "mailgun://") && contains(lines[0], "login refused: 401"), lines[0])
+  assert(contains(lines[1], "${vfRsaName}: no TXT record is published"), lines[1])
+  assert(contains(lines[2], "${vfEdName}: the key is revoked: p= is empty"), lines[2])
+}
+
+test "one problem reads as one problem" {
+  let m = vfMailerOutbox(vfDns([], [vfEdTxt()]))
+  assert(contains(vfFail(m), "verify found 1 problem:\n"), "wording")
+}
+
+test "log:// and file:// verify" {
+  let m = vfOpen("log://", Options{ from = "Inkwell <hello@inkwell.dev>" })
+  vfOk(m)
+}

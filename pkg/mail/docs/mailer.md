@@ -202,7 +202,7 @@ it once, when no send is running.
 
 ## Your own transport
 
-A transport is any class with `deliver`, `signs` and `close`; there is nothing to
+A transport is any class with `deliver`, `signs`, `check` and `close`; there is nothing to
 implement or register. `deliver` gets a `Delivery` (the `message`, the
 `envelope` with every address including `bcc`, the `messageId` and the final
 `raw` bytes) and returns a `Receipt` or a `MailError`. It may be called from
@@ -211,7 +211,9 @@ reach the recipient: true for a transport that sends them as they are (a
 server, a file), false for one that gives a provider the fields and lets it
 build the mail. A mailer with `Options.dkim` refuses a transport that answers
 false, because a signature made here would not survive. See
-[Signing your mail](dkim.md).
+[Signing your mail](dkim.md). `check` proves the transport can deliver without
+sending anything, and fails with the error a delivery would fail with at that
+step; `Mailer.verify` calls it. See [Checking the setup at boot](verify.md).
 
 ```bit
 import { Delivery, Mailer, MailError, Message, Options, Receipt, Rejection, Reply } from "mail"
@@ -251,6 +253,8 @@ class Screened {
   signs(): bool {
     return true
   }
+
+  check(): ()!MailError {}
 
   close() {}
 }

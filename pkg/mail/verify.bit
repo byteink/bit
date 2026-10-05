@@ -1,0 +1,238 @@
+// pkg/mail/verify.bit — `Mailer.verify`, the boot and health check: every
+// transport proves it can deliver (`Transport.check`, no message is sent) and
+// every DKIM key is compared with the record the world will read for it.
+//
+// The classic deploy mistakes are a wrong password, a port the host blocks, and
+// a DKIM key rotated in the app but not in DNS. None shows until a customer says
+// the mail never came, so `verify` reports all of them, each on its own line, in
+// one `MailError.Config`, and the operator fixes everything in one deploy.
+//
+// A DKIM key record is a tag list (RFC 6376 section 3.6.1): `v=DKIM1; k=rsa;
+// p=<base64>`. `p=` is the public key, a SubjectPublicKeyInfo DER for RSA and
+// the 32 raw bytes for Ed25519 (RFC 8463 section 4); an empty `p=` is a revoked
+// key. The TXT strings of one record are joined before it is read (RFC 6376
+// section 3.6.2.2), which `std/net`'s `lookupTxt` already does.
+
+import { decodeBase64, encodeBase64, ed25519PublicKey } from "std/crypto"
+import { asn1BigInteger, asn1BitString, asn1Encode, asn1Null, asn1Oid, asn1Sequence } from "std/crypto"
+import { bigintBitLen, bigintToBytes, RsaPrivateKey } from "std/crypto"
+import { hasPrefix, join, replace, trimSpace } from "std/strings"
+
+// How `Mailer` reads a DKIM record: `lookupTxt` in a program, a script in a
+// test (std/net's own seam, its nameserver argument, is not exported).
+type TxtLookup = (string) => []string!
+
+// The rsaEncryption object identifier, 1.2.840.113549.1.1.1 (RFC 8017 appendix A.1).
+fn rsaEncryptionOid(): []int {
+  return [1, 2, 840, 113549, 1, 1, 1]
+}
+
+// The key a DKIM record must publish for one configured key.
+class DkimPublic {
+  // `k=`: `rsa` or `ed25519`.
+  kind: string
+  // `p=`: the key as base64.
+  p: string
+
+  // The TXT value to publish, as RFC 6376 section 3.6.1 writes it.
+  txt(): string {
+    return "v=DKIM1; k=${this.kind}; p=${this.p}"
+  }
+}
+
+// The SubjectPublicKeyInfo DER of the public half of `key` (RFC 5280 section
+// 4.1.2.7, RFC 8017 appendix A.1.1): the algorithm, then the PKCS#1 RSAPublicKey
+// wrapped in a BIT STRING.
+fn rsaSpki(key: RsaPrivateKey): []byte!MailError {
+  let n = bigintToBytes(key.n, (bigintBitLen(key.n) + 7) / 8) catch _ {
+    fail MailError.Config("dkim: the RSA modulus cannot be written")
+  }
+  let e = bigintToBytes(key.e, (bigintBitLen(key.e) + 7) / 8) catch _ {
+    fail MailError.Config("dkim: the RSA exponent cannot be written")
+  }
+  let oid = asn1Oid(rsaEncryptionOid()) catch _ {
+    fail MailError.Config("dkim: the RSA algorithm identifier cannot be written")
+  }
+  let alg = asn1Sequence([oid, asn1Null()])
+  let pub = asn1Sequence([asn1BigInteger(n), asn1BigInteger(e)])
+  return asn1Encode(asn1Sequence([alg, asn1BitString(0, asn1Encode(pub))]))
+}
+
+// The record `k` must have in DNS.
+fn dkimPublic(k: DkimKey): DkimPublic!MailError {
+  match (k.material) {
+    Rsa(key) => return DkimPublic{ kind = "rsa", p = encodeBase64(rsaSpki(key)?) }
+    Ed25519(seed) => return DkimPublic{ kind = "ed25519", p = encodeBase64(ed25519PublicKey(seed)) }
+  }
+}
+
+// The tags of the record `text` (RFC 6376 section 3.2): `name=value` pairs
+// split by `;`, white space around names and values dropped, one trailing `;`
+// allowed. "" when it parses, else why it does not; a tag given twice is
+// refused, as the RFC says.
+fn parseTags(text: string, out: map<string, string>): string {
+  for part of split(text, ";") {
+    let spec = trimSpace(part)
+    if (spec == "") {
+      continue
+    }
+    let eq = indexOf(spec, "=")
+    if (eq < 1) {
+      return "the record is not a list of name=value tags"
+    }
+    let name = trimSpace(spec[0:eq])
+    if (name == "" || hasTag(out, name)) {
+      return "the tag ${shown(name)} is empty or given twice"
+    }
+    out[name] = trimSpace(spec[eq + 1:])
+  }
+  return ""
+}
+
+// Whether `tags` holds `name`, an empty value included.
+fn hasTag(tags: map<string, string>, name: string): bool {
+  let (_, ok) = tags[name]
+  return ok
+}
+
+// `s` without any of the white space a DNS tool folds a long value with.
+fn unfold(s: string): string {
+  return replace(replace(replace(replace(s, " ", ""), "\t", ""), "\r", ""), "\n", "")
+}
+
+// Why `tags` is not the record for `want`, "" when it is. Checked in the order
+// a verifier reads a record: `v`, `k`, then `p`.
+fn tagsProblem(tags: map<string, string>, want: DkimPublic): string {
+  if (hasTag(tags, "v") && tags["v"] != "DKIM1") {
+    return "v=${shown(tags["v"])} where DKIM1 is required"
+  }
+  let kind = "rsa"
+  if (hasTag(tags, "k")) {
+    kind = tags["k"]
+  }
+  if (kind != want.kind) {
+    return "k=${shown(kind)} but the configured key is ${want.kind}"
+  }
+  if (!hasTag(tags, "p")) {
+    return "the record has no p= tag"
+  }
+  return keyProblem(unfold(tags["p"]), want)
+}
+
+// Why the published `p` is not the key behind `want`, "" when it is.
+fn keyProblem(p: string, want: DkimPublic): string {
+  if (p == "") {
+    return "the key is revoked: p= is empty"
+  }
+  let der = decodeBase64(p) catch _ {
+    return "p= is not base64"
+  }
+  if (encodeBase64(der) != want.p) {
+    return "p= is a different key than the one Options.dkim signs with"
+  }
+  return ""
+}
+
+// Why the TXT `records` published for one key are not right, "" when they are.
+fn recordsProblem(records: []string, want: DkimPublic): string {
+  if (len(records) == 0) {
+    return "no TXT record is published"
+  }
+  if (len(records) > 1) {
+    return "${len(records)} TXT records are published and a verifier may read any of them; publish exactly one"
+  }
+  let tags: map<string, string> = {}
+  let bad = parseTags(records[0], tags)
+  if (bad != "") {
+    return bad
+  }
+  return tagsProblem(tags, want)
+}
+
+// The line for `k`, "" when its record matches. A key that does not match
+// carries the TXT value to publish.
+fn dkimLine(k: DkimKey, lookup: TxtLookup): string {
+  let name = dkimName(k)
+  let want = dkimPublic(k) catch e {
+    return "${name}: ${problemText(e)}"
+  }
+  let records = lookup("${k.selector}._domainkey.${toLower(k.domain)}") catch e {
+    return "${name}: the DNS lookup failed: ${oneLine(e.message())}"
+  }
+  let why = recordsProblem(records, want)
+  if (why == "") {
+    return ""
+  }
+  return "${name}: ${why}; publish this TXT value: ${want.txt()}"
+}
+
+// `s` on one line, so a server's text cannot start a line of its own.
+fn oneLine(s: string): string {
+  return replace(replace(s, "\r", " "), "\n", " ")
+}
+
+// What `e` says without the `mail: ` and `configuration: ` openings.
+fn problemText(e: MailError): string {
+  let m = e.message()
+  if (hasPrefix(m, "mail: ")) {
+    m = m[len("mail: "):]
+  }
+  if (hasPrefix(m, "configuration: ")) {
+    m = m[len("configuration: "):]
+  }
+  return oneLine(m)
+}
+
+// The line for `t` named `name`, "" when its `check` passes.
+fn transportLine(name: string, t: Transport): string {
+  t.check() catch e {
+    return "${name}: ${problemText(e)}"
+  }
+  return ""
+}
+
+// One line for each transport that fails: every one a `Failover` lists, the one
+// transport otherwise, reported as `name`.
+fn transportProblems(name: string, t: Transport): []string {
+  let (f, composed) = t.(Failover)
+  if (composed) {
+    return f.problems()
+  }
+  let line = transportLine(name, t)
+  if (line == "") {
+    return []
+  }
+  return [line]
+}
+
+// One line for each key whose record is missing or is not its key.
+fn dkimProblems(keys: []DkimKey, lookup: TxtLookup): []string {
+  let out: []string = []
+  for k of keys {
+    let line = dkimLine(k, lookup)
+    if (line != "") {
+      out = append(out, line)
+    }
+  }
+  return out
+}
+
+// `lines` as the one `MailError.Config` `Mailer.verify` fails with.
+fn verifyReport(lines: []string): MailError {
+  let word = "problems"
+  if (len(lines) == 1) {
+    word = "problem"
+  }
+  return MailError.Config("verify found ${len(lines)} ${word}:\n  ${join(lines, "\n  ")}")
+}
+
+// Runs every check and gathers every problem before failing.
+fn verifyMailer(name: string, t: Transport, keys: []DkimKey, lookup: TxtLookup): ()!MailError {
+  let lines = transportProblems(name, t)
+  for l of dkimProblems(keys, lookup) {
+    lines = append(lines, l)
+  }
+  if (len(lines) > 0) {
+    fail verifyReport(lines)
+  }
+}
