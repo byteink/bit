@@ -14,8 +14,8 @@ text you could read back.
 [chapter 14](01-first-endpoint.md):
 
 ```text
-$ bit add bitlang.org/pkg/auth@v0.5.0
-bit add: auth -> bitlang.org/pkg/auth@0.5.0 (2b3da0ae7c8df96c4f5af1380d0160e291175655)
+$ bit add bitlang.org/pkg/auth@v0.6.0
+bit add: auth -> bitlang.org/pkg/auth@0.6.0 (6eb3d34ee78433bf37089aa218e7327b61861dd0)
 ```
 
 ## Why you never store the plain password
