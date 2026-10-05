@@ -15,6 +15,7 @@
 import { Request, Response } from "std/http"
 import { contains, indexOf, lastIndexOf } from "std/strings"
 import { sqlOptInt } from "std/sql"
+import { WaitGroup } from "std/sync"
 
 fn testConfig(): AppConfig! {
   let url = env("DATABASE_URL")
@@ -364,29 +365,176 @@ test "POST /auth/token issues a bearer token, and GET /api/me accepts it" {
   assert(contains(me.body, username), "/api/me did not name the caller: ${me.body}")
 }
 
-test "POST /auth/token/refresh rotates the refresh token and rejects reuse" {
-  let app = testApp()
-  let username = uniqueName("refresher")
+// Logs `username` in through `POST /auth/token` and returns the response's
+// `refreshToken`.
+fn loginForRefreshToken(app: App, username: string): string {
   registerAndLogin(app, username, "correct horse battery") catch e {
     panic(e.message())
   }
-
   let tokenBody = "{\"username\":\"${username}\",\"password\":\"correct horse battery\"}"
   let tokenRes = app.handle(jsonReq("POST", "/auth/token", "", tokenBody))
   let refreshToken = jsonStringField(tokenRes.body, "refreshToken")
   assert(len(refreshToken) > 0, "no refreshToken in response: ${tokenRes.body}")
+  return refreshToken
+}
 
-  let refreshBody = "{\"refreshToken\":\"${refreshToken}\"}"
-  let rotated = app.handle(jsonReq("POST", "/auth/token/refresh", "", refreshBody))
+fn postRefresh(app: App, refreshToken: string): Response {
+  return app.handle(
+    jsonReq("POST", "/auth/token/refresh", "", "{\"refreshToken\":\"${refreshToken}\"}"),
+  )
+}
+
+test "POST /auth/token/refresh rotates the refresh token" {
+  let app = testApp()
+  let first = loginForRefreshToken(app, uniqueName("refresher"))
+
+  let rotated = postRefresh(app, first)
   assert(rotated.status == 200, "want 200 rotating a fresh refresh token, got ${rotated.status}")
   let newAccessToken = jsonStringField(rotated.body, "accessToken")
   assert(len(newAccessToken) > 0, "no accessToken in rotation response: ${rotated.body}")
-
-  let reused = app.handle(jsonReq("POST", "/auth/token/refresh", "", refreshBody))
+  let second = jsonStringField(rotated.body, "refreshToken")
   assert(
-    reused.status == 401,
-    "want 401 reusing an already-rotated refresh token, got ${reused.status}",
+    len(second) > 0 && second != first,
+    "rotation did not issue a new refresh token: ${rotated.body}",
   )
+
+  let me = app.handle(bearerReq("GET", "/api/me", newAccessToken))
+  assert(me.status == 200, "want 200 from /api/me with the rotated access token, got ${me.status}")
+
+  let again = postRefresh(app, second)
+  assert(again.status == 200, "want 200 rotating the second refresh token, got ${again.status}")
+}
+
+test "replaying a rotated refresh token revokes the whole family" {
+  let app = testApp()
+  let first = loginForRefreshToken(app, uniqueName("replayer"))
+  let rotated = postRefresh(app, first)
+  assert(rotated.status == 200, "want 200 rotating a fresh refresh token, got ${rotated.status}")
+  let second = jsonStringField(rotated.body, "refreshToken")
+
+  let replay = postRefresh(app, first)
+  assert(replay.status == 401, "want 401 replaying a rotated refresh token, got ${replay.status}")
+
+  // RFC 9700 section 4.14: the replay revoked the family, so the token the
+  // legitimate holder got from the rotation is dead too.
+  let revoked = postRefresh(app, second)
+  assert(
+    revoked.status == 401,
+    "want 401 for the second token after its family was revoked, got ${revoked.status}",
+  )
+}
+
+test "POST /auth/token/refresh answers every bad token with the same 401" {
+  let app = testApp()
+  let first = loginForRefreshToken(app, uniqueName("prober"))
+  let _ = postRefresh(app, first)
+  let replay = postRefresh(app, first)
+  let unknown = postRefresh(app, "not-a-token")
+  assert(
+    replay.status == 401 && unknown.status == 401,
+    "want 401 for a replay and an unknown token",
+  )
+  assert(
+    replay.body == unknown.body,
+    "a replayed and an unknown token must look the same: ${replay.body} vs ${unknown.body}",
+  )
+  assert(contains(replay.body, "invalid refresh token"), "unexpected 401 body: ${replay.body}")
+}
+
+test "OrmRefreshStore.rotate lets exactly one of two rotations of a token win" {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let db = open(cfg.databaseUrl) catch e {
+    panic(e.message())
+  }
+  let store = OrmRefreshStore(db)
+  let hash = uniqueName("hash")
+  let rec = RefreshRecord{
+    hash = hash, family = uniqueName("family"), subject = "1", expiresAt = 2_000_000_000,
+    familyExpiresAt = 2_000_000_000, data = "",
+  }
+  store.insert(rec) catch e {
+    panic(e.message())
+  }
+  let next1 = RefreshRecord{
+    hash = uniqueName("n1"), family = rec.family, subject = "1", expiresAt = 2_000_000_000,
+    familyExpiresAt = 2_000_000_000, data = "",
+  }
+  let next2 = RefreshRecord{
+    hash = uniqueName("n2"), family = rec.family, subject = "1", expiresAt = 2_000_000_000,
+    familyExpiresAt = 2_000_000_000, data = "",
+  }
+  let first = store.rotate(hash, next1, 100) catch e {
+    panic(e.message())
+  }
+  let second = store.rotate(hash, next2, 101) catch e {
+    panic(e.message())
+  }
+  assert(first, "the first rotation of a fresh token must win")
+  assert(!second, "the second rotation of the same token must lose")
+  let stored = store.findByHash(next2.hash) catch e {
+    panic(e.message())
+  }
+  assert(!isSome(stored), "a lost rotation must not store its next token")
+}
+
+fn rotateWorker(
+  store: OrmRefreshStore,
+  hash: string,
+  next: RefreshRecord,
+  wins: chan<bool>,
+  wg: WaitGroup,
+) {
+  defer wg.done()
+  let won = store.rotate(hash, next, 100) catch _ {
+    wins <- false
+    return
+  }
+  wins <- won
+}
+
+test "OrmRefreshStore.rotate lets exactly one of 16 concurrent rotations win" {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let db = open(cfg.databaseUrl) catch e {
+    panic(e.message())
+  }
+  let store = OrmRefreshStore(db)
+  let hash = uniqueName("race")
+  let family = uniqueName("family")
+  store.insert(
+    RefreshRecord{
+      hash = hash, family = family, subject = "1", expiresAt = 2_000_000_000,
+      familyExpiresAt = 2_000_000_000, data = "",
+    },
+  ) catch e {
+    panic(e.message())
+  }
+  let n = 16
+  let wins = chan<bool>(n)
+  let wg = WaitGroup()
+  wg.add(n)
+  let i = 0
+  while (i < n) {
+    let next = RefreshRecord{
+      hash = uniqueName("next"), family = family, subject = "1", expiresAt = 2_000_000_000,
+      familyExpiresAt = 2_000_000_000, data = "",
+    }
+    spawn rotateWorker(store, hash, next, wins, wg)
+    i = i + 1
+  }
+  wg.wait()
+  let won = 0
+  let k = 0
+  while (k < n) {
+    if (<- wins) {
+      won = won + 1
+    }
+    k = k + 1
+  }
+  assert(won == 1, "${won} of ${n} concurrent rotations of one token won, want exactly 1")
 }
 
 test "GET /auth/google is disabled (404) when Google sign-in is not configured" {
