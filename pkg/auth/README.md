@@ -85,6 +85,10 @@ protected route that is not itself doing the authenticating just reads
   800-63B: one `check` returning every rule broken, `hash` for the set side
   (it records NFKC in the stored hash, which `PasswordStrategy` follows); see
   [Check a new password](docs/password-policy.md).
+- `PwnedPasswords`, `PwnedOptions`, `RangeFetch` - the Have I Been Pwned range
+  check as a `BreachCheck`: only 5 hex digits of the password's SHA-1 leave, and
+  `endpoint` points it at a copy of the data you host; see
+  [Check against Have I Been Pwned](docs/password-policy.md#check-against-have-i-been-pwned).
 - `LoginThrottle`, `ThrottleOptions`, `Throttled`, `ThrottleEvent`,
   `ThrottleHook`, `ThrottleKind` - the brute-force defence: per-account and
   per-address failure counters over `pkg/web`'s `RateStore`, backoff, lockout,

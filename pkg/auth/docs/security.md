@@ -60,6 +60,26 @@ username and your own words kept out, a blocklist, runs like `12345`, and an
 optional breach check. It adds no composition rules and no expiry, because NIST
 says not to. See [Check a new password](password-policy.md).
 
+## What leaves your server when you check for breaches
+
+`PwnedPasswords` (the Have I Been Pwned range check, see [Check a new
+password](password-policy.md#check-against-have-i-been-pwned)) sends one thing: the
+first 5 hex digits of the password's SHA-1, in the path of a GET to
+`https://api.pwnedpasswords.com/range/`, with a `User-Agent` naming your app and
+`Add-Padding: true`. Five hex digits are 20 bits, shared by very many unrelated
+passwords (the service answers with hundreds of lines for each prefix), so they
+do not identify the password. The other 35 digits, the password and the account never leave; they are
+compared against the answer in your own process. The request carries no cookie, no
+username and no address of yours beyond the connection itself, which the service
+sees as it sees any client.
+
+The padding stops the size of the answer from hinting at which prefix was asked
+about. The service, and anyone who can read the connection, can still see that
+your server checked some password at that moment; if that is too much, host the
+data yourself and point `endpoint` at it (see "Host the data yourself" in
+[Check a new password](password-policy.md#host-the-data-yourself)). Nothing the
+check does writes the password, its hash or its suffix to an error or a log.
+
 ## Microsoft Entra ID: the tenant is checked, not assumed
 
 `Provider.Microsoft(tenant)` with a real tenant accepts only that tenant's
