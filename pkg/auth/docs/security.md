@@ -55,7 +55,7 @@ guessing](brute-force.md).
 
 `hashPassword` hashes whatever it is given. A `PasswordPolicy` is the opt-in check
 for a new password, after NIST SP 800-63B: a length in code points, NFKC
-normalization applied when the password is set and when it is verified, the
+normalization recorded in the stored hash and followed when it is verified, the
 username and your own words kept out, a blocklist, runs like `12345`, and an
 optional breach check. It adds no composition rules and no expiry, because NIST
 says not to. See [Check a new password](password-policy.md).
