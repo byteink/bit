@@ -1,0 +1,157 @@
+// pkg/mail/postmarkbody.bit — the JSON a `postmark://` transport posts to
+// Postmark's `POST /email` (https://postmarkapp.com/developer/api/email-api):
+// one object with `From`, `To`, `Cc`, `Bcc`, `Subject`, `Tag`, `HtmlBody`,
+// `TextBody`, `ReplyTo`, `Headers`, `Attachments`, `Metadata` and
+// `MessageStream`, in that order, a field left out when it is empty. `To`, `Cc`,
+// `Bcc` and `ReplyTo` are one string of addresses joined by `, `.
+//
+// Postmark builds the MIME message itself, so this file maps fields and never
+// bytes: `Delivery.raw` is not sent. What the SMTP path gets from the renderer
+// is reproduced from the same functions, so both transports agree on it: the
+// text part made from the HTML (`textBody`), the threading and `Auto-Submitted`
+// headers (`extraFields`), the attachment type (`guessType`).
+//
+// Postmark has one `Tag` and free `Metadata`, `Message.tags` has names and
+// values: the tag named `tag` is the `Tag`, every other one is a `Metadata`
+// entry, which Postmark returns as a string in its webhooks.
+
+import { Json, JsonEntry, jsonEncode } from "std/json"
+import { encodeBase64 } from "std/crypto"
+import { keys } from "std/seq"
+import { sorted } from "std/sort"
+
+// The `Message.tags` name that becomes Postmark's `Tag`.
+const pmTagKey: string = "tag"
+
+// `Tag` is at most this many characters.
+const pmMaxTag: int = 1000
+
+// `Metadata` holds at most this many entries, a name of at most `pmMaxName`
+// characters and a value of at most `pmMaxValue`
+// (https://postmarkapp.com/support/article/1125-custom-metadata-faq).
+const pmMaxEntries: int = 10
+
+const pmMaxName: int = 20
+
+const pmMaxValue: int = 80
+
+// Characters in `s`: the bytes that do not continue a multi-byte sequence.
+fn pmChars(s: string): int {
+  let n = 0
+  for c of []byte(s) {
+    if (c < 128 || c >= 192) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+// The `Tag` of `m`: its tag named `tag`, "" when it has none.
+fn pmTag(m: Message): string!MailError {
+  let tag = m.tags[pmTagKey]
+  if (pmChars(tag) > pmMaxTag) {
+    fail MailError.Invalid("tags[\"tag\"]: Postmark takes a Tag of at most ${pmMaxTag} characters, got ${pmChars(tag)}")
+  }
+  return tag
+}
+
+// One `Metadata` entry, refused when Postmark would refuse it.
+fn pmMeta(name: string, value: string): ()!MailError {
+  if (pmChars(name) < 1 || pmChars(name) > pmMaxName) {
+    fail MailError.Invalid("tags[${echoInput(name)}]: Postmark takes a Metadata name of 1 to ${pmMaxName} characters")
+  }
+  if (pmChars(value) > pmMaxValue) {
+    fail MailError.Invalid("tags[${echoInput(name)}]: Postmark takes a Metadata value of at most ${pmMaxValue} characters, got ${pmChars(value)}")
+  }
+}
+
+// `Message.tags` but `tag` as Postmark's `Metadata`, sorted by name. Postmark
+// takes at most `pmMaxEntries` entries and refuses two names that differ only
+// in case; a set it would refuse is refused here, before the request.
+fn pmMetadata(m: Message): []JsonEntry!MailError {
+  let out: []JsonEntry = []
+  let prev = ""
+  for name of sorted(keys(m.tags), (a, b) => toLower(a) < toLower(b)) {
+    if (name == pmTagKey) {
+      continue
+    }
+    pmMeta(name, m.tags[name])?
+    if (len(out) > 0 && toLower(name) == prev) {
+      fail MailError.Invalid("tags[${echoInput(name)}]: Postmark Metadata names are case-insensitive and ${echoInput(name)} repeats another")
+    }
+    prev = toLower(name)
+    out = append(out, apiEntry(name, Json.JsonString(m.tags[name])))
+  }
+  if (len(out) > pmMaxEntries) {
+    fail MailError.Invalid("${len(out)} tags besides \"tag\"; Postmark takes at most ${pmMaxEntries} Metadata entries")
+  }
+  return out
+}
+
+// `Message.headers` plus the threading pair and `Auto-Submitted`, as the SMTP
+// renderer writes them, sorted by name, as Postmark's `[{Name, Value}]`.
+fn pmHeaders(m: Message): []Json!MailError {
+  let out: []Json = []
+  for f of sortFields(extraFields(m)?)? {
+    out = append(
+      out,
+      Json.JsonObject(
+        [apiEntry("Name", Json.JsonString(f.name)), apiEntry("Value", Json.JsonString(f.value))],
+      ),
+    )
+  }
+  return out
+}
+
+// One attachment. Postmark names an inline image by `ContentID`, written
+// `cid:<id>` as its own examples do, which the HTML refers to with `cid:<id>`.
+fn pmAttachment(a: Attachment): Json {
+  let e = [
+    apiEntry("Name", Json.JsonString(a.name)),
+    apiEntry("Content", Json.JsonString(encodeBase64(a.data))),
+    apiEntry("ContentType", Json.JsonString(apiAttachType(a))),
+  ]
+  if (a.cid != "") {
+    e = append(e, apiEntry("ContentID", Json.JsonString("cid:${a.cid}")))
+  }
+  return Json.JsonObject(e)
+}
+
+fn pmAttachments(m: Message): []Json {
+  let out: []Json = []
+  for a of m.attachments {
+    out = append(out, pmAttachment(a))
+  }
+  return out
+}
+
+// The request body for `d`, sent on message stream `stream`. `from` and
+// `replyTo` are the mailer's defaults, for a message that sets none.
+fn pmPayload(d: Delivery, from: string, replyTo: []string, stream: string): string!MailError {
+  apiCheck(d, "Postmark")?
+  let m = d.message
+  let f = ApiFields{}
+  f.put("From", Json.JsonString(parseField("from", apiSender(m, from))?.toString()))
+  f.putJoined("To", apiAddresses("to", m.to)?)
+  f.putJoined("Cc", apiAddresses("cc", m.cc)?)
+  f.putJoined("Bcc", apiAddresses("bcc", m.bcc)?)
+  f.put("Subject", Json.JsonString(m.subject))
+  f.putText("Tag", pmTag(m)?)
+  f.putText("HtmlBody", m.html)
+  f.putText("TextBody", textBody(m))
+  f.putJoined("ReplyTo", apiAddresses("replyTo", apiReplyTo(m, replyTo))?)
+  let headers = pmHeaders(m)?
+  if (len(headers) > 0) {
+    f.put("Headers", Json.JsonArray(headers))
+  }
+  let files = pmAttachments(m)
+  if (len(files) > 0) {
+    f.put("Attachments", Json.JsonArray(files))
+  }
+  let meta = pmMetadata(m)?
+  if (len(meta) > 0) {
+    f.put("Metadata", Json.JsonObject(meta))
+  }
+  f.put("MessageStream", Json.JsonString(stream))
+  return jsonEncode(Json.JsonObject(f.entries))
+}

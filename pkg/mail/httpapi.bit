@@ -1,0 +1,342 @@
+// pkg/mail/httpapi.bit — what the HTTPS-API transports share (resend.bit,
+// postmark.bit): the `scheme://SECRET@host[?...]` URL, the client, the way a
+// failed request and a `Retry-After` become a `MailError`, and the pieces of
+// the JSON each of them posts. A provider keeps what is its own: the endpoint,
+// the headers, the body and what each of its answers means.
+//
+// The request is always TLS: there is no URL that sends the secret over
+// plaintext, and `insecureSkipVerify` is refused for a provider's real host, so
+// only a stand-in can be left unverified. The secret is never in an error, a
+// `Receipt` or the text of a transport.
+
+import { Client as HttpClient, header as httpHeader } from "std/http"
+import { HandshakeError, HandshakeFailure, TlsConfig, emptyTrustStore } from "std/tls"
+import { Json, JsonEntry, jsonAsInt, jsonAsString, jsonGet, jsonParse } from "std/json"
+import { hasPrefix, join, parseInt, replace, trimSpace } from "std/strings"
+import { Second } from "std/time"
+
+// The longest `Retry-After` taken at its word, in seconds: a day. A larger
+// number is a misread or an attack, and `Options.retry.max` caps the wait anyway.
+const apiMaxRetryAfter: int = 86400
+
+// The longest server text kept in an error.
+const apiMaxText: int = 500
+
+// What a provider's URL looks like: `scheme` with its `://`, the host `default`
+// stands for, what the secret is called in an error and as a placeholder in the
+// form shown to the caller, and the query parameters it takes besides
+// `insecureSkipVerify`.
+class ApiSpec {
+  scheme: string,
+  defaultHost: string,
+  secret: string,
+  placeholder: string,
+  params: []string = [],
+}
+
+// What a provider's URL names.
+class ApiTarget {
+  secret: string = "",
+  // `https://host[:port]`, no path.
+  base: string = "",
+  insecure: bool = false,
+  // The URL as an error shows it: `resend://***@default`.
+  display: string = "",
+  // The values of `ApiSpec.params` the URL set.
+  params: map<string, string> = {},
+}
+
+fn apiUrlError(s: ApiSpec, why: string): MailError {
+  return MailError.Config("${s.scheme}: ${why}")
+}
+
+// Whether `url` starts with `scheme`, whatever follows and in any case.
+fn hasScheme(url: string, scheme: string): bool {
+  return hasPrefix(toLower(url), scheme)
+}
+
+// A secret that is printable ASCII, so it can be written into a header.
+fn apiSecretOk(secret: string): bool {
+  for c of []byte(secret) {
+    if (c <= 32 || c >= 127) {
+      return false
+    }
+  }
+  return len(secret) > 0
+}
+
+// `host[:port]` as it is written after `@`, with the default host resolved.
+fn apiHost(s: ApiSpec, hostport: string): string!MailError {
+  if (indexOf(hostport, "[") >= 0 || indexOf(hostport, "/") >= 0) {
+    fail apiUrlError(s, "the host is a name with an optional port, `default` or host[:port]")
+  }
+  let host = hostport
+  let port = ""
+  let colon = lastIndexOf(hostport, ":")
+  if (colon >= 0) {
+    host = hostport[0:colon]
+    parsePort(hostport[colon + 1:])?
+    port = hostport[colon:]
+  }
+  if (host == "") {
+    fail apiUrlError(s, "the URL names no host; use ${s.scheme}${s.placeholder}@default")
+  }
+  if (host == "default") {
+    if (port != "") {
+      fail apiUrlError(s, "`default` is ${s.defaultHost} and takes no port")
+    }
+    return s.defaultHost
+  }
+  return pctDecode(host, "the host")? + port
+}
+
+// What the query parameters may be, as an error says it.
+fn apiParamHint(s: ApiSpec): string {
+  if (len(s.params) == 0) {
+    return "the only query parameter is insecureSkipVerify=true|false"
+  }
+  return "the query parameters are ${join(s.params, ", ")} and insecureSkipVerify=true|false"
+}
+
+// Whether `key` is one of the parameters `s` takes besides `insecureSkipVerify`.
+fn apiKnown(s: ApiSpec, key: string): bool {
+  for k of s.params {
+    if (k == key) {
+      return true
+    }
+  }
+  return false
+}
+
+// Sets `t` from one `key=value` of the query.
+fn apiParam(s: ApiSpec, t: ApiTarget, part: string, defaulted: bool): ()!MailError {
+  let eq = indexOf(part, "=")
+  if (eq < 0) {
+    fail apiUrlError(s, apiParamHint(s))
+  }
+  let key = part[0:eq]
+  let value = part[eq + 1:]
+  if (key != "insecureSkipVerify") {
+    if (!apiKnown(s, key)) {
+      fail apiUrlError(s, apiParamHint(s))
+    }
+    if (value == "") {
+      fail apiUrlError(s, "the query parameter '${key}' has no value")
+    }
+    if (t.params[key] != "") {
+      fail apiUrlError(s, "the query parameter '${key}' is given twice")
+    }
+    t.params[key] = value
+    return
+  }
+  if (value != "true" && value != "false") {
+    fail apiUrlError(s, apiParamHint(s))
+  }
+  if (defaulted) {
+    fail apiUrlError(
+      s,
+      "insecureSkipVerify is for a stand-in host; the real ${s.defaultHost} is always verified",
+    )
+  }
+  t.insecure = value == "true"
+}
+
+// `url` as a target, or a `Config` that never repeats the secret.
+fn parseApiUrl(s: ApiSpec, url: string): ApiTarget!MailError {
+  let rest = url[len(s.scheme):]
+  let query = ""
+  let q = indexOf(rest, "?")
+  if (q >= 0) {
+    query = rest[q + 1:]
+    rest = rest[0:q]
+  }
+  let at = lastIndexOf(rest, "@")
+  if (at < 0) {
+    fail apiUrlError(s, "the URL has no ${s.secret}; use ${s.scheme}${s.placeholder}@default")
+  }
+  if (indexOf(rest[0:at], ":") >= 0) {
+    fail apiUrlError(
+      s,
+      "the ${s.secret} goes before the @ alone, as ${s.scheme}${s.placeholder}@host; there is no password",
+    )
+  }
+  let secret = pctDecode(rest[0:at], "the ${s.secret}")?
+  if (!apiSecretOk(secret)) {
+    fail apiUrlError(s, "the ${s.secret} is empty or not printable ASCII")
+  }
+  let host = apiHost(s, rest[at + 1:])?
+  let t = ApiTarget{
+    secret = secret,
+    base = "https://${host}",
+    display = "${s.scheme}***@${host}",
+  }
+  if (query != "") {
+    for part of split(query, "&") {
+      apiParam(s, t, part, host == s.defaultHost)?
+    }
+  }
+  return t
+}
+
+// A fresh client per send: its headers carry this send's secret, and the
+// `Mailer` may call `deliver` from many tasks at once.
+fn apiClient(insecure: bool): HttpClient {
+  if (insecure) {
+    return HttpClient(TlsConfig(emptyTrustStore(), insecureSkipVerify = true))
+  }
+  return HttpClient()
+}
+
+// A request that got no answer. A certificate or protocol failure of the
+// handshake is the same next time, so it is `Rejected`; everything else (a
+// refused connection, a reset, a timeout) is `Transient`. `text` is already
+// scrubbed of the secret.
+fn apiNetError(text: string, e: error): MailError {
+  let r = Reply{ text = text }
+  let (h, ok) = e.(HandshakeError)
+  if (ok && h.kind != HandshakeFailure.Io) {
+    return MailError.Rejected(r)
+  }
+  return MailError.Transient(r)
+}
+
+// `Retry-After` in nanoseconds: delta-seconds only (RFC 9110 §10.2.3); an HTTP
+// date, a negative or an unreadable value is 0, no hint.
+fn apiRetryAfter(headers: string): int {
+  let v = trimSpace(httpHeader(headers, "retry-after"))
+  let n = parseInt(v) catch _ {
+    return 0
+  }
+  if (n < 0 || n > apiMaxRetryAfter) {
+    return 0
+  }
+  return n * Second
+}
+
+// `text` with every copy of `secret` hidden.
+fn apiScrub(text: string, secret: string): string {
+  return replace(text, secret, "***")
+}
+
+// `text` cut to `apiMaxText` bytes.
+fn apiClip(text: string): string {
+  if (len(text) > apiMaxText) {
+    return text[0:apiMaxText]
+  }
+  return text
+}
+
+// The member `name` of the JSON object `body`, `None` when `body` is not JSON
+// or has no such member.
+fn apiMember(body: string, name: string): Option<Json> {
+  let j = jsonParse(body) catch _ {
+    return Option<Json>.None
+  }
+  return jsonGet(j, name)
+}
+
+// A string member of a provider's reply, "" when it is absent or not a string.
+fn apiField(body: string, name: string): string {
+  match (apiMember(body, name)) {
+    Some(v) => return unwrapOr(jsonAsString(v), "")
+    None => return ""
+  }
+}
+
+// An integer member of a provider's reply, `fallback` when it is absent or not
+// an integer.
+fn apiIntField(body: string, name: string, fallback: int): int {
+  match (apiMember(body, name)) {
+    Some(v) => return unwrapOr(jsonAsInt(v), fallback)
+    None => return fallback
+  }
+}
+
+fn apiEntry(key: string, value: Json): JsonEntry {
+  return JsonEntry{ key = key, value = value }
+}
+
+fn apiStrings(list: []string): Json {
+  let out: []Json = []
+  for s of list {
+    out = append(out, Json.JsonString(s))
+  }
+  return Json.JsonArray(out)
+}
+
+// `list` parsed as `field[i]` and written back as `Name <email>`.
+fn apiAddresses(field: string, list: []string): []string!MailError {
+  let out: []string = []
+  for a of parseFields(field, list)? {
+    out = append(out, a.toString())
+  }
+  return out
+}
+
+// Every API takes at most this many addresses across `to`, `cc` and `bcc`.
+const apiMaxRecipients: int = 50
+
+// What an API that builds the mail itself cannot carry, refused before anything
+// is sent. `provider` is its name as an error says it.
+fn apiCheck(d: Delivery, provider: string): ()!MailError {
+  if (len(d.envelope.to) > apiMaxRecipients) {
+    fail MailError.Invalid("${len(d.envelope.to)} recipients; ${provider} takes at most ${apiMaxRecipients} across to, cc and bcc, so send in batches")
+  }
+  match (d.message.invite) {
+    Some(_) => fail MailError.Invalid("Message.invite: ${provider} has no calendar alternative; send an invite through smtp:// or attach the .ics yourself")
+    None => return
+  }
+}
+
+// The From of `m`, else the mailer's default `from`.
+fn apiSender(m: Message, from: string): string {
+  if (m.from != "") {
+    return m.from
+  }
+  return from
+}
+
+// The Reply-To list of `m`, else the mailer's default `replyTo`.
+fn apiReplyTo(m: Message, replyTo: []string): []string {
+  if (len(m.replyTo) > 0) {
+    return m.replyTo
+  }
+  return replyTo
+}
+
+// The MIME type of `a`: the one it names, else the one its file name implies.
+fn apiAttachType(a: Attachment): string {
+  if (a.contentType == "") {
+    return guessType(a.name)
+  }
+  return a.contentType
+}
+
+// The object being built: fields in the order they are written, a field with
+// nothing to say left out.
+class ApiFields {
+  entries: []JsonEntry = []
+
+  put(name: string, value: Json) {
+    this.entries = append(this.entries, apiEntry(name, value))
+  }
+
+  putList(name: string, list: []string) {
+    if (len(list) > 0) {
+      this.put(name, apiStrings(list))
+    }
+  }
+
+  // `list` as one string, its addresses joined by `, `.
+  putJoined(name: string, list: []string) {
+    if (len(list) > 0) {
+      this.put(name, Json.JsonString(join(list, ", ")))
+    }
+  }
+
+  putText(name: string, text: string) {
+    if (text != "") {
+      this.put(name, Json.JsonString(text))
+    }
+  }
+}

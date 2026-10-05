@@ -48,6 +48,7 @@ is written `%40`, `%2F`, `%3A`.
 | `smtp://user:pass@host` | port 587; STARTTLS (RFC 3207), required |
 | `smtp://host:1025?tls=off` | no TLS, no login: for a server on your own machine |
 | `resend://key@default` | Resend's HTTPS API instead of SMTP: see [Sending through Resend](resend.md) |
+| `postmark://token@default` | Postmark's HTTPS API instead of SMTP: see [Sending through Postmark](postmark.md) |
 
 TLS is not a setting you can lose. With `smtp://` the connection is upgraded
 with STARTTLS before any password is sent, and a server that does not offer
