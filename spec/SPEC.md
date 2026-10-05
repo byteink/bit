@@ -3077,11 +3077,11 @@ fn main() {}
 If `secret.key` cannot be read, the program prints
 
 ```text
-error: module <path> failed to start: <message> (<file>:<line>)
+error: module <path> failed to start: <message> (<path>/<file>:<line>)
 ```
 
-with `<path>` the module's import path, `<message>` the error's `message()`, and
-`<file>:<line>` the failing initializer. `catch` on the line is the explicit
+with `<path>` the module's import path (`.` for the root), `<message>` the
+error's `message()`, and `<path>/<file>:<line>` the failing initializer. `catch` on the line is the explicit
 fallback.
 
 **4. A `const` is set once; a `let` can be reassigned.** `const` fixes the
