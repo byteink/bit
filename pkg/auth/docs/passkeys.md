@@ -4,8 +4,9 @@ A password can be guessed, reused on another site, or typed into a fake login
 page. A passkey cannot: the browser makes a key pair for your site, keeps the
 private half in the phone, laptop or security key, and only ever answers the
 real origin. Inkwell's authors should be able to add one to their account and
-stop typing a password. This page is the registration half, the moment the
-author says "add a passkey" and your server stores the public key.
+stop typing a password. This page has both halves: registration, the moment the
+author says "add a passkey" and your server stores the public key, and sign-in,
+the moment the author comes back and proves they hold it.
 
 Registration is two requests. The first asks the server for options, the
 browser makes the key pair, and the second sends the result back to be
@@ -159,9 +160,9 @@ they register a passkey, and `beginRegistration` sends that as `user.id` in
 the options. Your own id never leaves the server.
 
 The handle is kept only when the registration succeeds, and every later
-registration for the same author sends the same one. Signing in will need to
-go the other way: the authenticator answers with the handle, and the store
-says which author it belongs to. `CredentialStore.handleFor(userId)` and
+registration for the same author sends the same one. Signing in goes the other
+way: the authenticator answers with the handle, and the store says which
+author it belongs to. `CredentialStore.handleFor(userId)` and
 `userForHandle(handle)` do those two lookups:
 
 ```bit
@@ -178,7 +179,10 @@ fn handleRoundTrip(store: CredentialStore, userId: string): string! {
 ```
 
 `handleFor` and `userForHandle` answer `Option.None` for a user or a handle
-the store does not know. Compare handles with `ctEq`, never `==`.
+the store does not know. A handle is not a secret (the browser holds it), so
+`userForHandle` is a plain lookup by key, not a constant-time scan; a database
+store keeps a `UNIQUE` index on it. Compare two handles you already hold with
+`ctEq`, never `==`.
 
 ## What is stored
 
@@ -318,10 +322,133 @@ fn strictPolicy(): WebAuthnOptions {
 - `timeoutMs`: the hint the browser shows its dialog for, 5 minutes by
   default. The server-side challenge lives 5 minutes whatever this says.
 
+## Signing in
+
+Registration binds no session: the author was already signed in. Signing in is
+a `WebAuthnStrategy`, a first-factor strategy like `PasswordStrategy`, over the
+same `WebAuthn` and store. You give it `resolve(userId)`, the function that turns
+the id a credential was registered under into the `Identity` to log in (and
+fails for an author you have since disabled):
+
+```bit
+import {
+  CloneAction,
+  Identity,
+  PasskeyLoginOptions,
+  UserVerification,
+  WebAuthn,
+  WebAuthnStrategy,
+} from "auth"
+import { Json } from "std/json"
+
+fn inkwellSignIn(wa: WebAuthn): WebAuthnStrategy! {
+  let resolve: (string) => Identity! = (userId) => {
+    return Identity{ id = userId, claims = Json.JsonNull }
+  }
+  let opts = PasskeyLoginOptions{
+    userVerification = UserVerification.Preferred,
+    onCloneSuspected = CloneAction.Reject,
+  }
+  return WebAuthnStrategy(wa, resolve, opts)?
+}
+```
+
+Like registration, sign-in is two requests. `beginLogin` returns the options
+for `navigator.credentials.get()` and keeps a fresh 32-byte challenge in the
+session, good for 5 minutes and one attempt. Pass the author's id and the
+options list their passkeys in `allowCredentials`; pass `None` and the list is
+empty, the browser offers whichever passkey it holds for your site (a
+"discoverable" login, and what the browser's autofill suggestion uses):
+
+```bit
+import { App } from "web"
+import { WebAuthnStrategy } from "auth"
+import { jsonEncode } from "std/json"
+
+fn signInRoutes(app: App, passkeys: WebAuthnStrategy) {
+  app.post("/signin/options", (c) => {
+    let options = passkeys.beginLogin(c, Option<string>.None)?
+    return c.text(jsonEncode(options)).header("Content-Type", "application/json")
+  })
+  app.post("/signin", (c) => {
+    let me = passkeys.authenticate(c)?
+    return c.text(me.id)
+  })
+  app.post("/signin/for/:name", (c) => {
+    let options = passkeys.beginLogin(c, Option<string>.Some(c.param("name")))?
+    return c.text(jsonEncode(options)).header("Content-Type", "application/json")
+  })
+}
+```
+
+A user id nobody has, or one with no passkeys, gets the same five members as a
+real one with a single made-up credential id (the same on every request), so the
+options never say whether an account exists.
+
+The browser side:
+
+```js
+const options = await (await fetch("/signin/options", { method: "POST" })).json()
+const assertion = await navigator.credentials.get({
+  publicKey: PublicKeyCredential.parseRequestOptionsFromJSON(options),
+})
+await fetch("/signin", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(assertion.toJSON()),
+})
+```
+
+`authenticate` spends the challenge first, on every attempt, then checks in this
+order: the credential exists and belongs to the author the options were for;
+the `userHandle`, when the authenticator sent one, is that author's (a
+discoverable login must send one); the `clientDataJSON` says `webauthn.get`,
+carries your challenge and an origin from your list; the `rpIdHash`; the user was
+present (and verified, when `userVerification` is `Required`); the backup
+eligibility is what it was at registration; and the signature over the
+authenticator data and the hash of the client data verifies under the stored key.
+
+Then the signature counter. An authenticator that counts raises it on every
+sign-in, so a count that did not rise means two copies of the key are in use.
+When either the stored or the reported count is not zero, the reported one must
+be greater. Synced passkeys always report 0 and are accepted. A suspected
+clone is refused with `CloneAction.Reject` (the default) and let through with
+`Allow`; both tell `onEvent` "login.clone". The stored counter never goes down.
+
+Every refusal, whichever check made it, is the same 401 `unauthorized()`, so a
+client learns nothing about which part was wrong. `onEvent` hears every
+outcome as an `AuthEvent` ("login.success", "login.failure", "login.locked",
+"login.clone"). A verified login stores the new counter and backup
+state, regenerates the session id and binds the session, and an app that owes a
+second factor sets `second` exactly as it does on `PasswordOptions`. The
+audit hook and the throttle work the same way they do there:
+
+```bit
+import {
+  AuthEventHook,
+  LoginThrottle,
+  PasskeyLoginOptions,
+  SecondRequired,
+} from "auth"
+
+fn auditedSignIn(
+  throttle: LoginThrottle,
+  needsCode: SecondRequired,
+  log: AuthEventHook,
+): PasskeyLoginOptions {
+  return PasskeyLoginOptions{
+    throttle = Option<LoginThrottle>.Some(throttle),
+    onEvent = log,
+    second = Option<SecondRequired>.Some(needsCode),
+  }
+}
+```
+
+Attempts are counted under `passkey:` and the credential id the client named,
+so guessing at one credential does not lock another.
+
 ## Where to go next
 
-Registration binds no session: the author was already signed in. A login
-with these passkeys is a separate step. See
-[Two-factor authentication with TOTP](totp.md) for the pending session a
+See [Two-factor authentication with TOTP](totp.md) for the pending session a
 second factor uses, and [Security model](security.md) for what this package
 checks for you.

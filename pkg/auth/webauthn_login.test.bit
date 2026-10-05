@@ -1,0 +1,728 @@
+// pkg/auth/webauthn_login.test.bit — #6959's acceptance for webauthn_login.bit:
+// the authentication ceremony of W3C Web Authentication Level 3 section 7.2.
+//
+//  - 3 of 3 specification vectors verify, ES256, RS256 and EdDSA, plus a second
+//    ES256 one (webauthn_login_vectors.test.bit; signCount 0 on both sides, the
+//    synced-passkey case, is accepted);
+//  - 10 of 10 required rejections (bad signature, wrong challenge, replayed
+//    challenge, wrong rpIdHash, UP clear, UV required but clear, userHandle
+//    mismatch, unknown credential, signCount regression, BE flipped) and more;
+//  - discoverable login, clone handling, the stored counter, `beginLogin`
+//    options, the session id, the second factor, the throttle and the audit hook.
+//
+// Every ceremony runs through `app.handle(req)` (the real `Ctx`, session and
+// failure mapping). A test that needs a known challenge seeds the pending login
+// the way `beginLogin` stores it (`lgSeed`); the full begin-then-assert flow is
+// its own test. `App`, `Config`, `MemoryStore`, `Request`, `Response`, `split`
+// (middleware.test.bit), `mfCookie` (mfa.test.bit), `coseKeyBytes`, `buildAd`,
+// `waHex`, `rpSha` (webauthn_bad / webauthn_parse tests), `freshClock` and
+// `throttleOn` (throttle.test.bit) come from one module.
+
+const lgRpId = "example.org"
+const lgOrigin = "https://example.org"
+const lgUser = "user-1"
+const lgIp = "10.0.0.9"
+
+// A strategy over a store that holds one ES256 credential for `user-1`
+// (signCount 5, BE set, BS clear) and a second user, `user-2`, with a handle.
+class Lg {
+  store: MemoryCredentialStore,
+  key: EcdsaPrivateKey,
+  credId: []byte,
+  handle: []byte,
+  otherHandle: []byte,
+  strategy: WebAuthnStrategy,
+  events: LgEvents,
+}
+
+class LgEvents {
+  kinds: []string,
+}
+
+fn lgResolve(): (string) => Identity! {
+  let f: (string) => Identity! = (id) => {
+    if (id == "gone") {
+      fail newError("user deleted")
+    }
+    return Identity{ id = id, claims = Json.JsonNull }
+  }
+  return f
+}
+
+fn lgRp(): RelyingParty {
+  return RelyingParty{ id = lgRpId, name = "Example", origins = [lgOrigin] }
+}
+
+fn lgWa(store: CredentialStore): WebAuthn {
+  return WebAuthn(lgRp(), store) catch e {
+    panic("WebAuthn: ${e.message()}")
+  }
+}
+
+fn lgHook(ev: LgEvents): AuthEventHook {
+  let h: AuthEventHook = (e) => {
+    ev.kinds = append(ev.kinds, e.kind)
+  }
+  return h
+}
+
+fn lgNew(opts: PasskeyLoginOptions = PasskeyLoginOptions{}): Lg {
+  let store = MemoryCredentialStore()
+  let key = ecdsaGenerateKey(nistecP256())
+  let credId = []byte("credential-id-01")
+  let handle = randomBytes(64)
+  let otherHandle = randomBytes(64)
+  store.bindHandle(lgUser, handle) catch e {
+    panic("bindHandle: ${e.message()}")
+  }
+  store.bindHandle("user-2", otherHandle) catch e {
+    panic("bindHandle: ${e.message()}")
+  }
+  store.add(
+    Credential{
+      id = credId,
+      userId = lgUser,
+      publicKey = coseKeyBytes(key),
+      alg = -7,
+      signCount = 5,
+      aaguid = []byte(16),
+      backupEligible = true,
+      backupState = false,
+      transports = ["internal"],
+      createdAt = 1,
+      name = "",
+    },
+  ) catch e {
+    panic("add: ${e.message()}")
+  }
+  let events = LgEvents{ kinds = []string(0) }
+  let o = opts
+  if (o.onEvent == nil) {
+    o.onEvent = lgHook(events)
+  }
+  let s = WebAuthnStrategy(lgWa(store), lgResolve(), o) catch e {
+    panic("WebAuthnStrategy: ${e.message()}")
+  }
+  return Lg{
+    store = store,
+    key = key,
+    credId = credId,
+    handle = handle,
+    otherHandle = otherHandle,
+    strategy = s,
+    events = events,
+  }
+}
+
+// One self-made assertion. `lgOk` is accepted by `lgNew()`'s strategy; each
+// rejection test changes one field.
+class LgA {
+  rp: string,
+  flags: byte,
+  count: uint,
+  kind: string,
+  origin: string,
+  challenge: []byte,
+  credId: []byte,
+  handle: []byte,
+  badSig: bool,
+}
+
+const lgFlagsOk: byte = 0x0D
+
+fn lgOk(lg: Lg, challenge: []byte): LgA {
+  return LgA{
+    rp = lgRpId,
+    flags = lgFlagsOk,
+    count = 6,
+    kind = "webauthn.get",
+    origin = lgOrigin,
+    challenge = challenge,
+    credId = lg.credId,
+    handle = []byte(0),
+    badSig = false,
+  }
+}
+
+fn lgClientData(a: LgA): []byte {
+  return []byte("{\"type\":\"${a.kind}\",\"challenge\":\"${encodeBase64Url(a.challenge)}\",\"origin\":\"${a.origin}\",\"crossOrigin\":false}")
+}
+
+// The `PublicKeyCredential.toJSON()` body for `a`, signed by `lg.key`.
+fn lgBody(lg: Lg, a: LgA): string {
+  let cd = lgClientData(a)
+  let ad = buildAd(a.rp, a.flags, a.count, []byte(0), []byte(0))
+  let msg = append([]byte(0), ...ad)
+  msg = append(msg, ...digest(Sha256(), cd))
+  if (a.badSig) {
+    msg = append(msg, 0)
+  }
+  let sig = ecdsaSign(lg.key, digest(Sha256(), msg), HashAlg.Sha256) catch e {
+    panic("ecdsaSign: ${e.message()}")
+  }
+  return lgJson(a.credId, cd, ad, ecdsaSignatureToDer(sig), a.handle)
+}
+
+fn lgJson(credId: []byte, cd: []byte, ad: []byte, sig: []byte, handle: []byte): string {
+  let inner = []JsonEntry{
+    JsonEntry{ key = "clientDataJSON", value = Json.JsonString(encodeBase64Url(cd)) },
+    JsonEntry{ key = "authenticatorData", value = Json.JsonString(encodeBase64Url(ad)) },
+    JsonEntry{ key = "signature", value = Json.JsonString(encodeBase64Url(sig)) },
+  }
+  if (len(handle) > 0) {
+    inner = append(
+      inner,
+      JsonEntry{ key = "userHandle", value = Json.JsonString(encodeBase64Url(handle)) },
+    )
+  }
+  return jsonEncode(
+    Json.JsonObject(
+      [
+        JsonEntry{ key = "id", value = Json.JsonString(encodeBase64Url(credId)) },
+        JsonEntry{ key = "type", value = Json.JsonString("public-key") },
+        JsonEntry{ key = "response", value = Json.JsonObject(inner) },
+      ],
+    ),
+  )
+}
+
+// Places a pending login where `beginLogin` keeps it. `expiresIn` is relative
+// to now, negative for an expired one.
+fn lgSeed(c: Ctx, challenge: []byte, user: Option<string>, expiresIn: i64) {
+  let p = PendingLogin{
+    challenge = challenge,
+    expiresAt = now().ns / Second + expiresIn,
+    userId = user,
+  }
+  let session = c.session() catch e {
+    panic("session: ${e.message()}")
+  }
+  session.set(loginSessionKey, encodePendingLogin(p))
+}
+
+fn lgReq(path: string, cookie: string, body: string): Request {
+  return Request{
+    method = "POST",
+    path = path,
+    headers = "Content-Type: application/json\r\nCookie: ${cookie}",
+    body = body,
+    peer = lgIp,
+  }
+}
+
+// `/login` runs `authenticate` once after seeding `seed` (when it is Some),
+// `/twice` runs it twice on the same body, and `/begin` answers the options.
+class LgSeed {
+  challenge: []byte,
+  user: Option<string>,
+  expiresIn: i64,
+}
+
+fn lgApp(lg: Lg, seed: Option<LgSeed>): App {
+  let app = App(Config{ secret = "test-secret", sessions = MemoryStore(1000) })
+  app.post("/login", (c) => {
+    if (isSome(seed)) {
+      lgSeed(c, unwrap(seed).challenge, unwrap(seed).user, unwrap(seed).expiresIn)
+    }
+    let identity = lg.strategy.authenticate(c)?
+    return c.text(identity.id)
+  })
+  app.post("/twice", (c) => {
+    lgSeed(c, unwrap(seed).challenge, unwrap(seed).user, unwrap(seed).expiresIn)
+    let first = lg.strategy.authenticate(c)?
+    let second = lg.strategy.authenticate(c)?
+    return c.text(first.id + second.id)
+  })
+  app.post("/begin", (c) => {
+    let who = Option<string>.None
+    if (c.rawBody()? != "") {
+      who = Option<string>.Some(c.rawBody()?)
+    }
+    return c.text(jsonEncode(lg.strategy.beginLogin(c, who)?))
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+fn lgSeedFor(challenge: []byte): Option<LgSeed> {
+  return Option<LgSeed>.Some(
+    LgSeed{ challenge = challenge, user = Option<string>.Some(lgUser), expiresIn = 300 },
+  )
+}
+
+// The status of one seeded assertion for `lgUser`.
+fn lgStatus(lg: Lg, a: LgA): int {
+  let app = lgApp(lg, lgSeedFor(randomBytes(32)))
+  return app.handle(lgReq("/login", "", lgBody(lg, a))).status
+}
+
+// The same, over the challenge the seed holds (`a.challenge`).
+fn lgStatusOver(lg: Lg, a: LgA, user: Option<string>, expiresIn: i64): int {
+  let app = lgApp(
+    lg,
+    Option<LgSeed>.Some(LgSeed{ challenge = a.challenge, user = user, expiresIn = expiresIn }),
+  )
+  return app.handle(lgReq("/login", "", lgBody(lg, a))).status
+}
+
+fn lgStored(lg: Lg): Credential {
+  let found = lg.store.byId(lg.credId) catch e {
+    panic("byId: ${e.message()}")
+  }
+  return unwrap(found)
+}
+
+// --- specification vectors ---------------------------------------------------
+
+// Stores the vector's credential, seeds its challenge and runs it.
+fn lgRunVector(v: LgVector): int {
+  let store = MemoryCredentialStore()
+  let pub = waHex(v.publicKey)
+  let key = parseCoseKey(pub) catch e {
+    panic("${v.name}: parseCoseKey: ${e.message()}")
+  }
+  let flags = waHex(v.authData)[32]
+  store.add(
+    Credential{
+      id = waHex(v.credId),
+      userId = lgUser,
+      publicKey = pub,
+      alg = coseAlg(key),
+      signCount = 0,
+      aaguid = []byte(16),
+      backupEligible = (flags & 0x08) != 0,
+      backupState = (flags & 0x10) != 0,
+      transports = [],
+      createdAt = 1,
+      name = "",
+    },
+  ) catch e {
+    panic("add: ${e.message()}")
+  }
+  let strategy = WebAuthnStrategy(lgWa(store), lgResolve()) catch e {
+    panic("WebAuthnStrategy: ${e.message()}")
+  }
+  let lg = Lg{
+    store = store,
+    key = ecdsaGenerateKey(nistecP256()),
+    credId = waHex(v.credId),
+    handle = []byte(0),
+    otherHandle = []byte(0),
+    strategy = strategy,
+    events = LgEvents{ kinds = []string(0) },
+  }
+  let app = lgApp(lg, lgSeedFor(waHex(v.challenge)))
+  let body = lgJson(
+    waHex(v.credId),
+    waHex(v.clientData),
+    waHex(v.authData),
+    waHex(v.signature),
+    []byte(0),
+  )
+  return app.handle(lgReq("/login", "", body)).status
+}
+
+test "spec vector ES256 (none attestation, signCount 0 on both sides) verifies" {
+  let s = lgRunVector(lgVecNoneES256())
+  assert(s == 200, "NoneES256: want 200, got ${s}")
+}
+
+test "spec vector ES256 (packed self, BE set) verifies" {
+  let s = lgRunVector(lgVecPackedSelfES256())
+  assert(s == 200, "PackedSelfES256: want 200, got ${s}")
+}
+
+test "spec vector RS256 verifies" {
+  let s = lgRunVector(lgVecPackedRS256())
+  assert(s == 200, "PackedRS256: want 200, got ${s}")
+}
+
+test "spec vector EdDSA verifies" {
+  let s = lgRunVector(lgVecPackedEdDSA())
+  assert(s == 200, "PackedEdDSA: want 200, got ${s}")
+}
+
+test "a spec vector with one signature byte changed is refused" {
+  let v = lgVecNoneES256()
+  let sig = waHex(v.signature)
+  sig[len(sig) - 1] = sig[len(sig) - 1] ^ 1
+  v.signature = encodeHex(sig)
+  let s = lgRunVector(v)
+  assert(s == 401, "want 401, got ${s}")
+}
+
+// --- accepted logins ---------------------------------------------------------
+
+test "a self-made ES256 assertion is accepted and the counter and backup state are stored" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  a.flags = 0x1D
+  let s = lgStatusOver(lg, a, Option<string>.Some(lgUser), 300)
+  assert(s == 200, "want 200, got ${s}")
+  let c = lgStored(lg)
+  assert(c.signCount == 6, "signCount ${c.signCount}, want 6")
+  assert(c.backupState, "backupState must follow the BS flag")
+  assert(c.backupEligible, "BE is immutable")
+  assert(join(lg.events.kinds, ",") == "login.success", "events ${join(lg.events.kinds, ",")}")
+}
+
+test "a discoverable login with a matching userHandle is accepted" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  a.handle = lg.handle
+  let s = lgStatusOver(lg, a, Option<string>.None, 300)
+  assert(s == 200, "want 200, got ${s}")
+}
+
+test "a login with a matching userHandle for an asked-for user is accepted" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  a.handle = lg.handle
+  let s = lgStatusOver(lg, a, Option<string>.Some(lgUser), 300)
+  assert(s == 200, "want 200, got ${s}")
+}
+
+test "signCount 0 reported against a stored 0 (a synced passkey) is accepted twice" {
+  let lg = lgNew()
+  let c = lgStored(lg)
+  c.signCount = 0
+  lg.store.update(c) catch e {
+    panic("update: ${e.message()}")
+  }
+  let a = lgOk(lg, randomBytes(32))
+  a.count = 0
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 200, "first")
+  a.challenge = randomBytes(32)
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 200, "second")
+  assert(lgStored(lg).signCount == 0, "the counter stays 0")
+}
+
+// --- the ten required rejections ---------------------------------------------
+
+test "reject: a bad signature" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  a.badSig = true
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 401, "want 401")
+  assert(lgStored(lg).signCount == 5, "a refused login must not move the counter")
+}
+
+test "reject: a wrong challenge" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  let app = lgApp(lg, lgSeedFor(randomBytes(32)))
+  assert(app.handle(lgReq("/login", "", lgBody(lg, a))).status == 401, "want 401")
+}
+
+test "reject: a replayed challenge (the second use of one challenge)" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  let app = lgApp(lg, lgSeedFor(a.challenge))
+  let res = app.handle(lgReq("/twice", "", lgBody(lg, a)))
+  assert(res.status == 401, "the second authenticate must fail, got ${res.status}")
+  assert(lgStored(lg).signCount == 6, "the first one succeeded and stored 6")
+}
+
+test "reject: a wrong rpIdHash" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  a.rp = "evil.example"
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 401, "want 401")
+}
+
+test "reject: user presence clear" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  a.flags = 0x0C
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 401, "want 401")
+}
+
+test "reject: user verification required but clear" {
+  let lg = lgNew(PasskeyLoginOptions{ userVerification = UserVerification.Required })
+  let a = lgOk(lg, randomBytes(32))
+  a.flags = 0x09
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 401, "UV clear: want 401")
+  let b = lgOk(lg, randomBytes(32))
+  assert(lgStatusOver(lg, b, Option<string>.Some(lgUser), 300) == 200, "UV set: want 200")
+}
+
+test "reject: a userHandle that is another user's" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  a.handle = lg.otherHandle
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 401, "want 401")
+}
+
+test "reject: a userHandle nobody has" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  a.handle = randomBytes(64)
+  assert(lgStatusOver(lg, a, Option<string>.None, 300) == 401, "want 401")
+}
+
+test "reject: an unknown credential id" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  a.credId = []byte("no-such-credential")
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 401, "want 401")
+}
+
+test "reject: a signCount regression is a clone, and the counter does not move" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  a.count = 3
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 401, "want 401")
+  let b = lgOk(lg, randomBytes(32))
+  b.count = 5
+  assert(
+    lgStatusOver(lg, b, Option<string>.Some(lgUser), 300) == 401,
+    "an equal count is a clone too",
+  )
+  assert(lgStored(lg).signCount == 5, "stored count moved")
+  assert(
+    join(lg.events.kinds, ",") == "login.clone,login.failure,login.clone,login.failure",
+    "events ${join(lg.events.kinds, ",")}",
+  )
+}
+
+test "reject: BE flipped since registration" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  a.flags = 0x05
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 401, "want 401")
+}
+
+// --- more rejections ---------------------------------------------------------
+
+test "reject: wrong clientData type, wrong origin" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  a.kind = "webauthn.create"
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 401, "type")
+  let b = lgOk(lg, randomBytes(32))
+  b.origin = "https://evil.example"
+  assert(lgStatusOver(lg, b, Option<string>.Some(lgUser), 300) == 401, "origin")
+}
+
+test "reject: a discoverable login with no userHandle" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  assert(lgStatusOver(lg, a, Option<string>.None, 300) == 401, "want 401")
+}
+
+test "reject: a credential that is not the asked-for user's" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  assert(lgStatusOver(lg, a, Option<string>.Some("user-2"), 300) == 401, "want 401")
+}
+
+test "reject: an expired challenge, and no pending login at all" {
+  let lg = lgNew()
+  let a = lgOk(lg, randomBytes(32))
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), -1) == 401, "expired")
+  let app = lgApp(lg, Option<LgSeed>.None)
+  assert(app.handle(lgReq("/login", "", lgBody(lg, a))).status == 401, "none pending")
+}
+
+test "reject: a malformed body is refused and a user the app cannot resolve is refused" {
+  let lg = lgNew()
+  let app = lgApp(lg, lgSeedFor(randomBytes(32)))
+  assert(app.handle(lgReq("/login", "", "{\"id\":1}")).status == 401, "bad shape")
+  let a = lgOk(lg, randomBytes(32))
+  let c = lgStored(lg)
+  c.userId = "gone"
+  lg.store.remove(lg.credId) catch e {
+    panic("remove: ${e.message()}")
+  }
+  lg.store.add(c) catch e {
+    panic("add: ${e.message()}")
+  }
+  assert(lgStatusOver(lg, a, Option<string>.Some("gone"), 300) == 401, "deleted user")
+}
+
+// --- clone handling ----------------------------------------------------------
+
+test "CloneAction.Allow lets a regression through, reports it, and keeps the higher counter" {
+  let lg = lgNew(PasskeyLoginOptions{ onCloneSuspected = CloneAction.Allow })
+  let a = lgOk(lg, randomBytes(32))
+  a.count = 3
+  assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 200, "want 200")
+  assert(lgStored(lg).signCount == 5, "the counter never goes down")
+  assert(
+    join(lg.events.kinds, ",") == "login.clone,login.success",
+    "events ${join(lg.events.kinds, ",")}",
+  )
+}
+
+// --- beginLogin --------------------------------------------------------------
+
+fn lgMembers(j: Json): []string {
+  let out = []string(0)
+  for e of unwrap(jsonAsObject(j)) {
+    out = append(out, e.key)
+  }
+  return out
+}
+
+fn lgOptions(app: App, user: string, cookie: string): Json {
+  let res = app.handle(lgReq("/begin", cookie, user))
+  assert(res.status == 200, "/begin: want 200, got ${res.status}")
+  return jsonParse(res.body) catch e {
+    panic("options JSON: ${e.message()}")
+  }
+}
+
+fn lgAllowIds(options: Json): []string {
+  let out = []string(0)
+  let m = unwrap(jsonGet(options, "allowCredentials"))
+  for d of unwrap(jsonAsArray(m)) {
+    out = append(out, unwrap(jsonAsString(unwrap(jsonGet(d, "id")))))
+  }
+  return out
+}
+
+test "beginLogin: a known user's options list their credential" {
+  let lg = lgNew()
+  let app = lgApp(lg, Option<LgSeed>.None)
+  let known = lgOptions(app, lgUser, "")
+  assert(
+    join(lgAllowIds(known), ",") == encodeBase64Url(lg.credId),
+    "allowCredentials ${join(lgAllowIds(known), ",")}",
+  )
+}
+
+test "beginLogin: discoverable options have an empty allowCredentials and a 32-byte challenge" {
+  let lg = lgNew()
+  let app = lgApp(lg, Option<LgSeed>.None)
+  let o = lgOptions(app, "", "")
+  assert(len(lgAllowIds(o)) == 0, "allowCredentials must be empty")
+  let ch = decodeBase64Url(unwrap(jsonAsString(unwrap(jsonGet(o, "challenge"))))) catch e {
+    panic("challenge: ${e.message()}")
+  }
+  assert(len(ch) == 32, "challenge ${len(ch)} bytes")
+  assert(unwrap(jsonAsString(unwrap(jsonGet(o, "rpId")))) == lgRpId, "rpId")
+}
+
+test "beginLogin: an unknown user's options have the member set of a known one, and a stable decoy id" {
+  let lg = lgNew()
+  let app = lgApp(lg, Option<LgSeed>.None)
+  let known = lgOptions(app, lgUser, "")
+  let ghost = lgOptions(app, "no-such-user", "")
+  let again = lgOptions(app, "no-such-user", "")
+  assert(
+    join(lgMembers(known), ",") == join(lgMembers(ghost), ","),
+    "known ${join(lgMembers(known), ",")} vs unknown ${join(lgMembers(ghost), ",")}",
+  )
+  assert(
+    join(lgMembers(known), ",") == "challenge,timeout,rpId,allowCredentials,userVerification",
+    "members",
+  )
+  assert(len(lgAllowIds(ghost)) == 1, "one decoy")
+  assert(
+    join(lgAllowIds(ghost), ",") == join(lgAllowIds(again), ","),
+    "the decoy id must be the same on every request",
+  )
+  assert(
+    join(lgAllowIds(ghost), ",") != join(lgAllowIds(known), ","),
+    "the decoy is not the real id",
+  )
+}
+
+// --- the whole flow ----------------------------------------------------------
+
+test "begin then assert over two requests: the session id is regenerated and the identity bound" {
+  let lg = lgNew()
+  let app = lgApp(lg, Option<LgSeed>.None)
+  let pre = app.handle(lgReq("/begin", "", lgUser))
+  let cookie = mfCookie(pre)
+  assert(cookie != "", "/begin must arm a session cookie")
+  let options = jsonParse(pre.body) catch e {
+    panic("options: ${e.message()}")
+  }
+  let challenge = decodeBase64Url(unwrap(jsonAsString(unwrap(jsonGet(options, "challenge"))))) catch e {
+    panic("challenge: ${e.message()}")
+  }
+  let res = app.handle(lgReq("/login", cookie, lgBody(lg, lgOk(lg, challenge))))
+  assert(res.status == 200, "want 200, got ${res.status}: ${res.body}")
+  assert(res.body == lgUser, "identity ${res.body}")
+  let fresh = mfCookie(res)
+  assert(fresh != "" && fresh != cookie, "the session id must change: '${cookie}' -> '${fresh}'")
+  let again = app.handle(lgReq("/login", fresh, lgBody(lg, lgOk(lg, challenge))))
+  assert(again.status == 401, "the challenge is single use, got ${again.status}")
+}
+
+// --- second factor, throttle, constructor ------------------------------------
+
+test "second: a user held back is bound pending and gets second_factor_required" {
+  let always: SecondRequired = (id) => true
+  let lg = lgNew(PasskeyLoginOptions{ second = Option<SecondRequired>.Some(always) })
+  let a = lgOk(lg, randomBytes(32))
+  let app = lgApp(
+    lg,
+    Option<LgSeed>.Some(
+      LgSeed{ challenge = a.challenge, user = Option<string>.Some(lgUser), expiresIn = 300 },
+    ),
+  )
+  let res = app.handle(lgReq("/login", "", lgBody(lg, a)))
+  assert(res.status == 401, "want 401, got ${res.status}")
+  assert(contains(res.body, "second_factor_required"), "body '${res.body}'")
+}
+
+test "throttle: five bad assertions for one credential lock it" {
+  let clock = freshClock()
+  let t = throttleOn(fakeStore(clock), clock, ThrottleOptions{})
+  let lg = lgNew(PasskeyLoginOptions{ throttle = Option<LoginThrottle>.Some(t) })
+  let i = 0
+  while (i < 5) {
+    let a = lgOk(lg, randomBytes(32))
+    a.badSig = true
+    assert(lgStatusOver(lg, a, Option<string>.Some(lgUser), 300) == 401, "attempt ${i}")
+    // Past the backoff the throttle asks for after each failure.
+    clock.t = clock.t + 20
+    i = i + 1
+  }
+  let good = lgOk(lg, randomBytes(32))
+  assert(
+    lgStatusOver(lg, good, Option<string>.Some(lgUser), 300) == 429,
+    "the sixth attempt is throttled",
+  )
+  assert(
+    lg.events.kinds[len(lg.events.kinds) - 1] == "login.locked",
+    "events ${join(lg.events.kinds, ",")}",
+  )
+}
+
+test "WebAuthnStrategy() refuses a nil resolve, and names itself passkey" {
+  let store = MemoryCredentialStore()
+  let r: (string) => Identity! = nil
+  let s = WebAuthnStrategy(lgWa(store), r) catch e {
+    assert(contains(e.message(), "resolve"), "message '${e.message()}'")
+    return
+  }
+  assert(false, "a nil resolve must fail construction, got ${s.name()}")
+}
+
+test "WebAuthnStrategy is a Strategy named passkey" {
+  let lg = lgNew()
+  let s: Strategy = lg.strategy
+  assert(s.name() == "passkey", "name ${s.name()}")
+}
+
+test "MemoryCredentialStore.userForHandle is a map lookup: found, unknown, and one handle per user" {
+  let lg = lgNew()
+  let found = lg.store.userForHandle(lg.handle) catch e {
+    panic("userForHandle: ${e.message()}")
+  }
+  assert(isSome(found) && unwrap(found) == lgUser, "owner")
+  let none = lg.store.userForHandle(randomBytes(64)) catch e {
+    panic("userForHandle: ${e.message()}")
+  }
+  assert(!isSome(none), "unknown handle")
+  lg.store.bindHandle("user-3", lg.handle) catch e {
+    assert(contains(e.message(), "already bound"), "message '${e.message()}'")
+    return
+  }
+  assert(false, "a handle already bound to another user must be refused")
+}
