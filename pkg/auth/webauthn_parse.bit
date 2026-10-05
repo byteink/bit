@@ -1,0 +1,470 @@
+// pkg/auth/webauthn_parse.bit — the byte-level parsing both WebAuthn
+// ceremonies (registration and authentication) start from (#6956), written
+// against W3C Web Authentication Level 3.
+//
+// Everything here reads bytes an attacker chose, so every length is checked
+// against the bytes that are actually there BEFORE a slice is taken, and a
+// malformed structure is an error naming what was wrong, never a panic. CBOR
+// and COSE are not parsed by hand: `decodePrefix`/`decode` (std/cbor) and
+// `parseCoseKey` (std/crypto, cose.bit) do that, with tight limits.
+//
+//   parseClientData        §5.8.1 CollectedClientData: `type`, `challenge`
+//                          (base64url, decoded), `origin`, `crossOrigin`,
+//                          `topOrigin`. A duplicated top-level key is an error
+//                          (two decoders could pick different ones); members
+//                          this file does not know are ignored, as §5.8.1
+//                          requires ("extra keys may be present").
+//   checkClientData        §7.1 steps 7-10 and §7.2 steps 11-14: the type, the
+//                          challenge (constant-time), the origin against an
+//                          exact allow-list, and a cross-origin or top-origin
+//                          claim only when the caller listed that top origin.
+//   parseAuthenticatorData §6.1: rpIdHash (32), flags (1), signCount (4, big
+//                          endian), then attested credential data (§6.5.1:
+//                          aaguid 16, credentialIdLength 2 big endian,
+//                          credentialId, a COSE_Key) when AT is set, then the
+//                          extensions CBOR map when ED is set. Nothing may
+//                          follow. BS without BE is invalid (§6.1.3).
+//   parseAttestationObject §6.5: a CBOR map with exactly `fmt`, `attStmt` and
+//                          `authData`; `authData` goes through
+//                          `parseAuthenticatorData`.
+//   checkRpIdHash          §7.1 step 13 / §7.2 step 15: SHA-256 of the RP ID
+//                          equals `rpIdHash`.
+//
+// Flag bits RFU1 (bit 1) and RFU2 (bit 5) are not examined: §6.1 reserves them
+// and a relying party has no rule to apply. `ClientData.type` and the other
+// names here are package-internal; the ceremony code in this module consumes
+// them.
+//
+// `digest`, `Sha256`, `ctEq`, `decodeBase64Url` (oidc_authorize.bit,
+// oidc_verify.bit, onetime.bit) and `Json`, `jsonGet`, `jsonParse`,
+// `jsonAsString`, `jsonAsBool`, `jsonAsObject` (strategy.bit, oidc_verify.bit,
+// bearer.bit, apple.bit) are already bound module-wide (SPEC §17.1);
+// re-importing any of them here is E0042.
+import { Cbor, CborEntry, DecodeOptions, decode, decodePrefix } from "std/cbor"
+import { CoseKey, parseCoseKey } from "std/crypto"
+import { isValidUtf8 } from "std/strings"
+
+// §6.1: rpIdHash 32 + flags 1 + signCount 4.
+const waHeaderLen = 37
+// §6.5.1: aaguid 16 + credentialIdLength 2.
+const waAttestedHeaderLen = 18
+// §6.5.1: the credentialId is at most 1023 bytes.
+const waMaxCredentialIdLen = 1023
+const waFlagUp: byte = 0x01
+const waFlagUv: byte = 0x04
+const waFlagBe: byte = 0x08
+const waFlagBs: byte = 0x10
+const waFlagAt: byte = 0x40
+const waFlagEd: byte = 0x80
+
+// The most clientDataJSON this file parses. A real one is a few hundred bytes;
+// the cap bounds the JSON parse of untrusted input.
+const waMaxClientDataLen = 16384
+
+// The most a credential public key, an extensions map and an attestation object
+// may decode to. A COSE_Key is a map of at most ~10 small items (cose.bit bounds
+// it again); extensions and attStmt (an x5c certificate chain) are larger.
+fn waCoseKeyOpts(): DecodeOptions {
+  return DecodeOptions{ maxDepth = 2, maxItems = 64, maxBytes = 4096 }
+}
+
+fn waExtensionOpts(): DecodeOptions {
+  return DecodeOptions{ maxDepth = 8, maxItems = 1024, maxBytes = 65536 }
+}
+
+fn waAttestationOpts(): DecodeOptions {
+  return DecodeOptions{ maxDepth = 8, maxItems = 4096, maxBytes = 262144 }
+}
+
+// ---------------------------------------------------------------------------
+// clientDataJSON
+// ---------------------------------------------------------------------------
+
+// §5.8.1 CollectedClientData, the members a relying party reads. `challenge`
+// is the decoded bytes; `topOrigin` is None when the member is absent.
+class ClientData {
+  kind: string,
+  challenge: []byte,
+  origin: string,
+  crossOrigin: bool,
+  topOrigin: Option<string>,
+}
+
+// The entries of the top-level JSON object, with a duplicated key rejected.
+fn waClientObject(json: []byte): []JsonEntry! {
+  if (len(json) == 0 || len(json) > waMaxClientDataLen) {
+    fail newError("auth: webauthn: clientDataJSON is ${len(json)} bytes, want 1 to ${waMaxClientDataLen}")
+  }
+  let text = string(json)
+  if (!isValidUtf8(text)) {
+    fail newError("auth: webauthn: clientDataJSON is not valid UTF-8")
+  }
+  let root = jsonParse(text) catch e {
+    fail newError("auth: webauthn: clientDataJSON is not JSON: ${e.message()}")
+  }
+  let obj = jsonAsObject(root)
+  if (!isSome(obj)) {
+    fail newError("auth: webauthn: clientDataJSON is not a JSON object")
+  }
+  let entries = unwrap(obj)
+  let i = 0
+  while (i < len(entries)) {
+    let j = i + 1
+    while (j < len(entries)) {
+      if (entries[i].key == entries[j].key) {
+        fail newError("auth: webauthn: clientDataJSON repeats the key '${entries[i].key}'")
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return entries
+}
+
+// A required string member of the client data.
+fn waString(root: Json, key: string): string! {
+  let m = jsonGet(root, key)
+  if (!isSome(m)) {
+    fail newError("auth: webauthn: clientDataJSON has no '${key}'")
+  }
+  let s = jsonAsString(unwrap(m))
+  if (!isSome(s)) {
+    fail newError("auth: webauthn: clientDataJSON '${key}' is not a string")
+  }
+  return unwrap(s)
+}
+
+// An optional string member: None when absent, an error when present and not a
+// string (a JSON null counts as present).
+fn waOptString(root: Json, key: string): Option<string>! {
+  let m = jsonGet(root, key)
+  if (!isSome(m)) {
+    return Option<string>.None
+  }
+  let s = jsonAsString(unwrap(m))
+  if (!isSome(s)) {
+    fail newError("auth: webauthn: clientDataJSON '${key}' is not a string")
+  }
+  return Option<string>.Some(unwrap(s))
+}
+
+// §5.8.1: `crossOrigin` is optional and false when absent.
+fn waCrossOrigin(root: Json): bool! {
+  let m = jsonGet(root, "crossOrigin")
+  if (!isSome(m)) {
+    return false
+  }
+  let b = jsonAsBool(unwrap(m))
+  if (!isSome(b)) {
+    fail newError("auth: webauthn: clientDataJSON 'crossOrigin' is not a boolean")
+  }
+  return unwrap(b)
+}
+
+// §5.8.1: `challenge` is base64url without padding. `decodeBase64Url` rejects
+// padding and any character outside the alphabet.
+fn waChallenge(root: Json): []byte! {
+  let text = waString(root, "challenge")?
+  return decodeBase64Url(text) catch e {
+    fail newError("auth: webauthn: clientDataJSON 'challenge' is not base64url: ${e.message()}")
+  }
+}
+
+// The client data in `json` (the exact bytes the browser signed over, never a
+// re-serialisation). Fails on JSON that does not parse, a duplicated key, a
+// missing or mistyped `type`, `challenge` or `origin`, a challenge that is not
+// unpadded base64url, a mistyped `crossOrigin` or `topOrigin`, and a
+// `topOrigin` without `crossOrigin: true` (§5.8.1).
+fn parseClientData(json: []byte): ClientData! {
+  let entries = waClientObject(json)?
+  let root = Json.JsonObject(entries)
+  let cd = ClientData{
+    kind = waString(root, "type")?,
+    challenge = waChallenge(root)?,
+    origin = waString(root, "origin")?,
+    crossOrigin = waCrossOrigin(root)?,
+    topOrigin = waOptString(root, "topOrigin")?,
+  }
+  if (isSome(cd.topOrigin) && !cd.crossOrigin) {
+    fail newError("auth: webauthn: clientDataJSON has a 'topOrigin' but 'crossOrigin' is not true")
+  }
+  return cd
+}
+
+// Whether `s` is exactly one of `list`. No wildcard, no scheme or port
+// normalisation: an origin is the serialised string the caller configured.
+fn waListed(s: string, list: []string): bool {
+  let i = 0
+  while (i < len(list)) {
+    if (list[i] == s) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// §7.1 steps 7-10 and §7.2 steps 11-14 on the parsed client data: `type` is
+// `expectType` ("webauthn.create" or "webauthn.get"), `challenge` equals the
+// one issued for this ceremony (constant-time), `origin` is exactly one of
+// `origins`, and a cross-origin ceremony is accepted only when its `topOrigin`
+// is exactly one of `topOrigins`. An empty `challenge` or `origins` fails
+// closed: nothing could have been issued or allowed.
+fn checkClientData(
+  cd: ClientData,
+  expectType: string,
+  challenge: []byte,
+  origins: []string,
+  topOrigins: []string,
+): ()! {
+  if (cd.kind != expectType) {
+    fail newError("auth: webauthn: clientData type is '${cd.kind}', want '${expectType}'")
+  }
+  if (len(challenge) == 0) {
+    fail newError("auth: webauthn: no challenge was issued for this ceremony")
+  }
+  if (!ctEq(cd.challenge, challenge)) {
+    fail newError("auth: webauthn: clientData challenge does not match the issued challenge")
+  }
+  if (!waListed(cd.origin, origins)) {
+    fail newError("auth: webauthn: clientData origin '${cd.origin}' is not an allowed origin")
+  }
+  if (!cd.crossOrigin) {
+    return
+  }
+  if (!isSome(cd.topOrigin) || !waListed(unwrap(cd.topOrigin), topOrigins)) {
+    fail newError("auth: webauthn: clientData is cross-origin and its topOrigin is not an allowed top origin")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Authenticator data
+// ---------------------------------------------------------------------------
+
+// §6.5.1 attested credential data. `publicKeyBytes` is the credentialPublicKey
+// exactly as it appeared on the wire (a relying party stores it verbatim);
+// `publicKey` is the parsed form, built only from a key `parseCoseKey` accepts.
+class AttestedCredential {
+  aaguid: []byte,
+  credentialId: []byte,
+  publicKey: CoseKey,
+  publicKeyBytes: []byte,
+}
+
+// §6.1 authenticator data. `raw` is the whole input, the bytes an assertion
+// signature covers; `extensions` is the CBOR map when ED was set.
+class AuthenticatorData {
+  rpIdHash: []byte,
+  up: bool,
+  uv: bool,
+  be: bool,
+  bs: bool,
+  signCount: uint,
+  attested: Option<AttestedCredential>,
+  extensions: Option<Cbor>,
+  raw: []byte,
+}
+
+// A copy of data[from:to]; the caller has already checked the range. A copy,
+// not a view, so a parsed value never aliases the caller's buffer.
+fn waCopy(data: []byte, from: int, to: int): []byte {
+  let out = []byte(0)
+  let i = from
+  while (i < to) {
+    out = append(out, data[i])
+    i = i + 1
+  }
+  return out
+}
+
+// §6.1: signCount is a 32-bit big-endian counter at bytes 33 to 36.
+fn waSignCount(data: []byte): uint {
+  return (uint(data[33]) << 24) | (uint(data[34]) << 16) | (uint(data[35]) << 8) | uint(data[36])
+}
+
+// §6.5.1 credentialIdLength: 16-bit big-endian at bytes 53 and 54.
+fn waCredentialIdLen(data: []byte): int {
+  return (int(data[waHeaderLen + 16]) << 8) | int(data[waHeaderLen + 17])
+}
+
+// The attested credential data at data[37:]. Returns it and the offset of the
+// first byte after the credentialPublicKey.
+fn waAttested(data: []byte): (AttestedCredential, int)! {
+  if (len(data) < waHeaderLen + waAttestedHeaderLen) {
+    fail newError("auth: webauthn: authenticatorData has the AT flag but only ${len(data)} bytes, want at least ${waHeaderLen + waAttestedHeaderLen}")
+  }
+  let idLen = waCredentialIdLen(data)
+  if (idLen == 0 || idLen > waMaxCredentialIdLen) {
+    fail newError("auth: webauthn: credentialIdLength is ${idLen}, want 1 to ${waMaxCredentialIdLen}")
+  }
+  let idStart = waHeaderLen + waAttestedHeaderLen
+  let keyStart = idStart + idLen
+  if (keyStart >= len(data)) {
+    fail newError("auth: webauthn: authenticatorData ends inside the credentialId or before the credentialPublicKey (credentialIdLength ${idLen}, ${len(data)} bytes)")
+  }
+  let (_, used) = decodePrefix(data[keyStart:], waCoseKeyOpts()) catch e {
+    fail newError("auth: webauthn: credentialPublicKey is not CBOR: ${e.message()}")
+  }
+  let keyBytes = waCopy(data, keyStart, keyStart + used)
+  let key = parseCoseKey(keyBytes) catch e {
+    fail newError("auth: webauthn: credentialPublicKey: ${e.message()}")
+  }
+  let ac = AttestedCredential{
+    aaguid = waCopy(data, waHeaderLen, waHeaderLen + 16),
+    credentialId = waCopy(data, idStart, keyStart),
+    publicKey = key,
+    publicKeyBytes = keyBytes,
+  }
+  return (ac, keyStart + used)
+}
+
+// §6.1 extensions: one CBOR map filling data[from:].
+fn waExtensions(data: []byte, from: int): Cbor! {
+  if (from >= len(data)) {
+    fail newError("auth: webauthn: authenticatorData has the ED flag but no extensions")
+  }
+  let v = decode(data[from:], waExtensionOpts()) catch e {
+    fail newError("auth: webauthn: extensions: ${e.message()}")
+  }
+  match (v) {
+    Map(_) => return v
+    _ => fail newError("auth: webauthn: extensions are not a CBOR map")
+  }
+}
+
+// §6.1.3: the flags that must agree with each other.
+fn waCheckFlags(flags: byte): ()! {
+  if ((flags & waFlagBs) != 0 && (flags & waFlagBe) == 0) {
+    fail newError("auth: webauthn: authenticatorData has BS without BE (§6.1.3)")
+  }
+}
+
+// The authenticator data in `data`, which must be exactly one structure: the
+// 37-byte header, the attested credential data when AT is set (and only then),
+// the extensions map when ED is set (and only then), and nothing else. Every
+// length is checked before the bytes behind it are read.
+fn parseAuthenticatorData(data: []byte): AuthenticatorData! {
+  if (len(data) < waHeaderLen) {
+    fail newError("auth: webauthn: authenticatorData is ${len(data)} bytes, want at least ${waHeaderLen}")
+  }
+  let flags = data[32]
+  waCheckFlags(flags)?
+  let ad = AuthenticatorData{
+    rpIdHash = waCopy(data, 0, 32),
+    up = (flags & waFlagUp) != 0,
+    uv = (flags & waFlagUv) != 0,
+    be = (flags & waFlagBe) != 0,
+    bs = (flags & waFlagBs) != 0,
+    signCount = waSignCount(data),
+    attested = Option<AttestedCredential>.None,
+    extensions = Option<Cbor>.None,
+    raw = waCopy(data, 0, len(data)),
+  }
+  let at = waHeaderLen
+  if ((flags & waFlagAt) != 0) {
+    let (ac, next) = waAttested(data)?
+    ad.attested = Option<AttestedCredential>.Some(ac)
+    at = next
+  }
+  if ((flags & waFlagEd) != 0) {
+    ad.extensions = Option<Cbor>.Some(waExtensions(data, at)?)
+    return ad
+  }
+  if (at != len(data)) {
+    fail newError("auth: webauthn: authenticatorData has ${len(data) - at} trailing bytes and no ED flag")
+  }
+  return ad
+}
+
+// §7.1 step 13 / §7.2 step 15: `rpIdHash` is the SHA-256 of `rpId`, compared in
+// constant time.
+fn checkRpIdHash(ad: AuthenticatorData, rpId: string): ()! {
+  if (len(rpId) == 0) {
+    fail newError("auth: webauthn: the relying party id is empty")
+  }
+  if (!ctEq(ad.rpIdHash, digest(Sha256(), []byte(rpId)))) {
+    fail newError("auth: webauthn: authenticatorData rpIdHash is not the SHA-256 of '${rpId}'")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Attestation object
+// ---------------------------------------------------------------------------
+
+// §6.5 attestation object: the statement format identifier, the statement
+// (format-specific CBOR, verified by the ceremony), and the parsed authData.
+class AttestationObject {
+  fmt: string,
+  attStmt: Cbor,
+  authData: AuthenticatorData,
+}
+
+// The value under text key `key` of a CBOR map, None when absent. A key that
+// appears twice is an error: two decoders could pick different ones.
+fn waMapGet(entries: []CborEntry, key: string): Option<Cbor>! {
+  let found = Option<Cbor>.None
+  let i = 0
+  while (i < len(entries)) {
+    match (entries[i].key) {
+      Text(k) => {
+        if (k == key) {
+          if (isSome(found)) {
+            fail newError("auth: webauthn: attestationObject repeats the key '${key}'")
+          }
+          found = Option<Cbor>.Some(entries[i].value)
+        }
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  return found
+}
+
+fn waRequire(entries: []CborEntry, key: string): Cbor! {
+  let v = waMapGet(entries, key)?
+  if (!isSome(v)) {
+    fail newError("auth: webauthn: attestationObject has no '${key}'")
+  }
+  return unwrap(v)
+}
+
+// §6.5: the map holds `fmt`, `attStmt` and `authData` and nothing else.
+fn waAttestationEntries(data: []byte): []CborEntry! {
+  let v = decode(data, waAttestationOpts()) catch e {
+    fail newError("auth: webauthn: attestationObject is not CBOR: ${e.message()}")
+  }
+  match (v) {
+    Map(entries) => {
+      if (len(entries) != 3) {
+        fail newError("auth: webauthn: attestationObject has ${len(entries)} members, want exactly fmt, attStmt and authData")
+      }
+      return entries
+    }
+    _ => fail newError("auth: webauthn: attestationObject is not a CBOR map")
+  }
+}
+
+// The attestation object in `data`: one CBOR map of exactly `fmt` (text),
+// `attStmt` (a map) and `authData` (bytes, parsed with `parseAuthenticatorData`).
+fn parseAttestationObject(data: []byte): AttestationObject! {
+  let entries = waAttestationEntries(data)?
+  let fmtVal = waRequire(entries, "fmt")?
+  let stmt = waRequire(entries, "attStmt")?
+  let authVal = waRequire(entries, "authData")?
+  let fmt = ""
+  match (fmtVal) {
+    Text(s) => fmt = s
+    _ => fail newError("auth: webauthn: attestationObject 'fmt' is not text")
+  }
+  match (stmt) {
+    Map(_) => {}
+    _ => fail newError("auth: webauthn: attestationObject 'attStmt' is not a map")
+  }
+  match (authVal) {
+    Bytes(b) => {
+      return AttestationObject{ fmt = fmt, attStmt = stmt, authData = parseAuthenticatorData(b)? }
+    }
+    _ => fail newError("auth: webauthn: attestationObject 'authData' is not a byte string")
+  }
+}
