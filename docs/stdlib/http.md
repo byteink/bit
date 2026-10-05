@@ -240,8 +240,9 @@ A response whose framing is ambiguous is refused before any body is read:
 The buffered client and the server refuse the same messages.
 
 Set `timeoutMs` on the request to bound the connect, the response head and each
-`read`. A stall fails with a `TimeoutError`, which you tell from other errors
-with `e.(TimeoutError)`:
+`read`. A stall in `read` fails with a `TimeoutError`, which you tell from other
+errors with `e.(TimeoutError)`; a connect, request or head that outlives it fails
+the `send` with a `RequestError` whose `cause` is the `TimeoutError`:
 
 ```bit
 import { Client, ClientRequest, TimeoutError } from "std/http"
@@ -521,9 +522,10 @@ fn charge(c: Client, body: string): string! {
 and after a followed redirect whichever hop failed. A failure before the
 network layer (a URL that does not parse, a header that cannot be sent) is a
 plain error and sent nothing. A streamed request (`Client.send` with
-`stream = true`) reports its failures as before. A reused connection that fails
-is repeated on a fresh one for an idempotent method only, and a `POST` fails
-with the `RequestError` of that connection.
+`stream = true`) fails the same way, and one that outlives `timeoutMs` fails
+with a `RequestError` whose `cause` is the `TimeoutError`. A reused connection
+that fails is repeated on a fresh one for an idempotent method only, and a
+`POST` fails with the `RequestError` of that connection.
 
 ## Serving requests: the basics
 
@@ -807,7 +809,8 @@ the cause's text.
 
 ### `TimeoutError`
 
-The error a streamed request fails with when `timeoutMs` ran out: `op` is
+The error a streamed request fails with when `timeoutMs` ran out (as the `cause`
+of a `RequestError` for `"send"`): `op` is
 `"send"` (connect, request, head) or `"read"` (one `BodyReader.read`) and `ms`
 the bound.
 
