@@ -1,0 +1,369 @@
+// pkg/mail/failover.test.bit — `Options.fallback` and `Options.spread`: which
+// failures move a delivery to the next transport (only `Transient`, never
+// `Unknown`), the rotation, the cool-down on a clock that moves when asked, the
+// receipt's name for the transport, and every setup mistake at `open`.
+
+import { contains } from "std/strings"
+import { Second } from "std/time"
+import { AtomicI64, WaitGroup } from "std/sync"
+import { envOr } from "std/os"
+import { mkdir, readDir, remove } from "std/fs"
+import { now } from "std/time"
+
+// A clock that moves only when told to.
+class FoClock {
+  t: int
+
+  monotonic(): int {
+    return this.t
+  }
+
+  sleep(d: int) {
+    this.t = this.t + d
+  }
+}
+
+// A transport that fails with `fails` in call order, then accepts, and counts
+// its calls. `signs` is what `signs()` answers.
+class FoScript {
+  fails: []MailError
+  calls: AtomicI64
+  signing: bool
+
+  deliver(d: Delivery): Receipt!MailError {
+    let n = int(this.calls.add(1)) - 1
+    if (n < len(this.fails)) {
+      fail this.fails[n]
+    }
+    return Receipt{ id = d.messageId, accepted = d.envelope.to }
+  }
+
+  signs(): bool {
+    return this.signing
+  }
+
+  close() {}
+}
+
+fn foScript(fails: []MailError): FoScript {
+  return FoScript{ fails = fails, calls = AtomicI64(0), signing = true }
+}
+
+fn foCalls(s: FoScript): int {
+  return int(s.calls.load())
+}
+
+fn foLater(text: string): MailError {
+  return MailError.Transient(Reply{ code = 451, enhanced = "4.7.1", text = text })
+}
+
+fn foMessage(): Message {
+  return Message{
+    from = "Inkwell <hello@inkwell.dev>",
+    to = ["Sara Ali <sara@example.com>"],
+    subject = "Welcome to Inkwell",
+    text = "Hello Sara.",
+    id = "welcome-1",
+  }
+}
+
+// A `Mailer` over a `Failover` of `scripts`, named a, b, c. `Retry` is off, so
+// a send that fails on every transport returns at once.
+fn foMailer(scripts: []FoScript, spread: bool, clock: FoClock): Mailer {
+  let ts: []Transport = []
+  let names: []string = []
+  let i = 0
+  for s of scripts {
+    ts = append(ts, s)
+    names = append(names, "t${i}://host")
+    i = i + 1
+  }
+  let o = Options{ from = "Inkwell <hello@inkwell.dev>", retry = Retry{ attempts = 1 } }
+  return Mailer(Failover(ts, names, spread, clock), o) catch e {
+    panic("Mailer: ${e.message()}")
+  }
+}
+
+// The text of the failure of a send that must fail.
+fn foFailure(m: Mailer): string {
+  m.send(foMessage()) catch e {
+    return e.message()
+  }
+  return "delivered"
+}
+
+fn foSend(m: Mailer): Receipt {
+  return m.send(foMessage()) catch e {
+    panic("send: ${e.message()}")
+  }
+}
+
+test "a Transient on the primary is delivered by the fallback and the Receipt names it" {
+  let a = foScript([foLater("down")])
+  let b = foScript([])
+  let m = foMailer([a, b], false, FoClock{})
+  let r = foSend(m)
+  assert(r.transport == "t1://host", r.transport)
+  assert(r.id == "<welcome-1@inkwell.dev>", r.id)
+  assert(foCalls(a) == 1 && foCalls(b) == 1, "calls ${foCalls(a)} ${foCalls(b)}")
+}
+
+test "a primary that delivers is the one named and the fallback is not called" {
+  let a = foScript([])
+  let b = foScript([])
+  let m = foMailer([a, b], false, FoClock{})
+  assert(foSend(m).transport == "t0://host", "transport")
+  assert(foCalls(b) == 0, "fallback called")
+}
+
+test "Rejected, Invalid, Auth, Config and Unknown never reach the fallback" {
+  let answers = [
+    MailError.Rejected(Reply{ code = 550, text = "no such user" }),
+    MailError.Invalid("x"),
+    MailError.Auth(Reply{ code = 535, text = "bad login" }),
+    MailError.Config("x"),
+    MailError.Unknown(Reply{ text = "connection reset" }),
+  ]
+  for e of answers {
+    let a = foScript([e])
+    let b = foScript([])
+    let m = foMailer([a, b], false, FoClock{})
+    m.send(foMessage()) catch got {
+      assert(got.message() == e.message(), got.message())
+      assert(foCalls(a) == 1, "${e.message()}: primary called ${foCalls(a)} times")
+      assert(
+        foCalls(b) == 0,
+        "${e.message()}: the fallback was called, the mail could be sent twice",
+      )
+      continue
+    }
+    assert(false, "${e.message()} was delivered")
+  }
+}
+
+test "a permanent refusal on the fallback is what comes back after a Transient" {
+  let a = foScript([foLater("down")])
+  let b = foScript([MailError.Rejected(Reply{ code = 550, text = "no such user" })])
+  let c = foScript([])
+  let m = foMailer([a, b, c], false, FoClock{})
+  m.send(foMessage()) catch e {
+    assert(e.message() == "mail: rejected: 550 no such user", e.message())
+    assert(foCalls(c) == 0, "went on past a refusal")
+    return
+  }
+  assert(false, "delivered")
+}
+
+test "every transport Transient returns the last one's error" {
+  let a = foScript([foLater("first")])
+  let b = foScript([foLater("second")])
+  let m = foMailer([a, b], false, FoClock{})
+  m.send(foMessage()) catch e {
+    assert(e.message() == "mail: temporary failure: 451 4.7.1 second", e.message())
+    return
+  }
+  assert(false, "delivered")
+}
+
+test "spread over 3 transports and 9 sends calls each 3 times, in turn" {
+  let s = [foScript([]), foScript([]), foScript([])]
+  let m = foMailer(s, true, FoClock{})
+  let i = 0
+  while (i < 9) {
+    let r = foSend(m)
+    assert(r.transport == "t${i % 3}://host", "send ${i} went to ${r.transport}")
+    i = i + 1
+  }
+  assert(foCalls(s[0]) == 3 && foCalls(s[1]) == 3 && foCalls(s[2]) == 3, "uneven")
+}
+
+test "spread fails over in list order from the rotation's start" {
+  // Send 0 starts at t0, send 1 at t1 (which is down), send 2 at t2.
+  let s = [foScript([]), foScript([foLater("down")]), foScript([])]
+  let m = foMailer(s, true, FoClock{})
+  assert(foSend(m).transport == "t0://host", "send 0")
+  assert(foSend(m).transport == "t2://host", "send 1 moves on to t2")
+}
+
+fn foWorker(m: Mailer, wg: WaitGroup) {
+  defer wg.done()
+  let i = 0
+  while (i < 30) {
+    m.send(foMessage()) catch e {
+      panic("send: ${e.message()}")
+    }
+    i = i + 1
+  }
+}
+
+test "spread is even under concurrent sends" {
+  let s = [foScript([]), foScript([]), foScript([]), foScript([])]
+  let m = foMailer(s, true, FoClock{})
+  let wg = WaitGroup()
+  wg.add(8)
+  let i = 0
+  while (i < 8) {
+    spawn foWorker(m, wg)
+    i = i + 1
+  }
+  wg.wait()
+  for t of s {
+    assert(foCalls(t) == 60, "a transport took ${foCalls(t)} of 240, want 60")
+  }
+}
+
+test "a primary that failed Transient is skipped for 15 seconds and used again after" {
+  let a = foScript([foLater("down")])
+  let b = foScript([])
+  let clock = FoClock{}
+  let m = foMailer([a, b], false, clock)
+  assert(foSend(m).transport == "t1://host", "first send")
+  assert(foCalls(a) == 1, "primary tried once")
+  clock.t = clock.t + 14 * Second
+  assert(foSend(m).transport == "t1://host", "inside the cool-down")
+  assert(foCalls(a) == 1, "primary asked during its cool-down")
+  clock.t = clock.t + 1 * Second
+  assert(foSend(m).transport == "t0://host", "after the cool-down")
+  assert(foCalls(a) == 2, "primary not asked after the cool-down")
+}
+
+test "when every transport is cooling down all are tried in order" {
+  let a = foScript([foLater("1"), foLater("3")])
+  let b = foScript([foLater("2")])
+  let m = foMailer([a, b], false, FoClock{})
+  let first = foFailure(m)
+  assert(contains(first, "451 4.7.1 2"), first)
+  assert(foCalls(a) == 1 && foCalls(b) == 1, "first send")
+  // Both are cooling now, and a second send still tries them, in order: the
+  // primary fails once more, the fallback delivers.
+  let r = foSend(m)
+  assert(r.transport == "t1://host", r.transport)
+  assert(foCalls(a) == 2 && foCalls(b) == 2, "calls ${foCalls(a)} ${foCalls(b)}")
+}
+
+test "Unknown does not start a cool-down" {
+  let a = foScript([MailError.Unknown(Reply{ text = "reset" })])
+  let b = foScript([])
+  let m = foMailer([a, b], false, FoClock{})
+  assert(contains(foFailure(m), "outcome unknown"), "Unknown")
+  assert(foSend(m).transport == "t0://host", "primary skipped after Unknown")
+}
+
+fn foConfig(url: string, o: Options): string {
+  open(url, o) catch e {
+    match (e) {
+      Config(why) => return why
+      _ => assert(false, "want Config, got ${e.message()}")
+    }
+  }
+  return "ok"
+}
+
+test "an empty fallback entry fails at open naming its index" {
+  assert(
+    foConfig("log://", Options{ fallback = [""] }) == "Options.fallback[0] is empty",
+    "[0]",
+  )
+  assert(
+    foConfig("log://", Options{ fallback = ["log://", ""] }) == "Options.fallback[1] is empty",
+    "[1]",
+  )
+}
+
+test "a fallback URL is parsed by open's rules and a refusal names the entry, never the password" {
+  let why = foConfig("log://", Options{ fallback = ["log://", "imap://u:s3cret-pw@host"] })
+  assert(contains(why, "Options.fallback[1]: unknown URL scheme 'imap'"), why)
+  assert(!contains(why, "s3cret-pw"), why)
+  let why2 = foConfig("log://", Options{ fallback = ["smtps://u:s3cret-pw@host:0"] })
+  assert(contains(why2, "Options.fallback[0]: ") && contains(why2, "port 0"), why2)
+  assert(!contains(why2, "s3cret-pw"), why2)
+}
+
+test "spread needs fallback, and Mailer(t, opts) refuses what only open reads" {
+  assert(
+    contains(foConfig("log://", Options{ spread = true }), "Options.spread needs Options.fallback"),
+    "spread alone",
+  )
+  Mailer(Outbox(), Options{ fallback = ["log://"] }) catch e {
+    assert(contains(e.message(), "read by open"), e.message())
+    return
+  }
+  assert(false, "Mailer ignored Options.fallback")
+}
+
+test "Options.dkim is refused at open when any listed transport builds the message itself" {
+  let ok = foScript([])
+  let api = foScript([])
+  api.signing = false
+  let ts: []Transport = [ok, api]
+  let o = Options{ dkim = [Dkim{}] }
+  checkFailoverDkim(ts, ["smtps://***@mail.example.com", "resend://***@default"], o) catch e {
+    match (e) {
+      Config(why) => {
+        assert(
+          contains(
+            why,
+            "Options.dkim: resend://***@default hands the message to a provider that builds it itself",
+          ),
+          why,
+        )
+        assert(!contains(why, "smtps://"), why)
+      }
+      _ => assert(false, "want Config, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "a transport that cannot sign was accepted")
+}
+
+test "Options.dkim through open refuses an API fallback behind an SMTP primary" {
+  let o = Options{ dkim = [dwRsa()], fallback = ["resend://re_key@default"] }
+  let why = foConfig("smtps://u:p@mail.example.com", o)
+  assert(
+    contains(
+      why,
+      "Options.dkim: resend://***@default hands the message to a provider that builds it itself",
+    ),
+    why,
+  )
+}
+
+test "the transport name hides userinfo and query" {
+  assert(
+      redactedUrl("smtps://u:pw@smtp.example.com:465?caFile=/x") ==
+      "smtps://***@smtp.example.com:465",
+    "smtps",
+  )
+  assert(redactedUrl("resend://re_key@default") == "resend://***@default", "resend")
+  assert(redactedUrl("mailgun://key:inkwell.dev@eu") == "mailgun://***@eu", "mailgun")
+  assert(redactedUrl("log://") == "log://", "log")
+  assert(redactedUrl("smtp://localhost:1025?tls=off") == "smtp://localhost:1025", "plain")
+}
+
+test "open with a dead primary delivers through the fallback and names it" {
+  let dir = "${envOr("TMPDIR", "/tmp")}/t6900-${now().ns}"
+  mkdir(dir) catch e {
+    panic(e.message())
+  }
+  let m = open(
+    "smtp://127.0.0.1:1?tls=off",
+    Options{
+      from = "Inkwell <hello@inkwell.dev>",
+      fallback = ["file://${dir}"],
+      retry = Retry{ attempts = 1 },
+    },
+  ) catch e {
+    panic("open: ${e.message()}")
+  }
+  let r = foSend(m)
+  assert(r.transport == "file://${dir}", r.transport)
+  let names = readDir(dir) catch e {
+    panic(e.message())
+  }
+  assert(len(names) == 1, "${len(names)} files written")
+  m.close()
+  for n of names {
+    remove("${dir}/${n}") catch _ {}
+  }
+  remove(dir) catch _ {}
+}

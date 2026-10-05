@@ -71,6 +71,9 @@ fn main(): ()! {
 * **`retry`** says how a delivery the server only postponed is repeated, and
   **`rate`** how many messages a second the mailer delivers at most. See
   [Retries and pace](retry.md).
+* **`fallback`** and **`spread`** are read by `open`: more URLs to try when
+  one says "not now", and whether to share the load. See
+  [A second route](failover.md).
 * **`redirect`** is for staging: every mail goes to that one address and to
   nobody else. See [Staging mail](redirect.md).
 

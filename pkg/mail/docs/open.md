@@ -235,5 +235,8 @@ else `localhost`.
 
 ## Where to go next
 
+`Options.fallback` takes more URLs of this kind for the day this server is down:
+[A second route](failover.md).
+
 The [Mailer](mailer.md) chapter has `Options` and the errors; [Messages](messages.md)
 has what a message may hold.

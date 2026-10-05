@@ -1,0 +1,243 @@
+// pkg/mail/failover.bit — `Failover`, the transport behind `Options.fallback`
+// and `Options.spread`: a list of transports tried in order, or in rotation.
+//
+// Only `MailError.Transient` moves a delivery to the next transport. It is the
+// server's "not now": the mail was refused before it was taken, so another
+// route cannot duplicate it. `Rejected`, `Invalid`, `Auth` and `Config` are a
+// permanent answer a second provider would only repeat, and `Unknown` (the
+// request was written and the answer never came) means the mail may already be
+// delivered, so trying a second transport could send it twice. Laravel's
+// `failover` mailer and Symfony's `failover://` and `roundrobin://` transports
+// fall through on any transport exception, an in-flight failure included, and
+// accept that duplicate; this one does not.
+//
+// A transport that failed with `Transient` is skipped for `failoverCooldown`,
+// so a provider that is down is not asked first by every mail. When every
+// transport is cooling down, all are tried again in order. The bookkeeping is
+// two integers a transport and one counter, allocated once; a send allocates
+// nothing for it. The clock is the seam `retry.bit` declares (`Clock`).
+
+import { Mutex, AtomicU64 } from "std/sync"
+import { Second } from "std/time"
+
+// How long a transport that failed `Transient` is skipped, in nanoseconds.
+const failoverCooldown: int = 15 * Second
+
+// `ts[0]` is the primary. `names[i]` is the redacted URL of `ts[i]`.
+class Failover {
+  ts: []Transport
+  names: []string
+  spread: bool
+  clk: Clock
+  mu: Mutex
+  // `until[i]` is the monotonic time before which `ts[i]` is cooling down.
+  until: []int
+  // Deliveries started; with `spread`, the rotation's position.
+  turn: AtomicU64
+
+  init(ts: []Transport, names: []string, spread: bool, clk: Clock) {
+    this.ts = ts
+    this.names = names
+    this.spread = spread
+    this.clk = clk
+    this.mu = Mutex()
+    this.until = []int(len(ts))
+    this.turn = AtomicU64(0)
+  }
+
+  // Delivers `d` through the first transport that does not fail `Transient`,
+  // starting at the rotation's next one with `spread`, at the primary without,
+  // and skipping those cooling down unless all are. The `Receipt` names the
+  // transport that took it. When the last one tried fails, its error comes
+  // back as it was.
+  deliver(d: Delivery): Receipt!MailError {
+    let n = len(this.ts)
+    let start = 0
+    if (this.spread) {
+      start = int((this.turn.add(1) - 1) % u64(n))
+    }
+    let now = this.clk.monotonic()
+    let skip = this.anyReady(now)
+    let k = this.nextReady(start, 0, now, skip)
+    while (k >= 0) {
+      let nk = this.nextReady(start, k + 1, now, skip)
+      let i = (start + k) % n
+      if (nk < 0) {
+        return this.attempt(i, now, d)?
+      }
+      let r = this.attempt(i, now, d) catch e {
+        match (e) {
+          Transient(_) => k = nk
+          _ => fail e
+        }
+        continue
+      }
+      return r
+    }
+    fail MailError.Config("Options.fallback: no transport to deliver through")
+  }
+
+  // `ts[i].deliver(d)`, the receipt named after it, and a `Transient` failure
+  // starts its cool-down.
+  attempt(i: int, now: int, d: Delivery): Receipt!MailError {
+    let r = this.ts[i].deliver(d) catch e {
+      match (e) {
+        Transient(_) => this.cool(i, now)
+        _ => {}
+      }
+      fail e
+    }
+    r.transport = this.names[i]
+    return r
+  }
+
+  cool(i: int, now: int) {
+    this.mu.lock()
+    this.until[i] = now + failoverCooldown
+    this.mu.unlock()
+  }
+
+  // True when at least one transport is not cooling down at `now`.
+  anyReady(now: int): bool {
+    this.mu.lock()
+    let ready = false
+    for u of this.until {
+      if (u <= now) {
+        ready = true
+      }
+    }
+    this.mu.unlock()
+    return ready
+  }
+
+  // The first `k` from `from` up to the list length whose transport,
+  // `(start + k) % n`, may be tried: -1 when none is. `skip` says to pass over
+  // the ones cooling down.
+  nextReady(start: int, from: int, now: int, skip: bool): int {
+    let n = len(this.ts)
+    let k = from
+    while (k < n) {
+      if (!skip || this.ready((start + k) % n, now)) {
+        return k
+      }
+      k = k + 1
+    }
+    return -1
+  }
+
+  ready(i: int, now: int): bool {
+    this.mu.lock()
+    let ok = this.until[i] <= now
+    this.mu.unlock()
+    return ok
+  }
+
+  // True when every transport signs the bytes it is given, the condition for
+  // `Options.dkim`; `checkFailoverDkim` has already named one that does not.
+  signs(): bool {
+    for t of this.ts {
+      if (!t.signs()) {
+        return false
+      }
+    }
+    return true
+  }
+
+  close() {
+    for t of this.ts {
+      t.close()
+    }
+  }
+}
+
+// `url` as a `Receipt.transport` shows it: the scheme, then the part after the
+// last `@` (the userinfo, which holds the password or the API key, becomes
+// `***`), without the query. `smtps://user:pw@smtp.example.com?caFile=x` is
+// `smtps://***@smtp.example.com`.
+fn redactedUrl(url: string): string {
+  let at = indexOf(url, "://")
+  if (at < 0) {
+    return "?"
+  }
+  let rest = url[at + 3:]
+  let q = indexOf(rest, "?")
+  if (q >= 0) {
+    rest = rest[0:q]
+  }
+  let userinfo = lastIndexOf(rest, "@")
+  let scheme = schemeShown(toLower(url[0:at]))
+  if (userinfo < 0) {
+    return "${scheme}://${rest}"
+  }
+  return "${scheme}://***@${rest[userinfo + 1:]}"
+}
+
+// Refuses a fallback list that cannot work: an empty entry (an unset
+// environment variable), or `spread` with nothing to spread over.
+fn checkFailoverList(o: Options): ()!MailError {
+  let i = 0
+  for u of o.fallback {
+    if (u == "") {
+      fail MailError.Config("Options.fallback[${i}] is empty")
+    }
+    i = i + 1
+  }
+  if (o.spread && len(o.fallback) == 0) {
+    fail MailError.Config("Options.spread needs Options.fallback: there is nothing to rotate over")
+  }
+}
+
+// `Options.dkim` signs the bytes the transport sends, so every listed
+// transport must hand them on unchanged; the first that does not is named.
+fn checkFailoverDkim(ts: []Transport, names: []string, o: Options): ()!MailError {
+  if (len(o.dkim) == 0) {
+    return
+  }
+  let i = 0
+  for t of ts {
+    if (!t.signs()) {
+      fail MailError.Config("Options.dkim: ${names[i]} hands the message to a provider that builds it itself and signs with its own DKIM key; configure DKIM with the provider or take it out of the transports, or remove Options.dkim")
+    }
+    i = i + 1
+  }
+}
+
+// `Mailer(t, opts)` takes one transport, so `Options.fallback` and
+// `Options.spread` there would be ignored without a word: they belong to
+// `open`, which builds the `Failover`.
+fn checkComposed(t: Transport, o: Options): ()!MailError {
+  if (len(o.fallback) == 0 && !o.spread) {
+    return
+  }
+  let (_, composed) = t.(Failover)
+  if (!composed) {
+    fail MailError.Config("Options.fallback and Options.spread are read by open(url, opts); Mailer(t, opts) takes the one transport you give it")
+  }
+}
+
+// The transport `open` uses: `primary` alone, or with `Options.fallback` a
+// `Failover` over it and each fallback URL, parsed here by the rules of `open`'s
+// url. A refusal names the entry (`Options.fallback[1]: ...`).
+fn openTransport(primary: Transport, url: string, o: Options): Transport!MailError {
+  if (len(o.fallback) == 0) {
+    return primary
+  }
+  let ts: []Transport = [primary]
+  let names: []string = [redactedUrl(url)]
+  let i = 0
+  for u of o.fallback {
+    ts = append(
+      ts,
+      transportFor(u, o) catch e {
+        match (e) {
+          Config(why) => fail MailError.Config("Options.fallback[${i}]: ${why}")
+          _ => fail e
+        }
+      },
+    )
+    names = append(names, redactedUrl(u))
+    i = i + 1
+  }
+  checkFailoverDkim(ts, names, o)?
+  return Failover(ts, names, o.spread, SystemClock{})
+}
