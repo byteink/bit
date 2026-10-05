@@ -597,10 +597,74 @@ recipient is refused. All of it happens before `MAIL FROM`, so a refusal sends
 nothing after `EHLO`. A `Bcc` recipient is just another entry in `to`: it never
 appears in the bytes.
 
+## Delivery status notifications
+
+A mail that cannot be delivered comes back as a bounce, and a sender that wants
+more than the server's default asks for it in the envelope (RFC 3461). Inkwell
+wants a report for every notification it sends, and wants to match the report to
+the notification it belongs to without parsing the body:
+
+```bit
+import { Client, Raw, Envelope, Dsn, Notify, Ret, SmtpError } from "std/smtp"
+
+// Ask for a failure or delay report that carries the headers of the original
+// message, tagged with the notification id.
+fn sendTracked(c: Client, id: int, to: string, signed: string): ()!SmtpError {
+  let dsn = Dsn{ notify = Notify.FailureAndDelay, ret = Ret.Headers, envid = "note-${id}" }
+  let e = Envelope{ from = "bounce+${id}@inkwell.dev", to = [to], dsn = dsn }
+  c.send(Raw(e, signed))?
+}
+```
+
+With a server that advertised `DSN`, that sends
+
+```text
+MAIL FROM:<bounce+7@inkwell.dev> RET=HDRS ENVID=note-7
+RCPT TO:<ana@example.net> NOTIFY=FAILURE,DELAY ORCPT=rfc822;ana@example.net
+```
+
+`Envelope.dsn` defaults to `Dsn{}`, which adds no parameter anywhere. The
+parameters are sent only when the server's EHLO reply advertised `DSN`. When
+the `Dsn` asks for anything and it did not, `send` fails before `MAIL FROM`
+with `smtp: delivery notifications were requested and the server does not
+offer DSN`, a permanent `SmtpError` with no code: a request for reports is
+never quietly dropped. Check `Client.supports("DSN")` first to fall back
+instead.
+
+A request also puts `ORCPT=rfc822;<recipient>` on every `RCPT TO`, which names
+the recipient as you gave it, so a report can say who it is about even after a
+server rewrote the address. Every value that goes on the wire is xtext
+(RFC 3461 section 4): a byte from 33 to 126 stands for itself except `+` and
+`=`, and any other byte is `+` and two upper-case hex digits, so `msg 42`
+becomes `msg+2042`. An envelope id with a byte outside printable ASCII, or
+longer than 100 characters once encoded, is refused before `MAIL FROM`.
+
+A `Message` derives an envelope with the default `Dsn{}`. To ask for
+notifications for one, render it and send the bytes as a `Raw` under an
+`Envelope` that carries the `dsn`.
+
+### `Dsn`
+
+`notify: Notify`, `ret: Ret` and `envid: string`, each left at its default
+(`Notify.Default`, `Ret.Default`, `""`) when it is left out of the literal.
+
+### `Notify`
+
+`NOTIFY` of each `RCPT TO`. `Default` sends none, and the server reports
+failures and delays. `Never` asks for no report at all. The others are the
+non-empty subsets of success, failure and delay: `Success`, `Failure`,
+`Delay`, `SuccessAndFailure`, `SuccessAndDelay`, `FailureAndDelay`, `All`.
+
+### `Ret`
+
+`RET` of `MAIL FROM`: how much of the message a failure report returns.
+`Default` sends none, `Headers` is `RET=HDRS`, `Full` is `RET=FULL`.
+
 ### `Envelope`
 
 `from: string` is the `MAIL FROM` addr-spec, `""` for the null reverse-path;
-`to: []string` is every `RCPT TO` addr-spec, at least one.
+`to: []string` is every `RCPT TO` addr-spec, at least one; `dsn: Dsn` is the
+delivery status notifications to ask for, `Dsn{}` by default.
 
 ### `Sendable`
 

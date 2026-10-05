@@ -235,7 +235,12 @@ test "a rendered Message sent as Raw under another envelope keeps its bytes" {
 // the channel its transcript arrives on. Panics when the session cannot be set
 // up: every caller is about what happens after.
 fn fakeClient(replies: []string): (Client, chan<string>) {
-  let (port, log) = startFake(append([ehloPlain()], ...replies)) catch e {
+  return fakeClientEhlo(ehloPlain(), replies)
+}
+
+// `fakeClient` against a server whose EHLO reply is `ehlo`.
+fn fakeClientEhlo(ehlo: string, replies: []string): (Client, chan<string>) {
+  let (port, log) = startFake(append([ehlo], ...replies)) catch e {
     panic("startFake: ${e.message()}")
   }
   let c = dial("127.0.0.1", port) catch e {
@@ -408,4 +413,149 @@ test "a 421 at RCPT TO fails at once, with its reply and no RSET" {
   assert(err.transient(), "a 421 must be transient")
   let sent = <- log
   assert(!contains(sent, "RSET") && !contains(sent, "bad@x.com"), "wire: '${sent}'")
+}
+
+// The EHLO reply of a server that offers DSN (RFC 3461).
+fn ehloDsn(): string {
+  return "250-fake.example.com\r\n250-PIPELINING\r\n250-DSN\r\n250 SIZE 35882577\r\n"
+}
+
+// `Raw` for two recipients under `dsn`.
+fn dsnRaw(dsn: Dsn): Raw {
+  return Raw(
+    Envelope{ from = "me@x.com", to = ["a@x.com", "b+tag@y.org"], dsn = dsn },
+    rawMessage(),
+  )
+}
+
+// Send `dsn` to a server whose EHLO reply is `ehlo` and accepts everything,
+// and return the lines of the transcript.
+fn dsnTranscript(ehlo: string, dsn: Dsn): []string {
+  let (c, log) = fakeClientEhlo(
+    ehlo,
+    ["250 OK\r\n", "250 OK\r\n", "250 OK\r\n", "354 Go\r\n", "250 Queued\r\n", "221 Bye\r\n"],
+  )
+  let _ = c.send(dsnRaw(dsn)) catch e {
+    assert(false, "send: ${e.message()}")
+    return []string(0)
+  }
+  c.quit() catch _ {}
+  return split(<- log, "\r\n")
+}
+
+test "DSN: RET and ENVID go on MAIL FROM, NOTIFY and ORCPT on every RCPT TO" {
+  let lines = dsnTranscript(
+    ehloDsn(),
+    Dsn{ notify = Notify.FailureAndDelay, ret = Ret.Headers, envid = "msg 42" },
+  )
+  assert(lines[1] == "MAIL FROM:<me@x.com> RET=HDRS ENVID=msg+2042", "line 1 = '${lines[1]}'")
+  assert(
+    lines[2] == "RCPT TO:<a@x.com> NOTIFY=FAILURE,DELAY ORCPT=rfc822;a@x.com",
+    "line 2 = '${lines[2]}'",
+  )
+  assert(
+    lines[3] == "RCPT TO:<b+tag@y.org> NOTIFY=FAILURE,DELAY ORCPT=rfc822;b+2Btag@y.org",
+    "line 3 = '${lines[3]}'",
+  )
+  assert(lines[4] == "DATA", "line 4 = '${lines[4]}'")
+}
+
+test "DSN: RET=FULL, and ENVID alone sends no RET" {
+  let full = dsnTranscript(ehloDsn(), Dsn{ ret = Ret.Full })
+  assert(full[1] == "MAIL FROM:<me@x.com> RET=FULL", "line 1 = '${full[1]}'")
+  assert(full[2] == "RCPT TO:<a@x.com> ORCPT=rfc822;a@x.com", "line 2 = '${full[2]}'")
+  let id = dsnTranscript(ehloDsn(), Dsn{ envid = "a=b" })
+  assert(id[1] == "MAIL FROM:<me@x.com> ENVID=a+3Db", "line 1 = '${id[1]}'")
+}
+
+test "DSN: NOTIFY=NEVER alone" {
+  let lines = dsnTranscript(ehloDsn(), Dsn{ notify = Notify.Never })
+  assert(lines[1] == "MAIL FROM:<me@x.com>", "line 1 = '${lines[1]}'")
+  assert(
+    lines[2] == "RCPT TO:<a@x.com> NOTIFY=NEVER ORCPT=rfc822;a@x.com",
+    "line 2 = '${lines[2]}'",
+  )
+}
+
+test "DSN: every Notify value has its keyword list" {
+  assert(notifyWord(Notify.Default) == "", "Default")
+  assert(notifyWord(Notify.Never) == "NEVER", "Never")
+  assert(notifyWord(Notify.Success) == "SUCCESS", "Success")
+  assert(notifyWord(Notify.Failure) == "FAILURE", "Failure")
+  assert(notifyWord(Notify.Delay) == "DELAY", "Delay")
+  assert(notifyWord(Notify.SuccessAndFailure) == "SUCCESS,FAILURE", "SuccessAndFailure")
+  assert(notifyWord(Notify.SuccessAndDelay) == "SUCCESS,DELAY", "SuccessAndDelay")
+  assert(notifyWord(Notify.FailureAndDelay) == "FAILURE,DELAY", "FailureAndDelay")
+  assert(notifyWord(Notify.All) == "SUCCESS,FAILURE,DELAY", "All")
+}
+
+test "DSN: the default Dsn sends no parameter, whether or not the server offers DSN" {
+  let ehlos = [ehloDsn(), ehloPlain()]
+  let i = 0
+  while (i < len(ehlos)) {
+    let lines = dsnTranscript(ehlos[i], Dsn{})
+    assert(lines[1] == "MAIL FROM:<me@x.com>", "line 1 = '${lines[1]}'")
+    assert(lines[2] == "RCPT TO:<a@x.com>", "line 2 = '${lines[2]}'")
+    assert(lines[3] == "RCPT TO:<b+tag@y.org>", "line 3 = '${lines[3]}'")
+    i = i + 1
+  }
+}
+
+test "DSN requested but not advertised: refused before MAIL FROM, permanent" {
+  let asks = [Dsn{ notify = Notify.Never }, Dsn{ ret = Ret.Full }, Dsn{ envid = "x" }]
+  let i = 0
+  while (i < len(asks)) {
+    let (c, log) = fakeClient(["221 Bye\r\n"])
+    let err = refusal(c, dsnRaw(asks[i]))
+    c.quit() catch _ {}
+    assert(
+        err.message() ==
+        "smtp: delivery notifications were requested and the server does not offer DSN",
+      "error = '${err.message()}'",
+    )
+    assert(!err.transient(), "a missing capability must not be transient")
+    let sent = <- log
+    assert(sent == "EHLO client.example.com\r\nQUIT\r\n", "wire: '${sent}'")
+    i = i + 1
+  }
+}
+
+test "xtext keeps 33..126 except plus and equals, and encodes the rest as +XX" {
+  assert(xtext("abc-XYZ_09") == "abc-XYZ_09", "plain")
+  assert(xtext("a+b=c") == "a+2Bb+3Dc", "plus and equals: ${xtext("a+b=c")}")
+  assert(xtext("a b") == "a+20b", "space")
+  assert(
+    xtext("\x01\x7f\xc3\xa9") == "+01+7F+C3+A9",
+    "controls and non-ASCII: ${xtext("\x01\x7f\xc3\xa9")}",
+  )
+  assert(xtext("") == "", "empty")
+}
+
+test "an envelope id with a control or non-ASCII byte is refused before MAIL FROM" {
+  let ids = ["a\r\nRCPT TO:<evil@x.com>", "caf\xc3\xa9", "tab\there"]
+  let i = 0
+  while (i < len(ids)) {
+    let (c, log) = fakeClientEhlo(ehloDsn(), ["221 Bye\r\n"])
+    let err = refusal(c, dsnRaw(Dsn{ envid = ids[i] }))
+    c.quit() catch _ {}
+    assert(contains(err.message(), "printable ASCII"), "error = '${err.message()}'")
+    let sent = <- log
+    assert(sent == "EHLO client.example.com\r\nQUIT\r\n", "wire: '${sent}'")
+    i = i + 1
+  }
+}
+
+test "an envelope id is limited to 100 characters once encoded" {
+  let ok = dsnTranscript(ehloDsn(), Dsn{ envid = repeat("x", 100) })
+  assert(contains(ok[1], "ENVID=" + repeat("x", 100)), "100 characters refused: '${ok[1]}'")
+  let (c, log) = fakeClientEhlo(ehloDsn(), ["221 Bye\r\n"])
+  let err = refusal(c, dsnRaw(Dsn{ envid = repeat("x", 101) }))
+  assert(contains(err.message(), "over 100"), "error = '${err.message()}'")
+  let (c2, log2) = fakeClientEhlo(ehloDsn(), ["221 Bye\r\n"])
+  let spaced = refusal(c2, dsnRaw(Dsn{ envid = repeat(" ", 34) }))
+  assert(contains(spaced.message(), "over 100"), "34 spaces encode to 102: '${spaced.message()}'")
+  c.close()
+  c2.close()
+  let _ = <- log
+  let _ = <- log2
 }
