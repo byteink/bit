@@ -177,6 +177,161 @@ test "the unmodified callback route returns the verified fake identity, no netwo
 }
 ```
 
+## A fake Apple
+
+`Provider.Endpoints` cannot carry the `AppleKey` that `Provider.Apple` needs, so
+Apple is faked one layer lower: `OidcOptions.discoveryFetch` is a function from
+a URL to the body served there, used for the discovery document and the JWKS, and
+the real constructor runs against it. The page on [Sign in with
+Apple](apple.md#testing-your-apple-routes) shows the strategy; here is a whole
+test, driving `beginAuthorization` and Apple's cookie-less form-POST
+`handleCallback`:
+
+<!-- doctest: test-file -->
+```bit
+import { App, Config, MemoryStore } from "web"
+import {
+  AppleKey, HttpFetch, MemoryOneTimeStore, OidcOptions, OidcStrategy, OneTimeStore,
+  Provider, TokenFetch, beginAuthorization, handleCallback,
+} from "auth"
+import { Request } from "std/http"
+import { encodeBase64Url, hmac, HashAlg } from "std/crypto"
+import { Json, JsonEntry, jsonEncode } from "std/json"
+import { now, Second } from "std/time"
+import { split } from "std/strings"
+
+const appleHost = "https://appleid.apple.com"
+const clientId = "com.example.inkwell.web"
+const kid = "test-key"
+
+// A throwaway P-256 key made for this page; it signs nothing Apple ever sees.
+const p8 = "-----BEGIN PRIVATE KEY-----\n" +
+  "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQghoAqb0cpl8arBQT+\n" +
+  "ebu4YgIUHiTTdFxPu2tgoaseJ0+hRANCAAQlERh2AAc44f8m3cJ6AotPl0/3cjr8\n" +
+  "BwqhlqfZUPvqpyqOhc0WOKkLsGfGYGJUjXB90JzKlsXcKqNNS3a8c+8u\n" +
+  "-----END PRIVATE KEY-----\n"
+
+fn hmacKey(): []byte { return []byte("test-hmac-secret-do-not-use-in-prod") }
+
+// What Apple would serve: the discovery document, then the JWKS it points to.
+fn fakeApple(): HttpFetch {
+  let f: HttpFetch = (url) => {
+    if (url == appleHost + "/.well-known/openid-configuration") {
+      return "{\"issuer\":\"" +
+        appleHost +
+        "\"," +
+        "\"authorization_endpoint\":\"" +
+        appleHost +
+        "/auth/authorize\"," +
+        "\"token_endpoint\":\"" +
+        appleHost +
+        "/auth/token\"," +
+        "\"jwks_uri\":\"" +
+        appleHost +
+        "/auth/keys\"}"
+    }
+    if (url == appleHost + "/auth/keys") {
+      return "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"" +
+        kid +
+        "\",\"k\":\"" +
+        encodeBase64Url(hmacKey()) +
+        "\"}]}"
+    }
+    fail newError("unexpected GET ${url}")
+  }
+  return f
+}
+
+class TokenBox { idToken: string }
+
+fn fakeTokenEndpoint(box: TokenBox): TokenFetch {
+  let f: TokenFetch = (url, headers, body) => {
+    return "{\"id_token\":\"" + box.idToken + "\"}"
+  }
+  return f
+}
+
+fn appleStrategy(box: TokenBox): OidcStrategy! {
+  let key = AppleKey("ABCDE12345", "KEYID67890", p8)?
+  let states: OneTimeStore = MemoryOneTimeStore()
+  return OidcStrategy(
+    Provider.Apple(key),
+    clientId,
+    "",
+    "https://app.example.com/auth/apple/callback",
+    OidcOptions{
+      stateStore = Option.Some(states),
+      discoveryFetch = fakeApple(),
+      tokenFetch = fakeTokenEndpoint(box),
+    },
+  )?
+}
+
+// A signed ID token naming `nonce`, the way Apple's would, with the fake JWKS key.
+fn idToken(nonce: string): string {
+  let header = jsonEncode(
+    Json.JsonObject(
+      [
+        JsonEntry{ key = "alg", value = Json.JsonString("HS256") },
+        JsonEntry{ key = "kid", value = Json.JsonString(kid) },
+      ],
+    ),
+  )
+  let t = now().ns / Second
+  let payload = jsonEncode(
+    Json.JsonObject(
+      [
+        JsonEntry{ key = "iss", value = Json.JsonString(appleHost) },
+        JsonEntry{ key = "aud", value = Json.JsonString(clientId) },
+        JsonEntry{ key = "sub", value = Json.JsonString("001234.abcdef.5678") },
+        JsonEntry{ key = "exp", value = Json.JsonInt(i64(t + 3600)) },
+        JsonEntry{ key = "iat", value = Json.JsonInt(i64(t - 10)) },
+        JsonEntry{ key = "nonce", value = Json.JsonString(nonce) },
+      ],
+    ),
+  )
+  let input = encodeBase64Url([]byte(header)) + "." + encodeBase64Url([]byte(payload))
+  return input + "." + encodeBase64Url(hmac(HashAlg.Sha256, hmacKey(), []byte(input)))
+}
+
+fn param(query: string, name: string): string {
+  return split(split(query, "${name}=")[1], "&")[0]
+}
+
+test "the unmodified Apple routes sign a user in against a fake Apple, no network" {
+  let box = TokenBox{ idToken = "" }
+  let s = appleStrategy(box) catch e {
+    panic("appleStrategy: ${e.message()}")
+  }
+  // The same two routes apple.md registers.
+  let app = App(Config{ secret = "test-secret", sessions = MemoryStore(1000) })
+  app.get("/auth/apple", (c) => beginAuthorization(s, c))
+  app.post("/auth/apple/callback", (c) => {
+    let who = handleCallback(s, c)?
+    return c.text(who.id)
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+
+  let begin = app.handle(Request{ method = "GET", path = "/auth/apple", headers = "", body = "" })
+  assert(begin.status == 302, "want a redirect, got ${begin.status}")
+  let location = begin.getHeader("Location")
+  box.idToken = idToken(param(location, "nonce"))
+
+  // Apple's answer is a cookie-less form POST carrying the state it was given.
+  let form = Request{
+    method = "POST",
+    path = "/auth/apple/callback",
+    headers = "Content-Type: application/x-www-form-urlencoded",
+    body = "code=apple-code&state=" + param(location, "state"),
+  }
+  let res = app.handle(form)
+  assert(res.status == 200, "want 200, got ${res.status}: ${res.body}")
+  assert(res.body == "001234.abcdef.5678", "want the token's sub, got '${res.body}'")
+}
+```
+
 ## Sharp edges
 
 The seam replaces the transport only. `verifyIdToken` still checks the
@@ -200,11 +355,17 @@ config is the allow-list `OidcOptions.allowedTenants` fills in production. The
 issuer, GUID and allow-list checks run on a fake token exactly as on a real
 one.
 
-Setting `tokenFetch` on a strategy your production code builds is the one
-way to misuse this seam: a strategy is configuration your app builds once
-at startup, so a non-`nil` `tokenFetch` reaching a real deployment means
-some code path constructed the strategy wrong, not that `handleCallback`
-itself needs different production and test versions.
+`Provider.Endpoints` is not the only way to skip the network. For the providers
+that discover their endpoints (`Google`, `Microsoft`, `Generic`, `Apple`),
+`OidcOptions.discoveryFetch` is a function from a URL to the body served there,
+used for the discovery document and the JWKS, so the real constructor runs
+against a fake provider; [A fake Apple](#a-fake-apple) is the worked example.
+
+Setting `tokenFetch` or `discoveryFetch` on a strategy your production code
+builds is the one way to misuse these seams: a strategy is configuration your
+app builds once at startup, so a non-`nil` `tokenFetch` or `discoveryFetch`
+reaching a real deployment means some code path constructed the strategy wrong,
+not that `handleCallback` itself needs different production and test versions.
 
 Next: [Security model](security.md), for the full list of checks this
 package runs on your behalf.
