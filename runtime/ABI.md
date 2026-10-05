@@ -3013,6 +3013,7 @@ defined exactly once).
 | `bit_rt_net_dial_deadline_w` | `(hostWords: usize, hostLen: i64, port: i64, deadlineNs: i64) -> i64` (§20, `bit_rt_net_dial` bounded by ONE absolute monotonic `deadlineNs` on `bit_rt_time_mono_ns`'s clock rather than parking forever; `host` crosses as a packed `[]byte`'s backing plus a length (§2) because §11.7 admits no `string` across an `extern fn`. fd, `-1` hard failure, `-2` timed out) |
 | `bit_rt_net_read`     | `(fd: i64, max: i64) -> *const RtBytes` (§20)          |
 | `bit_rt_net_read_deadline_w` | `(fd: i64, outWords: usize, cap: i64, deadlineNs: i64) -> i64` (§20, same deadline shape as `bit_rt_net_dial_deadline_w`; the kernel reads straight into the caller's own packed `outWords` buffer instead of a fresh string, with no runtime scratch or copy between, so the caller keeps that buffer live across the call with `keepAlive` (SPEC §11.5), as `std/net` does. Byte count, `0` peer closed, `-1` hard error, `-2` timed out) |
+| `bit_rt_net_read_bytes_w` | `(fd: i64, outWords: usize, cap: i64) -> i64` (§20, #7389: `bit_rt_net_read`'s byte-taking sibling — the kernel reads straight into the caller's own packed `outWords` buffer through the SAME parking, never-give-up engine `bit_rt_net_read` uses, not the deadline-bounded one, so `std/net`'s `Conn.readInto` with no deadline armed waits exactly like `Conn.read` and allocates nothing; the caller keeps the buffer live across the call with `keepAlive`. Byte count, `0` peer closed, `-1` hard error) |
 | `bit_rt_net_write`    | `(fd: i64, s: *const RtBytes) -> i64` (§20)            |
 | `bit_rt_net_write_deadline_w` | `(fd: i64, words: usize, n: i64, deadlineNs: i64) -> i64` (§20, same deadline shape; the body crosses as packed `words`/`n` and the kernel reads it straight from the caller's buffer, with no runtime copy, so the caller keeps that buffer live across the call with `keepAlive`. Bytes written, `-1` hard error, `-2` timed out) |
 | `bit_rt_net_write_bytes_w` | `(fd: i64, words: usize, n: i64) -> i64` (§20, #5928: `bit_rt_net_write`'s byte-taking sibling — same `words`/`n` packed-buffer shape `bit_rt_net_write_deadline_w` uses, but calls the SAME true-blocking, never-give-up engine `bit_rt_net_write` does, not the deadline-bounded one, so `std/net`'s `Conn.writeBytes` with no deadline armed behaves exactly like `Conn.write(s: string)`'s own no-deadline fast path. Bytes written, `-1` hard error) |
@@ -4460,6 +4461,7 @@ bit_rt_net_local_port(fd)       -> port  // the bound port (recovers a port-0 ch
 bit_rt_net_accept(fd)           -> fd    // next connection; parks. -1 on error
 bit_rt_net_dial(host, port)     -> fd    // connected socket; parks past the handshake. -1 on error
 bit_rt_net_read(fd, max)        -> str   // up to max bytes; parks. "" at end of stream OR on error
+bit_rt_net_read_bytes_w(fd, outWords, cap) -> n // up to cap bytes into outWords; parks. 0 = peer closed; -1 hard error
 bit_rt_net_write(fd, s)         -> n     // all of s (retried internally). -1 on error
 ```
 
