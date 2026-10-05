@@ -1,0 +1,154 @@
+// pkg/auth/webauthn_login_wire.bit — the JSON a passkey login exchanges with the
+// browser (#6959): the request options going out (W3C Web Authentication Level
+// 3 section 5.5, `PublicKeyCredentialRequestOptionsJSON`) and the assertion
+// coming back (section 5.1, `AuthenticationResponseJSON`), plus the small record
+// of a login in progress that lives in the session.
+//
+// The assertion is hostile input: every member is type-checked and every
+// base64url string decoded and sized by `waBytes` (webauthn_wire.bit) before use.
+// The member readers are shared with registration, so their messages say
+// "registration response"; `WebAuthnStrategy.authenticate` turns every failure
+// into one `unauthorized()` and never shows them to the client.
+//
+// `Json`, `JsonEntry`, `jsonGet`, `jsonAsString`, `jsonAsObject`,
+// `encodeBase64Url`, `decodeBase64Url`, `parseInt`, `split`, `digest`, `Sha256`,
+// `isSome` and `unwrap` are already bound module-wide (SPEC §17.1);
+// re-importing any of them here is E0042.
+
+// A login in progress, as `beginLogin` stored it in the session. `userId` is
+// the user the options were asked for (`allowCredentials` listed their
+// credentials); `None` is a discoverable login, where the authenticator picks
+// the account.
+class PendingLogin {
+  challenge: []byte,
+  expiresAt: i64,
+  userId: Option<string>,
+}
+
+// `challenge.expiresAt.kind.userId`: `kind` is "u" for a login asked for one
+// user and "d" for a discoverable one, and `userId` is base64url, empty for "d".
+// Every part is base64url or decimal, so the dot cannot occur inside one.
+fn encodePendingLogin(p: PendingLogin): string {
+  let kind = "d"
+  let user = ""
+  if (isSome(p.userId)) {
+    kind = "u"
+    user = encodeBase64Url([]byte(unwrap(p.userId)))
+  }
+  return encodeBase64Url(p.challenge) + "." + "${p.expiresAt}" + "." + kind + "." + user
+}
+
+fn decodePendingLogin(raw: string): PendingLogin! {
+  let parts = split(raw, ".")
+  if (len(parts) != 4 || (parts[2] != "u" && parts[2] != "d")) {
+    fail newError("auth: webauthn: the pending login in the session is malformed")
+  }
+  let challenge = decodeBase64Url(parts[0])?
+  let at = parseInt(parts[1])?
+  let user = Option<string>.None
+  if (parts[2] == "u") {
+    user = Option<string>.Some(string(decodeBase64Url(parts[3])?))
+  }
+  return PendingLogin{ challenge = challenge, expiresAt = i64(at), userId = user }
+}
+
+// The id a descriptor offers for a user who has no passkeys (or does not
+// exist): the SHA-256 of a per-process random salt and the user id, so one id
+// answers every request for that user and a client cannot tell it from a real
+// credential id by asking twice. It matches no credential, so a login against
+// it fails like any unknown credential.
+fn waDecoyId(salt: []byte, userId: string): []byte {
+  let seed = append([]byte(0), ...salt)
+  seed = append(seed, userId)
+  return digest(Sha256(), seed)
+}
+
+// A descriptor list with the single decoy id for `userId`.
+fn waDecoyDescriptors(salt: []byte, userId: string): Json {
+  return Json.JsonArray(
+    [
+      Json.JsonObject(
+        [
+          waEntry("type", waText("public-key")),
+          waEntry("id", waText(encodeBase64Url(waDecoyId(salt, userId)))),
+        ],
+      ),
+    ],
+  )
+}
+
+// The `PublicKeyCredentialRequestOptionsJSON` (section 5.5): the same five
+// members whether `allow` lists a user's credentials, a decoy, or nothing at all
+// (a discoverable login), so the response does not say which case it is.
+fn requestOptions(
+  rp: RelyingParty,
+  uv: UserVerification,
+  timeoutMs: int,
+  challenge: []byte,
+  allow: Json,
+): Json {
+  return Json.JsonObject(
+    [
+      waEntry("challenge", waText(encodeBase64Url(challenge))),
+      waEntry("timeout", Json.JsonInt(i64(timeoutMs))),
+      waEntry("rpId", waText(rp.id)),
+      waEntry("allowCredentials", allow),
+      waEntry("userVerification", waText(uv.wire())),
+    ],
+  )
+}
+
+// The assertion, decoded: the credential id the browser reports, the exact
+// clientDataJSON and authenticatorData bytes the signature covers, the
+// signature, and the user handle when the authenticator sent one.
+class AssertionResponse {
+  id: []byte,
+  clientData: []byte,
+  authData: []byte,
+  signature: []byte,
+  userHandle: Option<[]byte>,
+}
+
+// `userHandle` is absent, `null` or empty when the authenticator holds none
+// (section 5.2.2): all three are `None`. Any other type is an error, not a
+// quiet `None`.
+fn waUserHandle(inner: Json): Option<[]byte>! {
+  let m = jsonGet(inner, "userHandle")
+  if (!isSome(m)) {
+    return Option<[]byte>.None
+  }
+  match (unwrap(m)) {
+    JsonNull => return Option<[]byte>.None
+    _ => {}
+  }
+  let s = jsonAsString(unwrap(m))
+  if (!isSome(s)) {
+    fail newError("auth: webauthn: the assertion 'response.userHandle' is not a string")
+  }
+  if (len(unwrap(s)) == 0) {
+    return Option<[]byte>.None
+  }
+  return Option<[]byte>.Some(waBytes(inner, "userHandle", "response.")?)
+}
+
+// `response` is the object `PublicKeyCredential.toJSON()` returns for a
+// `get()`: `id`, optional `type` ("public-key"), and `response` holding
+// `clientDataJSON`, `authenticatorData`, `signature` and optionally `userHandle`.
+fn parseAssertionResponse(response: Json): AssertionResponse! {
+  let t = jsonGet(response, "type")
+  if (isSome(t) && !waIsPublicKey(unwrap(t))) {
+    fail newError("auth: webauthn: the assertion 'type' is not \"public-key\"")
+  }
+  let m = jsonGet(response, "response")
+  if (!isSome(m) || !isSome(jsonAsObject(unwrap(m)))) {
+    fail newError("auth: webauthn: the assertion has no 'response' object")
+  }
+  let inner = unwrap(m)
+  return AssertionResponse{
+    id = waBytes(response, "id", "")?,
+    clientData = waBytes(inner, "clientDataJSON", "response.")?,
+    authData = waBytes(inner, "authenticatorData", "response.")?,
+    signature = waBytes(inner, "signature", "response.")?,
+    userHandle = waUserHandle(inner)?,
+  }
+}

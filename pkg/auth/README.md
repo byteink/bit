@@ -168,6 +168,19 @@ protected route that is not itself doing the authenticating just reads
   client data, `rpIdHash`, flags, algorithm and credential id, accepts attestation
   `none` and stores the `Credential`; see
   [Let an author sign in with a passkey](docs/passkeys.md).
+- `WebAuthnStrategy`, `PasskeyLoginOptions`, `CloneAction` - passkey login, a
+  first-factor `Strategy` named `passkey`: `beginLogin(c, userId)` returns the
+  request options (`allowCredentials` for a known user, an empty list for a
+  discoverable login, a decoy id for a user nobody has, so the options do not say
+  whether the account exists) and keeps a single-use 5 minute challenge;
+  `authenticate(c)` spends it first, then checks the credential and its owner, the
+  `userHandle`, client data, `rpIdHash`, UP and UV, that BE has not changed and the
+  signature (`coseVerify`: ES256, EdDSA, RS256 and the rest), applies the
+  signature-counter rule of WebAuthn section 7.2 step 21 (`CloneAction.Reject` by
+  default), stores the new counter, regenerates the session id and binds the
+  session through `bindFirstFactor`, so `PasskeyLoginOptions.second` works as on
+  every other strategy; every refusal is one `unauthorized()`; see
+  [Let an author sign in with a passkey](docs/passkeys.md).
 - `OneTimeTokens`, `OneTimeStore`, `OneTimeRecord`, `OneTimeOptions`,
   `Live`, `MemoryOneTimeStore`, `InvalidToken`, `Deliver` - the one-time token behind
   password reset, email verification and magic links: 256 random bits stored
