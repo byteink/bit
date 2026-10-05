@@ -143,6 +143,27 @@ class XFrameSetup {
   nakedSpillOverflow: bool,
 }
 
+// #7241: `regs` with every register a call destroys ahead of every one it
+// preserves, each group in its own order. The allocator hands out the lowest
+// free file position, so a value no clobber point reaches now takes a
+// caller-saved register while one is free, rather than rbx (master position 3)
+// and a push/pop pair in the prologue it would otherwise not need. A value that
+// crosses one is held to the callee-saved positions either way (calleeSaved).
+fn xVolatileFirst(cc: XCallConv, regs: []XReg64): []XReg64 {
+  let out = []XReg64(0)
+  for r of regs {
+    if (!xIsCalleeSavedInt(cc, r)) {
+      out = append(out, r)
+    }
+  }
+  for r of regs {
+    if (xIsCalleeSavedInt(cc, r)) {
+      out = append(out, r)
+    }
+  }
+  return out
+}
+
 // The register files this function will allocate out of: the master
 // int/float lists, narrowed by whatever an `asm`/`syscall` block reserves
 // and, for a @naked function, to the volatile-only file.
@@ -166,7 +187,7 @@ fn xBuildFrameRegs(module: IrModule, f: IrFunc, cc: XCallConv): XFrameRegs {
     }
     ri = ri + 1
   }
-  intRegs = allocRegs
+  intRegs = xVolatileFirst(cc, allocRegs)
 
   // §10.3.1 @naked: the prologue never runs, so a callee-saved register would be
   // clobbered without ever being saved. Restrict a naked function to the volatile
@@ -378,7 +399,14 @@ fn xBuildFrameSetup(f: IrFunc, debug: bool, regs: XFrameRegs): XFrameSetup {
   // #3906: the rounding exists so rsp is 16-aligned AT A CALL, so a function
   // that emits none pays nothing for it. `flags` alone is NOT that predicate —
   // see xNeedsCallAlign (x64frame.bit), which takes it and finishes the job.
-  let needsCallAlign = xNeedsCallAlign(f, regs.flags, debug)
+  // #7241: frameless (x64tailcall.bit) when nothing needs the frame. Such a
+  // function makes no call, so it owes no alignment and takes no #5667 pad,
+  // and `noCallAlign` turns any call it did emit into a compiler abort.
+  let tails = xTailCallPlan(regs.module, f, regs.cc)
+  let frameless = rawFrame == 0 &&
+    len(savedGpr) == 0 &&
+    xFramelessCandidate(regs, f, built.safepoints, tails, debug)
+  let needsCallAlign = !frameless && xNeedsCallAlign(f, regs.flags, debug)
   // #5667: an 8-byte ALIGNMENT pad is cheaper as one more callee-saved push
   // than as a `subq`/`addq` pair, so xPadSavedGpr (x64frame.bit) may append a
   // free callee-saved register here. It must run before the XFrame literal
@@ -394,6 +422,7 @@ fn xBuildFrameSetup(f: IrFunc, debug: bool, regs: XFrameRegs): XFrameSetup {
     savedGpr = savedGpr, savedXmm = savedXmm, numSpillSlots = numSlots,
     pollCacheSlots = pollCacheSlots,
     frameSize = xAlignFrame(rawFrame, len(savedGpr), needsCallAlign),
+    frameless = frameless, tailCalls = tailCallsKept(tails, frameless),
   }
 
   // §10.3.1 @naked safety net: a spill slot is the only *per-function* frame need
@@ -456,7 +485,9 @@ fn xNewFuncCtx(f: IrFunc, debug: bool, regs: XFrameRegs, setup: XFrameSetup): XC
 // emit a binary then.
 fn xEmitFuncBody(cx: XCtx, f: IrFunc): bool {
   // §10.3.1 @naked: no prologue — the function runs on its caller's frame.
-  if (!f.isNaked) {
+  // #7241: nor does a frameless one, which has nothing for a prologue to do.
+  assert(!cx.frame.frameless || len(cx.frame.zeroOffs) == 0)
+  if (!f.isNaked && !cx.frame.frameless) {
     xEmitPrologue(cx)
   }
   cx.zTrack = true
@@ -555,6 +586,10 @@ fn xBuildFuncCode(cx: XCtx, f: IrFunc): FuncCode {
   let si = 0
   while (si < len(cx.alloc.stackMaps)) {
     let sm = cx.alloc.stackMaps[si]
+    si = si + 1
+    if (xIsTailCall(cx.frame, sm.pos)) {
+      continue // #7241: a `jmp` leaves no return address to look up
+    }
     let regs = []int(0)
     for r of sm.regs {
       regs = append(regs, xRegNum(cx.intRegs[r]))
@@ -571,11 +606,10 @@ fn xBuildFuncCode(cx: XCtx, f: IrFunc): FuncCode {
     safepoints = append(
       safepoints,
       SafepointView{
-        retOffset = cx.safepointCodeOffsets[si],
+        retOffset = cx.safepointCodeOffsets[si - 1],
         slots = slots, regs = regs,
       },
     )
-    si = si + 1
   }
 
   // Register-recovery slots: the prologue does `push rbp; mov rbp,rsp; push
