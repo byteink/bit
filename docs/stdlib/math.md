@@ -166,6 +166,14 @@ The larger of the two.
 
 Greatest common divisor of `|a|` and `|b|`. `gcd(0, 0)` is `0`.
 
+### `mul64(a: u64, b: u64): (u64, u64)`
+
+The full 128-bit product as `(hi, lo)`: `a * b == hi * 2^64 + lo` exactly,
+where the plain `a * b` operator keeps only `lo`. It compiles inline to one
+high-multiply instruction plus the ordinary multiply, with no call and no
+allocation, and its time does not depend on the operands, so it is safe in
+constant-time code.
+
 ```bit
 import { gcd, ipow, imax, iabs } from "std/math"
 
@@ -183,5 +191,17 @@ fn widest(xs: []int): int {
     best = imax(best, x)
   }
   return best
+}
+```
+
+`mul64` is what a 64-bit hash mix or a multi-word integer needs: the bits the
+plain product throws away.
+
+```bit
+import { mul64 } from "std/math"
+
+fn mix(a: u64, b: u64): u64 {
+  let (hi, lo) = mul64(a, b)
+  return hi ^ lo
 }
 ```
