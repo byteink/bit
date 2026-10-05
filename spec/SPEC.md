@@ -1105,6 +1105,16 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   it is a constant there is no allocation, no safepoint and no ordering
   between fields: each default is independent, and a defaulted field costs
   the same at the construction site as a spelled one.
+- A field whose own type is an enum may carry a default that names a
+  **payload-free variant**: `reader: Option<BodyReader> = Option.None`,
+  `method: Method = Method.Request`, `Box<T> { v: Option<T> = Option.None }`.
+  The variant is a constant of its enum type, though not one of the scalar
+  constant expressions §15.4 folds; it is rebuilt at each construction site,
+  like the literal defaults below, so a boxed enum's object is never shared
+  between two values. An explicit `= Option.None` is accepted even though
+  `Option`'s first variant is `None`, so an omitted `Option` field already
+  holds `None` (§13.4); the explicit form states it. A variant that carries a
+  payload (`Option.Some(1)`) is a call, not a constant, and stays `E0064`.
 - A field whose own type **is** a class may also carry a default, written as
   a composite literal of that class type (§12.2) - not a constant
   expression, and folded to no value. Each of its own field values must in
@@ -1120,10 +1130,10 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   to suggest it. It costs the same as writing the literal at the site: one
   allocation, no different from a spelled class-typed field - the "no
   allocation" guarantee above is scoped to non-class defaults specifically,
-  since a spelled class-typed field already allocates today. A
-  payload-carrying enum field still cannot have a default: no value of that
-  type is a constant expression or a composite literal, so it still has no
-  zero value and still raises `E0083` when omitted (§13.4).
+  since a spelled class-typed field already allocates today. An enum field
+  whose first variant carries a payload has no zero value and raises `E0083`
+  when omitted (§13.4) - unless it declares a payload-free variant default
+  above, which is then the value every construction gives it.
 - A field of **slice or map type** may carry a default written as a slice
   literal `[a, b]`, a map literal `{k: v}` (including the empty `[]` and
   `{}`), or the sized form `[]T(n)` (`[]T(0)` is the explicit empty spelling).
