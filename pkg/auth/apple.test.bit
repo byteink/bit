@@ -1,0 +1,495 @@
+// pkg/auth/apple.test.bit — #6946's acceptance: Sign in with Apple on
+// `OidcStrategy` against a fake Apple, no network. The .p8 is a P-256 key
+// generated here from a fixed scalar and wrapped in a PKCS#8 PEM by hand; the
+// token endpoint is the `TokenCallBox` double of oidc_callback.test.bit; the
+// ID token is signed with the HS256 JWKS of oidc_verify.test.bit, since the
+// verification path under test (`verifyIdToken`) is algorithm-agnostic and
+// what Apple's RS256 adds is already `std/jwt`'s test.
+//
+// `TokenCallBox`, `newBox`, `tokenFetchFor`, `callbackJwks`, `signIdToken`,
+// `testKid`, `clientId`, `authReq`, `queryFrom`, `paramOrPanic`, `contains`,
+// `split`, `decodeBase64Url` and the std/jwt and std/json names are bound by
+// the sibling files; only the ASN.1 builders and the SEC1 encoder are new.
+import {
+  asn1Encode,
+  asn1Integer,
+  asn1Null,
+  asn1Oid,
+  asn1OctetString,
+  asn1Sequence,
+  nistecPointEncode,
+  pemEncode,
+} from "std/crypto"
+import { es256PublicKey } from "std/jwt"
+
+const appleTeam = "ABCDE12345"
+const appleKid = "KEYID67890"
+const appleCallbackUri = "https://app.example.com/auth/apple/callback"
+const appleSub = "001234.abcdef.5678"
+
+fn oid(arcs: []int): Element {
+  return asn1Oid(arcs) catch e {
+    panic("oid: ${e.message()}")
+  }
+}
+
+fn scalarBytes(n: int): []byte {
+  let b = []byte(n)
+  let i = 0
+  while (i < n) {
+    b[i] = byte(i + 1)
+    i = i + 1
+  }
+  return b
+}
+
+// A PKCS#8 PrivateKeyInfo for an EC key with the given curve OID and scalar.
+fn p8Pem(algOid: []int, curveOid: []int, scalar: []byte): string {
+  let ec = asn1Sequence([asn1Integer(1), asn1OctetString(scalar)])
+  let alg = asn1Sequence([oid(algOid), oid(curveOid)])
+  let info = asn1Sequence([asn1Integer(0), alg, asn1OctetString(asn1Encode(ec))])
+  return pemEncode("PRIVATE KEY", asn1Encode(info))
+}
+
+fn p256Pem(): string {
+  return p8Pem([1, 2, 840, 10045, 2, 1], [1, 2, 840, 10045, 3, 1, 7], scalarBytes(32))
+}
+
+fn appleKey(): AppleKey {
+  return AppleKey(appleTeam, appleKid, p256Pem()) catch e {
+    panic("AppleKey: ${e.message()}")
+  }
+}
+
+fn appleKeyErr(teamId: string, keyId: string, pem: string): string {
+  AppleKey(teamId, keyId, pem) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+// The public half of `scalarBytes(32)`, as std/jwt wants it.
+fn applePublic(): VerifyKey {
+  let priv = es256PrivateKey(scalarBytes(32)) catch e {
+    panic("es256PrivateKey: ${e.message()}")
+  }
+  let sec1 = nistecPointEncode(priv.curve, priv.q, false) catch e {
+    panic("nistecPointEncode: ${e.message()}")
+  }
+  let pub = es256PublicKey(sec1) catch e {
+    panic("es256PublicKey: ${e.message()}")
+  }
+  return VerifyKey.Es256Key(pub)
+}
+
+fn appleStrategy(): OidcStrategy {
+  let store: OneTimeStore = MemoryOneTimeStore()
+  let opts = OidcOptions{ stateStore = Option.Some(store) }
+  let s = OidcStrategy{
+    config = OidcConfig{
+      issuer = "https://appleid.apple.com",
+      authorizationEndpoint = "https://appleid.apple.com/auth/authorize",
+      tokenEndpoint = "https://appleid.apple.com/auth/token",
+      jwksUri = testJwksUri,
+    },
+    clientId = clientId,
+    clientSecret = "",
+    redirectUri = appleCallbackUri,
+    jwks = callbackJwks(),
+    scopes = ["openid", "email", "profile"],
+  }
+  s.useApple(appleKey(), opts) catch e {
+    panic("useApple: ${e.message()}")
+  }
+  return s
+}
+
+fn appleApp(s: OidcStrategy, box: TokenCallBox): App {
+  let app = App(Config{ secret = "test-secret", sessions = MemoryStore(1000) })
+  app.get("/begin", (c) => {
+    return beginAuthorization(s, c)
+  })
+  app.post("/callback", (c) => {
+    let identity = handleCallbackFetch(s, c, tokenFetchFor(box))?
+    return c.text(jsonEncode(identity.claims))
+  })
+  app.get("/callback", (c) => {
+    let identity = handleCallbackFetch(s, c, tokenFetchFor(box))?
+    return c.text(identity.id)
+  })
+  app.get("/whoami", (c) => {
+    let identity = currentIdentity(c)?
+    return c.text(identity.id)
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+fn formPost(fields: string): Request {
+  return Request{
+    method = "POST",
+    path = "/callback",
+    headers = "Content-Type: application/x-www-form-urlencoded",
+    body = fields,
+  }
+}
+
+// What Apple's `begin` redirect carried: state and nonce.
+class AppleBegin {
+  state: string,
+  nonce: string,
+  location: string,
+  cookie: string,
+}
+
+fn beginApple_(app: App): AppleBegin {
+  let res = app.handle(authReq("/begin", ""))
+  assert(res.status == 302, "begin: want 302, got ${res.status}")
+  let location = res.getHeader("Location")
+  let q = queryFrom(location)
+  return AppleBegin{
+    state = paramOrPanic(q, "state"),
+    nonce = paramOrPanic(q, "nonce"),
+    location = location,
+    cookie = res.getHeader("Set-Cookie"),
+  }
+}
+
+// An Apple ID token for `nonce`; `extra` replaces or adds claims.
+fn appleToken(nonce: string, aud: string, extra: []JsonEntry): string {
+  let nowSeconds = now().ns / Second
+  let entries = []JsonEntry{
+    JsonEntry{ key = "iss", value = Json.JsonString("https://appleid.apple.com") },
+    JsonEntry{ key = "aud", value = Json.JsonString(aud) },
+    JsonEntry{ key = "sub", value = Json.JsonString(appleSub) },
+    JsonEntry{ key = "exp", value = Json.JsonInt(i64(nowSeconds + 3600)) },
+    JsonEntry{ key = "iat", value = Json.JsonInt(i64(nowSeconds - 10)) },
+    JsonEntry{ key = "email", value = Json.JsonString("abc@privaterelay.appleid.com") },
+  }
+  if (nonce != "") {
+    entries = append(entries, JsonEntry{ key = "nonce", value = Json.JsonString(nonce) })
+  }
+  for e of extra {
+    entries = append(entries, e)
+  }
+  return signIdToken(testKid, Json.JsonObject(entries))
+}
+
+fn callbackBody(state: string, user: string): string {
+  let body = "state=" + percentEncode(state) + "&code=" + percentEncode("apple-code")
+  if (user != "") {
+    body = body + "&user=" + percentEncode(user)
+  }
+  return body
+}
+
+fn claimString(body: string, key: string): string {
+  let j = jsonParse(body) catch _ {
+    panic("response is not JSON: ${body}")
+  }
+  let v = jsonGet(j, key)
+  if (!isSome(v)) {
+    return "<absent>"
+  }
+  let s = jsonAsString(unwrap(v))
+  if (isSome(s)) {
+    return unwrap(s)
+  }
+  return jsonEncode(unwrap(v))
+}
+
+// One full login: begin, then a cookie-less form_post carrying the `user`
+// field and an ID token with `extra` claims. Returns the callback response.
+fn loginWith(user: string, extra: []JsonEntry): Response {
+  let box = newBox()
+  let app = appleApp(appleStrategy(), box)
+  let begun = beginApple_(app)
+  box.token = appleToken(begun.nonce, clientId, extra)
+  return app.handle(formPost(callbackBody(begun.state, user)))
+}
+
+test "apple: AppleKey parses a P-256 .p8 into an ES256 signing key" {
+  let key = appleKey()
+  assert(key.teamId == appleTeam && key.keyId == appleKid, "ids not kept")
+  assert(signAlgName(key.privateKey) == "ES256", "want ES256, got ${signAlgName(key.privateKey)}")
+}
+
+test "apple: AppleKey refuses a P-384 key, a non-EC algorithm, junk, and two blocks" {
+  let p384 = p8Pem([1, 2, 840, 10045, 2, 1], [1, 3, 132, 0, 34], scalarBytes(48))
+  let m = appleKeyErr(appleTeam, appleKid, p384)
+  assert(contains(m, "want prime256v1"), "P-384 must be refused as not P-256, got '${m}'")
+
+  let rsaInfo = asn1Sequence(
+    [
+      asn1Integer(0),
+      asn1Sequence([oid([1, 2, 840, 113549, 1, 1, 1]), asn1Null()]),
+      asn1OctetString(scalarBytes(32)),
+    ],
+  )
+  let r = appleKeyErr(appleTeam, appleKid, pemEncode("PRIVATE KEY", asn1Encode(rsaInfo)))
+  assert(contains(r, "want id-ecPublicKey"), "an RSA key must be refused, got '${r}'")
+
+  let j = appleKeyErr(appleTeam, appleKid, "not a pem")
+  assert(contains(j, "p8Pem is not PEM"), "junk must be refused as not PEM, got '${j}'")
+
+  let two = appleKeyErr(appleTeam, appleKid, p256Pem() + p256Pem())
+  assert(contains(two, "exactly one"), "two blocks must be refused, got '${two}'")
+
+  let wrongLabel = pemEncode("EC PRIVATE KEY", scalarBytes(32))
+  let w = appleKeyErr(appleTeam, appleKid, wrongLabel)
+  assert(contains(w, "exactly one"), "a non-PKCS#8 label must be refused, got '${w}'")
+}
+
+test "apple: AppleKey refuses a missing or malformed team id and key id" {
+  assert(contains(appleKeyErr("", appleKid, p256Pem()), "teamId must be"), "empty team id")
+  assert(contains(appleKeyErr(appleTeam, "short", p256Pem()), "keyId must be"), "short key id")
+  assert(
+    contains(appleKeyErr("abcde12345", appleKid, p256Pem()), "teamId may only hold"),
+    "lowercase team id",
+  )
+}
+
+test "apple: the client secret carries all five claims and kid, verifies with the public key, and lives at most 300 seconds" {
+  let secret = appleClientSecret(appleKey(), clientId) catch e {
+    panic("appleClientSecret: ${e.message()}")
+  }
+  let rawHeader = decodeBase64Url(split(secret, ".")[0]) catch e {
+    panic("header: ${e.message()}")
+  }
+  assert(claimString(string(rawHeader), "alg") == "ES256", "alg must be ES256")
+  assert(claimString(string(rawHeader), "kid") == appleKid, "kid must be the key id")
+
+  let nowSeconds = now().ns / Second
+  let opts = ClaimsOptions{
+    now = nowSeconds,
+    leewaySeconds = 5,
+    expectedIss = Option.Some(appleTeam),
+    expectedAud = Option.Some("https://appleid.apple.com"),
+  }
+  let payload = verifyToken(secret, applePublic(), opts) catch e {
+    panic("the secret must verify with the public key and iss/aud/exp/iat: ${e.message()}")
+  }
+  let body = jsonEncode(payload)
+  assert(claimString(body, "sub") == clientId, "sub must be the client id: ${body}")
+  let iat = unwrap(jsonAsInt(unwrap(jsonGet(payload, "iat"))))
+  let exp = unwrap(jsonAsInt(unwrap(jsonGet(payload, "exp"))))
+  assert(exp - iat <= 300 && exp > iat, "exp must be within 300 s of iat, got ${exp - iat}")
+}
+
+test "apple: begin redirects with form_post, state, nonce and Apple's scopes, and sets no cookie" {
+  let app = appleApp(appleStrategy(), newBox())
+  let begun = beginApple_(app)
+  let q = queryFrom(begun.location)
+  assert(contains(begun.location, "https://appleid.apple.com/auth/authorize?"), "wrong endpoint")
+  assert(paramOrPanic(q, "response_mode") == "form_post", "response_mode must be form_post")
+  assert(paramOrPanic(q, "response_type") == "code", "response_type must be code")
+  assert(paramOrPanic(q, "client_id") == clientId, "client_id")
+  assert(paramOrPanic(q, "redirect_uri") == appleCallbackUri, "redirect_uri")
+  assert(paramOrPanic(q, "scope") == "email name", "scope: ${paramOrPanic(q, "scope")}")
+  assert(!contains(begun.location, "code_challenge"), "Apple documents no PKCE")
+  assert(begun.cookie == "", "begin must not touch the session, got '${begun.cookie}'")
+}
+
+test "apple: a form_post callback with a valid state signs in with NO session cookie, sending a signed client secret and no Authorization header" {
+  let box = newBox()
+  let app = appleApp(appleStrategy(), box)
+  let begun = beginApple_(app)
+  box.token = appleToken(begun.nonce, clientId, []JsonEntry{})
+  let res = app.handle(formPost(callbackBody(begun.state, "")))
+  assert(res.status == 200, "want 200, got ${res.status}: ${res.body}")
+  assert(claimString(res.body, "sub") == appleSub, "wrong sub: ${res.body}")
+
+  assert(box.calls == 1, "one token call, got ${box.calls}")
+  assert(box.lastUrl == "https://appleid.apple.com/auth/token", "wrong token URL")
+  assert(box.lastAuthHeader == "", "Apple takes client credentials in the body")
+  let sent = parseQuery(box.lastBody)
+  assert(paramOrPanic(sent, "grant_type") == "authorization_code", "grant_type")
+  assert(paramOrPanic(sent, "code") == "apple-code", "code")
+  assert(paramOrPanic(sent, "client_id") == clientId, "client_id")
+  assert(paramOrPanic(sent, "redirect_uri") == appleCallbackUri, "redirect_uri")
+  assert(!contains(box.lastBody, "code_verifier"), "no PKCE verifier is sent to Apple")
+  let opts = ClaimsOptions{
+    now = now().ns / Second,
+    leewaySeconds = 5,
+    expectedIss = Option.Some(appleTeam),
+    expectedAud = Option.Some("https://appleid.apple.com"),
+  }
+  verifyToken(paramOrPanic(sent, "client_secret"), applePublic(), opts) catch e {
+    panic("the posted client_secret must verify: ${e.message()}")
+  }
+
+  let cookie = res.getHeader("Set-Cookie")
+  assert(len(cookie) > 0, "a login must issue a session cookie")
+  let who = app.handle(authReq("/whoami", cookie))
+  assert(who.body == appleSub, "the Identity was not stored: '${who.body}'")
+}
+
+test "apple: a replayed state is refused and calls Apple once" {
+  let box = newBox()
+  let app = appleApp(appleStrategy(), box)
+  let begun = beginApple_(app)
+  box.token = appleToken(begun.nonce, clientId, []JsonEntry{})
+  let first = app.handle(formPost(callbackBody(begun.state, "")))
+  assert(first.status == 200, "first callback: ${first.status}")
+  let second = app.handle(formPost(callbackBody(begun.state, "")))
+  assert(second.status == 401, "a replayed state must be 401, got ${second.status}")
+  assert(box.calls == 1, "the replay must not reach Apple, got ${box.calls} calls")
+}
+
+test "apple: a wrong or missing state is a 401 and never reaches Apple" {
+  let box = newBox()
+  let app = appleApp(appleStrategy(), box)
+  let begun = beginApple_(app)
+  let wrong = app.handle(formPost(callbackBody("not-the-state", "")))
+  assert(wrong.status == 401, "wrong state: want 401, got ${wrong.status}")
+  let missing = app.handle(formPost("code=apple-code"))
+  assert(missing.status == 401, "missing state: want 401, got ${missing.status}")
+  assert(box.calls == 0, "Apple must not be called, got ${box.calls}")
+  assert(begun.state != "", "begin issued a state")
+}
+
+test "apple: an ID token whose nonce differs or is missing is refused" {
+  let box = newBox()
+  let app = appleApp(appleStrategy(), box)
+  let first = beginApple_(app)
+  box.token = appleToken("another-nonce", clientId, []JsonEntry{})
+  let mismatch = app.handle(formPost(callbackBody(first.state, "")))
+  assert(mismatch.status >= 400, "nonce mismatch must fail, got ${mismatch.status}")
+  let second = beginApple_(app)
+  box.token = appleToken("", clientId, []JsonEntry{})
+  let absent = app.handle(formPost(callbackBody(second.state, "")))
+  assert(absent.status >= 400, "a missing nonce must fail, got ${absent.status}")
+  assert(box.calls == 2, "both reached the token endpoint, got ${box.calls}")
+}
+
+test "apple: an ID token for another audience is refused" {
+  let box = newBox()
+  let app = appleApp(appleStrategy(), box)
+  let begun = beginApple_(app)
+  box.token = appleToken(begun.nonce, "com.someone.else", []JsonEntry{})
+  let res = app.handle(formPost(callbackBody(begun.state, "")))
+  assert(res.status >= 400, "a foreign aud must fail, got ${res.status}: ${res.body}")
+}
+
+test "apple: the user field's name passes through on first login and is absent otherwise" {
+  let first = loginWith(
+    "{\"name\":{\"firstName\":\"Ada\",\"lastName\":\"Lovelace\"},\"email\":\"ada@example.com\"}",
+    []JsonEntry{},
+  )
+  assert(first.status == 200, "first login: ${first.status}: ${first.body}")
+  assert(claimString(first.body, "given_name") == "Ada", "given_name: ${first.body}")
+  assert(claimString(first.body, "family_name") == "Lovelace", "family_name: ${first.body}")
+
+  let later = loginWith("", []JsonEntry{})
+  assert(claimString(later.body, "given_name") == "<absent>", "no user, no name: ${later.body}")
+  assert(claimString(later.body, "family_name") == "<absent>", "no user, no name: ${later.body}")
+}
+
+test "apple: a malformed user field, or a name with a control character, is dropped without failing the login" {
+  let junk = loginWith("{not json", []JsonEntry{})
+  assert(junk.status == 200, "malformed user must not fail the login, got ${junk.status}")
+  assert(claimString(junk.body, "given_name") == "<absent>", "no name from junk")
+
+  let control = loginWith(
+    "{\"name\":{\"firstName\":\"Ada\\u0000\",\"lastName\":\"Lovelace\"}}",
+    []JsonEntry{},
+  )
+  assert(control.status == 200, "got ${control.status}")
+  assert(
+    claimString(control.body, "given_name") == "<absent>",
+    "a control character drops the name",
+  )
+  assert(claimString(control.body, "family_name") == "Lovelace", "the clean name is kept")
+}
+
+test "apple: the private relay email and a string email_verified become booleans" {
+  let res = loginWith(
+    "",
+    []JsonEntry{
+      JsonEntry{ key = "email_verified", value = Json.JsonString("true") },
+      JsonEntry{ key = "is_private_email", value = Json.JsonString("true") },
+    },
+  )
+  assert(res.status == 200, "got ${res.status}: ${res.body}")
+  assert(claimString(res.body, "email") == "abc@privaterelay.appleid.com", "email: ${res.body}")
+  assert(claimString(res.body, "email_verified") == "true", "email_verified: ${res.body}")
+  assert(claimString(res.body, "is_private_email") == "true", "is_private_email: ${res.body}")
+
+  let bools = loginWith(
+    "",
+    []JsonEntry{
+      JsonEntry{ key = "email_verified", value = Json.JsonBool(true) },
+      JsonEntry{ key = "is_private_email", value = Json.JsonString("false") },
+    },
+  )
+  assert(claimString(bools.body, "email_verified") == "true", "bool true: ${bools.body}")
+  assert(claimString(bools.body, "is_private_email") == "false", "string false: ${bools.body}")
+
+  let junk = loginWith(
+    "",
+    []JsonEntry{ JsonEntry{ key = "email_verified", value = Json.JsonString("yes") } },
+  )
+  assert(claimString(junk.body, "email_verified") == "false", "junk is false: ${junk.body}")
+}
+
+test "apple: the callback is a POST, and Apple's error response burns the state" {
+  let box = newBox()
+  let app = appleApp(appleStrategy(), box)
+  let begun = beginApple_(app)
+  let get = app.handle(authReq("/callback?state=" + percentEncode(begun.state), ""))
+  assert(get.status == 400, "a GET callback must be 400, got ${get.status}")
+
+  let cancelled = app.handle(
+    formPost("error=user_cancelled_authorize&state=" + percentEncode(begun.state)),
+  )
+  assert(cancelled.status == 401, "a cancelled login must be 401, got ${cancelled.status}")
+  let replay = app.handle(formPost(callbackBody(begun.state, "")))
+  assert(replay.status == 401, "the cancelled state must be spent, got ${replay.status}")
+  assert(box.calls == 0, "Apple must not be called, got ${box.calls}")
+}
+
+fn appleCtorErr(provider: Provider, secret: string, redirect: string, opts: OidcOptions): string {
+  OidcStrategy(provider, clientId, secret, redirect, opts) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+test "apple: the constructor fails loudly for a missing store, a secret, a bad redirect, a bad scope, and a store on another provider" {
+  let store: OneTimeStore = MemoryOneTimeStore()
+  let withStore = OidcOptions{ stateStore = Option.Some(store) }
+  let key = Provider.Apple(appleKey())
+
+  let noStore = appleCtorErr(key, "", appleCallbackUri, OidcOptions{})
+  assert(contains(noStore, "OidcOptions.stateStore"), "no store: '${noStore}'")
+
+  let secret = appleCtorErr(key, "a-secret", appleCallbackUri, withStore)
+  assert(contains(secret, "signs its own client secret"), "secret: '${secret}'")
+
+  let http = appleCtorErr(key, "", "http://app.example.com/cb", withStore)
+  assert(contains(http, "https redirectUri"), "http redirect: '${http}'")
+
+  let scope = appleCtorErr(
+    key,
+    "",
+    appleCallbackUri,
+    OidcOptions{ stateStore = Option.Some(store), scopes = ["openid", "phone"] },
+  )
+  assert(contains(scope, "not 'phone'"), "scope: '${scope}'")
+
+  let tls = appleCtorErr(key, "", appleCallbackUri, withStore)
+  assert(contains(tls, "OidcOptions.tls is required"), "tls is needed to discover Apple: '${tls}'")
+
+  let google = appleCtorErr(Provider.Google, "s", "https://app.example.com/cb", withStore)
+  assert(contains(google, "applies only to Provider.Apple"), "store on Google: '${google}'")
+
+  let literal = AppleKey{
+    teamId = appleTeam,
+    keyId = appleKid,
+    privateKey = SigningKey.Hs256Key([]byte("a shared secret")),
+  }
+  let hmacKey = appleCtorErr(Provider.Apple(literal), "", appleCallbackUri, withStore)
+  assert(contains(hmacKey, "needs an ES256"), "a non-ES256 literal: '${hmacKey}'")
+}

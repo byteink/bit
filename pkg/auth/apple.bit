@@ -1,0 +1,445 @@
+// pkg/auth/apple.bit — Sign in with Apple (#6946) on `OidcStrategy`
+// (oidc_authorize.bit): `Provider.Apple(key)` (providers.bit) with an
+// `AppleKey` built from the .p8 file Apple hands out. Apple speaks OpenID
+// Connect, and everything that is plain OIDC (discovery of
+// https://appleid.apple.com, the JWKS, `verifyIdToken`) runs through the
+// code the other providers use. What differs, from Apple's own pages
+// ("Sign in with Apple REST API": "Request an authorization to the Sign in
+// with Apple server", "Generate and validate tokens", and "Creating a
+// client secret"):
+//
+//   - The client secret is not a string from a console. It is a JWT signed
+//     ES256 (P-256 ECDSA) with the .p8 key: header `alg`, `kid` = the key
+//     id; claims `iss` = the team id, `iat`, `exp` (at most six months
+//     ahead), `aud` = https://appleid.apple.com, `sub` = the client id (the
+//     Services ID). `appleClientSecret` mints one per token exchange that
+//     lives `appleSecretTtl` seconds and is never stored, so there is no
+//     long-lived secret to leak or to rotate.
+//   - The authorization request carries `response_mode=form_post`, which
+//     Apple requires whenever a scope is requested, and `nonce`. Apple's
+//     pages list no PKCE parameter for either endpoint, so none is sent;
+//     the client authenticates with the signed secret and `nonce` binds the
+//     ID token to the request.
+//   - Apple answers with a cross-site POST of `application/x-www-form-urlencoded`
+//     fields (`code`, `state`, `id_token`, and `user` the first time). A
+//     session cookie issued with SameSite=Lax is NOT sent on a cross-site
+//     POST, so `state` and `nonce` cannot live on the session: they live in
+//     a `OneTimeStore` (onetime.bit) instead. The `state` value IS the
+//     one-time token (256 random bits, only its hash is stored, redeemed
+//     once) and its record carries the `nonce`. A replayed, unknown, expired
+//     or foreign-purpose `state` is the same 401.
+//   - `user`, the JSON with the person's name, arrives only on the FIRST
+//     authorization and is not signed: it comes from the browser. It is read
+//     defensively (a malformed value or a name with control characters or
+//     over `appleNameMax` bytes is dropped, never fatal) and surfaces as
+//     `given_name`/`family_name` on `Identity.claims`. Persist it at once; a
+//     later sign-in will not carry it.
+//   - `email` can be a private relay address (`is_private_email`), and
+//     `email_verified`/`is_private_email` arrive as JSON booleans or the
+//     strings "true"/"false". Both are coerced to booleans in the claims; any
+//     other value is `false`, so a verified email is never inferred from junk.
+//
+// Scopes: Apple's own scope names are `name` and `email`. `OidcOptions.scopes`
+// keeps the OIDC names the other providers use: `email` requests the email,
+// `profile` requests the name, `openid` is implied and not sent. Anything else
+// fails at construction, because Apple would ignore it and the caller would
+// never learn why a claim is missing.
+//
+// The PKCS#8 parse below follows RFC 5958 (PrivateKeyInfo) and RFC 5915
+// (ECPrivateKey): the algorithm must be id-ecPublicKey with the prime256v1
+// parameter (RFC 5480 section 2.1.1.1) — nothing else can sign ES256.
+//
+// Everything this file uses that is not imported below (`Json`, `jsonGet`,
+// `jsonAsObject`, `sign`, `SigningKey`, `badRequest`, `percentEncode`, ...) is
+// already bound module-wide by its siblings; an import binds per MODULE
+// (SPEC section 17.1), so repeating one here is E0042.
+import {
+  Element,
+  asn1OidString,
+  asn1Parse,
+  asn1ReadInteger,
+  asn1ReadOctetString,
+  asn1ReadOid,
+  asn1ReadSequence,
+  pemDecode,
+} from "std/crypto"
+import { es256PrivateKey } from "std/jwt"
+import { parseQuery } from "std/http"
+import { jsonAsBool } from "std/json"
+
+// The issuer of every Apple ID token and the `aud` of every client secret.
+const appleIssuerUrl = "https://appleid.apple.com"
+
+// How long a client secret lives. Apple allows six months; the secret is
+// minted per exchange and used once, so five minutes is ample.
+const appleSecretTtl: int = 300
+
+// How long a `state` stays redeemable: the user may need a second factor on
+// Apple's page, so it is the same quarter hour the mailed links get.
+const appleStateTtl: i64 = 900
+
+// The purpose a `state` token is issued for and redeemed under.
+const appleStatePurpose = "oidc-state"
+
+// Apple's team id and key id are both ten characters of A-Z and 0-9.
+const appleIdLen: int = 10
+
+// The longest first or last name kept, in bytes. The `user` field is
+// browser-supplied, so it is bounded before it reaches a claim.
+const appleNameMax: int = 128
+
+// The most bytes of the `user` field parsed at all.
+const appleUserMax: int = 4096
+
+// id-ecPublicKey (RFC 5480 section 2.1.1) and prime256v1 / secp256r1.
+fn oidEcPublicKey(): []int {
+  return [1, 2, 840, 10045, 2, 1]
+}
+
+fn oidPrime256v1(): []int {
+  return [1, 2, 840, 10045, 3, 1, 7]
+}
+
+fn sameArcs(a: []int, b: []int): bool {
+  if (len(a) != len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The Sign in with Apple key: the team and key ids from the Apple developer
+// account, and the P-256 key from the .p8 file.
+//
+// `AppleKey(teamId, keyId, p8Pem)` parses the PKCS#8 PEM (`-----BEGIN
+// PRIVATE KEY-----`, the file Apple lets you download once) and fails with an
+// `Error` for an id that is not ten characters of A-Z and 0-9, a PEM that is
+// not exactly one PKCS#8 private key, or a key that is not P-256. A mistake
+// shows when the app starts, not at the first login.
+export class AppleKey {
+  export teamId: string
+  export keyId: string
+  export privateKey: SigningKey
+
+  init(teamId: string, keyId: string, p8Pem: string)! {
+    checkAppleId("teamId", teamId)?
+    checkAppleId("keyId", keyId)?
+    this.teamId = teamId
+    this.keyId = keyId
+    this.privateKey = SigningKey.Es256Key(es256PrivateKey(appleScalar(p8Pem)?)?)
+  }
+}
+
+fn checkAppleId(what: string, id: string): ()! {
+  if (len(id) != appleIdLen) {
+    fail newError("auth: AppleKey(): ${what} must be ${appleIdLen} characters from the Apple developer account, got ${len(id)}")
+  }
+  let i = 0
+  while (i < len(id)) {
+    let c = id[i]
+    if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
+      fail newError("auth: AppleKey(): ${what} may only hold A-Z and 0-9")
+    }
+    i = i + 1
+  }
+}
+
+// The 32-byte private scalar of the .p8 file's PKCS#8 P-256 key.
+fn appleScalar(p8Pem: string): []byte! {
+  let blocks = pemDecode(p8Pem) catch e {
+    fail newError("auth: AppleKey(): p8Pem is not PEM: ${e.message()}")
+  }
+  if (len(blocks) != 1 || blocks[0].label != "PRIVATE KEY") {
+    fail newError("auth: AppleKey(): p8Pem must hold exactly one PKCS#8 \"PRIVATE KEY\" block, the .p8 file Apple issues")
+  }
+  return scalarFromPkcs8(blocks[0].der) catch e {
+    fail newError("auth: AppleKey(): p8Pem is not a P-256 private key: ${e.message()}")
+  }
+}
+
+// PrivateKeyInfo ::= SEQUENCE { version, AlgorithmIdentifier, OCTET STRING },
+// whose OCTET STRING holds ECPrivateKey ::= SEQUENCE { version 1, OCTET STRING
+// privateKey, ... }; the optional curve and public key members are ignored,
+// the key being rebuilt from the scalar.
+fn scalarFromPkcs8(der: []byte): []byte! {
+  let info = asn1ReadSequence(asn1Parse(der)?)?
+  if (len(info) < 3) {
+    fail newError("PrivateKeyInfo has ${len(info)} fields, want at least 3")
+  }
+  checkEcAlgorithm(info[1])?
+  let inner = asn1ReadSequence(asn1Parse(asn1ReadOctetString(info[2])?)?)?
+  if (len(inner) < 2 || asn1ReadInteger(inner[0])? != 1) {
+    fail newError("ECPrivateKey must start with version 1 and the private key")
+  }
+  let scalar = asn1ReadOctetString(inner[1])?
+  if (len(scalar) != 32) {
+    fail newError("the P-256 private scalar is ${len(scalar)} bytes, want 32")
+  }
+  return scalar
+}
+
+fn checkEcAlgorithm(alg: Element): ()! {
+  let parts = asn1ReadSequence(alg)?
+  if (len(parts) != 2) {
+    fail newError("the key is not an EC key (it has no curve parameter)")
+  }
+  let kind = asn1ReadOid(parts[0])?
+  if (!sameArcs(kind, oidEcPublicKey())) {
+    fail newError("the key algorithm is ${asn1OidString(kind)}, want id-ecPublicKey 1.2.840.10045.2.1")
+  }
+  let curve = asn1ReadOid(parts[1])?
+  if (!sameArcs(curve, oidPrime256v1())) {
+    fail newError("the curve is ${asn1OidString(curve)}, want prime256v1 1.2.840.10045.3.1.7")
+  }
+}
+
+// What `OidcStrategy`'s constructor checks before any network call when the
+// provider is Apple, and the reverse for every other one: the state store is
+// Apple's alone, and Apple's client secret is minted, not passed.
+fn checkAppleOptions(
+  provider: Provider,
+  clientSecret: string,
+  redirectUri: string,
+  opts: OidcOptions,
+): ()! {
+  match (provider) {
+    Apple(key) => checkAppleStrategy(key, clientSecret, redirectUri, opts)?
+    _ => {
+      if (isSome(opts.stateStore)) {
+        fail newError("auth: OidcStrategy(): OidcOptions.stateStore applies only to Provider.Apple")
+      }
+    }
+  }
+}
+
+fn checkAppleStrategy(
+  key: AppleKey,
+  clientSecret: string,
+  redirectUri: string,
+  opts: OidcOptions,
+): ()! {
+  if (clientSecret != "") {
+    fail newError("auth: OidcStrategy(): Provider.Apple signs its own client secret from the AppleKey; pass \"\" as clientSecret")
+  }
+  if (!isSome(opts.stateStore)) {
+    fail newError("auth: OidcStrategy(): Provider.Apple needs OidcOptions.stateStore, because Apple's callback is a cross-site POST that carries no session cookie")
+  }
+  if (!hasPrefix(redirectUri, "https://") || contains(redirectUri, "#")) {
+    fail newError("auth: OidcStrategy(): Provider.Apple needs an https redirectUri without a fragment, got '${redirectUri}'")
+  }
+  checkAppleId("teamId", key.teamId)?
+  checkAppleId("keyId", key.keyId)?
+  appleScope(opts.scopes)?
+  match (key.privateKey) {
+    Es256Key(_) => return
+    _ => fail newError("auth: OidcStrategy(): Provider.Apple needs an ES256 (P-256) signing key; build the AppleKey with AppleKey(teamId, keyId, p8Pem)")
+  }
+}
+
+// `scopes` as Apple's scope parameter: `profile` is `name`, `email` is
+// `email`, `openid` is implied. Anything else is refused.
+fn appleScope(scopes: []string): string! {
+  let out = []string{}
+  for scope of scopes {
+    if (scope == "profile") {
+      out = append(out, "name")
+    } else if (scope == "email") {
+      out = append(out, "email")
+    } else if (scope != "openid") {
+      fail newError("auth: OidcStrategy(): Provider.Apple supports the scopes openid, email and profile (profile asks for the name), not '${scope}'")
+    }
+  }
+  return join(out, " ")
+}
+
+// A client secret for `clientId`, valid `appleSecretTtl` seconds from now —
+// see the file header for the claims.
+fn appleClientSecret(key: AppleKey, clientId: string): string! {
+  let iat = i64(now().ns / Second)
+  let payload = Json.JsonObject(
+    [
+      JsonEntry{ key = "iss", value = Json.JsonString(key.teamId) },
+      JsonEntry{ key = "iat", value = Json.JsonInt(iat) },
+      JsonEntry{ key = "exp", value = Json.JsonInt(iat + i64(appleSecretTtl)) },
+      JsonEntry{ key = "aud", value = Json.JsonString(appleIssuerUrl) },
+      JsonEntry{ key = "sub", value = Json.JsonString(clientId) },
+    ],
+  )
+  return sign(key.privateKey, payload, "JWT", key.keyId)?
+}
+
+// Starts the flow: issues the `state` token carrying a fresh `nonce`, and
+// redirects to the authorization endpoint with `response_mode=form_post`.
+// Nothing is written to the session.
+fn beginApple(s: OidcStrategy, c: Ctx): Res! {
+  let nonce = newAuthToken()
+  let state = unwrap(s.states).issue(appleStatePurpose, s.clientId, appleStateTtl, nonce)?
+  let query = "response_type=code&response_mode=form_post&client_id=" +
+    percentEncode(s.clientId) +
+    "&redirect_uri=" +
+    percentEncode(s.redirectUri) +
+    "&state=" +
+    percentEncode(state) +
+    "&nonce=" +
+    percentEncode(nonce)
+  let scope = appleScope(s.scopes)?
+  if (scope != "") {
+    query = query + "&scope=" + percentEncode(scope)
+  }
+  return c.redirect(s.config.authorizationEndpoint + "?" + query)
+}
+
+fn formField(form: map<string, string>, key: string): string {
+  let (v, ok) = form[key]
+  if (!ok) {
+    return ""
+  }
+  return v
+}
+
+// `state` redeemed once; the nonce it carries. Every refusal is the same 401,
+// a store failure is returned as it came.
+fn redeemAppleState(tokens: OneTimeTokens, state: string): string! {
+  let rec = tokens.redeem(state, appleStatePurpose) catch e {
+    let (_, refused) = e.(InvalidToken)
+    if (!refused) {
+      fail e
+    }
+    fail unauthorized("state mismatch")
+  }
+  return rec.data
+}
+
+// The `Identity` Apple's callback POST signs in — see the file header. `state`
+// is redeemed before anything else runs, so a forged callback costs no HTTP
+// call, and the code exchange sends the freshly signed client secret.
+fn handleApple(s: OidcStrategy, c: Ctx, fetch: TokenFetch): Identity! {
+  if (c.method() != "POST") {
+    fail badRequest("the Sign in with Apple callback is a form_post: register it with app.post")
+  }
+  let form = parseQuery(c.rawBody()?)
+  let nonce = redeemAppleState(unwrap(s.states), formField(form, "state"))?
+  if (formField(form, "error") != "") {
+    fail unauthorized("sign in was not completed")
+  }
+  let code = formField(form, "code")
+  if (code == "") {
+    fail unauthorized("missing authorization code")
+  }
+  let idToken = exchangeApple(s, fetch, code)?
+  let payload = verifiedPayload(s, idToken, nonce)?
+  return signIn(c, idToken, appleClaims(payload, formField(form, "user")))?
+}
+
+// The code exchange of "Generate and validate tokens": client credentials in
+// the form body, never an `Authorization` header.
+fn exchangeApple(s: OidcStrategy, fetch: TokenFetch, code: string): string! {
+  requireHttpsEndpoint(s.config.tokenEndpoint)?
+  let secret = appleClientSecret(unwrap(s.apple), s.clientId)?
+  let body = "grant_type=authorization_code&code=" +
+    percentEncode(code) +
+    "&redirect_uri=" +
+    percentEncode(s.redirectUri) +
+    "&client_id=" +
+    percentEncode(s.clientId) +
+    "&client_secret=" +
+    percentEncode(secret)
+  let headers = []Header{
+    Header{ name = "Content-Type", value = "application/x-www-form-urlencoded" },
+  }
+  let resBody = tokenPost(fetch, s.jwks.tls, s.config.tokenEndpoint, headers, body)?
+  return extractIdToken(resBody)?
+}
+
+// `value` as a bool: a JSON boolean, or the string "true"/"false" Apple
+// sometimes sends. Anything else is false.
+fn appleBool(value: Json): bool {
+  let b = jsonAsBool(value)
+  if (isSome(b)) {
+    return unwrap(b)
+  }
+  let text = jsonAsString(value)
+  return isSome(text) && unwrap(text) == "true"
+}
+
+// The verified ID token payload with `email_verified` and `is_private_email`
+// as booleans, plus `given_name` and `family_name` from the first-login
+// `user` field when it has them.
+fn appleClaims(payload: Json, userField: string): Json {
+  let entries = jsonAsObject(payload)
+  if (!isSome(entries)) {
+    return payload
+  }
+  let out = []JsonEntry{}
+  for e of unwrap(entries) {
+    if (e.key == "email_verified" || e.key == "is_private_email") {
+      out = append(out, JsonEntry{ key = e.key, value = Json.JsonBool(appleBool(e.value)) })
+    } else {
+      out = append(out, e)
+    }
+  }
+  for e of nameEntries(userField) {
+    out = append(out, e)
+  }
+  return Json.JsonObject(out)
+}
+
+// `given_name` and `family_name` entries for the names `userField` holds.
+fn nameEntries(userField: string): []JsonEntry {
+  let out = []JsonEntry{}
+  let given = userName(userField, "firstName")
+  if (given != "") {
+    out = append(out, JsonEntry{ key = "given_name", value = Json.JsonString(given) })
+  }
+  let family = userName(userField, "lastName")
+  if (family != "") {
+    out = append(out, JsonEntry{ key = "family_name", value = Json.JsonString(family) })
+  }
+  return out
+}
+
+// `user.name.<field>` from Apple's `user` JSON, or "" when it is absent,
+// malformed, too long or holds a control character.
+fn userName(userField: string, field: string): string {
+  if (userField == "" || len(userField) > appleUserMax) {
+    return ""
+  }
+  let user = jsonParse(userField) catch _ {
+    return ""
+  }
+  let name = jsonGet(user, "name")
+  if (!isSome(name)) {
+    return ""
+  }
+  let value = jsonGet(unwrap(name), field)
+  if (!isSome(value)) {
+    return ""
+  }
+  let text = jsonAsString(unwrap(value))
+  if (!isSome(text) || !plainName(unwrap(text))) {
+    return ""
+  }
+  return unwrap(text)
+}
+
+// Whether `name` is non-empty, within `appleNameMax` bytes and free of ASCII
+// control characters.
+fn plainName(name: string): bool {
+  if (name == "" || len(name) > appleNameMax) {
+    return false
+  }
+  let i = 0
+  while (i < len(name)) {
+    if (name[i] < 0x20 || name[i] == 0x7f) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}

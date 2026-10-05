@@ -6,6 +6,7 @@ The chapters below, in reading order.
 | ------- | ------ |
 | [Getting started](getting-started.md) | A password login: hash and look up a user, protect a route, read who is calling. |
 | [Sign in with Google](oidc.md) | Add an OpenID Connect provider beside the password login, PKCE included. |
+| [Sign in with Apple](apple.md) | `Provider.Apple`: a client secret signed from your `.p8` key on every exchange, the form_post callback and the state store it needs, the name that arrives once, and the private relay email. |
 | [Testing your sign-in routes](testing.md) | Drive your OIDC callback route against a fake, in-process provider with zero real network calls. |
 | [Other OIDC providers](providers.md) | Microsoft Entra ID, one tenant or many, and any other conformant provider. |
 | [Sign in with GitHub, or any OAuth 2.0 provider](oauth2.md) | A provider with no ID token: the authorization-code flow with PKCE, a profile fetch that yields the `Identity`, client authentication, `iss` checks, typed provider errors, and a fake provider for tests. |

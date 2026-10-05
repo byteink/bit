@@ -98,6 +98,13 @@ protected route that is not itself doing the authenticating just reads
   `Provider` names the identity provider (`Google`, `Microsoft(tenant)`,
   `Generic(issuer)`, `Endpoints(config, jwks)`) and `OidcOptions` carries the
   scopes, the `TlsConfig` and the token-exchange seam.
+- `AppleKey`, `Provider.Apple`, `OidcOptions.stateStore` - Sign in with Apple: `AppleKey(teamId,
+  keyId, p8Pem)` parses the .p8 and fails at startup for anything but a P-256 key,
+  `handleCallback` signs an ES256 client secret per exchange, and the form_post
+  callback keeps `state` and `nonce` in a `OneTimeStore` because Apple's POST carries no
+  session cookie; the first-login name surfaces as `given_name`/`family_name` and
+  `email_verified`/`is_private_email` are booleans; see
+  [Sign in with Apple](docs/apple.md).
 - `OAuth2Strategy`, `OAuth2Endpoints`, `OAuth2Options`, `ClientAuth`,
   `ProfileFetch`, `OAuth2Error`, `OAuth2ErrorKind` - the OAuth 2.0
   authorization-code flow with PKCE for providers that issue no ID token (GitHub,
