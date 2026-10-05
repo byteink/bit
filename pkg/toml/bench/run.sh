@@ -106,7 +106,7 @@ build_bit() {
   # uses for its own apps/bit/{bit.json,bit.lock}.
   printf '{"name": "tomlbench", "dependencies": {"toml": "%s"}}\n' "$PKG" > "$HERE/apps/bit/bit.json"
   printf '{"toml": {"path": "%s", "requires": {}}}\n' "$PKG" > "$HERE/apps/bit/bit.lock"
-  BIT_REPO="$REPO" "$BIT" build "$HERE/apps/bit/main.bit" -o "$HERE/out/bin/bitbench"
+  BIT_REPO="$REPO" BIT_STDLIB="$REPO/stdlib" "$BIT" build "$HERE/apps/bit/main.bit" -o "$HERE/out/bin/bitbench"
 }
 
 # build_go <dir> <out-name>. Pinned, not `go get ... @latest` (#5559):
