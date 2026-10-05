@@ -157,6 +157,75 @@ default list, `openid email profile`, therefore sends `scope=email name`. Anythi
 else, such as `phone`, fails at construction because Apple would silently ignore
 it.
 
+## Testing your Apple routes
+
+`OidcStrategy(Provider.Apple(key), ...)` discovers Apple's endpoints and keys
+over TLS when it is built, so a test would reach `appleid.apple.com` before it
+ran a single route. `OidcOptions.discoveryFetch` is the seam for that half, the
+way `tokenFetch` is for the code exchange: a function from a URL to the body
+served there, called for Apple's discovery document and for the JWKS the
+document names, and again when a key is rotated. Left `nil` it is the real TLS
+fetch. When it is set, `tls` is not required. The constructor, and every check
+it makes, runs unchanged, so the strategy under test is the one production
+builds:
+
+```bit
+import { HttpFetch, TokenFetch } from "auth"
+
+const appleHost = "https://appleid.apple.com"
+
+// What Apple would serve: the discovery document, then the JWKS it points to.
+fn fakeApple(jwks: string): HttpFetch {
+  let f: HttpFetch = (url) => {
+    if (url == appleHost + "/.well-known/openid-configuration") {
+      return "{\"issuer\":\"" +
+        appleHost +
+        "\"," +
+        "\"authorization_endpoint\":\"" +
+        appleHost +
+        "/auth/authorize\"," +
+        "\"token_endpoint\":\"" +
+        appleHost +
+        "/auth/token\"," +
+        "\"jwks_uri\":\"" +
+        appleHost +
+        "/auth/keys\"}"
+    }
+    if (url == appleHost + "/auth/keys") {
+      return jwks
+    }
+    fail newError("unexpected GET ${url}")
+  }
+  return f
+}
+
+// The strategy `apple` builds, with Apple replaced by `fakeApple` and the
+// token endpoint by `tokens`. Nothing else differs.
+fn appleUnderTest(p8: string, jwks: string, tokens: TokenFetch): OidcStrategy! {
+  let key = AppleKey("ABCDE12345", "KEYID67890", p8)?
+  let states: OneTimeStore = MemoryOneTimeStore()
+  return OidcStrategy(
+    Provider.Apple(key),
+    "com.example.inkwell.web",
+    "",
+    "https://app.example.com/auth/apple/callback",
+    OidcOptions{
+      stateStore = Option.Some(states),
+      discoveryFetch = fakeApple(jwks),
+      tokenFetch = tokens,
+    },
+  )?
+}
+```
+
+Hand it a throwaway P-256 key, a JWKS you control and a `tokenFetch` that answers
+with an ID token you signed, and the routes above, `beginAuthorization` and the
+form-POST `handleCallback`, run unchanged against it. The complete test, ID token
+included, is in [Testing your sign-in routes](testing.md#a-fake-apple). The ID
+token is checked exactly as a real one is: signature against the key named by
+`kid`, issuer, audience, nonce and expiry. Use `discoveryFetch` only in tests: a
+strategy your app builds at startup leaves it `nil`.
+
 ## Mistakes that fail at construction
 
 `AppleKey(...)` and `OidcStrategy(...)` return an error, so the app does not
@@ -170,7 +239,8 @@ start, for each of these:
 - a non-empty client secret;
 - a `redirectUri` that is not `https` or has a `#` fragment;
 - a scope other than `openid`, `email` and `profile`;
-- no `tls`, which the discovery of Apple's keys needs.
+- no `tls`, which the discovery of Apple's keys needs, unless
+  `discoveryFetch` is set (see [Testing your Apple routes](#testing-your-apple-routes)).
 
 Apple's pages document no PKCE for either endpoint, so none is sent: the client
 authenticates with the signed secret, and the `nonce` binds the ID token to your
