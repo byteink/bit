@@ -1,0 +1,232 @@
+// pkg/auth/webauthn_wire.bit — the JSON a passkey registration exchanges with
+// the browser (#6958): the creation options going out (W3C Web Authentication
+// Level 3 section 5.4, `PublicKeyCredentialCreationOptionsJSON`) and the
+// response coming back (section 5.1, `RegistrationResponseJSON`), plus the
+// small record of a ceremony in progress that lives in the session.
+//
+// The response is hostile input: every member is type-checked, every
+// base64url string decoded with `decodeBase64Url` (no padding, no other
+// alphabet) and sized before use.
+//
+// `Json`, `JsonEntry`, `jsonGet`, `jsonAsString`, `jsonAsArray`,
+// `jsonAsObject`, `encodeBase64Url`, `decodeBase64Url`, `parseInt`, `split`,
+// `isSome` and `unwrap` are already bound module-wide (SPEC §17.1);
+// re-importing any of them here is E0042.
+
+// The most base64url characters of one response member this file decodes: the
+// attestation object is a few hundred bytes without a certificate chain and a
+// few kilobytes with one.
+const waMaxMemberLen = 400000
+
+// The most transports a response may name, and the longest name. Registered
+// values (usb, nfc, ble, hybrid, internal, smart-card) are all under 12 bytes.
+const waMaxTransports = 8
+const waMaxTransportLen = 32
+
+// A registration in progress, as `beginRegistration` stored it in the session.
+class PendingRegistration {
+  challenge: []byte,
+  expiresAt: i64,
+  userId: string,
+}
+
+// `challenge.expiresAt.userId`, each part base64url or decimal, so the dot
+// cannot occur inside a part.
+fn encodePending(p: PendingRegistration): string {
+  return encodeBase64Url(p.challenge) +
+    "." +
+    "${p.expiresAt}" +
+    "." +
+    encodeBase64Url([]byte(p.userId))
+}
+
+fn decodePending(raw: string): PendingRegistration! {
+  let parts = split(raw, ".")
+  if (len(parts) != 3) {
+    fail newError("auth: webauthn: the pending registration in the session is malformed")
+  }
+  let challenge = decodeBase64Url(parts[0])?
+  let at = parseInt(parts[1])?
+  let uid = decodeBase64Url(parts[2])?
+  return PendingRegistration{ challenge = challenge, expiresAt = i64(at), userId = string(uid) }
+}
+
+fn waEntry(key: string, value: Json): JsonEntry {
+  return JsonEntry{ key = key, value = value }
+}
+
+fn waText(s: string): Json {
+  return Json.JsonString(s)
+}
+
+fn waCredParams(algs: []int): Json {
+  let out = []Json(0)
+  for alg of algs {
+    out = append(
+      out,
+      Json.JsonObject(
+        []JsonEntry{
+          waEntry("type", waText("public-key")),
+          waEntry("alg", Json.JsonInt(i64(alg))),
+        },
+      ),
+    )
+  }
+  return Json.JsonArray(out)
+}
+
+fn waTransportList(transports: []string): Json {
+  let out = []Json(0)
+  for t of transports {
+    out = append(out, waText(t))
+  }
+  return Json.JsonArray(out)
+}
+
+// Section 5.8.3: one `excludeCredentials` descriptor per credential the user
+// already has, so the authenticator refuses to register a second passkey on
+// the same device.
+fn waExclude(existing: []Credential): Json {
+  let out = []Json(0)
+  for c of existing {
+    let entries = []JsonEntry{
+      waEntry("type", waText("public-key")),
+      waEntry("id", waText(encodeBase64Url(c.id))),
+    }
+    if (len(c.transports) > 0) {
+      entries = append(entries, waEntry("transports", waTransportList(c.transports)))
+    }
+    out = append(out, Json.JsonObject(entries))
+  }
+  return Json.JsonArray(out)
+}
+
+// Section 5.4.3: `requireResidentKey` is the legacy twin of `residentKey`
+// (true exactly when it is "required"), still read by older authenticators.
+fn waSelection(opts: WebAuthnOptions): Json {
+  let entries = []JsonEntry{
+    waEntry("residentKey", waText(opts.residentKey.wire())),
+    waEntry("requireResidentKey", Json.JsonBool(opts.residentKey.wire() == "required")),
+    waEntry("userVerification", waText(opts.userVerification.wire())),
+  }
+  let attachment = opts.attachment.wire()
+  if (attachment != "") {
+    entries = append(entries, waEntry("authenticatorAttachment", waText(attachment)))
+  }
+  return Json.JsonObject(entries)
+}
+
+// The `PublicKeyCredentialCreationOptionsJSON` for `user`, with `challenge` and
+// the `existing` credentials to exclude. `rp.id` is sent as given (the browser
+// defaults it to the page's host otherwise, and the two must agree).
+fn creationOptions(
+  rp: RelyingParty,
+  opts: WebAuthnOptions,
+  user: UserEntity,
+  challenge: []byte,
+  existing: []Credential,
+): Json {
+  let rpJson = Json.JsonObject(
+    []JsonEntry{ waEntry("id", waText(rp.id)), waEntry("name", waText(rp.name)) },
+  )
+  let userJson = Json.JsonObject(
+    []JsonEntry{
+      waEntry("id", waText(encodeBase64Url([]byte(user.id)))),
+      waEntry("name", waText(user.name)),
+      waEntry("displayName", waText(user.displayName)),
+    },
+  )
+  return Json.JsonObject(
+    []JsonEntry{
+      waEntry("rp", rpJson),
+      waEntry("user", userJson),
+      waEntry("challenge", waText(encodeBase64Url(challenge))),
+      waEntry("pubKeyCredParams", waCredParams(opts.algorithms)),
+      waEntry("timeout", Json.JsonInt(i64(opts.timeoutMs))),
+      waEntry("excludeCredentials", waExclude(existing)),
+      waEntry("authenticatorSelection", waSelection(opts)),
+      waEntry("attestation", waText(opts.attestation.wire())),
+    },
+  )
+}
+
+// The registration response, decoded: the credential id the browser reports,
+// the exact clientDataJSON bytes and attestationObject bytes, and the
+// transports it named.
+class RegistrationResponse {
+  id: []byte,
+  clientData: []byte,
+  attestation: []byte,
+  transports: []string,
+}
+
+// A required string member of `obj`, named `where.key` in the error.
+fn waMember(obj: Json, key: string, where: string): string! {
+  let m = jsonGet(obj, key)
+  if (!isSome(m)) {
+    fail newError("auth: webauthn: the registration response has no '${where}${key}'")
+  }
+  let s = jsonAsString(unwrap(m))
+  if (!isSome(s)) {
+    fail newError("auth: webauthn: the registration response '${where}${key}' is not a string")
+  }
+  return unwrap(s)
+}
+
+// A required base64url member, bounded and decoded.
+fn waBytes(obj: Json, key: string, where: string): []byte! {
+  let text = waMember(obj, key, where)?
+  if (len(text) > waMaxMemberLen) {
+    fail newError("auth: webauthn: the registration response '${where}${key}' is ${len(text)} characters, at most ${waMaxMemberLen}")
+  }
+  return decodeBase64Url(text) catch e {
+    fail newError("auth: webauthn: the registration response '${where}${key}' is not base64url: ${e.message()}")
+  }
+}
+
+// The optional `transports` array of strings (section 5.2.1.1 `getTransports`).
+fn waTransports(inner: Json): []string! {
+  let out = []string(0)
+  let m = jsonGet(inner, "transports")
+  if (!isSome(m)) {
+    return out
+  }
+  let arr = jsonAsArray(unwrap(m))
+  if (!isSome(arr) || len(unwrap(arr)) > waMaxTransports) {
+    fail newError("auth: webauthn: the registration response 'response.transports' is not an array of at most ${waMaxTransports} strings")
+  }
+  for item of unwrap(arr) {
+    let s = jsonAsString(item)
+    if (!isSome(s) || len(unwrap(s)) == 0 || len(unwrap(s)) > waMaxTransportLen) {
+      fail newError("auth: webauthn: the registration response 'response.transports' holds a bad entry")
+    }
+    out = append(out, unwrap(s))
+  }
+  return out
+}
+
+fn waIsPublicKey(j: Json): bool {
+  let s = jsonAsString(j)
+  return isSome(s) && unwrap(s) == "public-key"
+}
+
+// `response` is the object `PublicKeyCredential.toJSON()` returns: `id`,
+// optional `type` ("public-key"), and `response` holding `clientDataJSON` and
+// `attestationObject`.
+fn parseRegistrationResponse(response: Json): RegistrationResponse! {
+  let t = jsonGet(response, "type")
+  if (isSome(t) && !waIsPublicKey(unwrap(t))) {
+    fail newError("auth: webauthn: the registration response 'type' is not \"public-key\"")
+  }
+  let m = jsonGet(response, "response")
+  if (!isSome(m) || !isSome(jsonAsObject(unwrap(m)))) {
+    fail newError("auth: webauthn: the registration response has no 'response' object")
+  }
+  let inner = unwrap(m)
+  return RegistrationResponse{
+    id = waBytes(response, "id", "")?,
+    clientData = waBytes(inner, "clientDataJSON", "response.")?,
+    attestation = waBytes(inner, "attestationObject", "response.")?,
+    transports = waTransports(inner)?,
+  }
+}
