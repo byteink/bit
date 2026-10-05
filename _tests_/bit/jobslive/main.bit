@@ -9,11 +9,13 @@
 // import from pkg/jobs cannot read an env var meant for a different
 // process's config).
 //
-// Proves, against a REAL server: N workers process every job exactly once
+// The same file runs against PostgreSQL and against MySQL 8 (the scheme of the
+// URL picks the driver, `requirePool`). `conformance.bit`'s `Store`/`Locker`
+// suite runs first, then everything below. Proves, against a REAL server: N workers process every job exactly once
 // (no double-processing), a crashed worker's claim is reclaimed once its
 // visibility timeout elapses, `stop()` drains an in-flight job before
 // returning, and three schedulers (three Queues, three pools, one
-// PostgresLocker each) enqueue every tick of one schedule exactly once
+// SqlLocker each) enqueue every tick of one schedule exactly once
 // while a stall they all suffer is caught up once between them. The
 // schedulers read a hand-moved clock, so the proof takes seconds. It also proves that
 // a whole fleet down across five ticks is caught up by each `Missed` policy
@@ -23,13 +25,15 @@
 
 import { args } from "std/os"
 import { pool, Pool, Datasource, Value, asInt, asText } from "std/sql"
-import { adapter } from "postgres"
+import { adapter as postgresAdapter } from "postgres"
+import { adapter as mysqlAdapter } from "mysql"
+import { hasPrefix } from "std/strings"
 import { sleep, Millisecond } from "std/time"
 import { AtomicI64 } from "std/sync"
 import { now, Minute, Second } from "std/time"
 import {
-  PostgresStore,
-  PostgresLocker,
+  SqlStore,
+  SqlLocker,
   migrate,
   open,
   Options,
@@ -42,17 +46,27 @@ import {
   tag: string,
 }
 
-fn requireStore(uri: string): PostgresStore {
-  let db = pool(adapter(), Datasource{ uri = uri }) catch e {
-    panic("pool(${uri}): ${e.message()}")
+fn storeOn(db: Pool): SqlStore {
+  return SqlStore(db) catch e {
+    panic("SqlStore: ${e.message()}")
   }
+}
+
+fn lockerOn(db: Pool, keep: int): SqlLocker {
+  return SqlLocker(db, keep = keep) catch e {
+    panic("SqlLocker: ${e.message()}")
+  }
+}
+
+fn requireStore(uri: string): SqlStore {
+  let db = requirePool(uri)
   migrate(db) catch e {
     panic("migrate: ${e.message()}")
   }
-  return PostgresStore(db)
+  return storeOn(db)
 }
 
-fn proveConcurrency(store: PostgresStore) {
+fn proveConcurrency(store: SqlStore) {
   let q = open(store, Options{ workers = 4, pollInterval = 20 * Millisecond }) catch e {
     panic("open: ${e.message()}")
   }
@@ -82,7 +96,7 @@ fn proveConcurrency(store: PostgresStore) {
   }
 }
 
-fn claimOrPanic(store: PostgresStore, label: string): Option<ClaimedJob> {
+fn claimOrPanic(store: SqlStore, label: string): Option<ClaimedJob> {
   return store.claim(200 * Millisecond) catch e {
     panic("${label}: ${e.message()}")
   }
@@ -106,7 +120,7 @@ fn expectNotClaimable(claimed: Option<ClaimedJob>, label: string) {
   }
 }
 
-fn proveCrashReclaim(store: PostgresStore) {
+fn proveCrashReclaim(store: SqlStore) {
   store.enqueue("live-echo", "{\"tag\":\"reclaim\"}", 0, 5) catch e {
     panic("enqueue: ${e.message()}")
   }
@@ -116,7 +130,7 @@ fn proveCrashReclaim(store: PostgresStore) {
   expectAttempts(claimOrPanic(store, "claim 3"), 2, "reclaim after timeout")
 }
 
-fn proveGracefulDrain(store: PostgresStore) {
+fn proveGracefulDrain(store: SqlStore) {
   let q = open(store, Options{ workers = 1, pollInterval = 20 * Millisecond }) catch e {
     panic("open: ${e.message()}")
   }
@@ -169,13 +183,13 @@ class handClock {
   }
 }
 
-// A `PostgresLocker` whose `serverNowNs` answers with the hand clock: these
+// A `SqlLocker` whose `serverNowNs` answers with the hand clock: these
 // proofs move the clock hours past the real one, which the skew guard
 // (#6368) would rightly refuse against the real database clock. The leases
 // still go through the real PostgreSQL; `proveServerClock` and
 // `proveSkewedClockFiresNothing` use the real `serverNowNs`.
 class handLocker {
-  inner: PostgresLocker
+  inner: SqlLocker
   clock: handClock
 
   tryAcquire(key: string, holder: string, nowNs: int, expiresAt: int): bool! {
@@ -198,14 +212,12 @@ class handLocker {
 }
 
 fn scheduledQueue(uri: string, clock: handClock, id: string, missed: Missed): Queue {
-  let db = pool(adapter(), Datasource{ uri = uri }) catch e {
-    panic("pool: ${e.message()}")
-  }
+  let db = requirePool(uri)
   let q = open(
-    PostgresStore(db),
+    storeOn(db),
     Options{
       workers = 1, pollInterval = 10 * Millisecond, locker = handLocker{
-        inner = PostgresLocker(db),
+        inner = lockerOn(db, 1024),
         clock = clock,
       },
       clock = clock, instanceId = id,
@@ -287,10 +299,10 @@ const downtimePeriod: int = 10 * Minute
 fn cronQueue(uri: string, clock: handClock, id: string, missed: Missed): Queue {
   let db = requirePool(uri)
   let q = open(
-    PostgresStore(db),
+    storeOn(db),
     Options{
       workers = 1, pollInterval = 10 * Millisecond,
-      locker = handLocker{ inner = PostgresLocker(db, keep = downtimeKeep), clock = clock },
+      locker = handLocker{ inner = lockerOn(db, downtimeKeep), clock = clock },
       clock = clock, instanceId = id,
     },
   ) catch e {
@@ -367,7 +379,7 @@ fn proveDowntimeCatchUp(uri: string) {
 }
 
 fn acquireOrPanic(
-  locker: PostgresLocker,
+  locker: SqlLocker,
   key: string,
   holder: string,
   nowNs: int,
@@ -406,7 +418,7 @@ fn leaseKeys(db: Pool): string {
 fn proveFutureTicksDoNotEvictCurrent(uri: string) {
   let db = requirePool(uri)
   resetTicks(db)
-  let locker = PostgresLocker(db, keep = 2)
+  let locker = lockerOn(db, 2)
   let future = 4 * 365 * 24 * 3600 * 1000000000
   for i of [0, 1, 2] {
     if (!acquireOrPanic(locker, "probe@${future + i}", "a", 1, "future tick ${i}")) {
@@ -437,7 +449,7 @@ fn proveFutureTicksDoNotEvictCurrent(uri: string) {
 fn proveNewestTickSurvivesLateCatchUp(uri: string) {
   let db = requirePool(uri)
   resetTicks(db)
-  let locker = PostgresLocker(db, keep = 2)
+  let locker = lockerOn(db, 2)
   for t of [100, 1, 2, 3, 4] {
     if (!acquireOrPanic(locker, "late@${t}", "a", 1, "tick ${t}")) {
       panic("PROBE: tick ${t} was not won")
@@ -453,10 +465,10 @@ fn proveNewestTickSurvivesLateCatchUp(uri: string) {
   resetTicks(db)
 }
 
-// `PostgresLocker.serverNowNs` reads the real database clock: within 5 s of
+// `SqlLocker.serverNowNs` reads the real database clock: within 5 s of
 // this host's (the harness and the server share one machine's clock).
 fn proveServerClock(uri: string) {
-  let locker = PostgresLocker(requirePool(uri))
+  let locker = lockerOn(requirePool(uri), 1024)
   let server = locker.serverNowNs() catch e {
     panic("serverNowNs: ${e.message()}")
   }
@@ -477,9 +489,9 @@ fn proveSkewedClockFiresNothing(uri: string) {
   let fourYears = 4 * 365 * 24 * 60 * Minute
   let clock = handClock{ ns = AtomicI64(i64(now().ns + fourYears)) }
   let q = open(
-    PostgresStore(db),
+    storeOn(db),
     Options{
-      workers = 1, pollInterval = 10 * Millisecond, locker = PostgresLocker(db),
+      workers = 1, pollInterval = 10 * Millisecond, locker = lockerOn(db, 1024),
       clock = clock, instanceId = "skewed",
     },
   ) catch e {
@@ -498,14 +510,31 @@ fn proveSkewedClockFiresNothing(uri: string) {
   }
 }
 
+// The driver the URL's scheme names: `mysql://` is MySQL, anything else
+// PostgreSQL.
 fn requirePool(uri: string): Pool {
-  return pool(adapter(), Datasource{ uri = uri }) catch e {
-    panic("pool(${uri}): ${e.message()}")
+  if (hasPrefix(uri, "mysql://")) {
+    return pool(mysqlAdapter(), Datasource{ uri = uri }) catch e {
+      panic("pool(mysql): ${e.message()}")
+    }
   }
+  return pool(postgresAdapter(), Datasource{ uri = uri }) catch e {
+    panic("pool(postgres): ${e.message()}")
+  }
+}
+
+// The shared suite, over two instances' stores and lockers on one database.
+fn proveConformance(uri: string) {
+  let db = requireStore(uri)
+  runStoreConformance(db)
+  resetTicks(requirePool(uri))
+  runLockerConformance(lockerOn(requirePool(uri), 1024), lockerOn(requirePool(uri), 1024))
+  resetTicks(requirePool(uri))
 }
 
 fn main() {
   let uri = args()[1]
+  proveConformance(uri)
   proveConcurrency(requireStore(uri))
   proveCrashReclaim(requireStore(uri))
   proveGracefulDrain(requireStore(uri))
