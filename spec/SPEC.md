@@ -2737,10 +2737,10 @@ So the rule is where a symbol may legitimately come from, not the platform:
   unpinned**: rejected with **E0078**, naming the symbol. A fully static ELF
   has nothing to resolve it against, so this would otherwise fail deep inside
   the linker.
-- In a build whose archive **cannot be read**: rejected on either platform.
-  Membership is undecidable there, and an undecided case must fall back to
-  rejection - an accept-on-unknown would convert a compile error into a link
-  error or a silent crash.
+- In a build whose archive **cannot be read**: rejected on either platform,
+  naming the archive member that could not be read rather than the `extern
+  fn`. Membership is undecidable there, and an accept-on-unknown would convert
+  a compile error into a link error or a silent crash.
 
 The admitted libSystem surface is a **table the compiler carries** (both
 compilers carry the same one), not a query against the host. It has to be, for
