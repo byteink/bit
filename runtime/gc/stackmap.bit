@@ -300,7 +300,17 @@ let smBoundsMsg: [8]i64
 // entries and this check refuses, by name, the moment it reaches one —
 // exactly the loud failure this ticket exists to produce instead of #1927's
 // silent bus error.
-export const smFormatVersion = 1
+//
+// 2 (#7303): every safepoint record ends in a u32 live-register mask. The
+// reader also accepts `smFormatVersionV1`, because the pinned stage0 that
+// builds `libbitrt.a` keeps stamping 1 until a repin, so one image carries
+// both; a version-1 record's mask reads as `smLiveUnknown`.
+export const smFormatVersion = 2
+export const smFormatVersionV1 = 1
+
+// `smLiveRegsAt`'s answer when no mask is recorded: `pc` is in no Bit
+// function, or its entry predates version 2. Every register may be live.
+export const smLiveUnknown = -1
 
 // Renders `v` as decimal ASCII into `buf` starting at byte `pos`, returning
 // the position just past the last digit. Every caller passes a u16 blob
@@ -431,7 +441,8 @@ const smBadVersion = -2
   }
   // Checked before any count-driven read (numSaved is the first): after a
   // version mismatch every offset past this point is meaningless.
-  if (blobU16(base, off + 8) != smFormatVersion) {
+  let version = blobU16(base, off + 8)
+  if (version != smFormatVersion && version != smFormatVersionV1) {
     return smBadVersion
   }
   // The WHOLE saved-register span (u16 reg + i32 fp_off each) at once, so
@@ -447,10 +458,21 @@ const smBadVersion = -2
   return p + 2
 }
 
+// Bytes a safepoint record of the entry at `off` carries past its register
+// list: version 2's u32 live_regs (#7303), none in version 1. The caller has
+// proven the header through `smSpsStart`, which admits only those two.
+@nosplit fn smSpTail(base: int, off: int): int {
+  if (blobU16(base, off + 8) == smFormatVersionV1) {
+    return 0
+  }
+  return 4
+}
+
 // The offset just past the safepoint record at `sp` (u32 ret_off, u16
-// num_slots, i32 slot_fp_off each, u16 num_regs, u16 reg each), every span
-// proven in bounds before the count after it is read; else `smBadBounds`.
-@nosplit fn smSpEnd(base: int, tblLen: int, sp: int): int {
+// num_slots, i32 slot_fp_off each, u16 num_regs, u16 reg each, then `tail`
+// bytes, see `smSpTail`), every span proven in bounds before the count after
+// it is read; else `smBadBounds`.
+@nosplit fn smSpEnd(base: int, tblLen: int, sp: int, tail: int): int {
   // retOff (4) + numSlots (2): fixed, one check covers both.
   if (!inBlob(sp, 6, tblLen)) {
     return smBadBounds
@@ -464,24 +486,25 @@ const smBadVersion = -2
     return smBadBounds
   }
   let numRegs = blobU16(base, p)
-  if (!inBlob(p + 2, numRegs * 2, tblLen)) {
+  if (!inBlob(p + 2, numRegs * 2 + tail, tblLen)) {
     return smBadBounds
   }
-  return p + 2 + numRegs * 2
+  return p + 2 + numRegs * 2 + tail
 }
 
 // The offset of the entry after the one at `off`, the whole entry proven in
 // bounds; else a refusal code.
-@nosplit fn smEntryEnd(base: int, tblLen: int, off: int): int {
+export @nosplit fn smEntryEnd(base: int, tblLen: int, off: int): int {
   let p = smSpsStart(base, tblLen, off)
   if (p < 0) {
     return p
   }
+  let tail = smSpTail(base, off)
   let numSps = blobU16(base, p - 2)
   let si = 0
   // Bounded: this entry's safepoint count.
   while (si < numSps) {
-    p = smSpEnd(base, tblLen, p)
+    p = smSpEnd(base, tblLen, p, tail)
     if (p < 0) {
       return p
     }
@@ -587,12 +610,13 @@ export @nosplit fn smLinearFind(pc: int): int {
     smRefuse(base, off, p)
     return
   }
+  let tail = smSpTail(base, off)
   let codeAddr = blobU64(base, off)
   let numSps = blobU16(base, p - 2)
   let si = 0
   // Bounded: this entry's safepoint count.
   while (si < numSps) {
-    let next = smSpEnd(base, tblLen, p)
+    let next = smSpEnd(base, tblLen, p, tail)
     if (next < 0) {
       smRefuse(base, off, next)
       return
@@ -604,6 +628,47 @@ export @nosplit fn smLinearFind(pc: int): int {
     si = si + 1
   }
   smRestoreSaved(base, off, fp)
+}
+
+// #7303: the live-register mask of the safepoint at `pc` in the entry at
+// `off` of the table `[base, base + tblLen)`: bit n set when physical
+// register n holds a value the code after `pc` still needs. `smLiveUnknown`
+// for a version-1 entry or a `pc` the entry records no safepoint at. A
+// malformed entry is refused by name, as `scanEntry` refuses it.
+export @nosplit fn smLiveRegsIn(base: int, tblLen: int, off: int, pc: int): int {
+  let p = smSpsStart(base, tblLen, off)
+  if (p < 0) {
+    smRefuse(base, off, p)
+    return smLiveUnknown
+  }
+  let tail = smSpTail(base, off)
+  let codeAddr = blobU64(base, off)
+  let numSps = blobU16(base, p - 2)
+  let si = 0
+  // Bounded: this entry's safepoint count.
+  while (si < numSps) {
+    let next = smSpEnd(base, tblLen, p, tail)
+    if (next < 0) {
+      smRefuse(base, off, next)
+      return smLiveUnknown
+    }
+    if (codeAddr + blobU32(base, p) == pc && tail == 4) {
+      return blobU32(base, next - 4)
+    }
+    p = next
+    si = si + 1
+  }
+  return smLiveUnknown
+}
+
+// #7303: `smLiveRegsIn` over the linked table, for the frame-0 register scan
+// of a task stopped at `pc`. `smLiveUnknown` when `pc` is in no Bit function.
+export @nosplit fn smLiveRegsAt(pc: int): int {
+  let off = smFindEntry(pc)
+  if (off < 0) {
+    return smLiveUnknown
+  }
+  return smLiveRegsIn(smTblBase(), smTblLen(), off, pc)
 }
 
 // ---------------------------------------------------------------------------
