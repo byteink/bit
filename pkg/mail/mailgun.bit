@@ -1,0 +1,173 @@
+// pkg/mail/mailgun.bit — the `Transport` `open("mailgun://KEY:domain@default")`
+// returns: one `POST https://api.mailgun.net/v3/<domain>/messages.mime` per
+// message with HTTP basic auth `api:KEY`
+// (https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/messages/post-v3--domain-name--messages-mime).
+// The multipart body is made in mailgunform.bit; the URL and the client are
+// shared with the other HTTPS-API transports (httpapi.bit); this file is the
+// request and what each answer means.
+//
+//   mailgun://KEY:domain@default                  api.mailgun.net, the sending domain `domain`
+//   mailgun://KEY:domain@eu                       api.eu.mailgun.net, for a domain in Mailgun's EU region
+//   mailgun://KEY:domain@host[:port]              https://host[:port], for a proxy or a test
+//   mailgun://KEY:domain@host[:port]?insecureSkipVerify=true   ... without checking its certificate
+//
+// `domain` is the domain the account sends from, a DNS name with at least one
+// dot (`mg.inkwell.dev`). The key is never in an error, a `Receipt` or the text
+// of the transport.
+//
+// Mailgun is sent the message as the `Mailer` rendered it: the file part
+// `message` is `Delivery.raw`, so `Options.dkim` signs what Mailgun forwards, and
+// the recipients are the envelope's `to` fields, which is how a `bcc` address is
+// delivered to without being in a header.
+//
+// What Mailgun answers, and what the caller gets:
+//   200                          `Receipt.providerId` is the `id` it returns, without its `<>`
+//   401                          `Auth`
+//   429                          `Transient`, `Reply.retryAfter` from `Retry-After`
+//   5xx                          `Transient`
+//   a failed TLS handshake       `Rejected`: the same certificate is presented next time
+//   a request that never left     `Transient`: a refused or failed connect
+//   a request cut off after it    `Unknown`: a reset or a timeout once it was
+//   was written                   written; Mailgun may have taken the mail, so it
+//                                 is not repeated
+//   400, 404 and any other 4xx   `Rejected` with Mailgun's `message`
+//
+// Mailgun has no idempotency key, so a send is repeated only when the mail was
+// not taken: a refused connection, a 429 or a 5xx. A request cut off after it was
+// written may or may not have been taken, and repeating it can send the mail
+// twice (RFC 9110 §9.2.2), so it is `Unknown` and `Options.retry` leaves it alone.
+
+import { Client as HttpClient } from "std/http"
+import { encodeBase64 } from "std/crypto"
+import { Millisecond } from "std/time"
+
+fn mailgunSpec(): ApiSpec {
+  return ApiSpec{
+    scheme = "mailgun://",
+    defaultHost = "api.mailgun.net",
+    regions = { "eu": "api.eu.mailgun.net" },
+    secret = "API key",
+    placeholder = "KEY",
+    second = "domain",
+  }
+}
+
+// Whether `url` is a `mailgun://` URL, whatever follows.
+fn isMailgunUrl(url: string): bool {
+  return hasScheme(url, "mailgun://")
+}
+
+// `url` as a target whose `second` is the sending domain, or a `Config` that
+// never repeats the key.
+fn parseMailgun(url: string): ApiTarget!MailError {
+  let t = parseApiUrl(mailgunSpec(), url)?
+  if (!isDnsName(t.second) || indexOf(t.second, ".") < 0) {
+    fail apiUrlError(
+      mailgunSpec(),
+      "the domain is the sending domain, a DNS name such as mg.inkwell.dev; got ${shown(t.second)}",
+    )
+  }
+  return t
+}
+
+class MailgunTransport {
+  t: ApiTarget
+  timeoutMs: int
+  // Makes the boundary candidates, so a test can name them.
+  boundary: () => string
+
+  init(t: ApiTarget, opts: Options) {
+    this.t = t
+    this.timeoutMs = opts.timeout / Millisecond
+    this.boundary = mgRandomBoundary
+  }
+
+  // Posts `d` as one Mailgun message. See the top of this file for what each
+  // answer becomes.
+  export deliver(d: Delivery): Receipt!MailError {
+    let req = mgRequest(d, this.boundary)?
+    let c = apiClient(this.t.insecure)
+    defer c.close()
+    this.setHeaders(c, req.contentType)?
+    let res = c.requestTimeout("POST", this.endpoint(), req.body, this.timeoutMs) catch e {
+      fail apiNetError("mailgun: ${this.scrub(e.message())}", e, false)
+    }
+    return this.answer(res.status, res.headers, res.body, d)?
+  }
+
+  // The URL every send is posted to.
+  endpoint(): string {
+    return "${this.t.base}/v3/${this.t.second}/messages.mime"
+  }
+
+  // What leaves is `Delivery.raw`, so a signature over it stays valid.
+  export signs(): bool {
+    return true
+  }
+
+  // Nothing is held between sends.
+  export close() {}
+
+  // `mailgun://***:mg.inkwell.dev@api.mailgun.net`, the key hidden.
+  export toString(): string {
+    return this.t.display
+  }
+
+  // The headers every send carries. The key was checked at `open`, so a refusal
+  // here is a bug, reported and never with the value.
+  setHeaders(c: HttpClient, contentType: string): ()!MailError {
+    let login = encodeBase64([]byte("api:${this.t.secret}"))
+    c.setHeader("Authorization", "Basic ${login}") catch _ {
+      fail MailError.Config("mailgun://: the API key cannot be sent as a header")
+    }
+    c.setHeader("Content-Type", contentType) catch _ {
+      fail MailError.Config("mailgun://: Content-Type cannot be set")
+    }
+    c.setHeader("Accept", "application/json") catch _ {
+      fail MailError.Config("mailgun://: Accept cannot be set")
+    }
+  }
+
+  scrub(s: string): string {
+    return apiScrub(s, this.t.secret)
+  }
+
+  // The `Receipt` for a 200, else the `MailError` for the answer.
+  answer(status: int, headers: string, body: string, d: Delivery): Receipt!MailError {
+    if (status == 200) {
+      return Receipt{
+        id = d.messageId,
+        providerId = mgId(apiField(body, "id")),
+        accepted = d.envelope.to,
+      }
+    }
+    let text = apiClip(this.scrub(apiField(body, "message")))
+    if (text == "") {
+      text = "HTTP ${status}"
+    }
+    fail mailgunError(
+      status,
+      Reply{ code = status, text = text, retryAfter = apiRetryAfter(headers) },
+    )
+  }
+}
+
+// `id` without the angle brackets Mailgun writes around a Message-ID.
+fn mgId(id: string): string {
+  if (len(id) >= 2 && id[0] == '<' && id[len(id) - 1] == '>') {
+    return id[1:len(id) - 1]
+  }
+  return id
+}
+
+// The `MailError` for an answer that is not a 200; the table is at the top of
+// this file.
+fn mailgunError(status: int, r: Reply): MailError {
+  if (status == 401) {
+    return MailError.Auth(r)
+  }
+  if (status == 429 || status >= 500) {
+    return MailError.Transient(r)
+  }
+  return MailError.Rejected(r)
+}
