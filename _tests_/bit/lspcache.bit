@@ -582,6 +582,133 @@ fn checkEditFollowsBuffer(root: string, edit: Run): bool {
   return true
 }
 
+// #7148: a project whose class module (`./models`) loads BEFORE the module that
+// declares an interface requiring `__field` (`./readable`), so `__field` is
+// synthesized on a class that precedes std/json. The old answer reloaded the
+// whole project with a fresh parse cache, so every request re-parsed every
+// module a second time. That doubles the cold build too, so the cold-build
+// percentage above cannot see it: the bar here is the same project written
+// WITHOUT the interface, whose rebuild the interface may add only the
+// synthesized members to (measured: +0.5% with the fix, +18.6% with the reload).
+const maxInterfacePercent: int = 110
+
+fn orderedMain(edit: int): string {
+  return "import { User } from \"./models\"\nimport { show } from \"./readable\"\n\n" +
+    "fn main() {\n  let u = User{ id = \"u1\", team = \"sport\", age = 41 }\n" +
+    "  println(show(u, \"id\"))\n}\n// edit ${edit}\n"
+}
+
+fn orderedReadable(withField: bool): string {
+  if (!withField) {
+    return "import { Json } from \"std/json\"\n\nexport interface Readable {\n  id: string,\n}\n\n" +
+      "export fn show(r: Readable, name: string): string {\n  let j = Json.JsonString(r.id)\n" +
+      "  return match (j) {\n    JsonString(s) => s + name\n    _ => \"other\"\n  }\n}\n"
+  }
+  return "import { Json } from \"std/json\"\n\nexport interface Readable {\n" +
+    "  __field(name: string): Option<Json>,\n}\n\nexport fn show(r: Readable, name: string): string {\n" +
+    "  return match (r.__field(name)) {\n    Some(j) => describe(j)\n    None => \"none\"\n  }\n}\n\n" +
+    "fn describe(j: Json): string {\n  return match (j) {\n    JsonString(_) => \"str\"\n    _ => \"other\"\n  }\n}\n"
+}
+
+// Writes the three-module project under `dir`: `main.bit` imports `./models`
+// before `./readable`.
+fn writeOrderedProject(root: string, dir: string, withField: bool): bool {
+  mkdirQuiet(dir)
+  mkdirQuiet(dir + "/models")
+  mkdirQuiet(dir + "/readable")
+  let user = "export class User {\n  export id: string,\n  export team: string,\n  export age: int,\n}\n"
+  writeFile(dir + "/models/models.bit", user) catch e {
+    failCase(root, "cannot write the ordered fixture's models: " + e.message())
+    return false
+  }
+  writeFile(dir + "/readable/readable.bit", orderedReadable(withField)) catch e {
+    failCase(root, "cannot write the ordered fixture's readable: " + e.message())
+    return false
+  }
+  writeFile(dir + "/main.bit", orderedMain(0)) catch e {
+    failCase(root, "cannot write the ordered fixture's main: " + e.message())
+    return false
+  }
+  return true
+}
+
+// `reps` hovers on `u` (line 4), each behind a didChange of `main.bit`.
+fn orderedEditFrames(uri: string, hoverReq: string): string {
+  let out = ""
+  let e = 1
+  while (e <= reps) {
+    out = out +
+      frame(
+          "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{" +
+          "\"textDocument\":{\"uri\":\"${uri}\",\"version\":${e + 1}}," +
+          "\"contentChanges\":[{\"text\":\"" +
+          jsonEscape(orderedMain(e)) +
+          "\"}]}}",
+      ) +
+      hoverReq
+    e = e + 1
+  }
+  return out
+}
+
+// Objects one edited-and-hovered request allocates in the ordered project, and
+// whether every hover answered.
+fn orderedRebuildCost(f: Fixture, name: string, withField: bool): (int, bool) {
+  let dir = f.root + "/" + name
+  if (!writeOrderedProject(f.root, dir, withField)) {
+    return 0, false
+  }
+  let uri = "file://" + dir + "/main.bit"
+  let open = frame(
+      "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+      "\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"bit\",\"version\":1," +
+      "\"text\":\"" +
+      jsonEscape(orderedMain(0)) +
+      "\"}}}",
+  )
+  let hoverReq = frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\"," +
+      "\"params\":{\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":4,\"character\":6}}}",
+  )
+  let prologue = f.initHandshake + open + hoverReq
+  let base = runLsp(f.bin, f.root + "/" + name + "-base", f.root, prologue)
+  let edit = runLsp(
+    f.bin, f.root + "/" + name + "-edit", f.root, prologue + orderedEditFrames(uri, hoverReq),
+  )
+  if (!base.ok || !edit.ok) {
+    return 0, false
+  }
+  if (countOf(edit.out, "\"id\":2,\"result\":null") != 0) {
+    failCase(f.root, "a hover in the ${name} project replied null (#7148)")
+    return 0, false
+  }
+  return (edit.total - base.total) / reps, true
+}
+
+fn checkOrderedProject(f: Fixture): bool {
+  let (plain, pok) = orderedRebuildCost(f, "plain", false)
+  let (ordered, ook) = orderedRebuildCost(f, "ordered", true)
+  if (!pok || !ook) {
+    return false
+  }
+  if (plain <= 0 || ordered <= 0) {
+    failCase(f.root, "nonsensical ordered-project costs: plain ${plain}, with interface ${ordered}")
+    return false
+  }
+  let pct = ordered * 100 / plain
+  print("lspcache: an edit in the __field project costs ${pct}% of the same project without it (${ordered} of ${plain})\n")
+  if (pct > maxInterfacePercent) {
+    failCase(
+      f.root,
+        "the models-before-interface project allocates ${pct}% of the same project without the " +
+        "interface per edited request, over ${maxInterfacePercent}% — the modules the edit did " +
+        "not touch are being re-parsed (#7148)",
+    )
+    return false
+  }
+  print("PASS lspcache: an edit re-parses only the edited module when __field synthesis needs std/json first\n")
+  return true
+}
 fn main() {
   let (f, fok) = buildFixture()
   if (!fok) {
@@ -603,6 +730,9 @@ fn main() {
     return
   }
   if (!checkEditFollowsBuffer(f.root, arms.edit)) {
+    return
+  }
+  if (!checkOrderedProject(f)) {
     return
   }
   print("lspcache: all scenarios passed\n")
