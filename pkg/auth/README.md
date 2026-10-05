@@ -145,6 +145,15 @@ protected route that is not itself doing the authenticating just reads
   (RFC 6238) two-factor codes: enrollment, the `otpauth://` QR-code URI, and
   verifying a submitted code with a skew window and caller-owned replay
   protection.
+- `BindOptions`, `SecondFactor`, `TotpFactor`, `TotpFactorOptions`,
+  `CompleteOptions`, `completeSecondFactor` - the second step of a two-factor
+  login: `bindSession(c, id, BindOptions{ second = true })` holds the session
+  pending, so `requireAuth` and `currentIdentity` answer 401
+  `second_factor_required` until `completeSecondFactor` verifies a
+  `SecondFactor` (`TotpFactor` for authenticator codes, which cannot be built
+  without a `LoginThrottle`), regenerates the session id and promotes the
+  identity; the pending state expires after `pendingTtl` (300 seconds); see
+  [Two-factor authentication with TOTP](docs/totp.md).
 - `OneTimeTokens`, `OneTimeStore`, `OneTimeRecord`, `OneTimeOptions`,
   `Live`, `MemoryOneTimeStore`, `InvalidToken`, `Deliver` - the one-time token behind
   password reset, email verification and magic links: 256 random bits stored

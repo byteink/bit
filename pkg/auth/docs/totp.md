@@ -70,17 +70,205 @@ to notice that happened.
 
 ## Wiring it into a login flow
 
-A full second-factor login is two requests, both routes [Getting
-started](getting-started.md) already showed you how to add to an `App`: the
-password step (`requireAuth([]Strategy{ PasswordStrategy(users) })`)
-succeeds and marks the session "awaiting 2FA" rather than fully
-authenticated - `c.session()?.set("2fa:pending", currentIdentity(c)?.id)?` -
-and a second route, `POST /login/totp`, reads that pending id back, calls
-`checkCode` (above) against the body's submitted code, and on success
-persists the returned counter and clears `"2fa:pending"` before answering.
-On failure - a bad code, or `parseSecret` failing on a corrupted stored
-value - the handler answers `unauthorized()` exactly like a wrong password
-does, and the session stays pending: the user can retry.
+`checkCode` above verifies a code, but nothing yet stops a user who only knows
+the password from walking into the app: the half-logged-in state is yours to
+build, and that is where apps ship a bypass. `auth` builds it for you. After
+the password step, hold the session **pending**; a pending session has no
+identity, so `currentIdentity` and `requireAuth` refuse it, and only
+`completeSecondFactor` turns it into a login.
+
+First the factor. `TotpFactor` wraps `verify` and the replay protection above;
+you give it the three things only your application knows: where a user's
+secret is, what the last accepted counter was, and how to store a new one. It
+also needs a `LoginThrottle` and will not be built without one, because a
+6-digit code has a million values and a client that may try them all will:
+
+```bit
+import { App, Ctx, MemoryCounter } from "web"
+import {
+  BindOptions,
+  CompleteOptions,
+  Identity,
+  LoginThrottle,
+  Secret,
+  SecondFactor,
+  Strategy,
+  TotpFactor,
+  TotpFactorOptions,
+  bindSession,
+  completeSecondFactor,
+  currentIdentity,
+  parseSecret,
+} from "auth"
+import { ctEq } from "std/crypto"
+
+// One row of your users table, as far as two-factor goes.
+class TwoFactorRow {
+  secretBase32: string,
+  lastCounter: uint,
+}
+
+// Stand-in for the table: user id to row.
+class TwoFactorDb {
+  rows: map<string, TwoFactorRow>,
+}
+
+fn inkwellFactor(db: TwoFactorDb): TotpFactor! {
+  let throttle = LoginThrottle(MemoryCounter(10_000))?
+  let secretFor: (string) => Option<Secret> = (userId) => {
+    let (row, found) = db.rows[userId]
+    if (!found) {
+      return Option<Secret>.None
+    }
+    let secret = parseSecret(row.secretBase32) catch _ {
+      return Option<Secret>.None
+    }
+    return Option<Secret>.Some(secret)
+  }
+  let last: (string) => uint! = (userId) => {
+    let (row, found) = db.rows[userId]
+    if (!found) {
+      return 0
+    }
+    return row.lastCounter
+  }
+  // Store `counter` only if it is newer than what is stored, and say whether
+  // it was. In a real database this is one `UPDATE ... WHERE counter < ?`.
+  let advance: (string, uint) => bool! = (userId, counter) => {
+    let (row, found) = db.rows[userId]
+    if (!found || counter <= row.lastCounter) {
+      return false
+    }
+    row.lastCounter = counter
+    return true
+  }
+  return TotpFactor(
+    secretFor,
+    TotpFactorOptions{
+      throttle = Option<LoginThrottle>.Some(throttle),
+      lastCounter = last,
+      advanceCounter = advance,
+    },
+  )?
+}
+```
+
+`advance` has to be one atomic statement. Two requests that carry the same
+code both pass `last`; exactly one of them may win `advance`, and the other is
+a replay. Wrong codes are counted in the throttle under the user's id, apart
+from the password login, so a flood of them locks the second step and not the
+whole account.
+
+Now the two routes. The password step authenticates as it always did, and, for
+a user who has enrolled, holds the session back with `second = true` before
+answering. The code step is one call:
+
+```bit
+@json class CodeForm {
+  code: string,
+}
+
+fn mountLogin(app: App, passwords: Strategy, factor: TotpFactor, db: TwoFactorDb) {
+  let login = app.group("/login")
+  login.post("/", (c) => {
+    let who = passwords.authenticate(c)?
+    let (_, enrolled) = db.rows[who.id]
+    if (!enrolled) {
+      return c.text("welcome")
+    }
+    bindSession(c, who, BindOptions{ second = true })?
+    return c.text("code required")
+  })
+  login.post("/code", (c) => {
+    let form = c.body<CodeForm>()?
+    let who = completeSecondFactor(c, factor, form.code)?
+    return c.text("welcome ${who.id}")
+  })
+  app.get("/me", (c) => c.text(currentIdentity(c)?.id))
+}
+```
+
+Read it from the top. `passwords.authenticate(c)` verifies the password and
+binds a full login, as every `Strategy` does; `bindSession` with
+`BindOptions{ second = true }` then replaces that login with a pending one, in
+the same request, before anything is sent. From then on the session holds the
+user's id under a pending key and nothing under the identity key. `/me` is
+refused, and so is every route behind `requireAuth` or `currentIdentity`, with a
+401 whose body says why:
+
+```text
+{"status":401,"error":"Unauthorized","detail":"second_factor_required"}
+```
+
+A front end switches on `detail` to show the code field instead of the sign-in
+form. `completeSecondFactor` asks the factor whether the code is right. A
+correct code regenerates the session id, so the id the browser held during the
+half login is dead, and moves the identity to a full login. A wrong one fails
+with a plain 401 and leaves the session pending, so the user can type again,
+until the throttle answers 429 or the pending state runs out. That takes
+`pendingTtl` seconds from the password step, 300 unless you say otherwise:
+
+```bit
+fn quickPending(c: Ctx, who: Identity): ()! {
+  bindSession(c, who, BindOptions{ second = true, pendingTtl = 120 })?
+}
+```
+
+The countdown starts at the password, not at the last wrong code, so retries
+do not extend it. A user who walks away is signed out of the half login after
+that, not left one code short of an account for the session's full day. A
+session that is not pending, or whose pending state ran out, gets the same plain
+401 from `completeSecondFactor`: nothing says which, so a stranger learns nothing.
+
+Handlers must pass the error on. `currentIdentity(c)?` keeps the code in the
+401. The `catch _ { fail unauthorized() }` pattern from [Getting
+started](getting-started.md) throws it away and the front end sees a plain
+sign-in prompt where it should see a code prompt.
+
+## A second factor of your own
+
+TOTP is one `SecondFactor`. Anything with a name and a `verify` that answers
+`true` for a right proof and `false` for a wrong one is another: a code sent by
+e-mail, a hardware key. Such a factor does not throttle itself, so hand
+`completeSecondFactor` the throttle through `CompleteOptions`:
+
+```bit
+// A code your app mailed to the user and remembers.
+class EmailedCode {
+  sent: map<string, string>
+
+  export name(): string {
+    return "email"
+  }
+
+  export verify(c: Ctx, userId: string, input: string): bool! {
+    let (want, found) = this.sent[userId]
+    if (!found) {
+      return false
+    }
+    return ctEq([]byte(want), []byte(input))
+  }
+}
+
+fn emailFactor(sent: map<string, string>): SecondFactor {
+  return EmailedCode{ sent = sent }
+}
+
+fn completeWithEmail(
+  c: Ctx,
+  factor: SecondFactor,
+  throttle: LoginThrottle,
+  input: string,
+): Identity! {
+  let opts = CompleteOptions{ throttle = Option<LoginThrottle>.Some(throttle) }
+  return completeSecondFactor(c, factor, input, opts)?
+}
+```
+
+Leave `throttle` empty for a `TotpFactor`, which already counts its attempts;
+passing it too counts each failure twice at the address. A failed `verify`
+call, as opposed to a `false`, refuses the login: the factor could not decide,
+and the answer is never a yes.
 
 ## When the phone is lost: recovery codes
 
@@ -281,6 +469,14 @@ a user's phone.
 - **Pass a throttle to `redeemRecoveryCode`.** Each guess already costs a
   password hash, but nothing stops a client making guesses all day unless the
   throttle does.
+- **Hold the half login with `bindSession(..., second = true)`, never with a
+  session key of your own.** Every reader of the identity looks at one key; a
+  second one is a route that forgot to look.
+- **Mount a password `Strategy` on the login route only.** A strategy that
+  authenticates on any route it guards would turn a password into a full login
+  there, and the second factor would be optional.
+- **Make `advanceCounter` atomic.** A read followed by a write lets two
+  requests with the same code both succeed.
 - **Clock skew is a security/usability tradeoff.** `skew = 1` (one step
   either side, 30 seconds) covers ordinary drift; a much larger skew widens
   the window an intercepted code stays valid in.
