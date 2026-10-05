@@ -1,0 +1,513 @@
+// pkg/mail/sendgrid.test.bit — the `sendgrid://` transport against the in-test
+// HTTPS server resend.test.bit starts (`rsStart`: a `std/tls` listener
+// answering HTTP/1.1 from a script), pinned with a non-default host and
+// `insecureSkipVerify=true`. No test reaches the network.
+//
+// What the server saw is the whole request text, so a test reads the request
+// line, the headers and the exact JSON body. Every error a test provokes goes
+// through `sgClean`, which fails when its text holds the API key.
+
+import { repeat } from "std/strings"
+import { Millisecond, Second } from "std/time"
+
+const sgKey: string = "SG.test-key-7d2"
+
+// The body a full message must produce: every field SendGrid takes, in the order
+// sendgridbody.bit writes them, field for field.
+const sgFullBody: string = "{\"personalizations\":[{\"to\":[{\"email\":\"sara@example.com\",\"name\":\"Sara Ali\"}],\"cc\":[{\"email\":\"lee@example.com\"}],\"bcc\":[{\"email\":\"audit@example.com\"}],\"custom_args\":{\"campaign\":\"welcome\",\"user\":\"7\"}}],\"from\":{\"email\":\"hello@inkwell.dev\",\"name\":\"Inkwell\"},\"reply_to_list\":[{\"email\":\"support@inkwell.dev\"}],\"subject\":\"Welcome to Inkwell\",\"content\":[{\"type\":\"text/plain\",\"value\":\"Hello Sara.\"},{\"type\":\"text/html\",\"value\":\"<p>Hello <img src=\\\"cid:logo\\\"></p>\"}],\"attachments\":[{\"content\":\"AQID\",\"type\":\"image/png\",\"filename\":\"logo.png\",\"disposition\":\"inline\",\"content_id\":\"logo\"},{\"content\":\"UERG\",\"type\":\"application/pdf\",\"filename\":\"invoice.pdf\",\"disposition\":\"attachment\"}],\"headers\":{\"Auto-Submitted\":\"auto-generated\",\"In-Reply-To\":\"<thread-1@inkwell.dev>\",\"References\":\"<thread-1@inkwell.dev>\",\"X-Run\":\"7\"},\"categories\":[\"welcome\",\"onboarding\"]}"
+
+fn sgAccepted(): string {
+  return rsReply(202, "X-Message-Id: filterdrecv-5f8-xyz-0\r\n", "")
+}
+
+// A SendGrid error answer: `status` with `{"errors": [{"message", "field"}]}`.
+fn sgError(status: int, extra: string, errors: string): string {
+  return rsReply(status, extra, "{\"errors\":[${errors}]}")
+}
+
+fn sgUrl(port: int): string {
+  return "sendgrid://${sgKey}@127.0.0.1:${port}?insecureSkipVerify=true"
+}
+
+fn sgMsg(): Message {
+  return Message{
+    to = ["Sara Ali <sara@example.com>"],
+    subject = "Welcome to Inkwell",
+    text = "Hello Sara.",
+    id = "welcome-1",
+  }
+}
+
+fn sgFull(): Message {
+  return Message{
+    to = ["Sara Ali <sara@example.com>"],
+    cc = ["lee@example.com"],
+    bcc = ["audit@example.com"],
+    replyTo = ["support@inkwell.dev"],
+    subject = "Welcome to Inkwell",
+    text = "Hello Sara.",
+    html = "<p>Hello <img src=\"cid:logo\"></p>",
+    attachments = [
+      Attachment{ name = "logo.png", data = [u8(1), u8(2), u8(3)], cid = "logo" },
+      Attachment{ name = "invoice.pdf", data = []byte("PDF") },
+    ],
+    headers = { "X-Run": "7" },
+    tags = { "user": "7", "campaign": "welcome", "category": "welcome, onboarding" },
+    inReplyTo = "<thread-1@inkwell.dev>",
+    id = "welcome-1",
+  }
+}
+
+fn sgClean(e: MailError) {
+  assert(!contains(e.message(), sgKey), "an error repeated the API key: ${e.message()}")
+}
+
+// What one send came to: the request the server saw, and either the receipt or
+// the error.
+class SgRun {
+  seen: string,
+  receipt: Receipt,
+  err: Option<MailError>,
+}
+
+// Sends `m` to a server that answers `reply` once.
+fn sgSend(reply: string, m: Message): SgRun {
+  let (port, log) = rsStart([reply]) catch e {
+    panic("fake: ${e.message()}")
+  }
+  let mailer = open(sgUrl(port), rsOpts()) catch e {
+    panic("open: ${e.message()}")
+  }
+  defer mailer.close()
+  let run = SgRun{ seen = "", receipt = Receipt{}, err = Option<MailError>.None }
+  let r = mailer.send(m) catch e {
+    run.err = Option<MailError>.Some(e)
+    run.seen = <- log
+    return run
+  }
+  run.receipt = r
+  run.seen = <- log
+  return run
+}
+
+// The error a send fails with; panics when it succeeds.
+fn sgFail(reply: string): MailError {
+  match (sgSend(reply, sgMsg()).err) {
+    Some(e) => {
+      sgClean(e)
+      return e
+    }
+    None => panic("the send succeeded against a server scripted to refuse")
+  }
+}
+
+test "a full message is posted as the exact JSON SendGrid documents, text/plain before text/html" {
+  let run = sgSend(sgAccepted(), sgFull())
+  assert(isNone(run.err), "the send failed")
+  let seen = run.seen
+  assert(hasPrefix(seen, "POST /v3/mail/send HTTP/1.1\r\n"), "request line: ${seen}")
+  assert(contains(seen, "Authorization: Bearer ${sgKey}\r\n"), "no Bearer key: ${seen}")
+  assert(contains(seen, "Content-Type: application/json\r\n"), "no content type: ${seen}")
+  assert(rsBody(seen) == sgFullBody, "body:\n${rsBody(seen)}\nwant:\n${sgFullBody}")
+  let receipt = run.receipt
+  assert(receipt.providerId == "filterdrecv-5f8-xyz-0", "providerId: ${receipt.providerId}")
+  assert(receipt.id == "<welcome-1@inkwell.dev>", "id: ${receipt.id}")
+  assert(len(receipt.accepted) == 3, "accepted: ${join(receipt.accepted, ",")}")
+}
+
+test "Options fill From and Reply-To, and HTML alone gets its text/plain part first" {
+  let (port, log) = rsStart([sgAccepted()]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let opts = rsOpts()
+  opts.replyTo = "Help <help@inkwell.dev>"
+  let mailer = open(sgUrl(port), opts) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  let m = Message{ to = ["sara@example.com"], subject = "Hi", html = "<p>Hello</p>" }
+  mailer.send(m) catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let body = rsBody(<- log)
+  assert(contains(body, "\"from\":{\"email\":\"hello@inkwell.dev\",\"name\":\"Inkwell\"}"), body)
+  assert(
+    contains(body, "\"reply_to_list\":[{\"email\":\"help@inkwell.dev\",\"name\":\"Help\"}]"),
+    body,
+  )
+  assert(
+    contains(
+      body,
+      "\"content\":[{\"type\":\"text/plain\",\"value\":\"Hello\"},{\"type\":\"text/html\"",
+    ),
+    body,
+  )
+  assert(
+      !contains(body, "\"cc\"") &&
+      !contains(body, "\"custom_args\"") &&
+      !contains(body, "\"categories\""),
+    body,
+  )
+}
+
+test "@default and @eu name the global and the EU host, and the request goes to /v3/mail/send" {
+  let a = parseSendgrid("sendgrid://${sgKey}@default") catch e {
+    assert(false, "default: ${e.message()}")
+    return
+  }
+  assert(
+    SendgridTransport(a, rsOpts()).endpoint() == "https://api.sendgrid.com/v3/mail/send",
+    a.base,
+  )
+  let b = parseSendgrid("SENDGRID://${sgKey}@eu") catch e {
+    assert(false, "eu: ${e.message()}")
+    return
+  }
+  let t = SendgridTransport(b, rsOpts())
+  assert(t.endpoint() == "https://api.eu.sendgrid.com/v3/mail/send", t.endpoint())
+  assert(t.toString() == "sendgrid://***@api.eu.sendgrid.com", t.toString())
+  assert(!b.insecure, "the EU host must be verified")
+}
+
+test "202 is a Receipt whose providerId is X-Message-Id, found in any case" {
+  let run = sgSend(rsReply(202, "x-message-id: abc.def\r\n", ""), sgMsg())
+  assert(isNone(run.err), "the send failed")
+  assert(run.receipt.providerId == "abc.def", "providerId: ${run.receipt.providerId}")
+}
+
+// A transport whose clock reads `at` seconds after the epoch.
+fn sgAt(port: int, at: int): Mailer {
+  let target = parseSendgrid(sgUrl(port)) catch e {
+    panic("parse: ${e.message()}")
+  }
+  let t = SendgridTransport(target, rsOpts())
+  t.clock = () => at * Second
+  return Mailer(t, rsOpts()) catch e {
+    panic("mailer: ${e.message()}")
+  }
+}
+
+test "429 with X-RateLimit-Reset 3 seconds ahead is Transient with retryAfter of 3 seconds" {
+  let (port, _) = rsStart(
+    [
+      sgError(
+        429,
+        "X-RateLimit-Reset: 1003\r\n",
+        "{\"field\":null,\"message\":\"too many requests\"}",
+      ),
+    ],
+  ) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  sgAt(port, 1000).send(sgMsg()) catch e {
+    sgClean(e)
+    match (e) {
+      Transient(r) => {
+        assert(r.code == 429 && r.retryAfter == 3 * Second, r.toString())
+        assert(r.text == "too many requests", r.text)
+      }
+      _ => assert(false, "want Transient, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "a 429 was accepted")
+}
+
+test "a reset in the past, missing or a day away gives no retryAfter" {
+  assert(sgRetryAfter("X-RateLimit-Reset: 999\r\n", 1000 * Second) == 0, "past")
+  assert(sgRetryAfter("X-RateLimit-Reset: 1000\r\n", 1000 * Second) == 0, "now")
+  assert(sgRetryAfter("", 1000 * Second) == 0, "missing")
+  assert(sgRetryAfter("X-RateLimit-Reset: soon\r\n", 1000 * Second) == 0, "unreadable")
+  assert(sgRetryAfter("X-RateLimit-Reset: 1000000\r\n", 1000 * Second) == 0, "far away")
+  assert(sgRetryAfter("X-RateLimit-Reset: 1090\r\n", 1000 * Second) == 90 * Second, "90 s")
+}
+
+test "400 is Rejected with every error message joined" {
+  let e = sgFail(
+    sgError(
+      400,
+      "",
+      "{\"message\":\"The subject is required.\",\"field\":\"subject\"},{\"message\":\"Invalid content.\",\"field\":null}",
+    ),
+  )
+  match (e) {
+    Rejected(r) => {
+      assert(r.code == 400 && r.enhanced == "", r.toString())
+      assert(r.text == "The subject is required.; Invalid content.", r.text)
+    }
+    _ => assert(false, "want Rejected, got ${e.message()}")
+  }
+}
+
+test "413 and 404 are Rejected" {
+  let a = sgFail(sgError(413, "", "{\"message\":\"Payload too large\",\"field\":null}"))
+  match (a) {
+    Rejected(r) => assert(r.code == 413 && r.text == "Payload too large", r.toString())
+    _ => assert(false, "want Rejected, got ${a.message()}")
+  }
+  let b = sgFail(rsReply(404, "", "not found"))
+  match (b) {
+    Rejected(r) => assert(r.code == 404 && r.text == "HTTP 404", r.toString())
+    _ => assert(false, "want Rejected, got ${b.message()}")
+  }
+}
+
+test "401 and 403 are Auth, but a 403 about the from field is Rejected" {
+  let a = sgFail(
+    sgError(
+      401,
+      "",
+      "{\"message\":\"The provided authorization grant is invalid\",\"field\":null}",
+    ),
+  )
+  match (a) {
+    Auth(r) => assert(r.code == 401, r.toString())
+    _ => assert(false, "want Auth, got ${a.message()}")
+  }
+  let b = sgFail(sgError(403, "", "{\"message\":\"access forbidden\",\"field\":null}"))
+  match (b) {
+    Auth(r) => assert(r.code == 403 && r.text == "access forbidden", r.toString())
+    _ => assert(false, "want Auth, got ${b.message()}")
+  }
+  let c = sgFail(
+    sgError(
+      403,
+      "",
+      "{\"message\":\"The from address does not match a verified Sender Identity.\",\"field\":\"from\"}",
+    ),
+  )
+  match (c) {
+    Rejected(r) => assert(contains(r.text, "verified Sender Identity"), r.toString())
+    _ => assert(false, "want Rejected, got ${c.message()}")
+  }
+}
+
+test "500 and 503 are Transient, a body that is not JSON still maps by status" {
+  let a = sgFail(sgError(500, "", "{\"message\":\"oops\",\"field\":null}"))
+  match (a) {
+    Transient(r) => assert(r.code == 500 && r.retryAfter == 0, r.toString())
+    _ => assert(false, "want Transient, got ${a.message()}")
+  }
+  let b = sgFail(rsReply(503, "", "<html>unavailable</html>"))
+  match (b) {
+    Transient(r) => assert(r.code == 503 && r.text == "HTTP 503", r.toString())
+    _ => assert(false, "want Transient, got ${b.message()}")
+  }
+}
+
+test "a server that echoes the key in its message does not leak it" {
+  let e = sgFail(sgError(400, "", "{\"message\":\"bad key ${sgKey} here\",\"field\":null}"))
+  match (e) {
+    Rejected(r) => assert(contains(r.text, "bad key *** here"), r.text)
+    _ => assert(false, "want Rejected, got ${e.message()}")
+  }
+}
+
+// A send that must fail before any request: nothing listens on the port, so a
+// send that tried would be Transient.
+fn sgInvalid(m: Message, want: string) {
+  let mailer = open("sendgrid://${sgKey}@127.0.0.1:1?insecureSkipVerify=true", rsOpts()) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  mailer.send(m) catch e {
+    match (e) {
+      Invalid(why) => assert(contains(why, want), "wanted '${want}' in: ${why}")
+      _ => assert(false, "want Invalid, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "a message with ${want} was accepted")
+}
+
+test "what SendGrid would refuse is Invalid before any request" {
+  let many: []string = []
+  let i = 0
+  while (i < 1001) {
+    many = append(many, "u${i}@example.com")
+    i = i + 1
+  }
+  let a = sgMsg()
+  a.to = many
+  sgInvalid(a, "1001 recipients")
+  let b = sgMsg()
+  b.to = []
+  b.bcc = ["audit@example.com"]
+  sgInvalid(b, "at least one to recipient")
+  let c = sgMsg()
+  c.tags = { "category": "a,,b" }
+  sgInvalid(c, "separated by commas")
+  let d = sgMsg()
+  d.tags = { "category": repeat("x", 256) }
+  sgInvalid(d, "1 to 255 characters")
+  let e = sgMsg()
+  e.tags = { "category": "a, b, a" }
+  sgInvalid(e, "given twice")
+  let f = sgMsg()
+  f.tags = { "category": "1,2,3,4,5,6,7,8,9,10,11" }
+  sgInvalid(f, "11 categories")
+  let g = sgMsg()
+  g.tags = { "k": repeat("v", 10000) }
+  sgInvalid(g, "10000 bytes of custom_args")
+  let h = sgMsg()
+  h.headers = { "Received": "from nowhere" }
+  sgInvalid(h, "does not let a request set the Received header")
+}
+
+test "an unreachable host is Transient" {
+  let mailer = open("sendgrid://${sgKey}@127.0.0.1:1?insecureSkipVerify=true", rsOpts()) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  mailer.send(sgMsg()) catch e {
+    sgClean(e)
+    match (e) {
+      Transient(_) => return
+      _ => assert(false, "want Transient, got ${e.message()}")
+    }
+  }
+  assert(false, "a send to a closed port succeeded")
+}
+
+test "a certificate that does not verify is Rejected and sends nothing" {
+  let (port, log) = rsStart([sgAccepted()]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let mailer = open("sendgrid://${sgKey}@127.0.0.1:${port}", rsOpts()) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  mailer.send(sgMsg()) catch e {
+    sgClean(e)
+    match (e) {
+      Rejected(r) => assert(r.code == 0 && hasPrefix(r.text, "sendgrid: "), r.toString())
+      _ => assert(false, "want Rejected, got ${e.message()}")
+    }
+    let seen = <- log
+    assert(!contains(seen, "POST /v3/mail/send"), "the request was sent anyway: ${seen}")
+    return
+  }
+  assert(false, "an unverifiable certificate was accepted")
+}
+
+// Retries as the 5xx test below: three tries, a millisecond apart.
+fn sgRetryOpts(): Options {
+  let opts = rsOpts()
+  opts.retry = Retry{ attempts = 3, base = Millisecond, max = 5 * Millisecond }
+  return opts
+}
+
+test "a request cut off after it was written is Unknown and is not retried" {
+  // The first connection reads the whole request and hangs up without an answer;
+  // a retry would reach the second reply and succeed.
+  let (port, log) = rsStart(["", sgAccepted()]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let mailer = open(sgUrl(port), sgRetryOpts()) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  defer mailer.close()
+  mailer.send(sgMsg()) catch e {
+    sgClean(e)
+    match (e) {
+      Unknown(r) => {
+        assert(r.code == 0 && contains(r.text, "sendgrid:"), r.toString())
+        assert(contains(e.message(), "may have been delivered"), e.message())
+      }
+      _ => assert(false, "want Unknown, got ${e.message()}")
+    }
+    let seen = <- log
+    assert(hasPrefix(seen, "POST /v3/mail/send HTTP/1.1\r\n"), "the fake saw: ${seen}")
+    return
+  }
+  assert(false, "a send the server never answered succeeded")
+}
+
+test "a 5xx is retried with the same body, a SendGrid acceptance ends the retries" {
+  let (port, log) = rsStart(
+    [sgError(503, "", "{\"message\":\"offline\",\"field\":null}"), sgAccepted()],
+  ) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let mailer = open(sgUrl(port), sgRetryOpts()) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  let r = mailer.send(sgMsg()) catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let first = <- log
+  let second = <- log
+  assert(rsBody(first) == rsBody(second), "the retry sent a different body")
+  assert(r.providerId != "", "no providerId after the retry")
+}
+
+fn sgRefused(url: string, want: string) {
+  open(url) catch e {
+    match (e) {
+      Config(why) => {
+        assert(contains(why, want), "wanted '${want}' in: ${why}")
+        assert(!contains(e.message(), sgKey), "the error repeated the key: ${e.message()}")
+      }
+      _ => assert(false, "want Config, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "${url} opened")
+}
+
+test "the real hosts open and every URL mistake fails at open" {
+  open("sendgrid://${sgKey}@default") catch e {
+    assert(false, "default: ${e.message()}")
+    return
+  }
+  open("sendgrid://${sgKey}@eu") catch e {
+    assert(false, "eu: ${e.message()}")
+    return
+  }
+  open("sendgrid://${sgKey}@proxy.internal:8443?insecureSkipVerify=false") catch e {
+    assert(false, "proxy: ${e.message()}")
+    return
+  }
+  sgRefused("sendgrid://eu", "no API key")
+  sgRefused("sendgrid://@default", "API key is empty")
+  sgRefused("sendgrid://${sgKey}:pw@default", "no password")
+  sgRefused("sendgrid://${sgKey}@", "names no host")
+  sgRefused("sendgrid://${sgKey}@default:443", "takes no port")
+  sgRefused("sendgrid://${sgKey}@eu:443", "`eu` is api.eu.sendgrid.com and takes no port")
+  sgRefused(
+    "sendgrid://${sgKey}@default?insecureSkipVerify=true",
+    "real api.sendgrid.com is always verified",
+  )
+  sgRefused(
+    "sendgrid://${sgKey}@eu?insecureSkipVerify=true",
+    "real api.eu.sendgrid.com is always verified",
+  )
+  sgRefused(
+    "sendgrid://${sgKey}@proxy.internal?stream=a",
+    "the only query parameter is insecureSkipVerify",
+  )
+  sgRefused("sendgrid://${sgKey}@proxy.internal/v3", "host is a name")
+  sgRefused("sendgrid://%0d%0a@default", "control byte")
+}
+
+test "Options.dkim is refused at open: SendGrid signs with its own key" {
+  let opts = rsOpts()
+  opts.dkim = [dwRsa()]
+  open("sendgrid://${sgKey}@default", opts) catch e {
+    match (e) {
+      Config(why) => assert(contains(why, "builds it itself and signs with its own DKIM key"), why)
+      _ => assert(false, "want Config, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "Options.dkim was accepted by a transport that cannot carry the signature")
+}
