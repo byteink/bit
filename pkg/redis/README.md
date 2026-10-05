@@ -6,12 +6,12 @@ not know `HELLO`.
 
 ## Install
 
-`bit add bitlang.org/pkg/redis@^0.3.0` writes:
+`bit add bitlang.org/pkg/redis@^0.4.0` writes:
 
 ```json
 {
   "dependencies": {
-    "redis": "bitlang.org/pkg/redis@^0.3.0"
+    "redis": "bitlang.org/pkg/redis@^0.4.0"
   }
 }
 ```

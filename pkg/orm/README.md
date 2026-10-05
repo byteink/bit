@@ -9,12 +9,12 @@ checked against the class at compile time.
 
 ## Install
 
-`bit add bitlang.org/pkg/orm@v0.3.0` writes:
+`bit add bitlang.org/pkg/orm@v0.4.0` writes:
 
 ```json
 {
   "dependencies": {
-    "orm": "bitlang.org/pkg/orm@v0.3.0"
+    "orm": "bitlang.org/pkg/orm@v0.4.0"
   }
 }
 ```
