@@ -22,7 +22,7 @@ Both go on the same `Queue` as `register`, before `run`:
 ```bit
 import { pool, Pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { PostgresStore, migrate, open, Options, Missed, Queue } from "jobs"
+import { SqlStore, migrate, open, Options, Missed, Queue } from "jobs"
 import { Json } from "std/json"
 import { Minute } from "std/time"
 
@@ -37,7 +37,7 @@ import { Minute } from "std/time"
 fn main(): ()! {
   let db = pool(adapter(), Datasource{ uri = "postgres://localhost/inkwell" })?
   migrate(db)?
-  let q = open(PostgresStore(db), Options{ workers = 4 })?
+  let q = open(SqlStore(db)?, Options{ workers = 4 })?
   q.register<NightlyDigest>((job: NightlyDigest) => {
     sendDigest(job.list)?
   })?
@@ -242,16 +242,16 @@ at the first tick after now.
 ## The real use case: three copies of the app
 
 With three instances, all three reach 02:00 together. Give each a `Locker`
-and only one of them enqueues the tick. `PostgresLocker` keeps a lease row
+and only one of them enqueues the tick. `SqlLocker` keeps a lease row
 per tick in the same database as the queue (`migrate` creates its table):
 
 ```bit
-import { PostgresLocker } from "jobs"
+import { SqlLocker } from "jobs"
 
 fn openOnEveryInstance(db: Pool, instance: string): Queue! {
   let q = open(
-    PostgresStore(db),
-    Options{ workers = 4, locker = PostgresLocker(db), instanceId = instance },
+    SqlStore(db)?,
+    Options{ workers = 4, locker = SqlLocker(db)?, instanceId = instance },
   )?
   q.schedule("0 2 * * *", NightlyDigest{ list = "readers" }, tz = "America/New_York")?
   return q
@@ -274,8 +274,8 @@ lease rows another instance still races for. With `keep = 200`, this fails when
 the schedule is registered:
 
 ```bit
-fn smallLeaseWindow(db: Pool): Locker {
-  return PostgresLocker(db, keep = 200)
+fn smallLeaseWindow(db: Pool): Locker! {
+  return SqlLocker(db, keep = 200)?
 }
 
 fn ledgerTooWide(q: Queue) {
@@ -286,7 +286,7 @@ fn ledgerTooWide(q: Queue) {
 ```
 
 ```text
-jobs: Missed.RunAll(500) exceeds the locker's lease window of 200; raise PostgresLocker(keep = ...)
+jobs: Missed.RunAll(500) exceeds the locker's lease window of 200; raise SqlLocker(db, keep = ...)
 ```
 
 A lease is stamped with the clock of the instance that takes it, so one
@@ -294,10 +294,10 @@ instance with a wrong clock could take the leases of ticks that are years away,
 enqueue those jobs now, and leave rows that block every correct instance when
 the real time reaches them. The scheduler therefore asks the `Locker` for the
 database's own clock, `serverNowNs()`, at most once a minute, and compares it
-with its own. `PostgresLocker` reads `clock_timestamp()`, the actual current
+with its own. `SqlLocker` reads `clock_timestamp()` on PostgreSQL, the actual current
 time, and not `now()`, which PostgreSQL defines as the start of the current
 transaction ([Date/Time Functions](https://www.postgresql.org/docs/current/functions-datetime.html),
-section 9.9.5). When the two differ by more than 30 seconds, that instance
+section 9.9.5); on MySQL it reads `UTC_TIMESTAMP(6)`. When the two differ by more than 30 seconds, that instance
 fires no scheduled tick until they agree, and says so once:
 
 ```text
@@ -389,14 +389,14 @@ message, for what would otherwise misbehave hours later:
 ```text
 jobs: Options.pollInterval must be positive, got 0
 jobs: Options.visibilityTimeout must be positive, got -1
-jobs: the locker keeps 0 lease row(s) per schedule; it must keep at least 1 (PostgresLocker(keep = ...))
+jobs: the locker keeps 0 lease row(s) per schedule; it must keep at least 1 (SqlLocker(db, keep = ...))
 jobs: Missed.RunAll cap must be at least 1, got 0
-jobs: Missed.RunAll(500) exceeds the locker's lease window of 200; raise PostgresLocker(keep = ...)
+jobs: Missed.RunAll(500) exceeds the locker's lease window of 200; raise SqlLocker(db, keep = ...)
 jobs: schedule 'nightly-digest|0 2 * * *|UTC' registered after start(); register schedules before start() or run()
 ```
 
 A zero `pollInterval` would spin the workers and the scheduler; a locker that
-keeps no lease rows (`PostgresLocker(db, keep = 0)`) would forget every tick
+keeps no lease rows (`SqlLocker(db, keep = 0)`) would forget every tick
 it wins, so `open` refuses it instead of quietly keeping one; a `RunAll` cap
 below 1 would drop ticks that are on time; a schedule registered after
 `start()` or `run()` would never be seen by the scheduler already running.
@@ -408,7 +408,7 @@ Register every schedule right after `open`, before either call.
   the two would share a lease and fire twice.
 - A scheduled job is an ordinary job, delivered at least once. A handler
   that runs the same tick twice must produce the same result, as described
-  in [PostgreSQL](postgres.md).
+  in [PostgreSQL and MySQL](sql.md).
 - `every` takes nanoseconds, like `enqueue`'s `delay`; `15 * Minute` is the
   readable form. A period of zero or less fails.
 - `L`, `W` and `#` (last day of month, nearest weekday, nth weekday) are
@@ -423,5 +423,5 @@ once per deploy rather than once per tick, use a migration.
 
 ## Next
 
-[PostgreSQL](postgres.md) covers the store and the lease table behind
-`PostgresLocker`, and why handlers must be idempotent.
+[PostgreSQL and MySQL](sql.md) covers the store and the lease table behind
+`SqlLocker`, and why handlers must be idempotent.

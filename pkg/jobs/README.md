@@ -1,7 +1,7 @@
 # bitlang.org/pkg/jobs
 
 Background jobs: a worker pool, retries with exponential backoff and full
-jitter, a dead-letter list, and a `PostgresStore`. No default queue
+jitter, a dead-letter list, and a `SqlStore` for PostgreSQL and MySQL 8. No default queue
 backend, the same call as pkg/web's session and rate-limit stores: an
 in-memory queue silently loses every pending job on deploy.
 
@@ -10,7 +10,7 @@ in-memory queue silently loses every pending job on deploy.
 ```bit
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { PostgresStore, migrate, open, Options } from "jobs"
+import { SqlStore, migrate, open, Options } from "jobs"
 import { Json } from "std/json"
 
 @job("send-welcome") @json class SendWelcome {
@@ -20,7 +20,7 @@ import { Json } from "std/json"
 fn main(): ()! {
   let db = pool(adapter(), Datasource{ uri = "postgres://localhost/myapp" })?
   migrate(db)?
-  let store = PostgresStore(db)
+  let store = SqlStore(db)?
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?
@@ -50,6 +50,6 @@ it to route the job to the right handler.
 - [Scheduled jobs](docs/cron.md): `schedule` and `every`, cron
   expressions and zones, missed-tick policies, leader election so three
   instances enqueue each tick once.
-- [PostgreSQL](docs/postgres.md): `PostgresStore`, running the migration,
-  writing your own `Store`, at-least-once delivery and idempotent
-  handlers.
+- [PostgreSQL and MySQL](docs/sql.md): `SqlStore`, the dialect the pool's
+  server picks, running the migration, writing your own `Store`,
+  at-least-once delivery and idempotent handlers.

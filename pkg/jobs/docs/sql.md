@@ -1,43 +1,74 @@
-# PostgreSQL
+# PostgreSQL and MySQL
 
 <!-- doctest: per-block -->
-<!-- doctest: deps postgres -->
+<!-- doctest: deps postgres mysql -->
 
 [Getting started](getting-started.md) enqueues and runs jobs against a
 `store` without saying what one is. There is no default: an in-memory
 queue silently loses every pending job on deploy and behaves differently
-on one instance than on three, so you always pick one. `PostgresStore` is
-the one this package ships.
+on one instance than on three, so you always pick one. `SqlStore` is
+the one this package ships, and it runs on PostgreSQL and on MySQL 8.0.1 or
+newer.
 
 ## The simplest thing that works
 
-`PostgresStore` takes a `std/sql.Pool` - the same one you would use for
-anything else in your app - and needs one table, created by
-`migrate` before the first `open`:
+`SqlStore` takes a `std/sql.Pool` - the same one you would use for
+anything else in your app - and needs two tables, created by
+`migrate` before the first `open`. The pool decides the database: build it
+with `postgres`'s adapter and you are on PostgreSQL, with `mysql`'s and you
+are on MySQL. Nothing else in your code changes:
 
 ```bit
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { PostgresStore, migrate, open, Options } from "jobs"
+import { SqlStore, migrate, open, Options } from "jobs"
 
 fn main(): ()! {
   let db = pool(adapter(), Datasource{ uri = "postgres://localhost/myapp" })?
   migrate(db)?
-  let store = PostgresStore(db)
+  let store = SqlStore(db)?
   let q = open(store, Options{ workers = 4 })?
   q.run()?
   return
 }
 ```
 
-`migrate` runs `migrationStatements()` - a plain `[]string`, one entry per
-statement, in order:
+The same program on MySQL changes the adapter and the URL:
 
 ```bit
-import { migrationStatements } from "jobs"
+import { pool, Datasource } from "std/sql"
+import { adapter } from "mysql"
+import { SqlStore, migrate, open, Options } from "jobs"
 
-fn printMigration() {
-  for stmt of migrationStatements() {
+fn main(): ()! {
+  let db = pool(adapter(), Datasource{ uri = "mysql://app:secret@localhost/myapp" })?
+  migrate(db)?
+  let store = SqlStore(db)?
+  let q = open(store, Options{ workers = 4 })?
+  q.run()?
+  return
+}
+```
+
+`SqlStore(db)` asks the server what it is with one `SELECT version()` and keeps
+the answer, so the store always speaks the dialect of the server it is
+connected to. That is also where a server this package cannot serve is
+refused, with the reason, instead of failing on the first claim under load:
+
+```text
+jobs: MySQL 5.7.44 is too old for SqlStore: claiming jobs needs SELECT ... FOR UPDATE SKIP LOCKED, which MySQL has had since 8.0.1
+jobs: SqlStore does not support MariaDB (the server reported '10.11.2-MariaDB'); use PostgreSQL or MySQL 8.0.1 or newer
+```
+
+`migrate` runs `migrationStatements(dialect)` - a plain `[]string`, one entry
+per statement, in order - for the dialect the server reported. The `Dialect`
+enum names the two, `Dialect.Postgres` and `Dialect.MySql`:
+
+```bit
+import { migrationStatements, Dialect } from "jobs"
+
+fn printMigration(dialect: Dialect) {
+  for stmt of migrationStatements(dialect) {
     println(stmt)
     println(";")
   }
@@ -45,20 +76,35 @@ fn printMigration() {
 ```
 
 If your app has its own migration tool, run those same statements through
-it instead of calling `migrate` - `migrationStatements()` is exposed
-exactly so you are not stuck writing the table definition by hand.
-The statements also create `bit_schedule_leases`, the table `PostgresLocker`
+it instead of calling `migrate` - `migrationStatements` is exposed
+exactly so you are not stuck writing the table definitions by hand.
+The statements also create `bit_schedule_leases`, the table `SqlLocker`
 (see [Cron](cron.md)) keeps its per-tick leases in. Its `seq` column numbers
 the leases in the order they were won, and that order, not the tick value and
 not the expiry, decides which old rows are dropped: both of those come from
 the clock of the instance that wrote the row, and one instance with a clock
 years ahead must not be able to push a correct instance's lease out of the
 table.
-`PostgresStore.claim` uses `SELECT ... FOR UPDATE SKIP LOCKED`, so several
-workers - even across several instances of your app - can poll the same
-table at once and never claim the same row twice, and a worker that
-crashes mid-job loses its claim automatically once its visibility timeout
-elapses, letting another worker pick the job back up.
+
+## How a claim works on each engine
+
+Both engines use `SELECT ... FOR UPDATE SKIP LOCKED`, so several workers -
+even across several instances of your app - can poll the same table at once and
+never claim the same row twice, and a worker that crashes mid-job loses its
+claim automatically once its visibility timeout elapses, letting another
+worker pick the job back up.
+
+What differs is the number of round trips. PostgreSQL claims in one statement,
+an `UPDATE` over the `SKIP LOCKED` subquery that returns the claimed row with
+`RETURNING`. MySQL has no `RETURNING`, so it claims in one transaction: the
+`SELECT ... FOR UPDATE SKIP LOCKED`, then an `UPDATE` of that row by id. The
+transaction runs at READ COMMITTED, so the scan locks the row it takes and no
+gap, and a worker enqueueing a job never waits for a claim.
+
+The two engines also disagree about case. MySQL's default collation compares
+text without regard to case, which would make the schedule leases `Report@1`
+and `report@1` the same row, so the MySQL lease table declares its keys
+`utf8mb4_bin`. If you run the statements yourself, keep that.
 
 ## Writing your own store
 
