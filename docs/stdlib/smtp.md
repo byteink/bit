@@ -937,6 +937,9 @@ reply (the connection broke or timed out), after a `421` (the server is closing
 the channel), or after the reply to the payload, which ends the transaction
 whatever it says: a `451` there leaves the session ready for the next `send`.
 
+Whether the `RSET` was answered is not lost: [`reusable`](#clientreusable-bool)
+reports it.
+
 ### `Delivery`
 
 What `send` did with the recipients of one message. It is returned only when at
@@ -962,6 +965,35 @@ transaction in progress, so the next `send` starts clean. After a successful
 `send` nothing needs resetting, and a refused `MAIL FROM` or `DATA` already
 resets by itself; this is for a caller that abandoned a transaction on its own
 account. `ehlo` must have run, as for `send`.
+
+### `Client.reusable(): bool`
+
+Whether the session can carry another `send`. It is `true` on a fresh session
+and after any refusal the server cleaned up: a refused `MAIL FROM`, `RCPT TO`
+or `DATA` followed by an `RSET` it answered 250, a `451` at the end of `DATA`,
+and a message `send` refused locally before writing anything. It is `false`
+after a failure with no reply (the connection broke), after a `421`, after a
+timeout, and after a refused transaction whose `RSET` failed or was not
+answered 250, since the server may still hold the abandoned transaction. A
+`false` is final: close the client and dial again.
+
+`send` fails with the refusal that mattered, never with the `RSET`'s, so
+`reusable` is how a failed `RSET` is seen. A pool needs nothing else to decide
+whether to keep a session after a failed message, and does not send an `RSET`
+of its own.
+
+```bit
+import { Client, Message } from "std/smtp"
+
+// Send `m`; keep `c` for the next message only when the server is still in
+// step with us. The caller closes `c` when this reports false.
+fn sendKeeping(c: Client, m: Message): bool {
+  let _ = c.send(m) catch _ {
+    return c.reusable()
+  }
+  return true
+}
+```
 
 ### `Client.noop(): ()!SmtpError`
 
