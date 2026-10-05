@@ -27,4 +27,5 @@ fn main(): ()! {
 
 The [chapters](docs/README.md) start with [Actions](docs/actions.md), then
 [Subjects](docs/subjects.md), then
-[Resources](docs/resources.md).
+[Resources](docs/resources.md), then
+[Relationships](docs/relationships.md).
