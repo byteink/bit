@@ -1,0 +1,505 @@
+// pkg/auth/oauth2.test.bit — #6942's acceptance for `OAuth2Strategy`
+// (oauth2.bit): a full begin -> callback round trip against a fake token
+// endpoint and a fake profile fetch (no network) yields the profile's
+// `Identity` and regenerates the session id; the authorization redirect and
+// the token request carry the RFC 6749 §4.1 / RFC 7636 shapes, S256 only,
+// with the verifier the session holds; both `ClientAuth` values produce the
+// RFC 6749 §2.3.1 request exactly; every callback failure (missing, wrong and
+// replayed `state`, a provider `error`, a wrong or missing `iss`, a
+// non-Bearer `token_type`) is refused before the profile is fetched; the
+// token endpoint's error documents become a typed `OAuth2Error`; and every
+// invalid construction is an `Error`.
+//
+// Routes on a real `App`, the shape `oidc_callback.test.bit` uses, because
+// this package has no `Ctx` constructor of its own. `authReq`, `queryFrom`,
+// `paramOrPanic` (oidc_authorize.test.bit), `split`, `contains`, `hasPrefix`,
+// `tlsStub` (oidc_discovery.test.bit), `authHeaderValue`
+// (oidc_callback.test.bit), `percentEncode`, `encodeBase64`, `Header` are
+// already bound module-wide (an import binds per MODULE, SPEC §17.1).
+
+const o2Authorize = "https://idp.example.com/oauth/authorize"
+const o2Token = "https://idp.example.com/oauth/token"
+const o2Redirect = "https://app.example.com/callback"
+const o2Issuer = "https://idp.example.com"
+
+// What the fakes saw and what they answer: the token endpoint's last request,
+// its canned response, and the access token the profile fetch received.
+class O2Box {
+  calls: int,
+  url: string,
+  body: string,
+  headers: []Header,
+  response: string,
+  profileCalls: int,
+  profileToken: string,
+}
+
+fn o2Box(): O2Box {
+  return O2Box{
+    calls = 0,
+    url = "",
+    body = "",
+    headers = []Header(0),
+    response = "{\"access_token\":\"at-1\",\"token_type\":\"Bearer\"}",
+    profileCalls = 0,
+    profileToken = "",
+  }
+}
+
+fn o2TokenFetch(box: O2Box): TokenFetch {
+  let f: TokenFetch = (url, headers, body) => {
+    box.calls = box.calls + 1
+    box.url = url
+    box.body = body
+    box.headers = headers
+    return box.response
+  }
+  return f
+}
+
+fn o2Profile(box: O2Box): ProfileFetch {
+  let f: ProfileFetch = (token) => {
+    box.profileCalls = box.profileCalls + 1
+    box.profileToken = token
+    return Identity{ id = "octocat", claims = Json.JsonString("The Octocat") }
+  }
+  return f
+}
+
+fn o2Endpoints(box: O2Box): OAuth2Endpoints {
+  return OAuth2Endpoints{ authorize = o2Authorize, token = o2Token, profile = o2Profile(box) }
+}
+
+fn o2Opts(box: O2Box): OAuth2Options {
+  return OAuth2Options{ scopes = ["read:user", "user:email"], tokenFetch = o2TokenFetch(box) }
+}
+
+fn o2Strategy(box: O2Box, secret: string, opts: OAuth2Options): OAuth2Strategy {
+  return OAuth2Strategy(o2Endpoints(box), "client-1", secret, o2Redirect, opts) catch e {
+    panic("OAuth2Strategy: ${e.message()}")
+  }
+}
+
+fn o2Err(
+  endpoints: OAuth2Endpoints,
+  clientId: string,
+  redirect: string,
+  opts: OAuth2Options,
+): string {
+  OAuth2Strategy(endpoints, clientId, "s", redirect, opts) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+fn o2App(s: OAuth2Strategy): App {
+  let app = App(Config{ secret = "test-secret", sessions = MemoryStore(1000) })
+  app.get("/begin", (c) => {
+    return s.beginAuthorization(c)
+  })
+  app.get("/session", (c) => {
+    let session = c.session() catch e {
+      panic("session: ${e.message()}")
+    }
+    return c.text(session.get(s.key("state")) + "|" + session.get(s.key("verifier")))
+  })
+  app.get("/callback", (c) => {
+    let identity = s.authenticate(c)?
+    return c.text(identity.id)
+  })
+  app.get("/kind", (c) => {
+    s.authenticate(c) catch e {
+      let (oe, ok) = e.(OAuth2Error)
+      if (ok) {
+        return c.text(oe.code)
+      }
+      fail e
+    }
+    return c.text("no error")
+  })
+  app.get("/whoami", (c) => {
+    let identity = currentIdentity(c)?
+    return c.text(identity.id)
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+// The session a `/begin` left: its cookie, the `state` and the verifier.
+class O2Begun {
+  cookie: string,
+  state: string,
+  verifier: string,
+  location: string,
+}
+
+fn o2Begin(app: App): O2Begun {
+  let res = app.handle(authReq("/begin", ""))
+  let cookie = res.getHeader("Set-Cookie")
+  let stored = split(app.handle(authReq("/session", cookie)).body, "|")
+  return O2Begun{
+    cookie = cookie,
+    state = stored[0],
+    verifier = stored[1],
+    location = res.getHeader("Location"),
+  }
+}
+
+fn o2CallbackReq(path: string, cookie: string, query: string): Request {
+  return authReq(path + "?" + query, cookie)
+}
+
+fn o2Ok(b: O2Begun): string {
+  return "code=the-code&state=" + percentEncode(b.state)
+}
+
+test "round trip: the profile's Identity comes back, the session id rotates, whoami sees it" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "sec", o2Opts(box)))
+  let b = o2Begin(app)
+
+  let res = app.handle(o2CallbackReq("/callback", b.cookie, o2Ok(b)))
+  assert(res.status == 200, "want 200, got ${res.status}: ${res.body}")
+  assert(res.body == "octocat", "want the profile's id, got '${res.body}'")
+  assert(
+    box.profileToken == "at-1",
+    "the profile fetch got '${box.profileToken}', not the access token",
+  )
+  assert(box.calls == 1, "want one token request, got ${box.calls}")
+  assert(box.url == o2Token, "token request went to '${box.url}'")
+
+  let newCookie = res.getHeader("Set-Cookie")
+  assert(len(newCookie) > 0, "a successful callback must issue a Set-Cookie")
+  assert(!contains(newCookie, b.cookie), "regenerate() did not rotate the session id")
+  let who = app.handle(authReq("/whoami", newCookie))
+  assert(who.body == "octocat", "the Identity was not stored for requireAuth: '${who.body}'")
+}
+
+test "authorization redirect: RFC 6749 4.1.1 parameters, S256 challenge of the stored verifier, state stored" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "sec", o2Opts(box)))
+  let b = o2Begin(app)
+  assert(hasPrefix(b.location, o2Authorize + "?"), "redirect went to '${b.location}'")
+
+  let p = queryFrom(b.location)
+  assert(paramOrPanic(p, "response_type") == "code", "want response_type=code")
+  assert(paramOrPanic(p, "client_id") == "client-1", "client_id not echoed")
+  assert(paramOrPanic(p, "redirect_uri") == o2Redirect, "redirect_uri not sent verbatim")
+  assert(paramOrPanic(p, "scope") == "read:user user:email", "scope is the space-joined list")
+  assert(paramOrPanic(p, "state") == b.state, "state in the URL is not the stored one")
+  assert(paramOrPanic(p, "code_challenge_method") == "S256", "want S256, never plain")
+  assert(
+    paramOrPanic(p, "code_challenge") == codeChallengeFor(b.verifier),
+    "code_challenge is not S256(stored verifier)",
+  )
+  assert(len(b.state) >= 32, "state must carry at least 128 bits, got ${len(b.state)} characters")
+}
+
+test "the verifier is 43-128 unreserved characters (RFC 7636 4.1) and differs between flows" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "sec", o2Opts(box)))
+  let a = o2Begin(app)
+  let b = o2Begin(app)
+  assert(len(a.verifier) >= 43 && len(a.verifier) <= 128, "verifier length ${len(a.verifier)}")
+  for ch of []byte(a.verifier) {
+    let unreserved = (ch >= 48 && ch <= 57) ||
+      (ch >= 65 && ch <= 90) ||
+      (ch >= 97 && ch <= 122) ||
+      ch == 45 ||
+      ch == 46 ||
+      ch == 95 ||
+      ch == 126
+    assert(unreserved, "verifier byte ${ch} is outside RFC 3986 unreserved")
+  }
+  assert(a.verifier != b.verifier, "two flows drew the same verifier")
+  assert(a.state != b.state, "two flows drew the same state")
+}
+
+test "the token request carries the stored verifier, the code and the redirect_uri (RFC 6749 4.1.3, RFC 7636 4.5)" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "sec", o2Opts(box)))
+  let b = o2Begin(app)
+  app.handle(o2CallbackReq("/callback", b.cookie, o2Ok(b)))
+  assert(contains(box.body, "grant_type=authorization_code"), "no grant_type: '${box.body}'")
+  assert(contains(box.body, "code=the-code"), "no code: '${box.body}'")
+  assert(
+    contains(box.body, "redirect_uri=" + percentEncode(o2Redirect)),
+    "no redirect_uri: '${box.body}'",
+  )
+  assert(
+    contains(box.body, "code_verifier=" + percentEncode(b.verifier)),
+    "the stored verifier was not sent: '${box.body}'",
+  )
+  assert(authHeaderValue(box.headers) != "", "Basic client authentication is the default")
+}
+
+test "ClientAuth.Basic: Authorization header, no client_id or client_secret in the body (RFC 6749 2.3.1)" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "s3cr:t", o2Opts(box)))
+  let b = o2Begin(app)
+  app.handle(o2CallbackReq("/callback", b.cookie, o2Ok(b)))
+  let want = "Basic " + encodeBase64([]byte("client-1:" + percentEncode("s3cr:t")))
+  assert(
+    authHeaderValue(box.headers) == want,
+    "wrong Basic header: '${authHeaderValue(box.headers)}'",
+  )
+  assert(!contains(box.body, "client_id"), "client_id in a Basic body: '${box.body}'")
+  assert(!contains(box.body, "client_secret"), "client_secret in a Basic body: '${box.body}'")
+}
+
+test "ClientAuth.Post: client_id and client_secret in the body, no Authorization header (RFC 6749 2.3.1)" {
+  let box = o2Box()
+  let opts = o2Opts(box)
+  opts.clientAuth = ClientAuth.Post
+  let app = o2App(o2Strategy(box, "s3cr&t", opts))
+  let b = o2Begin(app)
+  app.handle(o2CallbackReq("/callback", b.cookie, o2Ok(b)))
+  assert(authHeaderValue(box.headers) == "", "Authorization header on a Post request")
+  assert(contains(box.body, "&client_id=client-1"), "no client_id: '${box.body}'")
+  assert(
+    contains(box.body, "&client_secret=" + percentEncode("s3cr&t")),
+    "no encoded client_secret: '${box.body}'",
+  )
+}
+
+test "a public client (empty secret) sends client_id in the body and no Authorization header, under either ClientAuth" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "", o2Opts(box)))
+  let b = o2Begin(app)
+  app.handle(o2CallbackReq("/callback", b.cookie, o2Ok(b)))
+  assert(authHeaderValue(box.headers) == "", "Authorization header for a public client")
+  assert(contains(box.body, "&client_id=client-1"), "no client_id: '${box.body}'")
+  assert(!contains(box.body, "client_secret"), "client_secret for a public client: '${box.body}'")
+}
+
+test "callback with no state is refused before the token endpoint" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "sec", o2Opts(box)))
+  let b = o2Begin(app)
+  let res = app.handle(o2CallbackReq("/callback", b.cookie, "code=the-code"))
+  assert(res.status == 401, "want 401, got ${res.status}")
+  assert(box.calls == 0 && box.profileCalls == 0, "a stateless callback reached the provider")
+}
+
+test "callback with the wrong state is refused before the token endpoint" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "sec", o2Opts(box)))
+  let b = o2Begin(app)
+  let res = app.handle(o2CallbackReq("/callback", b.cookie, "code=the-code&state=not-it"))
+  assert(res.status == 401, "want 401, got ${res.status}")
+  assert(box.calls == 0 && box.profileCalls == 0, "a wrong-state callback reached the provider")
+}
+
+test "a replayed callback is refused exactly like an unknown state" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "sec", o2Opts(box)))
+  let b = o2Begin(app)
+  let first = app.handle(o2CallbackReq("/callback", b.cookie, o2Ok(b)))
+  assert(first.status == 200, "the first callback must pass, got ${first.status}")
+  let second = app.handle(o2CallbackReq("/callback", b.cookie, o2Ok(b)))
+  assert(second.status == 401, "want 401 on replay, got ${second.status}")
+  assert(box.calls == 1, "the replay reached the token endpoint")
+  let fresh = o2App(o2Strategy(o2Box(), "sec", o2Opts(o2Box())))
+  let unknown = fresh.handle(o2CallbackReq("/callback", "", "code=the-code&state=never-issued"))
+  assert(
+    second.body == unknown.body,
+    "replay '${second.body}' differs from unknown '${unknown.body}'",
+  )
+}
+
+test "a provider error response is refused with a typed OAuth2Error and spends no code" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "sec", o2Opts(box)))
+  let b = o2Begin(app)
+  let q = "error=access_denied&error_description=" +
+    percentEncode("<script>x</script>") +
+    "&state=" +
+    percentEncode(b.state)
+  let res = app.handle(o2CallbackReq("/callback", b.cookie, q))
+  assert(res.status == 401, "access_denied must be 401, got ${res.status}")
+  assert(!contains(res.body, "script"), "provider text reflected into the response: '${res.body}'")
+  assert(box.calls == 0, "an error response reached the token endpoint")
+
+  let b2 = o2Begin(app)
+  let kind = app.handle(
+    o2CallbackReq("/kind", b2.cookie, "error=access_denied&state=" + percentEncode(b2.state)),
+  )
+  assert(kind.body == "access_denied", "want the typed error's code, got '${kind.body}'")
+}
+
+test "RFC 9207: a callback whose iss is not the configured issuer is refused, as is a missing one" {
+  let box = o2Box()
+  let opts = o2Opts(box)
+  opts.issuer = o2Issuer
+  let app = o2App(o2Strategy(box, "sec", opts))
+
+  let wrong = o2Begin(app)
+  let r1 = app.handle(
+    o2CallbackReq(
+      "/callback",
+      wrong.cookie,
+      o2Ok(wrong) + "&iss=" + percentEncode("https://evil.example"),
+    ),
+  )
+  assert(r1.status == 401, "wrong iss must be 401, got ${r1.status}")
+
+  let missing = o2Begin(app)
+  let r2 = app.handle(o2CallbackReq("/callback", missing.cookie, o2Ok(missing)))
+  assert(r2.status == 401, "missing iss with a configured issuer must be 401, got ${r2.status}")
+  assert(box.calls == 0, "a mix-up callback reached the token endpoint")
+
+  let good = o2Begin(app)
+  let r3 = app.handle(
+    o2CallbackReq("/callback", good.cookie, o2Ok(good) + "&iss=" + percentEncode(o2Issuer)),
+  )
+  assert(r3.status == 200, "the right iss must pass, got ${r3.status}: ${r3.body}")
+}
+
+test "without a configured issuer, iss is not required" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "sec", o2Opts(box)))
+  let b = o2Begin(app)
+  let res = app.handle(o2CallbackReq("/callback", b.cookie, o2Ok(b)))
+  assert(res.status == 200, "want 200, got ${res.status}")
+}
+
+test "a token_type other than Bearer is refused, Bearer is matched case-insensitively" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "sec", o2Opts(box)))
+
+  box.response = "{\"access_token\":\"at-1\",\"token_type\":\"mac\"}"
+  let b = o2Begin(app)
+  let res = app.handle(o2CallbackReq("/callback", b.cookie, o2Ok(b)))
+  assert(res.status != 200, "a mac token was accepted")
+  assert(box.profileCalls == 0, "the profile was fetched with a non-Bearer token")
+
+  box.response = "{\"access_token\":\"at-1\"}"
+  let b2 = o2Begin(app)
+  let r2 = app.handle(o2CallbackReq("/callback", b2.cookie, o2Ok(b2)))
+  assert(r2.status != 200, "a response with no token_type was accepted")
+
+  box.response = "{\"access_token\":\"at-1\",\"token_type\":\"bEaReR\"}"
+  let b3 = o2Begin(app)
+  let r3 = app.handle(o2CallbackReq("/callback", b3.cookie, o2Ok(b3)))
+  assert(r3.status == 200, "bEaReR must be accepted, got ${r3.status}: ${r3.body}")
+}
+
+test "a token endpoint error document (RFC 6749 5.2) becomes an OAuth2Error with its kind" {
+  let box = o2Box()
+  box.response = "{\"error\":\"invalid_grant\",\"error_description\":\"expired\",\"error_uri\":\"https://idp.example.com/e\"}"
+  let app = o2App(o2Strategy(box, "sec", o2Opts(box)))
+  let b = o2Begin(app)
+  let kind = app.handle(o2CallbackReq("/kind", b.cookie, o2Ok(b)))
+  assert(kind.body == "invalid_grant", "want invalid_grant, got '${kind.body}'")
+  assert(box.profileCalls == 0, "the profile was fetched after a token error")
+
+  let b2 = o2Begin(app)
+  let res = app.handle(o2CallbackReq("/callback", b2.cookie, o2Ok(b2)))
+  assert(res.status == 401, "invalid_grant must be 401, got ${res.status}")
+
+  box.response = "{\"error\":\"server_error\"}"
+  let b3 = o2Begin(app)
+  let r3 = app.handle(o2CallbackReq("/callback", b3.cookie, o2Ok(b3)))
+  assert(r3.status == 502, "server_error must be 502, got ${r3.status}")
+
+  box.response = "{\"error\":\"vendor_thing\"}"
+  let b4 = o2Begin(app)
+  let r4 = app.handle(o2CallbackReq("/kind", b4.cookie, o2Ok(b4)))
+  assert(r4.body == "vendor_thing", "an unknown code keeps its wire value, got '${r4.body}'")
+}
+
+test "a callback with no code is refused before the token endpoint" {
+  let box = o2Box()
+  let app = o2App(o2Strategy(box, "sec", o2Opts(box)))
+  let b = o2Begin(app)
+  let res = app.handle(o2CallbackReq("/callback", b.cookie, "state=" + percentEncode(b.state)))
+  assert(res.status == 401, "want 401, got ${res.status}")
+  assert(box.calls == 0, "a code-less callback reached the token endpoint")
+}
+
+test "invalid constructions fail loudly" {
+  let box = o2Box()
+  let opts = o2Opts(box)
+  let ok = o2Endpoints(box)
+
+  let badAuth = OAuth2Endpoints{
+    authorize = "http://idp.example.com/a",
+    token = o2Token,
+    profile = o2Profile(box),
+  }
+  assert(
+    contains(o2Err(badAuth, "c", o2Redirect, opts), "authorize endpoint"),
+    "http authorize accepted",
+  )
+
+  let badToken = OAuth2Endpoints{
+    authorize = o2Authorize,
+    token = "http://idp.example.com/t",
+    profile = o2Profile(box),
+  }
+  assert(contains(o2Err(badToken, "c", o2Redirect, opts), "token endpoint"), "http token accepted")
+
+  assert(contains(o2Err(ok, "", o2Redirect, opts), "clientId is empty"), "empty clientId accepted")
+  assert(
+    contains(o2Err(ok, "c", o2Redirect + "#frag", opts), "fragment"),
+    "fragment redirect accepted",
+  )
+  assert(
+    contains(o2Err(ok, "c", "http://app.example.com/cb", opts), "must be https"),
+    "http redirect off loopback accepted",
+  )
+  assert(
+    contains(o2Err(ok, "c", "https://", opts), "must be https"),
+    "empty-host redirect accepted",
+  )
+  assert(
+    contains(o2Err(ok, "c", "http://localhost@evil.example/cb", opts), "must be https"),
+    "userinfo-spoofed loopback accepted",
+  )
+  assert(contains(o2Err(ok, "c", "", opts), "must be https"), "empty redirect accepted")
+
+  let noProfile = OAuth2Endpoints{ authorize = o2Authorize, token = o2Token }
+  assert(contains(o2Err(noProfile, "c", o2Redirect, opts), "profile"), "nil profile accepted")
+
+  let badScope = o2Opts(box)
+  badScope.scopes = ["read user"]
+  assert(contains(o2Err(ok, "c", o2Redirect, badScope), "scope"), "a scope with a space accepted")
+  badScope.scopes = [""]
+  assert(contains(o2Err(ok, "c", o2Redirect, badScope), "empty"), "an empty scope accepted")
+
+  let noTls = OAuth2Options{ scopes = ["a"] }
+  assert(contains(o2Err(ok, "c", o2Redirect, noTls), "tls"), "no tls and no tokenFetch accepted")
+
+  let badIssuer = o2Opts(box)
+  badIssuer.issuer = "http://idp.example.com"
+  assert(contains(o2Err(ok, "c", o2Redirect, badIssuer), "issuer"), "http issuer accepted")
+}
+
+test "valid constructions: loopback http redirects, tls instead of tokenFetch, a name" {
+  let box = o2Box()
+  let ok = o2Endpoints(box)
+  let opts = o2Opts(box)
+  assert(o2Err(ok, "c", "http://localhost:8080/cb", opts) == "", "http://localhost refused")
+  assert(o2Err(ok, "c", "http://127.0.0.1:3000/cb", opts) == "", "http://127.0.0.1 refused")
+  assert(o2Err(ok, "c", "http://[::1]:3000/cb", opts) == "", "http://[::1] refused")
+
+  let real = OAuth2Options{ tls = Option.Some(tlsStub()) }
+  assert(o2Err(ok, "c", o2Redirect, real) == "", "tls without tokenFetch refused")
+
+  let named = o2Opts(box)
+  named.name = "github"
+  let s = o2Strategy(box, "sec", named)
+  assert(s.name() == "github", "name() is '${s.name()}'")
+  assert(o2Strategy(box, "sec", o2Opts(box)).name() == "oauth2", "the default name is oauth2")
+}
+
+test "two strategies keep their state apart in one session" {
+  let box = o2Box()
+  let a = o2Strategy(box, "sec", o2Opts(box))
+  let o = o2Opts(box)
+  o.name = "other"
+  let b = o2Strategy(box, "sec", o)
+  assert(a.key("state") != b.key("state"), "two strategies share a session key")
+}

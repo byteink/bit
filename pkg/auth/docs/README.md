@@ -8,6 +8,7 @@ The chapters below, in reading order.
 | [Sign in with Google](oidc.md) | Add an OpenID Connect provider beside the password login, PKCE included. |
 | [Testing your sign-in routes](testing.md) | Drive your OIDC callback route against a fake, in-process provider with zero real network calls. |
 | [Other OIDC providers](providers.md) | Microsoft Entra ID, one tenant or many, and any other conformant provider. |
+| [Sign in with GitHub, or any OAuth 2.0 provider](oauth2.md) | A provider with no ID token: the authorization-code flow with PKCE, a profile fetch that yields the `Identity`, client authentication, `iss` checks, typed provider errors, and a fake provider for tests. |
 | [Verifying a token directly](manual-verification.md) | A mobile or single-page client that already holds an ID token, with no redirect. |
 | [Two-factor authentication with TOTP](totp.md) | A second login step with an authenticator app: enrollment, verifying a code, skew and replay protection, recovery codes for a lost phone. |
 | [Check a new password](password-policy.md) | An opt-in policy for new passwords after NIST SP 800-63B: length in code points, normalization recorded in the hash, context words, blocklists, runs, an optional breach check, and why there is no composition rule or expiry. |

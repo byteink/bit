@@ -98,6 +98,13 @@ protected route that is not itself doing the authenticating just reads
   `Provider` names the identity provider (`Google`, `Microsoft(tenant)`,
   `Generic(issuer)`, `Endpoints(config, jwks)`) and `OidcOptions` carries the
   scopes, the `TlsConfig` and the token-exchange seam.
+- `OAuth2Strategy`, `OAuth2Endpoints`, `OAuth2Options`, `ClientAuth`,
+  `ProfileFetch`, `OAuth2Error`, `OAuth2ErrorKind` - the OAuth 2.0
+  authorization-code flow with PKCE for providers that issue no ID token (GitHub,
+  Discord, Slack): `beginAuthorization` and `authenticate` are the two routes, a
+  `ProfileFetch` you supply turns the access token into an `Identity`, and a
+  provider's refusal arrives as a typed `OAuth2Error`; see
+  [Sign in with GitHub](docs/oauth2.md).
 - `OidcConfig`, `discover`, `JwksCache`, `JwksSource`, `verifyIdToken` - the
   discovery document and key set `OidcStrategy` is built from, and the ID
   token verifier, for a client that already holds a token and skips the
