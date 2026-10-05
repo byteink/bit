@@ -20,14 +20,15 @@
 // at ERROR once per policy and rule position. A rule whose condition cannot
 // be evaluated on this row gives the same answer.
 //
-// COST. The verdict on a rule is cached by (policy, position, resource,
-// action count), under a mutex held for an array lookup only, so a settled
-// rule costs a string compare. A condition without a placeholder is
+// COST. A subject's rules are built once per subject value and indexed by
+// (resource class, action) (rulecache.bit), so a check scans only the rules
+// that can match and returns a Decision built with the index. The verdict on
+// a rule is cached by (policy, position, resource, action count); a rule set
+// with no faulty rule skips it. A condition without a placeholder is
 // evaluated as it is (`bind` copies nothing), a `Cond.True` rule reads no
 // row, and the row's column names are computed once at `resource<T>()`. What
-// remains per call is what the design makes per-subject: `rolesOf` runs the
-// policy closures for this user, and the row's `__values()` is read once when
-// some matching rule has a condition.
+// remains per call is the row's `__values()`, read once when some matching
+// rule has a condition.
 
 import { LogSink } from "orm"
 import { Mutex } from "std/sync"
@@ -78,9 +79,11 @@ class DecideState<A: ActionEnum> {
   guest: []Rule<A>
   cols: []ResourceCols
   verdicts: []PolicyVerdicts
+  cache: RuleCache<A>
 
   init() {
     this.mu = Mutex()
+    this.cache = RuleCache<A>()
     this.sink = Option<LogSink>.None
     this.guest = []Rule<A>(0)
     this.cols = []ResourceCols(0)
@@ -248,19 +251,14 @@ fn invalidDecision(detail: string): Decision {
   return Decision{ allowed = false, policy = "", reason = detail, invalid = true }
 }
 
-// The rules of `user`: the guest role's for `None`, else the union over the
-// user's roles. What `rolesOf` leaves out is logged when a sink is set.
-fn rulesOf<A: ActionEnum>(a: Authz<A>, user: Option<Subject>): []Rule<A> {
-  if (!isSome(user)) {
-    return a.state.guest
+// Logs what `rolesOf` left out of `set`, when a sink is set.
+fn logSkipped<A: ActionEnum>(st: DecideState<A>, set: RuleSet<A>) {
+  if (!st.logging()) {
+    return
   }
-  let got = a.rolesOf(unwrap(user))
-  if (a.state.logging()) {
-    for line of got.skipped {
-      a.state.say("[authz] debug skipped: ${line}")
-    }
+  for line of set.skipped {
+    st.say("[authz] debug skipped: ${line}")
   }
-  return got.rules
 }
 
 // "policy P rule k: why" for the first rule of `rules` that is invalid, or "".
@@ -281,37 +279,13 @@ fn firstFault<A: ActionEnum>(a: Authz<A>, rules: []Rule<A>): string {
   return ""
 }
 
-// Where `applyRules` is: the row it reads once, and the rule position it is at.
-class RowScan {
-  ready: bool
-  names: []string
-  vals: []Value
-  prev: string
-  k: int
-
-  // The position of a rule of `policy` within its policy.
-  advance(policy: string): int {
-    if (policy != this.prev) {
-      this.prev = policy
-      this.k = 0
-    }
-    let at = this.k
-    this.k = at + 1
-    return at
+// `names` when it fits `vals`, else the names `T`'s columns give them; a
+// resource registered with `resource<T>()` always fits.
+fn rowNamesFor<T: Tabled>(names: []string, vals: []Value): []string! {
+  if (len(names) == len(vals)) {
+    return names
   }
-}
-
-// Reads `thing` into `view` the first time a condition needs it.
-fn loadRow<A: ActionEnum, T: Tabled>(st: DecideState<A>, view: RowScan, thing: T): ()! {
-  if (view.ready) {
-    return
-  }
-  view.vals = thing.__values()
-  view.names = st.namesOf(T.__className())
-  if (len(view.names) != len(view.vals)) {
-    view.names = rowNames(T.__columns(), view.vals)?
-  }
-  view.ready = true
+  return rowNames(T.__columns(), vals)?
 }
 
 // `r`'s condition with the user's attributes in it; a path the user cannot
@@ -334,70 +308,60 @@ fn isTrueTruth(t: Truth): bool {
   }
 }
 
-// Whether `r`'s condition holds on `thing`. Unknown does not hold.
-fn condHolds<A: ActionEnum, T: Tabled>(
-  st: DecideState<A>,
-  user: Option<Subject>,
-  r: Rule<A>,
-  view: RowScan,
-  thing: T,
-): bool! {
-  if (isTrue(r.cond)) {
-    return true
-  }
-  let c = boundCond<A>(st, r, user)
-  loadRow<A, T>(st, view, thing)?
-  return isTrueTruth(evalRow(c, view.names, view.vals, boxRow<T>(c, thing))?)
+// Whether `c`, a rule's condition bound to the user, holds on the row `vals`
+// read from `thing`. Unknown does not hold. `thing` is boxed only for a code
+// function (`boxRow`).
+fn condHolds<T: Tabled>(c: Cond, names: []string, vals: []Value, thing: T): bool! {
+  return isTrueTruth(evalRow(c, rowNamesFor<T>(names, vals)?, vals, boxRow<T>(c, thing))?)
 }
 
 fn denyAll(policy: string): Decision {
   return Decision{ allowed = false, policy = policy, reason = "denied by rule", invalid = false }
 }
 
-// The rules applied to `thing`: first matching Deny, else first matching
-// Allow, else default deny.
-fn applyRules<A: ActionEnum, T: Tabled>(
-  a: Authz<A>,
+// The rules of `slot` applied to `thing`: first matching Deny, else first
+// matching Allow, else default deny. The row is read the first time a rule
+// with a condition is reached.
+fn applySlot<A: ActionEnum, T: Tabled>(
+  st: DecideState<A>,
   user: Option<Subject>,
-  rules: []Rule<A>,
-  action: A,
+  slot: RuleSlot<A>,
   thing: T,
 ): Decision {
-  let className = T.__className()
-  let want = actionName(action)
-  let view = RowScan{ ready = false, prev = "", k = 0 }
-  let granted = false
-  let grantedBy = ""
-  for r of rules {
-    let k = view.advance(r.policy)
-    if (!applies<A>(r, className, want, a.wildcard)) {
-      continue
-    }
-    let hit = condHolds<A, T>(a.state, user, r, view, thing) catch e {
-      let why = "policy ${r.policy} rule ${k}: ${e.message()}"
-      a.state.say("[authz] ERROR invalid policy: ${why}")
-      return invalidDecision(why)
-    }
-    if (!hit) {
-      continue
+  let vals: []Value
+  let read = false
+  let granted = -1
+  let i = 0
+  while (i < len(slot.rules)) {
+    let r = slot.rules[i]
+    if (!isTrue(r.cond)) {
+      if (!read) {
+        vals = thing.__values()
+        read = true
+      }
+      let c = boundCond<A>(st, r, user)
+      let hit = condHolds<T>(c, slot.names, vals, thing) catch e {
+        let why = "policy ${r.policy} rule ${slot.at[i]}: ${e.message()}"
+        st.say("[authz] ERROR invalid policy: ${why}")
+        return invalidDecision(why)
+      }
+      if (!hit) {
+        i = i + 1
+        continue
+      }
     }
     if (r.effect == Effect.Deny) {
-      return denyAll(r.policy)
+      return slot.decs[i]
     }
-    if (!granted) {
-      granted = true
-      grantedBy = r.policy
+    if (granted < 0) {
+      granted = i
     }
+    i = i + 1
   }
-  if (granted) {
-    return Decision{
-      allowed = true,
-      policy = grantedBy,
-      reason = "allowed by rule",
-      invalid = false,
-    }
+  if (granted >= 0) {
+    return slot.decs[granted]
   }
-  return Decision{ allowed = false, policy = "", reason = noAllowRule, invalid = false }
+  return slot.none
 }
 
 fn subjectId(user: Option<Subject>): string {
@@ -418,12 +382,12 @@ fn verbOf(d: Decision): string {
 fn logged<A: ActionEnum>(
   st: DecideState<A>,
   user: Option<Subject>,
-  action: string,
+  action: A,
   resource: string,
   d: Decision,
 ): Decision {
   if (st.logging()) {
-    st.say("[authz] debug ${verbOf(d)} ${action} on ${resource} subject=${subjectId(user)} policy=${d.policy} reason=${d.reason}")
+    st.say("[authz] debug ${verbOf(d)} ${actionName(action)} on ${resource} subject=${subjectId(user)} policy=${d.policy} reason=${d.reason}")
   }
   return d
 }
@@ -436,17 +400,17 @@ fn decide<A: ActionEnum, T: Tabled>(
   action: A,
   thing: T,
 ): Decision {
-  let rules = rulesOf<A>(a, user)
-  let bad = firstFault<A>(a, rules)
-  let name = actionName(action)
-  if (bad != "") {
-    return logged<A>(a.state, user, name, T.__className(), invalidDecision(bad))
+  let set = ruleSetOf<A>(a, user)
+  logSkipped<A>(a.state, set)
+  let cls = T.__className()
+  if (!set.clean) {
+    let bad = firstFault<A>(a, set.rules)
+    if (bad != "") {
+      return logged<A>(a.state, user, action, cls, invalidDecision(bad))
+    }
   }
-  return logged<A>(
-    a.state,
-    user,
-    name,
-    T.__className(),
-    applyRules<A, T>(a, user, rules, action, thing),
-  )
+  let slot = a.state.cache.slotOf(set, a.state, cls, action, a.wildcard)
+  // Bound first: a call nested in the argument list costs an allocation.
+  let d = applySlot<A, T>(a.state, user, slot, thing)
+  return logged<A>(a.state, user, action, cls, d)
 }
