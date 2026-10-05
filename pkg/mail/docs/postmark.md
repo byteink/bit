@@ -118,7 +118,8 @@ made here would not be the one that counts.
 | 401 | `Auth` |
 | 429 and 5xx | `Transient`, with `Reply.retryAfter` from `Retry-After` |
 | 422 and any other 4xx | `Rejected`, with Postmark's own `Message` |
-| no answer at all (refused, reset, timed out) | `Transient`, naming the step |
+| no answer, the request never left (refused, connect failed) | `Transient`, naming the step |
+| no answer, after the request was written (reset, timed out) | `Unknown`: it may have been taken, so it is not retried |
 | a certificate that does not verify | `Rejected`: the same certificate comes back on every try |
 
 Every `ErrorCode` Postmark sends is kept in `Reply.enhanced` as
@@ -161,30 +162,37 @@ into shows `***`.
 
 ## A send that may happen twice
 
-Postmark has no idempotency key. `Options.retry` repeats a `Transient` failure,
-and that is safe when Postmark did not take the mail: a refused connection, a
-429, a 5xx (Postmark says a 500 loses the message, and a 503 is maintenance).
-A request that was sent and then cut off, a reset or a timeout while waiting for
-the answer, may have been taken, and the retry then sends the mail twice. A
-program that cannot accept that, a receipt or a one-time code, sets one try:
+Postmark has no idempotency key, so a repeat of a request it already took is a
+second mail. `Options.retry` therefore repeats a send only when Postmark cannot
+have taken it: a refused connection or a failed connect (the request never
+left), a 429, a 5xx (Postmark says a 500 loses the message, and a 503 is
+maintenance).
+
+A request that was written and then cut off, by a reset or a timeout while
+waiting for the answer, may have been taken. Repeating it on its own would send
+the mail twice (RFC 9110 section 9.2.2), so it fails with `MailError.Unknown`
+and is not retried. The text names the failure. A program decides what is
+worse, a lost mail or a double one:
 
 ```bit
-import { Options, Retry, open } from "mail"
-import { Second } from "std/time"
+import { MailError, Message, Options, open } from "mail"
 
 fn main(): ()! {
-  let mailer = open(
-    "postmark://server-token-123@default",
-    Options{
-      from = "Inkwell <hello@inkwell.dev>",
-      retry = Retry{ attempts = 1 },
-      timeout = 20 * Second,
-    },
-  )?
+  let mailer = open("postmark://server-token-123@default", Options{ from = "hello@inkwell.dev" })?
+  mailer.send(Message{ to = ["sara@example.com"], subject = "Your receipt", text = "Thanks" }) catch e {
+    match (e) {
+      Unknown(r) => println("may have been delivered, check Postmark's activity first: ${r.text}")
+      _ => println(e.message())
+    }
+  }
   mailer.close()
   return
 }
 ```
+
+A receipt or a one-time code is usually sent again anyway once the user asks, so
+`Unknown` there means "show the retry button". For a mail that must arrive
+exactly once, look the recipient up in Postmark's activity before sending again.
 
 See [Retries and pace](retry.md) for what is repeated and how long it waits.
 

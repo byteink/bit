@@ -88,7 +88,7 @@ The key must be at most 256 bytes.
 | 409 while the same key is in flight | `Transient` |
 | 409 for a key used with another body | `Invalid` |
 | any other 4xx | `Rejected`, with Resend's own `message` |
-| no answer at all (refused, reset, timed out) | `Transient`, naming the step |
+| no answer at all (refused, reset, timed out), even after the request was written | `Transient`, naming the step; the idempotency key makes the repeat safe |
 | a certificate that does not verify | `Rejected`: the same certificate comes back on every try |
 
 `Options.retry` repeats the `Transient` ones and honours `Retry-After` when it
