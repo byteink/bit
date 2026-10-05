@@ -570,16 +570,23 @@ fn xEmitShiftInt(cx: XCtx, dst: int, lhs: int, rhs: int, plan: XShiftPlan) {
 }
 
 // `dst = high 64 bits of lhs * rhs` (#4725), the x86-64 twin of arm64's
-// `emitMulHiInt`. The one-operand `imul`/`mul` is hardwired to rax (the other
-// factor) and writes rdx:rax, so both are clobbered here -- `xScanFuncFlags`
-// (x64call.bit) sets `needsRaxRdx` for these ops exactly as it does for the
-// divides, so no vreg lives in either and neither operand can BE one.
+// `emitMulHiInt`.
+fn xEmitMulHiInt(cx: XCtx, op: Op, dst: int, lhs: int, rhs: int) {
+  xMulRaxRdx(cx, op, lhs, rhs)
+  xPutInt(cx, dst, XReg64.Rdx)
+}
+
+// `rdx:rax = lhs * rhs`, signed for `Op.SMulHi`, unsigned otherwise. The
+// one-operand `imul`/`mul` is hardwired to rax (the other factor) and writes
+// rdx:rax, so both are clobbered here -- `xScanFuncFlags` (x64call.bit) sets
+// `needsRaxRdx` for the mulhi ops exactly as it does for the divides, so no
+// vreg lives in either and neither operand can BE one.
 //
 // Both operands are fetched before rax is loaded: `l` may itself sit in a
 // scratch register that loading rax would not disturb, but `r` must not be
 // read after rax is written, and reading both first makes the order
 // impossible to get wrong when this is edited.
-fn xEmitMulHiInt(cx: XCtx, op: Op, dst: int, lhs: int, rhs: int) {
+fn xMulRaxRdx(cx: XCtx, op: Op, lhs: int, rhs: int) {
   let l = xGetInt(cx, lhs, xScratch1())
   let r = xGetInt(cx, rhs, xScratch2())
   xMovRR(cx.buf, XReg64.Rax, l)
@@ -588,5 +595,104 @@ fn xEmitMulHiInt(cx: XCtx, op: Op, dst: int, lhs: int, rhs: int) {
   } else {
     xMulR(cx.buf, r)
   }
-  xPutInt(cx, dst, XReg64.Rdx)
+}
+
+// ---- #7181: one `mul` for `umulhi(a, b)` beside `a * b` ---------------------
+// std/math's `mul64` is `(umulHi(a, b), a * b)`: the high and low words of ONE
+// 128-bit product, and the one-operand `mul` that computes the high word
+// already leaves the low word in rax. Selected separately the pair is that
+// `mul` plus an `imul` recomputing the low word.
+//
+// ADJACENCY is the liveness argument, as it is for #5655's address fold. The
+// fused `mul` runs at the first instruction and writes the second's result
+// one instruction early. The allocator starts that result's live range at the
+// second instruction, so its home can only be shared with a value whose last
+// read is there too, and the second instruction reads nothing but the two
+// operands the `mul` has already consumed. With anything in between, that home
+// may still hold a live value. Same-block comes free: a block's last
+// instruction is a terminator, never a `mul`; blocks are walked anyway, so an
+// instruction no block emits is never paired with one that is.
+fn xMulPairs(cx: XCtx): []int {
+  if (!cx.mulPairReady) {
+    cx.mulPair = xComputeMulPairs(cx.ctx, cx.f, cx.debug)
+    cx.mulPairReady = true
+  }
+  return cx.mulPair
+}
+
+// Each paired instruction's partner id, -1 for every other instruction.
+fn xComputeMulPairs(ctx: TypeContext, f: IrFunc, debug: bool): []int {
+  let pair = []int(len(f.instrs))
+  let k = 0
+  while (k < len(pair)) {
+    pair[k] = -1
+    k = k + 1
+  }
+  for b of f.blocks {
+    let i = b.instsStart + b.paramCount
+    let end = b.instsStart + b.instsLen
+    while (i + 1 < end) {
+      if (xMulPairable(ctx, f.instrs[i], f.instrs[i + 1], debug)) {
+        pair[i] = i + 1
+        pair[i + 1] = i
+        i = i + 1
+      }
+      i = i + 1
+    }
+  }
+  return pair
+}
+
+// A `mul` and a `umulhi`, in either order, over the same two values.
+fn xMulPairable(ctx: TypeContext, x: IrInstr, y: IrInstr, debug: bool): bool {
+  if (x.op == Op.Mul && y.op == Op.UMulHi) {
+    return xMulHalves(ctx, x, y, debug)
+  }
+  if (x.op == Op.UMulHi && y.op == Op.Mul) {
+    return xMulHalves(ctx, y, x, debug)
+  }
+  return false
+}
+
+// `lo` is the low word of `hi`'s product: 64-bit, the operands in either
+// order, and no overflow trap to keep. A debug build's signed `mul` traps on
+// the two-operand `imul`'s OF (`xMaybeOverflowTrap`, x64selectovf.bit), which
+// the unsigned one-operand `mul` does not compute; `umulhi` is always 64-bit.
+fn xMulHalves(ctx: TypeContext, lo: IrInstr, hi: IrInstr, debug: bool): bool {
+  let w = widthOf(ctx, lo.ty)
+  if (w.bytes != 8 || (debug && w.signed)) {
+    return false
+  }
+  return (lo.lhs == hi.lhs && lo.rhs == hi.rhs) || (lo.lhs == hi.rhs && lo.rhs == hi.lhs)
+}
+
+// Emits instruction `i` when it is half of a pair: the whole product at the
+// first, nothing at the second. False, emitting nothing, for any other `i`.
+//
+// The first's result is written before the second's: when the first is never
+// read its live range ends where it starts, so the allocator may give both the
+// same home, and the second's write is the one that must survive.
+fn xEmitMulPairAt(cx: XCtx, i: int, op: Op): bool {
+  if (op != Op.Mul && op != Op.UMulHi) {
+    return false
+  }
+  let other = xMulPairs(cx)[i]
+  if (other < 0) {
+    return false
+  }
+  if (other > i) {
+    let ins = cx.f.instrs[i]
+    xMulRaxRdx(cx, Op.UMulHi, ins.lhs, ins.rhs)
+    xPutInt(cx, i, xMulHalfReg(op))
+    xPutInt(cx, other, xMulHalfReg(cx.f.instrs[other].op))
+  }
+  return true
+}
+
+// Where the one-operand `mul` leaves the result of a pair member `op`.
+fn xMulHalfReg(op: Op): XReg64 {
+  if (op == Op.UMulHi) {
+    return XReg64.Rdx
+  }
+  return XReg64.Rax
 }
