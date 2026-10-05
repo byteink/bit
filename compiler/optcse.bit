@@ -44,6 +44,18 @@
 // anything that could store. That is why a store clears everything rather than
 // clearing one offset.
 //
+// ONE STORE IS NAMED, and it is answered by memory REGION, not by base (#7182).
+// An `index_set` whose base is `field_get X[0]` with `X` slice-typed writes
+// into a slice's ELEMENT BUFFER, and a SLICE HEADER word cannot live in one:
+// `rtSliceNew` allocates the header and the buffer as two distinct objects,
+// and a slice element is a word or a packed class, never an inline header.
+// So header-word loads (`slice_len`, or `field_get` on a slice-typed base)
+// sit in a chain of their own that such a store leaves standing, while every
+// other load still clears — a packed element is read through a `field_get` on
+// an `i64` address INTO that buffer. LICM's `licmWritesSliceBuf`
+// (optloopcand.bit) rests on the same fact. Without it, fe25519MulCore reloaded
+// and null-tested `h`'s `len`, `buf` and `off` for each of its five stores.
+//
 // PURE OPS (#4036): nothing invalidates them, and they get their own chain for
 // exactly that reason. A pure op over the same SSA operand ids is the same
 // value by definition; SSA values are immutable, so a call between the two
@@ -92,6 +104,9 @@
 // and 0 for a constant; `ty` the result type — width is taken from the result
 // type at codegen, so two loads of one slot at different widths must not answer
 // each other, and an `i32` 2 never answers an `i64` 2.
+//
+// `slice[v]` is whether value `v` of the function this arena serves is
+// slice-typed: the one type fact the store rule in the header reads.
 class AvailArena {
   op: []int,
   a: []int,
@@ -99,12 +114,19 @@ class AvailArena {
   ty: []int,
   val: []int,
   next: []int,
+  slice: []bool,
 }
 
-fn newAvailArena(): AvailArena {
+fn newAvailArena(ctx: TypeContext, f: IrFunc): AvailArena {
+  let slice = []bool(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    slice = append(slice, ctx.types[f.instrs[i].ty].kind == TypeKind.Slice)
+    i = i + 1
+  }
   return AvailArena{
     op = []int(0), a = []int(0), b = []int(0), ty = []int(0),
-    val = []int(0), next = []int(0),
+    val = []int(0), next = []int(0), slice = slice,
   }
 }
 
@@ -183,6 +205,18 @@ fn opIsCseLoad(op: Op): bool {
   return op == Op.SliceLen || op == Op.FieldGet
 }
 
+// Whether `ins` is a store into a slice's element buffer, the one store the
+// header chain survives. The base is resolved through `fwd`, which is an
+// equality proof, so a later access whose `buf` read was answered by an
+// earlier one is still recognised.
+fn cseWritesSliceBuf(f: IrFunc, ar: AvailArena, fwd: []int, ins: IrInstr): bool {
+  if (ins.op != Op.IndexSet) {
+    return false
+  }
+  let b = f.instrs[cseResolve(fwd, ins.lhs)]
+  return b.op == Op.FieldGet && b.ival == 0 && ar.slice[b.lhs]
+}
+
 // The values this pass reuses without any barrier at all: every binary op
 // `isSideEffecting` does not name, plus the three constant ops. See the header
 // for why a call between two of them changes nothing.
@@ -230,6 +264,7 @@ fn cseConstValue(ins: IrInstr): int {
 // block boundary, so the walk allocates nothing per instruction.
 class CseHeads {
   load: int,
+  hdr: int,
   pure: int,
 }
 
@@ -275,11 +310,16 @@ fn cseStep(f: IrFunc, ar: AvailArena, fwd: []int, h: CseHeads, idx: int) {
   let ins = f.instrs[idx]
   if (opClobbersLoads(ins.op)) {
     h.load = -1
+    if (!cseWritesSliceBuf(f, ar, fwd, ins)) {
+      h.hdr = -1
+    }
   }
   if (fwd[idx] >= 0) {
     return
   }
-  if (opIsCseLoad(ins.op)) {
+  if (opIsCseLoad(ins.op) && ar.slice[ins.lhs]) {
+    h.hdr = cseTry(f, ar, fwd, h.hdr, idx)
+  } else if (opIsCseLoad(ins.op)) {
     h.load = cseTry(f, ar, fwd, h.load, idx)
   } else if (opIsCsePure(ins.op)) {
     h.pure = cseTry(f, ar, fwd, h.pure, idx)
@@ -381,21 +421,24 @@ fn emptyHeads(n: int): []int {
 // #4035 + #4036: fills `fwd` with every load another load already answered and
 // every pure computation another pure computation already answered. Walks
 // blocks in emission order so a predecessor's exit sets are always ready.
-fn cseAvailableValues(f: IrFunc, fwd: []int) {
-  let ar = newAvailArena()
+fn cseAvailableValues(ctx: TypeContext, f: IrFunc, fwd: []int) {
+  let ar = newAvailArena(ctx, f)
   let pred = singlePredecessors(f)
   let order = blockEmissionOrder(f)
   let pos = blockOrderPositions(f, order)
   let exitLoad = emptyHeads(len(f.blocks))
+  let exitHdr = emptyHeads(len(f.blocks))
   let exitPure = emptyHeads(len(f.blocks))
-  let h = CseHeads{ load = -1, pure = -1 }
+  let h = CseHeads{ load = -1, hdr = -1, pure = -1 }
   let i = 0
   while (i < len(order)) {
     let bi = order[i]
     h.load = cseInheritHead(pred, pos, exitLoad, bi, i)
+    h.hdr = cseInheritHead(pred, pos, exitHdr, bi, i)
     h.pure = cseInheritHead(pred, pos, exitPure, bi, i)
     cseBlock(f, ar, fwd, h, bi)
     exitLoad[bi] = h.load
+    exitHdr[bi] = h.hdr
     exitPure[bi] = h.pure
     i = i + 1
   }
