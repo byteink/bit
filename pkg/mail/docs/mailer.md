@@ -66,6 +66,8 @@ fn main(): ()! {
 * **`timeout`** is how long one delivery may take, in nanoseconds, so
   `10 * Second` with `Second` from `std/time`. The default is 30 seconds. A
   transport that talks to a network enforces it; `Outbox` never waits.
+* **`dkim`** is the list of keys every message is signed with. Empty (the
+  default) means unsigned. See [Signing your mail](dkim.md).
 
 `Options{}` is a valid setup. More fields arrive with the parts of the package
 that need them, always with a default, so code written today keeps working.
@@ -192,11 +194,16 @@ it once, when no send is running.
 
 ## Your own transport
 
-A transport is any class with `deliver` and `close`; there is nothing to
+A transport is any class with `deliver`, `signs` and `close`; there is nothing to
 implement or register. `deliver` gets a `Delivery` (the `message`, the
 `envelope` with every address including `bcc`, the `messageId` and the final
 `raw` bytes) and returns a `Receipt` or a `MailError`. It may be called from
-many tasks at once.
+many tasks at once. `signs` says whether the `raw` bytes are the bytes that
+reach the recipient: true for a transport that sends them as they are (a
+server, a file), false for one that gives a provider the fields and lets it
+build the mail. A mailer with `Options.dkim` refuses a transport that answers
+false, because a signature made here would not survive. See
+[Signing your mail](dkim.md).
 
 ```bit
 import { Delivery, Mailer, MailError, Message, Options, Receipt, Rejection, Reply } from "mail"
@@ -231,6 +238,10 @@ class Screened {
       rejected = no,
       queued = true,
     }
+  }
+
+  signs(): bool {
+    return true
   }
 
   close() {}
