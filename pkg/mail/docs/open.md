@@ -32,8 +32,9 @@ fn main(): ()! {
 `open(url, opts)` returns the same `Mailer` as `Mailer(Outbox(), opts)`, so
 everything in [The Mailer](mailer.md) applies: the defaults in `Options`, the
 checks before a send, `MailError`. Only the transport differs. `open` connects
-to nothing; the first `send` does. Each `send` uses its own connection and ends
-it with `QUIT`.
+to nothing; the first `send` does. Sessions are kept and reused, up to
+`Options.pool` of them, and `close` ends them with `QUIT`; see
+[Reusing connections](pool.md).
 
 A user name that is an address has an `@` in it, which a URL spells `%40`. User
 name and password are percent-decoded, so a password with `@`, `/` or `:` in it
