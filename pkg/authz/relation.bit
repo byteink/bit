@@ -14,13 +14,14 @@
 // `user:<id>`, another typed reference, or a USERSET `type:id#relation`
 // ("team:eng#member": everyone who is a member of team eng), which is what
 // makes groups and folder inheritance expressible. `related` answers for the
-// DIRECT tuple only; walking usersets is the check that comes after it.
+// DIRECT tuple only; `hasRelation` (rebac.bit) walks the usersets.
 //
 // Callers pass strings that came from an admin endpoint, so all of it is
 // validated here, before any store sees it, and every refusal is an
 // InvalidPolicy:
 //
-//  - relation: `[a-z][a-z0-9_]{0,31}`.
+//  - relation: `[a-z][a-z0-9_]{0,31}`, and declared on the object's type
+//    with `relation<T>()` (rebac.bit); so is a userset's relation.
 //  - type: `user` (subjects only) or a registered resource's type name.
 //  - id: 1 to 128 printable ASCII bytes with no space, ':' or '#'. Refusing
 //    everything else keeps a reference unambiguous in every store's key and
@@ -32,7 +33,7 @@
 // parameters: validation is one function (`checkTuple`), run by `Authz`.
 
 import { Mutex } from "std/sync"
-import { indexOf, join, toLower } from "std/strings"
+import { indexOf as find, join, toLower } from "std/strings"
 import { sorted } from "std/sort"
 
 const maxIdBytes: int = 128
@@ -51,13 +52,16 @@ export class Tuple {
 // cache of relationship answers know it is stale. Implementations may assume
 // every tuple was validated by `Authz`.
 //
-// `direct` answers the subjects holding `relation` on `object` (userset
-// subjects included, as written), oldest first. `list` answers every tuple
-// whose subject is exactly `subject`, oldest first.
+// `has` says whether that exact tuple is stored. `direct` answers one page of
+// the subjects holding `relation` on `object` (userset subjects included, as
+// written), oldest first: at most `limit` of them (`limit` is at least 1),
+// starting at `offset`, and fewer than `limit` only on the last page. `list`
+// answers every tuple whose subject is exactly `subject`, oldest first.
 export interface RelationStore {
   write(t: Tuple): ()!,
   delete(t: Tuple): ()!,
-  direct(object: string, relation: string): []string!,
+  has(t: Tuple): bool!,
+  direct(object: string, relation: string, offset: int, limit: int): []string!,
   list(subject: string): []Tuple!,
   version(): i64!,
 }
@@ -121,17 +125,34 @@ export class MemoryRelationStore {
     delete(this.keys, key)
     let slot = slotKey(t.object, t.relation)
     let (subs, _) = this.bySlot[slot]
-    this.bySlot[slot] = without(subs, t.subject)
+    this.bySlot[slot] = withoutSubject(subs, t.subject)
     let (held, _) = this.bySubject[t.subject]
     this.bySubject[t.subject] = withoutTuple(held, t)
     this.ver = this.ver + 1
   }
 
-  export direct(object: string, relation: string): []string! {
+  export has(t: Tuple): bool! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (_, present) = this.keys[tupleKey(t)]
+    return present
+  }
+
+  export direct(object: string, relation: string, offset: int, limit: int): []string! {
+    if (offset < 0 || limit < 1) {
+      fail newError("authz: MemoryRelationStore.direct(): offset ${offset} and limit ${limit} must be at least 0 and 1")
+    }
     this.mu.lock()
     defer this.mu.unlock()
     let (subs, _) = this.bySlot[slotKey(object, relation)]
-    return appendAll([]string(0), subs)
+    if (offset >= len(subs)) {
+      return []string(0)
+    }
+    let end = offset + limit
+    if (end > len(subs)) {
+      end = len(subs)
+    }
+    return appendAll([]string(0), subs[offset:end])
   }
 
   export list(subject: string): []Tuple! {
@@ -155,7 +176,11 @@ export class MemoryRelationStore {
 // The type a registered class goes by in a tuple: its name, first letter
 // lowered.
 fn typeName(r: ResourceInfo): string {
-  return toLower(r.name[0:1]) + r.name[1:]
+  return typeNameOf(r.name)
+}
+
+fn typeNameOf(className: string): string {
+  return toLower(className[0:1]) + className[1:]
 }
 
 fn isType(resources: []ResourceInfo, typ: string): bool {
@@ -197,7 +222,7 @@ fn appendAll(dst: []string, src: []string): []string {
   return dst
 }
 
-fn without(list: []string, drop: string): []string {
+fn withoutSubject(list: []string, drop: string): []string {
   let out = []string(0)
   for s of list {
     if (s != drop) {
@@ -215,16 +240,6 @@ fn withoutTuple(list: []Tuple, drop: Tuple): []Tuple {
     }
   }
   return out
-}
-
-// Whether `t` is stored, by its object's direct subjects.
-fn isStored(store: RelationStore, t: Tuple): bool! {
-  for s of store.direct(t.object, t.relation)? {
-    if (s == t.subject) {
-      return true
-    }
-  }
-  return false
 }
 
 fn refuse(detail: string): ()! {
@@ -267,7 +282,7 @@ fn checkRelation(role: string, r: string): ()! {
 
 // `ref` must be `type:id`, its type `user` (when `allowUser`) or registered.
 fn checkRef(role: string, ref: string, resources: []ResourceInfo, allowUser: bool): ()! {
-  let colon = indexOf(ref, ":")
+  let colon = find(ref, ":")
   if (colon < 0) {
     refuse("${role} must be \"type:id\"")?
   }
@@ -281,27 +296,31 @@ fn checkRef(role: string, ref: string, resources: []ResourceInfo, allowUser: boo
   refuse("${role} type is not a registered resource (registered: ${join(typeNames(resources), ", ")})")?
 }
 
-// The subject's reference part, checking a trailing `#relation` on the way.
-fn checkSubject(subject: string, resources: []ResourceInfo): ()! {
-  let hash = indexOf(subject, "#")
+// A subject is a reference, or a userset `type:id#relation` whose type
+// declares that relation. `user` has none, so `user:sara#x` is refused.
+fn checkSubject(subject: string, resources: []ResourceInfo, decls: []RelationDecl): ()! {
+  let hash = find(subject, "#")
   if (hash < 0) {
     checkRef("subject", subject, resources, true)?
     return
   }
   checkRelation("subject relation", subject[hash + 1:])?
   checkRef("subject", subject[0:hash], resources, true)?
+  checkDeclared(decls, typeOfRef(subject[0:hash]), subject[hash + 1:], "subject relation")?
 }
 
 // The tuple, or the InvalidPolicy that says which part is wrong. The one
 // place a caller's strings are trusted.
 fn checkTuple(
   resources: []ResourceInfo,
+  decls: []RelationDecl,
   subject: string,
   relation: string,
   object: string,
 ): Tuple! {
   checkRelation("relation", relation)?
   checkRef("object", object, resources, false)?
-  checkSubject(subject, resources)?
+  checkDeclared(decls, typeOfRef(object), relation, "relation")?
+  checkSubject(subject, resources, decls)?
   return Tuple{ subject = subject, relation = relation, object = object }
 }
