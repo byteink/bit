@@ -39,9 +39,11 @@
 // naming the first offending field (`vValueMemberBlame`, called from
 // `vValueMember`), never a runtime panic.
 //
-// THE HASH SEED is per process: the address of a string literal, which the
-// loader slides by ASLR. The runtime's own map hash is unseeded (`mapHash`,
-// runtime/root/maps.bit); this one is not meant to be stable across runs.
+// THE HASH SEED is the runtime's map-hash seed, read through the one export
+// `bit_rt_map_hash_seed` (`rtMapHashSeed`, runtime/root/maptable.bit) that `mapHash`
+// itself starts from; whatever per-process seeding the maps get (#7379) reaches
+// this hash with it. The module declares that `extern fn` once, grafted next to
+// the methods.
 //
 // E0312 (§14.3): a class declares one of the three names.
 const ecValueMemberDeclared = 312
@@ -53,6 +55,11 @@ const synthSameValueName = "__sameValue"
 const synthValueHashName = "__valueHash"
 const synthSnapshotName = "__snapshot"
 
+// The runtime export that hands out the map hash's seed (`rtMapHashSeed`,
+// runtime/root/maptable.bit); the hash starts from it so one change there reaches maps
+// and value hashes alike (#7379).
+const valueSeedFn = "bit_rt_map_hash_seed"
+const valueSeedDecl = "extern fn bit_rt_map_hash_seed(): u64\n"
 const valueMixConst = "0x9E3779B97F4A7C15"
 const valueDepthMax = 8
 
@@ -65,6 +72,12 @@ const vkString = 4
 const vkEnum = 5
 const vkClass = 6
 const vkSlice = 7
+const vkDecimal = 8
+const vkOption = 9
+const vkMap = 10
+const vkPEnum = 11
+// `vkContainerOf` answers this for a type it has no opinion on.
+const vkNA = -1
 
 fn isValueMemberName(name: string): bool {
   return name == synthSameValueName || name == synthValueHashName || name == synthSnapshotName
@@ -191,13 +204,21 @@ fn vkOfJson(k: int): int {
 }
 
 // What a field type written in module `mid` is, for value semantics, and for a
-// slice its element type node.
+// slice, `Option` or map its element (value) type node, for a payload enum its
+// decl node.
 fn vkOf(vd: ValueDemand, mid: int, t: int, depth: int): (int, int) {
+  if (depth > valueDepthMax) {
+    return (vkBad, 0)
+  }
+  let (ck, celem) = vkContainerOf(vd, mid, t, depth)
+  if (ck != vkNA) {
+    return (ck, celem)
+  }
   let jx = valueCtxOf(vd, mid)
   let (k, elem) = classifyJsonType(jx, t)
   if (k == jkSlice) {
     let (ek, _) = vkOf(vd, mid, elem, depth + 1)
-    if (ek == vkBad || depth > valueDepthMax) {
+    if (ek == vkBad) {
       return (vkBad, 0)
     }
     return (vkSlice, elem)
@@ -205,9 +226,20 @@ fn vkOf(vd: ValueDemand, mid: int, t: int, depth: int): (int, int) {
   if (k != jkNested || getNode(jx.tree, t).tag != Tag.Ident) {
     return (vkOfJson(k), 0)
   }
-  let name = jsonNodeText(jx, t)
+  return vkNamedOf(vd, mid, jsonNodeText(jx, t), depth)
+}
+
+// A bare type name that is not a predeclared scalar: `decimal`, an enum, a class.
+fn vkNamedOf(vd: ValueDemand, mid: int, name: string, depth: int): (int, int) {
+  if (name == "decimal") {
+    return (vkDecimal, 0)
+  }
   if (valueImportedEnum(vd, mid, name)) {
     return (vkEnum, 0)
+  }
+  let ed = valuePayloadEnumDecl(vd, mid, name, depth)
+  if (ed != 0) {
+    return (vkPEnum, ed)
   }
   if (valueClassOk(vd, mid, name, depth + 1)) {
     return (vkClass, 0)
@@ -260,6 +292,8 @@ class ValueGen {
   mid: int,
   n: int,
   buf: []u8,
+  // The u64 variable the hash statements fold into: `__vh`, or a map entry's own.
+  acc: string,
 }
 
 fn vgLine(g: ValueGen, s: string) {
@@ -279,7 +313,7 @@ fn vgTypeText(g: ValueGen, t: int): string {
   if (getNode(jx.tree, t).tag == Tag.SliceType) {
     return "[]" + vgTypeText(g, kidsOf(jx.tree, t)[0])
   }
-  return jsonNodeText(jx, t)
+  return vgTypeTextMore(g, t)
 }
 
 // `<a> != <b>` as one early return, for the kinds `!=` compares by value.
@@ -298,6 +332,9 @@ fn vgEqLeaf(g: ValueGen, kind: int, a: string, b: string) {
 // The equality statements for value `a` against `b`, whose type is `t`.
 fn vgEq(g: ValueGen, a: string, b: string, t: int) {
   let (kind, elem) = vkOf(g.vd, g.mid, t, 0)
+  if (vgEqMore(g, kind, elem, a, b)) {
+    return
+  }
   if (kind != vkSlice) {
     vgEqLeaf(g, kind, a, b)
     return
@@ -313,8 +350,8 @@ fn vgEq(g: ValueGen, a: string, b: string, t: int) {
 
 // One mixing step of the running hash `__vh` with u64 expression `v`.
 fn vgStep(g: ValueGen, v: string) {
-  vgLine(g, "__vh = (__vh ^ (${v})) * ${valueMixConst}")
-  vgLine(g, "__vh = __vh ^ (__vh >> 29)")
+  vgLine(g, "${g.acc} = (${g.acc} ^ (${v})) * ${valueMixConst}")
+  vgLine(g, "${g.acc} = ${g.acc} ^ (${g.acc} >> 29)")
 }
 
 fn vgHashLeaf(g: ValueGen, kind: int, a: string) {
@@ -345,6 +382,9 @@ fn vgHashLeaf(g: ValueGen, kind: int, a: string) {
 // length first for a string or slice, so `["a","b"]` and `["ab"]` differ.
 fn vgHash(g: ValueGen, a: string, t: int) {
   let (kind, elem) = vkOf(g.vd, g.mid, t, 0)
+  if (vgHashMore(g, kind, elem, a, t)) {
+    return
+  }
   if (kind != vkSlice && kind != vkString) {
     vgHashLeaf(g, kind, a)
     return
@@ -368,6 +408,10 @@ fn vgSnap(g: ValueGen, a: string, t: int): string {
   let (kind, elem) = vkOf(g.vd, g.mid, t, 0)
   if (kind == vkClass) {
     return "${a}.__snapshot()"
+  }
+  let (more, expr) = vgSnapMore(g, kind, elem, a, t)
+  if (more) {
+    return expr
   }
   if (kind != vkSlice) {
     return a
@@ -393,7 +437,7 @@ fn valueMembersText(
 ): string {
   let tree = vd.proj.mods[mid].tree
   let src = vd.proj.mods[mid].source
-  let g = ValueGen{ vd = vd, mid = mid, n = 0, buf = []u8(0) }
+  let g = ValueGen{ vd = vd, mid = mid, n = 0, buf = []u8(0), acc = "__vh" }
   let head = ""
   if (exported) {
     head = "export "
@@ -407,8 +451,7 @@ fn valueMembersText(
   vgLine(g, "return true")
   vgLine(g, "}")
   vgLine(g, "${head}${synthValueHashName}(): u64 {")
-  vgLine(g, "let __vsd: string = \"bit.valueHash\"")
-  vgLine(g, "let __vh = u64(int(ptrOf(__vsd)))")
+  vgLine(g, "let __vh = ${valueSeedFn}()")
   for f of fields {
     vgHash(g, "this.${identText(tree, src, kidsOf(tree, f)[0])}", kidsOf(tree, f)[1])
   }
@@ -467,6 +510,9 @@ fn collectValueClasses(vd: ValueDemand, m: SrcModule, mid: int): []ValueClass {
 // class's whole method text, as one word.
 fn valueSynthWords(classes: []ValueClass): []string {
   let out = []string(0)
+  if (len(classes) != 0) {
+    out = append(out, valueSeedDecl)
+  }
   for c of classes {
     out = append(out, c.text)
   }
@@ -503,10 +549,27 @@ fn graftValueDecls(dst: Tree, src: Tree, at: Span): []int {
   return out
 }
 
+// The seed's `extern fn` declaration, grafted once per module.
+fn graftValueTop(m: SrcModule, st: SynthText, text: string): []int {
+  let diags = newDiagnostics(newSourceManager())
+  let tree = parseSourceD(text, st.file, diags)
+  if (len(diags.list) != 0) {
+    panic("classvalue: synthesized declaration does not parse:\n${text}")
+  }
+  let out = []int(0)
+  for d of kidsOf(tree, tree.root) {
+    out = append(out, graftValueNode(m.tree, tree, d, synthSpan(st, text)))
+  }
+  return out
+}
+
 // Every class's three methods, grafted. A snippet that does not parse is a
 // COMPILER bug, so it fails loudly instead of building a wrong program.
 fn injectValueDecls(m: SrcModule, st: SynthText, classes: []ValueClass): []int {
   let out = []int(0)
+  if (len(classes) != 0) {
+    out = graftValueTop(m, st, valueSeedDecl)
+  }
   for c of classes {
     let diags = newDiagnostics(newSourceManager())
     let tree = parseSourceD(c.text, st.file, diags)
@@ -551,25 +614,60 @@ fn vReservedValueName(tree: Tree, source: string, diags: Diagnostics) {
 // ---- the call-site error ------------------------------------------------------
 
 // Why type `ty` has no value semantics, "" when it has (or cannot be judged:
-// the same permissive answer `vComparable` gives an unresolved type).
-fn vValueTypeBlame(c: Checker, ty: int, depth: int): string {
+// the same permissive answer `vComparable` gives an unresolved type). `home` is
+// the module of the class being judged: a payload enum has the members only
+// there.
+fn vValueTypeBlame(c: Checker, ty: int, depth: int, home: int): string {
   let t = c.ctx.types[ty]
-  if (depth > valueDepthMax || t.kind == TypeKind.Invalid) {
+  if (depth > valueDepthMax || t.kind == TypeKind.Invalid || t.kind == TypeKind.Prim) {
     return ""
   }
   if (t.kind == TypeKind.Slice) {
-    return vValueTypeBlame(c, t.elem, depth + 1)
+    return vValueTypeBlame(c, t.elem, depth + 1, home)
   }
   if (t.kind == TypeKind.Struct) {
     return vValueClassBlame(c, ty, depth + 1)
   }
-  if (t.kind == TypeKind.Prim && isDecimalPrim(c.ctx, ty)) {
-    return "a 'decimal' compares by value but stores its scale"
+  if (t.kind == TypeKind.Map) {
+    return vValueMapBlame(c, ty, depth, home)
   }
-  if (t.kind == TypeKind.Prim || (t.kind == TypeKind.Enum && !t.enumBoxed)) {
-    return ""
+  if (t.kind == TypeKind.Enum) {
+    return vValueEnumBlame(c, ty, depth, home)
   }
   return "its type has no value equality"
+}
+
+// A map has them when its key is a string, integer, bool or payload-free enum
+// and its value type has them.
+fn vValueMapBlame(c: Checker, ty: int, depth: int, home: int): string {
+  let t = c.ctx.types[ty]
+  let kt = c.ctx.types[t.mapKey]
+  let keyOk = kt.kind == TypeKind.Prim && !isDecimalPrim(c.ctx, t.mapKey) && !isFloatPrim(kt.prim)
+  if (!keyOk && !(kt.kind == TypeKind.Enum && !kt.enumBoxed)) {
+    return "a map key must be a string, integer, bool or payload-free enum"
+  }
+  return vValueTypeBlame(c, t.mapVal, depth + 1, home)
+}
+
+// A payload-free enum has them. `Option<T>` has them when `T` does. Any other
+// enum with payloads has them only when declared in the class's own module and
+// not generic; the rest (a recursive one) is judged by the syntactic pass.
+fn vValueEnumBlame(c: Checker, ty: int, depth: int, home: int): string {
+  let t = c.ctx.types[ty]
+  if (!t.enumBoxed) {
+    return ""
+  }
+  let inst = typeInstOfResult(c.ctx, ty)
+  if (inst >= 0 && c.ctx.typeInsts[inst].name == "Option") {
+    return vValueTypeBlame(c, c.ctx.typeInsts[inst].args[0], depth + 1, home)
+  }
+  if (inst >= 0) {
+    return "a generic enum has no value equality"
+  }
+  if (t.declModule != home) {
+    return "an enum with payloads has value semantics only in the module that declares the class"
+  }
+  return ""
 }
 
 // The FIRST field of class `ty`, in declaration order, without value semantics.
@@ -585,7 +683,7 @@ fn vValueClassBlame(c: Checker, ty: int, depth: int): string {
     let fty = structFieldLookup(c, "${ty}.${name}")
     let why = ""
     if (fty != 0) {
-      why = vValueTypeBlame(c, fty, depth)
+      why = vValueTypeBlame(c, fty, depth, c.ctx.types[ty].declModule)
     }
     if (why != "") {
       return "field '${name}' of type '${typeName(c.ctx, fty)}': ${why}"
@@ -607,7 +705,7 @@ fn vValueMemberBlame(c: Checker, rt: int, mname: string, nameNode: int): bool {
   report(
     c.diags, ecValueNotComparable, vSpan(c, nameNode),
     "'${mname}' is not available on '${typeName(c.ctx, rt)}': ${why}",
-    "deep value semantics need every field to be a string, number, bool, float, payload-free enum, slice of those or a class that has them (SPEC §14.3)",
+    "deep value semantics need every field to be a string, number, bool, float, decimal, enum, slice, map or Option of those, or a class that has them (SPEC §14.3)",
   )
   return true
 }
