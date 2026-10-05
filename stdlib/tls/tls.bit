@@ -124,49 +124,82 @@ export fn emptyTrustStore(): TrustStore {
 // wire, header included, so any one sealed record fits.
 const tlsapiRecordBufLen: int = 5 + recordMaxCiphertext
 
-// A TLS record reader over one socket: `conn` is the transport and `buf` holds
-// bytes read from it but not yet returned as a record. A reference type, so the
-// buffer it carries survives being handed from the handshake driver to the
-// `TlsConn` that reuses it for application records.
+// The size of `tlsapiFramer.buf`: two largest records, so a record that
+// straddles the end of one socket read completes after at most one compaction.
+const tlsapiReadBufLen: int = 2 * tlsapiRecordBufLen
+
+// A TLS record reader over one socket: `conn` is the transport and `buf[lo:hi]`
+// holds bytes read from it but not yet returned as a record. `buf` is one
+// buffer, allocated on the first read and reused for the life of the
+// connection; each socket read lands straight in its tail. A reference type, so
+// the buffer survives being handed from the handshake driver to the `TlsConn`
+// that reuses it for application records.
 class tlsapiFramer {
   conn: NetConn
   buf: []byte
-  // Read from the socket until `buf` holds at least `min` bytes. Fails if the peer
-  // closes first — a record was promised by its length prefix but never arrived.
-  // Bounded: each read yields at least one byte, so at most `min` iterations.
+  lo: int
+  hi: int
+  // Read from the socket until `buf[lo:hi]` holds at least `min` bytes (at most
+  // `5 + recordMaxCiphertext`). Fails if the peer closes first — a record was
+  // promised by its length prefix but never arrived. Bounded: each read yields
+  // at least one byte, so at most `min` iterations.
   fillTo(min: int): ()! {
+    if (this.hi - this.lo >= min) {
+      return
+    }
+    if (len(this.buf) == 0) {
+      this.buf = []byte(tlsapiReadBufLen)
+    }
+    if (this.lo + min > len(this.buf)) {
+      this.compact()
+    }
     let guard = 0
-    while (len(this.buf) < min && guard <= min) {
+    while (this.hi - this.lo < min && guard <= min) {
       guard = guard + 1
-      let chunk = this.connRead(recordMaxCiphertext)?
-      if (len(chunk) == 0) {
+      let got = this.connReadInto(this.buf[this.hi:len(this.buf)])?
+      if (got == 0) {
         fail tlsapiIoFail{ msg = "tls: connection closed in the middle of a record" }
       }
-      this.buf = tlsHsPutBytes(this.buf, []byte(chunk))
+      this.hi = this.hi + got
     }
   }
 
-  // Read up to `max` bytes off the underlying connection (a failure is a
-  // `tlsapiIoFail`, so a handshake reports it as `HandshakeFailure.Io`),
-  // bounded by its deadline when one is set (`conn.deadline() != 0`, from `dialDeadline`
-  // (#2995) — 0 is the "no deadline" sentinel every plain `dial`-made `Conn`
-  // gets; the accessor, not the field, since `Conn.deadlineNs` is private to
-  // `std/net` and #4631 enforces that) — the exact `s.conn.deadline() != 0`
-  // routing `netStream.readUp` (http.bit) uses for cleartext, so an
-  // undeadlined connection takes
-  // the identical call it always took and only a deadlined one bounds.
-  connRead(max: int): string! {
+  // Move the unconsumed `buf[lo:hi]` to the front of `buf` in one overlap-safe
+  // bulk move (#7377), so the rest of a record that straddles the end fits.
+  compact() {
+    let kept = append(this.buf[0:0], ...this.buf[this.lo:this.hi])
+    this.buf = kept[0:cap(kept)]
+    this.hi = this.hi - this.lo
+    this.lo = 0
+  }
+
+  // Read what the socket has, up to `len(dst)` bytes, into `dst`; 0 is a clean
+  // close and a failure is a `tlsapiIoFail`. A deadlined connection
+  // (`conn.deadline() != 0`) reads straight into `dst`
+  // (`Conn.readDeadlineInto`); an undeadlined one keeps `Conn.read`'s unbounded
+  // wait and copies its bytes in with one bulk append. `Conn.read` allocates a
+  // scratch of the size it is asked for on every call, so that request stays
+  // capped at one record.
+  connReadInto(dst: []byte): int! {
     if (this.conn.deadline() != 0) {
-      let s = this.conn.readDeadline(max) catch e {
+      let n = this.conn.readDeadlineInto(dst, len(dst)) catch e {
         fail tlsapiIoFail{ msg = e.message() }
       }
-      return s
+      return n
     }
-    return this.conn.read(max)
+    let max = len(dst)
+    if (max > recordMaxCiphertext) {
+      max = recordMaxCiphertext
+    }
+    let chunk = this.conn.read(max)
+    let _ = append(dst[0:0], chunk)
+    return len(chunk)
   }
 
   // Write `data` to the underlying connection, bounded by its deadline when one
-  // is set. Same routing as `connRead`.
+  // is set (`conn.deadline() != 0`; 0 is the "no deadline" sentinel). A
+  // failure is a `tlsapiIoFail`, so a handshake reports it as
+  // `HandshakeFailure.Io`.
   connWrite(data: string): ()! {
     if (this.conn.deadline() != 0) {
       this.conn.writeDeadline(data) catch e {
@@ -201,30 +234,38 @@ class tlsapiFramer {
   // length itself is unremarkable). Ordering this check first, shared by both the
   // client (`dial`) and server (`accept`) paths through this one framer, refuses
   // such a peer in milliseconds instead of blocking until it closes.
+  //
+  // The record is a VIEW into the reused `buf`, valid only until the next
+  // `nextRecord`: every caller copies it (`tlsHsPutBytes`) or decrypts it into
+  // a fresh slice (`RecordKeys.open`) before reading on.
   nextRecord(): []byte! {
+    if (this.lo == this.hi) {
+      this.lo = 0
+      this.hi = 0
+    }
     this.fillTo(5)?
-    let ct = int(this.buf[0])
+    let ct = int(this.buf[this.lo])
     if (ct != tlsCcsType &&
       ct != recordAlert &&
       ct != recordHandshake &&
       ct != recordApplicationData) {
       fail newError("tls: illegal record content type ${ct}")
     }
-    let n = (int(this.buf[3]) << 8) | int(this.buf[4])
+    let n = (int(this.buf[this.lo + 3]) << 8) | int(this.buf[this.lo + 4])
     let total = 5 + n
     if (total > 5 + recordMaxCiphertext) {
       fail newError("tls: record fragment of ${n} bytes exceeds the maximum")
     }
     this.fillTo(total)?
-    let rec = this.buf[0:total]
-    this.buf = this.buf[total:len(this.buf)]
+    let rec = this.buf[this.lo:this.lo + total]
+    this.lo = this.lo + total
     return rec
   }
 
   // Whether any bytes are already buffered — the driver's signal that another
   // record is (at least partly) in hand, so reading it on will not block.
   hasBuffered(): bool {
-    return len(this.buf) > 0
+    return this.hi > this.lo
   }
 }
 
@@ -445,7 +486,9 @@ export class TlsConn {
       }
       let pt = this.sealer.openApp(rec)?
       if (pt.contentType == recordApplicationData) {
-        this.plain = tlsHsPutBytes(this.plain, pt.content)
+        // `read` fills only once `plain` is drained, and `pt.content` is the
+        // record's own freshly decrypted slice, so it is served as is.
+        this.plain = pt.content
         return
       }
       if (pt.contentType == recordAlert) {
@@ -565,7 +608,7 @@ fn tlsapiClientConfig(host: string, config: TlsConfig): TlsClientConfig! {
 // `connRead`/`connWrite` and (through them) `TlsConn.read`/`write` consult to
 // decide whether to bound. No separate deadline threading is needed here.
 fn tlsapiHandshakeClient(conn: NetConn, clientCfg: TlsClientConfig): TlsConn! {
-  let f = tlsapiFramer{ conn = conn, buf = []byte(0) }
+  let f = tlsapiFramer{ conn = conn, buf = []byte(0), lo = 0, hi = 0 }
   let cc = tlsapiDriveClient(f, clientCfg) catch e {
     conn.close()
     fail tlsapiHandshakeError(e)
