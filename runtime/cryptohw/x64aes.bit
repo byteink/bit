@@ -1,0 +1,373 @@
+// x86-64 hardware AES via AES-NI (#7390): the providers of the four
+// `bit_rt_crypto_aes_*_hw` pins ABI.md §21b names, plus
+// `bit_rt_crypto_aes_ctr32_hw`, the multi-block counter-mode primitive GCM's
+// GCTR runs on. `stdlib/crypto/aes.bit` and `stdlib/crypto/gcm.bit` take this
+// path when `bit_rt_crypto_aes_hw_available()` answers true, and the
+// constant-time software AES otherwise.
+//
+// KEY MATERIAL. Every primitive takes the FIPS-197 forward schedule
+// `aes.bit`'s `expandKey` builds (16*(nr+1) bytes, round key i at 16*i, in
+// FIPS byte order), which is the byte order AESENC reads its round-key
+// operand in, so no translation runs. The decrypt primitive takes the
+// equivalent inverse cipher's schedule (FIPS-197 §5.3.5), which
+// `bit_rt_crypto_aes_invert_schedule_hw` derives with AESIMC.
+//
+// DETECTION. AES-NI is CPUID leaf 1 ECX bit 25. The answer is decided once
+// per process and cached; `BIT_CRYPTO_HW=0` (the switch `stdlib/crypto/hw.bit`
+// reads) forces it false, so the switch selects the software path on x86-64
+// as it does on arm64. Only legacy-SSE encodings run here (SSE2 plus AES-NI,
+// no VEX), so no AVX or XGETBV check is owed. On arm64 the answer is false
+// and every compute primitive panics: a caller reaching one asked for a path
+// it was told is absent, and a panic says so where wrong bytes would not.
+//
+// ADDRESSING. Each loop addresses the schedule as `rkEnd + i`, rkEnd = the
+// last round key (rk + 16*nr) and i running from 16 - 16*nr up to 0: round
+// key 0 is `rkEnd + span - 16`, rounds 1..nr-1 are the loop, round nr is
+// `rkEnd`, and `add i, 16` setting ZF ends the loop with no compare.
+//
+// PIPELINING. AESENC has a multi-cycle latency and a one-per-cycle (or
+// better) issue rate, so a single block per round leaves the unit idle. The
+// CTR loop runs four independent counter blocks through each round key
+// (xmm0..xmm3), xmm4 holds the nonce template and xmm5 the round key or the
+// data block being XORed. The counter itself lives in r10 in native order:
+// each block is `bswap` + `movd` + `pslldq 12` + `por` into the template,
+// and `inc r10d` wraps modulo 2^32, which is GCM's inc32.
+//
+// REGISTERS. Only xmm0..xmm5 are used: Win64 preserves xmm6..xmm15 across a
+// call, SysV preserves none, and one x64 payload serves both. Every block
+// names a caller-saved GPR in `clobber`, which makes it a clobber point that
+// keeps every live value, a float included, out of the caller-saved file
+// (SPEC §11.6).
+//
+// ENCODING PROVENANCE. No text assembler exists in this compiler (SPEC
+// §11.6): every byte below was assembled from the mnemonic in its comment
+// with this Mac's toolchain (`clang -c -arch x86_64`, Intel syntax) and read
+// back with `objdump -d`. No payload holds an `E8` byte or an `FF` whose
+// ModRM reg field is 2 or 3, so SPEC §11.6's call decoder reads none of it
+// as a call. Back edges are hand-computed displacements, as SPEC §11.6
+// allows.
+//
+// CHUNKED FOR THE COLLECTOR. The blocks are opaque and hold no safepoint, so
+// one CTR call runs at most `aesX64ChunkGroups` four-block groups (64 KiB)
+// and a large buffer still reaches the Bit loop's back edge, and its
+// safepoint, every few microseconds.
+//
+// THE CTR BLOCK. `bit_rt_crypto_aes_ctr32_hw` takes its counter and its
+// round count in one caller-owned 24-byte block: bytes 0..15 the counter
+// block, bytes 16..23 the round count as a little-endian 64-bit word.
+
+const aesX64ChunkGroups: int = 1024
+
+// CPUID leaf 1 ECX bit 25: AES-NI.
+const cpuidAes: u64 = 33554432
+
+// -1 = not yet decided, 0 = software, 1 = AES-NI. Racing first callers
+// compute the identical answer from the identical CPU and environment.
+let aesNiState: int = -1
+
+// 1 when this is x86-64 with AES-NI and `BIT_CRYPTO_HW` is not "0", else 0.
+fn x64AesNiDetect(): int {
+  if (!onX64()) {
+    return 0
+  }
+  if (osEnv("BIT_CRYPTO_HW") == "0") {
+    return 0
+  }
+  if ((x64CpuidLeaf1Ecx() & cpuidAes) == 0) {
+    return 0
+  }
+  return 1
+}
+
+// `bit_rt_crypto_aes_hw_available`: whether the AES-NI path below runs.
+export @symbol("bit_rt_crypto_aes_hw_available") fn rtCryptoAesHwAvailable(): bool {
+  if (aesNiState < 0) {
+    aesNiState = x64AesNiDetect()
+  }
+  return aesNiState == 1
+}
+
+// Panics unless AES-NI is in use and `nr` is an AES round count: the asm
+// loops below run nr-1 times and never terminate on nr = 1.
+fn x64AesNiRequire(nr: int) {
+  if (!rtCryptoAesHwAvailable()) {
+    panic("bit_rt_crypto_aes_*_hw: hardware AES requested but unavailable (runtime/cryptohw/x64aes.bit)")
+  }
+  if (nr != 10 && nr != 12 && nr != 14) {
+    panic("bit_rt_crypto_aes_*_hw: round count must be 10, 12 or 14")
+  }
+}
+
+// One block: `dst` = AES_rk(`src`). The arm64 arm is a trap.
+fn x64AesEncRun(rk: int, nr: int, src: int, dst: int) {
+  asm volatile {
+    arm64 { 0xD4200000 } // brk #0
+    x64 {
+      0xF3, 0x0F, 0x6F, 0x02,             // movdqu xmm0, [rdx]
+      0xF3, 0x0F, 0x6F, 0x6C, 0x08, 0xF0, // movdqu xmm5, [rax+rcx-0x10]
+      0x66, 0x0F, 0xEF, 0xC5,             // pxor xmm0, xmm5
+      0xF3, 0x0F, 0x6F, 0x2C, 0x08,       // loop: movdqu xmm5, [rax+rcx]
+      0x66, 0x0F, 0x38, 0xDC, 0xC5,       // aesenc xmm0, xmm5
+      0x48, 0x83, 0xC1, 0x10,             // add rcx, 0x10
+      0x75, 0xF0,                         // jne loop (rel8 -16)
+      0xF3, 0x0F, 0x6F, 0x28,             // movdqu xmm5, [rax]
+      0x66, 0x0F, 0x38, 0xDD, 0xC5,       // aesenclast xmm0, xmm5
+      0xF3, 0x41, 0x0F, 0x7F, 0x00,       // movdqu [r8], xmm0
+    }
+    input arm64 x0 x64 rax = rk + 16 * nr
+    input arm64 x1 x64 rcx = 16 - 16 * nr
+    input arm64 x2 x64 rdx = src
+    input arm64 x3 x64 r8 = dst
+    clobber arm64 { memory }
+    clobber x64 { r9, memory }
+  }
+}
+
+// One block: `dst` = AES^-1(`src`) under the equivalent inverse schedule
+// `drk`. The arm64 arm is a trap.
+fn x64AesDecRun(drk: int, nr: int, src: int, dst: int) {
+  asm volatile {
+    arm64 { 0xD4200000 } // brk #0
+    x64 {
+      0xF3, 0x0F, 0x6F, 0x02,             // movdqu xmm0, [rdx]
+      0xF3, 0x0F, 0x6F, 0x6C, 0x08, 0xF0, // movdqu xmm5, [rax+rcx-0x10]
+      0x66, 0x0F, 0xEF, 0xC5,             // pxor xmm0, xmm5
+      0xF3, 0x0F, 0x6F, 0x2C, 0x08,       // loop: movdqu xmm5, [rax+rcx]
+      0x66, 0x0F, 0x38, 0xDE, 0xC5,       // aesdec xmm0, xmm5
+      0x48, 0x83, 0xC1, 0x10,             // add rcx, 0x10
+      0x75, 0xF0,                         // jne loop (rel8 -16)
+      0xF3, 0x0F, 0x6F, 0x28,             // movdqu xmm5, [rax]
+      0x66, 0x0F, 0x38, 0xDF, 0xC5,       // aesdeclast xmm0, xmm5
+      0xF3, 0x41, 0x0F, 0x7F, 0x00,       // movdqu [r8], xmm0
+    }
+    input arm64 x0 x64 rax = drk + 16 * nr
+    input arm64 x1 x64 rcx = 16 - 16 * nr
+    input arm64 x2 x64 rdx = src
+    input arm64 x3 x64 r8 = dst
+    clobber arm64 { memory }
+    clobber x64 { r9, memory }
+  }
+}
+
+// `dst` = InvMixColumns(`src`), one round key. The arm64 arm is a trap.
+fn x64AesImc(src: int, dst: int) {
+  asm volatile {
+    arm64 { 0xD4200000 } // brk #0
+    x64 {
+      0xF3, 0x0F, 0x6F, 0x00,       // movdqu xmm0, [rax]
+      0x66, 0x0F, 0x38, 0xDB, 0xC0, // aesimc xmm0, xmm0
+      0xF3, 0x0F, 0x7F, 0x02,       // movdqu [rdx], xmm0
+    }
+    input arm64 x0 x64 rax = src
+    input arm64 x1 x64 rdx = dst
+    clobber arm64 { memory }
+    clobber x64 { r9, memory }
+  }
+}
+
+// The round count stored in the CTR block at `ctr` (bytes 16..23, little
+// endian). Validated by `x64AesNiRequire` before any asm loop runs on it.
+fn x64AesCtrRounds(ctr: int): int {
+  let nr = 0
+  let i = 23
+  while (i >= 16) {
+    nr = (nr << 8) | int(*aesByteAt(ctr + i))
+    i = i - 1
+  }
+  return nr
+}
+
+// `groups` (> 0) four-block groups of counter mode: block j of the run is
+// `dst[16j..]` = `src[16j..]` XOR AES_rk(counter + j), the counter being the
+// first 16 bytes of the CTR block at `ctr`, whose last four are a big-endian
+// count that wraps modulo 2^32. Reads `ctr` and leaves it unchanged; the
+// caller advances it. `dst` may equal `src`. Called only after the caller
+// validated the block's round count. The arm64 arm is a trap.
+fn x64AesCtrRun(rk: int, ctr: int, src: int, dst: int, groups: int) {
+  let nr = x64AesCtrRounds(ctr)
+  asm volatile {
+    arm64 { 0xD4200000 } // brk #0
+    x64 {
+      0xF3, 0x41, 0x0F, 0x6F, 0x23,       // movdqu xmm4, [r11]
+      0x45, 0x8B, 0x53, 0x0C,             // mov r10d, [r11+0xc]
+      0x41, 0x0F, 0xCA,                   // bswap r10d
+      0x66, 0x0F, 0x73, 0xFC, 0x04,       // pslldq xmm4, 0x4
+      0x66, 0x0F, 0x73, 0xDC, 0x04,       // psrldq xmm4, 0x4 (template: nonce, zero count)
+      0x45, 0x89, 0xD3,                   // group: mov r11d, r10d
+      0x41, 0x0F, 0xCB,                   // bswap r11d
+      0x66, 0x41, 0x0F, 0x6E, 0xC3,       // movd xmm0, r11d
+      0x66, 0x0F, 0x73, 0xF8, 0x0C,       // pslldq xmm0, 0xc
+      0x66, 0x0F, 0xEB, 0xC4,             // por xmm0, xmm4
+      0x41, 0xFF, 0xC2,                   // inc r10d
+      0x45, 0x89, 0xD3,                   // mov r11d, r10d
+      0x41, 0x0F, 0xCB,                   // bswap r11d
+      0x66, 0x41, 0x0F, 0x6E, 0xCB,       // movd xmm1, r11d
+      0x66, 0x0F, 0x73, 0xF9, 0x0C,       // pslldq xmm1, 0xc
+      0x66, 0x0F, 0xEB, 0xCC,             // por xmm1, xmm4
+      0x41, 0xFF, 0xC2,                   // inc r10d
+      0x45, 0x89, 0xD3,                   // mov r11d, r10d
+      0x41, 0x0F, 0xCB,                   // bswap r11d
+      0x66, 0x41, 0x0F, 0x6E, 0xD3,       // movd xmm2, r11d
+      0x66, 0x0F, 0x73, 0xFA, 0x0C,       // pslldq xmm2, 0xc
+      0x66, 0x0F, 0xEB, 0xD4,             // por xmm2, xmm4
+      0x41, 0xFF, 0xC2,                   // inc r10d
+      0x45, 0x89, 0xD3,                   // mov r11d, r10d
+      0x41, 0x0F, 0xCB,                   // bswap r11d
+      0x66, 0x41, 0x0F, 0x6E, 0xDB,       // movd xmm3, r11d
+      0x66, 0x0F, 0x73, 0xFB, 0x0C,       // pslldq xmm3, 0xc
+      0x66, 0x0F, 0xEB, 0xDC,             // por xmm3, xmm4
+      0x41, 0xFF, 0xC2,                   // inc r10d
+      0xF3, 0x0F, 0x6F, 0x6C, 0x08, 0xF0, // movdqu xmm5, [rax+rcx-0x10]
+      0x66, 0x0F, 0xEF, 0xC5,             // pxor xmm0, xmm5
+      0x66, 0x0F, 0xEF, 0xCD,             // pxor xmm1, xmm5
+      0x66, 0x0F, 0xEF, 0xD5,             // pxor xmm2, xmm5
+      0x66, 0x0F, 0xEF, 0xDD,             // pxor xmm3, xmm5
+      0x49, 0x89, 0xCB,                   // mov r11, rcx
+      0xF3, 0x42, 0x0F, 0x6F, 0x2C, 0x18, // round: movdqu xmm5, [rax+r11]
+      0x66, 0x0F, 0x38, 0xDC, 0xC5,       // aesenc xmm0, xmm5
+      0x66, 0x0F, 0x38, 0xDC, 0xCD,       // aesenc xmm1, xmm5
+      0x66, 0x0F, 0x38, 0xDC, 0xD5,       // aesenc xmm2, xmm5
+      0x66, 0x0F, 0x38, 0xDC, 0xDD,       // aesenc xmm3, xmm5
+      0x49, 0x83, 0xC3, 0x10,             // add r11, 0x10
+      0x75, 0xE0,                         // jne round (rel8 -32)
+      0xF3, 0x0F, 0x6F, 0x28,             // movdqu xmm5, [rax]
+      0x66, 0x0F, 0x38, 0xDD, 0xC5,       // aesenclast xmm0, xmm5
+      0x66, 0x0F, 0x38, 0xDD, 0xCD,       // aesenclast xmm1, xmm5
+      0x66, 0x0F, 0x38, 0xDD, 0xD5,       // aesenclast xmm2, xmm5
+      0x66, 0x0F, 0x38, 0xDD, 0xDD,       // aesenclast xmm3, xmm5
+      0xF3, 0x0F, 0x6F, 0x2A,             // movdqu xmm5, [rdx]
+      0x66, 0x0F, 0xEF, 0xC5,             // pxor xmm0, xmm5
+      0xF3, 0x41, 0x0F, 0x7F, 0x00,       // movdqu [r8], xmm0
+      0xF3, 0x0F, 0x6F, 0x6A, 0x10,       // movdqu xmm5, [rdx+0x10]
+      0x66, 0x0F, 0xEF, 0xCD,             // pxor xmm1, xmm5
+      0xF3, 0x41, 0x0F, 0x7F, 0x48, 0x10, // movdqu [r8+0x10], xmm1
+      0xF3, 0x0F, 0x6F, 0x6A, 0x20,       // movdqu xmm5, [rdx+0x20]
+      0x66, 0x0F, 0xEF, 0xD5,             // pxor xmm2, xmm5
+      0xF3, 0x41, 0x0F, 0x7F, 0x50, 0x20, // movdqu [r8+0x20], xmm2
+      0xF3, 0x0F, 0x6F, 0x6A, 0x30,       // movdqu xmm5, [rdx+0x30]
+      0x66, 0x0F, 0xEF, 0xDD,             // pxor xmm3, xmm5
+      0xF3, 0x41, 0x0F, 0x7F, 0x58, 0x30, // movdqu [r8+0x30], xmm3
+      0x48, 0x83, 0xC2, 0x40,             // add rdx, 0x40
+      0x49, 0x83, 0xC0, 0x40,             // add r8, 0x40
+      0x49, 0xFF, 0xC9,                   // dec r9
+      0x0F, 0x85, 0x08, 0xFF, 0xFF, 0xFF, // jne group (rel32 -248)
+    }
+    input arm64 x0 x64 rax = rk + 16 * nr
+    input arm64 x1 x64 rcx = 16 - 16 * nr
+    input arm64 x2 x64 rdx = src
+    input arm64 x3 x64 r8 = dst
+    input arm64 x4 x64 r9 = groups
+    input arm64 x5 x64 r11 = ctr
+    clobber arm64 { memory }
+    clobber x64 { r10, memory }
+  }
+}
+
+// Adds `n` to the big-endian count in bytes 12..15 of the counter block at
+// `ctr`, modulo 2^32 (GCM's inc32 applied `n` times).
+fn x64AesCtrAdvance(ctr: int, n: int) {
+  let c = 0
+  let i = 12
+  while (i < 16) {
+    c = (c << 8) | int(*aesByteAt(ctr + i))
+    i = i + 1
+  }
+  c = (c + n) & 0xffffffff
+  i = 15
+  while (i >= 12) {
+    *aesByteAt(ctr + i) = byte(c & 0xff)
+    c = c >> 8
+    i = i - 1
+  }
+}
+
+// One counter block: `dst` = `src` XOR AES_rk(counter), then the counter
+// advances by one. For the 0..3 blocks a run leaves after its four-block
+// groups.
+fn x64AesCtrOne(rk: int, nr: int, ctr: int, src: int, dst: int) {
+  let ks = []byte(16)
+  let ksAddr = int(ptrOf(ks))
+  x64AesEncRun(rk, nr, ctr, ksAddr)
+  let i = 0
+  while (i < 16) {
+    *aesByteAt(dst + i) = *aesByteAt(src + i) ^ ks[i]
+    i = i + 1
+  }
+  x64AesCtrAdvance(ctr, 1)
+}
+
+// `bit_rt_crypto_aes_encrypt_hw(round_keys, nr, block, out)`: one block.
+// `out` may equal `block`.
+export @symbol("bit_rt_crypto_aes_encrypt_hw") fn rtCryptoAesEncryptHw(
+  roundKeys: int,
+  nr: int,
+  block: int,
+  out: int,
+) {
+  x64AesNiRequire(nr)
+  x64AesEncRun(roundKeys, nr, block, out)
+}
+
+// `bit_rt_crypto_aes_decrypt_hw(dec_round_keys, nr, block, out)`: one block
+// under the schedule `bit_rt_crypto_aes_invert_schedule_hw` derives.
+export @symbol("bit_rt_crypto_aes_decrypt_hw") fn rtCryptoAesDecryptHw(
+  decRoundKeys: int,
+  nr: int,
+  block: int,
+  out: int,
+) {
+  x64AesNiRequire(nr)
+  x64AesDecRun(decRoundKeys, nr, block, out)
+}
+
+// `bit_rt_crypto_aes_invert_schedule_hw(enc_round_keys, nr, out)`: the
+// equivalent inverse cipher's schedule (FIPS-197 §5.3.5) into `out`, which
+// must not overlap the forward schedule: dw[0] = w[nr], dw[i] =
+// InvMixColumns(w[nr-i]) for 0 < i < nr, dw[nr] = w[0].
+export @symbol("bit_rt_crypto_aes_invert_schedule_hw") fn rtCryptoAesInvertScheduleHw(
+  encRoundKeys: int,
+  nr: int,
+  out: int,
+) {
+  x64AesNiRequire(nr)
+  aesCopyBlock(out, encRoundKeys + 16 * nr)
+  aesCopyBlock(out + 16 * nr, encRoundKeys)
+  let i = 1
+  while (i < nr) {
+    x64AesImc(encRoundKeys + 16 * (nr - i), out + 16 * i)
+    i = i + 1
+  }
+}
+
+// `bit_rt_crypto_aes_ctr32_hw(round_keys, ctr, src, dst, blocks)`: `blocks`
+// full 16-byte blocks of counter mode from `src` into `dst` (which may equal
+// `src`), the keystream being AES, at the round count the CTR block at `ctr`
+// carries, of its counter block under inc32. The counter is advanced past
+// the last block used, so a following call or a trailing partial block
+// continues the same stream.
+export @symbol("bit_rt_crypto_aes_ctr32_hw") fn rtCryptoAesCtr32Hw(
+  roundKeys: int,
+  ctr: int,
+  src: int,
+  dst: int,
+  blocks: int,
+) {
+  let nr = x64AesCtrRounds(ctr)
+  x64AesNiRequire(nr)
+  let groups = blocks / 4
+  let off = 0
+  while (groups > 0) {
+    let n = groups
+    if (n > aesX64ChunkGroups) {
+      n = aesX64ChunkGroups
+    }
+    x64AesCtrRun(roundKeys, ctr, src + off, dst + off, n)
+    x64AesCtrAdvance(ctr, n * 4)
+    off = off + n * 64
+    groups = groups - n
+  }
+  while (off < blocks * 16) {
+    x64AesCtrOne(roundKeys, nr, ctr, src + off, dst + off)
+    off = off + 16
+  }
+}
