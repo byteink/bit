@@ -51,6 +51,8 @@ is written `%40`, `%2F`, `%3A`.
 | `postmark://token@default` | Postmark's HTTPS API instead of SMTP: see [Sending through Postmark](postmark.md) |
 | `sendgrid://key@default` | SendGrid's HTTPS API instead of SMTP, `@eu` for its EU host: see [Sending through SendGrid](sendgrid.md) |
 | `mailgun://key:domain@default` | Mailgun's HTTPS API instead of SMTP, `@eu` for its EU region: see [Sending through Mailgun](mailgun.md) |
+| `log://` | prints each mail to standard output, sends nothing: see [Seeing mail in development](#seeing-mail-in-development) |
+| `file:///var/mail`, `file://./outbox` | writes each mail to that directory as one `.eml` file, sends nothing: see [Seeing mail in development](#seeing-mail-in-development) |
 
 TLS is not a setting you can lose. With `smtp://` the connection is upgraded
 with STARTTLS before any password is sent, and a server that does not offer
@@ -111,12 +113,98 @@ fn main(): ()! {
   it to a lab. It is not needed for a private CA: use `caFile`.
 * **`tls=off`** is above.
 
+## Seeing mail in development
+
+On your laptop there is no SMTP account, and still Sara's sign-up has to show
+you the verification link. Two URLs send nothing and show you the mail instead.
+Put the choice in the same `MAIL_URL` the production code reads, and the
+program does not change between your machine and the server:
+
+```bit
+import { Message, Options, open } from "mail"
+import { envOr } from "std/os"
+
+fn main(): ()! {
+  let mailer = open(envOr("MAIL_URL", "log://"), Options{ from = "Inkwell <hello@inkwell.dev>" })?
+  let receipt = mailer.send(
+    Message{
+      to = ["Sara Ali <sara@example.com>"],
+      subject = "Welcome to Inkwell",
+      text = "Hello Sara. Write your first note at https://inkwell.dev/new",
+      id = "welcome-7",
+    },
+  )?
+  println("sent ${receipt.id}, provider id ${receipt.providerId}")
+  mailer.close()
+  return
+}
+```
+
+With `log://` each mail is printed to standard output as a block: a rule, the
+`From`, `To`, `Cc` and `Bcc` lines, the `Subject`, the `Message-ID`, each
+attachment's name and size, the text part, and a rule. When a message has only
+`html`, the text shown is the one generated from it, so the link is there to
+click. The raw MIME is not printed: no base64 attachments, and no key or secret
+from `Options`. A DKIM signature appears as one line naming its `d=` and `s=`.
+`Receipt.providerId` is `log`.
+
+```text
+------------------------------------------------------------
+From: Inkwell <hello@inkwell.dev>
+To: Sara Ali <sara@example.com>
+Subject: Welcome to Inkwell
+Message-ID: <welcome-7@inkwell.dev>
+
+Hello Sara. Write your first note at https://inkwell.dev/new
+------------------------------------------------------------
+```
+
+A designer wants the real message in a mail client. `file://` writes the exact
+bytes that would go on the wire, signed if `Options.dkim` is set, to a directory:
+
+```bit
+import { Message, Options, open } from "mail"
+
+fn main(): ()! {
+  let mailer = open("file://./outbox", Options{ from = "Inkwell <hello@inkwell.dev>" })?
+  let receipt = mailer.send(
+    Message{
+      to = ["Sara Ali <sara@example.com>"],
+      subject = "Welcome to Inkwell",
+      text = "Hello Sara.",
+      id = "welcome-7",
+    },
+  )?
+  println(receipt.providerId)
+  mailer.close()
+  return
+}
+```
+
+That prints a name such as `20261006-070809-welcome-7_inkwell.dev.eml` in `./outbox`,
+which opens in Apple Mail, Thunderbird or Outlook.
+
+* The name is the UTC send time, `yyyyMMdd-HHmmss`, then the Message-ID with every
+  byte outside `A-Z a-z 0-9 . _ -` turned into `_`, so a listing sorts by send
+  time and a Message-ID can never reach another directory. Two mails with one
+  name get `-2`, `-3` and so on; a file is never overwritten.
+* Each file appears whole or not at all: it is written under a dot name in the
+  same directory and renamed into place. A symlink in the directory at a name
+  the mail would take is skipped over, never written through.
+* The directory is a path after `file://`: `file:///var/mail` is absolute and
+  `file://./outbox` is relative to where the program runs (resolved at `open`).
+  It must exist and be writable, which `open` checks by creating and deleting a
+  file in it. Otherwise `open` fails with a `MailError.Config`.
+* Neither URL takes a query parameter; there is nothing to set. One that is
+  given fails at `open`.
+
 ## Every mistake fails at `open`
 
 A URL is configuration, so a wrong one stops the program where it starts. Each
 of these is a `MailError.Config` that names what is wrong: an empty URL, an
 unknown scheme (`imap://`), no host, a port outside 1 to 65535, a path, any
-query parameter not listed above, the same parameter twice, a bad percent
+query parameter not listed above (any at all on `log://` and `file://`), a
+missing or unwritable `file://` directory, the same parameter twice, a bad percent
 escape, a missing `caFile`.
 
 The password is never in an error, a `Receipt` or the text of the transport. A
