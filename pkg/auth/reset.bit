@@ -1,0 +1,225 @@
+// pkg/auth/reset.bit — password reset on the one-time token primitive
+// (onetime.bit, #6925; this file is #6932, epic #3960). Built the way email
+// verification (verify_email.bit, #6933) and magic links (magiclink.bit,
+// #6934) are, so the three read alike.
+//
+//   let reset = PasswordReset(tokens, ResetOptions{
+//     lookup = users.idByEmail,
+//     deliver = mailTheLink,
+//     setPassword = users.setHash,
+//     sessions = sessions,
+//   })?
+//   reset.request("ada@example.com")?              // POST /reset: the same answer for anyone
+//   reset.confirm(tokenFromTheLink, newPassword)?  // POST /reset/confirm
+//
+// STANDARDS. OWASP Forgot Password Cheat Sheet (the same response and timing
+// for every identifier, single-use short-lived tokens stored hashed, end the
+// other sessions), OWASP ASVS v5 (credential recovery), and NIST SP 800-63B
+// section 5.1.1.2 (a new password is checked against the password rules) and
+// 6.1.2 (recovery by a secret sent out of band).
+//
+// ## What is guaranteed
+//
+//  - The token is the one `OneTimeTokens` makes: 256 bits from the OS CSPRNG,
+//    only its SHA-256 stored, redeemed once by an atomic take, compared to its
+//    purpose in constant time, and good for `ttl` seconds (an hour).
+//  - Only the newest token works. `request` issues with `Live.One`, so the
+//    earlier ones die in the same atomic store step that saves the new one,
+//    even when two requests run at the same instant.
+//  - `request` gives the same answer for an identifier that has an account and
+//    one that has none: the same result, the same one atomic store step, and no
+//    delivery failure ever reaches the caller (it would say "this account
+//    exists"). For an unknown identifier the store step is on a decoy record no
+//    token can reach and `deliver` is not called. What `deliver` costs is the
+//    app's to even out: have it queue the mail rather than send it inline.
+//  - `confirm` refuses every bad token with the same `InvalidToken`: unknown,
+//    expired, used, malformed, or issued for another purpose.
+//  - A password the policy refuses does not spend the token: the person is
+//    told what to fix and uses the same link again. The policy, and so its
+//    breach check, only ever runs for a holder of a live token, never for
+//    noise sent to the endpoint.
+//  - A reset ends every session the user holds (`logoutEverywhere`,
+//    revoke.bit), the one that asked included, and revokes every outstanding
+//    reset token of the user. A password changed under an attacker's stolen
+//    session ends that session.
+//  - Tokens are never put in an error message or a log line by this file.
+//
+// ## The token spent, the password not set
+//
+// The token is consumed before `setPassword` runs, so a failing `setPassword`
+// leaves the person to ask for a new link rather than leaving a spent link
+// live. The one exception is the policy: see above.
+import { runRecovering } from "std/runtime"
+
+// What the token is for. Not any other flow's purpose, so a verification token
+// or a magic link can never reset a password.
+const resetPurpose: string = "password-reset"
+
+// The purpose and subject of the record an unknown identifier gets instead of
+// a token, so `request` does the same store step for every identifier. Nobody
+// holds its token, and one record is all there ever is.
+const resetDecoyPurpose: string = "password-reset-decoy"
+const resetDecoySubject: string = "decoy"
+
+// Told when `deliver` fails. `request` revokes the token nobody received, and
+// cannot return the failure (see this file's header), so this is how the app
+// hears of it: log it. The error may name the identifier; the token is never
+// in it. Whatever the hook does, `request` goes on, and a panic in it is caught.
+export type ResetErrorHook = (error) => ()
+
+// The options of `PasswordReset`.
+export class ResetOptions {
+  // Finds the id of the user an identifier (an email address, a username)
+  // belongs to, `None` when there is none. Required.
+  export lookup: (string) => Option<string>,
+  // Sends the token to the person, the identifier being `to`. Required. Give
+  // it a queue, not an inline mail send, so a known account does not answer
+  // slower than an unknown one.
+  export deliver: Deliver,
+  // Stores `hash`, an Argon2id string (`hashPassword`, password.bit), as the
+  // password of the user `userId`. Called with `userId` and `hash`. Required.
+  // A failure is returned by `confirm` as it came.
+  export setPassword: (string, string) => ()!,
+  // The session store the app passed to `Config`: every session of the user
+  // dies when the password changes. Required.
+  export sessions: SessionStore,
+  // The rules for the new password (`None`: only that it is not empty). Pass
+  // one: NIST SP 800-63B asks for it, and it is how your blocklist or breach
+  // check applies here.
+  export policy: Option<PasswordPolicy>,
+  // How long a token lives, in seconds: one hour. At most the `maxTtl` of the
+  // `OneTimeTokens` it is built on.
+  export ttl: i64 = 3600,
+  // Told when `deliver` fails (`nil`: nobody).
+  export onError: ResetErrorHook,
+}
+
+// Sends and confirms password reset tokens. Stateless apart from the token
+// store, so one value is shared by every request.
+export class PasswordReset {
+  tokens: OneTimeTokens
+  opts: ResetOptions
+
+  // Fails for a missing option or a `ttl` that cannot work, so the mistake
+  // shows when the app starts.
+  init(tokens: OneTimeTokens, opts: ResetOptions)! {
+    if (opts.lookup == nil) {
+      fail newError("auth: PasswordReset(): `lookup` is not set — it finds the user an identifier belongs to")
+    }
+    if (opts.deliver == nil) {
+      fail newError("auth: PasswordReset(): `deliver` is not set — it sends the token")
+    }
+    if (opts.setPassword == nil) {
+      fail newError("auth: PasswordReset(): `setPassword` is not set — it stores the new password hash")
+    }
+    if (opts.sessions == nil) {
+      fail newError("auth: PasswordReset(): `sessions` is not set — pass the session store the app gave `Config`")
+    }
+    if (opts.ttl < 1 || opts.ttl > tokens.opts.maxTtl) {
+      fail newError("auth: PasswordReset(): `ttl` is ${opts.ttl} second(s) — it must be between 1 and ${tokens.opts.maxTtl}")
+    }
+    this.tokens = tokens
+    this.opts = opts
+  }
+
+  // Sends a reset token to `identifier` when it has an account, and kills the
+  // tokens sent before. Answers the same either way; see this file's header.
+  // A failed delivery is not a failure here: the token is revoked and the
+  // hook told. Fails only for a store that fails, which it does for known and
+  // unknown identifiers alike.
+  export request(identifier: string): ()! {
+    let lookup = this.opts.lookup
+    let found = lookup(identifier)
+    if (!isSome(found)) {
+      this.decoy()?
+      return
+    }
+    this.send(unwrap(found), identifier)?
+  }
+
+  // Consumes `token`, applies the policy to `newPassword`, stores its hash with
+  // `setPassword`, ends every session of the user and revokes their other
+  // reset tokens.
+  //
+  // Fails with `InvalidToken` for every reason it will not honour a token. A
+  // password the policy refuses fails with `PolicyViolations` and the token
+  // stays live. A failure of `setPassword` or of the session store is
+  // returned as it came, the token being spent.
+  export confirm(token: string, newPassword: string): ()! {
+    if (newPassword == "") {
+      fail newError("auth: PasswordReset.confirm(): `newPassword` is empty")
+    }
+    let rec = this.tokens.redeem(token, resetPurpose)?
+    let hash = this.hashNew(newPassword) catch e {
+      this.restore(token, rec)
+      fail e
+    }
+    let setPassword = this.opts.setPassword
+    setPassword(rec.subject, hash)?
+    logoutEverywhere(this.opts.sessions, rec.subject)?
+    this.tokens.revokeSubject(resetPurpose, rec.subject)?
+  }
+
+  // The token for `userId`, replacing the earlier ones, handed to `deliver`. A
+  // failed delivery revokes the token, nobody has it, and goes to the hook.
+  send(userId: string, identifier: string): ()! {
+    let at = this.tokens.nowSec()
+    let token = this.tokens.issue(resetPurpose, userId, this.opts.ttl, live = Live.One)?
+    // `at` is read before the record's own clock read, so a message saying
+    // "valid until" is never later than the truth.
+    let deliver = this.opts.deliver
+    deliver(identifier, token, at + this.opts.ttl) catch e {
+      this.dropUnsent(userId)
+      this.report(e)
+    }
+  }
+
+  // What an unknown identifier gets in place of `send`: the same issue, one
+  // atomic store step, of a token nobody is given.
+  decoy(): ()! {
+    let _ = this.tokens.issue(resetDecoyPurpose, resetDecoySubject, this.opts.ttl, live = Live.One)?
+  }
+
+  // A store that cannot revoke is not worse news than the delivery failure the
+  // hook is about to hear, so its error is dropped.
+  dropUnsent(userId: string) {
+    this.tokens.revokeSubject(resetPurpose, userId) catch _ {
+      return
+    }
+  }
+
+  // Hands the hook the delivery failure; whatever it does, `request` goes on.
+  report(e: error) {
+    let hook = this.opts.onError
+    if (hook == nil) {
+      return
+    }
+    let (_, _) = runRecovering(() => {
+      hook(e)
+    })
+  }
+
+  // `newPassword` hashed under the policy, failing with `PolicyViolations`
+  // when it breaks a rule; `hashPassword` when the app set none.
+  hashNew(newPassword: string): string! {
+    match (this.opts.policy) {
+      None => return hashPassword(newPassword)
+      Some(p) => return p.hash(newPassword)?
+    }
+  }
+
+  // Puts back the record `redeem` took, for the time it had left, so a password
+  // the policy refused does not cost the person their link. A store that fails
+  // here is not worse news than the violation the caller needs to see, so its
+  // error is dropped: the person asks for a new link. A request that issues
+  // between the take and this put leaves two live tokens until one is used.
+  restore(token: string, rec: OneTimeRecord) {
+    let left = rec.expiresAt - this.tokens.nowSec()
+    if (left < 1) {
+      return
+    }
+    this.tokens.store.put(oneTimeHash(token), rec, left) catch _ {
+      return
+    }
+  }
+}
