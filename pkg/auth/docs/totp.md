@@ -89,10 +89,13 @@ import {
   BindOptions,
   CompleteOptions,
   Identity,
+  Lookup,
   LoginThrottle,
+  PasswordOptions,
+  PasswordStrategy,
   Secret,
   SecondFactor,
-  Strategy,
+  SecondRequired,
   TotpFactor,
   TotpFactorOptions,
   bindSession,
@@ -159,25 +162,35 @@ a replay. Wrong codes are counted in the throttle under the user's id, apart
 from the password login, so a flood of them locks the second step and not the
 whole account.
 
-Now the two routes. The password step authenticates as it always did, and, for
-a user who has enrolled, holds the session back with `second = true` before
-answering. The code step is one call:
+Now the login. The password strategy is told, through `PasswordOptions.second`,
+which users still owe a code: it gets the verified `Identity` and answers
+`true` for one who has enrolled. For that user the strategy never starts a full
+session. It binds the login **pending** itself, before it answers, and fails
+with the 401 below; there is no moment when a password alone is a login, and no
+line for a handler to forget:
 
 ```bit
 @json class CodeForm {
   code: string,
 }
 
-fn mountLogin(app: App, passwords: Strategy, factor: TotpFactor, db: TwoFactorDb) {
+fn enrolled(db: TwoFactorDb): SecondRequired {
+  let f: SecondRequired = (who) => {
+    let (_, found) = db.rows[who.id]
+    return found
+  }
+  return f
+}
+
+fn mountLogin(app: App, lookup: Lookup, factor: TotpFactor, db: TwoFactorDb) {
+  let passwords = PasswordStrategy(
+    lookup,
+    PasswordOptions{ second = Option<SecondRequired>.Some(enrolled(db)) },
+  )
   let login = app.group("/login")
   login.post("/", (c) => {
     let who = passwords.authenticate(c)?
-    let (_, enrolled) = db.rows[who.id]
-    if (!enrolled) {
-      return c.text("welcome")
-    }
-    bindSession(c, who, BindOptions{ second = true })?
-    return c.text("code required")
+    return c.text("welcome ${who.id}")
   })
   login.post("/code", (c) => {
     let form = c.body<CodeForm>()?
@@ -188,13 +201,13 @@ fn mountLogin(app: App, passwords: Strategy, factor: TotpFactor, db: TwoFactorDb
 }
 ```
 
-Read it from the top. `passwords.authenticate(c)` verifies the password and
-binds a full login, as every `Strategy` does; `bindSession` with
-`BindOptions{ second = true }` then replaces that login with a pending one, in
-the same request, before anything is sent. From then on the session holds the
-user's id under a pending key and nothing under the identity key. `/me` is
-refused, and so is every route behind `requireAuth` or `currentIdentity`, with a
-401 whose body says why:
+Read it from the top. For a user who has not enrolled, `second` says no and
+`passwords.authenticate(c)` is the full login it always was. For one who has,
+it verifies the password and binds `BindOptions{ second = true }` directly, so
+the session holds the user's id under a pending key and nothing under the
+identity key, then fails instead of returning the `Identity`: `/login` answers
+401 and `/me` is refused, as is every route behind `requireAuth` or
+`currentIdentity`, with a body that says why:
 
 ```text
 {"status":401,"error":"Unauthorized","detail":"second_factor_required"}
@@ -207,6 +220,16 @@ half login is dead, and moves the identity to a full login. A wrong one fails
 with a plain 401 and leaves the session pending, so the user can type again,
 until the throttle answers 429 or the pending state runs out. That takes
 `pendingTtl` seconds from the password step, 300 unless you say otherwise:
+
+If `second` itself fails (the enrollment table is down), the login is refused:
+the strategy cannot tell whether a code is owed, and the answer is never a
+yes. The same option is on every strategy that can sign a user in: `PasswordOptions`,
+`MagicLinkOptions`, `OAuth2Options` and `OidcOptions` (which covers Google,
+Microsoft and Apple) each take a `second` and behave this way.
+
+When you bind a half login yourself, for a flow of your own, `bindSession` with
+`BindOptions{ second = true }` is the call, and `pendingTtl` sets how long it
+waits:
 
 ```bit
 fn quickPending(c: Ctx, who: Identity): ()! {
@@ -469,12 +492,15 @@ a user's phone.
 - **Pass a throttle to `redeemRecoveryCode`.** Each guess already costs a
   password hash, but nothing stops a client making guesses all day unless the
   throttle does.
-- **Hold the half login with `bindSession(..., second = true)`, never with a
-  session key of your own.** Every reader of the identity looks at one key; a
-  second one is a route that forgot to look.
+- **Set `second` on every first-factor strategy you mount.** A strategy
+  without it makes a login on the password, link or provider alone; the option
+  is what keeps a user who owes a code from ever holding a full session.
+- **Hold a half login of your own with `bindSession(..., second = true)`,
+  never with a session key of your own.** Every reader of the identity looks at
+  one key; a second one is a route that forgot to look.
 - **Mount a password `Strategy` on the login route only.** A strategy that
   authenticates on any route it guards would turn a password into a full login
-  there, and the second factor would be optional.
+  there (for a user with no second factor), so mount it where you mean one.
 - **Make `advanceCounter` atomic.** A read followed by a write lets two
   requests with the same code both succeed.
 - **Clock skew is a security/usability tradeoff.** `skew = 1` (one step
