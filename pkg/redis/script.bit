@@ -1,0 +1,439 @@
+// pkg/redis/script.bit - server-side scripting: `Script` (EVALSHA with an
+// automatic SCRIPT LOAD), `ScriptCache` (SCRIPT EXISTS / FLUSH), `Fn` (FCALL)
+// and `Functions` (FUNCTION LOAD / LIST / DELETE / FLUSH). Epic #6013, #6042.
+//
+// CONSTRUCTORS, NOT FACTORIES (epic #6477): `Script("return 1")`,
+// `Fn("rate_limit")`, `ScriptCache(c)`, `Functions(c)`. Each is a class with
+// an `init`; there is no `redis.script(...)` function.
+//
+// A SCRIPT HASHES ONCE. `Script`'s `init` runs SHA-1 over the source one
+// time, and `sha` is a plain field after that. The hot path of `run` is one
+// EVALSHA round trip: `callArgs` sizes the wire command once (`3 + keys +
+// args` strings, no `append`), and the reply goes straight to the caller's
+// `decode`; no `Cmd` is built. NOSCRIPT, the one failure that is expected
+// on a first call or after a restart or SCRIPT FLUSH, loads the source and
+// retries ONCE; a second NOSCRIPT is returned as is.
+//
+// `readOnly` IS A FACT ABOUT THE SCRIPT, SO IT IS A CONSTRUCTOR OPTION:
+// `Script(src, readOnly = true)` sends EVALSHA_RO, `Fn(name, readOnly =
+// true)` sends FCALL_RO. The server then refuses a write inside it, and a
+// read-only call is retried once on a dropped connection like `GET` is
+// (`client.bit`); a script that may write is never retried.
+//
+// ONE METHOD PER JOB, THE REPLY SHAPE IS THE CALLER'S CHOICE. What a script
+// returns is whatever Lua value it ends with, so `run` takes a `decode`:
+// pass one of `luaInt`, `luaBool`, `luaOptString`, `luaStrings` or
+// `luaReply` (below), or a closure of your own. The same `decode` argument
+// goes to `cmd`, which builds the `Cmd<T>` that `Pipeline.queue`/
+// `Tx.queue` take.
+//
+// INSIDE A PIPELINE OR TRANSACTION a `Script` cannot reload itself: its
+// replies only exist after EXEC, long after a NOSCRIPT would have been
+// seen. Call `s.load(c)` once before queuing `s.cmd(...)` (it is cheap and
+// safe to repeat). A function (`Fn`) needs no such step: FUNCTION LOAD
+// persists across restarts and SCRIPT FLUSH never touches it.
+//
+// CLUSTER: every key a script touches must be in `keys`, and all of them
+// must hash to one slot, so share a `{tag}` between them (`{rl:ada}:hits`,
+// `{rl:ada}:seq`); a key built inside the Lua source is not seen by the
+// server's routing. `redis.call('TIME')` is allowed in a script on every
+// supported server (Redis 7+ replicates effects, not source).
+
+import { Sha1, digest, encodeHex } from "std/crypto"
+
+// How a flush waits for the server to free memory. Both are explicit on
+// purpose: with neither, the `lazyfree-lazy-user-flush` setting picks, and
+// a flush that is sync on one server and async on the next is a surprise.
+export enum FlushMode {
+  Sync,
+  Async,
+}
+
+// A Lua script: the source, its SHA-1, and whether it only reads.
+export class Script {
+  export source: string
+  export sha: string
+  readOnly: bool
+
+  init(source: string, readOnly: bool = false) {
+    this.source = source
+    this.sha = encodeHex(digest(Sha1(), []byte(source)))
+    this.readOnly = readOnly
+  }
+
+  // EVALSHA (EVALSHA_RO for a read-only script). `keys` become `KEYS`,
+  // `args` become `ARGV` in Lua. On NOSCRIPT the source is loaded and the
+  // call is retried once.
+  export run<T>(
+    c: Client,
+    decode: (Reply) => T!RedisError,
+    keys: []string = []string(0),
+    args: []string = []string(0),
+  ): T!RedisError {
+    let wire = callArgs(this.verb(), this.sha, keys, args)
+    let r = this.send(c, wire)?
+    return decode(r)?
+  }
+
+  // The same call as a `Cmd<T>`, for `Pipeline.queue`, `Tx.queue` or
+  // `Client.runCmd`. No reload: see this file's header.
+  export cmd<T>(
+    decode: (Reply) => T!RedisError,
+    keys: []string = []string(0),
+    args: []string = []string(0),
+  ): Cmd<T> {
+    return Cmd<T>{
+      args = callArgs(this.verb(), this.sha, keys, args),
+      decode = decode,
+      readOnly = this.readOnly,
+    }
+  }
+
+  // SCRIPT LOAD: puts the source in the server's script cache and returns
+  // its SHA-1, which must equal `sha`; a mismatch means the server hashed
+  // different bytes and is a protocol error, not something to retry.
+  export load(c: Client): string!RedisError {
+    let r = c.command(["SCRIPT", "LOAD", this.source])?
+    let got = replyToString(r, "SCRIPT LOAD")?
+    if (got != this.sha) {
+      fail RedisError.Protocol("redis: SCRIPT LOAD returned ${got}, expected ${this.sha}")
+    }
+    return got
+  }
+
+  verb(): string {
+    if (this.readOnly) {
+      return "EVALSHA_RO"
+    }
+    return "EVALSHA"
+  }
+
+  send(c: Client, wire: []string): Reply!RedisError {
+    return this.roundTrip(c, wire) catch e {
+      match (e) {
+        NoScript(_) => {
+          this.load(c)?
+          return this.roundTrip(c, wire)?
+        }
+        _ => fail e
+      }
+    }
+  }
+
+  roundTrip(c: Client, wire: []string): Reply!RedisError {
+    if (this.readOnly) {
+      return c.readCommand(wire)?
+    }
+    return c.command(wire)?
+  }
+}
+
+// `[verb, target, numkeys, keys..., args...]`: the shape EVALSHA, EVALSHA_RO,
+// FCALL and FCALL_RO share, built into one slice sized up front.
+fn callArgs(verb: string, target: string, keys: []string, args: []string): []string {
+  let out = []string(3 + len(keys) + len(args))
+  out[0] = verb
+  out[1] = target
+  out[2] = "${len(keys)}"
+  let i = 0
+  while (i < len(keys)) {
+    out[3 + i] = keys[i]
+    i = i + 1
+  }
+  let j = 0
+  while (j < len(args)) {
+    out[3 + len(keys) + j] = args[j]
+    j = j + 1
+  }
+  return out
+}
+
+// A script's reply as it came off the wire: Lua numbers are `Int`, strings
+// `Bulk`, tables `Array`, `false` and `nil` `Null`, a `{ok = ...}` table
+// `Simple`.
+export fn luaReply(r: Reply): Reply!RedisError { return r }
+
+// A Lua number, as `i64`.
+export fn luaInt(r: Reply): i64!RedisError { return asInt(r, "script")? }
+
+// A Lua boolean: `true` arrives as 1 and `false` as nil on RESP2, as real
+// booleans on RESP3; both read as `bool` here.
+export fn luaBool(r: Reply): bool!RedisError {
+  match (r) {
+    Null => return false
+    _ => return asBool(r, "script")?
+  }
+}
+
+// A Lua string, or `None` when the script returned `nil` or `false`.
+export fn luaOptString(r: Reply): Option<string>!RedisError { return asOptString(r, "script")? }
+
+// A Lua table of strings.
+export fn luaStrings(r: Reply): []string!RedisError { return asStrings(r, "script")? }
+
+// The server's script cache: SCRIPT EXISTS and SCRIPT FLUSH.
+export class ScriptCache {
+  client: Client
+
+  init(c: Client) {
+    this.client = c
+  }
+
+  // SCRIPT EXISTS: one `bool` per SHA-1, in the order given.
+  export exists(shas: []string): []bool!RedisError {
+    if (len(shas) == 0) {
+      fail RedisError.Invalid("SCRIPT EXISTS needs at least one sha")
+    }
+    let r = this.client.command(withKeys("SCRIPT", withKeys("EXISTS", shas)))?
+    return asFlags(r, len(shas))?
+  }
+
+  // SCRIPT FLUSH: forgets every cached script. A `Script` reloads itself on
+  // its next `run`.
+  export flush(mode: FlushMode): ()!RedisError {
+    let r = this.client.command(["SCRIPT", "FLUSH", flushWord(mode)])?
+    asOk(r, "SCRIPT FLUSH")?
+  }
+}
+
+fn flushWord(mode: FlushMode): string {
+  match (mode) {
+    Sync => return "SYNC"
+    Async => return "ASYNC"
+  }
+}
+
+// `[1, 0, ...]` as `[]bool`; `want` is how many the command was asked about.
+fn asFlags(r: Reply, want: int): []bool!RedisError {
+  let items = asReplies(r, "SCRIPT EXISTS")?
+  if (len(items) != want) {
+    fail RedisError.Unexpected("SCRIPT EXISTS", "Array")
+  }
+  let out = []bool(len(items))
+  let i = 0
+  while (i < len(items)) {
+    out[i] = asBool(items[i], "SCRIPT EXISTS")?
+    i = i + 1
+  }
+  return out
+}
+
+// An `Array` or RESP3 `Set` reply's elements; a null array is empty.
+fn asReplies(r: Reply, cmd: string): []Reply!RedisError {
+  match (r) {
+    Array(items) => return unwrapOr(items, []Reply(0))
+    Set(items) => return items
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// A function registered by a library (FUNCTION LOAD), called with FCALL.
+export class Fn {
+  export name: string
+  readOnly: bool
+
+  init(name: string, readOnly: bool = false) {
+    this.name = name
+    this.readOnly = readOnly
+  }
+
+  // FCALL (FCALL_RO for a read-only function). A function that is not
+  // loaded fails with the server's `ERR Function not found`; there is no
+  // NOSCRIPT step because libraries persist.
+  export run<T>(
+    c: Client,
+    decode: (Reply) => T!RedisError,
+    keys: []string = []string(0),
+    args: []string = []string(0),
+  ): T!RedisError {
+    return c.runCmd(this.cmd(decode, keys, args))?
+  }
+
+  // The same call as a `Cmd<T>`, for `Pipeline.queue` and `Tx.queue`.
+  export cmd<T>(
+    decode: (Reply) => T!RedisError,
+    keys: []string = []string(0),
+    args: []string = []string(0),
+  ): Cmd<T> {
+    return Cmd<T>{
+      args = callArgs(this.verb(), this.name, keys, args),
+      decode = decode,
+      readOnly = this.readOnly,
+    }
+  }
+
+  verb(): string {
+    if (this.readOnly) {
+      return "FCALL_RO"
+    }
+    return "FCALL"
+  }
+}
+
+// One function in a library, as FUNCTION LIST reports it.
+export class FunctionInfo {
+  export name: string,
+  export description: Option<string>,
+  export flags: []string,
+}
+
+// One library, as FUNCTION LIST reports it. `code` is "" unless the list was
+// asked `withCode`.
+export class Library {
+  export name: string,
+  export engine: string,
+  export functions: []FunctionInfo,
+  export code: string,
+}
+
+// Library management: FUNCTION LOAD, LIST, DELETE and FLUSH.
+export class Functions {
+  client: Client
+
+  init(c: Client) {
+    this.client = c
+  }
+
+  // FUNCTION LOAD: `code` starts with `#!lua name=<library>`. Returns the
+  // library name. A library that already exists is an error unless
+  // `replace` is true.
+  export load(code: string, replace: bool = false): string!RedisError {
+    let wire = ["FUNCTION", "LOAD", code]
+    if (replace) {
+      wire = ["FUNCTION", "LOAD", "REPLACE", code]
+    }
+    let r = this.client.command(wire)?
+    return replyToString(r, "FUNCTION LOAD")?
+  }
+
+  // FUNCTION LIST. `libraryName` is a glob pattern, "" lists every library.
+  export list(libraryName: string = "", withCode: bool = false): []Library!RedisError {
+    let r = this.client.readCommand(libListArgs(libraryName, withCode))?
+    return asLibraries(r)?
+  }
+
+  // FUNCTION DELETE: removes the library and every function in it; a
+  // library that does not exist is an error.
+  export delete(name: string): ()!RedisError {
+    let r = this.client.command(["FUNCTION", "DELETE", name])?
+    asOk(r, "FUNCTION DELETE")?
+  }
+
+  // FUNCTION FLUSH: removes every library.
+  export flush(mode: FlushMode): ()!RedisError {
+    let r = this.client.command(["FUNCTION", "FLUSH", flushWord(mode)])?
+    asOk(r, "FUNCTION FLUSH")?
+  }
+}
+
+fn libListArgs(libraryName: string, withCode: bool): []string {
+  let out = ["FUNCTION", "LIST"]
+  if (libraryName != "") {
+    out = append(out, "LIBRARYNAME")
+    out = append(out, libraryName)
+  }
+  if (withCode) {
+    out = append(out, "WITHCODE")
+  }
+  return out
+}
+
+fn asLibraries(r: Reply): []Library!RedisError {
+  let items = asReplies(r, "FUNCTION LIST")?
+  let out = []Library(0)
+  let i = 0
+  while (i < len(items)) {
+    out = append(out, libraryFrom(items[i])?)
+    i = i + 1
+  }
+  return out
+}
+
+// Both wire shapes of a field/value record: a RESP3 `Map`, or the flat
+// `[k, v, k, v, ...]` `Array` RESP2 uses.
+fn asEntries(r: Reply, cmd: string): []MapEntry!RedisError {
+  match (r) {
+    Map(entries) => return entries
+    Array(items) => return pairUp(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn pairUp(list: []Reply, cmd: string): []MapEntry!RedisError {
+  if (len(list) % 2 != 0) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let out = []MapEntry(0)
+  let i = 0
+  while (i < len(list)) {
+    out = append(out, MapEntry{ key = list[i], value = list[i + 1] })
+    i = i + 2
+  }
+  return out
+}
+
+// The value stored under `name`, or `Null` when the record has no such
+// field (FUNCTION LIST leaves `library_code` out unless asked).
+fn fieldOf(entries: []MapEntry, name: string): Reply {
+  let i = 0
+  while (i < len(entries)) {
+    let k = replyToString(entries[i].key, "FUNCTION LIST") catch _ {
+      return Reply.Null
+    }
+    if (k == name) {
+      return entries[i].value
+    }
+    i = i + 1
+  }
+  return Reply.Null
+}
+
+fn textField(entries: []MapEntry, name: string): string!RedisError {
+  let v = fieldOf(entries, name)
+  match (v) {
+    Null => return ""
+    _ => return replyToString(v, "FUNCTION LIST")?
+  }
+}
+
+fn libraryFrom(r: Reply): Library!RedisError {
+  let e = asEntries(r, "FUNCTION LIST")?
+  let fns = asReplies(fieldOf(e, "functions"), "FUNCTION LIST")?
+  let infos = []FunctionInfo(0)
+  let i = 0
+  while (i < len(fns)) {
+    infos = append(infos, functionFrom(fns[i])?)
+    i = i + 1
+  }
+  return Library{
+    name = textField(e, "library_name")?,
+    engine = textField(e, "engine")?,
+    functions = infos,
+    code = textField(e, "library_code")?,
+  }
+}
+
+fn functionFrom(r: Reply): FunctionInfo!RedisError {
+  let e = asEntries(r, "FUNCTION LIST")?
+  let flags = []string(0)
+  let raw = fieldOf(e, "flags")
+  match (raw) {
+    Null => flags = []string(0)
+    _ => flags = flagNames(asReplies(raw, "FUNCTION LIST")?)?
+  }
+  return FunctionInfo{
+    name = textField(e, "name")?,
+    description = asOptString(fieldOf(e, "description"), "FUNCTION LIST")?,
+    flags = flags,
+  }
+}
+
+fn flagNames(items: []Reply): []string!RedisError {
+  let out = []string(0)
+  let i = 0
+  while (i < len(items)) {
+    out = append(out, replyToString(items[i], "FUNCTION LIST")?)
+    i = i + 1
+  }
+  return out
+}

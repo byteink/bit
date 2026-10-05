@@ -1,0 +1,300 @@
+// pkg/redis/script.test.bit - `script.bit`'s wire builders and reply
+// decoders, tested directly against plain arguments and `Reply` values: no
+// socket needed (`script.live.test.bit` runs them against a server). The last
+// tests drive `Script.run` against a fake local server (`client.test.bit`'s
+// shape) that answers a scripted list of replies, to pin the NOSCRIPT retry
+// without Docker.
+
+// `listen`/`Listener` (std/net) are `client.test.bit`'s import, module-wide.
+
+fn sBulk(s: string): Reply { return Reply.Bulk(Option.Some(s)) }
+
+fn sArr(items: []Reply): Reply { return Reply.Array(Option.Some(items)) }
+
+fn sIdent(r: Reply): Reply!RedisError { return r }
+
+test "Script hashes its source once, to the SHA-1 Redis reports" {
+  let s = Script("return 1")
+  assert(s.sha == "e0e1f9fabfc9d4800c877a703b823ac0578ff8db", "sha = ${s.sha}")
+  let t = Script("return redis.call('INCRBY', KEYS[1], ARGV[1])")
+  assert(t.sha == "8cd00688c05c46bde4a2e60658ef20a2e5c0b248", "sha = ${t.sha}")
+  assert(t.source == "return redis.call('INCRBY', KEYS[1], ARGV[1])", "source kept as given")
+}
+
+test "callArgs is verb, target, numkeys, keys, then args" {
+  let a = callArgs("EVALSHA", "abc", ["{u}:a", "{u}:b"], ["5", "60"])
+  assert(len(a) == 7, "expected 7 args, got ${len(a)}")
+  assert(a[0] == "EVALSHA" && a[1] == "abc" && a[2] == "2", "head = ${a[0]} ${a[1]} ${a[2]}")
+  assert(a[3] == "{u}:a" && a[4] == "{u}:b", "keys = ${a[3]} ${a[4]}")
+  assert(a[5] == "5" && a[6] == "60", "args = ${a[5]} ${a[6]}")
+}
+
+test "callArgs with no keys and no args is the three-word form" {
+  let a = callArgs("FCALL", "f", []string(0), []string(0))
+  assert(len(a) == 3, "expected 3 args, got ${len(a)}")
+  assert(a[2] == "0", "numkeys = ${a[2]}")
+}
+
+test "Script.cmd sends EVALSHA, or EVALSHA_RO and a read retry for a read-only script" {
+  let w = Script("return 1")
+  let c = w.cmd(sIdent, keys = ["k"], args = ["1"])
+  assert(c.args[0] == "EVALSHA" && c.args[1] == w.sha, "args = ${c.args[0]} ${c.args[1]}")
+  assert(!c.readOnly, "a script that may write is never retried")
+  let r = Script("return 1", readOnly = true)
+  let rc = r.cmd(sIdent)
+  assert(rc.args[0] == "EVALSHA_RO", "verb = ${rc.args[0]}")
+  assert(rc.readOnly, "a read-only script is retried like GET")
+}
+
+test "Fn.cmd sends FCALL, or FCALL_RO for a read-only function" {
+  let w = Fn("bump")
+  let c = w.cmd(sIdent, keys = ["k"], args = ["2"])
+  assert(c.args[0] == "FCALL" && c.args[1] == "bump" && c.args[2] == "1", "args = ${c.args[0]}")
+  assert(!c.readOnly, "FCALL may write")
+  let r = Fn("peek", readOnly = true)
+  assert(r.cmd(sIdent).args[0] == "FCALL_RO", "verb = ${r.cmd(sIdent).args[0]}")
+}
+
+test "the lua decoders read each Lua value's wire shape" {
+  let n = luaInt(Reply.Int(7)) catch e {
+    panic("luaInt: ${e.message()}")
+  }
+  assert(n == 7, "luaInt = ${n}")
+  let falsy = luaBool(Reply.Null) catch e {
+    panic("luaBool: ${e.message()}")
+  }
+  assert(!falsy, "nil and false read as false")
+  let one = luaBool(Reply.Int(1)) catch e {
+    panic("luaBool: ${e.message()}")
+  }
+  assert(one, "Int(1) reads as true")
+  let some = luaOptString(sBulk("x")) catch e {
+    panic("luaOptString: ${e.message()}")
+  }
+  assert(isSome(some) && unwrap(some) == "x", "luaOptString Bulk")
+  let none = luaOptString(Reply.Null) catch e {
+    panic("luaOptString: ${e.message()}")
+  }
+  assert(isNone(none), "luaOptString Null is None")
+  let xs = luaStrings(sArr([sBulk("a"), sBulk("b")])) catch e {
+    panic("luaStrings: ${e.message()}")
+  }
+  assert(len(xs) == 2 && xs[1] == "b", "luaStrings = ${len(xs)}")
+  let failed = false
+  let _ = luaInt(sBulk("7")) catch _ {
+    failed = true
+    0
+  }
+  assert(failed, "luaInt on a Bulk reply is an Unexpected failure")
+}
+
+test "asFlags turns SCRIPT EXISTS integers into bools and checks the count" {
+  let got = asFlags(sArr([Reply.Int(1), Reply.Int(0)]), 2) catch e {
+    panic("asFlags: ${e.message()}")
+  }
+  assert(got[0] && !got[1], "flags = ${got[0]} ${got[1]}")
+  let failed = false
+  let _ = asFlags(sArr([Reply.Int(1)]), 2) catch _ {
+    failed = true
+    []bool(0)
+  }
+  assert(failed, "a short reply must fail, not be padded")
+}
+
+test "flushWord names both modes" {
+  assert(flushWord(FlushMode.Sync) == "SYNC", "sync")
+  assert(flushWord(FlushMode.Async) == "ASYNC", "async")
+}
+
+test "libListArgs adds LIBRARYNAME and WITHCODE only when asked" {
+  assert(len(libListArgs("", false)) == 2, "bare FUNCTION LIST")
+  let a = libListArgs("rate*", true)
+  assert(len(a) == 5, "expected 5 args, got ${len(a)}")
+  assert(a[2] == "LIBRARYNAME" && a[3] == "rate*" && a[4] == "WITHCODE", "args = ${a[2]} ${a[3]}")
+}
+
+fn resp2Library(): Reply {
+  let entry = sArr(
+    [
+      sBulk("name"), sBulk("bump"),
+      sBulk("description"), Reply.Null,
+      sBulk("flags"), sArr([sBulk("no-writes")]),
+    ],
+  )
+  return sArr(
+    [
+      sBulk("library_name"), sBulk("mylib"),
+      sBulk("engine"), sBulk("LUA"),
+      sBulk("functions"), sArr([entry]),
+    ],
+  )
+}
+
+fn resp3Library(): Reply {
+  let entry = Reply.Map(
+    [
+      MapEntry{ key = sBulk("name"), value = sBulk("bump") },
+      MapEntry{ key = sBulk("description"), value = sBulk("adds one") },
+      MapEntry{ key = sBulk("flags"), value = Reply.Set([sBulk("no-writes")]) },
+    ],
+  )
+  return Reply.Map(
+    [
+      MapEntry{ key = sBulk("library_name"), value = sBulk("mylib") },
+      MapEntry{ key = sBulk("engine"), value = sBulk("LUA") },
+      MapEntry{ key = sBulk("functions"), value = sArr([entry]) },
+      MapEntry{ key = sBulk("library_code"), value = sBulk("#!lua name=mylib") },
+    ],
+  )
+}
+
+test "asLibraries decodes the RESP2 flat-array shape" {
+  let libs = asLibraries(sArr([resp2Library()])) catch e {
+    panic("asLibraries: ${e.message()}")
+  }
+  assert(len(libs) == 1, "libraries = ${len(libs)}")
+  assert(libs[0].name == "mylib" && libs[0].engine == "LUA", "name/engine = ${libs[0].name}")
+  assert(libs[0].code == "", "no code unless asked")
+  assert(len(libs[0].functions) == 1 && libs[0].functions[0].name == "bump", "function name")
+  assert(isNone(libs[0].functions[0].description), "a null description is None")
+  assert(libs[0].functions[0].flags[0] == "no-writes", "flags")
+}
+
+test "asLibraries decodes the RESP3 map shape, set flags and library code" {
+  let libs = asLibraries(sArr([resp3Library()])) catch e {
+    panic("asLibraries: ${e.message()}")
+  }
+  assert(libs[0].code == "#!lua name=mylib", "code = ${libs[0].code}")
+  let d = libs[0].functions[0].description
+  assert(isSome(d) && unwrap(d) == "adds one", "description kept")
+  assert(len(libs[0].functions[0].flags) == 1, "set flags decode like array flags")
+}
+
+test "asLibraries rejects a reply that is not a list of records" {
+  let failed = false
+  let _ = asLibraries(Reply.Int(1)) catch _ {
+    failed = true
+    []Library(0)
+  }
+  assert(failed, "an Int reply must fail")
+}
+
+// The server half of the scripted conversation: accepts up to two
+// connections (`connect` dials a probe first, `client.test.bit`), answers
+// each one's HELLO with an empty map, then replies to every request on the
+// real connection with the next of `replies`, in order. `done` receives
+// every request it saw, concatenated.
+fn serveSeq(l: Listener, replies: []string, done: chan<string>) {
+  let log = ""
+  let n = 0
+  let i = 0
+  while (i < 2 && n < len(replies)) {
+    i = i + 1
+    let c = l.accept() catch _ {
+      done <- log
+      return
+    }
+    c.read(4096)
+    c.write("%0\r\n") catch _ {
+      c.close()
+      done <- log
+      return
+    }
+    while (n < len(replies)) {
+      let req = c.read(4096)
+      if (len(req) == 0) {
+        break
+      }
+      log = log + req
+      c.write(replies[n]) catch _ {
+        break
+      }
+      n = n + 1
+    }
+    c.close()
+  }
+  done <- log
+}
+
+fn dialSeq(replies: []string): (Client, chan<string>, Listener) {
+  let l = listen("127.0.0.1", 0) catch e {
+    panic("listen: ${e.message()}")
+  }
+  let port = l.port() catch e {
+    panic("port: ${e.message()}")
+  }
+  let done = chan<string>(1)
+  spawn serveSeq(l, replies, done)
+  let client = connect(Options{ host = "127.0.0.1", port = port }) catch e {
+    panic("connect: ${e.message()}")
+  }
+  return client, done, l
+}
+
+const noScriptReply: string = "-NOSCRIPT No matching script. Please use EVAL.\r\n"
+const shaReply: string = "$40\r\ne0e1f9fabfc9d4800c877a703b823ac0578ff8db\r\n"
+
+test "run loads the script and retries once when the server answers NOSCRIPT" {
+  let (client, done, l) = dialSeq([noScriptReply, shaReply, ":42\r\n"])
+  let s = Script("return 1")
+  let n = s.run(client, luaInt) catch e {
+    panic("run: ${e.message()}")
+  }
+  client.close()
+  let log = <- done
+  l.close()
+  assert(n == 42, "the retried call's reply is the result, got ${n}")
+  let first = indexOf(log, "EVALSHA")
+  let load = indexOf(log, "SCRIPT")
+  assert(first >= 0 && load > first, "EVALSHA, then SCRIPT LOAD: first=${first} load=${load}")
+  assert(indexOf(log[load:len(log)], "EVALSHA") > 0, "then EVALSHA again")
+}
+
+test "a second NOSCRIPT after a successful load is returned, not retried forever" {
+  let (client, done, l) = dialSeq([noScriptReply, shaReply, noScriptReply])
+  let s = Script("return 1")
+  let noScript = false
+  let _ = s.run(client, luaInt) catch e {
+    match (e) {
+      NoScript(_) => noScript = true
+      _ => noScript = false
+    }
+    0
+  }
+  client.close()
+  <- done
+  l.close()
+  assert(noScript, "the second NOSCRIPT must surface as RedisError.NoScript")
+}
+
+test "an error other than NOSCRIPT is returned without a load or a retry" {
+  let (client, done, l) = dialSeq(["-ERR boom\r\n"])
+  let s = Script("return 1")
+  let failed = false
+  let _ = s.run(client, luaInt) catch _ {
+    failed = true
+    0
+  }
+  client.close()
+  let log = <- done
+  l.close()
+  assert(failed, "ERR must fail the call")
+  assert(indexOf(log, "SCRIPT") < 0, "no SCRIPT LOAD for an ordinary error")
+}
+
+test "load rejects a SHA-1 that differs from the client's" {
+  let (client, done, l) = dialSeq(["$40\r\n0000000000000000000000000000000000000000\r\n"])
+  let s = Script("return 1")
+  let bad = false
+  let _ = s.load(client) catch e {
+    match (e) {
+      Protocol(_) => bad = true
+      _ => bad = false
+    }
+    ""
+  }
+  client.close()
+  <- done
+  l.close()
+  assert(bad, "a mismatching hash is a protocol error")
+}

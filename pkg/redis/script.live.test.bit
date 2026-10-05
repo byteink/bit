@@ -1,0 +1,370 @@
+// pkg/redis/script.live.test.bit - scripts and functions against a real
+// server. `liveUrl`/`liveClient` are `client.live.test.bit`'s own (same
+// module, no import); every test is skipped, and says so, when
+// `REDIS_TEST_URL` is unset. `./make test-package-redis-live`
+// (`_tests_/bit/redislive.bit`) supplies it against a throwaway container.
+//
+// Several tests flush the whole script cache or function table. That is safe
+// here because the harness's server is private to this run and the tests of
+// one file run one after another.
+
+const incrSrc: string = "return redis.call('INCRBY', KEYS[1], ARGV[1])"
+
+// The rate limiter docs/scripting.md builds: a sliding window over two keys
+// that share a hash tag, timed by the server's own clock (`TIME`) so every
+// client agrees on "now".
+const limiterSrc: string = `
+local t = redis.call('TIME')
+local now = t[1] * 1000 + math.floor(t[2] / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - tonumber(ARGV[2]))
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[1]) then
+  return 0
+end
+local seq = redis.call('INCR', KEYS[2])
+redis.call('ZADD', KEYS[1], now, now .. '-' .. seq)
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+redis.call('PEXPIRE', KEYS[2], ARGV[2])
+return 1
+`
+
+const libSrc: string = `#!lua name=bitlive
+redis.register_function('bitlive_incr', function(keys, args)
+  return redis.call('INCRBY', keys[1], args[1])
+end)
+redis.register_function{
+  function_name = 'bitlive_peek',
+  callback = function(keys, args) return redis.call('GET', keys[1]) end,
+  flags = { 'no-writes' },
+  description = 'reads one key',
+}
+`
+
+fn scriptDel(c: Client, key: string) {
+  c.del([key]) catch e {
+    panic("del(${key}): ${e.message()}")
+  }
+}
+
+fn scriptCacheOf(c: Client): ScriptCache { return ScriptCache(c) }
+
+fn flushScripts(c: Client) {
+  scriptCacheOf(c).flush(FlushMode.Sync) catch e {
+    panic("SCRIPT FLUSH: ${e.message()}")
+  }
+}
+
+fn isCached(c: Client, s: Script): bool {
+  let got = scriptCacheOf(c).exists([s.sha]) catch e {
+    panic("SCRIPT EXISTS: ${e.message()}")
+  }
+  return got[0]
+}
+
+test "live: a script run with no prior load takes the NOSCRIPT path and caches itself" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  scriptDel(c, "bit:live:script:n")
+  flushScripts(c)
+  let s = Script(incrSrc)
+  assert(!isCached(c, s), "a flushed cache must not hold the script")
+
+  let n = s.run(c, luaInt, keys = ["bit:live:script:n"], args = ["5"]) catch e {
+    panic("run: ${e.message()}")
+  }
+  assert(n == 5, "INCRBY 5 on a fresh key = ${n}")
+  assert(isCached(c, s), "the NOSCRIPT retry loads the source")
+
+  let m = s.run(c, luaInt, keys = ["bit:live:script:n"], args = ["2"]) catch e {
+    panic("second run: ${e.message()}")
+  }
+  assert(m == 7, "second run, EVALSHA straight through = ${m}")
+  c.close()
+}
+
+test "live: SCRIPT FLUSH between calls is repaired by the automatic load" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  scriptDel(c, "bit:live:script:f")
+  let s = Script(incrSrc)
+  s.run(c, luaInt, keys = ["bit:live:script:f"], args = ["1"]) catch e {
+    panic("first run: ${e.message()}")
+  }
+  flushScripts(c)
+  assert(!isCached(c, s), "flush must empty the cache")
+  let n = s.run(c, luaInt, keys = ["bit:live:script:f"], args = ["1"]) catch e {
+    panic("run after flush: ${e.message()}")
+  }
+  assert(n == 2, "the counter survives a script flush, got ${n}")
+  c.close()
+}
+
+test "live: load returns the client-side SHA-1 and exists tells known from unknown" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = Script("return 'loaded'")
+  let sha = s.load(c) catch e {
+    panic("load: ${e.message()}")
+  }
+  assert(sha == s.sha, "server sha ${sha} vs client sha ${s.sha}")
+  let got = scriptCacheOf(c).exists([s.sha, "0000000000000000000000000000000000000000"]) catch e {
+    panic("exists: ${e.message()}")
+  }
+  assert(got[0] && !got[1], "exists = ${got[0]} ${got[1]}")
+  let text = s.run(c, luaOptString) catch e {
+    panic("run: ${e.message()}")
+  }
+  assert(isSome(text) && unwrap(text) == "loaded", "string result")
+  c.close()
+}
+
+test "live: a script inside a pipeline runs after an explicit load" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  scriptDel(c, "bit:live:script:p")
+  flushScripts(c)
+  let s = Script(incrSrc)
+  s.load(c) catch e {
+    panic("load: ${e.message()}")
+  }
+  let p = c.pipeline()
+  let a = p.queue(s.cmd(luaInt, keys = ["bit:live:script:p"], args = ["3"]))
+  let b = p.queue(s.cmd(luaInt, keys = ["bit:live:script:p"], args = ["4"]))
+  let g = p.get("bit:live:script:p")
+  p.exec() catch e {
+    panic("exec: ${e.message()}")
+  }
+  let x = a.get() catch e {
+    panic("first: ${e.message()}")
+  }
+  let y = b.get() catch e {
+    panic("second: ${e.message()}")
+  }
+  assert(x == 3 && y == 7, "pipelined results = ${x}, ${y}")
+  let v = g.get() catch e {
+    panic("get: ${e.message()}")
+  }
+  assert(isSome(v) && unwrap(v) == "7", "a plain command beside the scripts")
+  c.close()
+}
+
+test "live: a pipelined script on an unloaded SHA reports NOSCRIPT" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  flushScripts(c)
+  let s = Script("return 41 + 1")
+  let p = c.pipeline()
+  let f = p.queue(s.cmd(luaInt))
+  p.exec() catch e {
+    panic("exec: ${e.message()}")
+  }
+  let noScript = false
+  let _ = f.get() catch e {
+    match (e) {
+      NoScript(_) => noScript = true
+      _ => noScript = false
+    }
+    0
+  }
+  assert(noScript, "an unloaded script in a pipeline fails its own future with NoScript")
+  c.close()
+}
+
+test "live: a script inside a transaction is queued and committed" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  scriptDel(c, "bit:live:script:t")
+  let s = Script(incrSrc)
+  s.load(c) catch e {
+    panic("load: ${e.message()}")
+  }
+  let f = c.transaction<Future<i64>>(["bit:live:script:t"], (tx) => {
+    return tx.queue(s.cmd(luaInt, keys = ["bit:live:script:t"], args = ["9"]))
+  }) catch e {
+    panic("transaction: ${e.message()}")
+  }
+  let n = f.get() catch e {
+    panic("future: ${e.message()}")
+  }
+  assert(n == 9, "transacted INCRBY = ${n}")
+  c.close()
+}
+
+test "live: a multi-key script on a hash tag reads the server clock with TIME" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let keys = ["{bit:live:rl}:hits", "{bit:live:rl}:seq"]
+  scriptDel(c, keys[0])
+  scriptDel(c, keys[1])
+  let s = Script(limiterSrc)
+  let allowed = []bool(0)
+  let i = 0
+  while (i < 5) {
+    let ok = s.run(c, luaBool, keys = keys, args = ["3", "60000"]) catch e {
+      panic("limiter run ${i}: ${e.message()}")
+    }
+    allowed = append(allowed, ok)
+    i = i + 1
+  }
+  assert(allowed[0] && allowed[1] && allowed[2], "the first three calls are inside the limit")
+  assert(!allowed[3] && !allowed[4], "the fourth and fifth are refused")
+  let seq = c.counter(keys[1]).get() catch e {
+    panic("seq: ${e.message()}")
+  }
+  assert(seq == 3, "a refused call writes nothing, seq = ${seq}")
+  c.close()
+}
+
+test "live: a read-only script runs through EVALSHA_RO and refuses to write" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  c.set("bit:live:script:ro", "seen") catch e {
+    panic("set: ${e.message()}")
+  }
+  let reader = Script("return redis.call('GET', KEYS[1])", readOnly = true)
+  let v = reader.run(c, luaOptString, keys = ["bit:live:script:ro"]) catch e {
+    panic("read-only run: ${e.message()}")
+  }
+  assert(isSome(v) && unwrap(v) == "seen", "read-only GET")
+
+  let writer = Script("return redis.call('SET', KEYS[1], 'x')", readOnly = true)
+  let refused = false
+  let _ = writer.run(c, luaReply, keys = ["bit:live:script:ro"]) catch _ {
+    refused = true
+    Reply.Null
+  }
+  assert(refused, "a write inside a read-only script must fail")
+  let after = c.get("bit:live:script:ro") catch e {
+    panic("get: ${e.message()}")
+  }
+  assert(isSome(after) && unwrap(after) == "seen", "and must not have written")
+  c.close()
+}
+
+test "live: a library loaded with FUNCTION LOAD is listed and called with FCALL and FCALL_RO" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let fns = Functions(c)
+  fns.delete("bitlive") catch _ {
+    // not there yet
+  }
+  scriptDel(c, "bit:live:fn:n")
+  let name = fns.load(libSrc) catch e {
+    panic("load: ${e.message()}")
+  }
+  assert(name == "bitlive", "FUNCTION LOAD returns the library name, got ${name}")
+
+  let again = false
+  fns.load(libSrc) catch _ {
+    again = true
+    ""
+  }
+  assert(again, "loading an existing library without replace must fail")
+  fns.load(libSrc, replace = true) catch e {
+    panic("replace: ${e.message()}")
+  }
+
+  let libs = fns.list(libraryName = "bitlive") catch e {
+    panic("list: ${e.message()}")
+  }
+  assert(len(libs) == 1, "libraries = ${len(libs)}")
+  assert(libs[0].name == "bitlive" && libs[0].engine == "LUA", "name/engine = ${libs[0].name}")
+  assert(len(libs[0].functions) == 2, "functions = ${len(libs[0].functions)}")
+  assert(libs[0].code == "", "no code unless asked")
+  let withCode = fns.list(libraryName = "bitlive", withCode = true) catch e {
+    panic("list withCode: ${e.message()}")
+  }
+  assert(withCode[0].code == libSrc, "WITHCODE returns the source")
+
+  let bump = Fn("bitlive_incr")
+  let n = bump.run(c, luaInt, keys = ["bit:live:fn:n"], args = ["6"]) catch e {
+    panic("fcall: ${e.message()}")
+  }
+  assert(n == 6, "FCALL = ${n}")
+  let peek = Fn("bitlive_peek", readOnly = true)
+  let v = peek.run(c, luaOptString, keys = ["bit:live:fn:n"]) catch e {
+    panic("fcall_ro: ${e.message()}")
+  }
+  assert(isSome(v) && unwrap(v) == "6", "FCALL_RO")
+
+  let p = c.pipeline()
+  let f = p.queue(bump.cmd(luaInt, keys = ["bit:live:fn:n"], args = ["1"]))
+  p.exec() catch e {
+    panic("exec: ${e.message()}")
+  }
+  let queued = f.get() catch e {
+    panic("queued fcall: ${e.message()}")
+  }
+  assert(queued == 7, "pipelined FCALL = ${queued}")
+  c.close()
+}
+
+test "live: FUNCTION DELETE and FUNCTION FLUSH remove libraries" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let fns = Functions(c)
+  fns.load(libSrc, replace = true) catch e {
+    panic("load: ${e.message()}")
+  }
+  fns.delete("bitlive") catch e {
+    panic("delete: ${e.message()}")
+  }
+  let gone = fns.list(libraryName = "bitlive") catch e {
+    panic("list: ${e.message()}")
+  }
+  assert(len(gone) == 0, "a deleted library is not listed")
+
+  let missing = false
+  fns.delete("bitlive") catch _ {
+    missing = true
+  }
+  assert(missing, "deleting a library that is not there fails")
+
+  fns.load(libSrc) catch e {
+    panic("reload: ${e.message()}")
+  }
+  fns.flush(FlushMode.Sync) catch e {
+    panic("flush: ${e.message()}")
+  }
+  let none = fns.list() catch e {
+    panic("list all: ${e.message()}")
+  }
+  assert(len(none) == 0, "FUNCTION FLUSH leaves no library, got ${len(none)}")
+
+  let notFound = false
+  let _ = Fn("bitlive_incr").run(c, luaInt, keys = ["bit:live:fn:n"], args = ["1"]) catch _ {
+    notFound = true
+    0
+  }
+  assert(notFound, "FCALL of a flushed function fails")
+  c.close()
+}
