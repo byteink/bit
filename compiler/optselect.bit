@@ -41,13 +41,20 @@ fn maxSelectInsts(): int {
   return 4
 }
 
-// The ops R may hold: no memory, no call, no trap, no safepoint.
+// The ops R may hold: no memory, no call, no trap, no safepoint. `sub` is
+// rangeTest's offset, from an inner diamond's earlier round; an IR `sub` wraps
+// (an overflow check would be a `br` to a panic, which R cannot end in).
 fn speculatable(op: Op): bool {
   let o = int(op)
   if (o >= int(Op.ICmpEq) && o <= int(Op.ICmpUge)) {
     return true
   }
-  return op == Op.ConstInt || op == Op.ConstBool || op == Op.BAnd || op == Op.BOr || op == Op.BXor
+  return op == Op.ConstInt ||
+    op == Op.ConstBool ||
+    op == Op.BAnd ||
+    op == Op.BOr ||
+    op == Op.BXor ||
+    op == Op.Sub
 }
 
 // One round's decisions, indexed by the block they are made at. `r[a]` is the
@@ -251,6 +258,7 @@ fn selectPlanOf(f: IrFunc, sf: SelectFacts): SelectPlan {
 }
 
 class SelectCtx {
+  ctx: TypeContext,
   b: IrBuilder,
   f: IrFunc,
   p: SelectPlan,
@@ -288,15 +296,71 @@ fn emitSelect(sc: SelectCtx, a: int): []int {
     if (jargs[k] == rargs[k]) {
       out = append(out, sc.remap[jargs[k]])
     } else {
-      let n = mkInstr(op, sc.f.instrs[br.lhs].ty)
-      n.lhs = sc.remap[br.lhs]
-      n.rhs = sc.remap[rargs[k]]
-      n.span = br.span
-      out = append(out, builderEmit(sc.b, n))
+      out = append(out, emitJoinOp(sc, op, br, rargs[k]))
     }
     k = k + 1
   }
   return out
+}
+
+// `band`/`bor` of A's condition and R's value `rv`; a `band` that is a
+// two-sided unsigned range test becomes one compare (rangeTest).
+fn emitJoinOp(sc: SelectCtx, op: Op, br: IrInstr, rv: int): int {
+  let lhs = sc.remap[br.lhs]
+  let rhs = sc.remap[rv]
+  if (op == Op.BAnd) {
+    let t = rangeTest(sc, br, lhs, rhs)
+    if (t >= 0) {
+      return t
+    }
+  }
+  let n = mkInstr(op, sc.f.instrs[br.lhs].ty)
+  n.lhs = lhs
+  n.rhs = rhs
+  n.span = br.span
+  return builderEmit(sc.b, n)
+}
+
+// The `const_int` value `v` holds in the new body, when it is one.
+fn newConst(sc: SelectCtx, v: int): (bool, int) {
+  let ins = sc.b.instrs[v]
+  return (ins.op == Op.ConstInt, ins.ival)
+}
+
+// `x >=u lo && x <=u hi` as `(x - lo) <=u (hi - lo)` (#7243, the rule
+// `emitRunTest` applies to a switch run, lowerswitchrange.bit): one compare in
+// place of two and a `band`. Unsigned only, so `x - lo` wraps below `lo` to a
+// value above `hi - lo`; `lo <= hi`, or the range is empty and stays as is.
+// The two compares it replaces are left for DCE. -1 when `ge`/`le` are not
+// that shape.
+fn rangeTest(sc: SelectCtx, br: IrInstr, ge: int, le: int): int {
+  let g = sc.b.instrs[ge]
+  let l = sc.b.instrs[le]
+  if (g.op != Op.ICmpUge || l.op != Op.ICmpUle || g.lhs != l.lhs) {
+    return -1
+  }
+  let xty = sc.b.instrs[g.lhs].ty
+  let p = primOfType(sc.ctx, xty)
+  let (gk, lo) = newConst(sc, g.rhs)
+  let (lk, hi) = newConst(sc, l.rhs)
+  if (!gk || !lk || !isIntPrim(p) || isSignedPrim(p)) {
+    return -1
+  }
+  let bits = primBits(p)
+  if (u64(maskTo(lo, bits)) > u64(maskTo(hi, bits))) {
+    return -1
+  }
+  let off = mkInstr(Op.Sub, xty)
+  off.lhs = g.lhs
+  off.rhs = g.rhs
+  off.span = br.span
+  let w = mkInstr(Op.ConstInt, xty)
+  w.ival = maskTo(hi - lo, bits)
+  let t = mkInstr(Op.ICmpUle, l.ty)
+  t.lhs = builderEmit(sc.b, off)
+  t.rhs = builderEmit(sc.b, w)
+  t.span = br.span
+  return builderEmit(sc.b, t)
 }
 
 // The arguments block `c` passes on into its chain successor.
@@ -347,7 +411,7 @@ fn emitChain(sc: SelectCtx, bi: int) {
   builderEndBlock(sc.b)
 }
 
-fn selectEmit(f: IrFunc, p: SelectPlan): IrFunc {
+fn selectEmit(ctx: TypeContext, f: IrFunc, p: SelectPlan): IrFunc {
   let order = blockEmissionOrder(f)
   let b = newBuilder()
   let blockMap = []int(len(f.blocks))
@@ -365,7 +429,7 @@ fn selectEmit(f: IrFunc, p: SelectPlan): IrFunc {
     i = i + 1
   }
   let sc = SelectCtx{
-    b = b, f = f, p = p, known = known, remap = []int(len(f.instrs)), blockMap = blockMap,
+    ctx = ctx, b = b, f = f, p = p, known = known, remap = []int(len(f.instrs)), blockMap = blockMap,
   }
   k = 0
   while (k < len(order)) {
@@ -379,7 +443,7 @@ fn selectEmit(f: IrFunc, p: SelectPlan): IrFunc {
 
 // Every select-able diamond of `f` collapsed. `f` itself, untouched, when it
 // has none; at most one round per block, since each round removes one.
-fn selectShortCircuits(f: IrFunc): IrFunc {
+fn selectShortCircuits(ctx: TypeContext, f: IrFunc): IrFunc {
   let g = f
   let round = 0
   while (round < len(f.blocks)) {
@@ -387,7 +451,7 @@ fn selectShortCircuits(f: IrFunc): IrFunc {
     if (p.count == 0) {
       return g
     }
-    g = selectEmit(g, p)
+    g = selectEmit(ctx, g, p)
     round = round + 1
   }
   return g
