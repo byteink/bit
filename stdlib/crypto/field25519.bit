@@ -12,8 +12,8 @@
 // the schoolbook multiply run without a bignum.
 //
 // The hard part is the multiply. A product of two 51-bit limbs is up to 102
-// bits, and Bit has no u128, so `fe25519MulCore` splits every limb into 26-bit
-// halves and sums each output column as three u64 partial sums that cannot
+// bits; `fe25519MulCore` takes each one whole from the 64x64->128 multiply and
+// splits it at bit 51, summing each output column as two u64 sums that cannot
 // overflow, then carry-propagates them back down to 51-bit limbs. The
 // wrap-around fold uses 2^255 = 19 (mod p): any bit that carries past 2^255
 // re-enters limb 0 multiplied by 19.
@@ -27,11 +27,11 @@
 // index that depends on a field value. The canonical reduction in `ToBytes`
 // makes its "is this >= p" decision with a bias-and-mask trick, not an `if`, so
 // even the final freeze leaks nothing through timing.
-// bit:lint max-fn-lines=92 -- fe25519MulCore and fe25519PutBytes are unrolled
+// bit:lint max-fn-lines=92 -- fe25519PutBytes is unrolled
 // limb arithmetic over the 2^255-19 field, straight-line by construction and
-// constant-time. Splitting either means carrying a large set of limbs across
+// constant-time. Splitting it means carrying a large set of limbs across
 // a boundary or recomputing them. Raised rather than disabled so the file's
-// other 15 functions keep a ceiling.
+// other functions keep a ceiling.
 
 // Low 51 bits of a limb (2^51 - 1). Also the per-limb bias in the final freeze.
 // A function, not a top-level `const`: the seed compiler mis-lowers typed
@@ -70,25 +70,28 @@ fn fe25519Store64(b: []byte, off: int, v: u64) {
   b[off + 7] = byte(v >> 56)
 }
 
-// Fused multiply-add on a 128-bit accumulator held as `acc[0]`=low, `acc[1]`=high:
-// acc += a * b, in place. The 64x64->128 product is built from 32-bit halves,
-// with no u128: `t2` folds the two cross terms so no intermediate overflows a
-// u64, and the low-word add propagates its carry with a branchless bit formula
-// (the carry out of `x+y` is bit 63 of `(x&y) | ((x|y) & ~sum)`).
-fn fe25519MulAdd(acc: []u64, a: u64, b: u64) {
-  let aLo = a & 0xffffffff
-  let aHi = a >> 32
-  let bLo = b & 0xffffffff
-  let bHi = b >> 32
-  let t0 = aLo * bLo
-  let t1 = aHi * bLo + (t0 >> 32)
-  let t2 = aLo * bHi + (t1 & 0xffffffff)
-  let plo = (t0 & 0xffffffff) | (t2 << 32)
-  let phi = aHi * bHi + (t1 >> 32) + (t2 >> 32)
-  let nlo = acc[0] + plo
-  let carry = ((acc[0] & plo) | ((acc[0] | plo) & ~nlo)) >> 63
-  acc[1] = acc[1] + phi + carry
-  acc[0] = nlo
+// The high 64 bits of the 128-bit product `a * b`: one `umulh` (arm64) or
+// one-operand `mul` (x64), both data-independent in time. Written as §11.6
+// `asm` rather than the `umulHi` builtin (#7171) because this module is
+// imported by the compiler and so built by the pinned stage0, which predates
+// that builtin; the encodings are the ones runtime/root/maps.bit verified.
+// x64 pins `rax` as an input and the instruction overwrites it, which keeps
+// the allocator out of it without a `clobber`.
+@nosplit fn fe25519MulHi(a: u64, b: u64): u64 {
+  return asm {
+    arm64 { 0x9bc27c20 }     // umulh x0, x1, x2
+    x64 { 0x48, 0xf7, 0xe1 } // mulq %rcx
+    result arm64 x0 x64 rdx : u64
+    input arm64 x1 x64 rax = a
+    input arm64 x2 x64 rcx = b
+  }
+}
+
+// The 128-bit product `a * b` shifted right by 51. Every product here is below
+// 2^110, so the shifted value fits a u64: the high word supplies bits 13 and up
+// and the low word's top 13 bits fill the rest.
+fn fe25519MulShr51(a: u64, b: u64): u64 {
+  return (fe25519MulHi(a, b) << 13) | ((a * b) >> 51)
 }
 
 // One carry pass over five limbs holding a value below 2^53 per limb, folding
@@ -119,110 +122,144 @@ fn fe25519WeakReduce(h: []u64) {
 // `h` may alias `f` or `g` (every input limb is read before `h` is written).
 // Inputs must have limbs below 2^52, as every field operation here leaves them.
 //
-// Bit has no u128, so each 51-bit limb is split into a 26-bit low half (`fl`,
-// `gl`) and a high half below 2^26 (`fh`, `gh`), and the terms that wrap past
-// 2^255 use g scaled by 19 (`q`, below 2^56.3, high half below 2^30.3). A column
-// is then three plain u64 sums: s0 of low*low (< 2^54.4), s1 of the cross terms
-// (< 2^59.6) and s2 of high*high (< 2^58.6), worth s0 + s1*2^26 + s2*2^52. The
-// carry out of a column stays below 2^60, so no sum can wrap. The top carry is
-// folded through 2^255 = 19 in two halves so that 19*carry cannot overflow.
+// Each output column is a sum of five 128-bit products, the terms that wrap
+// past 2^255 using g scaled by 19 (`q`, below 2^56.3), so every product is
+// below 2^108.3. A column is kept as two u64 sums: its low 51 bits per product
+// (`lo`, below 2^54 with the carry in) and each product shifted down by 51
+// (`c`, below 2^60). Splitting every product at bit 51 means the column never
+// needs a 128-bit add: `lo`'s own overflow past bit 51 joins `c`, and `c` is
+// the carry into the next column.
 fn fe25519MulCore(h: []u64, f: []u64, g: []u64) {
-  let m26 = u64(0x3ffffff)
-  let m25 = u64(0x1ffffff)
-  let fl0 = f[0] & m26
-  let fh0 = f[0] >> 26
-  let fl1 = f[1] & m26
-  let fh1 = f[1] >> 26
-  let fl2 = f[2] & m26
-  let fh2 = f[2] >> 26
-  let fl3 = f[3] & m26
-  let fh3 = f[3] >> 26
-  let fl4 = f[4] & m26
-  let fh4 = f[4] >> 26
-  let gl0 = g[0] & m26
-  let gh0 = g[0] >> 26
-  let gl1 = g[1] & m26
-  let gh1 = g[1] >> 26
-  let gl2 = g[2] & m26
-  let gh2 = g[2] >> 26
-  let gl3 = g[3] & m26
-  let gh3 = g[3] >> 26
-  let gl4 = g[4] & m26
-  let gh4 = g[4] >> 26
-  let ql1 = (19 * g[1]) & m26
-  let qh1 = (19 * g[1]) >> 26
-  let ql2 = (19 * g[2]) & m26
-  let qh2 = (19 * g[2]) >> 26
-  let ql3 = (19 * g[3]) & m26
-  let qh3 = (19 * g[3]) >> 26
-  let ql4 = (19 * g[4]) & m26
-  let qh4 = (19 * g[4]) >> 26
+  let m = fe25519Mask()
+  let f0 = f[0]
+  let f1 = f[1]
+  let f2 = f[2]
+  let f3 = f[3]
+  let f4 = f[4]
+  let g0 = g[0]
+  let g1 = g[1]
+  let g2 = g[2]
+  let g3 = g[3]
+  let g4 = g[4]
+  let q1 = 19 * g1
+  let q2 = 19 * g2
+  let q3 = 19 * g3
+  let q4 = 19 * g4
 
   // h0 = f0*g0 + 19*(f1*g4 + f2*g3 + f3*g2 + f4*g1)
-  let s0 = fl0 * gl0 + fl1 * ql4 + fl2 * ql3 + fl3 * ql2 + fl4 * ql1
-  let s1 = fl0 * gh0 + fh0 * gl0 + fl1 * qh4 + fh1 * ql4 + fl2 * qh3
-  s1 = s1 + fh2 * ql3 + fl3 * qh2 + fh3 * ql2 + fl4 * qh1 + fh4 * ql1
-  let s2 = fh0 * gh0 + fh1 * qh4 + fh2 * qh3 + fh3 * qh2 + fh4 * qh1
-  let lo = s0 + ((s1 & m25) << 26)
-  let r0 = lo & fe25519Mask()
-  let c = (lo >> 51) + (s1 >> 25) + (s2 << 1)
+  let lo = ((f0 * g0) & m) + ((f1 * q4) & m) + ((f2 * q3) & m) + ((f3 * q2) & m)
+  lo = lo + ((f4 * q1) & m)
+  let c = fe25519MulShr51(f0, g0) + fe25519MulShr51(f1, q4) + fe25519MulShr51(f2, q3)
+  c = c + fe25519MulShr51(f3, q2) + fe25519MulShr51(f4, q1) + (lo >> 51)
+  let r0 = lo & m
 
   // h1 = f0*g1 + f1*g0 + 19*(f2*g4 + f3*g3 + f4*g2)
-  s0 = fl0 * gl1 + fl1 * gl0 + fl2 * ql4 + fl3 * ql3 + fl4 * ql2
-  s1 = fl0 * gh1 + fh0 * gl1 + fl1 * gh0 + fh1 * gl0 + fl2 * qh4
-  s1 = s1 + fh2 * ql4 + fl3 * qh3 + fh3 * ql3 + fl4 * qh2 + fh4 * ql2
-  s2 = fh0 * gh1 + fh1 * gh0 + fh2 * qh4 + fh3 * qh3 + fh4 * qh2
-  lo = s0 + ((s1 & m25) << 26) + c
-  let r1 = lo & fe25519Mask()
-  c = (lo >> 51) + (s1 >> 25) + (s2 << 1)
+  lo = ((f0 * g1) & m) + ((f1 * g0) & m) + ((f2 * q4) & m) + ((f3 * q3) & m)
+  lo = lo + ((f4 * q2) & m) + c
+  c = fe25519MulShr51(f0, g1) + fe25519MulShr51(f1, g0) + fe25519MulShr51(f2, q4)
+  c = c + fe25519MulShr51(f3, q3) + fe25519MulShr51(f4, q2) + (lo >> 51)
+  let r1 = lo & m
 
   // h2 = f0*g2 + f1*g1 + f2*g0 + 19*(f3*g4 + f4*g3)
-  s0 = fl0 * gl2 + fl1 * gl1 + fl2 * gl0 + fl3 * ql4 + fl4 * ql3
-  s1 = fl0 * gh2 + fh0 * gl2 + fl1 * gh1 + fh1 * gl1 + fl2 * gh0
-  s1 = s1 + fh2 * gl0 + fl3 * qh4 + fh3 * ql4 + fl4 * qh3 + fh4 * ql3
-  s2 = fh0 * gh2 + fh1 * gh1 + fh2 * gh0 + fh3 * qh4 + fh4 * qh3
-  lo = s0 + ((s1 & m25) << 26) + c
-  let r2 = lo & fe25519Mask()
-  c = (lo >> 51) + (s1 >> 25) + (s2 << 1)
+  lo = ((f0 * g2) & m) + ((f1 * g1) & m) + ((f2 * g0) & m) + ((f3 * q4) & m)
+  lo = lo + ((f4 * q3) & m) + c
+  c = fe25519MulShr51(f0, g2) + fe25519MulShr51(f1, g1) + fe25519MulShr51(f2, g0)
+  c = c + fe25519MulShr51(f3, q4) + fe25519MulShr51(f4, q3) + (lo >> 51)
+  let r2 = lo & m
 
   // h3 = f0*g3 + f1*g2 + f2*g1 + f3*g0 + 19*f4*g4
-  s0 = fl0 * gl3 + fl1 * gl2 + fl2 * gl1 + fl3 * gl0 + fl4 * ql4
-  s1 = fl0 * gh3 + fh0 * gl3 + fl1 * gh2 + fh1 * gl2 + fl2 * gh1
-  s1 = s1 + fh2 * gl1 + fl3 * gh0 + fh3 * gl0 + fl4 * qh4 + fh4 * ql4
-  s2 = fh0 * gh3 + fh1 * gh2 + fh2 * gh1 + fh3 * gh0 + fh4 * qh4
-  lo = s0 + ((s1 & m25) << 26) + c
-  let r3 = lo & fe25519Mask()
-  c = (lo >> 51) + (s1 >> 25) + (s2 << 1)
+  lo = ((f0 * g3) & m) + ((f1 * g2) & m) + ((f2 * g1) & m) + ((f3 * g0) & m)
+  lo = lo + ((f4 * q4) & m) + c
+  c = fe25519MulShr51(f0, g3) + fe25519MulShr51(f1, g2) + fe25519MulShr51(f2, g1)
+  c = c + fe25519MulShr51(f3, g0) + fe25519MulShr51(f4, q4) + (lo >> 51)
+  let r3 = lo & m
 
   // h4 = f0*g4 + f1*g3 + f2*g2 + f3*g1 + f4*g0
-  s0 = fl0 * gl4 + fl1 * gl3 + fl2 * gl2 + fl3 * gl1 + fl4 * gl0
-  s1 = fl0 * gh4 + fh0 * gl4 + fl1 * gh3 + fh1 * gl3 + fl2 * gh2
-  s1 = s1 + fh2 * gl2 + fl3 * gh1 + fh3 * gl1 + fl4 * gh0 + fh4 * gl0
-  s2 = fh0 * gh4 + fh1 * gh3 + fh2 * gh2 + fh3 * gh1 + fh4 * gh0
-  lo = s0 + ((s1 & m25) << 26) + c
-  let r4 = lo & fe25519Mask()
-  c = (lo >> 51) + (s1 >> 25) + (s2 << 1)
-
-  // c < 2^60 carries past 2^255: 19*c wraps a u64, so its low 51 bits enter
-  // limb 0 and its high bits (times 2^51) enter limb 1, each scaled by 19.
-  r0 = r0 + 19 * (c & fe25519Mask())
-  r1 = r1 + 19 * (c >> 51)
-  r1 = r1 + (r0 >> 51)
-  r0 = r0 & fe25519Mask()
-  r2 = r2 + (r1 >> 51)
-  r1 = r1 & fe25519Mask()
+  lo = ((f0 * g4) & m) + ((f1 * g3) & m) + ((f2 * g2) & m) + ((f3 * g1) & m)
+  lo = lo + ((f4 * g0) & m) + c
+  c = fe25519MulShr51(f0, g4) + fe25519MulShr51(f1, g3) + fe25519MulShr51(f2, g2)
+  c = c + fe25519MulShr51(f3, g1) + fe25519MulShr51(f4, g0) + (lo >> 51)
   h[0] = r0
   h[1] = r1
   h[2] = r2
   h[3] = r3
-  h[4] = r4
+  h[4] = lo & m
+  fe25519FoldTop(h, c)
+}
+
+// h = f^2 mod p, the square's own column sums: each cross term appears twice,
+// so a column has three products instead of five (`d` are the doubled limbs,
+// `t` the ones scaled by 38 = 2*19 or 19 for the wrapped terms, each below
+// 2^57.3, so every product is below 2^109.3 and `c` below 2^60).
+fn fe25519SqrCore(h: []u64, f: []u64) {
+  let m = fe25519Mask()
+  let f0 = f[0]
+  let f1 = f[1]
+  let f2 = f[2]
+  let f3 = f[3]
+  let f4 = f[4]
+  let d0 = 2 * f0
+  let d1 = 2 * f1
+  let t1 = 38 * f1
+  let t2 = 38 * f2
+  let t3 = 38 * f3
+  let u3 = 19 * f3
+  let u4 = 19 * f4
+
+  // h0 = f0^2 + 38*(f1*f4 + f2*f3)
+  let lo = ((f0 * f0) & m) + ((t1 * f4) & m) + ((t2 * f3) & m)
+  let c = fe25519MulShr51(f0, f0) + fe25519MulShr51(t1, f4) + fe25519MulShr51(t2, f3)
+  c = c + (lo >> 51)
+  let r0 = lo & m
+
+  // h1 = 2*f0*f1 + 38*f2*f4 + 19*f3^2
+  lo = ((d0 * f1) & m) + ((t2 * f4) & m) + ((u3 * f3) & m) + c
+  c = fe25519MulShr51(d0, f1) + fe25519MulShr51(t2, f4) + fe25519MulShr51(u3, f3)
+  c = c + (lo >> 51)
+  let r1 = lo & m
+
+  // h2 = 2*f0*f2 + f1^2 + 38*f3*f4
+  lo = ((d0 * f2) & m) + ((f1 * f1) & m) + ((t3 * f4) & m) + c
+  c = fe25519MulShr51(d0, f2) + fe25519MulShr51(f1, f1) + fe25519MulShr51(t3, f4)
+  c = c + (lo >> 51)
+  let r2 = lo & m
+
+  // h3 = 2*f0*f3 + 2*f1*f2 + 19*f4^2
+  lo = ((d0 * f3) & m) + ((d1 * f2) & m) + ((u4 * f4) & m) + c
+  c = fe25519MulShr51(d0, f3) + fe25519MulShr51(d1, f2) + fe25519MulShr51(u4, f4)
+  c = c + (lo >> 51)
+  let r3 = lo & m
+
+  // h4 = 2*f0*f4 + 2*f1*f3 + f2^2
+  lo = ((d0 * f4) & m) + ((d1 * f3) & m) + ((f2 * f2) & m) + c
+  c = fe25519MulShr51(d0, f4) + fe25519MulShr51(d1, f3) + fe25519MulShr51(f2, f2)
+  c = c + (lo >> 51)
+  h[0] = r0
+  h[1] = r1
+  h[2] = r2
+  h[3] = r3
+  h[4] = lo & m
+  fe25519FoldTop(h, c)
+}
+
+// Folds the carry `c` out of the top column of `h` back through 2^255 = 19.
+// `c` is below 2^60, so 19*c could wrap a u64: its low 51 bits enter limb 0
+// and its high bits (times 2^51) limb 1, each scaled by 19, and one carry step
+// leaves every limb below 2^52.
+fn fe25519FoldTop(h: []u64, c: u64) {
+  let m = fe25519Mask()
+  let a0 = h[0] + 19 * (c & m)
+  let a1 = h[1] + 19 * (c >> 51) + (a0 >> 51)
+  h[0] = a0 & m
+  h[1] = a1 & m
+  h[2] = h[2] + (a1 >> 51)
 }
 
 // h = f * g mod p in place (`h` may alias either input).
 fn fe25519MulTo(h: []u64, f: []u64, g: []u64) { fe25519MulCore(h, f, g) }
 
 // h = f^2 mod p in place (`h` may alias `f`).
-fn fe25519SqrTo(h: []u64, f: []u64) { fe25519MulCore(h, f, f) }
+fn fe25519SqrTo(h: []u64, f: []u64) { fe25519SqrCore(h, f) }
 
 // h = (f + g) mod p in place, weakly reduced (`h` may alias either input).
 fn fe25519AddTo(h: []u64, f: []u64, g: []u64) {
@@ -259,7 +296,7 @@ fn fe25519Copy(h: []u64, f: []u64) {
 fn fe25519SqNTo(h: []u64, n: int) {
   let i = 0
   while (i < n) {
-    fe25519MulCore(h, h, h)
+    fe25519SqrCore(h, h)
     i = i + 1
   }
 }
@@ -431,7 +468,7 @@ export fn fe25519Mul(f: []u64, g: []u64): []u64 {
 // Field squaring: (f * f) mod p.
 export fn fe25519Sqr(f: []u64): []u64 {
   let h = []u64(5)
-  fe25519MulCore(h, f, f)
+  fe25519SqrCore(h, f)
   return h
 }
 
@@ -440,15 +477,12 @@ export fn fe25519Sqr(f: []u64): []u64 {
 // step uses the 128-bit multiply and carries in u64.
 export fn fe25519Mul121666(f: []u64): []u64 {
   let h = []u64(5)
-  let acc = []u64(2)
   let carry: u64 = 0
   let i = 0
   while (i < 5) {
-    acc[0] = carry
-    acc[1] = 0
-    fe25519MulAdd(acc, f[i], 121666)
-    h[i] = acc[0] & fe25519Mask()
-    carry = (acc[0] >> 51) | (acc[1] << 13)
+    let lo = ((f[i] * 121666) & fe25519Mask()) + carry
+    h[i] = lo & fe25519Mask()
+    carry = fe25519MulShr51(f[i], 121666) + (lo >> 51)
     i = i + 1
   }
   h[0] = h[0] + 19 * carry
