@@ -21,7 +21,8 @@ refused login, and `Rejected` is a 5xx, a refusal for good. A 550 is never sent
 twice. `Unknown` is the odd one: the request was written to a provider with no
 idempotency key and then cut off, so the mail may already be delivered and a
 repeat could send it twice. It is for you to decide, not the retry loop; see
-[Sending through Postmark](postmark.md) or [SendGrid](sendgrid.md).
+[Sending through Postmark](postmark.md), [SendGrid](sendgrid.md) or
+[Mailgun](mailgun.md).
 
 The defaults retry twice (three tries in all), so `Options{}` already does the
 right thing. This mailer retries harder, and waits less:

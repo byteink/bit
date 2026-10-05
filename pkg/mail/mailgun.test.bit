@@ -1,0 +1,605 @@
+// pkg/mail/mailgun.test.bit — the `mailgun://` transport against the in-test
+// HTTPS server resend.test.bit starts (`rsStart`: a `std/tls` listener
+// answering HTTP/1.1 from a script), pinned with a non-default host and
+// `insecureSkipVerify=true`. No test reaches the network.
+//
+// What the server saw is the whole request text, so a test reads the request
+// line, the headers and, through `std/http`'s multipart parser, every form
+// field and the `message` file part. Every error a test provokes goes through
+// `mgClean`, which fails when its text holds the API key.
+
+import { Form, defaultLimits, parseMultipart } from "std/http"
+import { encodeBase64 } from "std/crypto"
+import { repeat } from "std/strings"
+import { Millisecond, Second } from "std/time"
+
+const mgKey: string = "key-3ax6xnjp29jd6fds4gc373sgvjxteol0"
+
+const mgDomain: string = "mg.inkwell.dev"
+
+fn mgAccepted(): string {
+  return rsReply(
+    200,
+    "",
+    "{\"id\":\"<20261006120000.1.AB12@mg.inkwell.dev>\",\"message\":\"Queued. Thank you.\"}",
+  )
+}
+
+fn mgUrl(port: int): string {
+  return "mailgun://${mgKey}:${mgDomain}@127.0.0.1:${port}?insecureSkipVerify=true"
+}
+
+fn mgMsg(): Message {
+  return Message{
+    to = ["Sara Ali <sara@example.com>"],
+    subject = "Welcome to Inkwell",
+    text = "Hello Sara.",
+    id = "welcome-1",
+  }
+}
+
+fn mgFull(): Message {
+  return Message{
+    to = ["Sara Ali <sara@example.com>"],
+    cc = ["lee@example.com"],
+    bcc = ["audit@example.com"],
+    replyTo = ["support@inkwell.dev"],
+    subject = "Welcome to Inkwell",
+    text = "Hello Sara.",
+    html = "<p>Hello <img src=\"cid:logo\"></p>",
+    attachments = [Attachment{ name = "logo.png", data = [u8(1), u8(2), u8(3)], cid = "logo" }],
+    headers = { "X-Run": "7" },
+    tags = { "tag": "welcome, onboarding", "user": "7", "plan": "pro" },
+    id = "welcome-1",
+  }
+}
+
+fn mgClean(e: MailError) {
+  assert(!contains(e.message(), mgKey), "an error repeated the API key: ${e.message()}")
+}
+
+// Hands every `Delivery` to Mailgun's transport and keeps its `raw`, so a test
+// can compare it with what the server received.
+class MgTap {
+  inner: MailgunTransport
+  raw: string = ""
+
+  deliver(d: Delivery): Receipt!MailError {
+    this.raw = d.raw
+    return this.inner.deliver(d)?
+  }
+
+  signs(): bool {
+    return this.inner.signs()
+  }
+
+  close() {}
+}
+
+// The form the server received in `seen`, parsed by the stdlib's reader.
+fn mgForm(seen: string): Form {
+  let head = seen[0:indexOf(seen, "\r\n\r\n")]
+  let at = indexOf(head, "boundary=")
+  assert(at >= 0, "no boundary in the request: ${head}")
+  let boundary = split(head[at + 9:], "\r\n")[0]
+  return parseMultipart([]byte(rsBody(seen)), boundary, defaultLimits()) catch e {
+    panic("the body is not multipart/form-data: ${e.message()}")
+  }
+}
+
+// The values of every field named `name`, in the order sent.
+fn mgValues(f: Form, name: string): []string {
+  let out: []string = []
+  for x of f.fields {
+    if (x.name == name) {
+      out = append(out, x.value)
+    }
+  }
+  return out
+}
+
+fn mgTapMailer(port: int, opts: Options): (Mailer, MgTap) {
+  let target = parseMailgun(mgUrl(port)) catch e {
+    panic("parse: ${e.message()}")
+  }
+  let tap = MgTap{ inner = MailgunTransport(target, opts) }
+  let mailer = Mailer(tap, opts) catch e {
+    panic("mailer: ${e.message()}")
+  }
+  return (mailer, tap)
+}
+
+// What one send came to: the request the server saw, the raw message the
+// transport was handed, and either the receipt or the error.
+class MgRun {
+  seen: string,
+  raw: string,
+  receipt: Receipt,
+  err: Option<MailError>,
+}
+
+// Sends `m` to a server that answers `reply` once.
+fn mgSend(reply: string, m: Message): MgRun {
+  let (port, log) = rsStart([reply]) catch e {
+    panic("fake: ${e.message()}")
+  }
+  let (mailer, tap) = mgTapMailer(port, rsOpts())
+  let run = MgRun{ seen = "", raw = "", receipt = Receipt{}, err = Option<MailError>.None }
+  let r = mailer.send(m) catch e {
+    run.err = Option<MailError>.Some(e)
+    run.seen = <- log
+    run.raw = tap.raw
+    return run
+  }
+  run.receipt = r
+  run.seen = <- log
+  run.raw = tap.raw
+  return run
+}
+
+// The error a send fails with; panics when it succeeds.
+fn mgFail(reply: string): MailError {
+  match (mgSend(reply, mgMsg()).err) {
+    Some(e) => {
+      mgClean(e)
+      return e
+    }
+    None => panic("the send succeeded against a server scripted to refuse")
+  }
+}
+
+test "a full message is posted as multipart: one message part equal to what the Mailer rendered, one to per envelope recipient" {
+  let run = mgSend(mgAccepted(), mgFull())
+  assert(isNone(run.err), "the send failed")
+  let seen = run.seen
+  assert(
+    hasPrefix(seen, "POST /v3/${mgDomain}/messages.mime HTTP/1.1\r\n"),
+    "request line: ${seen}",
+  )
+  let login = encodeBase64([]byte("api:${mgKey}"))
+  assert(contains(seen, "Authorization: Basic ${login}\r\n"), "no basic auth: ${seen}")
+  assert(contains(seen, "Content-Type: multipart/form-data; boundary="), "content type: ${seen}")
+  let form = mgForm(seen)
+  assert(len(form.files) == 1, "${len(form.files)} file parts")
+  let part = form.files[0]
+  assert(part.name == "message" && part.filename == "message.mime", "${part.name} ${part.filename}")
+  assert(string(part.content) == run.raw, "the message part is not the raw the Mailer built")
+  let to = mgValues(form, "to")
+  assert(
+    join(to, "|") == "sara@example.com|lee@example.com|audit@example.com",
+    "to: ${join(to, "|")}",
+  )
+  assert(!contains(run.raw, "Bcc"), "the raw message names a blind recipient")
+  assert(!contains(run.raw, "audit@example.com"), "the raw message holds the Bcc address")
+  assert(
+    join(mgValues(form, "o:tag"), "|") == "welcome|onboarding",
+    "o:tag: ${join(mgValues(form, "o:tag"), "|")}",
+  )
+  assert(form.value("v:user") == "7" && form.value("v:plan") == "pro", "v: fields")
+  assert(len(form.fields) == 7, "${len(form.fields)} fields: to x3, o:tag x2, v: x2")
+  assert(run.receipt.providerId == "20261006120000.1.AB12@mg.inkwell.dev", run.receipt.providerId)
+  assert(run.receipt.id == "<welcome-1@inkwell.dev>", "id: ${run.receipt.id}")
+  assert(len(run.receipt.accepted) == 3, "accepted: ${join(run.receipt.accepted, ",")}")
+}
+
+// A multipart message gets a fresh MIME boundary on every render, so the
+// comparison with `render` is made on a plain text message, which has none.
+test "the message part is what Mailer.render makes, Date aside" {
+  let (port, log) = rsStart([mgAccepted()]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let (mailer, _) = mgTapMailer(port, rsOpts())
+  let m = mgMsg()
+  mailer.send(m) catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let part = string(mgForm(<- log).files[0].content)
+  let rendered = mailer.render(m) catch e {
+    assert(false, "render: ${e.message()}")
+    return
+  }
+  assert(
+    mbNoDate(part) == mbNoDate(rendered),
+    "the part differs from render:\n${part}\n---\n${rendered}",
+  )
+}
+
+test "Options.dkim is accepted and the signature is inside the posted part" {
+  let (port, log) = rsStart([mgAccepted()]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let opts = rsOpts()
+  opts.dkim = [dwRsa()]
+  let (mailer, tap) = mgTapMailer(port, opts)
+  mailer.send(mgMsg()) catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let part = string(mgForm(<- log).files[0].content)
+  assert(contains(part, "DKIM-Signature: "), "the posted message is not signed")
+  assert(part == tap.raw, "the posted message is not the signed raw")
+  assert(tap.signs(), "signs() must be true so Options.dkim is accepted")
+}
+
+test "an invite travels in the raw message, which a field-built API cannot carry" {
+  let m = icMessage(icInvite())
+  let run = mgSend(mgAccepted(), m)
+  assert(isNone(run.err), "an invite was refused")
+  assert(contains(string(mgForm(run.seen).files[0].content), "text/calendar"), "no calendar part")
+}
+
+test "@default and @eu name the global and the EU host, and the request goes to /v3/<domain>/messages.mime" {
+  let a = parseMailgun("mailgun://${mgKey}:${mgDomain}@default") catch e {
+    assert(false, "default: ${e.message()}")
+    return
+  }
+  let ta = MailgunTransport(a, rsOpts())
+  assert(
+    ta.endpoint() == "https://api.mailgun.net/v3/mg.inkwell.dev/messages.mime",
+    ta.endpoint(),
+  )
+  let b = parseMailgun("MAILGUN://${mgKey}:${mgDomain}@eu") catch e {
+    assert(false, "eu: ${e.message()}")
+    return
+  }
+  let t = MailgunTransport(b, rsOpts())
+  assert(
+    t.endpoint() == "https://api.eu.mailgun.net/v3/mg.inkwell.dev/messages.mime",
+    t.endpoint(),
+  )
+  assert(t.toString() == "mailgun://***:mg.inkwell.dev@api.eu.mailgun.net", t.toString())
+  assert(!b.insecure, "the EU host must be verified")
+}
+
+test "a 200 without angle brackets or without an id still succeeds" {
+  let a = mgSend(
+    rsReply(200, "", "{\"id\":\"abc@mg.inkwell.dev\",\"message\":\"Queued.\"}"),
+    mgMsg(),
+  )
+  assert(isNone(a.err), "the send failed")
+  assert(a.receipt.providerId == "abc@mg.inkwell.dev", a.receipt.providerId)
+  let b = mgSend(rsReply(200, "", "{}"), mgMsg())
+  assert(isNone(b.err) && b.receipt.providerId == "", "providerId: ${b.receipt.providerId}")
+}
+
+test "400 is Rejected with Mailgun's message" {
+  let e = mgFail(
+    rsReply(
+      400,
+      "",
+      "{\"message\":\"to parameter is not a valid address. please check documentation\"}",
+    ),
+  )
+  match (e) {
+    Rejected(r) => {
+      assert(r.code == 400 && r.retryAfter == 0, r.toString())
+      assert(r.text == "to parameter is not a valid address. please check documentation", r.text)
+    }
+    _ => assert(false, "want Rejected, got ${e.message()}")
+  }
+}
+
+test "404 for an unknown domain is Rejected, a body that is not JSON maps by status" {
+  let a = mgFail(rsReply(404, "", "{\"message\":\"Domain not found: mg.inkwell.dev\"}"))
+  match (a) {
+    Rejected(r) => assert(r.code == 404 && contains(r.text, "Domain not found"), r.toString())
+    _ => assert(false, "want Rejected, got ${a.message()}")
+  }
+  let b = mgFail(rsReply(413, "", "too big"))
+  match (b) {
+    Rejected(r) => assert(r.code == 413 && r.text == "HTTP 413", r.toString())
+    _ => assert(false, "want Rejected, got ${b.message()}")
+  }
+}
+
+test "401 is Auth, whatever the body says" {
+  let e = mgFail(rsReply(401, "", "Forbidden"))
+  match (e) {
+    Auth(r) => assert(r.code == 401 && r.text == "HTTP 401", r.toString())
+    _ => assert(false, "want Auth, got ${e.message()}")
+  }
+}
+
+test "429 is Transient with Retry-After as retryAfter, 5xx is Transient" {
+  let a = mgFail(rsReply(429, "Retry-After: 7\r\n", "{\"message\":\"too many requests\"}"))
+  match (a) {
+    Transient(r) => {
+      assert(r.code == 429 && r.retryAfter == 7 * Second, r.toString())
+      assert(r.text == "too many requests", r.text)
+    }
+    _ => assert(false, "want Transient, got ${a.message()}")
+  }
+  let b = mgFail(rsReply(503, "", "<html>unavailable</html>"))
+  match (b) {
+    Transient(r) => assert(r.code == 503 && r.retryAfter == 0 && r.text == "HTTP 503", r.toString())
+    _ => assert(false, "want Transient, got ${b.message()}")
+  }
+}
+
+test "a server that echoes the key in its message does not leak it" {
+  let e = mgFail(rsReply(400, "", "{\"message\":\"bad key ${mgKey} here\"}"))
+  match (e) {
+    Rejected(r) => assert(contains(r.text, "bad key *** here"), r.text)
+    _ => assert(false, "want Rejected, got ${e.message()}")
+  }
+}
+
+// A send that must fail before any request: nothing listens on the port, so a
+// send that tried would be Transient.
+fn mgInvalid(m: Message, want: string) {
+  let mailer = open(
+    "mailgun://${mgKey}:${mgDomain}@127.0.0.1:1?insecureSkipVerify=true",
+    rsOpts(),
+  ) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  mailer.send(m) catch e {
+    match (e) {
+      Invalid(why) => assert(contains(why, want), "wanted '${want}' in: ${why}")
+      _ => assert(false, "want Invalid, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "a message with ${want} was accepted")
+}
+
+test "what Mailgun would refuse is Invalid before any request" {
+  let many: []string = []
+  let i = 0
+  while (i < 1001) {
+    many = append(many, "u${i}@example.com")
+    i = i + 1
+  }
+  let a = mgMsg()
+  a.to = many
+  mgInvalid(a, "1001 recipients")
+  let b = mgMsg()
+  b.tags = { "tag": "a,,b" }
+  mgInvalid(b, "1 to 128 printable ASCII")
+  let c = mgMsg()
+  c.tags = { "tag": repeat("x", 129) }
+  mgInvalid(c, "1 to 128 printable ASCII")
+  let d = mgMsg()
+  d.tags = { "tag": "a, B, b" }
+  mgInvalid(d, "given twice")
+  let e = mgMsg()
+  e.tags = { "tag": "1,2,3,4" }
+  mgInvalid(e, "4 tags")
+  let f = mgMsg()
+  f.tags = { "bad name": "x" }
+  mgInvalid(f, "variable name")
+  let g = mgMsg()
+  g.tags = { "k": repeat("v", 20000) }
+  mgInvalid(g, "bytes of options")
+  let h = mgMsg()
+  h.tags = { "tag": "caf\u{e9}" }
+  mgInvalid(h, "printable ASCII")
+}
+
+test "a boundary found in the message is not used, and none free is Invalid" {
+  let values = ["x bit-mail-aaaa y", "plain"]
+  let candidates = ["bit-mail-aaaa", "bit-mail-bbbb"]
+  let n = 0
+  let b = mgBoundary(values, () => {
+    n = n + 1
+    return candidates[n - 1]
+  }) catch e {
+    assert(false, "boundary: ${e.message()}")
+    return
+  }
+  assert(b == "bit-mail-bbbb" && n == 2, "${b} after ${n} tries")
+  mgBoundary(values, () => "bit-mail-aaaa") catch e {
+    match (e) {
+      Invalid(why) => assert(contains(why, "every multipart boundary"), why)
+      _ => assert(false, "want Invalid, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "a boundary that occurs in the message was used")
+}
+
+test "a message that holds a boundary-shaped line is posted whole under another boundary" {
+  let (port, log) = rsStart([mgAccepted()]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let target = parseMailgun(mgUrl(port)) catch e {
+    assert(false, "parse: ${e.message()}")
+    return
+  }
+  let t = MailgunTransport(target, rsOpts())
+  let tries = 0
+  t.boundary = () => {
+    tries = tries + 1
+    if (tries == 1) {
+      return "bit-mail-collide"
+    }
+    return "bit-mail-fresh"
+  }
+  let mailer = Mailer(t, rsOpts()) catch e {
+    assert(false, "mailer: ${e.message()}")
+    return
+  }
+  let m = mgMsg()
+  m.text = "line\r\n--bit-mail-collide\r\nmore bit-mail-collide"
+  mailer.send(m) catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let seen = <- log
+  assert(contains(seen, "boundary=bit-mail-fresh\r\n"), "the colliding boundary was used: ${seen}")
+  let form = mgForm(seen)
+  assert(contains(string(form.files[0].content), "--bit-mail-collide"), "the part lost its text")
+  assert(tries == 2, "${tries} boundary draws")
+}
+
+test "an unreachable host is Transient" {
+  let mailer = open(
+    "mailgun://${mgKey}:${mgDomain}@127.0.0.1:1?insecureSkipVerify=true",
+    rsOpts(),
+  ) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  mailer.send(mgMsg()) catch e {
+    mgClean(e)
+    match (e) {
+      Transient(_) => return
+      _ => assert(false, "want Transient, got ${e.message()}")
+    }
+  }
+  assert(false, "a send to a closed port succeeded")
+}
+
+test "a certificate that does not verify is Rejected and sends nothing" {
+  let (port, log) = rsStart([mgAccepted()]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let mailer = open("mailgun://${mgKey}:${mgDomain}@127.0.0.1:${port}", rsOpts()) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  mailer.send(mgMsg()) catch e {
+    mgClean(e)
+    match (e) {
+      Rejected(r) => assert(r.code == 0 && hasPrefix(r.text, "mailgun: "), r.toString())
+      _ => assert(false, "want Rejected, got ${e.message()}")
+    }
+    let seen = <- log
+    assert(!contains(seen, "POST /v3/"), "the request was sent anyway: ${seen}")
+    return
+  }
+  assert(false, "an unverifiable certificate was accepted")
+}
+
+// Retries as the 5xx test below: three tries, a millisecond apart.
+fn mgRetryOpts(): Options {
+  let opts = rsOpts()
+  opts.retry = Retry{ attempts = 3, base = Millisecond, max = 5 * Millisecond }
+  return opts
+}
+
+test "a request cut off after it was written is Unknown and is not retried" {
+  // The first connection reads the whole request and hangs up without an answer;
+  // a retry would reach the second reply and succeed.
+  let (port, log) = rsStart(["", mgAccepted()]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let mailer = open(mgUrl(port), mgRetryOpts()) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  defer mailer.close()
+  mailer.send(mgMsg()) catch e {
+    mgClean(e)
+    match (e) {
+      Unknown(r) => {
+        assert(r.code == 0 && contains(r.text, "mailgun:"), r.toString())
+        assert(contains(e.message(), "may have been delivered"), e.message())
+      }
+      _ => assert(false, "want Unknown, got ${e.message()}")
+    }
+    let seen = <- log
+    assert(
+      hasPrefix(seen, "POST /v3/${mgDomain}/messages.mime HTTP/1.1\r\n"),
+      "the fake saw: ${seen}",
+    )
+    return
+  }
+  assert(false, "a send the server never answered succeeded")
+}
+
+test "a 5xx is retried with the same message, a Mailgun acceptance ends the retries" {
+  let (port, log) = rsStart([rsReply(503, "", "{\"message\":\"offline\"}"), mgAccepted()]) catch e {
+    assert(false, "fake: ${e.message()}")
+    return
+  }
+  let mailer = open(mgUrl(port), mgRetryOpts()) catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  let r = mailer.send(mgMsg()) catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let first = mgForm(<- log)
+  let second = mgForm(<- log)
+  assert(
+    string(first.files[0].content) == string(second.files[0].content),
+    "the retry sent a different message",
+  )
+  assert(r.providerId != "", "no providerId after the retry")
+}
+
+fn mgRefused(url: string, want: string) {
+  open(url) catch e {
+    match (e) {
+      Config(why) => {
+        assert(contains(why, want), "wanted '${want}' in: ${why}")
+        assert(!contains(e.message(), mgKey), "the error repeated the key: ${e.message()}")
+      }
+      _ => assert(false, "want Config, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "${url} opened")
+}
+
+test "the real hosts open and every URL mistake fails at open" {
+  open("mailgun://${mgKey}:${mgDomain}@default") catch e {
+    assert(false, "default: ${e.message()}")
+    return
+  }
+  open("mailgun://${mgKey}:${mgDomain}@eu") catch e {
+    assert(false, "eu: ${e.message()}")
+    return
+  }
+  open("mailgun://${mgKey}:${mgDomain}@proxy.internal:8443?insecureSkipVerify=false") catch e {
+    assert(false, "proxy: ${e.message()}")
+    return
+  }
+  mgRefused("mailgun://eu", "no API key")
+  mgRefused("mailgun://${mgKey}@default", "no domain")
+  mgRefused("mailgun://${mgKey}:@default", "the domain is the sending domain")
+  mgRefused("mailgun://${mgKey}:localhost@default", "the domain is the sending domain")
+  mgRefused("mailgun://${mgKey}:-a.example.com@default", "the domain is the sending domain")
+  mgRefused("mailgun://${mgKey}:mg.inkwell.dev/x@default", "the domain is the sending domain")
+  mgRefused("mailgun://${mgKey}:mg.inkwell.dev:pw@default", "the domain is the sending domain")
+  mgRefused("mailgun://:${mgDomain}@default", "API key is empty")
+  mgRefused("mailgun://${mgKey}:${mgDomain}@", "names no host")
+  mgRefused("mailgun://${mgKey}:${mgDomain}@default:443", "takes no port")
+  mgRefused("mailgun://${mgKey}:${mgDomain}@eu:443", "`eu` is api.eu.mailgun.net and takes no port")
+  mgRefused(
+    "mailgun://${mgKey}:${mgDomain}@default?insecureSkipVerify=true",
+    "real api.mailgun.net is always verified",
+  )
+  mgRefused(
+    "mailgun://${mgKey}:${mgDomain}@eu?insecureSkipVerify=true",
+    "real api.eu.mailgun.net is always verified",
+  )
+  mgRefused(
+    "mailgun://${mgKey}:${mgDomain}@proxy.internal?stream=a",
+    "the only query parameter is insecureSkipVerify",
+  )
+  mgRefused("mailgun://${mgKey}:${mgDomain}@proxy.internal/v3", "host is a name")
+  mgRefused("mailgun://%0d%0a:${mgDomain}@default", "control byte")
+}
+
+test "the other providers still refuse a password after the key" {
+  for url of ["sendgrid://k:pw@default", "resend://k:pw@default", "postmark://k:pw@default"] {
+    open(url) catch e {
+      match (e) {
+        Config(why) => assert(contains(why, "there is no password"), why)
+        _ => assert(false, "want Config, got ${e.message()}")
+      }
+      continue
+    }
+    assert(false, "${url} opened")
+  }
+}

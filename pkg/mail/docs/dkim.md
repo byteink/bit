@@ -185,7 +185,9 @@ rewrite. `Mailer(...)` refuses the combination:
 mail: configuration: Options.dkim: this transport hands the message to a provider that builds it itself and signs with its own DKIM key; configure DKIM with the provider and remove Options.dkim
 ```
 
-SMTP, `Outbox` and any transport that sends `Delivery.raw` as it is can sign.
+SMTP, `Outbox` and any transport that sends `Delivery.raw` as it is can sign;
+`mailgun://` is one, because it posts the finished message
+([Sending through Mailgun](mailgun.md)).
 Your own transport says which it is with `signs()`: see
 [Your own transport](mailer.md#your-own-transport).
 

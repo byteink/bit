@@ -1,0 +1,206 @@
+// pkg/mail/mailgunform.bit — the `multipart/form-data` body a `mailgun://`
+// transport posts to Mailgun's `POST /v3/<domain>/messages.mime`
+// (https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/messages/post-v3--domain-name--messages-mime):
+// one `to` field for every envelope recipient, `o:tag` fields and `v:<name>`
+// fields from `Message.tags`, then one `message` file part holding
+// `Delivery.raw` byte for byte.
+//
+// Mailgun takes the message as it is, so this file builds no MIME: the bytes the
+// SMTP path would send, `Options.dkim` signature included, are the part. The
+// recipients are the envelope's, `bcc` among them, because no header of the raw
+// message names a blind recipient.
+//
+// `Message.tags` has names and values, Mailgun has `o:tag` (names only, at most
+// 3) and `v:` variables (a name and a value, returned in its events and
+// webhooks): the tag named `tag` holds the tags, separated by commas, and every
+// other entry is a `v:<name>` variable.
+
+import { encodeHex, randomBytes } from "std/crypto"
+import { join, trimSpace } from "std/strings"
+import { keys } from "std/seq"
+import { sorted } from "std/sort"
+
+// The `Message.tags` name that becomes Mailgun's `o:tag` fields.
+const mgTagKey: string = "tag"
+
+// A request carries at most this many recipients, `to` fields counted one each.
+const mgMaxRecipients: int = 1000
+
+// A message carries at most this many tags, each of 1 to 128 ASCII characters.
+const mgMaxTags: int = 3
+
+const mgMaxTag: int = 128
+
+// A `v:` name is 1 to this many of `A-Za-z0-9_.-`.
+const mgMaxName: int = 64
+
+// Mailgun reads the `o:`, `h:` and `v:` fields of a request up to this many
+// bytes of names and values together.
+const mgMaxOptions: int = 16384
+
+// Boundary candidates tried before the message is refused: a 128-bit random
+// token that occurs in the message is not a thing that happens twice.
+const mgBoundaryTries: int = 8
+
+// One form field, as Mailgun reads it.
+class MgField {
+  name: string,
+  value: string,
+}
+
+// What a send posts: the `Content-Type` that names the boundary, and the body.
+class MgRequest {
+  contentType: string,
+  body: string,
+}
+
+// Whether `s` is 1 to `mgMaxTag` printable ASCII bytes.
+fn mgTagOk(s: string): bool {
+  if (len(s) < 1 || len(s) > mgMaxTag) {
+    return false
+  }
+  for c of []byte(s) {
+    if (c < 32 || c >= 127) {
+      return false
+    }
+  }
+  return true
+}
+
+// The tags in `Message.tags["tag"]`, split on commas. A tag Mailgun would
+// refuse, a fourth one or a repeat is refused here, before the request.
+fn mgTags(m: Message): []string!MailError {
+  let text = m.tags[mgTagKey]
+  let out: []string = []
+  if (text == "") {
+    return out
+  }
+  for part of split(text, ",") {
+    let tag = trimSpace(part)
+    if (!mgTagOk(tag)) {
+      fail MailError.Invalid("tags[\"tag\"]: Mailgun takes tags of 1 to ${mgMaxTag} printable ASCII characters separated by commas; got ${echoInput(tag)}")
+    }
+    for seen of out {
+      if (toLower(seen) == toLower(tag)) {
+        fail MailError.Invalid("tags[\"tag\"]: Mailgun tags are case-insensitive and ${echoInput(tag)} is given twice")
+      }
+    }
+    out = append(out, tag)
+  }
+  if (len(out) > mgMaxTags) {
+    fail MailError.Invalid("${len(out)} tags in tags[\"tag\"]; Mailgun takes at most ${mgMaxTags} per message")
+  }
+  return out
+}
+
+// Whether `s` is a name of 1 to `mgMaxName` bytes of `[A-Za-z0-9_.-]`.
+fn mgNameOk(s: string): bool {
+  if (len(s) < 1 || len(s) > mgMaxName) {
+    return false
+  }
+  for c of []byte(s) {
+    if (!isAlnum(c) && c != 95 && c != 46 && c != 45) {
+      return false
+    }
+  }
+  return true
+}
+
+// The `o:tag` and `v:<name>` fields of `m`, tags first, variables sorted by
+// name. The total of their names and values is held under what Mailgun reads.
+fn mgOptions(m: Message): []MgField!MailError {
+  let out: []MgField = []
+  let size = 0
+  for tag of mgTags(m)? {
+    out = append(out, MgField{ name = "o:tag", value = tag })
+    size = size + len("o:tag") + len(tag)
+  }
+  for name of sorted(keys(m.tags), (a, b) => a < b) {
+    if (name == mgTagKey) {
+      continue
+    }
+    if (!mgNameOk(name)) {
+      fail MailError.Invalid("tags[${echoInput(name)}]: Mailgun takes a variable name of 1 to ${mgMaxName} letters, digits, '_', '.' and '-'")
+    }
+    out = append(out, MgField{ name = "v:${name}", value = m.tags[name] })
+    size = size + len(name) + 2 + len(m.tags[name])
+  }
+  if (size > mgMaxOptions) {
+    fail MailError.Invalid("tags hold ${size} bytes of options; Mailgun reads at most ${mgMaxOptions} bytes of o: and v: fields")
+  }
+  return out
+}
+
+// One `to` field for every recipient of the envelope, `bcc` included.
+fn mgRecipients(d: Delivery): []MgField {
+  let out: []MgField = []
+  for a of d.envelope.to {
+    out = append(out, MgField{ name = "to", value = a })
+  }
+  return out
+}
+
+// A random boundary, 128 bits of hex after a fixed prefix.
+fn mgRandomBoundary(): string {
+  return "bit-mail-${encodeHex(randomBytes(16))}"
+}
+
+// A boundary none of `values` contains, drawn from `next`; at most
+// `mgBoundaryTries` are tried.
+fn mgBoundary(values: []string, next: () => string): string!MailError {
+  let tries = 0
+  while (tries < mgBoundaryTries) {
+    tries = tries + 1
+    let b = next()
+    if (mgFree(values, b)) {
+      return b
+    }
+  }
+  fail MailError.Invalid("the message holds every multipart boundary tried; send it again")
+}
+
+// Whether no one of `values` contains `boundary`.
+fn mgFree(values: []string, boundary: string): bool {
+  for v of values {
+    if (contains(v, boundary)) {
+      return false
+    }
+  }
+  return true
+}
+
+// The body of the request: `fields`, then `raw` as the file part `message`,
+// each part opened by `--boundary` and the last closed by `--boundary--`.
+fn mgBody(fields: []MgField, raw: string, boundary: string): string {
+  let parts: []string = []
+  for f of fields {
+    parts = append(
+      parts,
+      "--${boundary}\r\nContent-Disposition: form-data; name=\"${f.name}\"\r\n\r\n${f.value}\r\n",
+    )
+  }
+  parts = append(
+    parts,
+    "--${boundary}\r\nContent-Disposition: form-data; name=\"message\"; filename=\"message.mime\"\r\nContent-Type: application/octet-stream\r\n\r\n${raw}\r\n--${boundary}--\r\n",
+  )
+  return join(parts, "")
+}
+
+// The request for `d`, or an `Invalid` for what Mailgun would refuse. `next`
+// makes the boundary candidates.
+fn mgRequest(d: Delivery, next: () => string): MgRequest!MailError {
+  apiCheckRecipients(d, "Mailgun", mgMaxRecipients)?
+  let fields = mgRecipients(d)
+  for f of mgOptions(d.message)? {
+    fields = append(fields, f)
+  }
+  let values = [d.raw]
+  for f of fields {
+    values = append(values, f.value)
+  }
+  let boundary = mgBoundary(values, next)?
+  return MgRequest{
+    contentType = "multipart/form-data; boundary=${boundary}",
+    body = mgBody(fields, d.raw, boundary),
+  }
+}
