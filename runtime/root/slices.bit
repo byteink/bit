@@ -471,6 +471,116 @@ export @nosplit @symbol("bit_rt_slice_append_str") fn rtSliceAppendStr(hIn: int,
   return h
 }
 
+// The byte stride of one element in a buffer whose header says `isRef`: a
+// reference buffer is word-per-element whatever `elemSize` says (epic #2941,
+// the collector walks it word by word), anything else is packed at
+// `elemSize`. The same rule `rtSliceAppend` spells as its `packed` test.
+@nosplit fn sliceStride(isRef: int, elemSize: int): int {
+  if (isRef != 0) {
+    return 8
+  }
+  return elemSize
+}
+
+// `len` of a slice header that may be null (§2's null-header contract: a
+// zeroed class's slice field is the empty slice).
+@nosplit fn sliceLenOrZero(h: int): int {
+  if (h == 0) {
+    return 0
+  }
+  return loadWord(h + slcLen)
+}
+
+// Copies `n` bytes from `src` to `dst` when the two regions MAY OVERLAP
+// (#7377). `copyBytes` (root.bit) walks upward, which is correct whenever
+// `dst <= src` or the regions are disjoint; only `src < dst < src + n` needs
+// the downward walk, or it would read bytes it has already overwritten. The
+// downward walk moves the partial tail first (it is the highest), then whole
+// words when both ends are 8-aligned, bytewise otherwise. Bounded by `n`.
+@nosplit fn moveBytes(dst: int, src: int, n: int) {
+  if (dst <= src || dst >= src + n) {
+    copyBytes(dst, src, n)
+    return
+  }
+  let words = 0
+  if (((dst | src) & 7) == 0) {
+    words = n >> 3
+  }
+  let i = n
+  while (i > words * 8) {
+    i = i - 1
+    storeByte(dst + i, loadByte(src + i))
+  }
+  while (i > 0) {
+    i = i - 8
+    storeWord(dst + i, loadWord(src + i))
+  }
+}
+
+// `bit_rt_slice_append_slice`: `append(dst, ...src)` in ONE call (#7377).
+// Grows once to `max(2 * cap, len + n)`, then moves `src`'s `n` elements as
+// one block of `n * stride` bytes.
+//
+// WHY NOT A LOOP AT THE CALL SITE. The lowering this replaces called
+// `slice_append` once per element: one call, one capacity test and one
+// doubling per element, so a 1 MiB `[]u8` spread paid a million calls and
+// twenty regrows. It also re-read `len(src)` every iteration, so
+// `append(s, ...s)` with spare capacity never terminated: `src` IS the header
+// being grown in place.
+//
+// MEMMOVE SEMANTICS. The appended elements are `src`'s as they stood at the
+// call: `n` is read before anything is written, and `moveBytes` is
+// overlap-safe, so `src` may view the very buffer being appended into
+// (`append(s, ...s)`, `append(s[0:2], ...s[1:5])`). `src`'s `buf`/`off` are
+// read AFTER the grow: when `src` is `h` itself the grow has just moved its
+// elements to the front of the new buffer, which is where `src` then reads
+// them; any other header still views its own, untouched buffer.
+//
+// EVERY ELEMENT TYPE, REFERENCES INCLUDED. The collector is stop-the-world,
+// non-moving and has no write barrier (`compiler/loweraccess.bit`, #3108), and
+// this function is `@nosplit`: the one place a collection can run is inside
+// `allocBuf`, before any element moves, and `rtSliceAppend`'s own grow already
+// copies a reference buffer's words with plain loads and stores. `isRef`/
+// `elemSize` are `dst`'s static element type, which is `src`'s too; a null
+// `src` is the empty slice and appends nothing. Same aliasing contract as
+// `rtSliceAppend`.
+export @nosplit @symbol("bit_rt_slice_append_slice") fn rtSliceAppendSlice(
+  hIn: int,
+  src: int,
+  isRef: int,
+  elemSize: int,
+): int {
+  let h = appendTarget(hIn, isRef, elemSize)
+  let n = sliceLenOrZero(src)
+  if (n == 0) {
+    return h
+  }
+  let vlen = loadWord(h + slcLen)
+  let vcap = loadWord(h + slcCap)
+  let off = loadWord(h + slcOff)
+  let bufIsRef = loadWord(h + slcIsRef)
+  let st = sliceStride(bufIsRef, elemSize)
+  let want = vlen + n
+  if (want > vcap) {
+    let newcap = vcap * 2
+    if (newcap < want) {
+      newcap = want
+    }
+    let nb = allocBuf(newcap, bufIsRef != 0, elemSize)
+    let old = loadWord(h + slcBuf)
+    copyBytes(nb, old + off * st, vlen * st)
+    storeWord(h + slcBuf, nb)
+    storeWord(h + slcOff, 0)
+    storeWord(h + slcCap, newcap)
+    off = 0
+  }
+  let buf = loadWord(h + slcBuf)
+  let from = loadWord(src + slcBuf) + loadWord(src + slcOff) * st
+  moveBytes(buf + (off + vlen) * st, from, n * st)
+  storeWord(h + slcLen, want)
+  return h
+}
+
 // `bit_rt_slice_get`: bounds-checked element read. OUT OF RANGE PANICS (SPEC
 // §12.6, #2014). `rtSliceInBounds` below is still the predicate for a caller
 // that must ask rather than fault.
