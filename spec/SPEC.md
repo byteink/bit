@@ -4907,6 +4907,44 @@ Method sets:
   is **E0311**. Modules loaded before `std/json` are loaded after it instead
   (the project is loaded once more with `std/json` first), so a class in any
   module of the program gets the member.
+- **`__sameValue`, `__valueHash` and `__snapshot`, deep value semantics
+  (#7327).** A class with value semantics (below) has three synthesized
+  methods, written per class as Bit text and checked like a declared method:
+  `__sameValue(other: C): bool`, `__valueHash(): u64` and `__snapshot(): C`.
+  `__sameValue` is structural equality over every field in declaration order; a
+  slice is equal when the lengths match and the elements are equal pairwise, a
+  map when the lengths match and every key of one is in the other with an equal
+  value, an `Option<T>` when both are `None` or both are `Some` of equal
+  payloads, a payload enum when the variants are the same and the payloads equal
+  in order, a nested class by its own `__sameValue`, a float by its bit pattern
+  (so a NaN equals itself and the relation is reflexive) and a `decimal` by
+  value (`1.0` and `1.00` are equal, as `==` has it, §11.1). `__valueHash` is
+  consistent with it: values that are `__sameValue` hash equal. It folds the
+  length of every string and slice before its elements (so `["a", "b"]` and
+  `["ab"]` differ), the tag of every `Option` and payload enum, and sums the
+  per-entry hashes of a map so that the iteration order of the map does not
+  matter; a `decimal` folds its integer part and first nine fraction digits, so
+  decimals differing only beyond that collide (a hash may collide, equality
+  still decides). The hash starts from the value the runtime's map hash starts
+  from (`bit_rt_map_hash_seed`, `runtime/ABI.md`), so a per-process map seed
+  seeds it too. `__snapshot` is a deep copy: slices, maps and nested classes are
+  copied, so a later mutation of the original cannot reach the copy. Equality
+  and hash allocate nothing; only `__snapshot` allocates, for what it copies.
+  The value-semantics field types are `string`, every integer type, `bool`,
+  `f32`/`f64`, `decimal`, a payload-free enum (same module or imported), a
+  payload enum declared in the same module (not generic, not recursive), a
+  slice of any of these, an `Option<T>` of any of these, a `map<K, V>` with `K`
+  a string, integer, bool or payload-free enum and `V` any of these, and a
+  non-generic class whose own fields qualify. A generic class, a tuple, a
+  function, interface or channel field, and any other type give the class **no**
+  member. The members are emitted only in a program whose source names one of the
+  three as an identifier (a call or an interface requirement; a string or a
+  comment does not count), for every qualifying class of that program, are
+  dispatched like any method and are not listed by `bit doc` or completion.
+  **E0312**: a class declares a method named `__sameValue`, `__valueHash` or
+  `__snapshot`. **E0313**: one of the three is called on a class that has no
+  such member; the message names the first field, in declaration order, whose
+  type has no value semantics.
 - `S` must be a **class or enum** type (or another interface, or `nil`). An
   interface value *is* the receiver's object pointer - there is no boxed
   scalar - so only a type that is already a reference (§13.3) can sit behind

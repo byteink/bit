@@ -173,6 +173,80 @@ named `__field`, so every other program is unchanged. Declaring a method named
 an interface by name alone. The name is hidden from `bit doc` like every
 `__` member.
 
+## Comparing whole values: `__sameValue`, `__valueHash`, `__snapshot`
+
+`a == b` on a class that holds a slice is a compile error (E0052): a slice has
+no value equality, so there is no answer to give. That is awkward the moment you
+want to remember work by the whole value of an object. Say Inkwell caches the
+rendered page of a draft: if the cache key were only the title, an edit to the
+tags would keep serving the old page. Three members, written for you, make the
+whole value the key:
+
+```bit
+class Author {
+  id: string,
+  roles: []string,
+}
+
+class Draft {
+  title: string,
+  tags: []string,
+  author: Author,
+  reviewer: Option<string>,
+  words: map<string, int>,
+}
+
+fn main() {
+  let a = Draft{
+    title = "Hello", tags = ["intro", "news"], author = Author{ id = "ana", roles = ["editor"] },
+    reviewer = Option.Some("bo"), words = map<string, int>{ "hello": 1, "world": 2 },
+  }
+  let b = Draft{
+    title = "Hello", tags = ["intro", "news"], author = Author{ id = "ana", roles = ["editor"] },
+    reviewer = Option.Some("bo"), words = map<string, int>{ "world": 2, "hello": 1 },
+  }
+  println("same: ${a.__sameValue(b)}")
+  println("same hash: ${a.__valueHash() == b.__valueHash()}")
+
+  let kept = a.__snapshot()
+  a.tags[0] = "changed"
+  println("copy unchanged: ${kept.__sameValue(b)}")
+  println("original differs: ${!a.__sameValue(b)}")
+}
+```
+
+- `x.__sameValue(y)` is true when every field is equal. A slice is equal when it
+  has the same length and equal elements, a map when it has the same keys with
+  equal values, an `Option` when both are `None` or both hold equal values, an
+  enum with payloads when it is the same variant with equal payloads, and a
+  nested class by these same rules. A float compares by its bits, so a `NaN`
+  field equals itself. A `decimal` compares by value, so `1.0` equals `1.00`.
+- `x.__valueHash()` is a `u64`. Values that are `__sameValue` have the same
+  hash, whatever order a map yields its entries in. Different values usually
+  differ, but two may collide, so a cache compares with `__sameValue` after a
+  hash match. The hash starts from the same per-program seed the built-in maps
+  use, so it is not a number to store or send anywhere.
+- `x.__snapshot()` is a deep copy: a later change to `x`, to one of its slices,
+  maps or nested classes, never reaches the copy.
+
+Comparing and hashing allocate nothing. Only `__snapshot` allocates, for the
+fresh slices and maps it returns.
+
+A class gets the three members when every field is a string, a number, a bool, a
+float, a `decimal`, an enum, a slice, a map or an `Option` of these, or a class
+that qualifies itself. A map key must be a string, an integer, a bool or an enum
+without payloads. An enum with payloads must be declared in the same module as
+the class, with no type parameters and no variant that contains itself.
+
+A class with a field of any other kind (a function, an interface, a channel, a
+generic class, a tuple, or an enum that breaks the rules above) has none of the
+three. Calling one is **E0313**, and the message names the first field in the
+way. Declaring a method with one of these names yourself is **E0312**, because a
+hand-written one would satisfy an interface requiring it by name alone.
+
+The members exist only in a program that names one of them, so every other
+program is unchanged. They are hidden from `bit doc` like every `__` member.
+
 ## The built-in `error` interface
 
 Bit's own `error` type is declared the same way:

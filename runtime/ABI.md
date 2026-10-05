@@ -2918,6 +2918,7 @@ defined exactly once).
 | `bit_rt_map_slot_str` | `(m: ?*MapHeader, ptr: *const u8, len: usize) -> i64` (§15; `bit_rt_map_slot` for a `string` key passed as its bytes, not a header) |
 | `bit_rt_map_delete`   | `(m: ?*MapHeader, key: u64) -> void` (§15)              |
 | `bit_rt_map_len`      | `(m: ?*MapHeader) -> i64` (§15)                         |
+| `bit_rt_map_hash_seed`| `() -> u64` (§15; the seed every map hash starts from, `0` until #7379 draws it per process. The compiler's synthesized `__valueHash` (SPEC §14.3) starts from the same value) |
 | `bit_rt_map_iter_init`| `(m: ?*MapHeader) -> i64` (§15)                         |
 | `bit_rt_map_iter_next`| `(m: ?*MapHeader, prev: i64) -> i64` (§15)              |
 | `bit_rt_map_key_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
