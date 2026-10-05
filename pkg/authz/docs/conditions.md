@@ -31,15 +31,15 @@ fn main(): ()! {
   let article = Article{ id = 1, authorId = "sara", status = "draft", views = 40 }
   let mine: Cond = eq("authorId", Value.Text("sara"))
   match (evalCond(mine, article)?) {
-    T => println("sara owns it")
-    F => println("not hers")
-    U => println("cannot tell")
+    True => println("sara owns it")
+    False => println("not hers")
+    Unknown => println("cannot tell")
   }
 }
 ```
 
-This prints `sara owns it`. The answer is a `Bool3`, not a `bool`: `T`, `F`
-or `U` for unknown, and the last section says when that happens. Field names
+This prints `sara owns it`. The answer is a `Truth`, not a `bool`: `True`,
+`False` or `Unknown`, and a later section says when that happens. Field names
 are the class's own (`authorId`), never column names, and values are
 `std/sql`'s `Value`: `Int`, `Float`, `Bool`, `Text`, `Blob` and `Null`.
 
@@ -60,7 +60,7 @@ Each one is a function that returns a `Cond`:
 `oneOf` is `in`: `in` is a reserved word, so it cannot name a function.
 
 ```bit
-import { Bool3, evalCond, gte, lt, ne, oneOf } from "authz"
+import { Truth, evalCond, gte, lt, ne, oneOf } from "authz"
 import { Tabled } from "orm"
 import { Value } from "std/sql"
 
@@ -73,11 +73,11 @@ import { Value } from "std/sql"
   editorNote: Option<string>
 }
 
-fn show(b: Bool3): string {
+fn show(b: Truth): string {
   return match (b) {
-    T => "yes"
-    F => "no"
-    U => "unknown"
+    True => "yes"
+    False => "no"
+    Unknown => "unknown"
   }
 }
 
@@ -101,7 +101,7 @@ always true and an empty `or` never is, so a list you build in a loop needs
 no special case for zero entries:
 
 ```bit
-import { Bool3, and, eq, evalCond, gt, not, or } from "authz"
+import { Truth, and, eq, evalCond, gt, not, or } from "authz"
 import { Tabled } from "orm"
 import { Value } from "std/sql"
 
@@ -121,8 +121,8 @@ fn main(): ()! {
   let popular = gt("views", Value.Int(1000))
   let canEdit = and([own, or([draft, popular])])
   let canNotEdit = not(canEdit)
-  let yes = evalCond(canEdit, a)? == Bool3.T
-  let no = evalCond(canNotEdit, a)? == Bool3.T
+  let yes = evalCond(canEdit, a)? == Truth.True
+  let no = evalCond(canNotEdit, a)? == Truth.True
   println("${yes}")
   println("${no}")
 }
@@ -188,7 +188,7 @@ is less than it and nothing differs from it, so every comparison with it is
 unknown, exactly as in SQL:
 
 ```bit
-import { Bool3, Cond, and, eq, evalCond, not, or } from "authz"
+import { Truth, Cond, and, eq, evalCond, not, or } from "authz"
 import { Tabled } from "orm"
 import { Value } from "std/sql"
 
@@ -201,11 +201,11 @@ import { Value } from "std/sql"
   editorNote: Option<string>
 }
 
-fn show(b: Bool3): string {
+fn show(b: Truth): string {
   return match (b) {
-    T => "T"
-    F => "F"
-    U => "U"
+    True => "True"
+    False => "False"
+    Unknown => "Unknown"
   }
 }
 
@@ -221,21 +221,21 @@ fn main(): ()! {
 }
 ```
 
-This prints `U`, `F`, `T`, `U`. `and` and `or` follow SQL's three-valued
+This prints `Unknown`, `False`, `True`, `Unknown`. `and` and `or` follow SQL's three-valued
 logic: a false child settles an `and` and a true child settles an `or`,
 whatever else is unknown; otherwise unknown wins; `not` leaves it alone.
 
-| and | T | F | U |
-| --- | - | - | - |
-| T | T | F | U |
-| F | F | F | F |
-| U | U | F | U |
+| and | True | False | Unknown |
+| --- | ---- | ----- | ------- |
+| True | True | False | Unknown |
+| False | False | False | False |
+| Unknown | Unknown | False | Unknown |
 
-| or | T | F | U |
-| -- | - | - | - |
-| T | T | T | T |
-| F | T | F | U |
-| U | T | U | U |
+| or | True | False | Unknown |
+| -- | ---- | ----- | ------- |
+| True | True | True | True |
+| False | True | False | Unknown |
+| Unknown | True | Unknown | Unknown |
 
 A rule that comes out unknown does not apply: an allow rule that is unknown
 grants nothing, and a deny rule that is unknown denies nothing. In SQL the
@@ -266,7 +266,7 @@ every comparison with it is false except `ne`.
 lowers to. `fromWhere` turns that `Where<T>` into a `Cond`, one node for one:
 
 ```bit
-import { Bool3, evalCond, fromWhere } from "authz"
+import { Truth, evalCond, fromWhere } from "authz"
 import { Tabled } from "orm"
 import { Clause, Op, Where } from "std/where"
 import { Value } from "std/sql"
@@ -282,7 +282,7 @@ fn main(): ()! {
   let own = Clause("authorId", Op.Eq, [Value.Text("sara")])?
   let w = Where<Article>(clauses = [own])
   let a = Article{ id = 1, authorId = "sara", status = "draft" }
-  let holds = evalCond(fromWhere(w), a)? == Bool3.T
+  let holds = evalCond(fromWhere(w), a)? == Truth.True
   println("${holds}")
 }
 ```
