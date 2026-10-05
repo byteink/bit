@@ -1,0 +1,333 @@
+// pkg/authz/condeval.bit — evaluate a `Cond` against ONE row. The semantics
+// are SQL's, on purpose: the list filter built from the same tree (a later
+// ticket) must give the answer this gives, row by row.
+//
+// THREE VALUES. A comparison is true, false or unknown (`Truth`). It is
+// unknown when the field is NULL (an `Option` that is `None`) or the operand
+// is `Value.Null`: nothing equals, orders against or differs from NULL. `and`,
+// `or` and `not` are Kleene's: a false child decides an `and` and a true child
+// an `or` whatever else is unknown; otherwise unknown wins; `not` leaves
+// unknown alone. `in` is a chain of `or`ed equalities, so `x in [1, NULL]` is
+// true for 1, unknown for anything else.
+//
+// The caller decides what unknown means: an allow rule that is unknown does
+// not grant, a deny rule that is unknown does not deny (the SQL form is
+// `NOT COALESCE(cond, false)`, decided by the SQL ticket).
+//
+// COMPARING. Integers compare exactly, an integer with a float as floats,
+// text byte by byte, bool and blob for equality only. Two unlike kinds are an
+// InvalidPolicy, not false: `eq("title", Value.Int(1))` is a bug in the
+// policy and `validate` refuses it at startup. A float NaN is unordered:
+// every comparison with it is false except `ne`.
+//
+// MISTAKES FAIL LOUD AND EARLY. Every child of an `and`/`or` and every operand
+// of an `in` is checked even when an earlier one already decides the answer, so
+// a typo'd field fails on the first row, not only on rows that reach it. An
+// unknown field, an operand count the operator does not take and a comparison
+// of unlike kinds are all an InvalidPolicy. Nothing here panics.
+
+// The answer to a condition: true, false, or unknown (SQL's NULL).
+export enum Truth { True, False, Unknown }
+
+fn and3(a: Truth, b: Truth): Truth {
+  return match (a) {
+    False => Truth.False
+    True => b
+    Unknown => match (b) {
+      False => Truth.False
+      _ => Truth.Unknown
+    }
+  }
+}
+
+fn or3(a: Truth, b: Truth): Truth {
+  return match (a) {
+    True => Truth.True
+    False => b
+    Unknown => match (b) {
+      True => Truth.True
+      _ => Truth.Unknown
+    }
+  }
+}
+
+fn not3(a: Truth): Truth {
+  return match (a) {
+    True => Truth.False
+    False => Truth.True
+    Unknown => Truth.Unknown
+  }
+}
+
+fn bool3(b: bool): Truth {
+  if (b) {
+    return Truth.True
+  }
+  return Truth.False
+}
+
+// How many values an operator takes: `in` one or more, every other exactly one.
+fn checkArity(field: string, op: Op, operands: []Value): ()! {
+  if (field == "") {
+    fail InvalidPolicy{ detail = "condition names an empty field" }
+  }
+  let n = len(operands)
+  let ok = n == 1
+  if (op == Op.In) {
+    ok = n >= 1
+  }
+  if (!ok) {
+    fail InvalidPolicy{ detail = "field ${field}: operator takes ${arityText(op)}, got ${n}" }
+  }
+}
+
+fn arityText(op: Op): string {
+  if (op == Op.In) {
+    return "one or more values"
+  }
+  return "exactly one value"
+}
+
+fn kindName(v: Value): string {
+  return match (v) {
+    Null => "null"
+    Int(_) => "an integer"
+    Float(_) => "a float"
+    Bool(_) => "a bool"
+    Text(_) => "text"
+    Blob(_) => "bytes"
+  }
+}
+
+fn numOf(v: Value): Option<f64> {
+  return match (v) {
+    Int(i) => Option<f64>.Some(f64(i))
+    Float(f) => Option<f64>.Some(f)
+    _ => Option<f64>.None
+  }
+}
+
+// -1, 0 or 1; 2 when unordered (NaN).
+fn cmpF(a: f64, b: f64): int {
+  if (a < b) {
+    return -1
+  }
+  if (a > b) {
+    return 1
+  }
+  if (a == b) {
+    return 0
+  }
+  return 2
+}
+
+fn cmpI(a: int, b: int): int {
+  if (a < b) {
+    return -1
+  }
+  if (a > b) {
+    return 1
+  }
+  return 0
+}
+
+fn cmpS(a: string, b: string): int {
+  if (a < b) {
+    return -1
+  }
+  if (a > b) {
+    return 1
+  }
+  return 0
+}
+
+fn cmpBytes(a: []byte, b: []byte): int {
+  if (len(a) != len(b)) {
+    return 1
+  }
+  let i = 0
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return 1
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+fn cmpBool(a: bool, b: bool): int {
+  if (a == b) {
+    return 0
+  }
+  return 1
+}
+
+fn mismatch(field: string, a: Value, b: Value): InvalidPolicy {
+  return InvalidPolicy{ detail = "field ${field} holds ${kindName(a)}, cannot compare with ${kindName(b)}" }
+}
+
+fn unlike(field: string, a: Value, b: Value): int! {
+  fail mismatch(field, a, b)
+}
+
+fn cmpText(field: string, x: string, a: Value, b: Value): int! {
+  return match (b) {
+    Text(y) => cmpS(x, y)
+    _ => unlike(field, a, b)?
+  }
+}
+
+fn cmpBoolV(field: string, x: bool, a: Value, b: Value): int! {
+  return match (b) {
+    Bool(y) => cmpBool(x, y)
+    _ => unlike(field, a, b)?
+  }
+}
+
+fn cmpBlob(field: string, x: []byte, a: Value, b: Value): int! {
+  return match (b) {
+    Blob(y) => cmpBytes(x, y)
+    _ => unlike(field, a, b)?
+  }
+}
+
+// Integers exactly, an integer with a float as floats.
+fn cmpNums(field: string, a: Value, b: Value): int! {
+  return match (a) {
+    Int(x) => cmpIntWith(field, x, a, b)?
+    _ => cmpFloats(field, a, b)?
+  }
+}
+
+fn cmpIntWith(field: string, x: int, a: Value, b: Value): int! {
+  return match (b) {
+    Int(y) => cmpI(x, y)
+    _ => cmpFloats(field, a, b)?
+  }
+}
+
+fn cmpFloats(field: string, a: Value, b: Value): int! {
+  let x = numOf(a)
+  let y = numOf(b)
+  if (isSome(x) && isSome(y)) {
+    return cmpF(unwrap(x), unwrap(y))
+  }
+  fail mismatch(field, a, b)
+}
+
+// Order of two values of the same kind (numbers across Int and Float),
+// otherwise an InvalidPolicy.
+fn cmpSame(field: string, a: Value, b: Value): int! {
+  return match (a) {
+    Text(x) => cmpText(field, x, a, b)?
+    Bool(x) => cmpBoolV(field, x, a, b)?
+    Blob(x) => cmpBlob(field, x, a, b)?
+    _ => cmpNums(field, a, b)?
+  }
+}
+
+fn isOrdering(op: Op): bool {
+  return match (op) {
+    Lt => true
+    Lte => true
+    Gt => true
+    Gte => true
+    _ => false
+  }
+}
+
+fn isOrderable(v: Value): bool {
+  return match (v) {
+    Bool(_) => false
+    Blob(_) => false
+    _ => true
+  }
+}
+
+// Does `c`, the order of the field and the operand, satisfy `op`?
+fn holds(op: Op, c: int): bool {
+  return match (op) {
+    Eq => c == 0
+    In => c == 0
+    Ne => c != 0
+    Lt => c == -1
+    Lte => c == -1 || c == 0
+    Gt => c == 1
+    Gte => c == 1 || c == 0
+  }
+}
+
+// The field's value against one operand. Unknown when either is NULL.
+fn cmpOne(field: string, op: Op, v: Value, operand: Value): Truth! {
+  if (isNull(v) || isNull(operand)) {
+    return Truth.Unknown
+  }
+  if (isOrdering(op) && !(isOrderable(v) && isOrderable(operand))) {
+    fail InvalidPolicy{ detail = "field ${field}: ${kindName(v)} cannot be ordered" }
+  }
+  return bool3(holds(op, cmpSame(field, v, operand)?))
+}
+
+// `in`: the `or` of the equalities, every operand checked.
+fn cmpIn(field: string, v: Value, operands: []Value): Truth! {
+  let out = Truth.False
+  for o of operands {
+    out = or3(out, cmpOne(field, Op.Eq, v, o)?)
+  }
+  return out
+}
+
+fn indexOf(names: []string, field: string): int! {
+  let i = 0
+  while (i < len(names)) {
+    if (names[i] == field) {
+      return i
+    }
+    i = i + 1
+  }
+  fail InvalidPolicy{ detail = "unknown field ${field}" }
+}
+
+fn evalCmp(names: []string, vals: []Value, field: string, op: Op, operands: []Value): Truth! {
+  checkArity(field, op, operands)?
+  let v = vals[indexOf(names, field)?]
+  if (op == Op.In) {
+    return cmpIn(field, v, operands)?
+  }
+  return cmpOne(field, op, v, operands[0])?
+}
+
+fn evalAll(names: []string, vals: []Value, cs: []Cond): Truth! {
+  let out = Truth.True
+  for c of cs {
+    out = and3(out, evalRow(c, names, vals)?)
+  }
+  return out
+}
+
+fn evalAny(names: []string, vals: []Value, cs: []Cond): Truth! {
+  let out = Truth.False
+  for c of cs {
+    out = or3(out, evalRow(c, names, vals)?)
+  }
+  return out
+}
+
+fn evalRow(c: Cond, names: []string, vals: []Value): Truth! {
+  return match (c) {
+    True => Truth.True
+    False => Truth.False
+    Cmp(field, op, operands) => evalCmp(names, vals, field, op, operands)?
+    And(cs) => evalAll(names, vals, cs)?
+    Or(cs) => evalAny(names, vals, cs)?
+    Not(inner) => not3(evalRow(inner, names, vals)?)
+  }
+}
+
+// `c` against `row`: true, false or unknown. A field `c` names that `row` does
+// not carry (not declared, or a relation) is an InvalidPolicy.
+export fn evalCond<T: Tabled>(c: Cond, row: T): Truth! {
+  let vals = row.__values()
+  let names = rowNames(T.__columns(), vals)?
+  return evalRow(c, names, vals)?
+}
