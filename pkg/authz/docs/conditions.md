@@ -383,6 +383,148 @@ A condition that still holds a `Param` when it is evaluated is an
 first. `validate` accepts a placeholder (its value is not known until the
 request) and still checks the field it compares.
 
+## Filtering a list
+
+"May sara update THIS article" is one row. Inkwell's "my articles" page asks
+for every row she may read, and loading the table to ask the first question a
+thousand times is the slow answer. `compileSql` turns the same condition into
+the text of a WHERE clause, so the database does the filtering and the two
+questions cannot disagree. It takes the condition, the resource's
+`ResourceInfo` (`resourceByName`), the server (`ServerDialect`, from `orm`)
+and the number of the first placeholder, and returns a `SqlFragment`: the text
+and the values its placeholders stand for:
+
+```bit
+import { Authz, SqlFragment, and, asAllow, asDeny, compileSql, eq, gt } from "authz"
+import { MysqlVersion, ServerDialect, Tabled } from "orm"
+import { Value } from "std/sql"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+  authorId: string
+  status: string
+  views: i64
+}
+
+fn main(): ()! {
+  let authz = Authz<Action>()?
+  authz.resource<Article>()?
+  let info = unwrap(authz.resourceByName("Article"))
+
+  let popular = and([eq("authorId", Value.Text("sara")), gt("views", Value.Int(10))])
+  let pg: SqlFragment = compileSql(popular, info, ServerDialect.Postgres, 1)?
+  println(pg.sql)
+  println("${len(pg.args)}")
+  println(asAllow(pg, ServerDialect.Postgres).sql)
+
+  let mysql = ServerDialect.Mysql(MysqlVersion{ major = 8, minor = 4 })
+  let archived = compileSql(eq("status", Value.Text("archived")), info, mysql, 1)?
+  println(asDeny(archived, mysql).sql)
+}
+```
+
+This prints:
+
+```text
+("author_id" = $1 AND "views" > $2)
+2
+COALESCE((("author_id" = $1 AND "views" > $2)), FALSE)
+NOT COALESCE((`status` = ?), 0)
+```
+
+Two rules keep this safe from SQL injection, and neither has an exception. A
+value is never part of the text: every operand is a bound parameter, `$1`,
+`$2` and so on on Postgres (counted from the number you pass, because the
+query you add it to has numbered its own already) and `?` on MySQL, and
+`oneOf` with three values is three placeholders. Text such as `'; DROP TABLE
+articles;--` ends up in `args` and the SQL is the same text it was without
+it. A name is never taken from the condition: it names a FIELD, the class's
+declared columns give the column (`authorId` is `author_id`, or whatever
+`@column` says) and it is quoted for the dialect with the quote doubled. A
+field the class does not declare is an `InvalidPolicy`, so a hostile name
+fails instead of being written.
+
+An empty `oneOf` is `FALSE` (`0` on MySQL), `and` and `or` are parenthesised
+groups and so is `not`, and a `$user.x` placeholder that `bind` has not
+replaced is an `InvalidPolicy`.
+
+The text is the condition as written, and a database NULL makes it unknown
+rather than false, just as `evalCond` answers `Unknown`. What unknown means
+depends on the rule: `asAllow` wraps an allow rule so an unknown row is not
+granted, and `asDeny` wraps a deny rule so an unknown row is not denied. That
+is how a list comes out the same rows as one check per row.
+
+## A rule written as code
+
+Some rules are not data: "the publish window is open" is a function of the
+clock. `canIf` writes one, and `custom` builds the same condition by hand:
+
+```bit
+import { Authz, Cond, NotFilterable, Policy, Subject, custom, eq, filterable } from "authz"
+import { Tabled } from "orm"
+import { Value } from "std/sql"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+  authorId: string
+  views: i64
+}
+
+class User {
+  export id: string,
+  export roles: []string,
+}
+
+fn publishing(): Policy<User, Action> {
+  return Policy("Publishing", (p, user) => {
+    p.canIf<Article>([Action.Publish], "PublishWindowOpen", (a: Article) => a.views < 100)
+  })
+}
+
+fn main(): ()! {
+  let authz = Authz<Action>()?
+  authz.resource<Article>()?
+  authz.role<User>("editor", [publishing()])?
+  let sara = User{ id = "sara", roles = ["editor"] }
+  let early = Article{ id = 1, authorId = "sara", views = 5 }
+  let late = Article{ id = 2, authorId = "sara", views = 500 }
+  println("${authz.can(Option<Subject>.Some(sara), Action.Publish, early)}")
+  println("${authz.can(Option<Subject>.Some(sara), Action.Publish, late)}")
+
+  let nested = Cond.Not(custom<Article>("Quiet", (a: Article) => a.views == 0))
+  println(unwrapOr(filterable(nested), "none"))
+  println(unwrapOr(filterable(eq("authorId", Value.Text("sara"))), "none"))
+
+  authz.validateFilterable<Article>(Action.Publish) catch e {
+    let (nf, ok) = e.(NotFilterable)
+    println("${ok}: ${nf.policy} / ${nf.label}")
+    println(e.message())
+  }
+}
+```
+
+This prints `true`, `false`, `Quiet`, `none`, then `true: Publishing /
+PublishWindowOpen` and the message `policy 'Publishing' rule
+'PublishWindowOpen' is a code function and cannot filter a list`. A single
+check runs the function, so `can` answers. A list cannot: the database has no
+function to run, so reading a list through the rule fails with
+`NotFilterable`, a 500 and a mistake in the app's policies, never a quietly
+wrong list. `filterable` finds the first code function in a condition however
+deeply it sits under `and`, `or` and `not`. `authz.validateFilterable<T>(action)`
+asserts it at startup (a test calls it for every list the app serves), and
+checks the rules each role gives its sample user, as `role` does.
+
+The `label` is required and names the rule in that error and the log; an empty
+one is an `InvalidPolicy` when the policy is registered. The function takes
+the typed row, written with its type (`(a: Article) => ...`). Prefer a
+condition when one can say it: a rule as data is also a filter.
+
 ## Sharp edges
 
 - Only fields stored in a row can be named: scalars (`i64`, `int`, `f64`,

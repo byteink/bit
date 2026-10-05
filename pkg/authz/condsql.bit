@@ -1,0 +1,265 @@
+// pkg/authz/condsql.bit — a `Cond` as the WHERE clause of a list read, for
+// Postgres and MySQL, so the rows a list returns are the rows a single check
+// (condeval.bit) would allow.
+//
+//   let f = compileSql(and([eq("authorId", Value.Text("sara")), gt("views", Value.Int(10))]),
+//                      info, ServerDialect.Postgres, 1)?
+//   f.sql   // (("author_id" = $1) AND ("views" > $2))
+//   f.args  // [Text("sara"), Int(10)]
+//
+// INJECTION. Two rules, no exceptions (OWASP SQL injection prevention:
+// parameterize every value, allow-list every identifier).
+//   - A VALUE is never written into the text. Every operand is a bound
+//     parameter: `$n` counted from `firstParam` on Postgres (the orm numbers
+//     its own arguments first), `?` on MySQL. `in` with k values is k
+//     placeholders. Hostile text in a value changes `args`, never `sql`.
+//   - An IDENTIFIER comes only from the resource's declared columns: the
+//     condition names a FIELD, the class's `__columns()` maps it to its column
+//     (`columnName`, `@column(...)` honoured), and a field the class does not
+//     declare is an InvalidPolicy, never emitted. The column is then quoted
+//     for the dialect with the quote character doubled, so even a
+//     `@column("a\"b")` cannot end the identifier.
+//
+// SHAPE. `and`/`or` are one parenthesised group, `not` is `(NOT x)`, a
+// comparison inside a `not` is parenthesised too, `True`/`False` are `TRUE`/
+// `FALSE` (Postgres) and `1`/`0` (MySQL, which has no boolean keyword in
+// every context). An empty `in` is a false literal; an empty `and`/`or` is
+// the true / false literal, as the evaluator reads them.
+//
+// NULL. A comparison with a NULL column is unknown in SQL, as in condeval.bit,
+// and `and`/`or`/`not` are Kleene's in both. What unknown MEANS is the
+// caller's: `asAllow` wraps an allow rule in `COALESCE((cond), FALSE)` (not
+// granted) and `asDeny` a deny rule in `NOT COALESCE((cond), FALSE)` (not
+// denying), the two readings `Authz.can` takes.
+//
+// NOT HERE. A code function (`Cond.Custom`) has no SQL form: NotFilterable. An
+// unbound `$user.x` placeholder (`bind`, condparam.bit, must run first) is an
+// InvalidPolicy. Relationship conditions arrive with their own variant.
+
+import { ServerDialect, columnName } from "orm"
+import { Builder, replace } from "std/strings"
+
+// SQL text and the values its placeholders stand for, in placeholder order.
+export class SqlFragment {
+  export sql: string,
+  export args: []Value,
+}
+
+fn isPostgres(d: ServerDialect): bool {
+  return match (d) {
+    Postgres => true
+    Mysql(_) => false
+  }
+}
+
+// The identifier `name` quoted for `d`, the quote character doubled.
+fn quoteFor(d: ServerDialect, name: string): string {
+  if (isPostgres(d)) {
+    let escaped = replace(name, "\"", "\"\"")
+    return "\"${escaped}\""
+  }
+  let escaped = replace(name, "`", "``")
+  return "`${escaped}`"
+}
+
+fn trueLit(d: ServerDialect): string {
+  if (isPostgres(d)) {
+    return "TRUE"
+  }
+  return "1"
+}
+
+fn falseLit(d: ServerDialect): string {
+  if (isPostgres(d)) {
+    return "FALSE"
+  }
+  return "0"
+}
+
+fn sqlOp(op: Op): string {
+  return match (op) {
+    Eq => "="
+    Ne => "<>"
+    Lt => "<"
+    Lte => "<="
+    Gt => ">"
+    Gte => ">="
+    In => "IN"
+  }
+}
+
+// One compilation: the text so far, the arguments, the next `$n` and the
+// resource's row columns. One Builder for the whole tree.
+class SqlOut {
+  b: Builder
+  args: []Value
+  d: ServerDialect
+  next: int
+  cols: []FieldDesc
+
+  w(s: string) {
+    this.b.write(s)
+  }
+
+  // One bound parameter for `v`.
+  param(v: Value) {
+    this.args = append(this.args, v)
+    if (isPostgres(this.d)) {
+      this.b.write("$")
+      this.b.write("${this.next}")
+      this.next = this.next + 1
+      return
+    }
+    this.b.write("?")
+  }
+
+  // The quoted column of `field`, or an InvalidPolicy when the class does not
+  // declare it as a row column.
+  column(field: string): string! {
+    for c of this.cols {
+      if (c.name == field) {
+        return quoteFor(this.d, columnName(c))
+      }
+    }
+    fail InvalidPolicy{ detail = "no field ${field} (fields: ${fieldList(this.cols)})" }
+  }
+
+  operand(field: string, o: Operand): ()! {
+    match (o) {
+      Lit(v) => this.param(v)
+      Param(path) => unboundSql(field, path)?
+    }
+  }
+
+  operands(field: string, os: []Operand): ()! {
+    let i = 0
+    while (i < len(os)) {
+      if (i > 0) {
+        this.w(", ")
+      }
+      this.operand(field, os[i])?
+      i = i + 1
+    }
+  }
+
+  cmp(field: string, op: Op, os: []Operand): ()! {
+    if (op != Op.In) {
+      checkArity(field, op, len(os))?
+    }
+    let col = this.column(field)?
+    if (op == Op.In) {
+      this.inList(col, os, field)?
+      return
+    }
+    this.w(col)
+    this.w(" ${sqlOp(op)} ")
+    this.operand(field, os[0])?
+  }
+
+  inList(col: string, os: []Operand, field: string): ()! {
+    if (len(os) == 0) {
+      this.w(falseLit(this.d))
+      return
+    }
+    this.w(col)
+    this.w(" IN (")
+    this.operands(field, os)?
+    this.w(")")
+  }
+
+  // `cs` joined by `sep` in one group; none is the literal `empty`.
+  group(cs: []Cond, sep: string, empty: string): ()! {
+    if (len(cs) == 0) {
+      this.w(empty)
+      return
+    }
+    this.w("(")
+    let i = 0
+    while (i < len(cs)) {
+      if (i > 0) {
+        this.w(sep)
+      }
+      this.node(cs[i])?
+      i = i + 1
+    }
+    this.w(")")
+  }
+
+  // A node as one unit: a comparison gets its own parentheses.
+  unit(c: Cond): ()! {
+    match (c) {
+      Cmp(field, op, os) => {
+        this.w("(")
+        this.cmp(field, op, os)?
+        this.w(")")
+      }
+      _ => this.node(c)?
+    }
+  }
+
+  node(c: Cond): ()! {
+    match (c) {
+      True => this.w(trueLit(this.d))
+      False => this.w(falseLit(this.d))
+      Cmp(field, op, os) => this.cmp(field, op, os)?
+      And(cs) => this.group(cs, " AND ", trueLit(this.d))?
+      Or(cs) => this.group(cs, " OR ", falseLit(this.d))?
+      Not(inner) => {
+        this.w("(NOT ")
+        this.unit(inner)?
+        this.w(")")
+      }
+      Custom(label, _) => refuseLabel(label)?
+    }
+  }
+}
+
+fn unboundSql(field: string, path: string): ()! {
+  fail InvalidPolicy{ detail = "unbound placeholder $user.${path} on field ${field}" }
+}
+
+fn refuseLabel(label: string): ()! {
+  fail NotFilterable{ policy = "", label = label }
+}
+
+// `c` as SQL over resource `res` for `dialect`. Postgres numbers its
+// placeholders from `firstParam` (at least 1), MySQL's are `?` and ignore it.
+// The result is the condition as written: wrap it with `asAllow` or `asDeny`
+// (NULL, above). Fails with an InvalidPolicy for a field the class does not
+// declare, an operator with the wrong number of values or an unbound
+// placeholder, and with a NotFilterable for a code function.
+export fn compileSql(
+  c: Cond,
+  res: ResourceInfo,
+  dialect: ServerDialect,
+  firstParam: int,
+): SqlFragment! {
+  if (isPostgres(dialect) && firstParam < 1) {
+    fail InvalidPolicy{ detail = "firstParam must be at least 1, got ${firstParam}" }
+  }
+  let out = SqlOut{
+    b = Builder(),
+    args = []Value(0),
+    d = dialect,
+    next = firstParam,
+    cols = rowColumns(res.columns),
+  }
+  out.node(c)?
+  return SqlFragment{ sql = out.b.toString(), args = out.args }
+}
+
+// `f` as an allow rule: a row whose condition is unknown (NULL) is not granted.
+export fn asAllow(f: SqlFragment, dialect: ServerDialect): SqlFragment {
+  return SqlFragment{
+    sql = "COALESCE((${f.sql}), ${falseLit(dialect)})",
+    args = f.args,
+  }
+}
+
+// `f` as a deny rule: a row whose condition is unknown (NULL) is not denied.
+export fn asDeny(f: SqlFragment, dialect: ServerDialect): SqlFragment {
+  return SqlFragment{
+    sql = "NOT COALESCE((${f.sql}), ${falseLit(dialect)})",
+    args = f.args,
+  }
+}
