@@ -1,0 +1,189 @@
+// Register PREFERENCES (#7274): which register a value would rather occupy,
+// the half both backends share. Same module as regalloc.bit; the scan's
+// `chooseReg` tries `preferredReg` before `firstFreeReg`.
+//
+// Lowest-free-first put `twoFolds(n, m) = (n + 5) * (m + 5)` on x86-64 into
+// eight instructions where four do: the params were copied out of rdi/rsi into
+// rax/rcx, which come first in the file, and the product was computed in rcx
+// because rax still held a sum read by the multiply, then moved to rax for the
+// return. Two kinds of preference remove both copies:
+//
+//   - a HINT names one file position: an entry param's incoming argument
+//     register, a returned value's return register. A tied value passes its
+//     hint to the operand it is tied to, so the sum feeding a returned product
+//     is computed in the return register to begin with.
+//   - a TIE names an operand whose register the value may take when the value's
+//     own definition is that operand's last read. The operand is dead from that
+//     point, so the shared register is never read for both.
+//
+// Neither is a constraint. A preference is taken only when the register is
+// inside the interval's mask, so a value live across a call still gets a
+// callee-saved register, and a lost preference costs a move, never a value.
+
+// One backend's register files as physical numbers: file position k names
+// `ints[k]` or `floats[k]`.
+class HintFiles {
+  ints: []int,
+  floats: []int,
+}
+
+fn filePosOf(file: []int, reg: int): int {
+  let k = 0
+  while (k < len(file)) {
+    if (file[k] == reg) {
+      return k
+    }
+    k = k + 1
+  }
+  return -1
+}
+
+// Prefers physical register `reg` of `iv`'s class for `iv`; -1 is no register
+// (a stack argument). The first preference set stands.
+fn hintTo(iv: LiveInterval, files: HintFiles, reg: int) {
+  if (reg < 0 || iv.hint >= 0) {
+    return
+  }
+  let file = files.floats
+  if (iv.regClass == RegClass.Int) {
+    file = files.ints
+  }
+  iv.hint = filePosOf(file, reg)
+}
+
+// Each entry param's ordinal within its own class, the count both conventions
+// number argument registers by (Win64 numbers by position; `xArgReg` reads it).
+fn paramClassOrdinals(f: IrFunc, intervals: []LiveInterval): []int {
+  let out = []int(0)
+  let counts = [0, 0]
+  let entry = f.blocks[0]
+  let p = 0
+  while (p < entry.paramCount) {
+    let c = 1
+    if (intervals[entry.instsStart + p].regClass == RegClass.Int) {
+      c = 0
+    }
+    out = append(out, counts[c])
+    counts[c] = counts[c] + 1
+    p = p + 1
+  }
+  return out
+}
+
+fn valueClasses(intervals: []LiveInterval, vals: []int): []RegClass {
+  let out = []RegClass(0)
+  for v of vals {
+    out = append(out, intervals[v].regClass)
+  }
+  return out
+}
+
+// Hints word k of a `ret` to `regs[k]`, the return register the backend's
+// convention gives it.
+fn hintRetWords(intervals: []LiveInterval, files: HintFiles, vals: []int, regs: []int) {
+  let k = 0
+  while (k < len(vals)) {
+    hintTo(intervals[vals[k]], files, regs[k])
+    k = k + 1
+  }
+}
+
+// The integer operations whose emitters on BOTH backends read the left operand
+// before writing the result: arm64 emits one three-address instruction (the
+// debug multiply's `smulh` runs first), and x86-64 opens with `xIntAccMov`,
+// whose `acc == src` case encodes no move at all.
+fn isTieOp(op: Op): bool {
+  return op == Op.Add ||
+    op == Op.Sub ||
+    op == Op.BAnd ||
+    op == Op.BOr ||
+    op == Op.BXor ||
+    op == Op.Mul
+}
+
+// Ties each `isTieOp` integer result to its left operand.
+fn markTies(f: IrFunc, intervals: []LiveInterval) {
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (isTieOp(f.instrs[i].op) && intervals[i].regClass == RegClass.Int) {
+      intervals[i].tie = f.instrs[i].lhs
+    }
+    i = i + 1
+  }
+}
+
+// The scan position of the interval `idx`'s tie operand shares a location
+// with, or -1. Only a value defined at its own position may share: a root
+// widened below its definition by an alias is not the definition reading it.
+fn tiePos(scan: []LiveInterval, posOf: []int, roots: []int, idx: int): int {
+  let iv = scan[idx]
+  if (iv.tie < 0 || iv.start != iv.vreg) {
+    return -1
+  }
+  let r = iv.tie
+  if (len(roots) > 0) {
+    r = roots[r]
+  }
+  let p = posOf[r]
+  if (scan[p].regClass != iv.regClass) {
+    return -1
+  }
+  return p
+}
+
+// A tied value's hint becomes its operand's when the operand has none, so the
+// operand is computed where the value wants to end up. Descending vreg order
+// carries a hint down a chain of ties in one pass, since an operand precedes
+// the instruction reading it.
+fn propagateTieHints(scan: []LiveInterval, posOf: []int, roots: []int) {
+  let v = len(scan)
+  while (v > 0) {
+    v = v - 1
+    let idx = posOf[v]
+    let t = tiePos(scan, posOf, roots, idx)
+    if (t >= 0 && scan[idx].hint >= 0 && scan[t].hint < 0) {
+      scan[t].hint = scan[idx].hint
+    }
+  }
+}
+
+fn admits(allowed: int, reg: int): bool {
+  return ((allowed >> reg) & 1) == 1
+}
+
+// The register `scan[idx]` prefers and can have, or -1: its hint when free and
+// allowed, else its tie operand's register when this definition is that
+// operand's last read. Taking the tie's register drops the operand from the
+// active set and leaves the register marked used, handed straight to `idx`.
+fn preferredReg(s: ClassState, scan: []LiveInterval, tp: int, idx: int, allowed: int): int {
+  let h = scan[idx].hint
+  if (h >= 0 && h < len(s.used) && !s.used[h] && admits(allowed, h)) {
+    return h
+  }
+  if (tp < 0) {
+    return -1
+  }
+  let k = 0
+  while (k < s.len) {
+    let e = s.active[k]
+    if (e.idx == tp) {
+      if (scan[tp].end != scan[idx].start || !admits(allowed, e.reg)) {
+        return -1
+      }
+      removeActiveAt(s, k)
+      return e.reg
+    }
+    k = k + 1
+  }
+  return -1
+}
+
+// The scan's register pick for `scan[idx]`: its preference, else the lowest
+// free allowed register, else -1 when a spill has to decide.
+fn chooseReg(s: ClassState, scan: []LiveInterval, tp: int, idx: int, allowed: int): int {
+  let r = preferredReg(s, scan, tp, idx, allowed)
+  if (r >= 0) {
+    return r
+  }
+  return firstFreeReg(s, allowed)
+}
