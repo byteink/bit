@@ -340,12 +340,12 @@ was registered. With the three roles above it passes.
   type to read them from, the compiler asks for them (E0068).
 - The resource is a type argument, `p.can<Article>(...)`. `Article` must be a
   `@table` class; a plain class is refused at compile time.
-- `can` and `cannot` record rules; nothing evaluates them yet. Deny-wins and
-  default-deny are applied by the evaluation chapter's `authz.can`.
+- `can` and `cannot` only record rules. Deny-wins and default-deny are
+  applied when you ask, by `authz.can` (the [Deciding](decisions.md) chapter).
 - Roles come from `user.roles` alone. Policies attached to one user directly
   arrive with stored policies.
 
 ## Next
 
-Policies and roles become useful once `authz.can(user, action, thing)`
-answers for a user; it builds on the `Rule` list `rolesOf` returns.
+Policies and roles answer questions in [Deciding](decisions.md):
+`authz.can(user, action, thing)` builds on the `Rule` list `rolesOf` returns.

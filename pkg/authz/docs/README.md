@@ -8,3 +8,4 @@
 | [Conditions](conditions.md) | The `Cond` tree: `eq`, `ne`, `oneOf`, `lt`, `lte`, `gt`, `gte`, `and`, `or`, `not`, `evalCond` and its `Truth` answer, `validate` at startup, `fromWhere`, how NULL and CASL differ |
 | [Relationships](relationships.md) | Tuples such as `user:sara`, `editor`, `folder:launch`: declaring relations with `relation`, `relate`, `unrelate`, `related`, usersets, the `hasRelation` check with `inherit` and its bounds (`RelationLimit`), `RelationStore` and `MemoryRelationStore` |
 | [Policies](policies.md) | `Policy`, `Rules`, `Rule` and `Effect`: `can`, `cannot`, `canAll`, `cannotAll`, `rulesFor`, and `validatePolicy` at startup; roles that bundle them: `role`, `roleNames`, `checkRoles`, `rolesOf` and `Resolved` |
+| [Deciding](decisions.md) | `can` and `check` on `Authz`: deny wins, default deny, `Manage`, the guest as `None`, `logTo`, the decision log and `Denied`, rules that are wrong at request time |

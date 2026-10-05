@@ -1,0 +1,452 @@
+// pkg/authz/decide.bit — `Authz.can` and `Authz.check`: may THIS user do THIS
+// to THIS row. CASL's algorithm over the rules of the user's roles:
+//
+//   1. a rule applies when its resource is the thing's class (or `all`) and
+//      its actions hold the asked action or `Manage`;
+//   2. its condition is bound to the user (`$user.x`, condparam.bit) and
+//      evaluated on the row; unknown does not match;
+//   3. any matching Deny refuses, else any matching Allow grants, else the
+//      answer is no: default deny, with no deciding policy.
+//
+// The guest is `None`: it gets the rules of the role called "guest" and is
+// evaluated like anyone else; with no such role every answer is no.
+//
+// FAIL CLOSED, LOUD. A rule `validateRulesIn` refuses (no actions, a resource
+// nothing registered, a condition that does not fit it) is a developer
+// mistake the startup check could miss, because `validatePolicy` runs a
+// policy for one probe subject and a policy may branch. Every rule of the
+// subject's role rules is checked here: `check` fails with an InvalidPolicy
+// naming the policy and the rule, `can` is false, and the mistake is logged
+// at ERROR once per policy and rule position. A rule whose condition cannot
+// be evaluated on this row gives the same answer.
+//
+// COST. The verdict on a rule is cached by (policy, position, resource,
+// action count), under a mutex held for an array lookup only, so a settled
+// rule costs a string compare. A condition without a placeholder is
+// evaluated as it is (`bind` copies nothing), a `Cond.True` rule reads no
+// row, and the row's column names are computed once at `resource<T>()`. What
+// remains per call is what the design makes per-subject: `rolesOf` runs the
+// policy closures for this user, and the row's `__values()` is read once when
+// some matching rule has a condition.
+
+import { LogSink } from "orm"
+import { Mutex } from "std/sync"
+import { join } from "std/strings"
+
+// The role `None` uses.
+const guestRole: string = "guest"
+
+const noAllowRule: string = "no matching allow rule"
+
+// The outcome of one decision. `invalid` means `reason` is an InvalidPolicy
+// detail and the answer is a refusal made because a rule is broken.
+class Decision {
+  allowed: bool,
+  policy: string,
+  reason: string,
+  invalid: bool,
+}
+
+// The names `__values()` carries for a registered resource, computed once.
+class ResourceCols {
+  name: string,
+  names: []string,
+}
+
+// What was found when a rule was last checked: 1 valid, 2 faulty; `resource`
+// and `actions` are the parts of the rule a fault depends on, so a policy
+// that branches on the subject is re-checked when the rule at this position
+// is a different one. `logged` keeps the ERROR line to once.
+class RuleVerdict {
+  code: int,
+  resource: ResourceRef,
+  actions: int,
+  logged: bool,
+}
+
+class PolicyVerdicts {
+  policy: string,
+  rules: []RuleVerdict,
+}
+
+// Everything `can` and `check` keep between calls: the guest's rules, the
+// log sink, the per-resource column names and the verdict cache. Written at
+// startup except the cache, which `mu` guards.
+class DecideState<A: ActionEnum> {
+  mu: Mutex
+  sink: Option<LogSink>
+  guest: []Rule<A>
+  cols: []ResourceCols
+  verdicts: []PolicyVerdicts
+
+  init() {
+    this.mu = Mutex()
+    this.sink = Option<LogSink>.None
+    this.guest = []Rule<A>(0)
+    this.cols = []ResourceCols(0)
+    this.verdicts = []PolicyVerdicts(0)
+  }
+
+  setSink(sink: LogSink) {
+    this.sink = Option<LogSink>.Some(sink)
+  }
+
+  setGuest(rules: []Rule<A>) {
+    this.guest = rules
+  }
+
+  noteResource(info: ResourceInfo) {
+    let names = []string(0)
+    for c of rowColumns(info.columns) {
+      names = append(names, c.name)
+    }
+    this.cols = append(this.cols, ResourceCols{ name = info.name, names = names })
+  }
+
+  logging(): bool {
+    return isSome(this.sink)
+  }
+
+  say(line: string) {
+    if (isSome(this.sink)) {
+      unwrap(this.sink).log(line)
+    }
+  }
+
+  namesOf(resource: string): []string {
+    for c of this.cols {
+      if (c.name == resource) {
+        return c.names
+      }
+    }
+    return []string(0)
+  }
+
+  // The verdict cached for rule `k` of `r.policy`, or 0.
+  lookup(r: Rule<A>, k: int): int {
+    this.mu.lock()
+    let code = this.lookupLocked(r, k)
+    this.mu.unlock()
+    return code
+  }
+
+  lookupLocked(r: Rule<A>, k: int): int {
+    for pv of this.verdicts {
+      if (pv.policy != r.policy) {
+        continue
+      }
+      if (k >= len(pv.rules)) {
+        return 0
+      }
+      let v = pv.rules[k]
+      if (v.resource == r.resource && v.actions == len(r.actions)) {
+        return v.code
+      }
+      return 0
+    }
+    return 0
+  }
+
+  // Records `code` for rule `k` of `r.policy`; true when this is the first
+  // faulty verdict for the position, the one that is logged.
+  store(r: Rule<A>, k: int, code: int): bool {
+    this.mu.lock()
+    let first = this.storeLocked(r, k, code)
+    this.mu.unlock()
+    return first
+  }
+
+  slot(policy: string): PolicyVerdicts {
+    for pv of this.verdicts {
+      if (pv.policy == policy) {
+        return pv
+      }
+    }
+    let pv = PolicyVerdicts{ policy = policy, rules = []RuleVerdict(0) }
+    this.verdicts = append(this.verdicts, pv)
+    return pv
+  }
+
+  storeLocked(r: Rule<A>, k: int, code: int): bool {
+    let pv = this.slot(r.policy)
+    while (len(pv.rules) <= k) {
+      pv.rules = append(
+        pv.rules,
+        RuleVerdict{ code = 0, resource = all, actions = 0, logged = false },
+      )
+    }
+    let v = pv.rules[k]
+    v.code = code
+    v.resource = r.resource
+    v.actions = len(r.actions)
+    let first = code == 2 && !v.logged
+    if (first) {
+      v.logged = true
+    }
+    return first
+  }
+
+  // 1 when rule `k` of its policy is valid, else 2. The check runs once per
+  // position; a faulty one is logged once.
+  verdict(resources: []ResourceInfo, r: Rule<A>, k: int): int {
+    let code = this.lookup(r, k)
+    if (code != 0) {
+      return code
+    }
+    let why = ruleFault<A>(resources, r)
+    code = 1
+    if (why != "") {
+      code = 2
+    }
+    if (this.store(r, k, code)) {
+      this.say("[authz] ERROR invalid policy: policy ${r.policy} rule ${k}: ${why}")
+    }
+    return code
+  }
+}
+
+// `policies` as the rules of one subject: the rules each makes for `sample`,
+// each policy once, as `rolesOf` resolves a role. This is what `None` gets.
+fn guestRules<S: Subject, A: ActionEnum>(policies: []Policy<S, A>, sample: S): []Rule<A> {
+  let out = []Rule<A>(0)
+  let seen = []string(0)
+  for p of policies {
+    if (hasName(seen, p.name)) {
+      continue
+    }
+    seen = append(seen, p.name)
+    for r of p.rulesFor(sample) {
+      out = append(out, r)
+    }
+  }
+  return out
+}
+
+fn resourceMatches(ref: ResourceRef, className: string): bool {
+  return match (ref) {
+    All => true
+    Named(n) => n == className
+  }
+}
+
+// Whether `actions` holds `want` or, when the enum has one, `Manage`.
+fn actionMatches<A: ActionEnum>(actions: []A, want: string, wildcard: bool): bool {
+  for a of actions {
+    let n = actionName(a)
+    if (n == want || (wildcard && n == "Manage")) {
+      return true
+    }
+  }
+  return false
+}
+
+fn applies<A: ActionEnum>(r: Rule<A>, className: string, want: string, wildcard: bool): bool {
+  return resourceMatches(r.resource, className) && actionMatches<A>(r.actions, want, wildcard)
+}
+
+fn invalidDecision(detail: string): Decision {
+  return Decision{ allowed = false, policy = "", reason = detail, invalid = true }
+}
+
+// The rules of `user`: the guest role's for `None`, else the union over the
+// user's roles. What `rolesOf` leaves out is logged when a sink is set.
+fn rulesOf<A: ActionEnum>(a: Authz<A>, user: Option<Subject>): []Rule<A> {
+  if (!isSome(user)) {
+    return a.state.guest
+  }
+  let got = a.rolesOf(unwrap(user))
+  if (a.state.logging()) {
+    for line of got.skipped {
+      a.state.say("[authz] debug skipped: ${line}")
+    }
+  }
+  return got.rules
+}
+
+// "policy P rule k: why" for the first rule of `rules` that is invalid, or "".
+// Rules of one policy are contiguous (`rolesOf` lists a policy once).
+fn firstFault<A: ActionEnum>(a: Authz<A>, rules: []Rule<A>): string {
+  let prev = ""
+  let k = 0
+  for r of rules {
+    if (r.policy != prev) {
+      prev = r.policy
+      k = 0
+    }
+    if (a.state.verdict(a.resources, r, k) == 2) {
+      return "policy ${r.policy} rule ${k}: ${ruleFault<A>(a.resources, r)}"
+    }
+    k = k + 1
+  }
+  return ""
+}
+
+// Where `applyRules` is: the row it reads once, and the rule position it is at.
+class RowScan {
+  ready: bool
+  names: []string
+  vals: []Value
+  prev: string
+  k: int
+
+  // The position of a rule of `policy` within its policy.
+  advance(policy: string): int {
+    if (policy != this.prev) {
+      this.prev = policy
+      this.k = 0
+    }
+    let at = this.k
+    this.k = at + 1
+    return at
+  }
+}
+
+// Reads `thing` into `view` the first time a condition needs it.
+fn loadRow<A: ActionEnum, T: Tabled>(st: DecideState<A>, view: RowScan, thing: T): ()! {
+  if (view.ready) {
+    return
+  }
+  view.vals = thing.__values()
+  view.names = st.namesOf(T.__className())
+  if (len(view.names) != len(view.vals)) {
+    view.names = rowNames(T.__columns(), view.vals)?
+  }
+  view.ready = true
+}
+
+// `r`'s condition with the user's attributes in it; a path the user cannot
+// supply is logged and makes its comparison not hold (condparam.bit).
+fn boundCond<A: ActionEnum>(st: DecideState<A>, r: Rule<A>, user: Option<Subject>): Cond {
+  if (!hasParam(r.cond)) {
+    return r.cond
+  }
+  let (c, missing) = bind(r.cond, user)
+  if (st.logging() && len(missing) > 0) {
+    st.say("[authz] debug policy ${r.policy}: no value for ${join(missing, ", ")}")
+  }
+  return c
+}
+
+fn isTrueTruth(t: Truth): bool {
+  return match (t) {
+    True => true
+    _ => false
+  }
+}
+
+// Whether `r`'s condition holds on `thing`. Unknown does not hold.
+fn condHolds<A: ActionEnum, T: Tabled>(
+  st: DecideState<A>,
+  user: Option<Subject>,
+  r: Rule<A>,
+  view: RowScan,
+  thing: T,
+): bool! {
+  if (isTrue(r.cond)) {
+    return true
+  }
+  let c = boundCond<A>(st, r, user)
+  loadRow<A, T>(st, view, thing)?
+  return isTrueTruth(evalRow(c, view.names, view.vals)?)
+}
+
+fn denyAll(policy: string): Decision {
+  return Decision{ allowed = false, policy = policy, reason = "denied by rule", invalid = false }
+}
+
+// The rules applied to `thing`: first matching Deny, else first matching
+// Allow, else default deny.
+fn applyRules<A: ActionEnum, T: Tabled>(
+  a: Authz<A>,
+  user: Option<Subject>,
+  rules: []Rule<A>,
+  action: A,
+  thing: T,
+): Decision {
+  let className = T.__className()
+  let want = actionName(action)
+  let view = RowScan{ ready = false, prev = "", k = 0 }
+  let granted = false
+  let grantedBy = ""
+  for r of rules {
+    let k = view.advance(r.policy)
+    if (!applies<A>(r, className, want, a.wildcard)) {
+      continue
+    }
+    let hit = condHolds<A, T>(a.state, user, r, view, thing) catch e {
+      let why = "policy ${r.policy} rule ${k}: ${e.message()}"
+      a.state.say("[authz] ERROR invalid policy: ${why}")
+      return invalidDecision(why)
+    }
+    if (!hit) {
+      continue
+    }
+    if (r.effect == Effect.Deny) {
+      return denyAll(r.policy)
+    }
+    if (!granted) {
+      granted = true
+      grantedBy = r.policy
+    }
+  }
+  if (granted) {
+    return Decision{
+      allowed = true,
+      policy = grantedBy,
+      reason = "allowed by rule",
+      invalid = false,
+    }
+  }
+  return Decision{ allowed = false, policy = "", reason = noAllowRule, invalid = false }
+}
+
+fn subjectId(user: Option<Subject>): string {
+  if (!isSome(user)) {
+    return guestRole
+  }
+  return unwrap(user).id
+}
+
+fn verbOf(d: Decision): string {
+  if (d.allowed) {
+    return "allow"
+  }
+  return "deny"
+}
+
+// The decision, once logged when a sink is set; the line is built only then.
+fn logged<A: ActionEnum>(
+  st: DecideState<A>,
+  user: Option<Subject>,
+  action: string,
+  resource: string,
+  d: Decision,
+): Decision {
+  if (st.logging()) {
+    st.say("[authz] debug ${verbOf(d)} ${action} on ${resource} subject=${subjectId(user)} policy=${d.policy} reason=${d.reason}")
+  }
+  return d
+}
+
+// One decision. An invalid rule anywhere in the user's rules beats everything
+// else, so a broken policy is never silently skipped.
+fn decide<A: ActionEnum, T: Tabled>(
+  a: Authz<A>,
+  user: Option<Subject>,
+  action: A,
+  thing: T,
+): Decision {
+  let rules = rulesOf<A>(a, user)
+  let bad = firstFault<A>(a, rules)
+  let name = actionName(action)
+  if (bad != "") {
+    return logged<A>(a.state, user, name, T.__className(), invalidDecision(bad))
+  }
+  return logged<A>(
+    a.state,
+    user,
+    name,
+    T.__className(),
+    applyRules<A, T>(a, user, rules, action, thing),
+  )
+}
