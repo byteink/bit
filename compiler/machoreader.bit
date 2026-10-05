@@ -239,6 +239,30 @@ fn mrRelocKind(rtype: int, length: int, sectionData: []u8, rAddress: int): LoRel
   fail newError("UnsupportedRelocation")
 }
 
+// Bytes the relocation's field occupies in the section: a 64-bit UNSIGNED
+// pointer is 8, everything else is one 4-byte word.
+fn mrRelocFieldWidth(rtype: int, length: int): int {
+  if (rtype == 0 && length == 3) {
+    return 8
+  }
+  return 4
+}
+
+// The segment command at `lcOff` holds its header and every section header it
+// claims, all inside its own `cmdsize`; returns the section count (#6345).
+fn mrCheckSegment(bytes: []u8, lcOff: int, cmdsize: int): int! {
+  loCheckRange(lcOff + cmdsize, lcOff, mrSizeofSegment(), "LC_SEGMENT_64 header")?
+  let nsects = loRdU32(bytes, lcOff + 64)
+  let heads = nsects * mrSizeofSection()
+  loCheckRange(lcOff + cmdsize, lcOff + mrSizeofSegment(), heads, "LC_SEGMENT_64 section headers")?
+  return nsects
+}
+
+// Relocation `ri`'s field lies inside its section's bytes.
+fn mrCheckRelocField(data: []u8, rAddress: int, rtype: int, length: int, ri: int): ()! {
+  loCheckRange(len(data), rAddress, mrRelocFieldWidth(rtype, length), "relocation ${ri} field")?
+}
+
 fn mrReadImplicitAddend(sectionData: []u8, rAddress: int, length: int): int {
   if (length == 3) {
     let lo = loRdU32(sectionData, rAddress)
@@ -251,8 +275,16 @@ fn mrReadImplicitAddend(sectionData: []u8, rAddress: int, length: int): int {
   return 0
 }
 
-// Parses a whole Mach-O64 arm64 MH_OBJECT into the generic object model.
+// Parses a whole Mach-O64 arm64 MH_OBJECT into the generic object model. Every
+// failure names the archive member `name` (#6345).
 fn readMachoObject(name: string, bytes: []u8): LoModule! {
+  let mod = machoParseObject(name, bytes) catch e {
+    fail newError(loMemberError(name, e.message()))
+  }
+  return mod
+}
+
+fn machoParseObject(name: string, bytes: []u8): LoModule! {
   if (len(bytes) < mrSizeofHeader()) {
     fail newError("Truncated")
   }
@@ -294,13 +326,10 @@ fn readMachoObject(name: string, bytes: []u8): LoModule! {
       fail newError("Malformed")
     }
     if (cmd == 0x19) { // LC_SEGMENT_64
-      let nsects = loRdU32(bytes, lcOff + 64)
+      let nsects = mrCheckSegment(bytes, lcOff, cmdsize)?
       let so = lcOff + mrSizeofSegment()
       let si = 0
       while (si < nsects) {
-        if (so + mrSizeofSection() > len(bytes)) {
-          fail newError("Truncated")
-        }
         let sect = mrName16(bytes, so)
         let seg = mrName16(bytes, so + 16)
         let addr = loRdU64(bytes, so + 32)
@@ -310,6 +339,9 @@ fn readMachoObject(name: string, bytes: []u8): LoModule! {
         let reloff = loRdU32(bytes, so + 56)
         let nreloc = loRdU32(bytes, so + 60)
         let flags = loRdU32(bytes, so + 64)
+        if (size < 0 || alignLog2 > 31) {
+          fail newError("section ${sect}: size ${size} or alignment 2^${alignLog2} is not valid")
+        }
         so = so + mrSizeofSection()
 
         let c = mrClassify(seg, sect, flags)
@@ -325,10 +357,7 @@ fn readMachoObject(name: string, bytes: []u8): LoModule! {
         } else {
           let data = []u8(0)
           if (!loIsBss(c.kind)) {
-            if (offset + size > len(bytes)) {
-              fail newError("Truncated")
-            }
-            data = bytes[offset:offset + size]
+            data = loSlice(bytes, offset, size, "section ${sect} data")?
           }
           meta = append(
             meta,
@@ -351,6 +380,7 @@ fn readMachoObject(name: string, bytes: []u8): LoModule! {
         si = si + 1
       }
     } else if (cmd == 0x2) { // LC_SYMTAB
+      loCheckRange(lcOff + cmdsize, lcOff, mrSizeofSymtab(), "LC_SYMTAB")?
       haveSymtab = true
       symoff = loRdU32(bytes, lcOff + 8)
       nsyms = loRdU32(bytes, lcOff + 12)
@@ -364,10 +394,7 @@ fn readMachoObject(name: string, bytes: []u8): LoModule! {
   if (!haveSymtab) {
     fail newError("Malformed")
   }
-  if (stroff + strsize > len(bytes)) {
-    fail newError("Truncated")
-  }
-  let strtab = bytes[stroff:stroff + strsize]
+  let strtab = loSlice(bytes, stroff, strsize, "string table")?
 
   // ---- pass 2: symbols ---------------------------------------------------
   let symTargets = []MrSymTarget(0)
@@ -375,9 +402,7 @@ fn readMachoObject(name: string, bytes: []u8): LoModule! {
   let s = 0
   while (s < nsyms) {
     let n = symoff + s * mrSizeofNlist()
-    if (n + mrSizeofNlist() > len(bytes)) {
-      fail newError("Truncated")
-    }
+    loCheckRange(len(bytes), n, mrSizeofNlist(), "symbol table entry ${s}")?
     let nStrx = loRdU32(bytes, n)
     let nType = int(bytes[n + 4])
     let nSect = int(bytes[n + 5])
@@ -463,9 +488,7 @@ fn readMachoObject(name: string, bytes: []u8): LoModule! {
       mi = mi + 1
       continue
     }
-    if (m.reloff + m.nreloc * mrSizeofRelocInfo() > len(bytes)) {
-      fail newError("Truncated")
-    }
+    loCheckRange(len(bytes), m.reloff, m.nreloc * mrSizeofRelocInfo(), "relocation table")?
     // A pending ARM64_RELOC_ADDEND prefix applies to the NEXT relocation only;
     // -1 sentinel rather than an optional, since a real addend can be negative
     // — hence the separate flag.
@@ -498,6 +521,7 @@ fn readMachoObject(name: string, bytes: []u8): LoModule! {
       }
 
       let sectionData = rawSections[m.rawIndex].data
+      mrCheckRelocField(sectionData, rAddress, rtype, length, ri)?
       let kind = mrRelocKind(rtype, length, sectionData, rAddress)?
 
       // Addend: UNSIGNED reads it from the field; the page/branch kinds take it
