@@ -1,27 +1,25 @@
-// tools/genunicode — renders `stdlib/net/gen_idna.bit` (#6880), the data
-// UTS #46 processing needs: every code point's IDNA status and mapping, the
-// Bidi_Class and Joining_Type of every scalar value, the viramas and the combining marks.
+// tools/genunicode — renders `stdlib/net/gen_idna.bit` (#6880, #7151), the
+// data UTS #46 processing needs: every code point's IDNA status and mapping,
+// the Bidi_Class and Joining_Type of every scalar value, the viramas and the
+// combining marks.
 //
-// Layout, as in gen_normalize.bit (normemit.bit): every table is ONE string
-// constant of fixed-width uppercase-hex records sorted by their first field,
-// binary-searched in place — O(log n), no decode step, no allocation, no
-// module state. Code points are SIX hex digits here: U+100000..U+10FFFD is
-// private use and appears in the IDNA table, so five do not suffice.
+// Layout (#7151), as in gen_normalize.bit (normemit.bit): a two-stage table
+// maps a code point to ONE 8-byte record holding everything the validity
+// criteria read, so a lookup is a few byte loads — no hex parsing, no search,
+// no allocation, no module state. Every table is a string constant of raw
+// bytes.
 //
-//   status   lo(6) status(1) off(5)   a run of one status over [lo, next lo);
-//            the table covers 0..10FFFF and ends in a sentinel record
-//            (lo = 110000) whose `off` is the total mapping length
-//   map      rune(5)...               every mapping, concatenated; a mapped
-//            run's mapping is `off` up to the next record's `off`
-//   bidi     lo(6) class(2)           a run of one Bidi_Class, covering 0..10FFFF
-//   joining  lo(6) type(1)            a run of one Joining_Type, covering 0..10FFFF
-//   virama   lo(6) hi(6)              ranges of canonical combining class 9
-//   mark     lo(6) hi(6)              ranges of General_Category M
+//   idnaStage1   2 bytes per block of 2^shift code points: the block's index
+//                in idnaStage2 (identical blocks are stored once)
+//   idnaStage2   2 bytes per code point: its record index in idnaInfo
+//   idnaInfo     8 bytes per record: status, Bidi_Class, Joining_Type, flags
+//                (1 virama, 2 combining mark), mapping length in runes, then
+//                the mapping's first rune index in idnaMapData (3 bytes)
+//   idnaMapData  3 bytes per rune; identical mappings are stored once
 //
-// Adjacent valid, ignored or disallowed runs merge; a mapped or deviation run
-// keeps its own record, because its `off` marks where its mapping starts.
-
-const idnaSentinel: int = 0x110000
+// Record 0 is the record of a rune outside 0..10FFFF (disallowed, bidiL,
+// joinU); code points at or past `idnaTrieLimit` all have it. A record has a
+// mapping only for a mapped or deviation status.
 
 fn writeIdnaHeader(b: Builder) {
   b.write("// Bit standard library — net module, UTS #46 IDNA data (#6880).\n")
@@ -46,7 +44,10 @@ fn writeIdnaHeader(b: Builder) {
   b.write("// maps to nothing). `bidiClass` and `joiningType` are the UAX #9 Bidi_Class\n")
   b.write("// and ArabicShaping Joining_Type values as the `bidi*` and `join*` codes;\n")
   b.write("// every scalar value has one. `isVirama` is canonical combining class 9 and\n")
-  b.write("// `isMark` is General_Category M (Mn, Mc, Me).\n")
+  b.write("// `isMark` is General_Category M (Mn, Mc, Me). A two-stage table (#7151)\n")
+  b.write("// maps a code point to one 8-byte record holding all of them, so a lookup\n")
+  b.write("// is a few byte loads, no search and no allocation.\n")
+  b.write("// tools/genunicode/idnaemit.bit documents the byte layout.\n")
   b.write("// A rune outside 0..10FFFF is disallowed, `bidiL` and `joinU`.\n\n")
 }
 
@@ -95,216 +96,233 @@ fn hasMapping(status: int): bool {
   return status == idnaStMapped || status == idnaStDeviation
 }
 
-// The status records and the mapping data they index.
-class IdnaPacked { records: string, data: string }
+// The record size and the flag bits of record byte 3.
+const idnaRecSize: int = 8
+const idnaFlagVirama: int = 1
+const idnaFlagMark: int = 2
 
-fn packIdnaStatus(runs: []IdnaRun): IdnaPacked {
-  checkIdnaCoverage(runs)
-  let rec = Builder()
-  let data = Builder()
-  let off = 0
-  let prev = -1
-  let i = 0
-  // Bounded by `len(runs)`, fixed before the loop starts.
-  while (i < len(runs)) {
-    let r = runs[i]
-    if (r.status != prev || hasMapping(r.status)) {
-      rec.write(hexPad(r.lo, 6) + hexPad(r.status, 1) + hexPad(off, 5))
-    }
-    prev = r.status
-    let j = 0
-    // Bounded by `len(r.mapping)`, at most 18 runes in UCD 17.0.0.
-    while (j < len(r.mapping)) {
-      data.write(hexPad(r.mapping[j], 5))
-      j = j + 1
-    }
-    off = off + len(r.mapping)
-    i = i + 1
-  }
-  rec.write(hexPad(idnaSentinel, 6) + hexPad(len(idnaStatusNames()) - 1, 1) + hexPad(off, 5))
-  return IdnaPacked{ records = rec.toString(), data = data.toString() }
+// The record index of every scalar value, the record bytes, and the mapping
+// data the records index, three bytes per rune.
+class IdnaBuild {
+  idx: []int,
+  recs: []int,
+  data: []int,
+  recAt: map<int, int>,
+  seqAt: map<string, int>,
 }
 
-// `vals` (one value per scalar value) as `lo(6) value(width)` records, one
-// per run of equal values.
-fn packValueRuns(vals: []int, width: int): string {
-  let b = Builder()
-  let prev = -1
+// Sets `bit` in `flags[c]` for every `c` of `rs`.
+fn flagRanges(flags: []int, rs: []UniRange, bit: int) {
   let i = 0
-  // Bounded by `len(vals)`, fixed before the loop starts.
-  while (i < len(vals)) {
-    if (vals[i] != prev) {
-      b.write(hexPad(i, 6) + hexPad(vals[i], width))
-      prev = vals[i]
-    }
-    i = i + 1
-  }
-  return b.toString()
-}
-
-fn packRanges(rs: []UniRange): string {
-  let b = Builder()
-  let i = 0
-  // Bounded by `len(rs)`, fixed before the loop starts.
+  // Bounded by `len(rs)`; the inner loop by each range's width.
   while (i < len(rs)) {
-    b.write(hexPad(rs[i].lo, 6) + hexPad(rs[i].hi, 6))
+    let c = rs[i].lo
+    while (c <= rs[i].hi) {
+      flags[c] = flags[c] | bit
+      c = c + 1
+    }
     i = i + 1
   }
-  return b.toString()
 }
 
-// One table as a string constant of `packed`, which is hex digits only and so
-// needs no escaping. (normemit.bit's `writeNormConst` takes raw bytes.)
-fn writeHexConst(b: Builder, name: string, doc: string, packed: string) {
-  b.write("// " + doc + "\n")
-  b.write("const " + name + ": string = \"" + packed + "\"\n\n")
+// The rune index of the sequence `m` in `ib.data`, adding it once.
+fn idnaSeqIndex(ib: IdnaBuild, m: []int): int {
+  let key = intsKey(m)
+  let (at, ok) = ib.seqAt[key]
+  if (ok) {
+    return at
+  }
+  at = len(ib.data) / 3
+  ib.seqAt[key] = at
+  let i = 0
+  // Bounded by `len(m)`, at most 18 runes in UCD 17.0.0.
+  while (i < len(m)) {
+    ib.data = putBytes(ib.data, m[i], 3)
+    i = i + 1
+  }
+  return at
+}
+
+// The index of the record [status, bidi, join, flags, n, at(3)], adding it
+// once. Every field but `at` is below 256, so the key is the bytes in order.
+fn idnaRecIndex(ib: IdnaBuild, fields: []int, at: int): int {
+  if (at >= 0x1000000) {
+    panic("genunicode: IDNA mapping data needs more than 24-bit offsets")
+  }
+  let key = 0
+  let i = 0
+  // Bounded by `len(fields)`, five.
+  while (i < len(fields)) {
+    key = key * 256 + fields[i]
+    i = i + 1
+  }
+  key = key * 0x1000000 + at
+  let (idx, ok) = ib.recAt[key]
+  if (ok) {
+    return idx
+  }
+  idx = len(ib.recs) / idnaRecSize
+  ib.recAt[key] = idx
+  i = 0
+  while (i < len(fields)) {
+    ib.recs = append(ib.recs, fields[i])
+    i = i + 1
+  }
+  ib.recs = putBytes(ib.recs, at, 3)
+  return idx
+}
+
+// One record per scalar value, interned. Record 0 is the one for a rune
+// outside 0..10FFFF: disallowed, `bidiL`, `joinU`, no flags, no mapping.
+fn buildIdna(d: IdnaData): IdnaBuild {
+  checkIdnaCoverage(d.runs)
+  let flags = []int(maxScalar + 1)
+  flagRanges(flags, d.viramas, idnaFlagVirama)
+  flagRanges(flags, d.marks, idnaFlagMark)
+  let ib = IdnaBuild{
+    idx = []int(maxScalar + 1),
+    recs = []int(0),
+    data = []int(0),
+    recAt = map<int, int>{},
+    seqAt = map<string, int>{},
+  }
+  if (idnaRecIndex(ib, []int{ idnaStDisallowed, 0, 0, 0, 0 }, 0) != 0) {
+    panic("genunicode: the out-of-range IDNA record is not record 0")
+  }
+  let i = 0
+  // Bounded by `len(d.runs)`; the inner loop by each run's width.
+  while (i < len(d.runs)) {
+    let r = d.runs[i]
+    let at = 0
+    let n = 0
+    if (hasMapping(r.status) && len(r.mapping) > 0) {
+      at = idnaSeqIndex(ib, r.mapping)
+      n = len(r.mapping)
+    }
+    let c = r.lo
+    while (c <= r.hi) {
+      let fields = []int{ r.status, d.bidi[c], d.joining[c], flags[c], n }
+      ib.idx[c] = idnaRecIndex(ib, fields, at)
+      c = c + 1
+    }
+    i = i + 1
+  }
+  return ib
 }
 
 fn emitIdna(d: IdnaData): string {
+  let ib = buildIdna(d)
+  if (len(ib.recs) / idnaRecSize >= 0x10000) {
+    panic("genunicode: the IDNA records need more than 16-bit indices")
+  }
+  let t = smallestTrie(ib.idx)
   let b = Builder()
-  let status = packIdnaStatus(d.runs)
   writeIdnaHeader(b)
   writeCodes(b, "IDNA statuses (UTS #46 section 5).", idnaConstNames())
   writeCodes(b, "Bidi_Class values (UAX #9).", prefixed("bidi", bidiAbbrs()))
   writeCodes(b, "Joining_Type values (ArabicShaping.txt).", prefixed("join", joinAbbrs()))
-  writeHexConst(
+  b.write("const idnaTrieShift: int = ${t.shift}\n")
+  b.write("const idnaTrieMask: int = ${(1 << t.shift) - 1}\n")
+  b.write("const idnaTrieLimit: int = 0x${toHex(t.limit)}\n")
+  b.write("const idnaFlagVirama: int = ${idnaFlagVirama}\n")
+  b.write("const idnaFlagMark: int = ${idnaFlagMark}\n\n")
+  writeByteConst(b, "idnaStage1", "Stage 1: a 16-bit block index per block.", t.stage1)
+  writeByteConst(b, "idnaStage2", "Stage 2: a 16-bit record index per code point.", t.stage2)
+  writeByteConst(
     b,
-    "idnaStatusTable",
-    "status records: lo(6) status(1) offset(5), sorted, plus a sentinel.",
-    status.records,
+    "idnaInfo",
+    "Records: status, bidi, joining, flags, mapping length, mapping offset(3).",
+    ib.recs,
   )
-  writeHexConst(b, "idnaMapData", "mappings, five hex digits per rune.", status.data)
-  writeHexConst(
-    b,
-    "idnaBidiTable",
-    "Bidi_Class runs: lo(6) class(2), sorted, covering 0..10FFFF.",
-    packValueRuns(d.bidi, 2),
-  )
-  writeHexConst(
-    b,
-    "idnaJoiningTable",
-    "Joining_Type runs: lo(6) type(1), sorted, covering 0..10FFFF.",
-    packValueRuns(d.joining, 1),
-  )
-  writeHexConst(
-    b,
-    "idnaViramaTable",
-    "virama ranges: lo(6) hi(6), sorted.",
-    packRanges(d.viramas),
-  )
-  writeHexConst(
-    b,
-    "idnaMarkTable",
-    "combining mark ranges (General_Category M): lo(6) hi(6), sorted.",
-    packRanges(d.marks),
-  )
-  writeIdnaSearch(b)
+  writeByteConst(b, "idnaMapData", "Mappings: three bytes per rune.", ib.data)
   writeIdnaLookups(b)
+  writeIdnaHelpers(b)
   return b.toString()
 }
 
-fn writeIdnaSearch(b: Builder) {
-  b.write("// The value of the `n` uppercase hex digits of `s` starting at byte `at`.\n")
-  b.write("fn idnaHex(s: string, at: int, n: int): int {\n")
-  b.write("  let v = 0\n")
-  b.write("  let i = at\n")
-  b.write("  // Bounded by `at + n`.\n")
-  b.write("  while (i < at + n) {\n")
-  b.write("    let c = int(s[i])\n")
-  b.write("    if (c <= int('9')) {\n")
-  b.write("      v = v * 16 + c - int('0')\n")
-  b.write("    } else {\n")
-  b.write("      v = v * 16 + c - int('A') + 10\n")
-  b.write("    }\n")
-  b.write("    i = i + 1\n")
-  b.write("  }\n")
-  b.write("  return v\n")
-  b.write("}\n\n")
-  b.write("// The index of the last `recLen`-byte record of `tbl` whose leading six-digit\n")
-  b.write("// key is <= `key`, or -1 when every key is larger. Binary search: O(log n)\n")
-  b.write("// probes, no allocation.\n")
-  b.write("fn idnaFloor(tbl: string, recLen: int, key: int): int {\n")
-  b.write("  let lo = 0\n")
-  b.write("  let hi = len(tbl) / recLen - 1\n")
-  b.write("  let found = -1\n")
-  b.write("  // Bounded: `hi - lo` strictly shrinks every iteration.\n")
-  b.write("  while (lo <= hi) {\n")
-  b.write("    let mid = lo + (hi - lo) / 2\n")
-  b.write("    if (idnaHex(tbl, mid * recLen, 6) <= key) {\n")
-  b.write("      found = mid\n")
-  b.write("      lo = mid + 1\n")
-  b.write("    } else {\n")
-  b.write("      hi = mid - 1\n")
-  b.write("    }\n")
-  b.write("  }\n")
-  b.write("  return found\n")
-  b.write("}\n\n")
-  b.write("// Whether `r` is a scalar value in 0..10FFFF, the range every table covers.\n")
-  b.write("fn idnaInRange(r: rune): bool {\n")
-  b.write("  return int(r) >= 0 && int(r) <= 0x10FFFF\n")
-  b.write("}\n\n")
+// The lookups `idna.bit` runs per code point.
+fn writeIdnaLookups(b: Builder) {
+  b.write(
+    ticks(
+      `// The byte offset of @cp@'s record in @idnaInfo@: two byte-pair loads. A
+// rune outside 0..10FFFF has record 0: disallowed, @bidiL@ and @joinU@.
+fn idnaRec(cp: int): int {
+  if (cp < 0 || cp >= idnaTrieLimit) {
+    return 0
+  }
+  let k = (cp >> idnaTrieShift) * 2
+  let blk = (int(idnaStage1[k]) << 8) | int(idnaStage1[k + 1])
+  let j = ((blk << idnaTrieShift) | (cp & idnaTrieMask)) * 2
+  return ((int(idnaStage2[j]) << 8) | int(idnaStage2[j + 1])) * 8
 }
 
-fn writeIdnaLookups(b: Builder) {
-  b.write("// The UTS #46 status of `r`: one of the `idna*` codes.\n")
-  b.write("fn idnaStatus(r: rune): int {\n")
-  b.write("  if (!idnaInRange(r)) {\n")
-  b.write("    return idnaDisallowed\n")
-  b.write("  }\n")
-  b.write("  let i = idnaFloor(idnaStatusTable, 12, int(r))\n")
-  b.write("  return idnaHex(idnaStatusTable, i * 12 + 6, 1)\n")
-  b.write("}\n\n")
-  b.write("// The sequence `r` maps to when its status is mapped or deviation, else an\n")
-  b.write("// empty slice. The record after `r`'s (the sentinel at worst) bounds it.\n")
-  b.write("fn idnaMapping(r: rune): []rune {\n")
-  b.write("  let out: []rune = []rune(0)\n")
-  b.write("  if (!idnaInRange(r)) {\n")
-  b.write("    return out\n")
-  b.write("  }\n")
-  b.write("  let i = idnaFloor(idnaStatusTable, 12, int(r))\n")
-  b.write("  let st = idnaHex(idnaStatusTable, i * 12 + 6, 1)\n")
-  b.write("  if (st != idnaMapped && st != idnaDeviation) {\n")
-  b.write("    return out\n")
-  b.write("  }\n")
-  b.write("  let j = idnaHex(idnaStatusTable, i * 12 + 7, 5)\n")
-  b.write("  let end = idnaHex(idnaStatusTable, i * 12 + 19, 5)\n")
-  b.write("  // Bounded by `end`, at most 18 runes past `j` in UCD 17.0.0.\n")
-  b.write("  while (j < end) {\n")
-  b.write("    out = append(out, rune(idnaHex(idnaMapData, j * 5, 5)))\n")
-  b.write("    j = j + 1\n")
-  b.write("  }\n")
-  b.write("  return out\n")
-  b.write("}\n\n")
-  b.write("// The Bidi_Class of `r`: one of the `bidi*` codes.\n")
-  b.write("fn bidiClass(r: rune): int {\n")
-  b.write("  if (!idnaInRange(r)) {\n")
-  b.write("    return bidiL\n")
-  b.write("  }\n")
-  b.write("  let i = idnaFloor(idnaBidiTable, 8, int(r))\n")
-  b.write("  return idnaHex(idnaBidiTable, i * 8 + 6, 2)\n")
-  b.write("}\n\n")
-  b.write("// The Joining_Type of `r`: one of the `join*` codes.\n")
-  b.write("fn joiningType(r: rune): int {\n")
-  b.write("  if (!idnaInRange(r)) {\n")
-  b.write("    return joinU\n")
-  b.write("  }\n")
-  b.write("  let i = idnaFloor(idnaJoiningTable, 7, int(r))\n")
-  b.write("  return idnaHex(idnaJoiningTable, i * 7 + 6, 1)\n")
-  b.write("}\n\n")
-  b.write("// Whether `r` has canonical combining class 9 (a virama).\n")
-  b.write("fn isVirama(r: rune): bool {\n")
-  b.write("  if (!idnaInRange(r)) {\n")
-  b.write("    return false\n")
-  b.write("  }\n")
-  b.write("  let i = idnaFloor(idnaViramaTable, 12, int(r))\n")
-  b.write("  return i >= 0 && int(r) <= idnaHex(idnaViramaTable, i * 12 + 6, 6)\n")
-  b.write("}\n\n")
-  b.write("// Whether `r` has General_Category M (a combining mark).\n")
-  b.write("fn isMark(r: rune): bool {\n")
-  b.write("  if (!idnaInRange(r)) {\n")
-  b.write("    return false\n")
-  b.write("  }\n")
-  b.write("  let i = idnaFloor(idnaMarkTable, 12, int(r))\n")
-  b.write("  return i >= 0 && int(r) <= idnaHex(idnaMarkTable, i * 12 + 6, 6)\n")
-  b.write("}\n")
+// The number of runes in the mapping of the record at @rec@.
+fn idnaMapLen(rec: int): int {
+  return int(idnaInfo[rec + 4])
+}
+
+// The rune index in @idnaMapData@ where the mapping of the record at @rec@
+// starts.
+fn idnaMapStart(rec: int): int {
+  return (int(idnaInfo[rec + 5]) << 16) | (int(idnaInfo[rec + 6]) << 8) | int(idnaInfo[rec + 7])
+}
+
+// Rune @k@ of @idnaMapData@.
+fn idnaMapRune(k: int): int {
+  let p = k * 3
+  return (int(idnaMapData[p]) << 16) | (int(idnaMapData[p + 1]) << 8) | int(idnaMapData[p + 2])
+}
+
+// The UTS #46 status of @r@: one of the @idna*@ codes.
+fn idnaStatus(r: rune): int {
+  return int(idnaInfo[idnaRec(int(r))])
+}
+
+// The Bidi_Class of @r@: one of the @bidi*@ codes.
+fn bidiClass(r: rune): int {
+  return int(idnaInfo[idnaRec(int(r)) + 1])
+}
+
+// The Joining_Type of @r@: one of the @join*@ codes.
+fn joiningType(r: rune): int {
+  return int(idnaInfo[idnaRec(int(r)) + 2])
+}
+
+// Whether @r@ has canonical combining class 9 (a virama).
+fn isVirama(r: rune): bool {
+  return (int(idnaInfo[idnaRec(int(r)) + 3]) & idnaFlagVirama) != 0
+}
+
+// Whether @r@ has General_Category M (a combining mark).
+fn isMark(r: rune): bool {
+  return (int(idnaInfo[idnaRec(int(r)) + 3]) & idnaFlagMark) != 0
+}
+
+`,
+    ),
+  )
+}
+
+// The test-facing view of the mapping data; a program that only calls
+// `idnaToAscii` or `idnaToUnicode` never references it.
+fn writeIdnaHelpers(b: Builder) {
+  b.write(
+    ticks(
+      `// The sequence @r@ maps to when its status is mapped or deviation, else an
+// empty slice.
+fn idnaMapping(r: rune): []rune {
+  let rec = idnaRec(int(r))
+  let out = []rune(0)
+  let k = idnaMapStart(rec)
+  let end = k + idnaMapLen(rec)
+  // Bounded by @end@, at most 18 runes past @k@ in UCD 17.0.0.
+  while (k < end) {
+    out = append(out, rune(idnaMapRune(k)))
+    k = k + 1
+  }
+  return out
+}
+`,
+    ),
+  )
 }
