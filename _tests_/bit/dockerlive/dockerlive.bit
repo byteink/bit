@@ -15,14 +15,34 @@
 // long the whole probe took. The one remaining skip is an explicit opt-out,
 // `BIT_LIVE_OPTIONAL=1`, which nothing in this repo sets.
 //
+// REMOTE MODE (#7428). The dev Mac's Docker can be down while an ssh host with
+// Docker is up. With `BIT_LIVE_DOCKER_HOST=<ssh host>` set, `requireDocker`
+// returns a generated `docker` shim that runs every docker call as
+// `ssh -n <host> docker ...` (stdin closed: an ssh child that inherits stdin
+// eats a payload), so the harnesses' own `output(bin, ...)` calls need no
+// edit. On top of that this file adds what a remote daemon needs:
+//   - the host's `/tmp/benchlock` DIRECTORY lock (mkdir/rmdir, the lock the
+//     host's other users take) is held from the first `docker run` until
+//     `releaseDocker`;
+//   - `hostPort` opens one `ssh -N -L` tunnel per published port, checks it
+//     accepts on 127.0.0.1, and returns the LOCAL port, so every URI a
+//     harness builds from it points at the tunnel unchanged;
+//   - a `-v <dir>:<target>` bind mount is copied to the host first (the
+//     local path does not exist there).
+// Every harness calls `releaseDocker(bin)` from its one cleanup function,
+// AFTER its containers are removed: it kills the tunnels, removes the staged
+// directories and releases the lock, on success and on failure alike. Unset,
+// nothing here runs and the local behaviour is unchanged.
+//
 // `failureText` is the one place a failed child's message is built, so a
 // timed-out docker call says "timed out after Nms" instead of printing an
 // empty stderr (s3live's `docker run: ` on 2026-09-30).
 
 import { output, RunResult } from "std/process"
 import { envOr, exit } from "std/os"
-import { exists } from "std/fs"
-import { join, lastIndexOf, parseInt, split, trimSpace } from "std/strings"
+import { exists, mkdir, readFile, remove, writeFile } from "std/fs"
+import { dialDeadline } from "std/net"
+import { hasPrefix, hasSuffix, join, lastIndexOf, parseInt, split, trimSpace } from "std/strings"
 import { sleep, monotonic, since, Millisecond } from "std/time"
 
 // A `docker` call that returns at once (info, port, ps, exec): 10 s.
@@ -109,6 +129,13 @@ fn unavailableReason(bin: string): string {
 // `who` prefixes the message (the harness's own name).
 export fn requireDocker(who: string): string {
   let bin = findBin(dockerCandidates())
+  if (remoteHost() != "") {
+    bin = installShim() catch e {
+      eprint("${who}: ${remoteHostEnv} is set but the remote docker shim could not be made: ${e.message()}\n")
+      exit(1)
+      return ""
+    }
+  }
   let start = monotonic()
   let why = unavailableReason(bin)
   if (why == "") {
@@ -127,7 +154,8 @@ export fn requireDocker(who: string): string {
 }
 
 export fn dockerRun(bin: string, args: []string): ()! {
-  let r = output(bin, args, dockerRunTimeoutMs)
+  let argv = remoteRunArgs(bin, args)?
+  let r = output(bin, argv, dockerRunTimeoutMs)
   if (r.exitCode != 0) {
     fail newError("docker ${args[0]}: ${failureText(r, dockerRunTimeoutMs)}")
   }
@@ -147,7 +175,11 @@ export fn hostPort(bin: string, name: string, containerPort: string): int! {
   if (colon < 0) {
     fail newError("docker port ${name}: unexpected output '${lines[0]}'")
   }
-  return parseInt(lines[0][colon + 1:])?
+  let port = parseInt(lines[0][colon + 1:])?
+  if (isRemote(bin)) {
+    return openTunnel(bin, port)?
+  }
+  return port
 }
 
 // Relays a `bit test` child's streams and returns its exit code, saying so
@@ -220,4 +252,260 @@ export fn sweepOrphans(bin: string, runLabel: string) {
     }
     output(bin, ["rm", "-f", id], dockerRunTimeoutMs)
   }
+}
+
+// ---- remote mode (#7428), see the header ----
+
+export const remoteHostEnv: string = "BIT_LIVE_DOCKER_HOST"
+const sshBin: string = "/usr/bin/ssh"
+const lockDir: string = "/tmp/benchlock"
+const stagePrefix: string = "/tmp/bit-live-stage-"
+const shimName: string = "docker-remote"
+// Waiting for the lock costs nothing: 360 * 5 s = 30 min.
+const lockAttempts: int = 360
+const lockGapMs: int = 5000
+// An ssh connection failing is rc 255, never a held lock.
+const sshFailedCode: int = 255
+const tunnelTries: int = 5
+const tunnelReadyAttempts: int = 40
+const tunnelReadyGapMs: int = 250
+const dialBudgetMs: int = 1000
+
+// Every arg single-quoted, because ssh joins argv with spaces and the remote
+// shell parses the result (`inspect -f {{index .Config.Labels "k"}}` needs it).
+const shimSource: string = `#!/bin/sh
+q=
+for a in "$@"; do
+  e=$(printf '%s' "$a" | sed "s/'/'\\\\''/g")
+  q="$q '$e'"
+done
+exec /usr/bin/ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$BIT_LIVE_DOCKER_HOST" docker$q
+`
+// Exit 0 when pid $1 is an `ssh -N` tunnel; a recycled pid is never matched.
+const tunnelAliveScript: string = `case "$(ps -p "$1" -o command= 2>/dev/null)" in *"ssh -N"*) exit 0;; esac; exit 1`
+// Starts a detached tunnel, local port $1 to the host's 127.0.0.1:$2 through ssh host $3.
+const tunnelSpawnScript: string = `/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ConnectTimeout=10 -L "$1:127.0.0.1:$2" "$3" </dev/null >/dev/null 2>&1 & echo $!`
+// Copies directory $1 to $2 on ssh host $3.
+const stageScript: string = `tar -C "$1" -cf - . | /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=10 "$3" "mkdir -p '$2' && tar -C '$2' -xf -"`
+
+fn remoteHost(): string {
+  return envOr(remoteHostEnv, "")
+}
+
+fn isRemote(bin: string): bool {
+  return hasSuffix(bin, "/${shimName}")
+}
+
+// The shim's directory: it holds this run's `lock`, `tunnels` and `staged`.
+fn stateDir(bin: string): string {
+  return bin[0:len(bin) - len(shimName) - 1]
+}
+
+fn ssh(host: string, cmd: string, timeoutMs: int): RunResult {
+  return output(
+    sshBin,
+    ["-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, cmd],
+    timeoutMs,
+  )
+}
+
+fn trimSlash(s: string): string {
+  if (hasSuffix(s, "/")) {
+    return s[0:len(s) - 1]
+  }
+  return s
+}
+
+// Writes the docker shim into a fresh directory under $TMPDIR and returns its path.
+fn installShim(): string! {
+  let pid = selfPid()?
+  let dir = "${trimSlash(envOr("TMPDIR", "/tmp"))}/bit-live-remote-${pid}-${monotonic().ns}"
+  mkdir(dir)?
+  let shim = "${dir}/${shimName}"
+  writeFile(shim, shimSource)?
+  let r = output("/bin/chmod", ["755", shim], dockerQuickTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("chmod ${shim}: ${failureText(r, dockerQuickTimeoutMs)}")
+  }
+  return shim
+}
+
+fn readLines(path: string): []string {
+  let out = []string(0)
+  if (!exists(path)) {
+    return out
+  }
+  let text = readFile(path) catch _ {
+    return out
+  }
+  for line of split(text, "\n") {
+    if (line != "") {
+      out = append(out, line)
+    }
+  }
+  return out
+}
+
+fn appendLine(path: string, line: string): ()! {
+  let text = ""
+  if (exists(path)) {
+    text = readFile(path)?
+  }
+  writeFile(path, "${text}${line}\n")?
+}
+
+// Takes the host's directory lock once per run, waiting for its other holders.
+fn acquireLock(bin: string, host: string): ()! {
+  let marker = "${stateDir(bin)}/lock"
+  if (exists(marker)) {
+    return
+  }
+  let why = ""
+  let i = 0
+  while (i < lockAttempts) {
+    let r = ssh(host, "mkdir ${lockDir}", dockerQuickTimeoutMs)
+    if (r.exitCode == 0) {
+      writeFile(marker, "held\n")?
+      return
+    }
+    why = failureText(r, dockerQuickTimeoutMs)
+    if (r.exitCode == sshFailedCode) {
+      fail newError("remote lock: ssh to the docker host failed: ${why}")
+    }
+    i = i + 1
+    sleep(lockGapMs * Millisecond)
+  }
+  fail newError("remote lock ${lockDir} still held after ${lockAttempts * lockGapMs / 1000}s: ${why}")
+}
+
+// Copies the host side of one `-v src:dst[:opt]` to the host and returns the spec naming the copy.
+fn stageMount(bin: string, host: string, spec: string): string! {
+  let parts = split(spec, ":")
+  let dir = stateDir(bin)
+  let stage = "${stagePrefix}${len(readLines("${dir}/staged"))}-${dir[lastIndexOf(dir, "/") + 1:]}"
+  appendLine("${dir}/staged", stage)?
+  let r = output("/bin/sh", ["-c", stageScript, "sh", parts[0], stage, host], dockerRunTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("staging ${parts[0]} on the docker host: ${failureText(r, dockerRunTimeoutMs)}")
+  }
+  parts[0] = stage
+  return join(parts, ":")
+}
+
+// `args` for a remote `docker run`: lock taken, bind mounts staged. Anything else, and every local call, unchanged.
+fn remoteRunArgs(bin: string, args: []string): []string! {
+  if (!isRemote(bin) || args[0] != "run") {
+    return args
+  }
+  let host = remoteHost()
+  acquireLock(bin, host)?
+  let out = []string(0)
+  let i = 0
+  while (i < len(args)) {
+    if (args[i] == "-v" && i + 1 < len(args)) {
+      out = append(out, "-v")
+      out = append(out, stageMount(bin, host, args[i + 1])?)
+      i = i + 2
+      continue
+    }
+    out = append(out, args[i])
+    i = i + 1
+  }
+  return out
+}
+
+fn tunnelAlive(pid: string): bool {
+  return output("/bin/sh", ["-c", tunnelAliveScript, "sh", pid], dockerQuickTimeoutMs).exitCode == 0
+}
+
+fn killTunnel(pid: string) {
+  if (tunnelAlive(pid)) {
+    output("/bin/kill", [pid], dockerQuickTimeoutMs)
+  }
+}
+
+// Whether something already accepts on 127.0.0.1:`port`.
+fn accepts(port: int): bool {
+  let c = dialDeadline("127.0.0.1", port, monotonic().ns + dialBudgetMs * Millisecond) catch _ {
+    return false
+  }
+  c.close()
+  return true
+}
+
+// True once the tunnel process `pid` is alive and 127.0.0.1:`port` accepts.
+fn tunnelReady(pid: string, port: int): bool {
+  let i = 0
+  while (i < tunnelReadyAttempts && tunnelAlive(pid)) {
+    if (accepts(port)) {
+      return true
+    }
+    sleep(tunnelReadyGapMs * Millisecond)
+    i = i + 1
+  }
+  return false
+}
+
+// Candidate k for the local end: the host's own port first, then spread across 20000-59999.
+fn localCandidate(remotePort: int, k: int): int {
+  if (k == 0) {
+    return remotePort
+  }
+  return 20000 + (remotePort * 31 + k * 977) % 40000
+}
+
+// One `ssh -N -L` tunnel to the host's 127.0.0.1:`remotePort`; the LOCAL port it answers on.
+// The pid is recorded before the readiness check so `releaseDocker` kills a tunnel that never became ready.
+fn openTunnel(bin: string, remotePort: int): int! {
+  let k = 0
+  while (k < tunnelTries) {
+    let local = localCandidate(remotePort, k)
+    k = k + 1
+    if (accepts(local)) {
+      continue
+    }
+    let r = output(
+      "/bin/sh",
+      ["-c", tunnelSpawnScript, "sh", "${local}", "${remotePort}", remoteHost()],
+      dockerQuickTimeoutMs,
+    )
+    let pid = trimSpace(r.stdout)
+    if (r.exitCode != 0 || pid == "") {
+      fail newError("ssh tunnel: ${failureText(r, dockerQuickTimeoutMs)}")
+    }
+    appendLine("${stateDir(bin)}/tunnels", pid)?
+    if (tunnelReady(pid, local)) {
+      return local
+    }
+    killTunnel(pid)
+  }
+  fail newError("ssh tunnel to the docker host's port ${remotePort}: no local port became ready in ${tunnelTries} tries")
+}
+
+// Ends a remote run: kills its tunnels, removes the staged copies and releases the host lock. A harness calls it
+// from its cleanup AFTER its containers are removed, on every path. No-op for a local docker.
+export fn releaseDocker(bin: string) {
+  if (!isRemote(bin)) {
+    return
+  }
+  let dir = stateDir(bin)
+  let host = remoteHost()
+  for pid of readLines("${dir}/tunnels") {
+    killTunnel(pid)
+  }
+  for stage of readLines("${dir}/staged") {
+    if (hasPrefix(stage, stagePrefix)) {
+      let _ = ssh(host, "rm -rf '${stage}'", dockerRunTimeoutMs)
+    }
+  }
+  if (exists("${dir}/lock")) {
+    let r = ssh(host, "rmdir ${lockDir}", dockerQuickTimeoutMs)
+    if (r.exitCode != 0) {
+      eprint("dockerlive: releasing ${lockDir}: ${failureText(r, dockerQuickTimeoutMs)}\n")
+    }
+  }
+  for f of ["lock", "tunnels", "staged", shimName] {
+    remove("${dir}/${f}") catch _ {}
+  }
+  remove(dir) catch _ {}
 }
