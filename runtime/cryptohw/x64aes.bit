@@ -3,7 +3,9 @@
 // `bit_rt_crypto_aes_ctr32_hw`, the multi-block counter-mode primitive GCM's
 // GCTR runs on. `stdlib/crypto/aes.bit` and `stdlib/crypto/gcm.bit` take this
 // path when `bit_rt_crypto_aes_hw_available()` answers true, and the
-// constant-time software AES otherwise.
+// constant-time software AES otherwise. The counter-mode pin also serves
+// arm64 (#7397): there it runs ./armaesctr.bit's ARMv8 loop, which
+// `gcm.bit` reaches when `Aes.hw` is set.
 //
 // KEY MATERIAL. Every primitive takes the FIPS-197 forward schedule
 // `aes.bit`'s `expandKey` builds (16*(nr+1) bytes, round key i at 16*i, in
@@ -17,8 +19,9 @@
 // reads) forces it false, so the switch selects the software path on x86-64
 // as it does on arm64. Only legacy-SSE encodings run here (SSE2 plus AES-NI,
 // no VEX), so no AVX or XGETBV check is owed. On arm64 the answer is false
-// and every compute primitive panics: a caller reaching one asked for a path
-// it was told is absent, and a panic says so where wrong bytes would not.
+// and every single-block primitive panics: a caller reaching one asked for a
+// path it was told is absent, and a panic says so where wrong bytes would
+// not.
 //
 // ADDRESSING. Each loop addresses the schedule as `rkEnd + i`, rkEnd = the
 // last round key (rk + 16*nr) and i running from 16 - 16*nr up to 0: round
@@ -48,15 +51,15 @@
 // allows.
 //
 // CHUNKED FOR THE COLLECTOR. The blocks are opaque and hold no safepoint, so
-// one CTR call runs at most `aesX64ChunkGroups` four-block groups (64 KiB)
-// and a large buffer still reaches the Bit loop's back edge, and its
+// one CTR call runs at most `aesCtrChunkBlocks` blocks (64 KiB) on either
+// arch and a large buffer still reaches the Bit loop's back edge, and its
 // safepoint, every few microseconds.
 //
 // THE CTR BLOCK. `bit_rt_crypto_aes_ctr32_hw` takes its counter and its
 // round count in one caller-owned 24-byte block: bytes 0..15 the counter
 // block, bytes 16..23 the round count as a little-endian 64-bit word.
 
-const aesX64ChunkGroups: int = 1024
+const aesCtrChunkBlocks: int = 4096
 
 // CPUID leaf 1 ECX bit 25: AES-NI.
 const cpuidAes: u64 = 33554432
@@ -87,15 +90,20 @@ export @symbol("bit_rt_crypto_aes_hw_available") fn rtCryptoAesHwAvailable(): bo
   return aesNiState == 1
 }
 
-// Panics unless AES-NI is in use and `nr` is an AES round count: the asm
-// loops below run nr-1 times and never terminate on nr = 1.
+// Panics unless `nr` is an AES round count: the asm loops here and in
+// armaesctr.bit run nr-1 times and never terminate on nr = 1.
+fn aesRoundsRequire(nr: int) {
+  if (nr != 10 && nr != 12 && nr != 14) {
+    panic("bit_rt_crypto_aes_*_hw: round count must be 10, 12 or 14")
+  }
+}
+
+// Panics unless AES-NI is in use and `nr` is an AES round count.
 fn x64AesNiRequire(nr: int) {
   if (!rtCryptoAesHwAvailable()) {
     panic("bit_rt_crypto_aes_*_hw: hardware AES requested but unavailable (runtime/cryptohw/x64aes.bit)")
   }
-  if (nr != 10 && nr != 12 && nr != 14) {
-    panic("bit_rt_crypto_aes_*_hw: round count must be 10, 12 or 14")
-  }
+  aesRoundsRequire(nr)
 }
 
 // One block: `dst` = AES_rk(`src`). The arm64 arm is a trap.
@@ -166,8 +174,8 @@ fn x64AesImc(src: int, dst: int) {
 }
 
 // The round count stored in the CTR block at `ctr` (bytes 16..23, little
-// endian). Validated by `x64AesNiRequire` before any asm loop runs on it.
-fn x64AesCtrRounds(ctr: int): int {
+// endian). Validated by `aesRoundsRequire` before any asm loop runs on it.
+fn aesCtrRounds(ctr: int): int {
   let nr = 0
   let i = 23
   while (i >= 16) {
@@ -184,7 +192,7 @@ fn x64AesCtrRounds(ctr: int): int {
 // caller advances it. `dst` may equal `src`. Called only after the caller
 // validated the block's round count. The arm64 arm is a trap.
 fn x64AesCtrRun(rk: int, ctr: int, src: int, dst: int, groups: int) {
-  let nr = x64AesCtrRounds(ctr)
+  let nr = aesCtrRounds(ctr)
   asm volatile {
     arm64 { 0xD4200000 } // brk #0
     x64 {
@@ -265,7 +273,7 @@ fn x64AesCtrRun(rk: int, ctr: int, src: int, dst: int, groups: int) {
 
 // Adds `n` to the big-endian count in bytes 12..15 of the counter block at
 // `ctr`, modulo 2^32 (GCM's inc32 applied `n` times).
-fn x64AesCtrAdvance(ctr: int, n: int) {
+fn aesCtrAdvance(ctr: int, n: int) {
   let c = 0
   let i = 12
   while (i < 16) {
@@ -282,18 +290,21 @@ fn x64AesCtrAdvance(ctr: int, n: int) {
 }
 
 // One counter block: `dst` = `src` XOR AES_rk(counter), then the counter
-// advances by one. For the 0..3 blocks a run leaves after its four-block
-// groups.
-fn x64AesCtrOne(rk: int, nr: int, ctr: int, src: int, dst: int) {
+// advances by one. For the blocks a run leaves after its groups.
+fn aesCtrOne(rk: int, nr: int, ctr: int, src: int, dst: int) {
   let ks = []byte(16)
   let ksAddr = int(ptrOf(ks))
-  x64AesEncRun(rk, nr, ctr, ksAddr)
+  if (onX64()) {
+    x64AesEncRun(rk, nr, ctr, ksAddr)
+  } else {
+    rtAesHwEncryptBlock(rk, nr, ctr, ksAddr)
+  }
   let i = 0
   while (i < 16) {
     *aesByteAt(dst + i) = *aesByteAt(src + i) ^ ks[i]
     i = i + 1
   }
-  x64AesCtrAdvance(ctr, 1)
+  aesCtrAdvance(ctr, 1)
 }
 
 // `bit_rt_crypto_aes_encrypt_hw(round_keys, nr, block, out)`: one block.
@@ -344,7 +355,8 @@ export @symbol("bit_rt_crypto_aes_invert_schedule_hw") fn rtCryptoAesInvertSched
 // `src`), the keystream being AES, at the round count the CTR block at `ctr`
 // carries, of its counter block under inc32. The counter is advanced past
 // the last block used, so a following call or a trailing partial block
-// continues the same stream.
+// continues the same stream. AES-NI on x86-64 (four blocks per group), the
+// ARMv8 AES instructions on arm64 (eight, ./armaesctr.bit).
 export @symbol("bit_rt_crypto_aes_ctr32_hw") fn rtCryptoAesCtr32Hw(
   roundKeys: int,
   ctr: int,
@@ -352,22 +364,38 @@ export @symbol("bit_rt_crypto_aes_ctr32_hw") fn rtCryptoAesCtr32Hw(
   dst: int,
   blocks: int,
 ) {
-  let nr = x64AesCtrRounds(ctr)
-  x64AesNiRequire(nr)
-  let groups = blocks / 4
+  let nr = aesCtrRounds(ctr)
+  let width = 8
+  if (onX64()) {
+    x64AesNiRequire(nr)
+    width = 4
+  } else {
+    armAesCtrRequire(nr)
+  }
+  let chunk = aesCtrChunkBlocks / width
+  let groups = blocks / width
   let off = 0
   while (groups > 0) {
     let n = groups
-    if (n > aesX64ChunkGroups) {
-      n = aesX64ChunkGroups
+    if (n > chunk) {
+      n = chunk
     }
-    x64AesCtrRun(roundKeys, ctr, src + off, dst + off, n)
-    x64AesCtrAdvance(ctr, n * 4)
-    off = off + n * 64
+    aesCtrRun(roundKeys, ctr, src + off, dst + off, n)
+    aesCtrAdvance(ctr, n * width)
+    off = off + n * width * 16
     groups = groups - n
   }
   while (off < blocks * 16) {
-    x64AesCtrOne(roundKeys, nr, ctr, src + off, dst + off)
+    aesCtrOne(roundKeys, nr, ctr, src + off, dst + off)
     off = off + 16
   }
+}
+
+// `groups` groups of the arch's width through its counter-mode loop.
+fn aesCtrRun(rk: int, ctr: int, src: int, dst: int, groups: int) {
+  if (onX64()) {
+    x64AesCtrRun(rk, ctr, src, dst, groups)
+    return
+  }
+  armAesCtrRun(rk, ctr, src, dst, groups)
 }

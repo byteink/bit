@@ -3033,7 +3033,7 @@ defined exactly once).
 | `bit_rt_crypto_aes_encrypt_hw` | `(rk: *byte, nr: i64, block: *byte, out: *byte) -> void` (§21b) |
 | `bit_rt_crypto_aes_decrypt_hw` | `(drk: *byte, nr: i64, block: *byte, out: *byte) -> void` (§21b) |
 | `bit_rt_crypto_aes_invert_schedule_hw` | `(erk: *byte, nr: i64, out: *byte) -> void` (§21b) |
-| `bit_rt_crypto_aes_ctr32_hw` | `(rk: *byte, ctr: *byte, src: *byte, dst: *byte, blocks: i64) -> void` (§21b, x86-64 AES-NI counter mode) |
+| `bit_rt_crypto_aes_ctr32_hw` | `(rk: *byte, ctr: *byte, src: *byte, dst: *byte, blocks: i64) -> void` (§21b, counter mode: x86-64 AES-NI, arm64 ARMv8 AES) |
 | `bit_rt_crypto_ghash_mul_hw` | `(acc0, acc1, b0, b1, h0, h1: u64, outHi: *u64) -> u64` (§21b) |
 | `bit_rt_crypto_sha256_compress_hw` | `(state: *u32, block: *byte) -> void` (§21b) |
 | `bit_rt_crypto_hwcaps` | `() -> u64` (§21c) |
@@ -4695,8 +4695,11 @@ the same shape as any other host-detection branch in the codebase, not a
 data-dependent one.
 
 **AES-NI (#7390).** The five AES pins are real on x86-64
-(`runtime/cryptohw/x64aes.bit`) and panic on arm64, where `stdlib/crypto`
-runs the §21d ARMv8 primitives instead. They use legacy-SSE encodings only
+(`runtime/cryptohw/x64aes.bit`). On arm64 the four single-block pins panic,
+where `stdlib/crypto` runs the §21d ARMv8 primitives instead, and
+`bit_rt_crypto_aes_ctr32_hw` runs the ARMv8 AES instructions
+(`runtime/cryptohw/armaesctr.bit`, #7397), panicking when the CPU lacks
+them. They use legacy-SSE encodings only
 (SSE2 plus AES-NI, no VEX), so availability is the CPUID AES bit alone, no
 AVX or XGETBV check; `BIT_CRYPTO_HW=0` forces it false, so the switch
 `stdlib/crypto/hw.bit` reads selects the software path on x86-64 too.
@@ -4706,8 +4709,9 @@ caller-owned 24-byte block: bytes 0..15 the counter block, whose last four
 bytes are a big-endian count that wraps modulo 2^32 (GCM's inc32), and bytes
 16..23 the round count (10, 12 or 14) as a little-endian i64. The counter is
 advanced past the last block. It
-pipelines four counter blocks per round key and returns to Bit every 64 KiB
-so a large buffer still reaches a safepoint; GCM's GCTR runs on it.
+pipelines four (x86-64) or eight (arm64) counter blocks per round key and
+returns to Bit every 64 KiB so a large buffer still reaches a safepoint;
+GCM's GCTR runs on it on both architectures.
 
 **AES-NI key material.** `bit_rt_crypto_aes_encrypt_hw` takes the plain
 FIPS-197 forward round-key schedule (`16*(nr+1)` bytes, one 128-bit round key
