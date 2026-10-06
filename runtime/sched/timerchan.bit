@@ -36,7 +36,10 @@
 
 // One entry, `ctEntryWords` apart in `chanTimerPool`.
 const ctEntryWords: int = 6
-const ctState: int = 0 // 0 free, 1 pending
+// 0 free, 1 pending, 2 pending and firing: a periodic slot whose expiry send is
+// in flight. `schedTimerChanCancel` waits out state 2, which is what makes a
+// `true` from it a promise that no further tick is sent (#7442).
+const ctState: int = 0
 const ctDeadline: int = 1
 const ctPeriod: int = 2
 const ctChan: int = 3 // raw channel handle (int), opaque here — never
@@ -56,7 +59,7 @@ let chanTimerPool: [196608]i64
 let chanTimerFreeHead: [1]i64
 let chanTimerHigh: [1]i64
 let chanTimerLockWord: [1]i64
-// How many slots are currently pending (state == 1). A dedicated counter
+// How many slots are currently pending (state 1 or 2). A dedicated counter
 // rather than a scan: `schedCheckDeadlock` (worker.bit) reads this on every
 // idle turn a single-worker program takes, the same frequency
 // `schedTimerAny`/`schedPollPendingCount` are already read at, so this
@@ -182,8 +185,8 @@ export @nosplit @symbol("bit_rt_sched_timer_chan_arm") fn rtSchedTimerChanArm(
   return ctMakeId(slot, gen)
 }
 
-// The slot `id` names, iff it is still pending AND `id`'s generation matches
-// the slot's current occupant — -1 for an unknown id, an id whose slot has
+// The slot `id` names, iff it is still pending (state 1 or 2) AND `id`'s
+// generation matches the slot's current occupant — -1 for an unknown id, an id whose slot has
 // since fired-and-freed-and-been-reused, or an id whose slot is still free.
 // MUST BE CALLED WITH `chanTimerLockAddr()` HELD: the generation/state check
 // and the caller's use of the result must be one atomic read, or a concurrent
@@ -197,7 +200,7 @@ export @nosplit @symbol("bit_rt_sched_timer_chan_arm") fn rtSchedTimerChanArm(
   let slot = idx % ctCap
   let gen = idx / ctCap
   let e = ctEntryAt(slot)
-  if (*(e + ctState) != 1 || *(e + ctGen) != gen) {
+  if (*(e + ctState) == 0 || *(e + ctGen) != gen) {
     return -1
   }
   return slot
@@ -205,7 +208,7 @@ export @nosplit @symbol("bit_rt_sched_timer_chan_arm") fn rtSchedTimerChanArm(
 
 // Frees `slot` onto the head of the free list. Caller holds the lock.
 // Caller holds `chanTimerLockAddr()` and has already verified the slot was
-// PENDING (state == 1) — freeing an already-free slot would double-count the
+// PENDING (state 1 or 2) — freeing an already-free slot would double-count the
 // decrement below against `schedTimerChanArm`'s single increment.
 @nosplit fn ctFreeSlot(slot: int) {
   *(ctEntryAt(slot) + ctState) = 0
@@ -218,22 +221,40 @@ export @nosplit @symbol("bit_rt_sched_timer_chan_arm") fn rtSchedTimerChanArm(
 // (and is now cancelled), `false` when it already fired or `id` is unknown —
 // exactly the race `cancel` racing `expire` must resolve one way or the
 // other, never both.
+//
+// A `true` MEANS NO FURTHER TICK IS SENT (#7442), the contract of Go's
+// `Ticker.Stop`: a tick already sitting in the channel may remain, none that
+// is still in flight lands after this returns. A periodic slot whose expiry
+// send is under way is in state 2 (`chanTimerExpireSlot`), and cancel waits
+// for that send to finish rather than freeing the slot underneath it. The wait
+// is bounded by one non-blocking `bit_rt_port_chan_try_send_drop`, which never
+// parks and never takes this lock, so the sender always reaches its store of
+// state 1. The lock is dropped between looks so the sender's own `ctState`
+// store and every other slot's arm, expire and reset proceed meanwhile.
 export @nosplit @symbol("bit_rt_sched_timer_chan_cancel") fn schedTimerChanCancel(id: int): bool {
   let cell = chanTimerLockAddr()
-  spinAcquire(cell)
-  let slot = ctLookupPending(id)
-  if (slot < 0) {
+  while (true) {
+    spinAcquire(cell)
+    let slot = ctLookupPending(id)
+    if (slot < 0) {
+      spinRelease(cell)
+      return false
+    }
+    if (atomicLoad(ctEntryAt(slot) + ctState) == 1) {
+      ctFreeSlot(slot)
+      spinRelease(cell)
+      return true
+    }
     spinRelease(cell)
-    return false
+    spinBackoff(parkMinBackoffNs)
   }
-  ctFreeSlot(slot)
-  spinRelease(cell)
-  return true
 }
 
 // Moves a pending entry to a new absolute deadline. `false` when `id` is
 // unknown (already fired, or never valid) — the same lookup `cancel` uses, so
-// the two report unknown-ness identically. Same shape as
+// the two report unknown-ness identically. A slot in state 2 (expiry send in
+// flight) is moved too: reset writes only `ctDeadline`, which the sender never
+// touches after its re-arm, so the two cannot lose each other's update. Same shape as
 // `rtSchedTimerChanArm` deliberately (#5845): moving a deadline EARLIER while
 // worker 0 sleeps on the old bound is the identical bug arming one is, so
 // this calls the same two helpers, in the same order.
@@ -268,6 +289,15 @@ extern fn bit_rt_port_chan_try_send_drop(ch: int, value: int): bool
 // A one-shot entry (`period <= 0`) is freed before the send, not after: the
 // send cannot fail as far as this pool is concerned (`chanTrySendDrop` drops
 // rather than erroring), so there is no outcome that should leave it pending.
+// (So `Timer.stop()` is false once the timer is due, and the value arrives.)
+//
+// A PERIODIC entry is re-armed AND marked state 2 under the lock, sent on
+// outside it, and only then returned to state 1 (#7442). Re-arming and
+// releasing before the send left a window in which `schedTimerChanCancel` saw
+// state 1, freed the slot and returned true, and the send then landed: a tick
+// after a successful `Ticker.stop()`. Cancel now waits out state 2, so the send
+// and the cancel are mutually exclusive. A sweep that finds state 2 returns the
+// slot's deadline without firing it: the send in flight is the expiry.
 //
 // RETURNS THIS SLOT'S REMAINING FUTURE DEADLINE, or 0 when it has none — free,
 // or a one-shot that just fired and was released. A periodic entry reports the
@@ -280,12 +310,13 @@ extern fn bit_rt_port_chan_try_send_drop(ch: int, value: int): bool
   let cell = chanTimerLockAddr()
   spinAcquire(cell)
   let e = ctEntryAt(slot)
-  if (*(e + ctState) != 1) {
+  let state = *(e + ctState)
+  if (state == 0) {
     spinRelease(cell)
     return 0
   }
   let deadline = *(e + ctDeadline)
-  if (deadline > now) {
+  if (state == 2 || deadline > now) {
     spinRelease(cell)
     return deadline
   }
@@ -295,12 +326,16 @@ extern fn bit_rt_port_chan_try_send_drop(ch: int, value: int): bool
   if (period > 0) {
     rearmed = now + period
     *(e + ctDeadline) = rearmed
+    *(e + ctState) = 2
   } else {
     ctFreeSlot(slot)
   }
   spinRelease(cell)
   schedTimerTrace(ttFire, deadline, now)
   let _ = bit_rt_port_chan_try_send_drop(c, 1)
+  if (period > 0) {
+    atomicStore(e + ctState, 1)
+  }
   schedTimerTrace(ttSent, 1, slot)
   return rearmed
 }
