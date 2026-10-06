@@ -103,5 +103,63 @@ as that narrow type and recovers the full subject with a type assertion.
 through chain methods such as `where`. Opening without a guard changes
 nothing.
 
+## Three handles, and the one that fails
+
+With a guard on the `Db`, every table it protects needs to say who is asking.
+`Draft` (above) is protected by `OwnDrafts`, so a plain `db.table<Draft>()` is a
+mistake in the program and the ORM says so loudly:
+
+```bit
+import { Actor, Db, Guard, Logger, Options, ScopedDb, ScopedRepo, SystemDb, Unscoped, open } from "orm"
+
+fn openGuarded(url: string, guard: Guard, logger: Logger): Db! {
+  return open(url, Options{ authz = guard, logger = logger })?
+}
+
+fn forRequest(db: Db, who: Actor): ScopedDb {
+  return db.as(who, "inkwell")
+}
+
+fn forGuest(db: Db): ScopedDb {
+  return db.asGuest()
+}
+
+fn myDrafts(scoped: ScopedDb): ScopedRepo<Draft> {
+  return scoped.table<Draft>()
+}
+
+fn forNightlyJob(db: Db): SystemDb {
+  return db.asSystem()
+}
+
+fn forgotToScope(db: Db): ()! {
+  db.table<Draft>().all() catch e {
+    let (u, ok) = e.(Unscoped)
+    if (ok) {
+      print("refused: ${u.message()} (status ${u.status()})")
+    }
+  }
+}
+```
+
+- `db.as(subject)` is for one request. `subject` is any class with an `id`;
+  the optional second argument names a tenant. It returns a `ScopedDb`, and
+  `table<T>()` on that returns a `ScopedRepo<T>`, the repository that holds
+  the actor and the guard. `as` is a reserved word; after a `.` it is an
+  ordinary method name.
+- `db.asGuest()` is the same with no subject. A guest is still checked: it is
+  an actor with no id, not an unchecked one.
+- `db.asSystem()` is for jobs and migrations. It returns a `SystemDb` whose
+  `table<T>()` is the plain, unguarded repository, so existing job code keeps
+  its API. When `Options.logger` is set, each `table<T>()` writes one debug
+  line, `orm: system access to <table>`, so system access can be audited.
+- A plain `db.table<T>()` (and `tx.table<T>()`) on a protected table returns a
+  repository whose every terminal call (`find`, `all`, `insert`, `update`,
+  `delete` and the rest) fails with `Unscoped`. Its message names the table
+  and never a value the caller passed. Its status is 500, so a web handler
+  that returns it reports a server fault and never leaks it to the client as
+  a client error. Tables the guard does not protect, and a `Db` opened with
+  no guard, are unchanged.
+
 Where to go next: [Querying](query.md) for the chain a guard narrows, and
 [Raw SQL and transactions](raw.md) for the handles that carry it.
