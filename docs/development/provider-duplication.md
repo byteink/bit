@@ -309,8 +309,8 @@ linux `runtime/net/linux/netabi.bit:224-237` (14 lines) / darwin `runtime/net/da
 ### netAbiReadDeadlineW
 linux `runtime/net/linux/netabi.bit:303-319` (17 lines) / darwin `runtime/net/darwin/netabi.bit:291-307` (17 lines) - thin `bit_rt_*`-exported wrapper that forwards straight to a same-named provider primitive (`netSys*`/`netRead*`/`netWrite*`); the wrapper itself is pure forwarding, no OS call.
 
-### netAbiResolve
-linux `runtime/net/linux/netabi.bit:573-607` (35 lines) / darwin `runtime/net/darwin/netabi.bit:562-596` (35 lines) - DNS-or-literal host resolution dispatcher; calls `netParseIpv4`, `readResolvConf`, `netFirstNameserver`, `netResolveHost` - all either core or already-provider-abstracted. No direct OS touch.
+### netAbiResolveW
+linux `runtime/net/linux/netabi.bit:573-607` (35 lines) / darwin `runtime/net/darwin/netabi.bit:562-596` (35 lines) - DNS-or-literal host resolution dispatcher (the walk is `netResolveConf`); calls `netParseIpv4`, `readResolvConf`, `netNextNameserver`, `netResolveHost` - all either core or already-provider-abstracted. No direct OS touch.
 
 ### netAbiShutdownSockW
 linux `runtime/net/linux/netabi.bit:347-349` (3 lines) / darwin `runtime/net/darwin/netabi.bit:335-337` (3 lines) - thin `bit_rt_*`-exported wrapper that forwards straight to a same-named provider primitive (`netSys*`/`netRead*`/`netWrite*`); the wrapper itself is pure forwarding, no OS call.
