@@ -5,7 +5,7 @@ The full set of named methods on `Client`, each a thin wrapper over
 returns a plain Bit value instead of a raw `Reply`.
 
 ```bit
-import { open, asOptString } from "redis"
+import { open, asOptString, InfoSection } from "redis"
 
 fn main(): ()! {
   let c = open("redis://127.0.0.1:6379")?
@@ -17,7 +17,7 @@ fn main(): ()! {
   }
   let removed = c.del(["greeting"])?
   println("${removed}")
-  let server = c.info("server")?
+  let server = c.info(InfoSection.Server)?
   println(server)
   let doctor = asOptString(c.command(["MEMORY", "DOCTOR"])?, "MEMORY DOCTOR")?
   match (doctor) {
@@ -43,11 +43,13 @@ fn main(): ()! {
   the timeout was set.
 - `ping(): string ! RedisError` - the server's reply text (normally
   `"PONG"`).
-- `info(section = ""): string ! RedisError` - the server's `INFO` report as
-  raw `name:value` lines (`redis_version:7.2.4`, ...). Plain `INFO` with no
-  section; `info("server")`, `info("memory")` and the other documented names
-  narrow it. RESP3 answers `INFO` as a verbatim string; `info` hands back its
-  text either way.
+- `info(section = InfoSection.Default): string ! RedisError` - the server's
+  `INFO` report as raw `name:value` lines (`redis_version:7.2.4`, ...).
+  `InfoSection` has a variant for every section and group the server
+  documents (`Server`, `Memory`, `Keyspace`, `All`, `Everything`, ...), so a
+  mistyped name does not compile; `Module(name)` is the one free-form case,
+  for a module-defined section. `Default` sends plain `INFO`. RESP3 answers
+  `INFO` as a verbatim string; `info` hands back its text either way.
 - `command(args): Reply ! RedisError` - the generic escape hatch described
   in [Connecting](connecting.md); every method above is built on it.
 
