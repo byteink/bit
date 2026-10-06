@@ -32,7 +32,8 @@
 // by each entry point's own caller-visible contract, matching the sibling
 // providers' "an error reads as empty/failure" convention.
 
-import { netParseIpv4, netMaxStalls, netClampDeadline, netDeadlineMaxWaitNs } from "../../net"
+import { netParseIpv4, netParseIpv6, netHostIsV6 } from "../../net"
+import { netMaxStalls, netClampDeadline, netDeadlineMaxWaitNs } from "../../net"
 import { saBytes, ipBytes, netSockAddrPort } from "../../net"
 import {
   pollClaimOp, pollOpOverlapped, pollOpWsabuf, pollOpCommit,
@@ -54,17 +55,47 @@ extern fn CancelIoEx(hFile: i64, lpOverlapped: *byte): i32
 // TCP
 // ---------------------------------------------------------------------------
 
+// A listen/dial host as a sockaddr in `sa` (28 bytes: `sa6Len`): an IPv6
+// literal (any host holding ':', parsed by `netParseIpv6`) becomes a
+// `sockaddr_in6` and returns `sa6Len`; an IPv4 dotted quad a `sockaddr_in` and
+// returns `saLen`. 0 when `host` is neither -- a name, a zone id, garbage.
+// The caller owns `sa` (a managed local that outlives the async op), so there
+// is no per-worker scratch to refill after a park.
+@nosplit fn netHostAddr(host: *u8, hostLen: int, port: int, sa: *u8): int {
+  let ip = ipBytes()
+  if (netHostIsV6(host, hostLen)) {
+    if (!netParseIpv6(host, hostLen, ip)) {
+      return 0
+    }
+    netFillSockAddr6(sa, ip, port)
+    return sa6Len
+  }
+  if (!netParseIpv4(host, hostLen, ip)) {
+    return 0
+  }
+  netFillSockAddr(sa, ip, port)
+  return saLen
+}
+
+// The socket family `host` needs: `afInet6()` for a literal holding ':'.
+@nosplit fn netHostFamily(host: *u8, hostLen: int): int {
+  if (netHostIsV6(host, hostLen)) {
+    return afInet6()
+  }
+  return afInet()
+}
+
 export @symbol("bit_rt_port_net_listen_tcp") @nosplit fn netListenTcp(
   host: *u8,
   hostLen: int,
   port: int,
   backlog: int,
 ): int {
-  let ip = ipBytes()
-  if (!netParseIpv4(host, hostLen, ip)) {
+  let salen = netHostAddr(host, hostLen, port, sa6Bytes())
+  if (salen == 0) {
     return 0 - 1
   }
-  let fd = netSysSocket(false)
+  let fd = netSysSocketFamily(netHostFamily(host, hostLen), false)
   if (fd < 0) {
     return 0 - lastErr()
   }
@@ -73,8 +104,7 @@ export @symbol("bit_rt_port_net_listen_tcp") @nosplit fn netListenTcp(
     netClose(fd)
     return 0 - e
   }
-  netFillSockAddr(saBytes(), ip, port)
-  if (!netSysBind(fd, saBytes())) {
+  if (!netSysBindLen(fd, sa6Bytes(), salen)) {
     let e = lastErr()
     netClose(fd)
     return 0 - e
@@ -88,18 +118,16 @@ export @symbol("bit_rt_port_net_listen_tcp") @nosplit fn netListenTcp(
 }
 
 export @symbol("bit_rt_port_net_local_port") fn netSockLocalPort(fd: int): int {
+  // 28 bytes (`sa6Len`), not `saLen`: Winsock fails WSAEFAULT instead of
+  // truncating when the buffer is smaller than an IPv6 listener's address.
+  let sa = []i64(4)
   let lenBuf = []i64(1)
-  lenBuf[0] = i64(saLenConst())
-  if (wsaRc(int(getsockname(i64(fd), saBytes(), i32PtrAt(int(ptrOf(lenBuf)))))) < 0) {
+  lenBuf[0] = i64(sa6Len)
+  if (wsaRc(int(getsockname(i64(fd), bytesAtI64(ptrOf(sa)), i32PtrAt(int(ptrOf(lenBuf)))))) < 0) {
     return 0 - 1
   }
-  return netSockAddrPort(saBytes())
+  return netSockAddrPort(bytesAtI64(ptrOf(sa)))
 }
-
-// `saLen` (../../net's core const) under a local name: ../sock.bit's
-// `saLen` clashes with nothing here, but a fresh accessor avoids adding yet
-// another cross-module import for one constant only this function needs.
-@nosplit fn saLenConst(): int { return 16 }
 
 // Claim a slot and arm the park for `sock` — the shared prefix of every
 // real-op entry point below (steps 1-2 of this file's header). Returns the
@@ -129,10 +157,12 @@ fn acceptIssue(pollFd: int, taskAddr: int, lfd: int, accSock: int): int {
   // trampoline call still needs to read from, must survive the park below
   // as a stack-map-visible local, not a raw address.
   //
-  // AcceptEx's own output buffer: 2 * (sockaddr_in(16) + 16 slack) = 64
-  // bytes — required by AcceptEx even though this file never reads it (no
-  // caller here wants the pre-received-data or peer-address feature).
-  let outBuf = []i64(8)
+  // AcceptEx's own output buffer: 2 * (sockaddr_in6(28) + 16 slack) = 88
+  // bytes, 96 rounded to words -- sized for the larger family so one buffer
+  // serves an IPv4 and an IPv6 listener. Required by AcceptEx even though
+  // this file never reads it (no caller here wants the pre-received-data or
+  // peer-address feature).
+  let outBuf = []i64(12)
   let recvBytes = []i64(1)
   let args = []i64(4)
 
@@ -140,8 +170,8 @@ fn acceptIssue(pollFd: int, taskAddr: int, lfd: int, accSock: int): int {
   if (slot < 0) {
     return 0 - 5
   }
-  args[0] = i64(32)
-  args[1] = i64(32)
+  args[0] = i64(44)
+  args[1] = i64(44)
   args[2] = i64(int(bytesAtI64(ptrOf(recvBytes))))
   args[3] = i64(int(pollOpOverlapped(slot)))
   let rc = acceptExCall(int(acceptExPtr), lfd, accSock, int(ptrOf(outBuf)), int(ptrOf(args)))
@@ -158,6 +188,18 @@ fn acceptIssue(pollFd: int, taskAddr: int, lfd: int, accSock: int): int {
     return 0 - (7000 + st % 100000)
   }
   return 0
+}
+
+// The address family `lfd` was created with: AcceptEx needs the accept socket
+// in the listener's own family. IPv4 when the query fails (the legacy answer).
+fn netListenerFamily(lfd: int): int {
+  let sa = []i64(4)
+  let lenBuf = []i64(1)
+  lenBuf[0] = i64(sa6Len)
+  if (wsaRc(int(getsockname(i64(lfd), bytesAtI64(ptrOf(sa)), i32PtrAt(int(ptrOf(lenBuf)))))) < 0) {
+    return afInet()
+  }
+  return netSockAddrFamily(bytesAtI64(ptrOf(sa)))
 }
 
 export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
@@ -184,7 +226,7 @@ export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
   if (!pollAssociate(pollFd, lfd)) {
     return 0 - (9000 + lastErr())
   }
-  let accSock = netSysSocket(false)
+  let accSock = netSysSocketFamily(netListenerFamily(lfd), false)
   if (accSock < 0) {
     return 0 - (4000 + lastErr())
   }
@@ -204,10 +246,17 @@ export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
 // Trap #2: bind the socket to the wildcard address before ConnectEx can be
 // resolved/called at all — split out of `netDialTcp` to keep its own
 // complexity under the lint ceiling.
-fn dialPrep(fd: int): int {
-  let zero = []i64(2)
-  netFillSockAddr(bytesAtI64(ptrOf(zero)), zeroIp(), 0)
-  if (!netSysBind(fd, bytesAtI64(ptrOf(zero)))) {
+fn dialPrep(fd: int, v6: bool): int {
+  let zero = []i64(4)
+  let zip = []i64(2)
+  let zlen = saLen
+  if (v6) {
+    netFillSockAddr6(bytesAtI64(ptrOf(zero)), bytesAtI64(ptrOf(zip)), 0)
+    zlen = sa6Len
+  } else {
+    netFillSockAddr(bytesAtI64(ptrOf(zero)), bytesAtI64(ptrOf(zip)), 0)
+  }
+  if (!netSysBindLen(fd, bytesAtI64(ptrOf(zero)), zlen)) {
     return 0 - (1000 + lastErr())
   }
   if (!resolveExtensionFns(fd)) {
@@ -220,12 +269,14 @@ fn dialPrep(fd: int): int {
 // header), once `fd` is already bound. Returns `0` on a successful
 // handshake, else a negative diagnostic code — the caller closes `fd`
 // either way.
-fn dialConnect(pollFd: int, taskAddr: int, fd: int, ip: *u8, port: int): int {
+fn dialConnect(fd: int, host: *u8, hostLen: int, port: int): int {
+  let pollFd = currentPollFd()
+  let taskAddr = currentTaskAddr()
   // MANAGED scratch, same reasoning as `netAcceptTcp`'s: `target` (the
   // sockaddr ConnectEx connects to) is read by the OS for the whole async
   // window, not just at the call.
-  let target = []i64(2)
-  netFillSockAddr(bytesAtI64(ptrOf(target)), ip, port)
+  let target = []i64(4)
+  let salen = netHostAddr(host, hostLen, port, bytesAtI64(ptrOf(target)))
   let sentBytes = []i64(1)
   let args = []i64(3)
 
@@ -240,7 +291,7 @@ fn dialConnect(pollFd: int, taskAddr: int, fd: int, ip: *u8, port: int): int {
     int(connectExPtr),
     fd,
     int(bytesAtI64(ptrOf(target))),
-    16,
+    salen,
     int(ptrOf(args)),
   )
   if (rc == 0 && int(WSAGetLastError()) != wsaIoPending()) {
@@ -261,8 +312,8 @@ fn dialConnect(pollFd: int, taskAddr: int, fd: int, ip: *u8, port: int): int {
 // Connect to `host:port` via ConnectEx, parking until the handshake
 // finishes.
 export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int, port: int): int {
-  let ip = ipBytes()
-  if (!netParseIpv4(host, hostLen, ip)) {
+  let sa = []i64(4)
+  if (netHostAddr(host, hostLen, port, bytesAtI64(ptrOf(sa))) == 0) {
     return 0 - 1
   }
   let pollFd = currentPollFd()
@@ -270,28 +321,22 @@ export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int
   if (pollFd == 0 || taskAddr == 0) {
     return 0 - 2
   }
-  let fd = netSysSocket(false)
+  let fd = netSysSocketFamily(netHostFamily(host, hostLen), false)
   if (fd < 0) {
     return 0 - (6000 + lastErr())
   }
-  let prepRc = dialPrep(fd)
+  let prepRc = dialPrep(fd, netHostIsV6(host, hostLen))
   if (prepRc != 0) {
     netClose(fd)
     return prepRc
   }
-  let connectRc = dialConnect(pollFd, taskAddr, fd, ip, port)
+  let connectRc = dialConnect(fd, host, hostLen, port)
   if (connectRc != 0) {
     netClose(fd)
     return connectRc
   }
   let _ = netSetUpdateConnectContext(fd)
   return fd
-}
-
-// Four zero octets — `netDialTcp`'s bind target is the wildcard address.
-fn zeroIp(): *u8 {
-  let z = []i64(1)
-  return bytesAtI64(ptrOf(z))
 }
 
 // Read up to `bufCap` bytes into `buf` via WSARecv, parking until some
