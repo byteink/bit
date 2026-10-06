@@ -150,38 +150,56 @@ fn main() {
 Calling `setDefault` a second time panics: two parts of a program fighting
 over the default is a bug to find, not to paper over.
 
-## Cost of a disabled call
+## On a hot path: `at(level)`
 
 `logger.debug("msg")` with debug turned off asks the handler one question,
 compares the level, and returns: no `Record`, no allocation. Measured with
 `BIT_GC_STATS=1` over 10000 calls it allocates the same bytes as 0 calls.
 
-Attributes are built before the call, so `log.debug("x", Int("i", i))` allocates
-for the `Int` and the argument list even when debug is off. On a hot path
-guard it:
+Attributes passed to `info` and its siblings are built before the call, so
+`log.debug("x", Int("i", i))` allocates the `Int` and the argument list even
+when debug is off, and an enabled call costs one object per attribute. On a
+path that logs per request or per item, start the record with `at(level)`
+instead, add attributes with its typed methods, and finish with `log(msg)`:
 
 ```bit
-import { Logger, TextHandler, LevelDebug, Int } from "std/log"
+import { Logger, TextHandler, LevelInfo } from "std/log"
 import { stderr } from "std/io"
+
+class Timeout {
+  export message(): string {
+    return "upstream timed out"
+  }
+}
 
 fn main() {
   let log = Logger(TextHandler(stderr()))
   let i = 0
   while (i < 3) {
-    if (log.enabled(LevelDebug)) {
-      log.debug("tick", Int("i", i))
-    }
+    let r = log.at(LevelInfo).str("route", "/users/:id").int("status", 200)
+    r.duration("took", 412000).bool("cached", i > 0).float("ratio", 0.5).log("request")
     i = i + 1
   }
+  log.at(LevelInfo).err(Timeout{}).log("retrying")
 }
 ```
+
+The record holds its first five attributes in its own fields, so a record of
+up to five costs two objects, the record and the line, whatever those
+attributes are; each one past five is an `Attr`. When the level is off, `at`
+returns a shared record that keeps nothing, so the whole chain allocates
+nothing and needs no `enabled` guard. A record is written only by `log(msg)`:
+a chain without it writes nothing. Groups are not inline; nest them with
+`withGroup` or pass a `Group` to `info`.
 
 ## Your own handler
 
 `Handler` has four methods: `enabled(level)`, `handle(record)`,
-`with(attrs)` and `withGroup(name)`. A `Record` has `time`, `level`, `msg` and
-`attrs`. Implement them to route records to a metrics counter, a network
-sink, or a test double.
+`with(attrs)` and `withGroup(name)`. A `Record` answers `time()` (nanoseconds
+since the Unix epoch), `level()`, `msg()` and `attrs()`; `attrs()` builds an
+`Attr` for each attribute on every call, which the shipped handlers never
+do. Implement them to route records to a metrics counter, a network sink, or
+a test double.
 
 ```bit
 import { Logger, Handler, Record, Attr, LevelInfo } from "std/log"
@@ -192,7 +210,9 @@ class Counter {
     return level >= LevelInfo
   }
   export handle(r: Record): ()! {
-    this.n = this.n + 1
+    if (r.level() >= LevelInfo && r.msg() != "" && r.time() > 0) {
+      this.n = this.n + len(r.attrs())
+    }
   }
   export with(attrs: []Attr): Handler {
     return this
@@ -204,8 +224,8 @@ class Counter {
 
 fn main() {
   let c = Counter{ n = 0 }
-  Logger(c).info("counted")
-  println("${c.n}") // 1
+  Logger(c).at(LevelInfo).int("a", 1).int("b", 2).log("counted")
+  println("${c.n}") // 2
 }
 ```
 
@@ -248,6 +268,11 @@ Writes one record at `level` if the handler enables it.
 ### `Logger.error(msg: string, ...attrs: Attr)`
 
 `log` at `LevelError`.
+
+### `Logger.at(level: int): Record`
+
+A record at `level` to fill with the typed methods below and write with
+`log(msg)`; a shared record that keeps nothing when `level` is disabled.
 
 ### `Logger.enabled(level: int): bool`
 
@@ -335,7 +360,39 @@ Attributes nested under `key`.
 
 ### `Record`
 
-What one call produced: `time`, `level`, `msg`, `attrs`.
+What one call produced, and the builder `Logger.at` returns. Its first five
+attributes live in its own fields.
+
+### `Record.str(key: string, value: string): Record`
+
+### `Record.int(key: string, value: int): Record`
+
+### `Record.float(key: string, value: f64): Record`
+
+### `Record.bool(key: string, value: bool): Record`
+
+### `Record.duration(key: string, nanos: int): Record`
+
+### `Record.err(e: error, key: string = "error"): Record`
+
+Add one attribute, as `Str`, `Int`, `Float`, `Bool`, `Duration` and `Err`
+build one, and return the record. An empty key panics, enabled or not.
+
+### `Record.log(msg: string)`
+
+Writes the record with `msg`, or nothing when its level was disabled.
+
+### `Record.time(): int`
+
+Nanoseconds since the Unix epoch at which the record was made.
+
+### `Record.level(): int`
+
+### `Record.msg(): string`
+
+### `Record.attrs(): []Attr`
+
+Every attribute in order, as a fresh `Attr` each.
 
 ### `Handler`
 
