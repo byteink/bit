@@ -344,7 +344,10 @@ case "${BUCKET}" in
     # test-fmt-prec-matrix (#6417): every expression slot x form, parenthesized
     # or not, formatted: `bit fmt` must keep the tree and reach its fixpoint, so
     # a compiler/** diff in the formatter's paren decisions is what it catches.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword test-no-warnings test-call-shapes test-fmt-prec-matrix)
+    # test-hashseed (#7396): the compiler's check and dump output under three map
+    # hash seeds must be identical, so a compiler/** diff that lets map iteration
+    # order reach a diagnostic or an emitted order is what it catches.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword test-no-warnings test-call-shapes test-fmt-prec-matrix test-hashseed)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did

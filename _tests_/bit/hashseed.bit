@@ -1,0 +1,277 @@
+// Compiler output is a function of its input only, never of the process's map
+// hash seed (#7396).
+//
+// Since #7379 every process seeds its map hash from the OS CSPRNG, so any place
+// where the compiler's observable output follows map iteration order is
+// nondeterministic: check_trait_use_cycle reported trait 'A' or 'B' at random
+// and test-checker-diag went red about one run in three. This gate runs the
+// compiler under test over two corpora, the checker-diag cases
+// (BIT_CHECKER_CASES_DIR) and the golden corpus (BIT_CASES_DIR), once per seed
+// in BIT_SEEDS (default "1 2 3"; at least three), in four modes:
+//
+//   bit check <f>   bit --dump-ir <f>   bit --dump-types <f>   bit --dump-diags <f>
+//
+// and requires stdout, stderr and the exit code to be byte-identical across
+// the seeds. Seeds go in through BIT_HASH_SEED, the variable the runtime reads
+// (#7379). Two seeds can order a two-element map the same way, hence three.
+//
+// The work is a /bin/sh worker fanned out by xargs: ~20000 compiler runs, each
+// tens of milliseconds, so a serial loop in Bit would dominate the gate.
+//
+// ANTI-VACUITY. (1) Before the real run the same worker is pointed at a stub
+// "compiler" that prints its own seed; it must report that file as
+// NONDETERMINISTIC in all four modes, so a worker that stopped comparing turns
+// the gate red. (2) Every corpus file must produce one RAN line and the file
+// count has a floor, so an empty or unreadable corpus fails instead of passing.
+//
+// Run by hand:
+//   BIT_BIN=$PWD/bit-out/bin/bit BIT_STDLIB=$PWD/stdlib \
+//   BIT_CHECKER_CASES_DIR=$PWD/_tests_/bit/checkercases \
+//   BIT_CASES_DIR=$PWD/_tests_/cases bit run _tests_/bit/hashseed.bit
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, readDir, exists, remove, mkdir } from "std/fs"
+import { hasPrefix, hasSuffix, trimSpace, parseInt, split } from "std/strings"
+
+// A corpus smaller than this is a misconfigured directory, not a clean run.
+const minFiles: int = 1000
+const defaultSeeds: string = "1 2 3"
+const poolJobs: int = 8
+const defaultTimeoutS: int = 900
+const modeCount: int = 4
+
+// One corpus file: runs `$bin <mode> <file>` in <dir> once per seed and
+// compares everything the process produced against the first seed's. Prints
+// RAN once per file and, per differing mode, one NONDETERMINISTIC line (plus the
+// first differing lines) for the first seed that differs.
+const workerScript: string = `#!/bin/sh
+bin=$1; tmp=$2; dir=$3; f=$4
+cd "$dir" || exit 125
+echo "RAN $dir/$f"
+for mode in check --dump-ir --dump-types --dump-diags; do
+  ref=
+  for s in $BIT_SEEDS; do
+    out="$tmp/$$.$s"
+    BIT_HASH_SEED=$s "$bin" $mode "$f" > "$out" 2>&1
+    echo "exit=$?" >> "$out"
+    if [ -z "$ref" ]; then
+      ref=$s
+    elif ! cmp -s "$tmp/$$.$ref" "$out"; then
+      echo "NONDETERMINISTIC $dir/$f $mode seed $ref vs seed $s"
+      diff "$tmp/$$.$ref" "$out" | head -6
+      break
+    fi
+  done
+  rm -f "$tmp/$$".*
+done
+`
+
+const stubScript: string = `#!/bin/sh
+echo "seed=$BIT_HASH_SEED"
+`
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("hashseed: ${name} is not set; this gate has no defaults\n")
+    exit(2)
+  }
+  return v
+}
+
+// `BIT_TEST_TIMEOUT_S`, the contract every harness here shares; `0` means the
+// one-hour ceiling.
+fn timeoutMs(): int {
+  let raw = trimSpace(envOr("BIT_TEST_TIMEOUT_S", ""))
+  if (raw == "") {
+    return defaultTimeoutS * 1000
+  }
+  let s = parseInt(raw) catch _ {
+    return defaultTimeoutS * 1000
+  }
+  if (s <= 0 || s > 3600) {
+    return 3600 * 1000
+  }
+  return s * 1000
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn quietRemove(path: string) {
+  remove(path) catch _ {
+    return
+  }
+}
+
+fn writeExec(path: string, text: string) {
+  writeFile(path, text) catch _ {
+    eprint("hashseed: cannot write ${path}\n")
+    exit(2)
+  }
+  if (fsChmod(path, 448) != 0) { // 0o700
+    eprint("hashseed: cannot chmod ${path}\n")
+    exit(2)
+  }
+}
+
+// "<dir> <name>" for every `.bit` file directly in `dir`, in readDir's sorted
+// order, so a failing run names the same files in the same order every time.
+fn listCorpus(dir: string): []string {
+  let names = readDir(dir) catch _ {
+    eprint("hashseed: cannot list ${dir}\n")
+    exit(2)
+    return []string(0)
+  }
+  let out = []string(0)
+  for n of names {
+    if (hasSuffix(n, ".bit")) {
+      out = append(out, "${dir} ${n}")
+    }
+  }
+  return out
+}
+
+// Runs the worker over `lines` through xargs and returns its combined
+// stdout+stderr, ok=false when the pool itself broke. xargs exits 123 when a
+// worker exited 1-125; the verdict is read from the text, so that is not
+// itself a failure.
+fn fanOut(scratch: string, bin: string, lines: []string, seeds: string, jobs: int): (string, bool) {
+  let list = scratch + "/list"
+  let outFile = scratch + "/out"
+  let text = ""
+  for l of lines {
+    text = text + l + "\n"
+  }
+  writeFile(list, text) catch _ {
+    eprint("hashseed: cannot write ${list}\n")
+    return "", false
+  }
+  let script = "#!/bin/sh\nBIT_SEEDS=" + shQuote(seeds) + "\nexport BIT_SEEDS\n"
+  script = script + "exec xargs -n 2 -P ${jobs} /bin/sh " + shQuote(scratch + "/worker.sh")
+  script = script + " " + shQuote(bin) + " " + shQuote(scratch + "/tmp")
+  script = script + " < " + shQuote(list) + " > " + shQuote(outFile) + " 2>&1\n"
+  writeExec(scratch + "/run.sh", script)
+  let code = osRunBounded(scratch + "/run.sh", timeoutMs())
+  if (code != 0 && code != 123) {
+    eprint("hashseed: worker pool exited ${code} (-2 is a timeout), not a verdict\n")
+    return "", false
+  }
+  let out = readFile(outFile) catch _ {
+    eprint("hashseed: cannot read ${outFile}\n")
+    return "", false
+  }
+  return out, true
+}
+
+fn countPrefix(out: string, prefix: string): int {
+  let n = 0
+  for line of split(out, "\n") {
+    if (hasPrefix(line, prefix)) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+// The detection control: a "compiler" whose output IS the seed must be
+// reported as nondeterministic once per mode.
+fn selfTest(scratch: string, seeds: string): bool {
+  writeExec(scratch + "/stub.sh", stubScript)
+  mkdir(scratch + "/probe") catch _ {
+    eprint("hashseed: cannot create ${scratch}/probe\n")
+    exit(2)
+  }
+  writeFile(scratch + "/probe/p.bit", "fn main() {}\n") catch _ {
+    eprint("hashseed: cannot write the probe file\n")
+    exit(2)
+  }
+  let (out, ok) = fanOut(scratch, scratch + "/stub.sh", ["${scratch}/probe p.bit"], seeds, 1)
+  if (!ok) {
+    return false
+  }
+  let hits = countPrefix(out, "NONDETERMINISTIC ")
+  if (hits == modeCount) {
+    return true
+  }
+  eprint("hashseed: FAIL self-test: the seed-printing stub was reported ${hits} time(s), want ${modeCount}:\n${out}\n")
+  return false
+}
+
+fn cleanup(scratch: string) {
+  for f of ["list", "run.sh", "out", "worker.sh", "stub.sh", "probe/p.bit"] {
+    quietRemove(scratch + "/" + f)
+  }
+  quietRemove(scratch + "/probe")
+  quietRemove(scratch + "/tmp")
+  quietRemove(scratch)
+}
+
+fn makeScratch(): string {
+  let scratch = envOr("TMPDIR", "/tmp") + "/bit-hashseed-${timeUnixNs()}"
+  mkdir(scratch) catch _ {
+    eprint("hashseed: cannot create ${scratch}\n")
+    exit(2)
+  }
+  mkdir(scratch + "/tmp") catch _ {
+    eprint("hashseed: cannot create ${scratch}/tmp\n")
+    exit(2)
+  }
+  writeExec(scratch + "/worker.sh", workerScript)
+  return scratch
+}
+
+fn main() {
+  let bin = requiredEnv("BIT_BIN")
+  let checkerDir = requiredEnv("BIT_CHECKER_CASES_DIR")
+  let goldenDir = requiredEnv("BIT_CASES_DIR")
+  let seeds = trimSpace(envOr("BIT_SEEDS", defaultSeeds))
+  if (!exists(bin)) {
+    eprint("hashseed: BIT_BIN='${bin}' does not exist\n")
+    exit(2)
+  }
+  if (len(split(seeds, " ")) < 3) {
+    eprint("hashseed: BIT_SEEDS='${seeds}' names fewer than 3 seeds; two can agree by chance\n")
+    exit(2)
+  }
+  let lines = listCorpus(checkerDir)
+  for l of listCorpus(goldenDir) {
+    lines = append(lines, l)
+  }
+  if (len(lines) < minFiles) {
+    eprint("hashseed: FAIL census: ${len(lines)} corpus file(s), floor ${minFiles}\n")
+    exit(1)
+  }
+
+  let scratch = makeScratch()
+  if (!selfTest(scratch, seeds)) {
+    exit(1)
+  }
+  let (out, ok) = fanOut(scratch, bin, lines, seeds, poolJobs)
+  if (!ok) {
+    exit(1)
+  }
+  let ran = countPrefix(out, "RAN ")
+  let bad = countPrefix(out, "NONDETERMINISTIC ")
+  if (ran != len(lines)) {
+    eprint("hashseed: FAIL: ${ran} of ${len(lines)} files reached the worker\n${out}\n")
+    exit(1)
+  }
+  if (bad > 0) {
+    eprint("hashseed: FAIL: ${bad} (file, mode) pair(s) differ across seeds [${seeds}]:\n${out}\n")
+    exit(1)
+  }
+  cleanup(scratch)
+  println("hashseed: ${ran} files x ${modeCount} modes x seeds [${seeds}]: output identical")
+}
