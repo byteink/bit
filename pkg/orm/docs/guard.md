@@ -223,5 +223,48 @@ not read and a row that does not exist give the same answer, so the error
 never tells a caller that a draft exists. Make `notFound` a 404 and never a
 403; `denied` is for writes.
 
+## Creating through a ScopedRepo
+
+`insert` and `insertAll` have the same signatures as on `Repo<T>`. Before any
+SQL, the ORM asks the guard
+`allows(actor, GuardOp.Create, table, columns, values)` about the new row:
+
+```bit
+import { ScopedRepo } from "orm"
+
+fn startDraft(mine: ScopedRepo<Draft>, who: i64, body: string): Draft! {
+  return mine.insert(Draft{ id = 0, authorId = who, body = body })?
+}
+
+fn startMany(mine: ScopedRepo<Draft>, who: i64, bodies: []string): []Draft! {
+  let rows = []Draft(0)
+  for body of bodies {
+    rows = append(rows, Draft{ id = 0, authorId = who, body = body })
+  }
+  return mine.insertAll(rows)?
+}
+```
+
+- `columns` are the field names of the row's columns (relation fields
+  are not columns), in the order of `values`. For `Draft` that is `id`,
+  `authorId`, `body`.
+- The guard sees the row as the caller built it. A database-generated id is
+  still `0` at this point and `@timestamps` columns are not yet filled, so a
+  create rule over `id` or a timestamp cannot work; write it over the fields
+  the caller sets, such as `authorId`.
+- When `allows` returns `false`, the call fails with
+  `guard.denied(actor, GuardOp.Create, table)` and nothing is written. Make
+  `denied` a 403: the caller named a row they may not make.
+- When `allows` fails (a store it cannot read), that error is returned
+  unchanged. A write is never run because the check could not be made.
+- `insertAll` asks about every row before the first statement, so one
+  refused row rejects the whole batch. No transaction is opened, so none is
+  left behind.
+- The row comes back as `Repo<T>.insert` returns it, read back with no read
+  filter. Someone who may create a draft but not read it still gets their
+  row back from the call that made it.
+- A table the guard does not `protects` is not asked, and a `ScopedRepo`
+  with no guard inserts like a plain `Repo<T>`.
+
 Where to go next: [Querying](query.md) for the chain a guard narrows, and
 [Raw SQL and transactions](raw.md) for the handles that carry it.

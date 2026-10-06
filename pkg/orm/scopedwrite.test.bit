@@ -1,0 +1,350 @@
+// pkg/orm/scopedwrite.test.bit — #7037's acceptance for
+// `pkg/orm/scopedwrite.bit`: a `ScopedRepo<T>`'s `insert` and `insertAll` ask
+// the guard `allows(actor, GuardOp.Create, ...)` on the new row before any
+// SQL, and a refusal is `guard.denied` with nothing written.
+//
+// `swGuard` is a structural `Guard` (SPEC §14.3) whose `allows` answers from a
+// script (`mode`) and records what it was asked; `newRawPool`/`newRawAdapter`
+// (./rawsql.test.bit) record every statement, so a refusal is seen as zero
+// statements. The cases run once per dialect (`srPostgres`/`srMysql`,
+// ./scopedread.test.bit): `insert` emits the same text for both, the MySQL
+// adapter rewrites `$n` itself. The live proof at the bottom
+// (`ORM_TEST_LIVE_PG_URI`/`ORM_TEST_LIVE_MYSQL_URI`) is skipped, and says so,
+// when no server is set.
+
+@table("swposts") class SwPost {
+  id: i64,
+  authorId: i64,
+  body: string,
+}
+
+class swUser {
+  id: string,
+}
+
+// mode: 0 = allow, 1 = deny, 2 = error, 3 = deny a row whose body is "bad".
+class swGuard {
+  mode: int
+  asked: int
+  lastActor: string
+  lastOp: GuardOp
+  lastTable: string
+  lastCols: string
+  lastBody: string
+
+  protects(t: string): bool {
+    return t == "swposts"
+  }
+
+  filter(
+    actor: Actor,
+    op: GuardOp,
+    t: string,
+    dialect: ServerDialect,
+    firstParam: int,
+  ): GuardFilter! {
+    return GuardFilter.All
+  }
+
+  allows(actor: Actor, op: GuardOp, t: string, columns: []string, values: []Value): bool! {
+    this.asked = this.asked + 1
+    this.lastActor = actor.id
+    this.lastOp = op
+    this.lastTable = t
+    this.lastCols = join(columns, ",")
+    this.lastBody = srArgText(values[2])
+    if (this.mode == 2) {
+      fail newError("authz: rule store unavailable")
+    }
+    if (this.mode == 1) {
+      return false
+    }
+    if (this.mode == 3) {
+      return this.lastBody != "tbad"
+    }
+    return true
+  }
+
+  denied(actor: Actor, op: GuardOp, t: string): error {
+    return newError("denied ${actor.id} ${t}")
+  }
+
+  notFound(t: string): error {
+    return newError("${t}: not found")
+  }
+
+  check(): ()! {}
+}
+
+fn swGuardMode(mode: int): swGuard {
+  return swGuard{
+    mode = mode, asked = 0, lastActor = "", lastOp = GuardOp.Read, lastTable = "", lastCols = "", lastBody = "",
+  }
+}
+
+fn swRepo(a: rawAdapter, d: ServerDialect, g: swGuard): ScopedRepo<SwPost> {
+  let db = Db{ pool = newRawPool(a), dialect = d, guard = g }
+  return db.as(swUser{ id = "u7" }).table<SwPost>()
+}
+
+fn swRows(a: rawAdapter) {
+  a.cols = ["id", "author_id", "body"]
+  a.rows = [[Value.Int(5), Value.Int(7), Value.Text("hi")]]
+}
+
+fn swPost(body: string): SwPost {
+  return SwPost{ id = 0, authorId = 7, body = body }
+}
+
+const swInsertSql: string = "insert into swposts (author_id, body) values ($1, $2) returning *"
+
+fn swCaseAllowed(d: ServerDialect) {
+  let a = newRawAdapter()
+  swRows(a)
+  let g = swGuardMode(0)
+  let got = swRepo(a, d, g).insert(swPost("hi")) catch e {
+    assert(false, "insert: ${e.message()}")
+    return
+  }
+  assert(got.id == 5, "the row comes back from RETURNING, id ${got.id}")
+  assert(len(a.queries) == 1, "expected 1 statement, got ${len(a.queries)}")
+  assert(lastQuery(a).sql == swInsertSql, "sql: ${lastQuery(a).sql}")
+  assert(g.asked == 1 && g.lastActor == "u7", "asked ${g.asked}x as '${g.lastActor}'")
+  assert(g.lastOp == GuardOp.Create && g.lastTable == "swposts", "op or table wrong")
+  assert(g.lastCols == "id,authorId,body", "columns: ${g.lastCols}")
+  assert(g.lastBody == "thi", "values must line up with columns, body ${g.lastBody}")
+}
+
+fn swCaseDenied(d: ServerDialect) {
+  let a = newRawAdapter()
+  swRows(a)
+  swRepo(a, d, swGuardMode(1)).insert(swPost("hi")) catch e {
+    assert(e.message() == "denied u7 swposts", "got ${e.message()}")
+    assert(len(a.queries) == 0 && len(a.execs) == 0, "a denied insert must run 0 statements")
+    return
+  }
+  assert(false, "a denied insert must fail")
+}
+
+fn swCaseGuardError(d: ServerDialect) {
+  let a = newRawAdapter()
+  swRows(a)
+  swRepo(a, d, swGuardMode(2)).insert(swPost("hi")) catch e {
+    assert(
+      e.message() == "authz: rule store unavailable",
+      "must propagate unchanged: ${e.message()}",
+    )
+    assert(len(a.queries) == 0 && len(a.execs) == 0, "a guard error must run 0 statements")
+    return
+  }
+  assert(false, "a guard error must fail the insert closed")
+}
+
+test "ScopedRepo.insert on Postgres: allowed runs one INSERT, denied and guard error run none (3 of 3)" {
+  let d = srPostgres()
+  swCaseAllowed(d)
+  swCaseDenied(d)
+  swCaseGuardError(d)
+}
+
+test "ScopedRepo.insert on MySQL: allowed runs one INSERT, denied and guard error run none (3 of 3)" {
+  let d = srMysql()
+  swCaseAllowed(d)
+  swCaseDenied(d)
+  swCaseGuardError(d)
+}
+
+test "insertAll is all-or-nothing: the second of three denied runs 0 statements" {
+  let a = newRawAdapter()
+  swRows(a)
+  let g = swGuardMode(3)
+  swRepo(a, srPostgres(), g).insertAll([swPost("a"), swPost("bad"), swPost("c")]) catch e {
+    assert(e.message() == "denied u7 swposts", "got ${e.message()}")
+    assert(len(a.queries) == 0 && len(a.execs) == 0, "0 statements, got ${len(a.queries)}")
+    assert(g.asked == 2, "the check stops at the first denial, asked ${g.asked}x")
+    return
+  }
+  assert(false, "a batch with a denied row must fail")
+}
+
+test "insertAll of allowed rows asks about each row, then runs one statement" {
+  let a = newRawAdapter()
+  swRows(a)
+  let g = swGuardMode(3)
+  let got = swRepo(a, srMysql(), g).insertAll([swPost("a"), swPost("b"), swPost("c")]) catch e {
+    assert(false, "insertAll: ${e.message()}")
+    return
+  }
+  assert(len(got) == 1, "the recorder returns its one canned row, got ${len(got)}")
+  assert(g.asked == 3, "asked ${g.asked}x")
+  assert(len(a.queries) == 1, "expected 1 statement, got ${len(a.queries)}")
+}
+
+test "insertAll of no rows asks nothing and runs nothing" {
+  let a = newRawAdapter()
+  let g = swGuardMode(1)
+  let got = swRepo(a, srPostgres(), g).insertAll([]SwPost(0)) catch e {
+    assert(false, "insertAll: ${e.message()}")
+    return
+  }
+  assert(len(got) == 0 && g.asked == 0 && len(a.queries) == 0, "an empty batch is a no-op")
+}
+
+test "a guest is checked with an empty id, an unprotected table is not asked, no guard inserts plainly" {
+  let a = newRawAdapter()
+  swRows(a)
+  let g = swGuardMode(1)
+  let db = Db{ pool = newRawPool(a), dialect = srPostgres(), guard = g }
+  let denied = false
+  db.asGuest().table<SwPost>().insert(swPost("hi")) catch e {
+    assert(e.message() == "denied  swposts", "a guest is still denied: ${e.message()}")
+    denied = true
+  }
+  assert(denied, "a guest's insert must be refused")
+  assert(g.asked == 1 && g.lastActor == "", "asked ${g.asked}x as '${g.lastActor}'")
+
+  let b = newRawAdapter()
+  b.cols = ["id", "body"]
+  b.rows = [[Value.Int(1), Value.Text("x")]]
+  let g2 = swGuardMode(1)
+  let db2 = Db{ pool = newRawPool(b), dialect = srPostgres(), guard = g2 }
+  db2.as(swUser{ id = "u7" }).table<RawNote>().insert(RawNote{ id = 0, body = "x" }) catch e {
+    assert(false, "unprotected insert: ${e.message()}")
+    return
+  }
+  assert(g2.asked == 0 && len(b.queries) == 1, "a table the guard does not protect is not asked")
+
+  let c = newRawAdapter()
+  swRows(c)
+  let db3 = Db{ pool = newRawPool(c) }
+  db3.as(swUser{ id = "u7" }).table<SwPost>().insert(swPost("hi")) catch e {
+    assert(false, "no guard: ${e.message()}")
+    return
+  }
+  assert(len(c.queries) == 1, "a ScopedRepo with no guard inserts like a plain Repo")
+}
+
+const swLiveSource: string = `import { args } from "std/os"
+import { Actor, GuardFilter, GuardOp, Options, ServerDialect, open } from "orm"
+import { Value } from "std/sql"
+
+@table("swposts") class SwPost {
+  id: i64,
+  authorId: i64,
+  body: string,
+}
+
+// Creates are allowed only for author 7: the proof is that the ORM asks
+// first and writes nothing when the answer is no.
+class OnlySeven {
+  protects(table: string): bool {
+    return table == "swposts"
+  }
+
+  filter(actor: Actor, op: GuardOp, table: string, dialect: ServerDialect, firstParam: int): GuardFilter! {
+    return GuardFilter.All
+  }
+
+  allows(actor: Actor, op: GuardOp, table: string, columns: []string, values: []Value): bool! {
+    match (values[1]) {
+      Int(n) => return n == 7
+      Null => return false
+      Float(_) => return false
+      Bool(_) => return false
+      Text(_) => return false
+      Blob(_) => return false
+    }
+  }
+
+  denied(actor: Actor, op: GuardOp, table: string): error {
+    return newError("denied")
+  }
+
+  notFound(table: string): error {
+    return newError("not found")
+  }
+
+  check(): ()! {}
+}
+
+class Me {
+  export id: string,
+}
+
+fn main(): ()! {
+  let uri = args()[1]
+  let db = open(uri, Options{ authz = OnlySeven{} })?
+  db.exec("drop table if exists swposts")?
+  db.exec(args()[2])?
+  let mine = db.as(Me{ id = "7" }).table<SwPost>()
+  mine.insert(SwPost{ id = 0, authorId = 7, body = "ok" })?
+  mine.insert(SwPost{ id = 0, authorId = 8, body = "no" }) catch e {
+    mine.insertAll([SwPost{ id = 0, authorId = 7, body = "a" }, SwPost{ id = 0, authorId = 8, body = "b" }]) catch e2 {
+      let n = db.asSystem().table<SwPost>().count()?
+      if (n != 1) {
+        panic("LIVE PROOF FAILED: expected 1 row after one allowed and two refused writes")
+      }
+      print("LIVE_PROOF_OK")
+      return
+    }
+    panic("LIVE PROOF FAILED: a batch with a denied row must fail")
+  }
+  panic("LIVE PROOF FAILED: a denied insert must fail")
+}
+`
+
+fn swRunLive(envVar: string, name: string, createTable: string) {
+  let uri = env(envVar)
+  if (uri == "") {
+    print("  skipped: ${envVar} is unset, no live server to talk to")
+    return
+  }
+  let repoRoot = findRepoRoot()
+  if (repoRoot == "") {
+    print("  skipped: cannot locate the repo root; set BIT_REPO")
+    return
+  }
+  let ormAbs = "${repoRoot}/pkg/orm"
+  let postgresAbs = "${repoRoot}/pkg/postgres"
+  let mysqlAbs = "${repoRoot}/pkg/mysql"
+  let proj = scratchDir("liveproof7037${name}")
+  mkdir(proj) catch e {
+    panic("mkdir: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.json",
+    "{\"name\": \"liveproof7037${name}\", \"dependencies\": {\"orm\": \"${ormAbs}\", \"postgres\": \"${postgresAbs}\", \"mysql\": \"${mysqlAbs}\"}}\n",
+  ) catch e {
+    panic("writeFile bit.json: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.lock",
+    "{\"orm\": {\"path\": \"${ormAbs}\", \"requires\": {}}, \"postgres\": {\"path\": \"${postgresAbs}\", \"requires\": {}}, \"mysql\": {\"path\": \"${mysqlAbs}\", \"requires\": {}}}\n",
+  ) catch e {
+    panic("writeFile bit.lock: ${e.message()}")
+  }
+  writeFile("${proj}/main.bit", swLiveSource) catch e {
+    panic("writeFile main.bit: ${e.message()}")
+  }
+  let bin = envOr("BIT_BIN", "${repoRoot}/bit-out/bin/bit")
+  let rc = run(bin, ["run", "${proj}/main.bit", uri, createTable])
+  assert(
+    rc == 0,
+    "live proof against a real ${name} server failed, rc=${rc}; run manually: ${bin} run ${proj}/main.bit '${uri}' '<ddl>'",
+  )
+  resetDir(proj)
+}
+
+test "live: a denied insert and a batch with a denied row write nothing on Postgres (#7037)" {
+  swRunLive(
+    "ORM_TEST_LIVE_PG_URI", "pg",
+    "create table swposts (id bigint generated always as identity primary key, author_id bigint not null, body text not null)",
+  )
+}
+
+test "live: a denied insert and a batch with a denied row write nothing on MySQL (#7037)" {
+  swRunLive(
+    "ORM_TEST_LIVE_MYSQL_URI", "mysql",
+    "create table swposts (id bigint auto_increment primary key, author_id bigint not null, body text not null)",
+  )
+}
