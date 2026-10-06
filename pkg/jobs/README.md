@@ -1,7 +1,7 @@
 # bitlang.org/pkg/jobs
 
 Background jobs: a worker pool, retries with exponential backoff and full
-jitter, a dead-letter list, and a `SqlStore` for PostgreSQL, MySQL 8 and MariaDB 10.6. No default queue
+jitter, a dead-letter list, and stores for PostgreSQL, MySQL 8, MariaDB 10.6 and Redis 7+ (`SqlStore`, `RedisStore`). No default queue
 backend, the same call as pkg/web's session and rate-limit stores: an
 in-memory queue silently loses every pending job on deploy.
 
@@ -50,6 +50,9 @@ it to route the job to the right handler.
 - [Scheduled jobs](docs/cron.md): `schedule` and `every`, cron
   expressions and zones, missed-tick policies, leader election so three
   instances enqueue each tick once.
+- [Redis](docs/redis.md): `RedisStore` and `RedisLocker` on Redis 7+, the
+  keys and atomic scripts behind a claim, the hash-tag prefix for Redis
+  Cluster, what Redis durability means for a queue.
 - [PostgreSQL, MySQL and MariaDB](docs/sql.md): `SqlStore`, the dialect the pool's
   server picks, running the migration, writing your own `Store`,
   at-least-once delivery and idempotent handlers.

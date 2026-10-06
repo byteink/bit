@@ -1,0 +1,390 @@
+// _tests_/bit/jobslive/redis.bit — the Redis half of the live proof (#7321).
+// `main.bit` calls `proveRedis(url)` when the URL's scheme is `redis://`. It
+// is written for `RedisStore` and `RedisLocker` and reads the keys they leave
+// behind, which `conformance.bit` (backend-neutral) never does.
+//
+// Every run uses its own key prefix (`{jl-<uuid>}`), so a shared server holds
+// no state between runs, and removes what it created at the end.
+//
+// This file is copied beside `main.bit` into the scratch project
+// `_tests_/bit/jobslive.bit` generates, and resolves "jobs" and "redis"
+// through that project's `bit.lock`.
+
+import { Client, open as redisOpen, asInt as redisInt, asOptString, asStrings } from "redis"
+import {
+  RedisStore, RedisLocker, ClaimedJob, Options, PermanentFailure, open as queueOpen,
+} from "jobs"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { Mutex, WaitGroup } from "std/sync"
+import { sleep, Millisecond } from "std/time"
+import { parseInt } from "std/strings"
+
+@job("live-redis-dead") @json class LiveRedisDeadJob {
+  tag: string,
+}
+
+// How many jobs the throughput run claims, and with how many workers.
+const perfJobs: int = 500
+const perfWorkers: int = 8
+const pingSamples: int = 200
+
+fn redisConn(uri: string): Client {
+  return redisOpen(uri) catch e {
+    panic("redis open: ${e.message()}")
+  }
+}
+
+fn storeOver(c: Client, prefix: string): RedisStore {
+  return RedisStore(c, prefix = prefix) catch e {
+    panic("RedisStore: ${e.message()}")
+  }
+}
+
+fn lockerOver(c: Client, prefix: string, keep: int): RedisLocker {
+  return RedisLocker(c, prefix = prefix, keep = keep) catch e {
+    panic("RedisLocker: ${e.message()}")
+  }
+}
+
+fn cmdInt(c: Client, args: []string): int {
+  let r = c.command(args) catch e {
+    panic("${args[0]}: ${e.message()}")
+  }
+  let n = redisInt(r, args[0]) catch e {
+    panic("${args[0]}: ${e.message()}")
+  }
+  return int(n)
+}
+
+// A command whose reply does not matter.
+fn cmdDo(c: Client, args: []string) {
+  let _ = cmdInt(c, args)
+}
+
+fn cmdText(c: Client, args: []string): string {
+  let r = c.command(args) catch e {
+    panic("${args[0]}: ${e.message()}")
+  }
+  let got = asOptString(r, args[0]) catch e {
+    panic("${args[0]}: ${e.message()}")
+  }
+  match (got) {
+    Some(s) => return s
+    None => return "(nil)"
+  }
+}
+
+fn hashInt(c: Client, key: string, field: string): int {
+  return parseInt(cmdText(c, ["HGET", key, field])) catch e {
+    panic("HGET ${key} ${field}: ${e.message()}")
+  }
+}
+
+fn expect(got: int, want: int, label: string) {
+  if (got != want) {
+    panic("LIVE PROOF FAILED: ${label}: got ${got}, want ${want}")
+  }
+}
+
+// Removes every key of this run, so a shared server is left as it was found.
+fn sweep(c: Client, prefix: string) {
+  let it = c.keys().scan("${prefix}:*", 500)
+  let keys = []string(0)
+  while (true) {
+    let next = it.next() catch e {
+      panic("scan: ${e.message()}")
+    }
+    match (next) {
+      None => break
+      Some(k) => keys = append(keys, k)
+    }
+  }
+  for k of keys {
+    cmdDo(c, ["UNLINK", k])
+  }
+}
+
+// A job sent through `Queue` with a handler that fails PermanentFailure goes
+// to the dead set at once, with attempts left, and carries its reason. `prefix`
+// is a queue of its own, so the dead set holds only this job.
+fn provePermanentFailure(c: Client, prefix: string) {
+  let q = queueOpen(storeOver(c, prefix), Options{ workers = 1, pollInterval = 20 * Millisecond }) catch e {
+    panic("open: ${e.message()}")
+  }
+  q.register<LiveRedisDeadJob>((job: LiveRedisDeadJob) => {
+    fail PermanentFailure{ reason = "the provider refused ${job.tag}" }
+  }) catch e {
+    panic("register: ${e.message()}")
+  }
+  q.enqueue(LiveRedisDeadJob{ tag = "addr" }) catch e {
+    panic("enqueue: ${e.message()}")
+  }
+  q.start()
+  let waited = 0
+  while (cmdInt(c, ["ZCARD", "${prefix}:dead"]) < 1 && waited < 15000) {
+    sleep(20 * Millisecond)
+    waited = waited + 20
+  }
+  q.stop()
+  expect(cmdInt(c, ["ZCARD", "${prefix}:dead"]), 1, "dead set size after a PermanentFailure")
+  let ids = asStrings(
+    c.command(["ZRANGE", "${prefix}:dead", "0", "0"]) catch e {
+      panic("ZRANGE: ${e.message()}")
+    },
+    "ZRANGE",
+  ) catch e {
+    panic("ZRANGE decode: ${e.message()}")
+  }
+  let job = "${prefix}:job:${ids[0]}"
+  let reason = cmdText(c, ["HGET", job, "reason"])
+  if (reason != "the provider refused addr") {
+    panic("LIVE PROOF FAILED: dead letter reason is '${reason}' (set member ${ids[0]})")
+  }
+  expect(hashInt(c, job, "attempts"), 1, "a PermanentFailure is not retried")
+  expect(cmdInt(c, ["ZCARD", "${prefix}:ready"]), 0, "a dead job left the ready set")
+  expect(cmdInt(c, ["ZCARD", "${prefix}:flight"]), 0, "a dead job left the in-flight set")
+}
+
+fn claimOnce(store: RedisStore, label: string): Option<ClaimedJob> {
+  return store.claim(5000 * Millisecond) catch e {
+    panic("${label}: claim: ${e.message()}")
+  }
+}
+
+fn enqueueAt(store: RedisStore, availableAt: int) {
+  store.enqueue("live-server-time", "{}", availableAt, 3) catch e {
+    panic("enqueue: ${e.message()}")
+  }
+}
+
+// Nothing may be claimable now.
+fn expectNothing(store: RedisStore, label: string) {
+  match (claimOnce(store, label)) {
+    None => {}
+    Some(job) => panic("LIVE PROOF FAILED: ${label}: job ${job.id} was claimable")
+  }
+}
+
+// One job must be claimable now; it is completed.
+fn expectOneJob(store: RedisStore, label: string) {
+  match (claimOnce(store, label)) {
+    None => panic("LIVE PROOF FAILED: ${label}: nothing was claimable")
+    Some(job) => store.complete(job.id) catch e {
+      panic("complete: ${e.message()}")
+    }
+  }
+}
+
+// A delay is a delay on the SERVER's clock: a job 700 ms ahead by the caller's
+// clock is not claimable after 300 ms and is after a second, whatever the
+// caller's clock and the server's disagree by (printed, not asserted: it is a
+// property of the machines). A job an hour ahead never is, and one an hour
+// behind always is.
+fn proveDelayIsADuration(c: Client, store: RedisStore, locker: RedisLocker) {
+  let server = locker.serverNowNs() catch e {
+    panic("serverNowNs: ${e.message()}")
+  }
+  print("REDIS_SKEW server_minus_caller_ms=${(server - now().ns) / 1000000}\n")
+  let hour = 3600 * 1000 * 1000000
+  enqueueAt(store, now().ns + 700 * Millisecond)
+  enqueueAt(store, now().ns + hour)
+  sleep(300 * Millisecond)
+  expectNothing(store, "before its delay")
+  sleep(800 * Millisecond)
+  expectOneJob(store, "after its delay")
+  expectNothing(store, "an hour early")
+  enqueueAt(store, now().ns - hour)
+  expectOneJob(store, "an hour late")
+  sweepFuture(c, store)
+}
+
+// The hour-ahead job above would otherwise stay in the ready set.
+fn sweepFuture(c: Client, store: RedisStore) {
+  cmdDo(c, ["DEL", store.readyKey])
+}
+
+fn leaseKeyCount(c: Client, prefix: string): int {
+  let it = c.keys().scan("${prefix}:lease:*", 500)
+  let n = 0
+  while (true) {
+    let next = it.next() catch e {
+      panic("scan: ${e.message()}")
+    }
+    match (next) {
+      None => return n
+      Some(_) => n = n + 1
+    }
+  }
+}
+
+fn winOrPanic(l: RedisLocker, key: string, holder: string, label: string) {
+  let won = l.tryAcquire(key, holder, 1, 1000) catch e {
+    panic("${label}: ${e.message()}")
+  }
+  if (!won) {
+    panic("LIVE PROOF FAILED: ${label}: ${key} was not won")
+  }
+}
+
+// A locker that keeps 2 arrivals holds at most 3 lease keys per schedule, and
+// (`prefix` is a locker of its own, so no other lease is counted) and
+// remembers the newest tick by VALUE however late it arrived or how far ahead
+// of every correct tick a skewed instance's ticks were (#6371).
+fn proveLeasePruning(c: Client, prefix: string) {
+  let l = lockerOver(c, prefix, 2)
+  let future = 4 * 365 * 24 * 3600 * 1000000000
+  for i of [0, 1, 2] {
+    winOrPanic(l, "probe@${future + i}", "a", "future tick ${i}")
+  }
+  winOrPanic(l, "probe@10", "a", "tick 10")
+  let again = l.tryAcquire("probe@10", "b", 500, 2500) catch e {
+    panic("tick 10 again: ${e.message()}")
+  }
+  if (again) {
+    panic("LIVE PROOF FAILED: tick 10 was won by a and then again by b")
+  }
+  let last = l.lastTick("probe") catch e {
+    panic("lastTick: ${e.message()}")
+  }
+  expect(last, future + 2, "lastTick after future ticks")
+  let kept = leaseKeyCount(c, prefix)
+  if (kept > 3) {
+    panic("LIVE PROOF FAILED: ${kept} lease keys for keep = 2, want at most 3")
+  }
+  for t of [100, 1, 2, 3, 4] {
+    winOrPanic(l, "late@${t}", "a", "late tick ${t}")
+  }
+  expect(
+    l.lastTick("late") catch e {
+      panic("lastTick: ${e.message()}")
+    },
+    100,
+    "the newest tick survives a late catch-up",
+  )
+}
+
+// `serverNowNs` is `TIME`: the host and the server may be two machines, so
+// the bound is generous; the point is that it is the server's, whole micros.
+fn proveRedisClock(l: RedisLocker) {
+  let a = l.serverNowNs() catch e {
+    panic("serverNowNs: ${e.message()}")
+  }
+  let b = l.serverNowNs() catch e {
+    panic("serverNowNs: ${e.message()}")
+  }
+  if (b < a || a % 1000 != 0) {
+    panic("LIVE PROOF FAILED: serverNowNs went ${a} then ${b}")
+  }
+}
+
+class perfLog {
+  mu: Mutex,
+  claimed: int,
+  errors: int,
+}
+
+fn perfWorker(store: RedisStore, log: perfLog, wg: WaitGroup) {
+  while (true) {
+    let got = store.claim(60000 * Millisecond) catch _ {
+      log.mu.lock()
+      log.errors = log.errors + 1
+      log.mu.unlock()
+      wg.done()
+      return
+    }
+    match (got) {
+      None => {
+        wg.done()
+        return
+      }
+      Some(job) => {
+        store.complete(job.id) catch _ {
+          log.mu.lock()
+          log.errors = log.errors + 1
+          log.mu.unlock()
+        }
+        log.mu.lock()
+        log.claimed = log.claimed + 1
+        log.mu.unlock()
+      }
+    }
+  }
+}
+
+fn pingNs(c: Client): int {
+  let i = 0
+  while (i < pingSamples) {
+    c.ping() catch e {
+      panic("ping: ${e.message()}")
+    }
+    i = i + 1
+  }
+  let t0 = now().ns
+  i = 0
+  while (i < pingSamples) {
+    c.ping() catch e {
+      panic("ping: ${e.message()}")
+    }
+    i = i + 1
+  }
+  return (now().ns - t0) / pingSamples
+}
+
+fn fill(store: RedisStore) {
+  let i = 0
+  while (i < perfJobs) {
+    store.enqueue("live-perf", "{\"i\":${i}}", 0, 3) catch e {
+      panic("enqueue: ${e.message()}")
+    }
+    i = i + 1
+  }
+}
+
+// Claims and completes `perfJobs` jobs with `n` workers; returns jobs per
+// second, after checking every job was claimed once and nothing failed.
+fn claimsPerSecond(store: RedisStore, n: int): int {
+  fill(store)
+  let log = perfLog{ mu = Mutex(), claimed = 0, errors = 0 }
+  let wg = WaitGroup()
+  wg.add(i64(n))
+  let start = now().ns
+  let w = 0
+  while (w < n) {
+    spawn perfWorker(store, log, wg)
+    w = w + 1
+  }
+  wg.wait()
+  let took = now().ns - start
+  expect(log.errors, 0, "perf: errors with ${n} workers")
+  expect(log.claimed, perfJobs, "perf: jobs claimed with ${n} workers")
+  return perfJobs * 1000000000 / took
+}
+
+// Claim throughput over this link: one worker, then `perfWorkers`, each claim
+// followed by a complete. Also the average PING round trip, so a claim's cost
+// reads as a multiple of one round trip. Printed, never asserted: the numbers
+// belong to the link between the host and the server.
+fn provePerf(c: Client, store: RedisStore) {
+  let ping = pingNs(c)
+  let one = claimsPerSecond(store, 1)
+  print("REDIS_PERF ping_us=${ping / 1000} claim_complete_one_worker_per_s=${one}\n")
+  let many = claimsPerSecond(store, perfWorkers)
+  print("REDIS_PERF workers=${perfWorkers} claim_complete_per_s=${many}\n")
+}
+
+// The whole Redis proof against `uri`: the shared conformance suites first,
+// then what is particular to Redis.
+fn proveRedis(uri: string) {
+  let c = redisConn(uri)
+  let prefix = "{jl-${uuidFormat(uuidV4())}}"
+  let store = storeOver(c, prefix)
+  runStoreConformance(store)
+  runLockerConformance(lockerOver(c, prefix, 1024), lockerOver(redisConn(uri), prefix, 1024))
+  provePermanentFailure(c, "${prefix}:pf")
+  proveDelayIsADuration(c, store, lockerOver(c, prefix, 1024))
+  proveLeasePruning(c, "${prefix}:lp")
+  proveRedisClock(lockerOver(c, prefix, 1024))
+  provePerf(c, store)
+  sweep(c, prefix)
+  c.close()
+}

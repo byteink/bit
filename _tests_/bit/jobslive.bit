@@ -1,12 +1,14 @@
 // _tests_/bit/jobslive.bit — `./make test-package-jobs-live` (#6082, epic
-// #4023, #7320, #7436). Provisions its OWN throwaway PostgreSQL, MySQL 8 AND
-// MariaDB 11 containers (the same pattern as `redislive.bit`, #6021, and `ormlive.bit`):
+// #4023, #7320, #7436, #7321). Provisions its OWN throwaway PostgreSQL, MySQL 8,
+// MariaDB 11 AND Redis containers (the same pattern as `redislive.bit`, #6021, and `ormlive.bit`):
 // `docker run --rm -d`, readiness polled with `pg_isready` / `mysqladmin
-// ping` / `mariadb-admin ping`, each URL handed in turn as argv to `_tests_/bit/jobslive/main.bit`
+// ping` / `mariadb-admin ping` / `redis-cli ping`, each URL handed in turn as argv to `_tests_/bit/jobslive/main.bit`
 // (run from a generated scratch project, see `writeScratchProject` below),
 // then always removed. `main.bit` runs the same `Store`/`Locker` conformance
 // suite (`_tests_/bit/jobslive/conformance.bit`) and the same scheduler proofs
-// against every engine; the gate fails if any fails. `pkg/jobs`'s
+// against every SQL engine, and `_tests_/bit/jobslive/redis.bit` runs that
+// suite and its own proofs against Redis (`RedisStore`/`RedisLocker`); the gate
+// fails if any fails. `pkg/jobs`'s
 // `interface Job` declares a `static` requirement (#6091).
 //
 // IMAGE: `postgres:18.6` (the newest 18.x patch as of 2026-09-28 per Docker
@@ -27,6 +29,9 @@
 // the previous one); MariaDB has had `SKIP LOCKED` since 10.6, the floor
 // `pkg/jobs/sql.test.bit` proves against a server that reports `10.5.27`.
 //
+// REDIS IS `redis@sha256:d5ac52db...`, the digest `redislive.bit` pins, so the
+// two gates exercise the same server.
+//
 // THE IMAGE ITSELF IS KEPT, never deleted (redislive.bit's own header: not
 // a one-off throwaway install, this gate depends on it every run). Only the
 // CONTAINER is throwaway — see CLEANUP.
@@ -44,15 +49,15 @@
 // two, tools/build/gatestable3.bit):
 //   BIT_REPO   repo root, so pkg/jobs resolves regardless of cwd (required)
 //   BIT_BIN    compiler under test    (default bit-out/bin/bit)
-//   BIT_JOBS_LIVE_PG_URI, BIT_JOBS_LIVE_MYSQL_URI
-//              optional, both or neither: run against these servers and start
-//              no container (Docker is not needed). The databases must be empty
-//              or hold only this suite's own tables; the URIs are the same
-//              shape `main.bit` takes as argv.
-//   BIT_JOBS_LIVE_MARIADB_URI
-//              optional, only with the two above: a `mysql://` URI of a MariaDB
-//              server, run as a third engine. Unset, the run says it skipped
-//              MariaDB.
+//   BIT_JOBS_LIVE_PG_URI, BIT_JOBS_LIVE_MYSQL_URI, BIT_JOBS_LIVE_MARIADB_URI,
+//   BIT_JOBS_LIVE_REDIS_URL
+//              optional, any subset: when at least one is set, run against
+//              exactly the servers named and start no container (Docker is not
+//              needed); the engines left unset are reported as skipped. The SQL
+//              databases must be empty or hold only this suite's own tables
+//              (the MariaDB one is a `mysql://` URI); Redis keys live under a
+//              per-run prefix the proof removes. The values are the same shape
+//              `main.bit` takes as argv.
 
 import { output } from "std/process"
 import { env, envOr, exit } from "std/os"
@@ -68,11 +73,13 @@ import {
 const image: string = "postgres@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"
 const myImage: string = "mysql:8.4"
 const mariaImage: string = "mariadb:11.8"
+const redisImage: string = "redis@sha256:d5ac52db24d4e70566fe9944f22cf5bdc2bc739b05c0f426335161ea6c23f3b3"
 const myRootPassword: string = "bit-jobs-live-pw"
 const myDatabase: string = "jobs_live"
 const pgUriVar: string = "BIT_JOBS_LIVE_PG_URI"
 const myUriVar: string = "BIT_JOBS_LIVE_MYSQL_URI"
 const mariaUriVar: string = "BIT_JOBS_LIVE_MARIADB_URI"
+const redisUriVar: string = "BIT_JOBS_LIVE_REDIS_URL"
 const runLabel: string = "bit.jobs.live=1"
 // Pairs with `runLabel` on the container this run starts (see
 // `startPostgres` below): the owning process's own pid, learned via
@@ -266,6 +273,34 @@ fn startMariadb(bin: string, name: string, ownerLabel: string): int! {
   return port
 }
 
+fn redisReady(bin: string, name: string): bool {
+  let i = 0
+  while (i < readyAttempts) {
+    let r = output(bin, ["exec", name, "redis-cli", "ping"], dockerQuickTimeoutMs)
+    if (r.exitCode == 0 && contains(r.stdout, "PONG")) {
+      return true
+    }
+    sleep(readyDelayMs * Millisecond)
+    i = i + 1
+  }
+  return false
+}
+
+fn startRedis(bin: string, name: string, ownerLabel: string): int! {
+  dockerRun(
+    bin,
+    [
+      "run", "--rm", "-d", "--name", name, "--label", runLabel, "--label", ownerLabel,
+      "-p", "127.0.0.1:0:6379", redisImage,
+    ],
+  )?
+  let port = hostPort(bin, name, "6379/tcp")?
+  if (!redisReady(bin, name)) {
+    fail newError("${name}: redis-cli ping never answered within ${readyAttempts * readyDelayMs}ms")
+  }
+  return port
+}
+
 fn cleanup(bin: string, names: []string) {
   for name of names {
     output(bin, ["rm", "-f", name], dockerRunTimeoutMs)
@@ -289,18 +324,21 @@ fn writeScratchProject(repo: string, dir: string): ()! {
   let jobsAbs = "${repo}/pkg/jobs"
   let postgresAbs = "${repo}/pkg/postgres"
   let mysqlAbs = "${repo}/pkg/mysql"
+  let redisAbs = "${repo}/pkg/redis"
   writeFile(
     "${dir}/bit.json",
-    "{\"name\": \"jobslive\", \"dependencies\": {\"jobs\": \"${jobsAbs}\", \"postgres\": \"${postgresAbs}\", \"mysql\": \"${mysqlAbs}\"}}\n",
+    "{\"name\": \"jobslive\", \"dependencies\": {\"jobs\": \"${jobsAbs}\", \"postgres\": \"${postgresAbs}\", \"mysql\": \"${mysqlAbs}\", \"redis\": \"${redisAbs}\"}}\n",
   )?
   writeFile(
     "${dir}/bit.lock",
-    "{\"jobs\": {\"path\": \"${jobsAbs}\", \"requires\": {}}, \"postgres\": {\"path\": \"${postgresAbs}\", \"requires\": {}}, \"mysql\": {\"path\": \"${mysqlAbs}\", \"requires\": {}}}\n",
+    "{\"jobs\": {\"path\": \"${jobsAbs}\", \"requires\": {}}, \"postgres\": {\"path\": \"${postgresAbs}\", \"requires\": {}}, \"mysql\": {\"path\": \"${mysqlAbs}\", \"requires\": {}}, \"redis\": {\"path\": \"${redisAbs}\", \"requires\": {}}}\n",
   )?
   let source = readFile("${repo}/_tests_/bit/jobslive/main.bit")?
   writeFile("${dir}/main.bit", source)?
   let conformance = readFile("${repo}/_tests_/bit/jobslive/conformance.bit")?
   writeFile("${dir}/conformance.bit", conformance)?
+  let redisProof = readFile("${repo}/_tests_/bit/jobslive/redis.bit")?
+  writeFile("${dir}/redis.bit", redisProof)?
 }
 
 // Runs the live proof with the database URL as argv — `bit run` forwards
@@ -325,21 +363,22 @@ fn runEngine(bitPath: string, repo: string, label: string, url: string): int {
   return runLiveTests(bitPath, repo, url, "${tmp}/bit-jobs-live-${uuidFormat(uuidV4())}")
 }
 
-// Every engine in turn; a failure on one still runs the rest so one run
-// reports all. `mariaUrl` is empty when no MariaDB server was given.
-fn runAll(bitPath: string, repo: string, pgUrl: string, myUrl: string, mariaUrl: string): int {
-  let rc = runEngine(bitPath, repo, "PostgreSQL", pgUrl)
-  let myRc = runEngine(bitPath, repo, "MySQL", myUrl)
-  if (rc == 0) {
-    rc = myRc
-  }
-  if (len(mariaUrl) == 0) {
-    print("jobslive: MariaDB skipped (${mariaUriVar} is not set)\n")
-    return rc
-  }
-  let mariaRc = runEngine(bitPath, repo, "MariaDB", mariaUrl)
-  if (rc == 0) {
-    rc = mariaRc
+// Every engine with a URL, in turn; a failure on one still runs the rest so
+// one run reports all. An empty URL means that engine was not given, and says
+// so, naming the variable that would supply it.
+fn runAll(bitPath: string, repo: string, labels: []string, urls: []string, vars: []string): int {
+  let rc = 0
+  let i = 0
+  while (i < len(urls)) {
+    if (len(urls[i]) == 0) {
+      print("jobslive: ${labels[i]} skipped (${vars[i]} is not set)\n")
+    } else {
+      let got = runEngine(bitPath, repo, labels[i], urls[i])
+      if (rc == 0) {
+        rc = got
+      }
+    }
+    i = i + 1
   }
   return rc
 }
@@ -348,18 +387,14 @@ fn main() {
   let repo = repoRoot()
   let bitPath = envOr("BIT_BIN", "${repo}/bit-out/bin/bit")
 
-  // Both URIs set: run against those servers and provision nothing, so the
-  // same harness serves a machine whose Docker is unusable (the servers are
-  // started elsewhere and tunnelled in).
-  let givenPg = env(pgUriVar)
-  let givenMy = env(myUriVar)
-  if (len(givenPg) > 0 && len(givenMy) > 0) {
-    exit(runAll(bitPath, repo, givenPg, givenMy, env(mariaUriVar)))
-    return
-  }
-  if (len(givenPg) > 0 || len(givenMy) > 0) {
-    eprint("jobslive: set both ${pgUriVar} and ${myUriVar}, or neither\n")
-    exit(1)
+  // Any URL set: run against exactly those servers and provision nothing, so
+  // the same harness serves a machine whose Docker is unusable (the servers
+  // are started elsewhere and tunnelled in).
+  let labels = ["PostgreSQL", "MySQL", "MariaDB", "Redis"]
+  let vars = [pgUriVar, myUriVar, mariaUriVar, redisUriVar]
+  let given = [env(pgUriVar), env(myUriVar), env(mariaUriVar), env(redisUriVar)]
+  if (len(given[0]) > 0 || len(given[1]) > 0 || len(given[2]) > 0 || len(given[3]) > 0) {
+    exit(runAll(bitPath, repo, labels, given, vars))
     return
   }
 
@@ -369,7 +404,8 @@ fn main() {
   let pgName = "bit-jobs-live-pg-${runId}"
   let myName = "bit-jobs-live-mysql-${runId}"
   let mariaName = "bit-jobs-live-mariadb-${runId}"
-  let names = [pgName, myName, mariaName]
+  let redisName = "bit-jobs-live-redis-${runId}"
+  let names = [pgName, myName, mariaName, redisName]
 
   let pid = selfPid() catch e {
     eprint("jobslive: ${e.message()}\n")
@@ -398,10 +434,18 @@ fn main() {
     return
   }
 
+  let redisPort = startRedis(bin, redisName, ownerLabel) catch e {
+    eprint("jobslive: ${e.message()}\n")
+    cleanup(bin, names)
+    exit(1)
+    return
+  }
+
   let pgUrl = "postgres://postgres@127.0.0.1:${pgPort}/postgres"
   let myUrl = "mysql://root:${myRootPassword}@127.0.0.1:${myPort}/${myDatabase}"
   let mariaUrl = "mysql://root:${myRootPassword}@127.0.0.1:${mariaPort}/${myDatabase}"
-  let rc = runAll(bitPath, repo, pgUrl, myUrl, mariaUrl)
+  let redisUrl = "redis://127.0.0.1:${redisPort}"
+  let rc = runAll(bitPath, repo, labels, [pgUrl, myUrl, mariaUrl, redisUrl], vars)
   cleanup(bin, names)
   exit(rc)
 }
