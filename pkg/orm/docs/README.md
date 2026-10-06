@@ -20,6 +20,7 @@
 | [Apply migrations](migrate.md) | `bit make migration`/`bit migrate`/`bit migrate status`/`bit migrate rollback`: one file per migration under `migrations/`, applied against a live database in file-name order with no hand-written registry, one transaction per migration with the ledger row inside it, an advisory lock around the whole run |
 | [Check the schema in CI](check.md) | `check`: runs the identical diff `generate` runs and fails naming every disagreement, one line per line, instead of writing a file - column presence, type, and an enum column's CHECK drift |
 | [Sync your database automatically](sync.md) | `open(url, Options{ synchronize = true })`: adds any table or column your `@table` classes declare and the live database is missing, in any environment - never drops or renames, a removed field only warns |
+| [Logging](logging.md) | `Options.logger` and `QueryLog`: std/log records for every statement, a slow-query warning, a statement counter, and why a bound value never reaches a log line |
 | [Testing](testing.md) | `withRollback`: run a test inside a transaction that always rolls back, even on success, so nothing it wrote is ever there to clean up; `make`/`create`/`Seq` build deterministic per-test rows |
 
 `Data`, `Patch` and `Keyset pagination` merged into [Write](write.md) and
