@@ -80,6 +80,8 @@ fn main(): ()! {
   it; set `Auto-Submitted` in `headers` to send your own value instead.
 * **`unsubscribe`** is how a recipient leaves the list, one click or by mail;
   see [Unsubscribe](unsubscribe.md).
+* **`invite`** is a calendar event sent with the mail, as an `Option<Invite>`;
+  see [Calendar invites](invites.md).
 * **`tags`** are labels for your own bookkeeping. They are never written into
   the message.
 * **`inReplyTo`** is the Message-ID of the mail this one answers, with or

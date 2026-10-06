@@ -49,13 +49,54 @@ added in the same release as its parser.
 |---|---|
 | `kind` | An `EventKind`: `Delivered`, `Deferred`, `Bounced`, `Complained`, `Unsubscribed`, `Opened`, `Clicked`, `Rejected` or `Subscribe` |
 | `recipient` | The address the event is about |
-| `messageId` | The Message-ID of the mail as written, `<...>`; it is the `Receipt.messageId` of the send, so you can find the mail again. `""` when Resend did not report it |
+| `messageId` | The Message-ID of the mail as written, `<...>`; it is the `Receipt.id` of the send, so you can find the mail again. `""` when Resend did not report it |
 | `providerId` | Resend's own id for the message (`data.email_id`) |
 | `deliveryId` | Resend's id for this webhook delivery (`svix-id`); the same on every retry |
 | `at` | When it happened, as Resend reports it |
 | `permanent` | For `Bounced`: the refusal is for good. A bounce Resend does not classify counts as permanent. `false` for every other kind |
 | `reason` | Resend's explanation, or `""`. It is the provider's text: escape it before you show it on a page |
 | `provider` | Who posted it |
+
+A log line for the support team reads each kind, the time and who posted it:
+
+```bit
+import { Event, EventKind, Provider } from "mail"
+import { parseRfc3339 } from "std/time"
+
+fn describe(e: Event): string {
+  match (e.kind) {
+    Delivered => return "${e.recipient} took the mail"
+    Deferred => return "${e.recipient} is busy, Resend will try again"
+    Bounced => return "${e.recipient} bounced, permanent ${e.permanent}: ${e.reason}"
+    Complained => return "${e.recipient} reported spam: stop writing"
+    Unsubscribed => return "${e.recipient} unsubscribed"
+    Opened => return "${e.recipient} opened it"
+    Clicked => return "${e.recipient} followed a link"
+    Rejected => return "Resend did not send to ${e.recipient}: ${e.reason}"
+    Subscribe => return "${e.recipient} subscribed"
+  }
+}
+
+fn main(): ()! {
+  let e = Event{
+    kind = EventKind.Bounced,
+    recipient = "sara@example.com",
+    messageId = "<welcome-7@inkwell.dev>",
+    providerId = "49a3999c-0ce1-4ea6-ab68-afcd6dc2e794",
+    deliveryId = "msg_2Lh9KRb0pzN3LePPs7bPXpNnTcv",
+    at = parseRfc3339("2026-10-06T09:15:00Z")?,
+    permanent = true,
+    reason = "mailbox does not exist",
+    provider = Provider.Resend,
+  }
+  println(describe(e))
+  println("${e.at.toString()} ${e.provider == Provider.Resend}")
+  return
+}
+```
+
+That prints `sara@example.com bounced, permanent true: mailbox does not exist`
+and then `2026-10-06T09:15:00Z true`.
 
 Resend's `email.delivered`, `email.delivery_delayed`, `email.bounced`,
 `email.complained`, `email.opened` and `email.clicked` become `Delivered`,

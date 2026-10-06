@@ -146,11 +146,13 @@ attachment's name and size, the text part, and a rule. When a message has only
 `html`, the text shown is the one generated from it, so the link is there to
 click. The raw MIME is not printed: no base64 attachments, and no key or secret
 from `Options`. A DKIM signature appears as one line naming its `d=` and `s=`.
-`Receipt.providerId` is `log`.
+`Receipt.providerId` is `log`. The `From` line is the sender as the message names
+it, or the bare address of `Options.from` when it names none, as here. The program
+above then prints `sent <welcome-7@inkwell.dev>, provider id log`.
 
 ```text
 ------------------------------------------------------------
-From: Inkwell <hello@inkwell.dev>
+From: hello@inkwell.dev
 To: Sara Ali <sara@example.com>
 Subject: Welcome to Inkwell
 Message-ID: <welcome-7@inkwell.dev>
