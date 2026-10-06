@@ -1,125 +1,57 @@
-// ARM64 hardware GHASH via the ARMv8 Cryptographic Extension: PMULL/PMULL2
-// (128-bit-result carry-less multiply) for the GF(2^128) product GCM's GHASH
-// universal hash needs. #2523, epic #1224, mirrors #2522's armaes.bit exactly:
-// same extern declaration, same asm-provenance methodology, same hwcaps guard.
-//
-// Two pins, matching the ticket's own signatures exactly:
+// ARM64 hardware GHASH via the ARMv8 Cryptographic Extension: PMULL/PMULL2,
+// the 64x64 -> 128-bit carry-less multiply, for GCM's GF(2^128) universal
+// hash (NIST SP 800-38D §6.3). #2523 added the pins; #7403 made the fold one
+// asm loop.
 //
 //   bit_rt_ghash_hw_mul(h: int, x: int, out: int)
 //   bit_rt_ghash_hw_blocks(h: int, state: int, data: int, blocks: u64)
 //
-// Every pointer is a raw address (`int`), the same convention every other pin
-// in this tree (and `armaes.bit` beside this file) already uses.
+// Every pointer is a raw address (`int`). `stdlib/crypto/gcm.bit`'s
+// `gcmAbsorbHw` and `gcmGhashHw` call them, gated on `AesGcm.pmull`.
 //
-// CALLED since #2527: `stdlib/crypto/gcm.bit`'s `gcmAbsorbHw` (lines 231 and
-// 241) calls `bit_rt_ghash_hw_blocks`, and `gcmGhashHw` (line 271) calls
-// `bit_rt_ghash_hw_mul`, gated on `AesGcm.pmull` (set once per cipher from
-// `hwPmull()`, hw.bit).
-//
-// PLATFORM-FREE, same reasoning as armaes.bit: no OS service is needed, only
-// the CPU's own carry-less multiply, so this file compiles once per TARGET
-// (Bit has no arch-conditional compilation, SPEC §11.8). On x86_64 both
-// exported functions route to the PCLMULQDQ implementation in
+// PLATFORM-FREE: no OS service is needed, so this file compiles once per
+// TARGET (SPEC §11.8). On x86_64 both pins route to the PCLMULQDQ code in
 // `x64ghash.bit` (#7385); `onX64()` folds to the target's answer, so the
-// untaken arch's arm is deleted.
+// untaken arch's arm is deleted. Every pin first calls
+// `ghashRequireHwSupport`, because PMULL and PCLMULQDQ are optional.
 //
-// NOT EVERY CPU HAS A CARRY-LESS MULTIPLY (PMULL is a separate ARMv8
-// Cryptographic Extension feature from AES, and PCLMULQDQ a separate CPUID
-// bit), so every exported function first calls `ghashRequireHwSupport` —
-// reads bit 1 of `bit_rt_crypto_hwcaps()` and panics with a clear message
-// instead of letting an unsupported CPU fault on the first instruction.
+// THE ALGORITHM. `LD1` then `REV64` then `EXT #8` turns 16 wire bytes into
+// the bit-reflected field element: lane 0 holds bytes 8..15 and lane 1 bytes
+// 0..7, each as a big-endian u64. The product of two reflected 128-bit values
+// is reflected over 255 bits, one short of the 256-bit register pair, so H is
+// multiplied by x once up front ("twisted": shifted left one bit, the carry
+// reduced by 0xc2 << 56 in the high lane) and every product comes out
+// aligned. A product is Karatsuba: PMULL lo*lo, PMULL2 hi*hi and one PMULL of
+// (lo^hi)(lo^hi), the last against a precomputed lo^hi of the key. The 256-bit
+// result is reduced modulo x^128 + x^7 + x^2 + x + 1 by two PMULLs against
+// 0xc200000000000000 (the reflected polynomial's low terms), each folding 64
+// bits. This is the construction of Gueron and Kounavis's Intel GCM paper, as
+// the Linux arm64 ghash-ce and OpenSSL ghashv8 code run it.
 //
-// `bit_rt_crypto_hwcaps` and `onX64` are already declared/imported by
-// `armaes.bit`, in this SAME module (`runtime/cryptohw/`) — a module is the
-// import/declaration scope, not a file (this tree's own documented lesson:
-// re-declaring an already-visible module-scope name is E0042 "already
-// declared in this scope"), so this file calls both directly with no
-// extern/import of its own. Every small helper below (byte-pointer idiom,
-// 16-byte XOR/copy) is instead its OWN self-contained copy rather than a
-// reach into `armaes.bit`'s internals — the same tradeoff that file's own
-// header makes for `aesRconNext`, deliberately, to keep each file legible on
-// its own.
+// AGGREGATION. Four blocks fold with one reduction: for state S and blocks
+// D0..D3, the next state is (S^D0)H^4 ^ D1 H^3 ^ D2 H^2 ^ D3 H, the four
+// unreduced Karatsuba products XORed lane-wise first. `armGhashKeys` computes
+// the twisted H^2..H^4 with the same multiply: twisted A times twisted B
+// yields twisted AB, because the multiply removes one factor of x. A run
+// shorter than four blocks skips the powers.
 //
-// ENCODING PROVENANCE. As armaes.bit: no text assembler in this compiler
-// (SPEC §11.6), so every word below was produced by assembling the intended
-// AArch64 mnemonic with this Mac's native toolchain (`as -arch arm64`) and
-// reading the encoding back with `objdump -d --triple=arm64-apple-darwin`,
-// not transcribed from memory.
+// REGISTERS. Only v0..v7 and v16..v27, all AAPCS64 caller-saved. Each block
+// names a caller-saved GPR in `clobber`, so it is a clobber point and no live
+// value, a float included, sits in a caller-saved register across it (SPEC
+// §11.6). The blocks advance their pointer and count inputs in place, which an
+// input pins out of the allocator for the whole function.
 //
-// REGISTER CHOICE. v0-v7 are AAPCS64 caller-saved (never preserved across a
-// call), and none of these functions declares a float/vector local of its
-// own, so v0-v6 (used below) never alias a live Bit-level value — the same
-// argument armaes.bit's header makes for its v0-v2, extended here to v0-v6
-// because this algorithm genuinely needs more live vector state at once (H
-// reflected, X reflected twice, and four 128-bit partial products).
+// ENCODING PROVENANCE. No text assembler exists in this compiler (SPEC
+// §11.6): every word was assembled from the mnemonic in its comment with
+// this Mac's toolchain (`as -arch arm64`) and read back with
+// `objdump -d --triple=arm64-apple-darwin`. No word is a `bl` or `blr`;
+// every branch displacement is the assembler's.
 //
-// THE ALGORITHM. GHASH (NIST SP 800-38D §6.3) associates a 128-bit block
-// with a GF(2^128) polynomial by reading its bit string MSB-first: bit 0
-// (the top bit of byte 0) is the coefficient of alpha^0, bit 127 (the bottom
-// bit of byte 15) the coefficient of alpha^127 — the software path's
-// `gcmGfMul`/`gcmMulHWords` (stdlib/crypto/gcm.bit) implement exactly this,
-// unchanged, and are the oracle every hardware result is checked against.
-//
-// PMULL always treats a loaded 64-bit register in the opposite convention
-// (bit 0 = LSB = coefficient of x^0), so an unmodified 16-byte load cannot be
-// fed to it directly. Loading with `LD1` places memory byte i into vector
-// byte-lane i (byte 0 -> the register's own low byte); `REV64` then reverses
-// byte ORDER within each 8-byte lane. The composition of "byte's own bits
-// land in the register the normal (LSB-first) way" with "REV64 reverses
-// which byte holds which lane" turns out to be an exact bit-for-bit reversal
-// relative to GHASH's MSB-first convention — verified by direct derivation,
-// not assumed: for the low 8-byte lane, register bit k (after LD1+REV64)
-// equals GHASH's own spec bit (63-k), for every k in 0..63.
-//
-// So `LD1 {v.16b},[addr]; REV64 v.16b,v.16b` gives a 128-bit register whose
-// two 64-bit halves are, in the field-theory sense, the RECIPROCAL
-// polynomials of GHASH's own low/high halves: d[0] represents GHASH bits
-// 0..63 read backwards (call it A), d[1] represents bits 64..127 read
-// backwards (call it B). One more lane swap (`EXT v.16b,v.16b,v.16b,#8`)
-// reorders these into (d[0]=B, d[1]=A) — call the resulting register `Ĥ`.
-// This specific layout is exactly what makes the schoolbook multiply below
-// come out right: Ĥ(x) = B + x^64·A is the FULL 128-bit reciprocal
-// polynomial of H, i.e. Ĥ(x) = x^127·H(1/x`) — and reciprocal-polynomial
-// multiplication satisfies Ĥ(x)·X̂(x) = the reciprocal of H(alpha)·X(alpha)
-// (the RAW, unreduced 255-bit product), which is exactly what an ordinary
-// (non-reflected) carry-less multiply of Ĥ and X̂ computes. This identity —
-// not a rule of thumb — is why REV64+lane-swap is the right load, and it is
-// the same technique real-world ARMv8 PMULL GHASH implementations use.
-//
-// Given Ĥ=(P,Q) [d0=P,d1=Q] and X̂=(S,T), the schoolbook product needs all
-// four cross terms: PS (pmull), QT (pmull2), and PT/QS, obtained by feeding
-// PMULL/PMULL2 a lane-swapped copy of X̂ (T,S) instead. Combined (each
-// PMULL/PMULL2 result is a 128-bit value, lo/hi 64-bit halves):
-//
-//   r0 = PS.lo
-//   r1 = PS.hi XOR (PT XOR QS).lo
-//   r2 = (PT XOR QS).hi XOR QT.lo
-//   r3 = QT.hi
-//
-// (r0,r1,r2,r3), read as one 256-bit value (r0 least significant), is the
-// bit-reflected form of the raw 255-bit product H(alpha)*X(alpha) — reflected
-// over 255 bit-positions, not 256, which is why converting it back to the
-// software's own MSB-first-per-word layout needs a 1-bit left shift (across
-// all four words, with carry) THEN a whole-word reversal (word0<->word3,
-// word1<->word2), not a plain per-word byte/bit reversal. Both the "1-bit
-// shift" step and the reflection identity above were derived and then
-// verified against a from-scratch GF(2^128) reference (schoolbook polynomial
-// multiplication with no reflection at all) over thousands of random
-// 128-bit pairs plus every relevant edge case (all-zero, all-one operands,
-// single-bit operands at each end, H equal to the GCM reduction constant),
-// not read off a remembered formula.
-//
-// REDUCTION. Once the unreduced product is in the software's own layout
-// (word0 = degrees 0-63 MSB-first, ..., word3 = degrees 192-254), it is
-// reduced by the SAME relation the software path folds one bit at a time —
-// alpha^128 = alpha^7+alpha^2+alpha+1 (R = 0xe1 in the top byte) — applied to
-// the whole high half (word2,word3) at once via four shifted copies (by
-// 128, 127, 126 and 121 bits: multiplying the high half by R = 1+x+x^2+x^7,
-// each term a shift because R is a fixed public constant, not attacker
-// data), XORed into (word0,word1). One round leaves a small residue that can
-// still reach degree 133; a second, identical round always finishes it —
-// proved by exhaustive testing (thousands of random trials, always exactly
-// 0, 1 or 2 rounds; never 3), not asserted from a citation.
+// CHUNKED FOR THE COLLECTOR. The run block is opaque and holds no safepoint,
+// so one call folds at most `ghashArmChunk` blocks (64 KiB) and a large
+// buffer still reaches the Bit loop's back edge, and its safepoint.
+
+const ghashArmChunk: int = 4096
 
 fn ghashRequireHwSupport() {
   if ((bit_rt_crypto_hwcaps() & 2) == 0) {
@@ -127,164 +59,175 @@ fn ghashRequireHwSupport() {
   }
 }
 
-// A `*byte` at raw address `addr` — the same "nil plus byte offset" idiom
-// `armaes.bit`'s `aesByteAt` uses, kept as its own copy per this file's own
-// header (small and self-contained beats a cross-file reach for one line).
+// A `*byte` at raw address `addr`: the "nil plus byte offset" idiom
+// `armaes.bit`'s `aesByteAt` uses; `x64ghash.bit` reads through it too.
 fn ghashByteAt(addr: int): *byte {
   let z: *byte = nil
   return z + addr
 }
 
-// dst[0..15] = a[0..15] XOR b[0..15]. Bounded by a fixed literal.
-fn ghashXorBlock(dst: int, a: int, b: int) {
-  let i = 0
-  while (i < 16) {
-    *ghashByteAt(dst + i) = *ghashByteAt(a + i) ^ *ghashByteAt(b + i)
-    i = i + 1
-  }
-}
-
-// Read 8 bytes at `addr+off` as a little-endian u64 — the layout `ST1`
-// naturally produces for a vector register's own 64-bit half, and the
-// convention every raw-product read below uses (internal-only; the final
-// 128-bit GHASH result is stored big-endian, matching GCM's wire order, by
-// `ghashStoreResult`).
-fn ghashLoadWordLE(addr: int, off: int): u64 {
-  let w: u64 = 0
-  let i = 0
-  while (i < 8) {
-    w = w | (u64(*ghashByteAt(addr + off + i)) << u64(i * 8))
-    i = i + 1
-  }
-  return w
-}
-
-// Store the reduced 128-bit result (word0 = bits 0-63 MSB-first, word1 =
-// bits 64-127) as 16 big-endian bytes at `out` — GCM's own wire order,
-// matching every other 128-bit GHASH value in this tree.
-fn ghashStoreResult(out: int, word0: u64, word1: u64) {
-  let i = 0
-  while (i < 8) {
-    *ghashByteAt(out + i) = byte(word0 >> u64(56 - i * 8))
-    *ghashByteAt(out + 8 + i) = byte(word1 >> u64(56 - i * 8))
-    i = i + 1
-  }
-}
-
-// The raw (unreduced) carry-less products needed for the reflected-domain
-// schoolbook multiply of H (at `hAddr`) and X (at `xAddr`): PS, QT, PT, QS
-// (each a 128-bit PMULL/PMULL2 result, stored as 16 bytes at its own
-// address) — see the file header for what these represent and why REV64
-// plus a lane swap is the load. `rawOut` must point at 64 contiguous,
-// writable bytes: PS, QT, PT, QS, 16 bytes each, in that order (the
-// addresses of the last three are computed in-block from `rawOut`, so this
-// stays a 3-parameter function — grouping four raw addresses into a single
-// contiguous buffer is also simply what the caller already wants).
-fn hwGhashRawProducts(hAddr: int, xAddr: int, rawOut: int) {
+// Writes the 64-byte key table at `keys`: twisted H (from the 16 wire bytes
+// at `h`), then twisted H^2, H^3 and H^4 when `blocks` >= 4, each in the
+// reflected lane layout the run loop loads. The x64 arm is a trap.
+fn armGhashKeys(h: int, keys: int, blocks: int) {
   asm volatile {
+    x64 { 0x0F, 0x0B } // ud2
     arm64 {
-      0x4c407000, // ld1.16b {v0}, [x0]              (H)
-      0x4c407021, // ld1.16b {v1}, [x1]              (X)
-      0x4e200800, // rev64.16b v0, v0
-      0x6e004000, // ext.16b v0, v0, v0, #8           v0 = Ĥ = (P,Q)
-      0x4e200821, // rev64.16b v1, v1
-      0x6e014021, // ext.16b v1, v1, v1, #8           v1 = X̂ = (S,T)
-      0x6e014022, // ext.16b v2, v1, v1, #8           v2 = X̂ lane-swapped = (T,S)
-      0x0ee1e003, // pmull.1q   v3, v0, v1            v3 = P*S
-      0x4ee1e004, // pmull2.1q  v4, v0, v1            v4 = Q*T
-      0x0ee2e005, // pmull.1q   v5, v0, v2            v5 = P*T
-      0x4ee2e006, // pmull2.1q  v6, v0, v2            v6 = Q*S
-      0x91004043, // add x3, x2, #16                  x3 = rawOut+16 (outQT)
-      0x91008044, // add x4, x2, #32                  x4 = rawOut+32 (outPT)
-      0x9100c045, // add x5, x2, #48                  x5 = rawOut+48 (outQS)
-      0x4c007043, // st1.16b {v3}, [x2]               outPS
-      0x4c007064, // st1.16b {v4}, [x3]               outQT
-      0x4c007085, // st1.16b {v5}, [x4]               outPT
-      0x4c0070a6, // st1.16b {v6}, [x5]               outQS
+      0x4c407000, 0x4e200800, // ld1.16b {v0}, [x0]; rev64.16b v0, v0
+      0x6e004000, 0x4f07e427, // ext.16b v0, v0, v0, #8; movi.16b v7, #0xe1
+      0x4f7954e7, 0x6f410402, // shl.2d v7, v7, #57; ushr.2d v2, v0, #63
+      0x4e1c0403, 0x4f210463, // dup.4s v3, v0[3]; sshr.4s v3, v3, #31
+      0x6e024042, 0x4f415400, // ext.16b v2, v2, v2, #8; shl.2d v0, v0, #1
+      0x4ea21c00, 0x6f00e404, // orr.16b v0, v0, v2; movi.2d v4, #0
+      0x6e074084, 0x4e231c84, // ext.16b v4, v4, v7, #8; and.16b v4, v4, v3
+      0x6e241c00, 0x4c9f7020, // eor.16b v0, v0, v4; st1.16b {v0}, [x1], #16
+      0xf100105f, 0x54000743, // cmp x2, #4; b.lo end (+58 words)
+      0x6e004006, 0x6e201cc6, // ext.16b v6, v0, v0, #8; eor.16b v6, v6, v0
+      0x4ea01c01, 0x6e014022, // mov.16b v1, v0; ext.16b v2, v1, v1, #8
+      0x6e211c42, 0x4ee0e024, // eor.16b v2, v2, v1; pmull2.1q v4, v1, v0
+      0x0ee0e021, 0x0ee6e045, // pmull.1q v1, v1, v0; pmull.1q v5, v2, v6
+      0x6e044022, 0x6e241c23, // ext.16b v2, v1, v4, #8; eor.16b v3, v1, v4
+      0x6e231ca5, 0x6e221ca5, // eor.16b v5, v5, v3; eor.16b v5, v5, v2
+      0x0ee7e023, 0x6e0844a4, // pmull.1q v3, v1, v7; mov.d v4[0], v5[1]
+      0x6e180425, 0x6e231ca1, // mov.d v5[1], v1[0]; eor.16b v1, v5, v3
+      0x6e014023, 0x0ee7e021, // ext.16b v3, v1, v1, #8; pmull.1q v1, v1, v7
+      0x6e241c63, 0x6e231c21, // eor.16b v3, v3, v4; eor.16b v1, v1, v3
+      0x4c9f7021, 0x6e014022, // st1.16b {v1}, [x1], #16; ext.16b v2, v1, v1, #8
+      0x6e211c42, 0x4ee0e024, // eor.16b v2, v2, v1; pmull2.1q v4, v1, v0
+      0x0ee0e021, 0x0ee6e045, // pmull.1q v1, v1, v0; pmull.1q v5, v2, v6
+      0x6e044022, 0x6e241c23, // ext.16b v2, v1, v4, #8; eor.16b v3, v1, v4
+      0x6e231ca5, 0x6e221ca5, // eor.16b v5, v5, v3; eor.16b v5, v5, v2
+      0x0ee7e023, 0x6e0844a4, // pmull.1q v3, v1, v7; mov.d v4[0], v5[1]
+      0x6e180425, 0x6e231ca1, // mov.d v5[1], v1[0]; eor.16b v1, v5, v3
+      0x6e014023, 0x0ee7e021, // ext.16b v3, v1, v1, #8; pmull.1q v1, v1, v7
+      0x6e241c63, 0x6e231c21, // eor.16b v3, v3, v4; eor.16b v1, v1, v3
+      0x4c9f7021, 0x6e014022, // st1.16b {v1}, [x1], #16; ext.16b v2, v1, v1, #8
+      0x6e211c42, 0x4ee0e024, // eor.16b v2, v2, v1; pmull2.1q v4, v1, v0
+      0x0ee0e021, 0x0ee6e045, // pmull.1q v1, v1, v0; pmull.1q v5, v2, v6
+      0x6e044022, 0x6e241c23, // ext.16b v2, v1, v4, #8; eor.16b v3, v1, v4
+      0x6e231ca5, 0x6e221ca5, // eor.16b v5, v5, v3; eor.16b v5, v5, v2
+      0x0ee7e023, 0x6e0844a4, // pmull.1q v3, v1, v7; mov.d v4[0], v5[1]
+      0x6e180425, 0x6e231ca1, // mov.d v5[1], v1[0]; eor.16b v1, v5, v3
+      0x6e014023, 0x0ee7e021, // ext.16b v3, v1, v1, #8; pmull.1q v1, v1, v7
+      0x6e241c63, 0x6e231c21, // eor.16b v3, v3, v4; eor.16b v1, v1, v3
+      0x4c007021,             // st1.16b {v1}, [x1]
     }
-    input arm64 x0 x64 rax = hAddr
-    input arm64 x1 x64 rcx = xAddr
-    input arm64 x2 x64 rdx = rawOut
-    clobber arm64 { memory, x3, x4, x5 }
+    input arm64 x0 x64 rax = h
+    input arm64 x1 x64 rcx = keys
+    input arm64 x2 x64 rdx = blocks
+    clobber arm64 { x3, memory }
   }
 }
 
-// The R-fold reduction described in the file header folds the high-degree
-// (word2,word3) into (word0,word1) via R = 1+x+x^2+x^7 (shifts by 128, 127,
-// 126, 121 bits, i.e. a whole word then k = 63, 62, 57 more). One round maps
-// (w0,w1,w2,w3) to (w0^F(w2), w1^F(w3)^G(w2), G(w3), 0), with F the in-word
-// right-shift part and G the part that carries into the next word; the
-// second round, on (.., G(w3), 0), adds F(G(w3)) and G(G(w3)) and leaves
-// zero residue. Scalar u64 helpers, so a block reduces with no allocation.
-fn ghashFoldF(x: u64): u64 {
-  return x ^ (x >> u64(1)) ^ (x >> u64(2)) ^ (x >> u64(7))
+// Folds `blocks` (> 0, <= ghashArmChunk) 16-byte blocks at `data` into the
+// 16-byte state at `state`, under the table `armGhashKeys` wrote at `keys`
+// for a run at least this long: four blocks per reduction while four remain,
+// then one at a time. The x64 arm is a trap.
+fn armGhashRun(keys: int, state: int, data: int, blocks: int) {
+  asm volatile {
+    x64 { 0x0F, 0x0B } // ud2
+    arm64 {
+      0x4c402010, 0x4f07e427, // ld1.16b {v16, v17, v18, v19}, [x0]; movi.16b v7, #0xe1
+      0x4f7954e7, 0x6e104206, // shl.2d v7, v7, #57; ext.16b v6, v16, v16, #8
+      0x6e301cc6, 0x4ed12a14, // eor.16b v6, v6, v16; trn1.2d v20, v16, v17
+      0x4ed16a02, 0x6e221e94, // trn2.2d v2, v16, v17; eor.16b v20, v20, v2
+      0x4ed32a55, 0x4ed36a42, // trn1.2d v21, v18, v19; trn2.2d v2, v18, v19
+      0x6e221eb5, 0x4c407021, // eor.16b v21, v21, v2; ld1.16b {v1}, [x1]
+      0x4e200821, 0x6e014021, // rev64.16b v1, v1; ext.16b v1, v1, v1, #8
+      0xf100107f, 0x54000703, // cmp x3, #4; b.lo one (+56 words)
+      0x4cdf2058, 0x4e200b18, // four: ld1.16b {v24, v25, v26, v27}, [x2], #64; rev64.16b v24, v24
+      0x6e184318, 0x4e200b39, // ext.16b v24, v24, v24, #8; rev64.16b v25, v25
+      0x6e194339, 0x4e200b5a, // ext.16b v25, v25, v25, #8; rev64.16b v26, v26
+      0x6e1a435a, 0x4e200b7b, // ext.16b v26, v26, v26, #8; rev64.16b v27, v27
+      0x6e1b437b, 0x6e211f18, // ext.16b v27, v27, v27, #8; eor.16b v24, v24, v1
+      0x6e184302, 0x6e381c42, // ext.16b v2, v24, v24, #8; eor.16b v2, v2, v24
+      0x0ef3e301, 0x4ef3e304, // pmull.1q v1, v24, v19; pmull2.1q v4, v24, v19
+      0x4ef5e045, 0x6e194322, // pmull2.1q v5, v2, v21; ext.16b v2, v25, v25, #8
+      0x6e391c42, 0x0ef2e323, // eor.16b v2, v2, v25; pmull.1q v3, v25, v18
+      0x6e231c21, 0x4ef2e323, // eor.16b v1, v1, v3; pmull2.1q v3, v25, v18
+      0x6e231c84, 0x0ef5e043, // eor.16b v4, v4, v3; pmull.1q v3, v2, v21
+      0x6e231ca5, 0x6e1a4342, // eor.16b v5, v5, v3; ext.16b v2, v26, v26, #8
+      0x6e3a1c42, 0x0ef1e343, // eor.16b v2, v2, v26; pmull.1q v3, v26, v17
+      0x6e231c21, 0x4ef1e343, // eor.16b v1, v1, v3; pmull2.1q v3, v26, v17
+      0x6e231c84, 0x4ef4e043, // eor.16b v4, v4, v3; pmull2.1q v3, v2, v20
+      0x6e231ca5, 0x6e1b4362, // eor.16b v5, v5, v3; ext.16b v2, v27, v27, #8
+      0x6e3b1c42, 0x0ef0e363, // eor.16b v2, v2, v27; pmull.1q v3, v27, v16
+      0x6e231c21, 0x4ef0e363, // eor.16b v1, v1, v3; pmull2.1q v3, v27, v16
+      0x6e231c84, 0x0ef4e043, // eor.16b v4, v4, v3; pmull.1q v3, v2, v20
+      0x6e231ca5, 0x6e044022, // eor.16b v5, v5, v3; ext.16b v2, v1, v4, #8
+      0x6e241c23, 0x6e231ca5, // eor.16b v3, v1, v4; eor.16b v5, v5, v3
+      0x6e221ca5, 0x0ee7e023, // eor.16b v5, v5, v2; pmull.1q v3, v1, v7
+      0x6e0844a4, 0x6e180425, // mov.d v4[0], v5[1]; mov.d v5[1], v1[0]
+      0x6e231ca1, 0x6e014023, // eor.16b v1, v5, v3; ext.16b v3, v1, v1, #8
+      0x0ee7e021, 0x6e241c63, // pmull.1q v1, v1, v7; eor.16b v3, v3, v4
+      0x6e231c21, 0xd1001063, // eor.16b v1, v1, v3; sub x3, x3, #4
+      0xf100107f, 0x54fff962, // cmp x3, #4; b.hs four (-53 words)
+      0xb4000303,             // cbz x3, done (+24 words)
+      0x4cdf7042, 0x4e200842, // one: ld1.16b {v2}, [x2], #16; rev64.16b v2, v2
+      0x6e024042, 0x6e221c21, // ext.16b v2, v2, v2, #8; eor.16b v1, v1, v2
+      0x6e014022, 0x6e211c42, // ext.16b v2, v1, v1, #8; eor.16b v2, v2, v1
+      0x4ef0e024, 0x0ef0e021, // pmull2.1q v4, v1, v16; pmull.1q v1, v1, v16
+      0x0ee6e045, 0x6e044022, // pmull.1q v5, v2, v6; ext.16b v2, v1, v4, #8
+      0x6e241c23, 0x6e231ca5, // eor.16b v3, v1, v4; eor.16b v5, v5, v3
+      0x6e221ca5, 0x0ee7e023, // eor.16b v5, v5, v2; pmull.1q v3, v1, v7
+      0x6e0844a4, 0x6e180425, // mov.d v4[0], v5[1]; mov.d v5[1], v1[0]
+      0x6e231ca1, 0x6e014023, // eor.16b v1, v5, v3; ext.16b v3, v1, v1, #8
+      0x0ee7e021, 0x6e241c63, // pmull.1q v1, v1, v7; eor.16b v3, v3, v4
+      0x6e231c21, 0xf1000463, // eor.16b v1, v1, v3; subs x3, x3, #1
+      0x54fffd41,             // b.ne one (-22 words)
+      0x6e014021, 0x4e200821, // done: ext.16b v1, v1, v1, #8; rev64.16b v1, v1
+      0x4c007021,             // st1.16b {v1}, [x1]
+    }
+    input arm64 x0 x64 rax = keys
+    input arm64 x1 x64 rcx = state
+    input arm64 x2 x64 rdx = data
+    input arm64 x3 x64 r8 = blocks
+    clobber arm64 { x4, memory }
+  }
 }
 
-fn ghashFoldG(x: u64): u64 {
-  return (x << u64(63)) ^ (x << u64(62)) ^ (x << u64(57))
+// `state` = GHASH fold of `blocks` blocks at `data` under H at `h`, at most
+// `ghashArmChunk` blocks per opaque asm call. The key table is built once.
+fn armGhashBlocks(h: int, state: int, data: int, blocks: int) {
+  let keys = []byte(64)
+  let k = int(ptrOf(keys))
+  armGhashKeys(h, k, blocks)
+  let left = blocks
+  let p = data
+  while (left > 0) {
+    let n = left
+    if (n > ghashArmChunk) {
+      n = ghashArmChunk
+    }
+    armGhashRun(k, state, p, n)
+    p = p + n * 16
+    left = left - n
+  }
+  keepAlive(keys)
 }
 
-// The full GF(2^128) product H*X (GCM bit order), from the four raw
-// carry-less products already sitting at `raw` (64 bytes: PS,QT,PT,QS, 16
-// bytes each, in that order) — see the file header for the shift+reverse
-// and the two-round fold this performs.
-fn ghashCombineAndReduce(raw: int, out: int) {
-  let psLo = ghashLoadWordLE(raw, 0)
-  let psHi = ghashLoadWordLE(raw, 8)
-  let qtLo = ghashLoadWordLE(raw, 16)
-  let qtHi = ghashLoadWordLE(raw, 24)
-  let ptLo = ghashLoadWordLE(raw, 32)
-  let ptHi = ghashLoadWordLE(raw, 40)
-  let qsLo = ghashLoadWordLE(raw, 48)
-  let qsHi = ghashLoadWordLE(raw, 56)
-
-  let midLo = ptLo ^ qsLo
-  let midHi = ptHi ^ qsHi
-  let r0 = psLo
-  let r1 = psHi ^ midLo
-  let r2 = midHi ^ qtLo
-  let r3 = qtHi
-
-  // Shift the 256-bit (r0,r1,r2,r3) left by 1 bit, then reverse word order
-  // (see the file header derivation).
-  let word3 = r0 << u64(1)
-  let word2 = (r1 << u64(1)) | (r0 >> u64(63))
-  let word1 = (r2 << u64(1)) | (r1 >> u64(63))
-  let word0 = (r3 << u64(1)) | (r2 >> u64(63))
-
-  let carry = ghashFoldG(word3)
-  let lo = word0 ^ ghashFoldF(word2) ^ ghashFoldF(carry)
-  let hi = word1 ^ ghashFoldF(word3) ^ ghashFoldG(word2) ^ ghashFoldG(carry)
-  ghashStoreResult(out, lo, hi)
-}
-
-// One GF(2^128) multiply-accumulate: `out` = H*X (GCM bit order), for H at
-// `h` and X at `x` (16 bytes each). `out` may alias `h` and/or `x` — every
-// byte of both operands is read (via `hwGhashRawProducts`) before `out` is
-// ever written.
-// `rawAddr` is the caller's 64-byte scratch for the four raw products, so a
-// multi-block fold allocates it once rather than once per block.
-fn ghashMulInto(out: int, h: int, x: int, rawAddr: int) {
-  hwGhashRawProducts(h, x, rawAddr)
-  ghashCombineAndReduce(rawAddr, out)
-}
-
-// `bit_rt_ghash_hw_mul(h, x, out)`: `out` = H*X in GF(2^128), GCM bit order.
+// `bit_rt_ghash_hw_mul(h, x, out)`: `out` = H*X in GF(2^128), GCM bit order,
+// as one fold of X into a zero state, so `out` may alias `h` or `x`: both
+// are read before `out` is written.
 export @symbol("bit_rt_ghash_hw_mul") fn rtGhashHwMul(h: int, x: int, out: int) {
   ghashRequireHwSupport()
   if (onX64()) {
     x64GhashMul(h, x, out)
     return
   }
-  let raw = []byte(64)
-  ghashMulInto(out, h, x, int(ptrOf(raw)))
+  let acc = []byte(16)
+  armGhashBlocks(h, int(ptrOf(acc)), x, 1)
+  let i = 0
+  while (i < 16) {
+    *ghashByteAt(out + i) = acc[i]
+    i = i + 1
+  }
 }
 
 // `bit_rt_ghash_hw_blocks(h, state, data, blocks)`: folds `blocks` 16-byte
-// blocks at `data` into the running GHASH state at `state` (mutated in
-// place), under subkey H at `h`: state = (state XOR block) * H, once per
-// block, in order — the same recurrence `stdlib/crypto/gcm.bit`'s software
-// `gcmAbsorb` implements.
+// blocks at `data` into the GHASH state at `state` (mutated in place), under
+// subkey H at `h`: state = (state XOR block) * H, once per block, in order,
+// the recurrence `stdlib/crypto/gcm.bit`'s software `gcmAbsorb` implements.
 export @symbol("bit_rt_ghash_hw_blocks") fn rtGhashHwBlocks(
   h: int,
   state: int,
@@ -296,14 +239,5 @@ export @symbol("bit_rt_ghash_hw_blocks") fn rtGhashHwBlocks(
     x64GhashBlocks(h, state, data, blocks)
     return
   }
-  let scratch = []byte(80)
-  let tmpAddr = int(ptrOf(scratch))
-  let rawAddr = tmpAddr + 16
-  let i: u64 = 0
-  while (i < blocks) {
-    let blockAddr = data + int(i) * 16
-    ghashXorBlock(tmpAddr, state, blockAddr)
-    ghashMulInto(state, tmpAddr, h, rawAddr)
-    i = i + 1
-  }
+  armGhashBlocks(h, state, data, int(blocks))
 }
