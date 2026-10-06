@@ -57,7 +57,7 @@ fn main(): ()! {
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?
-  })
+  })?
   q.enqueue(SendWelcome{ userId = 1 })?
   q.run()?
   return
@@ -86,7 +86,7 @@ fn runAlongsideWebServer(store: Store): ()! {
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?
-  })
+  })?
   q.start()
   // ... serve requests, run migrations, whatever this process does ...
   q.stop()
@@ -109,7 +109,7 @@ fn runWithRetries(store: Store): ()! {
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?
-  })
+  })?
   q.enqueue(SendWelcome{ userId = 1 }, 0, 5)?
   q.run()?
   return
@@ -146,7 +146,7 @@ fn runGivingUp(store: Store): ()! {
       fail PermanentFailure{ reason = "user ${job.userId} does not exist" }
     }
     sendWelcomeEmail(job.userId)?
-  })
+  })?
   q.enqueue(SendWelcome{ userId = -1 }, 0, 5)?
   q.run()?
   return
@@ -163,6 +163,16 @@ renamed after jobs were already queued under its old `@job` name, or a
 deploy that removed a handler - it goes straight to the dead-letter list
 with the reason `no handler registered for '<name>'`, rather than being
 retried forever or dropped silently.
+
+## Sharp edge: a second handler for one job name fails
+
+`register` keeps one handler per `@job` name. Registering the same job on a
+queue twice would leave one handler dead, so the second call fails at startup
+and names the job:
+
+```text
+jobs: register: a handler for job 'send-welcome' is already registered on this Queue
+```
 
 ## Sharp edge: bad options fail in `open`
 

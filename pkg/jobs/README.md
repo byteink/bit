@@ -24,7 +24,7 @@ fn main(): ()! {
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?
-  })
+  })?
   q.enqueue(SendWelcome{ userId = 1 })?
   q.run()?
   return

@@ -65,7 +65,7 @@ fn openJobQueue(databaseUrl: string): Queue! {
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?
-  })
+  })?
   return q
 }
 ```
@@ -89,7 +89,8 @@ fn main(): ()! {
 
 Rebuilding an article's search index after it is published is the same
 shape as the welcome email - a second job type, registered on the same
-queue. `register` can be called once per job type, and `start` runs the
+queue. `register` is called once per job type (a second call for the same
+name fails, naming the job), and `start` runs the
 pool in the background instead of blocking, which is what you want when
 jobs share a process with something else:
 
@@ -103,11 +104,12 @@ fn reindexArticle(articleId: i64): ()! {
   return
 }
 
-fn startJobs(q: Queue) {
+fn startJobs(q: Queue): ()! {
   q.register<ReindexArticle>((job: ReindexArticle) => {
     reindexArticle(job.articleId)?
-  })
+  })?
   q.start()
+  return
 }
 ```
 
@@ -155,7 +157,7 @@ fn mountRoutes(app: App, q: Queue) {
 fn serveWithJobs(databaseUrl: string): ()! {
   let app = App(Config{ secret = "change-me" })
   let q = openJobQueue(databaseUrl)?
-  startJobs(q)
+  startJobs(q)?
   mountRoutes(app, q)
   let srv = app.serve()?
   waitForSignal([Signal.Term, Signal.Int])

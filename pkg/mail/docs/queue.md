@@ -75,6 +75,11 @@ own transport, so a worker needs no handler of its own. The web process may run
 the workers too (`queue.start()`), or only enqueue and leave delivery to a
 separate worker process; both build the `Mailer` the same way.
 
+A queue takes one `Mailer`. A second `Mailer(...)` on the same `Queue` fails
+with `MailError.Config` at construction, naming the job, instead of replacing
+the first one's transport. Two transports are one `Mailer` with
+`Options.fallback`.
+
 ## What fails where
 
 A mistake in the message is still the caller's. `send` renders before it
@@ -160,9 +165,6 @@ pkg/jobs repeats show as extra `transient` counts. See
   take fields, not bytes) also needs the `Message`, so the row carries it a
   second time, attachments as base64 text. SMTP and Mailgun's `messages.mime`
   send the bytes as they are and store them once.
-* **One `Mailer` per queue.** The queue holds one handler for mail, so a second
-  `Mailer` on the same `Queue` replaces the first one's transport. Two
-  transports are one `Mailer` with `Options.fallback`.
 * **The queue is yours to close.** `Mailer.close` releases the transport and
   leaves the queue running.
 * **`Mailer.verify` still checks the transport**, queue or not; call it in the
