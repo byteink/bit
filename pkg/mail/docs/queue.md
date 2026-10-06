@@ -21,11 +21,11 @@ change: it still calls `send`.
 import { Message, Options, open as openMailer } from "mail"
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { PostgresStore, open as openQueue, Options as QueueOptions } from "jobs"
+import { SqlStore, open as openQueue, Options as QueueOptions } from "jobs"
 
 fn main(): ()! {
   let db = pool(adapter(), Datasource{ uri = "postgres://localhost/inkwell" })?
-  let queue = openQueue(PostgresStore(db), QueueOptions{ workers = 4 })?
+  let queue = openQueue(SqlStore(db)?, QueueOptions{ workers = 4 })?
   let mailer = openMailer(
     "smtps://hello%40inkwell.dev:secret@smtp.inkwell.dev",
     Options{ from = "Inkwell <hello@inkwell.dev>", queue = Option.Some(queue) },
@@ -55,11 +55,11 @@ that builds the same `Mailer` over the same store and calls `run`:
 import { Options, open as openMailer } from "mail"
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { PostgresStore, open as openQueue, Options as QueueOptions } from "jobs"
+import { SqlStore, open as openQueue, Options as QueueOptions } from "jobs"
 
 fn main(): ()! {
   let db = pool(adapter(), Datasource{ uri = "postgres://localhost/inkwell" })?
-  let queue = openQueue(PostgresStore(db), QueueOptions{ workers = 4 })?
+  let queue = openQueue(SqlStore(db)?, QueueOptions{ workers = 4 })?
   let mailer = openMailer(
     "smtps://hello%40inkwell.dev:secret@smtp.inkwell.dev",
     Options{ from = "Inkwell <hello@inkwell.dev>", queue = Option.Some(queue) },
@@ -121,13 +121,13 @@ a queue fails at startup:
 
 ```bit
 import { Retry, Options, Mailer, Outbox } from "mail"
-import { PostgresStore, open as openQueue, Options as QueueOptions } from "jobs"
+import { SqlStore, open as openQueue, Options as QueueOptions } from "jobs"
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
 
 fn main(): ()! {
   let db = pool(adapter(), Datasource{ uri = "postgres://localhost/inkwell" })?
-  let queue = openQueue(PostgresStore(db), QueueOptions{ workers = 1 })?
+  let queue = openQueue(SqlStore(db)?, QueueOptions{ workers = 1 })?
   Mailer(
     Outbox(),
     Options{ queue = Option.Some(queue), retry = Retry{ attempts = 5, max = 5000000000 } },
