@@ -1,0 +1,344 @@
+// pkg/mail/observe.bit — `Options.metrics` and `Options.tracer`: counters, a
+// latency histogram and spans for every send, see docs/observe.md.
+//
+// Both are off when unset, and off costs nothing: `Mailer(...)` then wraps no
+// transport, and a send reads no clock, builds no label list and starts no
+// span. When on, each delivery attempt goes through `Observed`, a decorator
+// that wraps one transport, so the attempts of a `Failover` each count against
+// their own transport and a retried send counts once per try.
+//
+// Label and attribute values are scheme names from a closed set (`schemeOf`),
+// the result is one of the nine words of `failure` and `success`, and the
+// Message-ID is cut to the part before its `@`, so an address, a host, a user
+// name or a key never leaves the process through a scrape or a span.
+
+import { Registry, Counter, Histogram, defaultBuckets } from "std/metrics"
+import { Tracer, Span, SpanStatus } from "std/trace"
+import { Mono, monotonic, since } from "std/time"
+import { runRecovering } from "std/runtime"
+
+const nsPerSecond: f64 = 1000000000.0
+
+// The four metric families a `Mailer` registers on `Options.metrics`.
+class MailMetrics {
+  sent: Counter,
+  rejected: Counter,
+  retries: Counter,
+  seconds: Histogram,
+}
+
+// What one try, or one send, came to: the `result` label's value, the server's
+// reply code (0 when it gave none), how many recipients it refused while
+// taking the rest, and whether it failed.
+class Outcome {
+  result: string,
+  code: int = 0,
+  rejected: int = 0,
+  failed: bool = false,
+}
+
+// The outcome of a failed delivery, one result word per `MailError` kind.
+// `Signature` is a webhook error that no send returns; it reads as `invalid`.
+fn failure(e: MailError): Outcome {
+  match (e) {
+    Invalid(_) => return Outcome{ result = "invalid", failed = true }
+    Config(_) => return Outcome{ result = "config", failed = true }
+    Signature(_) => return Outcome{ result = "invalid", failed = true }
+    Auth(r) => return Outcome{ result = "auth", code = r.code, failed = true }
+    Rejected(r) => return Outcome{ result = "rejected", code = r.code, failed = true }
+    Transient(r) => return Outcome{ result = "transient", code = r.code, failed = true }
+    Unknown(r) => return Outcome{ result = "unknown", code = r.code, failed = true }
+  }
+}
+
+// The outcome of a delivery the transport took: `ok`, or `queued` when it only
+// took the mail to send later.
+fn success(r: Receipt): Outcome {
+  let res = "ok"
+  if (r.queued) {
+    res = "queued"
+  }
+  return Outcome{ result = res, rejected = len(r.rejected) }
+}
+
+// The Message-ID as a span shows it: `<welcome-7@inkwell.dev>` is `welcome-7`.
+// The domain goes, so the value holds no `@`.
+fn idLocal(id: string): string {
+  let s = id
+  if (len(s) > 0 && s[0:1] == "<") {
+    s = s[1:]
+  }
+  let at = indexOf(s, "@")
+  if (at < 0) {
+    return s
+  }
+  return s[0:at]
+}
+
+// The `transport` label of `t`: its scheme, never a host or a user. A transport
+// this package does not build is `custom`.
+fn schemeOf(t: Transport): string {
+  let (o, wrapped) = t.(Observed)
+  if (wrapped) {
+    return o.scheme
+  }
+  let (_, composed) = t.(Failover)
+  if (composed) {
+    return "failover"
+  }
+  return builtinScheme(t)
+}
+
+// The scheme of a transport this package builds.
+fn builtinScheme(t: Transport): string {
+  let (smtp, isSmtp) = t.(SmtpTransport)
+  if (isSmtp) {
+    if (smtp.t.implicit) {
+      return "smtps"
+    }
+    return "smtp"
+  }
+  return apiScheme(t)
+}
+
+fn apiScheme(t: Transport): string {
+  let (_, resend) = t.(ResendTransport)
+  if (resend) {
+    return "resend"
+  }
+  let (_, postmark) = t.(PostmarkTransport)
+  if (postmark) {
+    return "postmark"
+  }
+  let (_, sendgrid) = t.(SendgridTransport)
+  if (sendgrid) {
+    return "sendgrid"
+  }
+  let (_, mailgun) = t.(MailgunTransport)
+  if (mailgun) {
+    return "mailgun"
+  }
+  return localScheme(t)
+}
+
+fn localScheme(t: Transport): string {
+  let (_, outbox) = t.(Outbox)
+  if (outbox) {
+    return "outbox"
+  }
+  let (_, log) = t.(LogTransport)
+  if (log) {
+    return "log"
+  }
+  let (_, file) = t.(FileTransport)
+  if (file) {
+    return "file"
+  }
+  return "custom"
+}
+
+// Registers the four families on `reg`. A second `Mailer` on the same
+// `Registry` would register the same names again, which `std/metrics` answers
+// with a panic; here it is a `Config` at startup instead.
+fn registerMetrics(reg: Registry): MailMetrics!MailError {
+  let got: Option<MailMetrics> = Option.None
+  let (panicked, msg) = runRecovering(() => {
+    got = Option.Some(newMailMetrics(reg))
+  })
+  if (panicked) {
+    fail MailError.Config("Options.metrics: ${msg}; give each Mailer its own Registry")
+  }
+  return unwrap(got)
+}
+
+fn newMailMetrics(reg: Registry): MailMetrics {
+  return MailMetrics{
+    sent = reg.counter(
+      "mail_sent_total",
+      "Delivery attempts by transport scheme and result.",
+      ["transport", "result"],
+    ),
+    rejected = reg.counter(
+      "mail_recipients_rejected_total",
+      "Recipients a server refused while taking the others, by transport scheme.",
+      ["transport"],
+    ),
+    retries = reg.counter(
+      "mail_retries_total",
+      "Deliveries repeated after a temporary failure, by transport scheme.",
+      ["transport"],
+    ),
+    seconds = reg.histogram(
+      "mail_send_seconds",
+      "Time of one delivery attempt in seconds, by transport scheme.",
+      ["transport"],
+      defaultBuckets(),
+    ),
+  }
+}
+
+// What a `Mailer` records, held by the `Mailer`, its `Pacer` and every
+// `Observed`. Both fields `None` is off.
+class Observer {
+  m: Option<MailMetrics> = Option.None
+  tr: Option<Tracer> = Option.None
+  // The `Mailer`'s own transport label, for what happens before or around a
+  // delivery: a refused message, a rate-limit wait, a retry.
+  scheme: string = ""
+
+  on(): bool {
+    return isSome(this.m) || isSome(this.tr)
+  }
+
+  start(name: string): Option<Span> {
+    match (this.tr) {
+      Some(t) => return Option.Some(t.startSpan(name))
+      None => return Option.None
+    }
+  }
+
+  // A monotonic reading, 0 when no histogram wants one.
+  clock(): int {
+    if (isSome(this.m)) {
+      return monotonic().ns
+    }
+    return 0
+  }
+
+  // One count of `o.result` for `scheme`.
+  count(scheme: string, o: Outcome) {
+    match (this.m) {
+      Some(m) => m.sent.inc([scheme, o.result])
+      None => {}
+    }
+  }
+
+  retried() {
+    match (this.m) {
+      Some(m) => m.retries.inc([this.scheme])
+      None => {}
+    }
+  }
+
+  // The metrics of one delivery attempt that started at `t0`.
+  record(scheme: string, t0: int, o: Outcome) {
+    match (this.m) {
+      Some(m) => {
+        m.sent.inc([scheme, o.result])
+        m.seconds.observe(f64(since(Mono{ ns = t0 })) / nsPerSecond, [scheme])
+        if (o.rejected > 0) {
+          m.rejected.add(f64(o.rejected), [scheme])
+        }
+      }
+      None => {}
+    }
+  }
+
+  // One delivery attempt through `t`, as one `mail.deliver` span, one count
+  // and one histogram observation.
+  attempt(t: Transport, scheme: string, d: Delivery): Receipt!MailError {
+    let sp = this.start("mail.deliver")
+    let t0 = this.clock()
+    let r = t.deliver(d) catch e {
+      let o = failure(e)
+      this.record(scheme, t0, o)
+      endSpan(sp, scheme, d, o)
+      fail e
+    }
+    let o = success(r)
+    this.record(scheme, t0, o)
+    endSpan(sp, scheme, d, o)
+    return r
+  }
+
+  // A message refused before any transport saw it.
+  refused(sp: Option<Span>, e: MailError) {
+    let o = failure(e)
+    this.count(this.scheme, o)
+    match (sp) {
+      Some(s) => closeSpan(s, this.scheme, o)
+      None => {}
+    }
+  }
+
+  // Ends the `mail.send` span with the send's final outcome.
+  endSend(sp: Option<Span>, d: Delivery, o: Outcome) {
+    endSpan(sp, this.scheme, d, o)
+  }
+}
+
+fn endSpan(sp: Option<Span>, scheme: string, d: Delivery, o: Outcome) {
+  match (sp) {
+    Some(s) => {
+      s.setAttribute("mail.message_id", idLocal(d.messageId))
+      s.setAttribute("mail.recipients", "${len(d.envelope.to)}")
+      closeSpan(s, scheme, o)
+    }
+    None => {}
+  }
+}
+
+fn closeSpan(s: Span, scheme: string, o: Outcome) {
+  s.setAttribute("mail.transport", scheme)
+  s.setAttribute("mail.result", o.result)
+  if (o.code > 0) {
+    s.setAttribute("smtp.code", "${o.code}")
+  }
+  if (o.failed) {
+    s.setStatus(SpanStatus.Error)
+  }
+  s.end()
+}
+
+// The `Observer` for a `Mailer` over `t`, with the metrics registered.
+fn observerFor(o: Options, t: Transport): Observer!MailError {
+  let ob = Observer{ tr = o.tracer, scheme = schemeOf(t) }
+  match (o.metrics) {
+    Some(reg) => ob.m = Option.Some(registerMetrics(reg)?)
+    None => {}
+  }
+  return ob
+}
+
+// The transport a `Mailer` calls: `t` itself when nothing is observed, a
+// `Failover` with each of its transports wrapped, or `t` wrapped.
+fn observedTransport(t: Transport, ob: Observer): Transport {
+  if (!ob.on()) {
+    return t
+  }
+  let (f, composed) = t.(Failover)
+  if (composed) {
+    f.observe(ob)
+    return t
+  }
+  return Observed(t, ob.scheme, ob)
+}
+
+// One transport whose every `deliver` is observed under its own `scheme`.
+class Observed {
+  inner: Transport
+  scheme: string
+  ob: Observer
+
+  init(inner: Transport, scheme: string, ob: Observer) {
+    this.inner = inner
+    this.scheme = scheme
+    this.ob = ob
+  }
+
+  export deliver(d: Delivery): Receipt!MailError {
+    return this.ob.attempt(this.inner, this.scheme, d)?
+  }
+
+  export signs(): bool {
+    return this.inner.signs()
+  }
+
+  export check(): ()!MailError {
+    this.inner.check()?
+  }
+
+  export close() {
+    this.inner.close()
+  }
+}

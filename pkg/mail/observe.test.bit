@@ -1,0 +1,309 @@
+// pkg/mail/observe.test.bit — `Options.metrics` and `Options.tracer`: the
+// counters and the histogram a send leaves on a `Registry`, the `mail.send`
+// span with a `mail.deliver` child per attempt, one result word per
+// `MailError` kind, failover attempts counted under their own scheme, and that
+// nothing in either holds an address.
+
+import { contains, split } from "std/strings"
+import { Registry } from "std/metrics"
+import { Tracer } from "std/trace"
+import { serve, listenAndServeOn, ok, Server, Request, Response } from "std/http"
+import { jsonParse, jsonGet, jsonAsArray, jsonAsString } from "std/json"
+
+const obRetry: Retry = Retry{ attempts = 3, base = 1, max = 1 }
+
+fn obMessage(): Message {
+  return Message{
+    to = ["Sara Ali <sara@example.com>"],
+    subject = "Welcome to Inkwell",
+    text = "Hello Sara.",
+    id = "welcome-1",
+  }
+}
+
+// A transport that answers with `fails[n]` on its n-th delivery and takes the
+// mail once the script is spent. It is not one this package builds, so its
+// label is `custom`.
+class ObScript {
+  fails: []MailError
+  calls: int
+  box: Outbox
+
+  init(fails: []MailError) {
+    this.fails = fails
+    this.calls = 0
+    this.box = Outbox()
+  }
+
+  export deliver(d: Delivery): Receipt!MailError {
+    let n = this.calls
+    this.calls = n + 1
+    if (n < len(this.fails)) {
+      fail this.fails[n]
+    }
+    return this.box.deliver(d)?
+  }
+
+  export signs(): bool {
+    return true
+  }
+
+  export check(): ()!MailError {}
+
+  export close() {}
+}
+
+// A transport that takes the mail, refuses one of its recipients and says
+// `queued`.
+class ObQueued {
+  export deliver(d: Delivery): Receipt!MailError {
+    return Receipt{
+      id = d.messageId,
+      queued = true,
+      rejected = [
+        Rejection{
+          address = "nobody@example.com",
+          reply = Reply{ code = 550, text = "no such user" },
+        },
+      ],
+    }
+  }
+
+  export signs(): bool {
+    return true
+  }
+
+  export check(): ()!MailError {}
+
+  export close() {}
+}
+
+fn obMailer(t: Transport, o: Options): Mailer {
+  o.from = "Inkwell <hello@inkwell.dev>"
+  return Mailer(t, o) catch e {
+    panic("Mailer: ${e.message()}")
+  }
+}
+
+fn obSend(m: Mailer) {
+  m.send(obMessage()) catch _ {
+    return
+  }
+}
+
+// True when the exposition holds the line `want` whole.
+fn obHas(reg: Registry, want: string): bool {
+  for line of split(reg.exposition(), "\n") {
+    if (line == want) {
+      return true
+    }
+  }
+  return false
+}
+
+fn obWant(reg: Registry, want: string) {
+  assert(obHas(reg, want), "missing ${want} in:\n${reg.exposition()}")
+}
+
+class ObCapture {
+  ch: chan<string>
+  handle(req: Request): Response {
+    this.ch <- req.body
+    return ok("")
+  }
+}
+
+fn obRunCapture(s: Server, target: ObCapture) {
+  listenAndServeOn(s, target.handle) catch _ {
+    return
+  }
+}
+
+// A `Tracer` at ratio 1 exporting to a fake collector, and the channel the
+// one exported batch arrives on.
+fn obTracer(): (Tracer, Server, chan<string>) {
+  let s = serve("127.0.0.1", 0) catch e {
+    panic("serve: ${e.message()}")
+  }
+  let ch = chan<string>(1)
+  spawn obRunCapture(s, ObCapture{ ch = ch })
+  let port = s.port() catch e {
+    panic("port: ${e.message()}")
+  }
+  return Tracer("http://127.0.0.1:${port}/v1/traces", "test", 1.0), s, ch
+}
+
+fn obField(j: Json, key: string): Json {
+  return unwrap(jsonGet(j, key))
+}
+
+fn obSpans(body: string): []Json {
+  let doc = jsonParse(body) catch e {
+    panic("jsonParse: ${e.message()}")
+  }
+  let rs = unwrap(jsonAsArray(obField(doc, "resourceSpans")))
+  let ss = unwrap(jsonAsArray(obField(rs[0], "scopeSpans")))
+  return unwrap(jsonAsArray(obField(ss[0], "spans")))
+}
+
+fn obName(sp: Json): string {
+  return unwrap(jsonAsString(obField(sp, "name")))
+}
+
+fn obAttr(sp: Json, key: string): string {
+  for a of unwrap(jsonAsArray(obField(sp, "attributes"))) {
+    if (unwrap(jsonAsString(obField(a, "key"))) == key) {
+      return unwrap(jsonAsString(obField(obField(a, "value"), "stringValue")))
+    }
+  }
+  return ""
+}
+
+test "three sends through an Outbox count ok 3 and a histogram" {
+  let reg = Registry(100)
+  let m = obMailer(Outbox(), Options{ metrics = Option.Some(reg) })
+  obSend(m)
+  obSend(m)
+  obSend(m)
+  obWant(reg, "mail_sent_total{transport=\"outbox\",result=\"ok\"} 3")
+  obWant(reg, "mail_send_seconds_count{transport=\"outbox\"} 3")
+  assert(!contains(reg.exposition(), "@"), "an @ in the exposition")
+}
+
+test "three sends, the first retried once: ok counts 3, one transient, one retry" {
+  let reg = Registry(100)
+  let t = ObScript([MailError.Transient(Reply{ code = 451, text = "try later" })])
+  let m = obMailer(t, Options{ metrics = Option.Some(reg), retry = obRetry })
+  obSend(m)
+  obSend(m)
+  obSend(m)
+  obWant(reg, "mail_sent_total{transport=\"custom\",result=\"ok\"} 3")
+  obWant(reg, "mail_sent_total{transport=\"custom\",result=\"transient\"} 1")
+  obWant(reg, "mail_retries_total{transport=\"custom\"} 1")
+  obWant(reg, "mail_send_seconds_count{transport=\"custom\"} 4")
+  assert(!contains(reg.exposition(), "@"), "an @ in the exposition")
+}
+
+test "every MailError kind has its own result word" {
+  let reply = Reply{ code = 550, text = "no" }
+  let cases = [
+    ("rejected", MailError.Rejected(reply)),
+    ("auth", MailError.Auth(reply)),
+    ("unknown", MailError.Unknown(reply)),
+    ("invalid", MailError.Invalid("x")),
+    ("config", MailError.Config("x")),
+  ]
+  for c of cases {
+    let (want, e) = c
+    let r = Registry(100)
+    let m = obMailer(ObScript([e]), Options{ metrics = Option.Some(r), retry = obRetry })
+    obSend(m)
+    obWant(r, "mail_sent_total{transport=\"custom\",result=\"${want}\"} 1")
+  }
+}
+
+test "a transport that only queued the mail counts queued, and refused recipients are counted" {
+  let reg = Registry(100)
+  let m = obMailer(ObQueued{}, Options{ metrics = Option.Some(reg) })
+  obSend(m)
+  obWant(reg, "mail_sent_total{transport=\"custom\",result=\"queued\"} 1")
+  obWant(reg, "mail_recipients_rejected_total{transport=\"custom\"} 1")
+}
+
+test "a message refused before the transport counts invalid under the mailer's scheme" {
+  let reg = Registry(100)
+  let t = ObScript([])
+  let m = obMailer(t, Options{ metrics = Option.Some(reg) })
+  m.send(Message{ subject = "no recipient" }) catch _ {}
+  obWant(reg, "mail_sent_total{transport=\"custom\",result=\"invalid\"} 1")
+  assert(t.calls == 0, "the transport was called")
+}
+
+test "a send the rate limit refuses counts transient" {
+  let reg = Registry(100)
+  let m = obMailer(
+    ObScript([]),
+    Options{ metrics = Option.Some(reg), rate = 1, timeout = 1, retry = Retry{ attempts = 1 } },
+  )
+  obSend(m)
+  obSend(m)
+  obWant(reg, "mail_sent_total{transport=\"custom\",result=\"ok\"} 1")
+  obWant(reg, "mail_sent_total{transport=\"custom\",result=\"transient\"} 1")
+}
+
+test "failover attempts count under their own scheme" {
+  let reg = Registry(100)
+  let down = ObScript([MailError.Transient(Reply{ code = 421, text = "down" })])
+  let f = Failover(
+    [down, Outbox()],
+    ["smtps://***@a.example", "resend://***@default"],
+    false,
+    SystemClock{},
+  )
+  let m = obMailer(f, Options{ metrics = Option.Some(reg) })
+  obSend(m)
+  obWant(reg, "mail_sent_total{transport=\"custom\",result=\"transient\"} 1")
+  obWant(reg, "mail_sent_total{transport=\"outbox\",result=\"ok\"} 1")
+  assert(!contains(reg.exposition(), "example"), "a host in the exposition")
+}
+
+test "a second Mailer on the same Registry is a Config at startup" {
+  let reg = Registry(100)
+  let _ = obMailer(Outbox(), Options{ metrics = Option.Some(reg) })
+  Mailer(Outbox(), Options{ metrics = Option.Some(reg) }) catch e {
+    match (e) {
+      Config(why) => assert(contains(why, "Options.metrics"), why)
+      _ => assert(false, "want Config, got ${e.message()}")
+    }
+    return
+  }
+  assert(false, "the second Mailer was accepted")
+}
+
+test "with neither set the transport is not wrapped" {
+  let m = obMailer(Outbox(), Options{})
+  let (_, bare) = m.t.(Outbox)
+  assert(bare, "an unobserved Mailer wrapped its transport")
+  let reg = Registry(100)
+  let on = obMailer(Outbox(), Options{ metrics = Option.Some(reg) })
+  let (_, wrapped) = on.t.(Outbox)
+  assert(!wrapped, "an observed Mailer did not wrap its transport")
+}
+
+test "a retried send is one mail.send span with two mail.deliver children, and no @" {
+  let (tr, s, ch) = obTracer()
+  let t = ObScript([MailError.Transient(Reply{ code = 451, text = "try later" })])
+  let m = obMailer(t, Options{ tracer = Option.Some(tr), retry = obRetry })
+  obSend(m)
+  tr.shutdown()
+  s.close()
+  let body = <- ch
+  assert(!contains(body, "@"), "an @ in the exported spans: ${body}")
+  let spans = obSpans(body)
+  let send: []Json = []
+  let deliver: []Json = []
+  for sp of spans {
+    if (obName(sp) == "mail.send") {
+      send = append(send, sp)
+    }
+    if (obName(sp) == "mail.deliver") {
+      deliver = append(deliver, sp)
+    }
+  }
+  assert(len(send) == 1, "want 1 mail.send, got ${len(send)}")
+  assert(len(deliver) == 2, "want 2 mail.deliver, got ${len(deliver)}")
+  let sid = unwrap(jsonAsString(obField(send[0], "spanId")))
+  for d of deliver {
+    assert(
+      unwrap(jsonAsString(obField(d, "parentSpanId"))) == sid,
+      "a mail.deliver is not a child of mail.send",
+    )
+    assert(obAttr(d, "mail.transport") == "custom", "mail.transport")
+    assert(obAttr(d, "mail.recipients") == "1", "mail.recipients")
+  }
+  assert(obAttr(deliver[0], "mail.result") == "transient", obAttr(deliver[0], "mail.result"))
+  assert(obAttr(deliver[0], "smtp.code") == "451", obAttr(deliver[0], "smtp.code"))
+  assert(obAttr(deliver[1], "mail.result") == "ok", obAttr(deliver[1], "mail.result"))
+  assert(obAttr(send[0], "mail.result") == "ok", obAttr(send[0], "mail.result"))
+  assert(obAttr(send[0], "mail.message_id") == "welcome-1", obAttr(send[0], "mail.message_id"))
+}
