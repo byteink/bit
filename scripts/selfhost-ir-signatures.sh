@@ -279,8 +279,13 @@
 #     elem_size)`; the oracle emits a header, a body holding exactly one
 #     `slice_append` and an exit block. Rewrite: the loop (index from 0, stepping
 #     by 1, every other value passed through) becomes that call and the exit
-#     block continues the entry block. Files: run_append_spread,
-#     decimal_collections.
+#     block continues the entry block. In `iropt` a function the loop rewrite fired
+#     on also gets the optimizer's block-local CSE (#7471): the oracle optimized the
+#     exit block alone, so an `add` there repeats one of the entry block, and once the
+#     blocks are one the tree has the single add. A later `add T x, y` equal to an
+#     earlier one of the same straight-line run is dropped (cseAdds,
+#     ir-signatures-walk.sh); no other op, and no function without a loop. Files:
+#     run_append_spread, decimal_collections.
 #   7387-self-result-oracle-omits-function (`ir`, `iropt`). #7387 lowers an
 #     interface method whose result is `Self`; the oracle never lowered the
 #     function that calls one. Identity: the oracle lacks only functions the

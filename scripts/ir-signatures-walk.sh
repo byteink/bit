@@ -434,6 +434,28 @@ function loopAt(a, n, j,    h, t, e, i, k, args, B2, back, acc, ref, es, src, Ri
   gHit["loop"] = 1
   return m
 }
+# cseAdds -- #7377 in the optimized dump. The oracle optimizes each block alone, so an `add` after the
+# append loop (in its exit block) was never merged with an identical `add` before it (in the entry
+# block). Once the exit block continues the entry block the tree has the one add and the oracle two.
+# A later `%b = add T x, y` equal to an earlier add of the same straight-line run is dropped and %b is
+# read as the earlier id. SSA: equal operands are equal values, and an earlier line of a run
+# dominates a later one. Only `add`, and only called for a function the loop rewrite fired on.
+function cseAdds(a, n,    i, l, key, seen, rep, out, m) {
+  split("", seen); split("", rep); m = 0
+  for (i = 1; i <= n; i++) {
+    l = mapLine(a[i], rep)
+    if (l !~ /^  /) { split("", seen) }
+    else if (l ~ /^  %[0-9]+ = add [a-z0-9]+ [^ ]+, [^ ]+$/) {
+      key = substr(l, index(l, " = ") + 3)
+      if (key in seen) { rep[defId(l)] = seen[key]; continue }
+      seen[key] = defId(l)
+    }
+    out[++m] = l
+  }
+  for (i = 1; i <= m; i++) { a[i] = out[i] }
+  for (i = m + 1; i <= n; i++) { delete a[i] }
+  return m
+}
 # renumber -- `%N` and `bbN` to first-appearance order in this function. The text of a const_string is
 # never touched (only its own id).
 function renumber(a, n,    i, s, out, tok, pre, map, cnt, first, sym) {
@@ -499,7 +521,7 @@ function procFn(s, k,    a, n, t, i) {
   if (s == "A") { if (kind == "ir") { n = foldPairs(a, n) } n = foldRange(a, n, 1) }
   n = eraseConsts(a, n)
   split("", gHit)
-  if (s == "A") { n = chainRewrite(a, n); n = okRewrite(a, n); n = loopRewrite(a, n) }
+  if (s == "A") { n = chainRewrite(a, n); n = okRewrite(a, n); n = loopRewrite(a, n); if (kind == "iropt" && ("loop" in gHit)) { n = cseAdds(a, n) } }
   for (i in gHit) { fhit[s, k, i] = 1 }
   renumber(a, n)
   fnorm[s, k] = joinLines(a, n)

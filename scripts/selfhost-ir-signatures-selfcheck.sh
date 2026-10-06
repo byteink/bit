@@ -369,6 +369,69 @@ X
   expect "" "$(explainMismatch "${loop_o//  %13 = field_get/  %12 = call @g() i64
   %13 = field_get}" "$loop_t" ir)" "a loop body holding another call"
   expect "" "$(explainMismatch "${loop_o//jump bb1(%15, %6, %7, %8, %17)/jump bb1(%15, %1, %7, %8, %17)}" "$loop_t" ir)" "a loop that replaces its source"
+  # Two rules at once (the optimized run_append_spread, #7471): the loop of 7377 and, because the
+  # exit block now continues the entry block, the `add` the oracle recomputed there.
+  cse_o=$(cat <<'X'
+func f(%0: []i64, %1: []i64, %2: i64, %3: i64, %30: i64, %31: i64) i64 {
+bb0(%0: []i64, %1: []i64, %2: i64, %3: i64, %30: i64, %31: i64):
+  %4 = const_int i64 0
+  %32 = add i64 %30, %31
+  jump bb1(%0, %1, %2, %3, %4)
+bb1(%5: []i64, %6: []i64, %7: i64, %8: i64, %9: i64):
+  %10 = slice_len %6
+  %11 = icmp_slt bool %9, %10
+  br %11, bb2(), bb3(%5)
+bb2():
+  %13 = field_get %6[0] i64
+  %14 = index_get %13[%9] i64
+  %15 = rt_call slice_append(%5, %14, %7, %8) []i64
+  %16 = const_int i64 1
+  %17 = add i64 %9, %16
+  jump bb1(%15, %6, %7, %8, %17)
+bb3(%18: []i64):
+  %19 = add i64 %30, %31
+  %20 = add i64 %19, %32
+  ret %20
+}
+X
+)
+  cse_t=$(cat <<'X'
+func f(%0: []i64, %1: []i64, %2: i64, %3: i64, %30: i64, %31: i64) i64 {
+bb0(%0: []i64, %1: []i64, %2: i64, %3: i64, %30: i64, %31: i64):
+  %32 = add i64 %30, %31
+  %4 = rt_call slice_append_slice(%0, %1, %2, %3) []i64
+  %20 = add i64 %32, %32
+  ret %20
+}
+X
+)
+  expect 7377-append-spread-bulk-move "$(explainMismatch "$cse_o" "$cse_t" iropt)" "iropt: the loop and the add it left twice"
+  expect "" "$(explainMismatch "$cse_o" "$cse_t" ir)" "ir: a repeated add is not folded before the optimizer"
+  expect "" "$(explainMismatch "$cse_o" "${cse_t//add i64 %32, %32/add i64 %32, %30}" iropt)" "iropt: the add reads another value"
+  expect "" "$(explainMismatch "$cse_o" "${cse_t//  %20 = add i64 %32, %32/  %20 = sub i64 %32, %32}" iropt)" "iropt: a different op after the loop"
+  expect "" "$(explainMismatch "${cse_o//%19 = add i64 %30, %31/%19 = add i64 %31, %30}" "$cse_t" iropt)" "iropt: the repeated add has swapped operands"
+  expect "" "$(explainMismatch "${cse_o//%19 = add i64 %30, %31/%19 = add i64 %30, %2}" "$cse_t" iropt)" "iropt: the second add is another value"
+  expect "" "$(explainMismatch "$cse_o" "${cse_t//%32 = add i64 %30, %31/%32 = add i64 %30, %2}" iropt)" "iropt: the tree add is another value"
+  cse_noloop=$(cat <<'X'
+func g(%0: i64, %1: i64) i64 {
+bb0(%0: i64, %1: i64):
+  %2 = add i64 %0, %1
+  %3 = add i64 %0, %1
+  %4 = add i64 %2, %3
+  ret %4
+}
+X
+)
+  cse_noloop_t=$(cat <<'X'
+func g(%0: i64, %1: i64) i64 {
+bb0(%0: i64, %1: i64):
+  %2 = add i64 %0, %1
+  %4 = add i64 %2, %2
+  ret %4
+}
+X
+)
+  expect "" "$(explainMismatch "$cse_noloop" "$cse_noloop_t" iropt)" "iropt: a repeated add with no loop rewritten"
   omit_o=$(cat <<'X'
 func g() void {
 bb0():
