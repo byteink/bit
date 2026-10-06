@@ -38,7 +38,7 @@
 // re-claim needs no separate method or schedule, just the same predicate
 // evaluated on the next poll.
 
-import { Pool, Tx, Rows, Value, Isolation, TxOptions, asInt, asText, txValueAt } from "std/sql"
+import { Pool, Tx, Rows, Value, Isolation, TxOptions, Executor, asInt, asText, txValueAt } from "std/sql"
 import { hasPrefix, contains, parseInt } from "std/strings"
 
 // The SQL engines `SqlStore` and `SqlLocker` speak. `MySql` is the dialect of
@@ -252,10 +252,9 @@ export class SqlStore {
   }
 
   export claim(visibilityTimeout: int): Option<ClaimedJob>! {
-    let nowNs = now().ns
     match (this.dialect) {
-      Postgres => return claimPostgres(this.db, nowNs, visibilityTimeout)?
-      MySql => return claimMysql(this.db, nowNs, visibilityTimeout)?
+      Postgres => return claimPostgres(this.db, visibilityTimeout)?
+      MySql => return claimMysql(this.db, visibilityTimeout)?
     }
   }
 
@@ -288,7 +287,23 @@ const claimPostgresSql: string = "UPDATE bit_jobs SET attempts = attempts + 1, c
   "ORDER BY available_at LIMIT 1 FOR UPDATE SKIP LOCKED) " +
   "RETURNING id, name, payload, attempts, max_attempts"
 
-fn claimPostgres(db: Pool, nowNs: int, visibilityTimeout: int): Option<ClaimedJob>! {
+// THE LEASE CLOCK IS THE CALLER'S, READ ONLY ONCE THE CONNECTION IS OURS
+// (#7452). `enqueue`'s `availableAt` is a caller-clock time and the claim
+// compares it, so the lease must be on the same clock; a server-side `now()`
+// would make every `availableAt` skew-sensitive. What a stall can still do is
+// shorten the lease by however long the claim waited for a pooled connection
+// (seconds under pool exhaustion, a TCP and TLS handshake on a fresh one), so
+// `Pool.pinned` checks the connection out FIRST, with no transaction and no
+// extra round trip, and `now()` is read inside it, immediately before the
+// statement is sent.
+fn claimPostgres(db: Pool, visibilityTimeout: int): Option<ClaimedJob>! {
+  return db.pinned<Option<ClaimedJob>>((ex) => {
+    return claimPostgresOn(ex, visibilityTimeout)?
+  })?
+}
+
+fn claimPostgresOn(db: Executor, visibilityTimeout: int): Option<ClaimedJob>! {
+  let nowNs = now().ns
   let rows = db.query(claimPostgresSql, [Value.Int(nowNs), Value.Int(nowNs + visibilityTimeout)])?
   let has = rows.next()?
   if (!has) {
@@ -309,18 +324,19 @@ const claimMysqlSql: string = "SELECT id, name, payload, attempts, max_attempts 
   "WHERE done = FALSE AND dead_lettered = FALSE AND available_at <= $1 AND claimed_until <= $1 " +
   "ORDER BY available_at LIMIT 1 FOR UPDATE SKIP LOCKED"
 
-fn claimMysql(db: Pool, nowNs: int, visibilityTimeout: int): Option<ClaimedJob>! {
+fn claimMysql(db: Pool, visibilityTimeout: int): Option<ClaimedJob>! {
   return txValueAt<Option<ClaimedJob>>(
     db,
     TxOptions{ isolation = Isolation.ReadCommitted },
     (t) => {
-      return claimMysqlLocked(t, nowNs, visibilityTimeout)?
+      return claimMysqlLocked(t, visibilityTimeout)?
     },
   )?
 }
 
 // The SELECT-then-UPDATE inside `claimMysql`'s transaction.
-fn claimMysqlLocked(t: Tx, nowNs: int, visibilityTimeout: int): Option<ClaimedJob>! {
+fn claimMysqlLocked(t: Tx, visibilityTimeout: int): Option<ClaimedJob>! {
+  let nowNs = now().ns
   let rows = t.query(claimMysqlSql, [Value.Int(nowNs)])?
   let has = rows.next()?
   if (!has) {
@@ -329,11 +345,12 @@ fn claimMysqlLocked(t: Tx, nowNs: int, visibilityTimeout: int): Option<ClaimedJo
   }
   let row = readClaimRow(rows)?
   rows.close()
-  // The lease runs from HERE, not from `nowNs`: `nowNs` was read before the
-  // pool checkout (a fresh connection costs a TCP and TLS handshake) and the
-  // BEGIN and SELECT round trips, and a lease stamped that early is already
-  // that much shorter when the worker receives the job. On a loaded host the
-  // difference exceeded the whole window and a claim came back expired (#7452).
+  // The lease is stamped HERE, not from `nowNs`: the SELECT's round trip sits
+  // between the two, and a lease stamped before it is that much shorter when
+  // the worker receives the job. On a loaded host the difference exceeded the
+  // whole window and a claim came back expired (#7452). `nowNs` itself is read
+  // inside the transaction, after the pool checkout and the BEGIN, for the
+  // same reason (see `claimPostgres`).
   t.exec(
     "UPDATE bit_jobs SET attempts = $1, claimed_until = $2 WHERE id = $3",
     [Value.Int(row.attempts + 1), Value.Int(now().ns + visibilityTimeout), Value.Int(row.id)],
