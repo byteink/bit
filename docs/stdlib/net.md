@@ -376,9 +376,10 @@ fn echo(s: UdpSocket, n: int): ()! {
 ### `resolve(host: string): string!`
 
 Resolves a hostname to an IPv4 address (a dotted quad), asking each nameserver
-in `/etc/resolv.conf` in turn until one answers. A dotted-quad argument comes back unchanged, so
-it is safe on an address that may already be numeric. A records only - no IPv6,
-no search domains, no caching. `dial` and `udpBind` take numeric addresses, so
+in `/etc/resolv.conf` in turn until one answers. A dotted-quad argument or an
+IPv6 literal (no brackets) comes back unchanged, so it is safe on an address
+that may already be numeric. A records only - no AAAA, no search domains, no
+caching. `dial` and `udpBind` take numeric addresses, so
 resolve first:
 
 ```bit

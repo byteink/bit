@@ -162,9 +162,14 @@ just against a smaller trust set.
   so a failed one does fail there; a server-side `accept()` cannot, since it
   has not run the handshake yet.
 - **`dial` defaults `serverName` to its `host` argument.** Set
-  `config.serverName` explicitly only when you are connecting to an IP
-  address or a proxy and need the certificate checked against a different
-  name.
+  `config.serverName` explicitly only when you are connecting through a proxy
+  and need the certificate checked against a different name.
+- **An IP address as `host` is verified, never named.** `dial("::1", ...)`,
+  `dial("[::1]", ...)` and `dial("127.0.0.1", ...)` send no server_name in the
+  ClientHello (RFC 6066 section 3 forbids a literal address there), and the
+  certificate must carry that address as an iPAddress SubjectAltName: 4 bytes
+  for IPv4, 16 for IPv6, an IPv4-mapped IPv6 form being the same address as its
+  IPv4 form. A dNSName or a CN spelling the address does not match.
 
 ## Where to go next
 
