@@ -1,0 +1,145 @@
+// DNS resolver policy for std/net (#6350): the ONE place the timeout and the
+// retry count of a lookup are decided. The runtime owns neither number; it takes
+// both through `bit_rt_net_resolve_w` and `bit_rt_net_lookup_txt_w`
+// (runtime/ABI.md section 20), so what `resolveBudgetMs` promises a caller and
+// what the resolver spends cannot drift apart.
+//
+// The policy is resolv.conf(5)'s, as glibc reads it:
+//
+//   options timeout:N attempts:N
+//
+// `timeout:N` is the receive window of ONE attempt in seconds (default 5, capped
+// at 30) and `attempts:N` how many times a nameserver is asked before the next
+// is tried (default 2, capped at 5). Where the platform has no resolv.conf
+// (Windows) or it cannot be read, the defaults stand. A later `options` line
+// overrides an earlier one; an unknown option, a malformed number and a value
+// below 1 are ignored, so the default holds for that key.
+//
+// One deliberate difference from glibc: `attempts` here is per nameserver, not
+// the number of passes over the whole list, because the runtime walks the list
+// once and gives each server its own budget (#6338). That makes the worst case
+// exactly `servers x attempts x timeout`, which is what `resolveBudgetMs`
+// returns.
+
+// glibc's RES_TIMEOUT and RES_DFLRETRY, in milliseconds and attempts.
+const dnsDefaultTimeoutMs: int = 5000
+const dnsDefaultAttempts: int = 2
+
+// glibc's RES_MAXRETRANS (seconds) and RES_MAXRETRY: what a resolv.conf asking
+// for more is silently held to.
+const dnsMaxTimeoutSec: int = 30
+const dnsMaxAttempts: int = 5
+
+// The resolver reads at most this many bytes of /etc/resolv.conf
+// (`resolvConfMax`, `runtime/net/{darwin,linux}/netabi.bit`), so a
+// `nameserver` line past it is never tried and must not be budgeted.
+const resolvConfScanBytes: int = 4096
+
+// What a lookup is asked under: one attempt's window, how many attempts a
+// nameserver gets, and how many nameservers the file names (an upper bound on
+// the servers tried: a line whose address does not parse is skipped by the
+// resolver and counted here).
+class DnsPolicy {
+  timeoutMs: int,
+  attempts: int,
+  servers: int,
+}
+
+// Whether `l` is a `kw` line: the keyword, then a space or a tab, then more.
+fn hasKeyword(l: string, kw: string): bool {
+  let n = len(kw)
+  return len(l) > n && hasPrefix(l, kw) && (l[n] == ' ' || l[n] == '\t')
+}
+
+// `tok`'s number when it is `key` followed by a whole number of at least 1, else
+// 0. `timeout:5` with key `timeout:` is 5; `timeout:abc`, `timeout:0` and
+// `attempts:2` are 0.
+fn optionValue(tok: string, key: string): int {
+  if (!hasPrefix(tok, key)) {
+    return 0
+  }
+  let n = parseInt(tok[len(key):len(tok)]) catch _ {
+    return 0
+  }
+  if (n < 1) {
+    return 0
+  }
+  return n
+}
+
+// One `options` token applied to `p`.
+fn applyDnsOption(p: DnsPolicy, tok: string) {
+  let t = optionValue(tok, "timeout:")
+  if (t > 0) {
+    if (t > dnsMaxTimeoutSec) {
+      t = dnsMaxTimeoutSec
+    }
+    p.timeoutMs = t * 1000
+  }
+  let a = optionValue(tok, "attempts:")
+  if (a > 0) {
+    if (a > dnsMaxAttempts) {
+      a = dnsMaxAttempts
+    }
+    p.attempts = a
+  }
+}
+
+// The options of one `options` line: every space- or tab-separated token.
+fn applyDnsOptions(p: DnsPolicy, line: string) {
+  let toks = split(replace(line, "\t", " "), " ")
+  let i = 0
+  while (i < len(toks)) {
+    applyDnsOption(p, toks[i])
+    i = i + 1
+  }
+}
+
+// The policy `conf` (a resolv.conf's text) describes: its `options` over the
+// defaults, and its `nameserver` line count, both within the first
+// `resolvConfScanBytes` bytes the resolver reads.
+fn parseDnsPolicy(conf: string): DnsPolicy {
+  let p = DnsPolicy{ timeoutMs = dnsDefaultTimeoutMs, attempts = dnsDefaultAttempts, servers = 0 }
+  let head = conf
+  if (len(head) > resolvConfScanBytes) {
+    head = conf[0:resolvConfScanBytes]
+  }
+  let lines = split(head, "\n")
+  let i = 0
+  while (i < len(lines)) {
+    let l = trimSpace(lines[i])
+    if (hasKeyword(l, "nameserver")) {
+      p.servers = p.servers + 1
+    } else if (hasKeyword(l, "options")) {
+      applyDnsOptions(p, l[7:len(l)])
+    }
+    i = i + 1
+  }
+  return p
+}
+
+// This machine's policy. An unreadable resolv.conf is the defaults with no
+// servers, which `resolveBudgetMs` budgets as one.
+fn readDnsPolicy(): DnsPolicy {
+  let conf = readFile("/etc/resolv.conf") catch _ {
+    return parseDnsPolicy("")
+  }
+  return parseDnsPolicy(conf)
+}
+
+// The longest `resolve` can take on this machine, in milliseconds: every
+// nameserver in /etc/resolv.conf is tried in turn (#6338), each for up to its
+// full retry budget (`attempts` windows of `timeout`), so the worst case scales
+// with the number of servers (at least one: an empty or unreadable file fails at
+// once, which the floor of 1 over-counts safely). A caller that races `resolve`
+// (through `std/tls.dial` or `std/http.get`) against its own timer must give
+// that timer at least this much plus whatever connecting and transferring
+// needs, or slow but eventually successful DNS reads as a timeout.
+export fn resolveBudgetMs(): int {
+  let p = readDnsPolicy()
+  let n = p.servers
+  if (n < 1) {
+    n = 1
+  }
+  return n * p.attempts * p.timeoutMs
+}
