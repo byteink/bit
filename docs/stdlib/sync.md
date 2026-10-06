@@ -283,6 +283,9 @@ The pool's tunables. Every field has a default, so `PoolOptions{}` is a
 complete, working configuration.
 
 - `maxSize` - the most resources open at once (default 10).
+- `maxIdle` - how many resources may sit idle; a resource released above
+  this is closed instead of parked (default -1, no cap beyond `maxSize`; 0
+  parks nothing).
 - `minIdle` - how many idle resources `maxIdleTime` will not reap below
   (default 0).
 - `maxIdleTime` - retire a resource idle this many milliseconds (default
