@@ -170,7 +170,7 @@ fn archiveWithLock(db: Pool, id: string): int! {
   return db.pinned<int>((conn) => {
     conn.exec("SELECT GET_LOCK('archive', -1)", []Value(0))?
     defer releaseArchiveLock(conn)
-    return conn.exec("UPDATE drafts SET status = 'archived' WHERE id = ?", [Value.Text(id)])?
+    return conn.exec("UPDATE drafts SET status = 'archived' WHERE id = ?", [Value.Text(id)])?.rowsAffected
   })?
 }
 
@@ -413,11 +413,33 @@ driver's own.
 ### `Conn`
 
 A single logical database connection, as handed back by `Registry.open`:
-`query(sqlText, params): Rows!`, `exec(sqlText, params): int!`,
+`query(sqlText, params): Rows!`, `exec(sqlText, params): ExecResult!`,
 `prepare(sqlText): Stmt!`, `begin(opts: TxOptions): Tx!`, `close()`. `query` runs SQL
 expected to produce a row set; `exec` runs SQL expected only to change rows
-and reports how many were affected. Several green threads may hold and use
-the same `Conn` at once.
+and reports what it did as an `ExecResult`. Several green threads may hold
+and use the same `Conn` at once.
+
+### `ExecResult`
+
+What `exec` reports: `rowsAffected: int`, the server's own count of the rows
+the statement changed, and `lastInsertId: Option<int>`, the id the server
+generated for an auto-increment column. MySQL reports the id in the reply to
+the statement itself: for a multi-row `INSERT` it is the first generated id,
+and `Some(0)` when the statement generated none. A driver whose protocol has
+no such report leaves it `None`; on Postgres, `INSERT ... RETURNING` through
+`query` is how a generated id comes back.
+
+```bit
+import { Pool, Value } from "std/sql"
+
+fn addNote(db: Pool, body: string): int! {
+  let res = db.exec("INSERT INTO notes (body) VALUES (?)", [Value.Text(body)])?
+  match (res.lastInsertId) {
+    Some(id) => { return id }
+    None => { fail newError("this driver reports no generated id") }
+  }
+}
+```
 
 ### `TxOptions`
 
@@ -453,7 +475,7 @@ the current row.
 ### `Stmt`
 
 A prepared statement, from `Conn.prepare`: `query(params): Rows!`,
-`exec(params): int!`, `close()`. `params` is positional, in the same order
+`exec(params): ExecResult!`, `close()`. `params` is positional, in the same order
 as the placeholders in the SQL text the statement was prepared from.
 
 ### `Tx`
@@ -550,9 +572,9 @@ Runs `sqlText` and returns its rows. The connection stays checked out until
 the returned `Rows` is closed, so a caller that never closes its `Rows`
 leaks a connection.
 
-### `Pool.exec(sqlText: string, params: []Value): int!`
+### `Pool.exec(sqlText: string, params: []Value): ExecResult!`
 
-Runs `sqlText` for its effect and returns the number of rows it changed. The
+Runs `sqlText` for its effect and returns what it did (`ExecResult`). The
 connection is back in the pool before this returns.
 
 ### `Pool.close()`
@@ -618,7 +640,7 @@ never a replica, until the caller takes a fresh `Session`.
 Routes to the writer once this handle has written; otherwise the same
 routing `Pool.query` itself uses.
 
-### `Session.exec(sqlText: string, params: []Value): int!`
+### `Session.exec(sqlText: string, params: []Value): ExecResult!`
 
 Always runs on the writer, and marks this handle sticky once the write has
 actually committed.
@@ -649,7 +671,7 @@ the one implementation; the other three are spellings of it.
 ### `Executor`
 
 Anything statements can run on: `query(sqlText, params): Rows!`,
-`exec(sqlText, params): int!`. A `Pool` and a running `Tx` both satisfy it,
+`exec(sqlText, params): ExecResult!`. A `Pool` and a running `Tx` both satisfy it,
 so a function that takes an `Executor` instead of a `Pool` composes: the
 caller decides whether it runs standalone or inside a transaction.
 
