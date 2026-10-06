@@ -3076,10 +3076,8 @@ defined exactly once).
 | `bit_rt_aes_hw_expand_key` | `(key: i64, keyBits: i64, roundKeys: i64) -> void` (§21d) |
 | `bit_rt_aes_hw_encrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
 | `bit_rt_aes_hw_decrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
-| `bit_rt_ghash_hw_mul` | `(h: i64, x: i64, out: i64) -> void` (§21e) |
-| `bit_rt_ghash_hw_blocks` | `(h: i64, state: i64, data: i64, blocks: u64) -> void` (§21e) |
 | `bit_rt_ghash_hw_keys` | `(h: i64, keys: i64, keysLen: i64) -> void` (§21e, #7460: the key table for subkey H, built once per key into a caller buffer of at least 304 bytes) |
-| `bit_rt_ghash_hw_blocks_keyed` | `(keys: i64, state: i64, data: i64, blocks: u64) -> void` (§21e, #7460: `bit_rt_ghash_hw_blocks` under that table instead of H) |
+| `bit_rt_ghash_hw_blocks_keyed` | `(keys: i64, state: i64, data: i64, blocks: u64) -> void` (§21e, #7460: folds `blocks` 16-byte blocks into `state` under that table) |
 | `bit_rt_sha256_hw_blocks` | `(state: i64, data: i64, blocks: u64) -> void` (§21f) |
 | `bit_rt_bytes_copy`   | `(dst: *byte, src: *byte, n: i64) -> void` (§11.4/§11.7, `@nosplit`, bounded by `n` — copies `n` bytes; regions must be disjoint) |
 | `bit_rt_bytes_equal`  | `(a: *byte, b: *byte, n: i64) -> bool` (§11.4/§11.7, `@nosplit`, bounded by `n`) |
@@ -4892,25 +4890,21 @@ unchanged, `dw[i] = AESIMC(w[Nr-i])` for the interior keys.
 ## 21e. ARM64 GHASH (`runtime/cryptohw/armghash.bit`)
 
 ```
-bit_rt_ghash_hw_mul(h, x, out)             // out = H*X in GF(2^128), GCM bit order
-bit_rt_ghash_hw_blocks(h, state, data, blocks)  // fold `blocks` 16-byte blocks into state
 bit_rt_ghash_hw_keys(h, keys, keysLen)     // write H's key table into `keys` (#7460)
 bit_rt_ghash_hw_blocks_keyed(keys, state, data, blocks)  // fold under that table
 ```
 
 Every pointer is a raw address (`int`) except `blocks`, a `u64` count.
-`h`/`x`/`out`/`state` point at 16-byte buffers; `data` at `16*blocks` bytes.
-`bit_rt_ghash_hw_mul`'s `out` may alias `h` and/or `x` — both operands are
-fully read before `out` is written. `bit_rt_ghash_hw_blocks` implements the
-same recurrence `stdlib/crypto/gcm.bit`'s software `gcmAbsorb` does: `state =
-(state XOR block) * H`, once per block, in order.
+`h`/`state` point at 16-byte buffers; `data` at `16*blocks` bytes.
+`bit_rt_ghash_hw_blocks_keyed` implements the same recurrence
+`stdlib/crypto/gcm.bit`'s software `gcmAbsorb` does: `state =
+(state XOR block) * H`, once per block, in order. (#7481 retired the two earlier pins, which took H instead
+of a key table and rebuilt H's powers on every call.)
 
-**The key table (#7460).** `bit_rt_ghash_hw_blocks` builds H's powers on
-every call. `bit_rt_ghash_hw_keys` builds them once into the caller's
-`keysLen`-byte buffer at `keys` and panics when `keysLen` is under 304;
-`bit_rt_ghash_hw_blocks_keyed` is `bit_rt_ghash_hw_blocks` with that buffer in
-place of `h`. The layout is per arch and private to the runtime (x86-64:
-H^1..H^8 with their Karatsuba keys, the PSHUFB mask and H's wire bytes, 288
+**The key table (#7460).** `bit_rt_ghash_hw_keys` builds H's powers once into
+the caller's `keysLen`-byte buffer at `keys` and panics when `keysLen` is
+under 304; `bit_rt_ghash_hw_blocks_keyed` folds against that buffer. The
+layout is per arch and private to the runtime (x86-64: H^1..H^8 with their Karatsuba keys, the PSHUFB mask and H's wire bytes, 288
 bytes; arm64: twisted H^1..H^4, 64 bytes), written at the buffer's first
 16-byte boundary, which is stable because the collector never moves an
 object (§8). The caller keeps the buffer alive across both calls and never
@@ -4926,10 +4920,9 @@ x^128+x^7+x^2+x+1, #7385). Every exported function first calls
 "optional extension, SIGILL otherwise" reason §21d documents for AES.
 
 On arm64 the fold is one PMULL/PMULL2 asm loop (#7403): twisted H and its
-powers H^2..H^4 are computed once per call (once per key through the keyed
-pin), four blocks share one reduction,
-and one asm call folds at most 4096 blocks so the Bit loop reaches a
-safepoint. `stdlib/crypto/gcm.bit` calls the keyed pins when `AesGcm.pmull` is set.
+powers H^2..H^4 are computed once per key by the keys pin, four blocks
+share one reduction, and one asm call folds at most 4096 blocks so the Bit
+loop reaches a safepoint. `stdlib/crypto/gcm.bit` calls the keyed pins when `AesGcm.pmull` is set.
 
 **The algorithm.** PMULL always treats a 64-bit register as LSB-first (bit 0
 = coefficient of x^0); GHASH's own bit order (SP 800-38D §6.3) is MSB-first
