@@ -39,7 +39,7 @@ A job is a class with a stable name and a JSON-shaped payload. `open`
 builds a queue over a `Store`; `register` tells it what to do with a job
 type; `enqueue` adds one. `jobs` ships no default store (this package's own
 README), so every runnable example on this page opens a `SqlStore` -
-see [PostgreSQL and MySQL](sql.md) for what `migrate` and `SqlStore` do.
+see [PostgreSQL, MySQL and MariaDB](sql.md) for what `migrate` and `SqlStore` do.
 
 ```bit
 import { pool, Datasource } from "std/sql"
@@ -204,6 +204,6 @@ for the work to finish.
 
 ## Next
 
-[PostgreSQL and MySQL](sql.md): a real `Store`, the migration, writing your own
+[PostgreSQL, MySQL and MariaDB](sql.md): a real `Store`, the migration, writing your own
 store, and why a handler that runs the same job twice must produce the
 same result.

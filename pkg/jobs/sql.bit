@@ -1,18 +1,20 @@
 // pkg/jobs/sql.bit — a `Store` (store.bit) backed by a `std/sql.Pool` on
-// PostgreSQL or MySQL 8.0.1+, using `SELECT ... FOR UPDATE SKIP LOCKED` so N
+// PostgreSQL, MySQL 8.0.1+ or MariaDB 10.6+, using `SELECT ... FOR UPDATE SKIP LOCKED` so N
 // workers polling concurrently never claim the same row (#6082, #7320, epic
-// #4023).
+// #4023, #7436).
 //
-// ONE STORE, TWO DIALECTS. `SqlStore(pool)` asks the server what it is once,
+// ONE STORE, TWO DIALECTS (MySQL and MariaDB speak the second). `SqlStore(pool)` asks the server what it is once,
 // at construction (`detectDialect`), and keeps the answer. `Pool` carries no
 // driver name and `std/sql` knows no dialect (stdlib/sql/tx.bit's header), and
 // `SELECT version()` is the one statement both engines answer: PostgreSQL
-// reports `PostgreSQL 18.6 ...`, MySQL `8.4.0`. The server's own answer also
-// carries the version, which is what lets construction REFUSE a MySQL older
-// than 8.0.1, the first release with `SKIP LOCKED`, instead of failing on the
-// first `claim` with a syntax error under load. MariaDB is refused by name: its
-// `SKIP LOCKED` arrived with a different version line and this package is not
-// run against it.
+// reports `PostgreSQL 18.6 ...`, MySQL `8.4.0`, MariaDB `11.4.2-MariaDB`. The
+// server's own answer also carries the version, which is what lets
+// construction REFUSE a MySQL older than 8.0.1 or a MariaDB older than 10.6, the
+// first releases with `SKIP LOCKED`, instead of failing on the first `claim`
+// with a syntax error under load. MariaDB takes the MySQL dialect unchanged:
+// its `UPDATE` has no `RETURNING` before 13.0 (https://mariadb.com/kb/en/update/),
+// so there is no one-statement claim to prefer, and `INSERT`/`DELETE ...
+// RETURNING` would buy the lease queries nothing.
 //
 // ONLY TWO STATEMENTS DIFFER PER ENGINE, besides the DDL: `claim` (below) and
 // the lease queries (sqllocker.bit). `enqueue`, `complete`, `retry` and
@@ -39,13 +41,18 @@
 import { Pool, Tx, Rows, Value, Isolation, asInt, asText, txValueAt } from "std/sql"
 import { hasPrefix, contains, parseInt } from "std/strings"
 
-// The SQL engines `SqlStore` and `SqlLocker` speak.
+// The SQL engines `SqlStore` and `SqlLocker` speak. `MySql` is the dialect of
+// MySQL 8.0.1+ and of MariaDB 10.6+.
 export enum Dialect { Postgres, MySql }
 
-// The lowest MySQL release with `SELECT ... FOR UPDATE SKIP LOCKED`
-// (https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-1.html).
+// The lowest release of each MySQL-family server with `SELECT ... FOR UPDATE
+// SKIP LOCKED`: MySQL 8.0.1
+// (https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-1.html), MariaDB
+// 10.6 (https://mariadb.com/kb/en/what-is-mariadb-106/).
 const mysqlMajor: int = 8
 const mysqlPatch: int = 1
+const mariadbMajor: int = 10
+const mariadbMinor: int = 6
 
 // What `SELECT version()` said, as the dialect it names, or a failure naming
 // the server and what this package needs. Pure, so `sql.test.bit` can feed it
@@ -54,12 +61,15 @@ fn dialectOfVersion(version: string): Dialect! {
   if (hasPrefix(version, "PostgreSQL ")) {
     return Dialect.Postgres
   }
-  if (contains(version, "MariaDB")) {
-    fail newError("jobs: SqlStore does not support MariaDB (the server reported '${version}'); use PostgreSQL or MySQL 8.0.1 or newer")
-  }
   let parts = versionNumbers(version)
   if (len(parts) != 3) {
-    fail newError("jobs: SqlStore supports PostgreSQL and MySQL 8.0.1 or newer; the server reported '${version}'")
+    fail newError("jobs: SqlStore supports PostgreSQL, MySQL 8.0.1 or newer and MariaDB 10.6 or newer; the server reported '${version}'")
+  }
+  if (contains(version, "MariaDB")) {
+    if (!mariadbHasSkipLocked(parts)) {
+      fail newError("jobs: MariaDB ${version} is too old for SqlStore: claiming jobs needs SELECT ... FOR UPDATE SKIP LOCKED, which MariaDB has had since 10.6")
+    }
+    return Dialect.MySql
   }
   if (!mysqlHasSkipLocked(parts)) {
     fail newError("jobs: MySQL ${version} is too old for SqlStore: claiming jobs needs SELECT ... FOR UPDATE SKIP LOCKED, which MySQL has had since 8.0.1")
@@ -77,8 +87,15 @@ fn mysqlHasSkipLocked(parts: []int): bool {
   return parts[2] >= mysqlPatch
 }
 
-// The leading `major.minor.patch` of a MySQL version string (`8.4.0`,
-// `5.7.44-log`, `8.0.36-0ubuntu0.22.04.1`), or an empty slice when the text
+fn mariadbHasSkipLocked(parts: []int): bool {
+  if (parts[0] != mariadbMajor) {
+    return parts[0] > mariadbMajor
+  }
+  return parts[1] >= mariadbMinor
+}
+
+// The leading `major.minor.patch` of a MySQL or MariaDB version string
+// (`8.4.0`, `5.7.44-log`, `11.4.2-MariaDB`, `8.0.36-0ubuntu0.22.04.1`), or an empty slice when the text
 // does not start with three dotted numbers.
 fn versionNumbers(version: string): []int {
   let out = []int(0)
@@ -220,7 +237,7 @@ export class SqlStore {
   dialect: Dialect
 
   // A fresh store over an already-open pool. Fails when the server is not
-  // PostgreSQL or MySQL 8.0.1+ (`detectDialect`), so a store the server cannot
+  // PostgreSQL, MySQL 8.0.1+ or MariaDB 10.6+ (`detectDialect`), so a store the server cannot
   // serve never exists.
   init(db: Pool)! {
     this.db = db
@@ -283,7 +300,7 @@ fn claimPostgres(db: Pool, nowNs: int, visibilityTimeout: int): Option<ClaimedJo
   return Option.Some(job)
 }
 
-// MySQL has no `UPDATE ... RETURNING`, so its claim cannot be one statement: it
+// MySQL (and MariaDB before 13.0) has no `UPDATE ... RETURNING`, so its claim cannot be one statement: it
 // is one transaction of two, `SELECT ... FOR UPDATE SKIP LOCKED` then an
 // `UPDATE` by id (BEGIN ISOLATION LEVEL, SELECT, UPDATE, COMMIT on the wire).
 // READ COMMITTED, so the scan takes record locks and no gap locks and a
