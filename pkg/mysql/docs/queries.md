@@ -74,7 +74,9 @@ fn transferCents(db: Pool, fromId: string, toId: string, cents: int): ()! {
 }
 ```
 
-`Conn.begin` sends `START TRANSACTION` over `COM_QUERY`; `commit`/`rollback`
+`Conn.begin` sends `START TRANSACTION` over `COM_QUERY`, with `READ ONLY`
+appended when `db.txAt(TxOptions{ readOnly = true }, ...)` asked for it (the
+server then refuses every write in the block); `commit`/`rollback`
 send `COMMIT`/`ROLLBACK` on that same connection. A level given with
 `db.txAt` reaches `begin` in the `TxOptions`, and the driver sends `SET
 TRANSACTION ISOLATION LEVEL ...` first, then `START TRANSACTION`, because MySQL

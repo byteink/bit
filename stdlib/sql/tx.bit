@@ -41,15 +41,18 @@
 // inside a caller's transaction with no second entry point and no second
 // spelling.
 //
-// FOUR ENTRY POINTS, BECAUSE BIT HAS NEITHER DEFAULT ARGUMENTS NOR A `()` TYPE
-// ARGUMENT. `tx`/`txAt` take a block that returns nothing; `txValue`/
-// `txValueAt` return the block's own value on commit, so a transaction can
-// produce an inserted id without a mutable captured outside it. The `*At` pair
-// takes the isolation level; the other two run at the database's own default.
-// A type parameter cannot be instantiated at `()` (E0068), which is why the
-// value form cannot also serve the block that returns nothing, and there are no
-// default arguments (SPEC §10.3's `param` production has no default-value form)
-// to fold the level into one name.
+// FOUR ENTRY POINTS, BECAUSE A TYPE PARAMETER CANNOT BE `()`. `tx`/`txAt` take
+// a block that returns nothing; `txValue`/`txValueAt` return the block's own
+// value on commit, so a transaction can produce an inserted id without a
+// mutable captured outside it. A type parameter cannot be instantiated at `()`
+// (E0068), which is why the value form cannot also serve the block that
+// returns nothing.
+//
+// The options are one typed value, not a method per option. The `*At` pair
+// takes a `TxOptions` (./sql.bit: isolation level and read-only) BEFORE the
+// block: a defaulted parameter must be trailing (SPEC §10.3), which would put
+// the options after a multi-line closure, away from the `tx` they qualify. The
+// other two run at the database's own defaults.
 //
 // THE ONLY SQL THIS FILE BUILDS BY INTERPOLATION IS A SAVEPOINT NAME, AND THAT
 // NAME IS AN INTEGER THIS MODULE COUNTED OUT ITSELF (`bit_sp_1`, `bit_sp_2`,
@@ -57,11 +60,14 @@
 // intact, and it has to be built this way because no SQL dialect accepts a
 // placeholder where a savepoint name goes.
 //
-// THE ISOLATION LEVEL TRAVELS WITH THE BEGIN. `enter` hands the driver a
+// THE OPTIONS TRAVEL WITH THE BEGIN. `enter` hands the driver the caller's
 // `TxOptions` (./sql.bit) and the driver emits its own dialect's one correct
-// form, because this module knows no dialect: Postgres folds the level into
-// `BEGIN ISOLATION LEVEL x`, and MySQL sends `SET TRANSACTION ISOLATION LEVEL x`
-// BEFORE `START TRANSACTION`, which it requires (error 1568 once one is open).
+// form, because this module knows no dialect: Postgres folds them into
+// `BEGIN ISOLATION LEVEL x READ ONLY`, and MySQL sends `SET TRANSACTION
+// ISOLATION LEVEL x` BEFORE `START TRANSACTION READ ONLY`, which it requires
+// (error 1568 once one is open). A read-only transaction makes the server
+// refuse every write in it with its own error, and some proxies route it to a
+// replica.
 
 import { runRecovering } from "std/runtime"
 
@@ -94,12 +100,14 @@ export interface Executor {
 // unchanged. `db` is the pool, or the handle of a transaction already running —
 // in which case this is a savepoint inside it.
 export fn tx(db: Executor, f: (Tx) => ()!): ()! {
-  txAt(db, Isolation.Default, f)?
+  txAt(db, TxOptions{}, f)?
 }
 
-// `tx`, at the isolation level `level` instead of the database's own.
-export fn txAt(db: Executor, level: Isolation, f: (Tx) => ()!): ()! {
-  let _ = txValueAt<bool>(db, level, (t) => {
+// `tx`, with the isolation level and read-only flag in `opts` instead of the
+// database's own defaults. `TxOptions{ readOnly = true }` is a read-only
+// transaction at the database's own level.
+export fn txAt(db: Executor, opts: TxOptions, f: (Tx) => ()!): ()! {
+  let _ = txValueAt<bool>(db, opts, (t) => {
     f(t)?
     return true
   })?
@@ -109,13 +117,13 @@ export fn txAt(db: Executor, level: Isolation, f: (Tx) => ()!): ()! {
 // Nothing is returned on a failure: the value is only a result if the work it
 // describes is durable.
 export fn txValue<T>(db: Executor, f: (Tx) => T!): T! {
-  return txValueAt<T>(db, Isolation.Default, f)?
+  return txValueAt<T>(db, TxOptions{}, f)?
 }
 
-// `txValue`, at the isolation level `level` instead of the database's own. This
-// is the one implementation; the other three are spellings of it.
-export fn txValueAt<T>(db: Executor, level: Isolation, f: (Tx) => T!): T! {
-  let scope = enter(db, level)?
+// `txValue`, with `opts` instead of the database's own defaults. This is the
+// one implementation; the other three are spellings of it.
+export fn txValueAt<T>(db: Executor, opts: TxOptions, f: (Tx) => T!): T! {
+  let scope = enter(db, opts)?
   let out: T
   let failed = false
   let cause = newError("sql: tx: the block failed without reporting an error")
@@ -202,17 +210,23 @@ class scopedTx {
     }
   }
 
-  // Opens a savepoint inside this scope. A level cannot be given: isolation is
-  // a property of the transaction, and a savepoint is not a transaction — a
-  // nested call that asked for one would be asking for something SQL cannot do,
-  // and silently ignoring it would be worse.
-  nest(level: Isolation): scopedTx! {
+  // Opens a savepoint inside this scope. Options cannot be given: isolation
+  // and read-only are properties of the transaction, and a savepoint is not a
+  // transaction — a nested call that asked for either would be asking for
+  // something SQL cannot do, and silently ignoring it would be worse.
+  nest(opts: TxOptions): scopedTx! {
     this.usable()?
-    match (level) {
+    match (opts.isolation) {
       Default => {}
       _ => fail newError(
           "sql: tx: a transaction already running cannot change isolation " +
           "level; the nested block is a savepoint of it",
+      )
+    }
+    if (opts.readOnly) {
+      fail newError(
+          "sql: tx: a transaction already running cannot become read-only; " +
+          "the nested block is a savepoint of it",
       )
     }
     this.st.seq = this.st.seq + 1
@@ -269,10 +283,10 @@ class scopedTx {
 
 // Opens the scope a block runs in: a transaction on a connection the pool pins
 // to it, or a savepoint inside the transaction `db` is the handle of.
-fn enter(db: Executor, level: Isolation): scopedTx! {
+fn enter(db: Executor, opts: TxOptions): scopedTx! {
   let (outer, nested) = db.(scopedTx)
   if (nested) {
-    return outer.nest(level)?
+    return outer.nest(opts)?
   }
   let (p, isPool) = db.(Pool)
   if (!isPool) {
@@ -281,7 +295,7 @@ fn enter(db: Executor, level: Isolation): scopedTx! {
         "Pool, or the handle the enclosing block was given",
     )
   }
-  let inner = p.begin(TxOptions{ isolation = level })?
+  let inner = p.begin(opts)?
   return scopedTx{ st = txState{ inner = inner }, name = "" }
 }
 

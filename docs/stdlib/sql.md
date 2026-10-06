@@ -144,8 +144,27 @@ fn createDraft(db: Pool, title: string): i64! {
 }
 ```
 
-`txAt`/`txValueAt` take an `Isolation` level instead of the database's own
-default. **A `tx` nested inside another is a SAVEPOINT**, not a second
+`txAt`/`txValueAt` take a `TxOptions` before the block instead of the
+database's own defaults: an `Isolation` level, and `readOnly`. A read-only
+transaction makes the server refuse every write in it with its own error (the
+Postgres `cannot execute INSERT in a read-only transaction`, the MySQL
+`Cannot execute statement in a READ ONLY transaction`), and lets the database
+skip write bookkeeping; reads work as usual:
+
+```bit
+import { Pool, Value, Isolation, TxOptions, asInt, txAt } from "std/sql"
+
+fn draftCount(db: Pool): ()! {
+  txAt(db, TxOptions{ isolation = Isolation.RepeatableRead, readOnly = true }, (t) => {
+    let rows = t.query("SELECT COUNT(*) FROM drafts", []Value(0))?
+    defer rows.close()
+    let _ = rows.next()?
+    println("drafts: ${asInt(rows.value(0))?}")
+  })?
+}
+```
+
+**A `tx` nested inside another is a SAVEPOINT**, not a second
 transaction - naming which one by passing the handle, since Bit has no
 ambient "current transaction" a shared `Pool` could answer for the wrong
 caller. An inner failure rolls back only the inner block; the outer one
@@ -446,8 +465,8 @@ fn addNote(db: Pool, body: string): int! {
 What a transaction is opened with, passed to `Conn.begin` so the driver emits
 its own dialect's one correct form: `isolation: Isolation` and `readOnly:
 bool`. The zero value is the database's own defaults, and `Isolation.Default`
-is variant 0 for exactly that reason. `tx`/`txAt` build it from the level they
-were given; a driver reads it:
+is variant 0 for exactly that reason. `txAt`/`txValueAt` pass the `TxOptions` they
+were given, and `tx`/`txValue` pass the zero value; a driver reads it:
 
 ```text
 begin(opts: TxOptions): Tx! {
@@ -587,18 +606,19 @@ still checked out is closed as it is returned. Safe to call more than once.
 `tx` as a method: runs `f` in a transaction at the database's own isolation
 level.
 
-### `Pool.txAt(level: Isolation, f: (Tx) => ()!): ()!`
+### `Pool.txAt(opts: TxOptions, f: (Tx) => ()!): ()!`
 
-`Pool.tx` at the isolation level `level` instead of the database's own.
+`Pool.tx` with the isolation level and read-only flag in `opts` instead of the
+database's own defaults.
 
 ### `Pool.txValue<T>(f: (Tx) => T!): T!`
 
 `txValue` as a method: runs `f` in a transaction and returns what `f`
 returned, once the commit has succeeded.
 
-### `Pool.txValueAt<T>(level: Isolation, f: (Tx) => T!): T!`
+### `Pool.txValueAt<T>(opts: TxOptions, f: (Tx) => T!): T!`
 
-`Pool.txValue` at the isolation level `level` instead of the database's own.
+`Pool.txValue` with `opts` instead of the database's own defaults.
 
 ### `Pool.session(): Session`
 
@@ -653,9 +673,12 @@ Runs `f` in a transaction at the database's own isolation level. `db` is the
 pool, or the handle of a transaction already running, in which case this is
 a savepoint inside it rather than a second transaction.
 
-### `txAt(db: Executor, level: Isolation, f: (Tx) => ()!): ()!`
+### `txAt(db: Executor, opts: TxOptions, f: (Tx) => ()!): ()!`
 
-`tx`, at `level` instead of the database's own isolation level.
+`tx`, with the isolation level and read-only flag in `opts` instead of the
+database's own defaults. A `txAt` nested inside a running transaction is a
+savepoint and cannot change either: asking for a level or `readOnly = true`
+there fails.
 
 ### `txValue<T>(db: Executor, f: (Tx) => T!): T!`
 
@@ -663,9 +686,9 @@ a savepoint inside it rather than a second transaction.
 Nothing is returned on a failure, because a value is only a result if the
 work behind it is durable.
 
-### `txValueAt<T>(db: Executor, level: Isolation, f: (Tx) => T!): T!`
+### `txValueAt<T>(db: Executor, opts: TxOptions, f: (Tx) => T!): T!`
 
-`txValue`, at `level` instead of the database's own isolation level. This is
+`txValue`, with `opts` instead of the database's own defaults. This is
 the one implementation; the other three are spellings of it.
 
 ### `Executor`
