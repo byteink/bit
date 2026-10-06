@@ -1,0 +1,109 @@
+// #7442: `Ticker.stop()` returned true and one more tick still arrived.
+// `chanTimerExpireSlot` (`runtime/sched/timerchan.bit`) re-armed a periodic slot
+// and dropped the pool lock before its send, so a `stop()` landing in that gap
+// freed the slot, returned true, and the send then landed: a tick after a
+// successful stop, against Go's `Ticker.Stop` contract.
+//
+// THE GAP IS ~20ns, so a bare stop loop needs millions of stops to see one
+// (7 late ticks in 1,080,000 stops). Two contender tasks per ticker hammer
+// `select { case <- c: default: }` on the live channel, so the expiry send
+// queues behind their channel-lock acquisitions and the gap becomes microseconds:
+// 5-17 late ticks in 90000 stops (BIT_WORKERS=8, aarch64 macOS, five runs) before
+// the fix, 0 in eight runs after.
+//
+// HOW A LATE TICK IS TOLD FROM A PENDING ONE. Contenders stop the moment `stop()`
+// returns true. The stopper then drains `c` once (a tick sent before `stop`
+// returned may sit there), spins `settleNs`, and looks again. A tick found by
+// that second look was sent after the drain, hence after `stop` returned. It
+// is never a false positive; a late tick a contender or the first drain takes
+// is a miss, which only makes the test less sensitive.
+//
+// `workers` pins 8: with one worker the stopper, contenders and the sweeping
+// worker never run at the same time and the race cannot happen.
+import { Ticker, monotonic } from "std/time"
+const iters: int = 30000
+const periodNs: int = 100000
+const spinBudget: int = 100000000
+const stoppers: int = 3
+const contenders: int = 2
+const settleNs: int = 10000
+class Args { out: chan<int>, seed: int }
+class Hammer { c: chan<bool>, flags: []i64, done: chan<int> }
+fn got(c: chan<bool>): bool {
+  select {
+    case <- c:
+      return true
+    default:
+      return false
+  }
+}
+fn spinUntil(t: int) {
+  let n = 0
+  while (monotonic().ns < t && n < spinBudget) {
+    n = n + 1
+  }
+}
+fn hammer(h: Hammer) {
+  let fp = ptrOf(h.flags)
+  let taken = 0
+  while (atomicLoad(fp) == 0) {
+    if (got(h.c)) {
+      taken = taken + 1
+    }
+  }
+  h.done <- taken
+}
+fn worker(a: Args) {
+  let late = 0
+  let stopTrue = 0
+  let rng = a.seed
+  let i = 0
+  while (i < iters) {
+    rng = rng * 6364136223846793005 + 1442695040888963407
+    let jit = ((rng >> 33) & 0x7fffffff) % 40000 - 15000
+    let t = Ticker(periodNs)
+    let flags = []i64(1)
+    let done = chan<int>(contenders)
+    let k = 0
+    while (k < contenders) {
+      spawn hammer(Hammer{ c = t.c, flags = flags, done = done })
+      k = k + 1
+    }
+    spinUntil(monotonic().ns + periodNs + jit)
+    let ok = t.stop()
+    atomicStore(ptrOf(flags), 1)
+    k = 0
+    while (k < contenders) {
+      let _ = <- done
+      k = k + 1
+    }
+    if (ok) {
+      stopTrue = stopTrue + 1
+      let _ = got(t.c)
+      spinUntil(monotonic().ns + settleNs)
+      if (got(t.c)) {
+        late = late + 1
+      }
+    }
+    i = i + 1
+  }
+  a.out <- late * 1000000 + stopTrue
+}
+fn main() {
+  let out = chan<int>(stoppers)
+  let k = 0
+  while (k < stoppers) {
+    spawn worker(Args{ out = out, seed = 12345 + k * 7919 })
+    k = k + 1
+  }
+  let late = 0
+  let st = 0
+  k = 0
+  while (k < stoppers) {
+    let v = <- out
+    late = late + v / 1000000
+    st = st + v % 1000000
+    k = k + 1
+  }
+  print("stopTrue=${st} late=${late}\n")
+}
