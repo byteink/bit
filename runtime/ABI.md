@@ -574,6 +574,7 @@ bit_rt_iface_as_ok() -> bool                          // ok of the iface_as/ifac
 bit_rt_iface_assert(recv: ref, want: usize) -> ref    // panics on mismatch
 bit_rt_iface_as_enum(recv: ref, want: usize) -> ref   // ENUM target: recv on a type_id match, else null (§2.2a)
 bit_rt_iface_has(recv: ref, id: usize) -> ref         // recv if its type has method `id`, else null
+bit_rt_iface_implements(recv: ref, ids: ref) -> ref   // INTERFACE target: recv if its type has every id in `ids`, else null, cached (§2.2b)
 ```
 
 - `want` is a `*const TypeInfo` passed as a plain integer: the descriptor lives
@@ -662,6 +663,30 @@ rather than a second runtime entry point.
 A non-boxed (bare-tag) enum can never be a type-assertion target at all —
 §14.4/§14.3 — so `bit_rt_iface_as_enum` is never called with one; `bit check`
 rejects it before lowering (E0041).
+
+#### 2.2b `bit_rt_iface_implements`: the INTERFACE target, verdict cached (#7406)
+
+```
+bit_rt_iface_implements(recv: ref, ids: ref string) -> ref   // recv if its type has every method id of `ids`, else null
+```
+
+The INTERFACE-target assertion `x.(I)` (SPEC §14.4) is one call. `ids` is a
+pooled string constant holding `I`'s dispatch ids (§2.1) as decimal numbers
+joined by `,` (e.g. `"12,57"`); lowering emits no call for an interface with no
+methods. The result is `recv` on a hit and null on a miss or when `recv` has no
+dynamic type, and the caller takes `ok` as `result != nil` (#7408); the per-task
+`ok` slot is not written.
+
+The verdict is cached per (dynamic type, `ids`) pair, so a repeated assertion
+costs a probe, not a method-table walk per method. The key is the dynamic
+type's descriptor address and the address of the pooled `ids` string (equal id
+lists share one string). The cache is a fixed table in `.bss`: no GC
+allocation. Each entry is two words written once and never changed (a CAS
+claims the first word, a release store publishes the second), so a reader never
+observes a torn pair at any worker count; a full probe window (8 slots)
+computes the answer uncached. The runtime lives in `runtime/root`, shared by
+every provider, so no provider has anything to add. `bit_rt_iface_has` (the
+per-method chain this replaced) stays for code the pinned stage0 built.
 
 ### 2.3 `string` value, and shared-backing views (`s[lo:hi]`)
 
