@@ -1,0 +1,148 @@
+// pkg/redis/tx.test.bit - `tx.bit`'s failure paths against a FAKE local server
+// that models MULTI the way Redis does: inside MULTI every command but
+// EXEC/DISCARD is answered `+QUEUED` (or `-ERR` when it is rejected at queue
+// time), outside it `PING` is `+PONG`. A connection left in MULTI therefore
+// answers the next caller's PING with `+QUEUED`, which is exactly the stale
+// reply #7434 handed out. No Docker needed; `client.live.test.bit` runs the
+// same paths against a real server.
+
+// The command name of one encoded request: `*N\r\n$L\r\nNAME\r\n...`.
+fn txReqName(req: string): string {
+  return split(req, "\r\n")[2]
+}
+
+fn txReply(name: string, multi: bool): string {
+  if (name == "BADCMD") {
+    return "-ERR unknown command 'BADCMD'\r\n"
+  }
+  if (name == "WATCH" || name == "UNWATCH" || name == "MULTI" || name == "DISCARD") {
+    return "+OK\r\n"
+  }
+  if (multi) {
+    return "+QUEUED\r\n"
+  }
+  return "+PONG\r\n"
+}
+
+// Whether the server is inside MULTI after answering `name`.
+fn txMulti(name: string, multi: bool): bool {
+  if (name == "MULTI") {
+    return true
+  }
+  if (name == "DISCARD" || name == "EXEC") {
+    return false
+  }
+  return multi
+}
+
+// Serves `conns` connections (the first is `connect`'s probe). On connection
+// number `stallOn` a DISCARD is never answered, so the client's read times out.
+// The log is the command names, in arrival order, one list per connection.
+fn serveTx(l: Listener, conns: int, stallOn: int, done: chan<string>) {
+  let log = ""
+  let i = 0
+  while (i < conns) {
+    i = i + 1
+    log = log + "[${i}]"
+    let c = l.accept() catch _ {
+      done <- log
+      return
+    }
+    c.read(4096)
+    c.write("%0\r\n") catch _ {
+      c.close()
+      done <- log
+      return
+    }
+    let multi = false
+    while (true) {
+      let req = c.read(4096)
+      if (len(req) == 0) {
+        break
+      }
+      let name = txReqName(req)
+      log = log + " " + name
+      if (name == "DISCARD" && i == stallOn) {
+        continue
+      }
+      let reply = txReply(name, multi)
+      multi = txMulti(name, multi)
+      c.write(reply) catch _ {
+        break
+      }
+    }
+    c.close()
+  }
+  done <- log
+}
+
+fn dialTx(conns: int, stallOn: int): (Client, chan<string>, Listener) {
+  let l = listen("127.0.0.1", 0) catch e {
+    panic("listen: ${e.message()}")
+  }
+  let port = l.port() catch e {
+    panic("port: ${e.message()}")
+  }
+  let done = chan<string>(1)
+  spawn serveTx(l, conns, stallOn, done)
+  let client = connect(
+    Options{
+      host = "127.0.0.1",
+      port = port,
+      poolSize = 1,
+      commandTimeout = 300 * Millisecond,
+    },
+  ) catch e {
+    panic("connect: ${e.message()}")
+  }
+  return client, done, l
+}
+
+// Runs a transaction that queues `SET` then a command the server rejects at
+// queue time; true when `transaction` failed with the server's error.
+fn rejectedTx(client: Client): bool {
+  let failed = false
+  client.transaction<bool>(["k"], (tx) => {
+    let _ = tx.set("k", "v")
+    let _ = tx.queue(Cmd<Reply>{ args = ["BADCMD"], decode = sIdent, readOnly = false })
+    return true
+  }) catch _ {
+    failed = true
+    false
+  }
+  return failed
+}
+
+test "a transaction whose queued command is rejected sends DISCARD, so the pooled connection answers the next command itself" {
+  let (client, done, l) = dialTx(2, 0)
+  let failed = rejectedTx(client)
+  let pong = client.ping() catch e {
+    panic("ping: ${e.message()}")
+  }
+  client.close()
+  let log = <- done
+  l.close()
+  assert(failed, "the rejected queue-time command must fail the transaction")
+  assert(pong == "PONG", "ping read '${pong}', want PONG: MULTI was left open")
+  assert(
+    log == "[1][2] WATCH MULTI SET BADCMD DISCARD PING",
+    "wire log '${log}' (one pooled connection, DISCARD before the next caller)",
+  )
+}
+
+test "a transaction whose cleanup cannot be proven clean retires the connection, and the next command uses a fresh one" {
+  let (client, done, l) = dialTx(3, 2)
+  let failed = rejectedTx(client)
+  let pong = client.ping() catch e {
+    panic("ping: ${e.message()}")
+  }
+  client.close()
+  let log = <- done
+  l.close()
+  assert(failed, "the rejected queue-time command must fail the transaction")
+  assert(pong == "PONG", "ping read '${pong}' on the replacement connection, want PONG")
+  assert(
+    log == "[1][2] WATCH MULTI SET BADCMD DISCARD[3] PING",
+    "wire log '${log}' (the unanswered DISCARD retires connection 2)",
+  )
+}

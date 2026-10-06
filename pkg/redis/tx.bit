@@ -28,7 +28,10 @@
 // `MULTI`, so there is nothing queued server-side to `DISCARD` yet: only
 // the `WATCH` needs clearing before the connection goes back to the pool,
 // or the NEXT caller to lease it would silently inherit stale watched
-// keys.
+// keys. A failure AFTER `MULTI` (the server rejected a queued command, or
+// answered something other than `+QUEUED`) sends `DISCARD` instead, which
+// also clears the WATCH: otherwise the next caller's command would be queued
+// into the old MULTI and answered `+QUEUED` (`abortTx`, #7434).
 //
 // `tx.read` (#6029): real check-and-set ("read balance, fail if
 // insufficient, else decrement") needs a read INSIDE `body` that runs now,
@@ -121,34 +124,93 @@ fn runTransaction<R>(client: Client, keys: []string, body: (Tx) => R!RedisError)
   fail RedisError.ExecAbort("transaction: exceeded ${maxTxRetries} retries after WATCH conflicts")
 }
 
-// One WATCH/body/MULTI/queued-commands/EXEC attempt over `conn`. `body`
-// runs between WATCH and MULTI (this file's header) — its own return value
-// is `result`; its queued commands are `batch.queued`. `committed` is
-// `true` only when EXEC actually ran them (and `batch.box` is now filled —
-// every `Future<T>` `result` carries is live); `false` only for a nil EXEC,
-// so the caller retries with a fresh WATCH and a fresh `Batch`.
+// One WATCH/body/MULTI/queued-commands/EXEC attempt over `conn`, leaving
+// `conn` clean whatever happens: a failure that is not a dead connection is
+// followed by `abortTx` (UNWATCH, or DISCARD once MULTI is open) before the
+// error is returned, so the connection can go back to the pool (#7434). A
+// dead connection is retired by `Client.withConn`, so there is nothing to
+// clean.
 fn runTxAttempt<R>(
   conn: redisConn,
   timeoutNs: int,
   keys: []string,
   body: (Tx) => R!RedisError,
 ): (R, bool)!RedisError {
+  let out = attemptTx<R>(conn, timeoutNs, keys, body) catch e {
+    abortTx(conn, timeoutNs, e)
+    fail e
+  }
+  return out
+}
+
+// `body` runs between WATCH and MULTI (this file's header) — its own return
+// value is `result`; its queued commands are `batch.queued`. `committed` is
+// `true` only when EXEC actually ran them (and `batch.box` is now filled —
+// every `Future<T>` `result` carries is live); `false` only for a nil EXEC,
+// so the caller retries with a fresh WATCH and a fresh `Batch`. `conn.watching`
+// and `conn.multi` record what the server holds open, for `abortTx`.
+fn attemptTx<R>(
+  conn: redisConn,
+  timeoutNs: int,
+  keys: []string,
+  body: (Tx) => R!RedisError,
+): (R, bool)!RedisError {
+  conn.watching = true
   writeCommand(conn, withKeys("WATCH", keys), timeoutNs)?
   readOneReply(conn, timeoutNs)?
   let batch = Batch()
   let tx = Tx{ batch = batch, read = TxRead{ conn = conn, timeoutNs = timeoutNs } }
-  let result = body(tx) catch e {
-    writeCommand(conn, ["UNWATCH"], timeoutNs)?
-    readOneReply(conn, timeoutNs)?
-    fail e
-  }
+  let result = body(tx)?
   writeCommand(conn, ["MULTI"], timeoutNs)?
   readOneReply(conn, timeoutNs)?
+  conn.multi = true
   queueBatchOverWire(conn, timeoutNs, batch.queued)?
-  writeCommand(conn, ["EXEC"], timeoutNs)?
-  let r = readOneReply(conn, timeoutNs)?
+  let r = execOverWire(conn, timeoutNs)?
   let committed = fillFromExec(batch, r)?
   return result, committed
+}
+
+// Sends EXEC and reads its reply. EXEC ends the MULTI and clears the WATCH
+// whatever it answers (an `-EXECABORT` included), so both flags drop as soon
+// as the reply is read, before a server error is turned into a failure.
+fn execOverWire(conn: redisConn, timeoutNs: int): Reply!RedisError {
+  writeCommand(conn, ["EXEC"], timeoutNs)?
+  let r = readReplyRaw(conn, timeoutNs)?
+  conn.multi = false
+  conn.watching = false
+  match (r) {
+    Err(msg) => fail fromServer(msg)
+    _ => return r
+  }
+}
+
+// Undoes whatever `attemptTx` left open on the server after failing with `e`:
+// DISCARD once MULTI is open (it also clears the WATCH), else UNWATCH. Skipped
+// when `e` says the connection is dead — `withConn` retires it. If the
+// cleanup itself fails, the flags stay set and `withConn` retires the
+// connection instead (`connClean`); the error the caller sees is still `e`.
+fn abortTx(conn: redisConn, timeoutNs: int, e: RedisError) {
+  if (connectionBad(e)) {
+    return
+  }
+  if (conn.multi) {
+    settleTx(conn, timeoutNs, "DISCARD")
+    return
+  }
+  if (conn.watching) {
+    settleTx(conn, timeoutNs, "UNWATCH")
+  }
+}
+
+fn settleTx(conn: redisConn, timeoutNs: int, name: string) {
+  writeCommand(conn, [name], timeoutNs) catch _ {
+    return
+  }
+  let _ = readReplyRaw(conn, timeoutNs) catch _ {
+    return
+  }
+  conn.multi = false
+  conn.watching = false
 }
 
 // Sends every already-queued command, expecting `+QUEUED` for each — the
