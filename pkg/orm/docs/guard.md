@@ -110,7 +110,8 @@ With a guard on the `Db`, every table it protects needs to say who is asking.
 mistake in the program and the ORM says so loudly:
 
 ```bit
-import { Actor, Db, Guard, Logger, Options, ScopedDb, ScopedRepo, SystemDb, Unscoped, open } from "orm"
+import { Actor, Db, Guard, Options, ScopedDb, ScopedRepo, SystemDb, Unscoped, open } from "orm"
+import { Logger } from "std/log"
 
 fn openGuarded(url: string, guard: Guard, logger: Logger): Db! {
   return open(url, Options{ authz = guard, logger = logger })?
@@ -151,8 +152,10 @@ fn forgotToScope(db: Db): ()! {
   an actor with no id, not an unchecked one.
 - `db.asSystem()` is for jobs and migrations. It returns a `SystemDb` whose
   `table<T>()` is the plain, unguarded repository, so existing job code keeps
-  its API. When `Options.logger` is set, each `table<T>()` writes one debug
-  line, `orm: system access to <table>`, so system access can be audited.
+  its API. Each `table<T>()` writes one debug record, `msg="system access"
+  table=<table>`, to `Options.logger` (std/log's default logger when unset), so
+  system access can be audited once the logger's level admits debug; see
+  [Logging](logging.md).
 - A plain `db.table<T>()` (and `tx.table<T>()`) on a protected table returns a
   repository whose every terminal call (`find`, `all`, `insert`, `update`,
   `delete` and the rest) fails with `Unscoped`. Its message names the table

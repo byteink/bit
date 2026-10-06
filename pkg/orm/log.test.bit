@@ -1,6 +1,6 @@
-// pkg/orm/log.test.bit — #5075's acceptance, against fakes that need no
-// `Pool`/`Conn` machinery: `Logger.wrap` takes a `Data` (Executor) directly,
-// so a fake only has to implement `query`/`exec`.
+// pkg/orm/log.test.bit — #5075's acceptance, restated for std/log (#7430),
+// against fakes that need no `Pool`/`Conn` machinery: `QueryLog.wrap` takes a
+// `Data` (Executor) directly, so a fake only has to implement `query`/`exec`.
 //
 // `Value`/`Rows`/`join`/`contains` are already imported module-wide
 // (data.test.bit/query.bit/query.test.bit, this module's own siblings) and
@@ -9,24 +9,36 @@
 // `relPeople`/`relCall`/`relResult`/`personRow` are relation.test.bit's own
 // #5061 fixtures, reused unchanged for the statement-counter test below so
 // it proves the SAME two-statements-for-any-parent-count guarantee that
-// file already pins, just observed through `Logger` instead of `a.calls`.
+// file already pins, just observed through `QueryLog` instead of `a.calls`.
 
 import { sleep } from "std/time"
+// `LevelError` and `Logger` are bound by log.bit (an import binds per MODULE).
+// `TextHandler` and `LevelDebug` are bound here for every test file of the
+// module, `relationauto.test.bit` and `scoped.test.bit` included.
+import { TextHandler, LevelDebug } from "std/log"
 
-// The one value every redaction assertion below must never see outside the
-// `Shown` test — unmistakable, so a leak cannot be confused with anything
-// this file legitimately writes to the sink.
+// The one value every redaction assertion below must never see —
+// unmistakable, so a leak cannot be confused with anything this file
+// legitimately writes to the sink.
 const secretValue: string = "secret@example.test"
 
+// A std/log `Sink`: std/log hands it one finished record per `write`, with
+// its trailing newline, which is dropped here so a test compares the line.
 class recSink {
   lines: []string
-  export log(line: string) {
-    this.lines = append(this.lines, line)
+  export write(s: string): ()! {
+    this.lines = append(this.lines, trimRight(s, "\n"))
   }
 }
 
 fn newLogSink(): recSink {
   return recSink{ lines = []string(0) }
+}
+
+// A text handler at DEBUG without timestamps, so a record reads back
+// byte for byte: `level=INFO msg=statement sql=... rows=1 took=...`.
+fn recLogger(sink: recSink): Logger {
+  return Logger(TextHandler(sink, LevelDebug, false))
 }
 
 fn sinkText(s: recSink): string {
@@ -78,7 +90,7 @@ class logRows {
 }
 
 // A `Data` whose `query` sleeps `delayNs` (a REAL monotonic delay — this is
-// what lets the slow-query tests exercise `Logger`'s own `monotonic`/
+// what lets the slow-query tests exercise `QueryLog`'s own `monotonic`/
 // `since` timing rather than a mocked clock) before handing back `data`.
 class logQueryFake {
   delayNs: int
@@ -101,249 +113,164 @@ fn drain(rows: Rows): ()! {
   while (rows.next()?) {}
 }
 
-test "values are redacted by default, and by a zero-valued options class" {
-  let defaultSink = newLogSink()
-  let defaultLogger = Logger(defaultSink)
-  let db1 = defaultLogger.wrap(logExecFake{ calls = []logCall(0), failMessage = "" })
-  db1.exec("insert into users (email) values ($1)", [Value.Text(secretValue)]) catch e {
-    assert(false, "must not error: ${e.message()}")
-    return
-  }
+const insertEmail: string = "insert into users (email) values ($1)"
 
-  let zeroSink = newLogSink()
-  let zeroLogger = Logger(zeroSink, LogOptions{})
-  let db2 = zeroLogger.wrap(logExecFake{ calls = []logCall(0), failMessage = "" })
-  db2.exec("insert into users (email) values ($1)", [Value.Text(secretValue)]) catch e {
-    assert(false, "must not error: ${e.message()}")
-    return
+// Runs `sql` through `db.exec` and hands back whether it failed — the caller
+// asserts on the sink, so a test never reads past a swallowed error.
+fn execFailure(db: Data, sqlText: string): string {
+  db.exec(sqlText, [Value.Text(secretValue)]) catch e {
+    return e.message()
   }
-
-  for text of [sinkText(defaultSink), sinkText(zeroSink)] {
-    assert(contains(text, "insert into users"), "statement text must still be logged: ${text}")
-    assert(!contains(text, secretValue), "a bound value leaked into the log: ${text}")
-  }
+  return ""
 }
 
-test "LogValues.Shown logs the bound value in cleartext" {
-  let sink = newLogSink()
-  let logger = Logger(
-    sink,
-    LogOptions{ values = LogValues.Shown, slowThresholdMs = 0 },
-  )
-  let db = logger.wrap(logExecFake{ calls = []logCall(0), failMessage = "" })
+fn slowRead(q: QueryLog, delayMs: int, data: [][]Value): ()! {
+  let db = q.wrap(logQueryFake{ delayNs = delayMs * Millisecond, cols = ["id"], data = data })
+  let rows = db.query("select id from users", []Value(0))?
+  drain(rows)?
+  rows.close()
+}
 
-  db.exec("insert into users (email) values ($1)", [Value.Text(secretValue)]) catch e {
+test "a statement record carries the statement text, the row count and the duration, and no bound value" {
+  let sink = newLogSink()
+  let q = QueryLog(recLogger(sink))
+  let db = q.wrap(logExecFake{ calls = []logCall(0), failMessage = "" })
+  db.exec(insertEmail, [Value.Text(secretValue)]) catch e {
     assert(false, "must not error: ${e.message()}")
     return
   }
 
   assert(
-    contains(sinkText(sink), secretValue),
-    "LogValues.Shown must include the bound value: ${sinkText(sink)}",
+    len(sink.lines) == 1,
+    "one record per statement, got ${len(sink.lines)}: ${sinkText(sink)}",
   )
+  let want = "level=INFO msg=statement sql=\"insert into users (email) values ($1)\" rows=1 took="
+  assert(hasPrefix(sink.lines[0], want), "got: ${sink.lines[0]}")
+  assert(
+    !contains(sinkText(sink), secretValue),
+    "a bound value leaked into the log: ${sinkText(sink)}",
+  )
+  assert(q.statementCount == 1, "the statement counter must count it, got ${q.statementCount}")
 }
 
-test "a slow query logs a warn entry naming the duration and the returned row count; a fast one logs none" {
+test "a level the logger has off writes nothing, and the statement is still counted" {
   let sink = newLogSink()
-  let logger = Logger(sink) // default: 200ms threshold
-  let db = logger.wrap(
-    logQueryFake{
-      delayNs = 250 * Millisecond, cols = ["id"], data = [[Value.Int(1)], [Value.Int(2)]],
-    },
-  )
-
-  let rows = db.query("select id from users", []Value(0)) catch e {
+  let q = QueryLog(Logger(TextHandler(sink, LevelError, false)))
+  let db = q.wrap(logExecFake{ calls = []logCall(0), failMessage = "" })
+  db.exec(insertEmail, [Value.Text(secretValue)]) catch e {
     assert(false, "must not error: ${e.message()}")
     return
   }
-  drain(rows) catch e {
+  assert(len(sink.lines) == 0, "INFO is below ERROR and must write nothing: ${sinkText(sink)}")
+  assert(q.statementCount == 1, "got ${q.statementCount}")
+}
+
+test "a slow query logs a WARN record naming the duration and the returned row count; a fast one logs none" {
+  let sink = newLogSink()
+  slowRead(QueryLog(recLogger(sink)), 250, [[Value.Int(1)], [Value.Int(2)]]) catch e {
     assert(false, "must not error: ${e.message()}")
     return
   }
-  rows.close()
-
   let text = sinkText(sink)
-  assert(contains(text, "[warn]"), "a 250ms query must log a warn entry: ${text}")
-  assert(contains(text, "rows=2"), "the warn entry must name the returned row count: ${text}")
+  assert(contains(text, "level=WARN msg=\"slow statement\""), "a 250ms query must warn: ${text}")
+  assert(contains(text, "rows=2"), "the warning must name the returned row count: ${text}")
+  assert(contains(text, "took="), "the warning must name the duration: ${text}")
 
   let fastSink = newLogSink()
-  let fastLogger = Logger(fastSink)
-  let fastDb = fastLogger.wrap(
-    logQueryFake{ delayNs = 10 * Millisecond, cols = ["id"], data = [[Value.Int(1)]] },
-  )
-  let fastRows = fastDb.query("select id from users", []Value(0)) catch e {
+  slowRead(QueryLog(recLogger(fastSink)), 10, [[Value.Int(1)]]) catch e {
     assert(false, "must not error: ${e.message()}")
     return
   }
-  drain(fastRows) catch e {
-    assert(false, "must not error: ${e.message()}")
-    return
-  }
-  fastRows.close()
   assert(
-    !contains(sinkText(fastSink), "[warn]"),
+    !contains(sinkText(fastSink), "level=WARN"),
     "a 10ms query under the 200ms default must not warn: ${sinkText(fastSink)}",
   )
 }
 
 test "the slow-query threshold is configurable: 250ms under a 500ms threshold logs no warning" {
   let sink = newLogSink()
-  let logger = Logger(
-    sink,
-    LogOptions{ values = LogValues.Redacted, slowThresholdMs = 500 },
-  )
-  let db = logger.wrap(
-    logQueryFake{ delayNs = 250 * Millisecond, cols = ["id"], data = [[Value.Int(1)]] },
-  )
-
-  let rows = db.query("select id from users", []Value(0)) catch e {
+  slowRead(QueryLog(recLogger(sink), 500), 250, [[Value.Int(1)]]) catch e {
     assert(false, "must not error: ${e.message()}")
     return
   }
-  drain(rows) catch e {
-    assert(false, "must not error: ${e.message()}")
-    return
-  }
-  rows.close()
-
   assert(
-    !contains(sinkText(sink), "[warn]"),
-    "250ms under a 500ms threshold must not warn: ${sinkText(sink)}",
+    !contains(sinkText(sink), "level=WARN"),
+    "250ms under 500ms must not warn: ${sinkText(sink)}",
   )
 }
 
 test "a zero slow-query threshold disables the warning rather than firing on every query" {
   let sink = newLogSink()
-  let logger = Logger(
-    sink,
-    LogOptions{ values = LogValues.Redacted, slowThresholdMs = 0 },
-  )
-  let db = logger.wrap(
-    logQueryFake{ delayNs = 250 * Millisecond, cols = ["id"], data = [[Value.Int(1)]] },
-  )
-
-  let rows = db.query("select id from users", []Value(0)) catch e {
+  slowRead(QueryLog(recLogger(sink), 0), 250, [[Value.Int(1)]]) catch e {
     assert(false, "must not error: ${e.message()}")
     return
   }
-  drain(rows) catch e {
-    assert(false, "must not error: ${e.message()}")
-    return
-  }
-  rows.close()
-
   assert(
-    !contains(sinkText(sink), "[warn]"),
+    !contains(sinkText(sink), "level=WARN"),
     "a zero threshold must disable the warning, not fire on every query: ${sinkText(sink)}",
   )
 }
 
 test "a negative slow-query threshold also disables the warning" {
   let sink = newLogSink()
-  let logger = Logger(
-    sink,
-    LogOptions{ values = LogValues.Redacted, slowThresholdMs = -5 },
-  )
-  let db = logger.wrap(
-    logQueryFake{ delayNs = 250 * Millisecond, cols = ["id"], data = [[Value.Int(1)]] },
-  )
-
-  let rows = db.query("select id from users", []Value(0)) catch e {
+  slowRead(QueryLog(recLogger(sink), -5), 250, [[Value.Int(1)]]) catch e {
     assert(false, "must not error: ${e.message()}")
     return
   }
-  drain(rows) catch e {
-    assert(false, "must not error: ${e.message()}")
-    return
-  }
-  rows.close()
-
   assert(
-    !contains(sinkText(sink), "[warn]"),
-    "a negative threshold must disable the warning: ${sinkText(sink)}",
+    !contains(sinkText(sink), "level=WARN"),
+    "a negative threshold must disable it: ${sinkText(sink)}",
   )
 }
 
-test "a failed statement logs its text and the driver's message on separate lines, and the failure still reaches the caller" {
+test "a failed statement writes one ERROR record, text and message as separate attributes, and the failure still reaches the caller" {
   let sink = newLogSink()
-  let logger = Logger(sink)
-  let db = logger.wrap(
+  let db = QueryLog(recLogger(sink)).wrap(
     logExecFake{ calls = []logCall(0), failMessage = "constraint violation: duplicate key" },
   )
-
-  db.exec("insert into users (email) values ($1)", [Value.Text(secretValue)]) catch e {
-    assert(
-      contains(e.message(), "constraint violation"),
-      "the driver's own failure must still reach the caller: ${e.message()}",
-    )
-    let text = sinkText(sink)
-    assert(contains(text, "insert into users"), "the statement text must still be logged: ${text}")
-    assert(
-      !contains(text, secretValue),
-      "a bound value must not leak through a failure log: ${text}",
-    )
-    assert(
-      len(sink.lines) == 2,
-      "the statement text and the driver message must be two lines, got ${len(sink.lines)}",
-    )
-    return
-  }
-  assert(false, "a rejected statement must fail the query, not swallow it")
+  let msg = execFailure(db, insertEmail)
+  assert(
+    contains(msg, "constraint violation"),
+    "the driver's own failure must still reach the caller: ${msg}",
+  )
+  assert(len(sink.lines) == 1, "one record, got ${len(sink.lines)}: ${sinkText(sink)}")
+  let want = "level=ERROR msg=\"statement failed\" sql=\"insert into users (email) values ($1)\" " +
+    "error=\"constraint violation: duplicate key\""
+  assert(sink.lines[0] == want, "got: ${sink.lines[0]}")
+  assert(
+    !contains(sink.lines[0], secretValue),
+    "a bound value leaked through a failure log: ${sink.lines[0]}",
+  )
 }
 
-// #5381's own test: the previous test's canned driver message never
-// contained `secretValue`, so it could not have caught the defect it now
-// guards against — a driver message THAT EMBEDS a bound value, the way a
-// real Postgres unique-violation DETAIL line does, must still not reach the
-// sink at the default `LogValues.Redacted`. This is the missing twin of
-// "values are redacted by default" above, on the error path instead of the
-// success path.
+// #5381's own test: a canned driver message that never contained
+// `secretValue` could not have caught the defect — a driver message THAT
+// EMBEDS a bound value, the way a real Postgres unique-violation DETAIL line
+// does, must not reach the sink.
 fn driverDetailMessage(): string {
   return "duplicate key value violates unique constraint \"users_email_key\"\n" +
     "DETAIL:  Key (email)=(${secretValue}) already exists."
 }
 
-test "a driver message embedding a bound value is redacted at the default, same as a bound value in args" {
+test "a driver message embedding a bound value is redacted, same as a bound value in args" {
   let sink = newLogSink()
-  let logger = Logger(sink)
-  let db = logger.wrap(logExecFake{ calls = []logCall(0), failMessage = driverDetailMessage() })
-
-  db.exec("insert into users (email) values ($1)", [Value.Text(secretValue)]) catch e {
-    assert(
-      contains(e.message(), secretValue),
-      "the driver's own failure reaching the caller is untouched by log redaction: ${e.message()}",
-    )
-    for line of sink.lines {
-      assert(
-        !contains(line, secretValue),
-        "a bound value leaked through the driver's own error message: ${line}",
-      )
-    }
-    assert(
-      contains(sinkText(sink), "users_email_key"),
-      "the failure line must still name the constraint: ${sinkText(sink)}",
-    )
-    return
-  }
-  assert(false, "a rejected statement must fail the query, not swallow it")
-}
-
-test "LogValues.Shown lets a failed statement's driver message through unredacted" {
-  let sink = newLogSink()
-  let logger = Logger(
-    sink,
-    LogOptions{ values = LogValues.Shown, slowThresholdMs = 0 },
+  let db = QueryLog(recLogger(sink)).wrap(
+    logExecFake{ calls = []logCall(0), failMessage = driverDetailMessage() },
   )
-  let db = logger.wrap(logExecFake{ calls = []logCall(0), failMessage = driverDetailMessage() })
-
-  db.exec("insert into users (email) values ($1)", [Value.Text(secretValue)]) catch _ {
-    assert(
-      contains(sinkText(sink), secretValue),
-      "LogValues.Shown must include the driver's own message unredacted: ${sinkText(sink)}",
-    )
-    return
-  }
-  assert(false, "a rejected statement must fail the query, not swallow it")
+  let msg = execFailure(db, insertEmail)
+  assert(
+    contains(msg, secretValue),
+    "the driver's own failure reaching the caller is untouched by log redaction: ${msg}",
+  )
+  assert(len(sink.lines) == 1, "one record, got ${len(sink.lines)}")
+  assert(
+    !contains(sink.lines[0], secretValue),
+    "a bound value leaked through the driver's message: ${sink.lines[0]}",
+  )
+  assert(
+    contains(sink.lines[0], "users_email_key"),
+    "the record must still name the constraint: ${sink.lines[0]}",
+  )
 }
 
 // #5381 follow-up: an earlier version of `redactErrorMessage`'s own doc
@@ -364,34 +291,31 @@ fn driverCastErrorMessage(): string {
 
 test "a Postgres primary-line cast error (no DETAIL, double-quoted) is redacted, and a double-quoted identifier in the same message survives" {
   let sink = newLogSink()
-  let logger = Logger(sink)
-  let db = logger.wrap(logExecFake{ calls = []logCall(0), failMessage = driverCastErrorMessage() })
-
-  db.exec("insert into payments (card_number) values ($1)", [Value.Text(secretValue)]) catch e {
+  let db = QueryLog(recLogger(sink)).wrap(
+    logExecFake{ calls = []logCall(0), failMessage = driverCastErrorMessage() },
+  )
+  let msg = execFailure(db, "insert into payments (card_number) values ($1)")
+  assert(
+    contains(msg, secretValue),
+    "the driver's own failure reaching the caller is untouched by log redaction: ${msg}",
+  )
+  for line of sink.lines {
     assert(
-      contains(e.message(), secretValue),
-      "the driver's own failure reaching the caller is untouched by log redaction: ${e.message()}",
+      !contains(line, secretValue),
+      "a value quoted after a bare colon leaked through the driver's own error message: ${line}",
     )
-    for line of sink.lines {
-      assert(
-        !contains(line, secretValue),
-        "a value quoted after a bare colon leaked through the driver's own error message: ${line}",
-      )
-    }
-    assert(
-      contains(sinkText(sink), "\"payments\""),
-      "a double-quoted IDENTIFIER (preceded by a word, not a colon) must survive: ${sinkText(sink)}",
-    )
-    return
   }
-  assert(false, "a rejected statement must fail the query, not swallow it")
+  assert(
+    contains(sinkText(sink), "payments"),
+    "a double-quoted IDENTIFIER (preceded by a word, not a colon) must survive: ${sinkText(sink)}",
+  )
 }
 
-// The source-level half of "must not write to stdout by default"
-// (this file's header, #5075's own constraint): log.bit calls only
-// `sink.log` or `eprint` (stderr), never `print`. Same contract as
+// The source-level half of "never write to stdout" (#5075's own constraint)
+// and of "never log a bound value" (#7430): log.bit calls no `print`, and no
+// log attribute is built from `params`. Same contract as
 // pkg/orm/raw.test.bit's own source check.
-test "source check: log.bit never calls print (stdout), only sink.log or eprint (stderr)" {
+test "source check: log.bit never calls print (stdout) and never reads a statement's params into a record" {
   let loc = locateBit()
   if (len(loc.repo) == 0) {
     print("log.bit source check: repo not locatable (set BIT_REPO) — skipping\n")
@@ -402,6 +326,7 @@ test "source check: log.bit never calls print (stdout), only sink.log or eprint 
   }
   assert(len(src) > 500, "log.bit read back ${len(src)} byte(s) — the read failed")
   assert(count(src, " print(") == 0, "log.bit must not call print (stdout)")
+  assert(count(src, "params)") == 2, "params must only be forwarded to inner.query/inner.exec")
 
   // The control: the needle search itself must be able to find a positive,
   // proven against this file's own source, which legitimately calls print

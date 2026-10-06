@@ -154,7 +154,7 @@ This prints `true false`.
 ## Logging the reason
 
 The deciding policy never reaches the client, but you will want it. Give the
-handle a sink, the one-method `LogSink` pkg/orm's `Logger` writes to, and every
+handle a sink, a class with one `log(line: string)` method, and every
 decision logs a line with the action, resource, subject, outcome and policy:
 
 ```bit
@@ -207,9 +207,8 @@ unavailable` and never the policy or the table: pkg/web maps by `status()` and
 `message()`, so nothing here is registered with it.
 
 The sink is any class with `log(line: string)`. The usual one writes to
-stderr, and the same class can be given to `logTo` and to pkg/orm's `Logger`,
-which puts the two logs in one stream (pkg/web writes through `std/log`'s
-`Logger`, set with `Config.logger`):
+stderr (pkg/web and pkg/orm write through `std/log`'s `Logger`, set with
+`Config.logger` and `Options.logger`):
 
 ```bit
 class StderrLines {
