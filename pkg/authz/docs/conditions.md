@@ -457,6 +457,126 @@ depends on the rule: `asAllow` wraps an allow rule so an unknown row is not
 granted, and `asDeny` wraps a deny rule so an unknown row is not denied. That
 is how a list comes out the same rows as one check per row.
 
+## Asking the rules for the whole list
+
+`compileSql` needs a condition, and a person's rules are a pile of allows and
+denies. `filterFor` folds them for you. It asks what `can` would ask, with no
+row: which rules apply to this class and action for this person, with their
+`$user.x` placeholders already filled in. The answer is a `Filter`, one of
+three things:
+
+- `All`: every row passes. An allow with no condition and no deny.
+- `None`: no row does. No allow at all, or a deny with no condition.
+- `Where(c)`: the rows for which `c` is true. It is "any allow, and no deny"
+  written as one condition, and `compileSql` turns it into the WHERE clause.
+
+```bit
+import { Authz, Cond, Filter, Policy, Subject, Truth, compileSql, eq, evalCond } from "authz"
+import { ServerDialect, Tabled } from "orm"
+import { Value } from "std/sql"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+  authorId: string
+  status: string
+  editorNote: Option<string>
+}
+
+class User {
+  export id: string,
+  export roles: []string,
+}
+
+fn reading(): Policy<User, Action> {
+  return Policy("Reading", (p, user) => {
+    p.can<Article>([Action.Read], eq("status", Value.Text("published")))
+    p.can<Article>([Action.Read], eq("authorId", Value.Text(user.id)))
+    p.cannot<Article>([Action.Read], eq("editorNote", Value.Text("hold")))
+  })
+}
+
+fn everything(): Policy<User, Action> {
+  return Policy("Everything", (p, user) => {
+    p.canAll([Action.Manage])
+  })
+}
+
+fn main(): ()! {
+  let authz = Authz<Action>()?
+  authz.resource<Article>()?
+  authz.role<User>("reader", [reading()])?
+  authz.role<User>("admin", [everything()])?
+  let sara = Option<Subject>.Some(User{ id = "sara", roles = ["reader"] })
+  let root = Option<Subject>.Some(User{ id = "root", roles = ["admin"] })
+
+  let mine: Filter = authz.filterFor<Article>(sara, Action.Read)?
+  match (mine) {
+    All => println("all")
+    None => println("none")
+    Where(c) => {
+      let info = unwrap(authz.resourceByName("Article"))
+      let sql = compileSql(c, info, ServerDialect.Postgres, 1)?
+      println(sql.sql)
+      let draft = Article{ id = 1, authorId = "sara", status = "draft" }
+      println("${authz.can(sara, Action.Read, draft)}")
+      println("${evalCond(c, draft)? == Truth.True}")
+
+      let hold = eq("editorNote", Value.Text("hold"))
+      println("${evalCond(hold, draft)? == Truth.Unknown}")
+      println("${evalCond(Cond.Known(hold), draft)? == Truth.False}")
+    }
+  }
+  match (authz.filterFor<Article>(root, Action.Read)?) {
+    All => println("all")
+    _ => println("not all")
+  }
+  match (authz.filterFor<Article>(Option<Subject>.None, Action.Read)?) {
+    None => println("none")
+    _ => println("not none")
+  }
+}
+```
+
+```
+
+This prints:
+
+```text
+((COALESCE(("status" = $1), FALSE) OR COALESCE(("author_id" = $2), FALSE)) AND (NOT COALESCE(("editor_note" = $3), FALSE)))
+true
+true
+true
+true
+all
+none
+```
+
+The WHERE clause is "some allow holds and no deny does". Sara reads what is
+published and what she wrote, except what an editor put on hold. The admin
+has an allow with no condition and no deny, so `All`; the guest has no role,
+so no allow, so `None`. Neither needs a query.
+
+The `COALESCE`s are the NULL rule from "Unknown is not false". The draft has
+no editor note, so "the note says hold" is unknown for it, and an unknown deny
+denies nothing: `can` lets sara read it, and so does the filter. SQL alone
+would get this wrong, because `NOT unknown` is unknown and a WHERE drops
+unknown rows. `filterFor` therefore wraps every rule in `Cond.Known`, which is
+true only when its inner condition is exactly true and false when it is false
+or unknown. `evalCond(Cond.Known(hold), draft)` is `False` where `hold` alone
+is `Unknown`, and `compileSql` writes it as `COALESCE((...), FALSE)` (`0` on
+MySQL). The promise is one sentence: for every row, the filter keeps it
+exactly when `can` allows it, NULL columns included.
+
+A rule written as code (below) has no SQL form, so `filterFor` fails with a
+`NotFilterable` as soon as one applies to the class and action, even when
+another rule would allow every row: which rule is met first must not decide
+whether a list works. A rule `check` would refuse as invalid is an
+`InvalidPolicy` here too. Repeat calls for the same person are cheap: the
+rules come from the same per-person cache `can` uses.
+
 ## A rule written as code
 
 Some rules are not data: "the publish window is open" is a function of the

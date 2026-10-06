@@ -1,0 +1,110 @@
+// pkg/authz/filter.bit — `Authz.filterFor`: the rules of `decide.bit` run
+// without a row, so a list read returns the rows `can` would allow.
+//
+//   match (authz.filterFor<Article>(user, Action.Read)?) {
+//     All => list everything
+//     None => list nothing
+//     Where(c) => compileSql(c, ...) as the WHERE clause (condsql.bit)
+//   }
+//
+// This is CASL's `rulesToQuery` / `accessibleBy`: collect the rules that
+// apply to (resource, action) for the subject's roles (the guest's role for
+// `None`), bind their `$user.x` placeholders (condparam.bit), then fold:
+//
+//   no allow rule                       None
+//   an allow of True, no deny           All
+//   a deny of True                      None
+//   otherwise  And([Or(Known(allows)), Not(Or(Known(denies)))])
+//
+// `Known` (cond.bit) is what keeps NULL honest. A comparison against a NULL
+// column is unknown, an unknown allow does not grant and an unknown deny does
+// not deny (`can`), and SQL's `NOT unknown` is unknown, which a WHERE drops.
+// Wrapping each rule in `Known` makes it two-valued, so the filter is true for
+// exactly the rows `can` allows, NULL columns included.
+//
+// THE CONTRACT. For every row `r` of `T` and every rule set that `filterFor`
+// answers, `evalCond(c, r)` for `Where(c)` (true), `All` (every row) and
+// `None` (no row) equals `can(user, action, r)`.
+//
+// CODE FUNCTIONS. A rule that holds a `Cond.Custom` has no SQL form. If one
+// applies to (resource, action) the answer is a `NotFilterable` naming the
+// policy and the label, even when another rule would allow everything:
+// listing must not depend on which rule is met first. A rule of the subject's
+// that `validateRulesIn` refuses is an `InvalidPolicy`, as in `check`.
+//
+// COST. The rules come from the subject's cache slot (rulecache.bit), so a
+// repeat call for the same (resource, action) is a cache lookup plus the fold.
+
+// What a list read may return: every row, no row, or the rows satisfying the
+// condition.
+export enum Filter {
+  All,
+  None,
+  Where(Cond),
+}
+
+fn anyTrue(cs: []Cond): bool {
+  for c of cs {
+    if (isTrue(c)) {
+      return true
+    }
+  }
+  return false
+}
+
+// The filter the rules' conditions make; each is `Known` already, so a
+// constant is True or False and anything else is two-valued.
+fn fold(allows: []Cond, denies: []Cond): Filter {
+  if (anyTrue(denies)) {
+    return Filter.None
+  }
+  let allow = or(allows)
+  if (anyTrue(allows)) {
+    allow = Cond.True
+  }
+  if (isFalse(allow)) {
+    return Filter.None
+  }
+  let c = and([allow, not(or(denies))])
+  if (isTrue(c)) {
+    return Filter.All
+  }
+  return Filter.Where(c)
+}
+
+// The slot's rules split into Allow and Deny conditions, bound to `user`. A
+// rule with a code function fails the whole call, whatever the others say.
+fn foldSlot<A: ActionEnum>(
+  sink: Option<LogSink>,
+  user: Option<Subject>,
+  rules: []Rule<A>,
+): Filter! {
+  let allows = []Cond(0)
+  let denies = []Cond(0)
+  for r of rules {
+    refuseCustom(r.policy, r.cond)?
+    let c = known(boundCond<A>(sink, r, user))
+    if (r.effect == Effect.Deny) {
+      denies = append(denies, c)
+    } else {
+      allows = append(allows, c)
+    }
+  }
+  return fold(allows, denies)
+}
+
+fn filterOf<A: ActionEnum, T: Tabled>(
+  a: Authz<A>,
+  user: Option<Subject>,
+  action: A,
+): Filter! {
+  let slot = slotFor<A>(a, user, T.__className(), action)
+  let set = slot.set
+  if (!set.clean) {
+    let bad = firstFault<A>(a.state, set.reg, set.rules)
+    if (bad != "") {
+      fail InvalidPolicy{ detail = bad }
+    }
+  }
+  return foldSlot<A>(set.reg.sink, user, slot.rules)?
+}
