@@ -22,12 +22,17 @@ import { Store, Locker, ClaimedJob } from "jobs"
 
 const workers: int = 6
 const jobsPerRun: int = 30
-// Long enough that two calls in a row stay inside it over a tunnelled database
-// (a fresh connection's TLS handshake alone took more than the 150 ms this
-// started at); `mustNotClaim` after a claim would otherwise reclaim by expiry.
+// The first window every early-reclaim check tries. Long enough that two calls
+// in a row usually stay inside it over a tunnelled database, but NOT relied on:
+// `withWindow` below measures how long the check really took and retries with a
+// longer window when the machine was too slow to prove anything, so a loaded
+// host costs time, never a verdict.
 const visibility: int = 600 * Millisecond
-// Past `visibility`, with room for a loaded machine.
-const pastVisibility: int = 1500 * Millisecond
+// How far past a window the cases sleep before expecting the lease to be gone.
+const slack: int = 900 * Millisecond
+// A check that could not finish inside its window is retried with the window
+// doubled, at most this many times (600 ms up to 9.6 s).
+const maxDoublings: int = 4
 
 fn refuse(label: string, what: string) {
   panic("CONFORMANCE FAILED: ${label}: ${what}")
@@ -71,6 +76,50 @@ fn mustNotClaim(store: Store, label: string) {
   }
 }
 
+// One claim that must not hit a row BEFORE `deadline` (this clock's ns): the
+// moment the job's lease expires or it becomes available. True when nothing
+// was claimed. A claim that DID hit a row is an early reclaim and fails the
+// suite only if the clock read AFTER the call is still short of `deadline`
+// (the store stamps `now()` somewhere inside the call, never later than its
+// return, so a stamp past `deadline` is then impossible). Past `deadline` the
+// claim was legitimate and the check proved nothing: the row is completed so
+// the next attempt starts clean, and the answer is false.
+fn claimNotBefore(store: Store, deadline: int, label: string): bool {
+  match (claimNow(store, visibility, label)) {
+    None => return true
+    Some(job) => {
+      let at = now().ns
+      if (at < deadline) {
+        refuse(
+          label,
+          "claimed job ${job.id} (${job.name}) ${(deadline - at) / Millisecond} ms before its lease or availability ended",
+        )
+      }
+      completeNow(store, job.id, label)
+      return false
+    }
+  }
+}
+
+// Runs `attempt` with a window of `visibility`, and again with the window
+// doubled each time it answers false (a check that finished too late to prove
+// anything, see `claimNotBefore`). Every retry is printed with how late it
+// ran; a window that never fits fails. A real early reclaim never answers
+// false: it fails inside `claimNotBefore` on the first attempt.
+fn withWindow(label: string, attempt: (int) => bool) {
+  let window = visibility
+  let n = 0
+  while (n <= maxDoublings) {
+    if (attempt(window)) {
+      return
+    }
+    print("CONFORMANCE RETRY ${label}: the check ran past its ${window / Millisecond} ms window, retrying with ${2 * window / Millisecond} ms\n")
+    window = 2 * window
+    n = n + 1
+  }
+  refuse(label, "no check finished inside its window, the last was ${window / 2 / Millisecond} ms")
+}
+
 // Claims and completes everything claimable, so a case starts on an empty
 // queue. Bounded: a store that keeps handing rows back forever fails here
 // instead of hanging.
@@ -87,25 +136,45 @@ fn drain(store: Store) {
 }
 
 fn caseRoundTrip(store: Store) {
+  withWindow("round trip", (window) => {
+    return attemptRoundTrip(store, window)
+  })
+}
+
+fn attemptRoundTrip(store: Store, window: int): bool {
   drain(store)
   enqueueNow(store, "conf-roundtrip", "{\"k\":1}", 0, 3)
-  let job = mustClaim(store, visibility, 1, "round trip")
+  let before = now().ns
+  let job = mustClaim(store, window, 1, "round trip")
   if (job.name != "conf-roundtrip" || job.payload != "{\"k\":1}" || job.maxAttempts != 3) {
     refuse("round trip", "got ${job.name} ${job.payload} max ${job.maxAttempts}")
   }
-  mustNotClaim(store, "round trip: a claimed job is leased")
+  if (!claimNotBefore(store, before + window, "round trip: a claimed job is leased")) {
+    return false
+  }
   completeNow(store, job.id, "round trip")
-  sleep(pastVisibility)
+  sleep(window + slack)
   mustNotClaim(store, "round trip: a completed job never returns")
+  return true
 }
 
 fn caseNotYetAvailable(store: Store) {
+  withWindow("not yet available", (window) => {
+    return attemptNotYetAvailable(store, window)
+  })
+}
+
+fn attemptNotYetAvailable(store: Store, window: int): bool {
   drain(store)
-  enqueueNow(store, "conf-later", "{}", now().ns + 200 * Millisecond, 3)
-  mustNotClaim(store, "not yet available")
-  sleep(pastVisibility)
+  let availableAt = now().ns + window
+  enqueueNow(store, "conf-later", "{}", availableAt, 3)
+  if (!claimNotBefore(store, availableAt, "not yet available")) {
+    return false
+  }
+  sleep(window + slack)
   let job = mustClaim(store, 10000 * Millisecond, 1, "available after its time")
   completeNow(store, job.id, "not yet available")
+  return true
 }
 
 fn caseOldestFirst(store: Store) {
@@ -122,29 +191,51 @@ fn caseOldestFirst(store: Store) {
 }
 
 fn caseVisibilityReclaim(store: Store) {
+  withWindow("visibility", (window) => {
+    return attemptVisibilityReclaim(store, window)
+  })
+}
+
+// Claims with `window`, expects the job unclaimable until the window ends
+// (measured on this clock, from before the claim), and reclaimable after it.
+fn attemptVisibilityReclaim(store: Store, window: int): bool {
   drain(store)
   enqueueNow(store, "conf-crash", "{}", 0, 5)
-  let first = mustClaim(store, visibility, 1, "visibility: first claim")
-  mustNotClaim(store, "visibility: inside the window")
-  sleep(pastVisibility)
+  let before = now().ns
+  let first = mustClaim(store, window, 1, "visibility: first claim")
+  if (!claimNotBefore(store, before + window, "visibility: inside the window")) {
+    return false
+  }
+  sleep(window + slack)
   let again = mustClaim(store, visibility, 2, "visibility: reclaim after the window")
   if (again.id != first.id) {
     refuse("visibility", "reclaimed job ${again.id}, the abandoned one was ${first.id}")
   }
   completeNow(store, again.id, "visibility")
+  return true
 }
 
 fn caseRetry(store: Store) {
+  withWindow("retry", (window) => {
+    return attemptRetry(store, window)
+  })
+}
+
+fn attemptRetry(store: Store, window: int): bool {
   drain(store)
   enqueueNow(store, "conf-retry", "{}", 0, 5)
   let first = mustClaim(store, 10000 * Millisecond, 1, "retry: first claim")
-  store.retry(first.id, now().ns + 200 * Millisecond) catch e {
+  let availableAt = now().ns + window
+  store.retry(first.id, availableAt) catch e {
     panic("CONFORMANCE FAILED: retry: ${e.message()}")
   }
-  mustNotClaim(store, "retry: before its new availability")
-  sleep(pastVisibility)
+  if (!claimNotBefore(store, availableAt, "retry: before its new availability")) {
+    return false
+  }
+  sleep(window + slack)
   let second = mustClaim(store, 10000 * Millisecond, 2, "retry: after its new availability")
   completeNow(store, second.id, "retry")
+  return true
 }
 
 fn caseDeadLetter(store: Store) {
@@ -154,7 +245,7 @@ fn caseDeadLetter(store: Store) {
   store.deadLetter(job.id, "conformance") catch e {
     panic("CONFORMANCE FAILED: deadLetter: ${e.message()}")
   }
-  sleep(pastVisibility)
+  sleep(visibility + slack)
   mustNotClaim(store, "dead letter: a dead-lettered job never returns")
 }
 
