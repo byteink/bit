@@ -1884,7 +1884,7 @@ acknowledging.
 
 **Known limitation, narrowed by the `syscall` contract but not closed.** Blocking runtime calls
 made *from* Bit code (`bit_rt_print` on a full pipe, `bit_rt_fs_read` on stdin,
-`bit_rt_net_resolve`'s DNS timeout) mostly do **not** use either contract: their
+`bit_rt_net_resolve_w`'s DNS timeout) mostly do **not** use either contract: their
 frames legitimately hold live references, so `blocked` is wrong, and they have
 not been converted to `syscall`. Such a thread stays `running`, so a concurrent
 collection waits for it and abandons if it exceeds the rendezvous bound. That is
@@ -3053,13 +3053,13 @@ defined exactly once).
 | `bit_rt_net_write_deadline_w` | `(fd: i64, words: usize, n: i64, deadlineNs: i64) -> i64` (§20, same deadline shape; the body crosses as packed `words`/`n` and the kernel reads it straight from the caller's buffer, with no runtime copy, so the caller keeps that buffer live across the call with `keepAlive`. Bytes written, `-1` hard error, `-2` timed out) |
 | `bit_rt_net_write_bytes_w` | `(fd: i64, words: usize, n: i64) -> i64` (§20, #5928: `bit_rt_net_write`'s byte-taking sibling — same `words`/`n` packed-buffer shape `bit_rt_net_write_deadline_w` uses, but calls the SAME true-blocking, never-give-up engine `bit_rt_net_write` does, not the deadline-bounded one, so `std/net`'s `Conn.writeBytes` with no deadline armed behaves exactly like `Conn.write(s: string)`'s own no-deadline fast path. Bytes written, `-1` hard error) |
 | `bit_rt_net_shutdown_sock_w` | `(fd: i64) -> bool` (§20, shuts BOTH directions of `fd` down without releasing it for reuse — see `netShutdownSock` in runtime/net/{darwin,linux,windows}/tcp.bit for why this exists alongside plain close. No buffer, so unlike its `_w` siblings it needs no packed-byte scratch; `true` on success) |
-| `bit_rt_net_lookup_txt_w` | `(inWords: usize, hostLen: i64, nsLen: i64, port: i64, outWords: usize) -> i64` (§20, #6882: the TXT records of a host, written into the caller's own `outWords` buffer (65537 bytes) as entries of a two-byte big-endian length then that many bytes, one per TXT RR with its character-strings concatenated in order. `in` holds the host (`hostLen` bytes) then, when `nsLen > 0`, one nameserver's IPv4 or IPv6 text (at most 64 bytes) that is asked on `port`; `nsLen == 0` asks every nameserver in `/etc/resolv.conf` on port 53. Returns the bytes written (`0`: no TXT record, NXDOMAIN included), `-1` timeout or server failure, `-2` malformed reply, `-3` unsupported (Windows, which has no TXT lookup). A reply with TC set is repeated over TCP (IPv4 nameservers only) inside the same per-server budget as `bit_rt_net_resolve`. Both buffers cross as packed `[]byte` backings the caller holds live with `keepAlive`) |
+| `bit_rt_net_lookup_txt_w` | `(inWords: usize, hostLen: i64, nsLen: i64, port: i64, outWords: usize) -> i64` (§20, #6882: the TXT records of a host, written into the caller's own `outWords` buffer (65537 bytes) as entries of a two-byte big-endian length then that many bytes, one per TXT RR with its character-strings concatenated in order. `in` holds a 16-byte budget header (#6350: the per-attempt window in milliseconds, then the attempt count, each a little-endian 64-bit word; it rides in the buffer because the entry is at the five-parameter ceiling), then the host (`hostLen` bytes), then, when `nsLen > 0`, one nameserver's IPv4 or IPv6 text (at most 64 bytes) that is asked on `port`; `nsLen == 0` asks every nameserver in `/etc/resolv.conf` on port 53. A budget outside 1..1000000 for either word returns `-1`. Returns the bytes written (`0`: no TXT record, NXDOMAIN included), `-1` timeout or server failure, `-2` malformed reply, `-3` unsupported (Windows, which has no TXT lookup). A reply with TC set is repeated over TCP (IPv4 nameservers only) inside the same per-server budget as `bit_rt_net_resolve_w`. Both buffers cross as packed `[]byte` backings the caller holds live with `keepAlive`) |
 | `bit_rt_net_udp_bind` | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_udp_send` | `(fd: i64, host: *const RtBytes, port: i64, data: *const RtBytes) -> i64` (§20) |
 | `bit_rt_net_udp_recv` | `(fd: i64, max: i64) -> *const RtBytes` (§20)          |
 | `bit_rt_net_udp_sender_host` | `() -> *const RtBytes` (§20)                    |
 | `bit_rt_net_udp_sender_port` | `() -> i64` (§20)                               |
-| `bit_rt_net_resolve`  | `(host: *const RtBytes) -> *const RtBytes` (§20)       |
+| `bit_rt_net_resolve_w` | `(hostWords: usize, hostLen: i64, timeoutMs: i64, attempts: i64, outWords: usize) -> i64` (§20, #6350: the first A record of the host as a dotted quad written into the caller's own `outWords` buffer (at least 16 bytes), its byte count returned; `-1` once every nameserver has failed or an argument is refused (a host of 0 or over 255 bytes, a null buffer, `timeoutMs` or `attempts` outside 1..1000000). `timeoutMs` is the receive window of ONE try and `attempts` how many passes are made over the nameserver list (A, B, A, B: resolv.conf(5)'s meaning, so a dead first server costs one window before the second is asked; the window is fixed, no retrans back-off): `std/net` owns both (resolv.conf's `options timeout:N attempts:N`, defaults 5000 and 2) and the runtime keeps no default of its own. A plain `extern fn` in `stdlib/net/net.bit`, which replaced the `netResolve` compiler primitive and its `bit_rt_net_resolve` entry: a primitive's arity is baked into the compiler that emits the call, so widening it would have needed a stage0 repin (`tools/build/abiarity.bit`); an `extern` takes its arity from the source it is compiled against. Both buffers cross as packed `[]byte` backings the caller holds live with `keepAlive`) |
 | `bit_rt_random_bytes` | `(len: i64) -> *const RtBytes` (§21)                   |
 | `bit_rt_secure_zero`  | `(h: *SliceHeader) -> void` (§21)                      |
 | `bit_rt_crypto_aes_hw_available` | `() -> bool` (§21b)                         |
@@ -4582,12 +4582,14 @@ bit_rt_net_udp_sender_port()            -> port  // last recv's sender port, or 
 **DNS.** `resolve` returns the first A record for `host` as a dotted quad, or `""`
 on failure; a dotted-quad `host` passes straight back. It queries every
 nameserver in `/etc/resolv.conf` in order over a non-blocking UDP socket with
-bounded retransmits (3 attempts of 2 s each per nameserver). The calling task
+bounded retransmits (`attempts` passes over the list, one try of `timeoutMs`
+per nameserver per pass, both passed in by `std/net`, which takes them from `options timeout:N attempts:N`
+in `resolv.conf` and defaults to 2 tries of 5 s as glibc does). The calling task
 parks on the netpoller with the attempt's deadline, so a lost packet neither
 holds the OS thread nor delays a stop-the-world rendezvous.
 
 ```
-bit_rt_net_resolve(host)        -> str   // first A record, dotted quad. "" on failure
+bit_rt_net_resolve_w(host, hostLen, timeoutMs, attempts, out) -> n   // first A record, dotted quad, in out[0..n). -1 on failure
 ```
 
 **Deadline-bounded dial/read/write.** A server that completes the

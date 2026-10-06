@@ -9,7 +9,7 @@
 // DNS I/O rides the same non-blocking socket + netpoller path TCP and UDP
 // use (#6341). A lookup used to be a raw blocking `sendto`/`recvfrom` with
 // SO_RCVTIMEO inside `@nosplit` code: the OS thread sat in the kernel for up
-// to `netDnsTimeoutMs` per attempt with no safepoint, so every stop-the-world
+// to the attempt's window with no safepoint, so every stop-the-world
 // attempted meanwhile stalled, and the thread could do nothing else. Now the
 // resolving task parks on readability with the attempt's deadline
 // (`netAwaitReadyOrDeadline`, ./tcpdeadline.bit), the OS thread returns to the
@@ -86,12 +86,12 @@ export @symbol("bit_rt_port_net_dns_socket6") @nosplit fn netDnsSocket6(): int {
 }
 
 // One datagram into this worker's reply slot (`dnsBytes() + netMaxDnsMsg`),
-// waiting at most `netDnsTimeoutMs`. Returns its length, `netDeadlineTimedOut`
+// waiting at most `timeoutMs`. Returns its length, `netDeadlineTimedOut`
 // when nothing arrived in time, or -1 on a hard error. Bounded by
 // `netDeadlineMaxPolls` (Power of 10); the monotonic deadline is what ends a
 // real wait.
-@nosplit fn netDnsRecv(fd: int, gen: int): int {
-  let deadline = netClockNowNs() + netDnsTimeoutMs * 1000000
+@nosplit fn netDnsRecv(fd: int, gen: int, timeoutMs: int): int {
+  let deadline = netClockNowNs() + timeoutMs * 1000000
   let slice = netDeadlineFastPollNs
   let polls = 0
   while (polls < netDeadlineMaxPolls) {
@@ -116,28 +116,20 @@ export @symbol("bit_rt_port_net_dns_socket6") @nosplit fn netDnsSocket6(): int {
   return netDeadlineTimedOut
 }
 
-// Up to `netDnsRetries` query/reply exchanges over the connected `fd`. A lost
-// or late reply, a failed send and a malformed answer (or one with no A
-// record) each cost an attempt and retransmit; a hard receive error, such as
-// the nameserver's port refusing the datagram, ends the lookup.
-@nosplit fn netDnsAttempts(fd: int, host: *u8, hostLen: int, out: *u8): bool {
+// ONE query/reply exchange over the connected `fd`, waiting at most the window
+// `ns`'s block carries (`netNsTimeoutOff`). A failed send, a lost or late reply,
+// a malformed answer (or one with no A record) and a hard receive error, such as
+// the nameserver's port refusing the datagram, each end it with false. Retrying
+// is the caller's: `netResolvePasses` (./netabi.bit) goes round the whole
+// nameserver list once per attempt, so a dead first server costs one window
+// before the second is asked (resolv.conf(5) `attempts`, #6350).
+@nosplit fn netDnsAttempt(fd: int, host: *u8, hostLen: int, out: *u8, ns: *u8): bool {
   let gen = *netFdGenAddr(fd)
-  let attempt = 0
-  // Bounded retransmits (Power of 10): a lost query is retried a fixed number
-  // of times and then reported, never waited on forever.
-  while (attempt < netDnsRetries) {
-    attempt = attempt + 1
-    if (netDnsSend(fd, host, hostLen, 1)) {
-      let got = netDnsRecv(fd, gen)
-      if (got == 0 - 1) {
-        return false
-      }
-      if (got >= 0 && netParseAnswer(dnsBytes() + netMaxDnsMsg, got, netDnsId, out)) {
-        return true
-      }
-    }
+  if (!netDnsSend(fd, host, hostLen, 1)) {
+    return false
   }
-  return false
+  let got = netDnsRecv(fd, gen, getU64Le(ns, netNsTimeoutOff))
+  return got >= 0 && netParseAnswer(dnsBytes() + netMaxDnsMsg, got, netDnsId, out)
 }
 
 // A datagram socket connected to the nameserver, or -1 when the name cannot
@@ -162,17 +154,18 @@ export @symbol("bit_rt_port_net_dns_socket6") @nosplit fn netDnsSocket6(): int {
   return fd
 }
 
-// Runs the exchange on `fd` and always closes it.
-@nosplit fn netDnsFinish(fd: int, host: *u8, hostLen: int, out: *u8): bool {
-  let ok = netDnsAttempts(fd, host, hostLen, out)
+// Runs one attempt on `fd` and always closes it.
+@nosplit fn netDnsFinish(fd: int, host: *u8, hostLen: int, out: *u8, ns: *u8): bool {
+  let ok = netDnsAttempt(fd, host, hostLen, out, ns)
   netClose(fd)
   return ok
 }
 
 // Resolve `host` to an IPv4 address, written to `out`. A dotted quad passes
 // straight through; a hostname is queried against the nameserver at
-// `ns[0..4]:port`. Each of the `netDnsRetries` attempts waits up to
-// `netDnsTimeoutMs`, parked on the poller.
+// `ns[0..4]:port`, ONE attempt: `ns` is a resolve block (`netNsBlockBytes`,
+// ../../net) whose window `std/net` chose bounds the wait, parked on the
+// poller. The attempt count is `netResolvePasses`'s.
 //
 // THE NAMESERVER IS A PARAMETER RATHER THAN READ FROM /etc/resolv.conf HERE.
 // The parse of that file is `netFirstNameserver` in ../net.bit, split out so it
@@ -183,7 +176,7 @@ export @symbol("bit_rt_port_net_dns_socket6") @nosplit fn netDnsSocket6(): int {
 //
 // `port` IS ALSO A PARAMETER, NOT A LITERAL 53, for the same testability
 // reason (#6338): every real nameserver speaks port 53, which the ONE
-// caller (`../netabi.bit`'s `netAbiResolve`) passes, but binding port 53
+// caller (`../netabi.bit`'s `netResolveConf`) passes, but binding port 53
 // for a local test stub needs root -- `_tests_/stress/netdnsfallback` points
 // this at an ephemeral-port stub instead.
 export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(
@@ -197,11 +190,11 @@ export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(
     return true
   }
   let fd = netDnsOpen(host, hostLen, ns, port, false)
-  return fd >= 0 && netDnsFinish(fd, host, hostLen, out)
+  return fd >= 0 && netDnsFinish(fd, host, hostLen, out, ns)
 }
 
 // #6338: `netResolveHost`'s IPv6 twin -- `ns` is sixteen bytes (an address
-// `../dns.bit`'s `netParseIpv6`, via `../netabi.bit`'s `netAbiResolve`,
+// `../dns.bit`'s `netParseIpv6`, via `../netabi.bit`'s `netResolveConf`,
 // already parsed) rather than four, and the socket dials AF_INET6/
 // `sockaddr_in6`. Still an A-record query: this only changes which
 // transport reaches the nameserver, not what it is asked for.
@@ -209,11 +202,12 @@ export @symbol("bit_rt_port_net_resolve6") @nosplit fn netResolveHost6(
   host: *u8,
   hostLen: int,
   ns: *u8,
+  port: int,
   out: *u8,
 ): bool {
   if (netParseIpv4(host, hostLen, out)) {
     return true
   }
-  let fd = netDnsOpen(host, hostLen, ns, 53, true)
-  return fd >= 0 && netDnsFinish(fd, host, hostLen, out)
+  let fd = netDnsOpen(host, hostLen, ns, port, true)
+  return fd >= 0 && netDnsFinish(fd, host, hostLen, out, ns)
 }

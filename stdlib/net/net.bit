@@ -12,7 +12,7 @@
 // terminating proxy in front. Adding TLS means an implementation of the record
 // layer and a certificate verifier, which is its own task.
 import { readFile } from "std/fs"
-import { split, hasPrefix, indexOf, trimSpace } from "std/strings"
+import { split, hasPrefix, indexOf, trimSpace, replace, parseInt } from "std/strings"
 
 // A listening socket. Not a `Conn`: the only thing you can do with it is accept.
 export class Listener {
@@ -482,10 +482,35 @@ export fn udpBind(host: string, port: int): UdpSocket! {
   return UdpSocket{ fd = fd }
 }
 
+// `bit_rt_net_resolve_w` (#6350): the first A record of the host
+// `host[0..hostLen)` written into `out` (at least 16 bytes) as a dotted quad,
+// its byte count returned; -1 once every nameserver failed. `timeoutMs` is ONE
+// try's receive window and `attempts` how many passes are made over the
+// nameserver list (A, B, A, B, as glibc does): both
+// are this module's (`DnsPolicy`, dnsconf.bit), the runtime has no default.
+// A plain `extern fn`, not a builtin: SPEC §11.7 admits no `string` across that
+// boundary, and a new builtin arity could not be reached from here until the
+// next stage0 repin, because `make selfhost` compiles this file with the PINNED
+// stage0. Both buffers are packed `[]byte` backings held live with `keepAlive`.
+extern fn bit_rt_net_resolve_w(
+  host: *byte,
+  hostLen: int,
+  timeoutMs: int,
+  attempts: int,
+  out: *byte,
+): int
+
+// The longest dotted quad is 15 bytes; the runtime wants 16.
+const resolveOutCap: int = 16
+
 // Resolve a hostname to an IPv4 address (dotted quad) via the system resolver
-// (the first nameserver in /etc/resolv.conf). A dotted-quad argument or an IPv6
-// literal (`isIpv6Literal`, no brackets) is returned unchanged, so it is safe to
-// call on an address that may already be numeric.
+// (every nameserver in /etc/resolv.conf, in order). A dotted-quad argument or an
+// IPv6 literal (`isIpv6Literal`, no brackets) is returned unchanged, so it is
+// safe to call on an address that may already be numeric.
+//
+// The nameservers are asked, pass by pass, under resolv.conf's `options
+// timeout:N attempts:N` (defaults 5 s and 2 attempts, glibc's), see
+// `resolveBudgetMs`.
 //
 // Only A records — no AAAA, no search domains, no caching. Pair it with `dial`:
 // `dial(resolve("example.com")?, 80)`.
@@ -493,19 +518,36 @@ export fn resolve(host: string): string! {
   if (isIpv6Literal(host)) {
     return host
   }
-  let ip = netResolve(host)
-  if (len(ip) == 0) {
+  return resolveUnder(host, readDnsPolicy())?
+}
+
+// `resolve` under an explicit policy: the seam the tests give a short budget.
+fn resolveUnder(host: string, p: DnsPolicy): string! {
+  let packed = []byte(len(host) + 1)
+  let i = 0
+  while (i < len(host)) {
+    packed[i] = host[i]
+    i = i + 1
+  }
+  let out = []byte(resolveOutCap)
+  let n = bit_rt_net_resolve_w(ptrOf(packed), len(host), p.timeoutMs, p.attempts, ptrOf(out))
+  keepAlive(packed)
+  keepAlive(out)
+  if (n <= 0 || n > resolveOutCap) {
     fail newError("could not resolve ${host}")
   }
-  return ip
+  return string(out[0:n])
 }
 
 // `bit_rt_net_lookup_txt_w` (#6882): the TXT records of a host, as a list of
 // entries each a two-byte big-endian length then that many bytes, written into
-// `out` (`txtOutCap` bytes). `in` holds the host (`hostLen` bytes) and then, when
-// `nsLen > 0`, ONE nameserver's address text (IPv4 or IPv6), `port` being its
-// port; `nsLen == 0` asks every nameserver in /etc/resolv.conf in order on port
-// 53. Returns the bytes written (0: the name has no TXT record), -1 on a timeout
+// `out` (`txtOutCap` bytes). `in` holds a 16-byte budget header (`txtHeaderBytes`:
+// `timeoutMs`, then `attempts`, each a little-endian 64-bit word, this module's
+// `DnsPolicy` as `resolve` passes it; it rides in the buffer because the entry
+// point is at the five-parameter lint ceiling), then the host (`hostLen` bytes)
+// and then, when `nsLen > 0`, ONE nameserver's address text (IPv4 or IPv6),
+// `port` being its port; `nsLen == 0` asks every nameserver in /etc/resolv.conf
+// in order on port 53. Returns the bytes written (0: the name has no TXT record), -1 on a timeout
 // or server failure, -2 for a malformed reply, -3 where the runtime has no TXT
 // lookup (Windows). A plain `extern fn`, not a builtin, for the reason
 // `bit_rt_net_peer_addr_w` above gives; both buffers cross as packed `[]byte`
@@ -522,19 +564,35 @@ extern fn bit_rt_net_lookup_txt_w(
 // the entries written from it never outgrow it, plus the last entry's length.
 const txtOutCap: int = 65537
 
-// `host` followed by `ns` as one packed byte buffer, at least one byte long (an
-// empty `[]byte` has no address to pass).
-fn txtPack(host: string, ns: string): []byte {
-  let n = len(host) + len(ns)
-  let b = []byte(n + 1)
+// The budget header `bit_rt_net_lookup_txt_w`'s `in` opens with: two words.
+const txtHeaderBytes: int = 16
+
+// `v` (not negative) as eight little-endian bytes at `b[off..off+8)`.
+fn putWordLe(b: []byte, off: int, v: int) {
+  let x = v
+  let k = 0
+  while (k < 8) {
+    b[off + k] = byte(x % 256)
+    x = x / 256
+    k = k + 1
+  }
+}
+
+// The runtime's request: the budget header, then `host`, then `ns`, as one
+// packed byte buffer.
+fn txtPack(host: string, ns: string, p: DnsPolicy): []byte {
+  let n = txtHeaderBytes + len(host) + len(ns)
+  let b = []byte(n)
+  putWordLe(b, 0, p.timeoutMs)
+  putWordLe(b, 8, p.attempts)
   let i = 0
   while (i < len(host)) {
-    b[i] = host[i]
+    b[txtHeaderBytes + i] = host[i]
     i = i + 1
   }
   let j = 0
   while (j < len(ns)) {
-    b[len(host) + j] = ns[j]
+    b[txtHeaderBytes + len(host) + j] = ns[j]
     j = j + 1
   }
   return b
@@ -562,8 +620,8 @@ fn txtEntries(name: string, out: []byte, n: int): []string! {
 
 // `lookupTxt` against an explicit nameserver `ns:port` (`ns == ""` is the
 // system resolver). Unexported: the seam the tests point at a fake DNS server on
-// 127.0.0.1, since 53 cannot be bound without root.
-fn lookupTxtVia(name: string, ns: string, port: int): []string! {
+// 127.0.0.1, since 53 cannot be bound without root, and give a short budget.
+fn lookupTxtVia(name: string, ns: string, port: int, p: DnsPolicy): []string! {
   let n = len(name)
   // A trailing dot spells the root (`example.com.`); the wire format has no
   // empty label for it.
@@ -573,7 +631,7 @@ fn lookupTxtVia(name: string, ns: string, port: int): []string! {
   if (n == 0 || n > 253) {
     fail newError("lookupTxt ${name}: invalid name")
   }
-  let packed = txtPack(name[0:n], ns)
+  let packed = txtPack(name[0:n], ns, p)
   let out = []byte(txtOutCap)
   let rc = bit_rt_net_lookup_txt_w(ptrOf(packed), n, len(ns), port, ptrOf(out))
   keepAlive(packed)
@@ -604,58 +662,7 @@ fn lookupTxtVia(name: string, ns: string, port: int): []string! {
 // only. `lookupTxt("sel._domainkey.example.com")` is how a mailer reads its
 // published DKIM key.
 export fn lookupTxt(name: string): []string! {
-  return lookupTxtVia(name, "", 0)?
-}
-
-// The worst-case wall clock the resolver spends on ONE nameserver: one
-// `netDnsTimeoutMs` (2000) receive window per attempt, `netDnsRetries` (3)
-// attempts (`runtime/net/net.bit`). std/net cannot import a runtime constant,
-// so the product is restated here; `resolveBudgetMs` is the only reader.
-const dnsServerBudgetMs: int = 6000
-
-// The resolver reads at most this many bytes of /etc/resolv.conf
-// (`resolvConfMax`, `runtime/net/{darwin,linux}/netabi.bit`), so a
-// `nameserver` line past it is never tried and must not be budgeted.
-const resolvConfScanBytes: int = 4096
-
-// How many `nameserver` lines `conf`'s first `resolvConfScanBytes` bytes hold.
-// An upper bound on the servers the resolver tries: it skips a line whose
-// address does not parse, which this does not check.
-fn countNameservers(conf: string): int {
-  let head = conf
-  if (len(head) > resolvConfScanBytes) {
-    head = conf[0:resolvConfScanBytes]
-  }
-  let lines = split(head, "\n")
-  let n = 0
-  let i = 0
-  while (i < len(lines)) {
-    let l = trimSpace(lines[i])
-    if (len(l) > 10 && hasPrefix(l, "nameserver") && (l[10] == ' ' || l[10] == '\t')) {
-      n = n + 1
-    }
-    i = i + 1
-  }
-  return n
-}
-
-// The longest `resolve` can take on this machine, in milliseconds: every
-// nameserver in /etc/resolv.conf is tried in turn (#6338), each for up to its
-// full retry budget, so the worst case scales with the number of servers (at
-// least one: an empty or unreadable file fails at once, which the floor of 1
-// over-counts safely). A caller that races `resolve` (through
-// `std/tls.dial` or `std/http.get`) against its own timer must give that timer
-// at least this much plus whatever connecting and transferring needs, or slow
-// but eventually successful DNS reads as a timeout.
-export fn resolveBudgetMs(): int {
-  let conf = readFile("/etc/resolv.conf") catch _ {
-    return dnsServerBudgetMs
-  }
-  let n = countNameservers(conf)
-  if (n < 1) {
-    n = 1
-  }
-  return n * dnsServerBudgetMs
+  return lookupTxtVia(name, "", 0, readDnsPolicy())?
 }
 
 // ---------------------------------------------------------------------------

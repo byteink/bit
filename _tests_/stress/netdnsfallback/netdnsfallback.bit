@@ -4,7 +4,8 @@
 //
 // #6338's own acceptance: the resolver must fall through a nameserver that
 // refuses the connection to one that answers, and must tolerate that one
-// taking up to 150ms -- comfortably inside `netDnsTimeoutMs`'s 2000ms budget.
+// taking up to 150ms -- comfortably inside the 2000ms attempt window the test
+// puts in its nameserver block (`ipBytes`).
 // Both servers are local UDP stubs on ephemeral ports: `netResolveHost`'s
 // `port` parameter exists precisely so this needs no root to bind 53 (see
 // its own header, ../../../runtime/net/darwin/dns.bit).
@@ -35,7 +36,9 @@
 // "fallback false" after 3 x 2000ms. The region holds no managed reference
 // (module words and raw buffers only), which is the bracket's precondition.
 
-import { netBindUdp, netSockLocalPort, netClose, netResolveHost } from "../../../runtime/net/darwin"
+import { netBindUdp, netSockLocalPort, netClose, netResolveHost, netResolvePasses } from "../../../runtime/net/darwin"
+import { putU64Le, netNsTimeoutOff, netNsAttemptsOff } from "../../../runtime/net"
+import { netNsPortOff, netNsPortStepOff, netNsConfOff, netNsConfLenOff } from "../../../runtime/net"
 import { threadJoin, threadJoinDone, threadRunning } from "../../../runtime/thread"
 import { threadStart, threadRelease } from "../../../runtime/thread/darwin"
 import { parkSleepNs, parkMonoNs } from "../../../runtime/park/darwin"
@@ -52,6 +55,8 @@ extern fn bit_rt_fs_close(fd: i64): i64
 extern fn nanosleep(req: *u8, rem: *u8): i32
 
 const slowDelayMinNs: int = 150000000
+const dnsAttemptMs: int = 2000
+const dnsAttempts: int = 3
 const dnsStubAnswerLen: int = 16
 const dnsStubMax: int = 512
 
@@ -65,7 +70,11 @@ const respMaxWaitNs: int = 5000000000
 
 let hostBuf: [4]i64
 let badHostBuf: [4]i64
-let ipBuf: [1]i64
+// The resolve block `netResolveHost`/`netResolvePasses` take (`netNsBlockBytes`,
+// 64 bytes): the address, then the window, the attempt count and the walk's
+// port, port step and conf text std/net would pass down.
+let ipBuf: [8]i64
+let confBuf: [8]i64
 let octBuf: [1]i64
 let dnsQueryBuf: [64]i64
 let joinSleepScratch: [2]i64
@@ -349,18 +358,14 @@ fn dnsFallbackProps(hostLen: int, badLen: int): bool {
   let packed = rawUdpBind()
   let slowFd = packed / 100000
   let slowPort = packed % 100000
-  slowRespFd = i64(slowFd)
-  slowWrote = 0
-  atomicStore(ptrOf(slowGoWords), i32(0))
-  atomicStore(ptrOf(slowDoneWords), i32(threadRunning))
-  let bp: *byte = nil
-  let h = threadStart(entryOf(slowDnsResponderEntry), bp, ptrOf(slowDoneWords))
-  atomicStore(ptrOf(slowGoWords), i32(1))
+  let h = startStub(slowFd)
 
   putByte(ipBytes(), 0, 127)
   putByte(ipBytes(), 1, 0)
   putByte(ipBytes(), 2, 0)
   putByte(ipBytes(), 3, 1)
+  putU64Le(ipBytes(), netNsTimeoutOff, dnsAttemptMs)
+  putU64Le(ipBytes(), netNsAttemptsOff, dnsAttempts)
 
   clear(octBytes(), 4)
   let t0 = parkMonoNs()
@@ -373,6 +378,28 @@ fn dnsFallbackProps(hostLen: int, badLen: int): bool {
   let deadOk = !netResolveHost(badHostBytes(), badLen, ipBytes(), deadPort, octBytes())
   diagDeadNs = parkMonoNs() - t1
 
+  let stubOk = stopStub(h, slowFd)
+  diagSlowOk = slowOk
+  diagDeadOk = deadOk
+  return deadOk && slowOk && stubOk
+}
+
+// Starts the one-shot slow responder on `slowFd` (it answers ONE query, 150ms
+// after receiving it) and returns its thread handle.
+fn startStub(slowFd: int): int {
+  slowRespFd = i64(slowFd)
+  slowWrote = 0
+  atomicStore(ptrOf(slowGoWords), i32(0))
+  atomicStore(ptrOf(slowDoneWords), i32(threadRunning))
+  let bp: *byte = nil
+  let h = threadStart(entryOf(slowDnsResponderEntry), bp, ptrOf(slowDoneWords))
+  atomicStore(ptrOf(slowGoWords), i32(1))
+  return h
+}
+
+// Joins and releases the responder, closes its socket; true when it ran, was
+// joined, released, and wrote its answer.
+fn stopStub(h: int, slowFd: int): bool {
   let joined = threadJoin(
     ptrOf(slowDoneWords),
     120000000000,
@@ -381,10 +408,93 @@ fn dnsFallbackProps(hostLen: int, badLen: int): bool {
   ) == threadJoinDone
   let released = threadRelease(h)
   let _ = int(bit_rt_fs_close(i64(slowFd)))
-  diagSlowOk = slowOk
-  diagDeadOk = deadOk
   diagJoined = joined
-  return deadOk && slowOk && h != 0 && joined && released && int(slowWrote) > 0
+  return h != 0 && joined && released && int(slowWrote) > 0
+}
+
+// `text` at `base[off..)`, returning the offset past it.
+fn putText(base: *u8, off: int, text: string): int {
+  let i = 0
+  while (i < len(text)) {
+    putByte(base, off + i, int(text[i]))
+    i = i + 1
+  }
+  return off + len(text)
+}
+
+// resolv.conf(5) `attempts` goes round the nameserver LIST, A B A B, not A A B
+// B (#6350): with the first server a blackhole (a socket this program bound and
+// never reads, so the query is delivered and nothing comes back, unlike the
+// refused port above) and the second the slow stub, `netResolvePasses` must
+// answer from the second after ONE window, not after the first server's two.
+// Both servers are on 127.0.0.1, so each gets its own port through the block's
+// port step; the conf text names 127.0.0.1 twice. The step is unsigned, so the
+// stub's port must be the higher one: rebind until it is.
+//
+// With a 1000ms window the right order takes ~1000ms + the stub's 150ms; the
+// wrong one ~2000ms + 150ms. The bounds sit between.
+const orderWindowMs: int = 1000
+const orderBindTries: int = 50
+
+let diagOrderNs: int = 0
+let diagOrderOk: bool = false
+
+// The blackhole's fd, in `ordBlackFd`, and the stub's `fd * 100000 + port` pack
+// (`rawUdpBind`) in `ordStub`, with the stub's port the higher; false when 50
+// tries never ordered them.
+let ordBlackFd: int = 0
+let ordStub: int = 0
+
+fn bindOrdered(hostLen: int): bool {
+  let tries = 0
+  while (tries < orderBindTries) {
+    tries = tries + 1
+    ordBlackFd = netBindUdp(hostBytes(), hostLen, 0)
+    ordStub = rawUdpBind()
+    if (ordBlackFd >= 0 && ordStub >= 0 && ordStub % 100000 > netSockLocalPort(ordBlackFd)) {
+      return true
+    }
+    if (ordBlackFd >= 0) {
+      netClose(ordBlackFd)
+    }
+    if (ordStub >= 0) {
+      let _ = int(bit_rt_fs_close(i64(ordStub / 100000)))
+    }
+  }
+  return false
+}
+
+fn dnsOrderProps(hostLen: int, badLen: int): bool {
+  if (!bindOrdered(hostLen)) {
+    return false
+  }
+  let blackPort = netSockLocalPort(ordBlackFd)
+  let stubPort = ordStub % 100000
+  let h = startStub(ordStub / 100000)
+
+  let confLen = putText(
+    bytesAt(int(ptrOf(confBuf))),
+    0,
+    "nameserver 127.0.0.1\nnameserver 127.0.0.1\n",
+  )
+  putByte(ipBytes(), 0, 127)
+  putU64Le(ipBytes(), netNsTimeoutOff, orderWindowMs)
+  putU64Le(ipBytes(), netNsAttemptsOff, 2)
+  putU64Le(ipBytes(), netNsPortOff, blackPort)
+  putU64Le(ipBytes(), netNsPortStepOff, stubPort - blackPort)
+  putU64Le(ipBytes(), netNsConfOff, int(ptrOf(confBuf)))
+  putU64Le(ipBytes(), netNsConfLenOff, confLen)
+
+  clear(octBytes(), 4)
+  let t0 = parkMonoNs()
+  let resolved = netResolvePasses(badHostBytes(), badLen, ipBytes(), octBytes())
+  diagOrderNs = parkMonoNs() - t0
+  let stubOk = stopStub(h, ordStub / 100000)
+  netClose(ordBlackFd)
+  let inTime = ms(diagOrderNs) >= orderWindowMs * 9 / 10 &&
+    ms(diagOrderNs) < orderWindowMs * 18 / 10
+  diagOrderOk = resolved && isStubAnswer(octBytes())
+  return diagOrderOk && inTime && stubOk
 }
 
 fn ms(ns: int): int {
@@ -394,10 +504,10 @@ fn ms(ns: int): int {
 // The failure report. Everything needed to tell an OS stall from a collector
 // stall is here: if `slow resolve` ran long while `stub` shows the planned
 // ~150ms, the time went to the client, and `gc` says whether a stop-the-world
-// rendezvous took it (`pausemax`, `rdv`, `abandoned`). `netDnsTimeoutMs` is
-// 2000.
+// rendezvous took it (`pausemax`, `rdv`, `abandoned`). The attempt window is
+// `dnsAttemptMs`, 2000.
 fn report() {
-  println("slow resolve: ok=${diagSlowOk} elapsed=${ms(diagSlowNs)}ms (budget 2000ms per attempt)")
+  println("slow resolve: ok=${diagSlowOk} elapsed=${ms(diagSlowNs)}ms (budget ${dnsAttemptMs}ms per attempt)")
   println("dead resolve: refused=${diagDeadOk} elapsed=${ms(diagDeadNs)}ms")
   println("stub: receive-to-send=${ms(diagStubSendNs - diagStubRecvNs)}ms (planned ${ms(slowDelayMinNs)}ms) wrote=${slowWrote} joined=${diagJoined}")
   println("gc: collections=${stwCollections()} pauses=${stwPauses()} abandoned=${stwAbandonedCount()} pausemax=${ms(stwPauseMaxNs())}ms rdvtotal=${ms(stwRdvNs())}ms")
@@ -410,5 +520,10 @@ fn main() {
   println("fallback ${fallback}")
   if (!fallback) {
     report()
+  }
+  let order = dnsOrderProps(hostLen, badLen)
+  println("order ${order}")
+  if (!order) {
+    println("order resolve: ok=${diagOrderOk} elapsed=${ms(diagOrderNs)}ms (window ${orderWindowMs}ms: want ${orderWindowMs}..${orderWindowMs * 18 / 10}ms)")
   }
 }
