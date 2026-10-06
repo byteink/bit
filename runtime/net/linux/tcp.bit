@@ -28,6 +28,45 @@ import { pdCancel } from "../../sched"
 // TCP
 // ---------------------------------------------------------------------------
 
+// A listen/dial host as a sockaddr in this worker's scratch: an IPv6 literal
+// (any host holding ':', parsed by `netParseIpv6`) fills `sa6Bytes()` and
+// returns `sa6Len`; otherwise an IPv4 dotted quad fills `saBytes()` and
+// returns `saLen`. 0 when `host` is neither -- a name, a zone id, garbage --
+// and nothing is filled. The caller picks the buffer with `netHostSa` and
+// the socket family with `netHostFamily`. Per-worker scratch: refill after
+// every park, never reuse across one.
+@nosplit fn netFillHostAddr(host: *u8, hostLen: int, port: int): int {
+  let ip = ipBytes()
+  if (netHostIsV6(host, hostLen)) {
+    if (!netParseIpv6(host, hostLen, ip)) {
+      return 0
+    }
+    netFillSockAddr6(sa6Bytes(), ip, port)
+    return sa6Len
+  }
+  if (!netParseIpv4(host, hostLen, ip)) {
+    return 0
+  }
+  netFillSockAddr(saBytes(), ip, port)
+  return saLen
+}
+
+// The scratch `netFillHostAddr` filled, given the length it returned.
+@nosplit fn netHostSa(salen: int): *u8 {
+  if (salen == sa6Len) {
+    return sa6Bytes()
+  }
+  return saBytes()
+}
+
+// The socket family `host` needs: `afInet6()` for a literal holding ':'.
+@nosplit fn netHostFamily(host: *u8, hostLen: int): int {
+  if (netHostIsV6(host, hostLen)) {
+    return afInet6()
+  }
+  return afInet()
+}
+
 // A listening socket bound to `host:port`. `port == 0` lets the kernel pick one;
 // recover it with `netLocalPort`. Returns a negative value on failure.
 //
@@ -39,7 +78,7 @@ import { pdCancel } from "../../sched"
 // cannot clobber this worker's own slot even on success, but capturing first
 // keeps this file's discipline identical to the Darwin twin's, where that
 // guarantee is weaker.
-// `netParseIpv4` rejecting the host is NOT a kernel errno, so that branch
+// `netFillHostAddr` rejecting the host is NOT a kernel errno, so that branch
 // keeps the fixed `-1` sentinel.
 export @symbol("bit_rt_port_net_listen_tcp") @nosplit fn netListenTcp(
   host: *u8,
@@ -47,11 +86,10 @@ export @symbol("bit_rt_port_net_listen_tcp") @nosplit fn netListenTcp(
   port: int,
   backlog: int,
 ): int {
-  let ip = ipBytes()
-  if (!netParseIpv4(host, hostLen, ip)) {
+  if (netFillHostAddr(host, hostLen, port) == 0) {
     return 0 - 1
   }
-  let fd = netSysSocket(false)
+  let fd = netSysSocketFamily(netHostFamily(host, hostLen), false)
   if (fd < 0) {
     return 0 - lastErr()
   }
@@ -60,8 +98,8 @@ export @symbol("bit_rt_port_net_listen_tcp") @nosplit fn netListenTcp(
     netClose(fd)
     return 0 - e
   }
-  netFillSockAddr(saBytes(), ip, port)
-  if (!netSysBind(fd, saBytes())) {
+  let salen = netFillHostAddr(host, hostLen, port)
+  if (!netSysBindLen(fd, netHostSa(salen), salen)) {
     let e = lastErr()
     netClose(fd)
     return 0 - e
@@ -168,11 +206,10 @@ fn netAcceptTcpLoop(lfd: int, gen: int): int {
 // thin wrapper plus `netDialTcpConnect` to keep both under the complexity
 // ceiling, same shape as `netAcceptTcp`/`netAcceptTcpLoop` above.
 export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int, port: int): int {
-  let ip = ipBytes()
-  if (!netParseIpv4(host, hostLen, ip)) {
+  if (netFillHostAddr(host, hostLen, port) == 0) {
     return 0 - 1
   }
-  let fd = netSysSocket(false)
+  let fd = netSysSocketFamily(netHostFamily(host, hostLen), false)
   if (fd < 0) {
     return 0 - lastErr()
   }
@@ -228,9 +265,8 @@ fn netDialTcpCheckDone(fd: int, rc2: int, ce: int, outResult: *i64): bool {
 }
 
 fn netDialTcpConnect(fd: int, gen: int, host: *u8, hostLen: int, port: int): int {
-  let ip = ipBytes()
-  netFillSockAddr(saBytes(), ip, port)
-  let rc = sysRc(int(syscall(sysConnect(), i64(fd), i64(int(saBytes())), i64(saLen))))
+  let salen = netFillHostAddr(host, hostLen, port)
+  let rc = sysRc(int(syscall(sysConnect(), i64(fd), i64(int(netHostSa(salen))), i64(salen))))
   if (rc >= 0) {
     return fd
   }
@@ -275,7 +311,7 @@ fn netDialTcpConnect(fd: int, gen: int, host: *u8, hostLen: int, port: int): int
     } else {
       spins = spins + 1
     }
-    // THE ADDRESS IS REBUILT EVERY ATTEMPT, NOT REUSED. `saBytes()`/`ipBytes()`
+    // THE ADDRESS IS REBUILT EVERY ATTEMPT, NOT REUSED. `saBytes()`/`sa6Bytes()`/`ipBytes()`
     // are PER-WORKER scratch (#3273), shared by every entry point that resumes
     // on the same worker, and `netAwaitReady` above PARKS the calling green
     // thread — so either another task runs a `netListenTcp`/`netBindUdp`/
@@ -283,12 +319,12 @@ fn netDialTcpConnect(fd: int, gen: int, host: *u8, hostLen: int, port: int): int
     // worker's slot, or this task itself resumes on a DIFFERENT worker whose
     // slot was never filled for this call. Reconnecting to whatever is there
     // either way would be a silent cross-connection.
-    if (!netParseIpv4(host, hostLen, ip)) {
+    salen = netFillHostAddr(host, hostLen, port)
+    if (salen == 0) {
       netClose(fd)
       return 0 - 1
     }
-    netFillSockAddr(saBytes(), ip, port)
-    let rc2 = sysRc(int(syscall(sysConnect(), i64(fd), i64(int(saBytes())), i64(saLen))))
+    let rc2 = sysRc(int(syscall(sysConnect(), i64(fd), i64(int(netHostSa(salen))), i64(salen))))
     let ce = lastErr()
     if (netDialTcpCheckDone(fd, rc2, ce, netDialDoneAddr())) {
       return int(*netDialDoneAddr())
