@@ -10,9 +10,9 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 . "${ROOT}/scripts/selfhost-ir-signatures.sh"
 
 # Self-check: run directly (not sourced) to assert explainMismatch explains
-# nothing on any kind while no signature is declared (see scripts/selfhost-ir-
-# signatures.sh's Retirement history), and that declaredSignatureNames() stays
-# in sync with it.
+# each declared signature's real divergence and nothing unrelated (see
+# scripts/selfhost-ir-signatures.sh's Retirement history), and that
+# declaredSignatureNames() stays in sync with it.
 # `bash scripts/selfhost-ir-signatures-selfcheck.sh`. Same pattern as
 # scripts/selfhost-ir-canon.sh's self-check.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
@@ -35,6 +35,59 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       fail=1
     fi
   done
+
+  # --- the signatures declared against the 0.39.0 oracle (#7451) ---
+  #
+  # Each fixture is a reduced copy of the real divergence; the negative
+  # variants break exactly one clause of the identity.
+  expect() { # <want name or ""> <got> <label>
+    if [ "$1" != "$2" ]; then
+      echo "FAIL: $3: want '$1' got '$2'"
+      fail=1
+    fi
+  }
+  at='  --> m.bit:3:17
+   |
+3 |   export static count(): i64 {
+   |                 ^^^^^'
+  static_o="error[E0021]: expected '(', found an identifier
+$at
+error[E0021]: expected ':', found '('
+  --> m.bit:3:22
+   |
+3 |   export static count(): i64 {
+   |                      ^
+error[E0021]: expected '}', found end of file
+  --> m.bit:4:1"
+  eof_t="error[E0021]: expected '}', found end of file
+  --> m.bit:4:1"
+  expect 6403-enum-static-method-presyntax "$(explainMismatch "$static_o" "$eof_t" diags)" "static head and cascade"
+  expect "" "$(explainMismatch "$static_o" "" diags)" "static: the tree lost the truncation error too"
+  expect "" "$(explainMismatch "${static_o}
+error[E0001]: unrelated
+  --> m.bit:9:1" "$eof_t" diags)" "static: an extra oracle record"
+  kw_o="error[E0021]: 'as' is a reserved keyword
+  --> m.bit:2:10
+   |
+2 |   export as(a: Actor): string {
+   |          ^^ reserved words cannot be used as identifiers (SPEC §5.2)"
+  expect 7035-keyword-member-name-presyntax "$(explainMismatch "$kw_o" "" diags)" "keyword method name"
+  expect "" "$(explainMismatch "$(printf '%s' "$kw_o" | sed 's/as(a/as: a/')" "" diags)" "keyword field name stays rejected"
+  mkdir -p "${TMPDIR:-/tmp}" && mf=$(mktemp "${TMPDIR:-/tmp}/ir-sig-selfcheck.XXXXXX")
+  printf 'fn a(c: bool): string { return render(c ? <a>a#b</a> : <b>no</b>) }\n' >"$mf"
+  panic_o='panic: slice bounds out of range'
+  expect 6421-ternary-jsx-hash-oracle-panic "$(explainMismatch "$panic_o" "" diags "$mf")" "oracle panic on a ternary JSX then with #"
+  expect "" "$(explainMismatch "$panic_o" "" diags)" "oracle panic without the input file"
+  expect "" "$(explainMismatch "$panic_o" "$static_o" diags "$mf")" "oracle panic against a tree that errors"
+  printf 'fn a(): int { return 1 }\n' >"$mf"
+  expect "" "$(explainMismatch "$panic_o" "" diags "$mf")" "oracle panic on an input without the construct"
+  rm -f "$mf"
+  jo='  let p = <p>it'"'"'s</p>;'
+  jt='  let p = <p>it'"'"'s</p>'
+  expect 7380-jsx-text-apostrophe-stray-semicolon "$(explainMismatch "$jo" "$jt" fmt)" "stray ; after JSX text"
+  expect "" "$(explainMismatch "  let p = <p>its</p>;" "  let p = <p>its</p>" fmt)" "stray ; with no apostrophe"
+  expect "" "$(explainMismatch "$jo
+let z = 1" "$jt" fmt)" "fmt: a longer oracle output"
 
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #

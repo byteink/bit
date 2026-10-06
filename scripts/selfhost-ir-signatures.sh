@@ -218,20 +218,163 @@
 # are preserved in git history at this file's state before #7164, and
 # scripts/ir-signatures-walk.sh, which held the walks, is deleted.
 #
-# NO SIGNATURE IS DECLARED. `explainMismatch` below is the empty table every
-# caller still consults, so the next lowering change that outruns the oracle
-# adds its entry there instead of re-plumbing the callers. The input protocol
-# is the text the awk body of the previous revision read: the oracle's dump,
-# a line `@@@BIT2@@@`, then the tree's dump, with the kind and the corpus file
-# as `-v` variables. A new entry must satisfy the rules in the header: an
-# exact identity, derived from FULL dumps (the oracle's from
-# `sh scripts/stage0.sh`, the tree's from `bit-out/bin/bit`), never an excerpt.
+# Declared (#7451) against the 0.39.0 oracle; retires at the next repin. Four
+# signatures, all in the `diags` and `fmt` kinds, each the oracle failing on
+# something the tree already handles:
 #
+#   6403-enum-static-method-presyntax (`diags`, also the `diags` row of
+#     selfhost-fuzzdiff.sh). #6403 parses `static` methods in an enum body;
+#     the oracle reads `static` as the member name and reports a cascade of
+#     E0021 errors on that line. Files: _tests_/cases/run_enum_static.bit and
+#     its truncations.
+#   7035-keyword-member-name-presyntax (`diags`, fuzzdiff). #7035 lets a
+#     reserved word name a method (`as(`, `in<`, `match(`) and follow a glued
+#     `.`; the oracle reports E0021 `'as' is a reserved keyword` at each. Files:
+#     _tests_/cases/run_keyword_member_names.bit and its truncations.
+#   6421-ternary-jsx-hash-oracle-panic (`diags`, fuzzdiff only). The oracle
+#     PANICS (`slice bounds out of range`, exit 2) on a file holding a ternary
+#     whose JSX `then` branch contains `#`; the tree (#6421) parses it. Files:
+#     the truncations of _tests_/cases/parse_ternary_jsx_then.bit that keep its
+#     `attrs` function.
+#   7380-jsx-text-apostrophe-stray-semicolon (`fmt`). The oracle's fmt lexes a
+#     statement whole, so an apostrophe in JSX text opens a rune and it appends
+#     a `;` after the closing tag; the tree does not (SPEC/FMT.md section 9).
+#     File: _tests_/cases/jsx_text_raw_chars.bit.
+#
+# Each is an exact identity over the FULL dumps (see explainDiagsLag and
+# explainFmtJsxApostrophe below), so a second, unrelated difference on an
+# explained file still fails. The input protocol is the oracle's text, the
+# tree's text, the kind and, for the panic arm, the file the tree was run on.
+# A new entry must satisfy the rules in the header: an exact identity, derived
+# from FULL dumps (the oracle's from `sh scripts/stage0.sh`, the tree's from
+# `bit-out/bin/bit`), never an excerpt.
+
+# explainDiagsLag <oracle_diags> <tree_diags> <input_file> -- the three `diags`
+# signatures declared against the 0.39.0 oracle. Prints the name and returns 0
+# when the divergence is exactly the oracle failing on syntax the tree accepts;
+# else prints nothing, returns 1. <input_file> is read only by the panic arm.
+#
+# A diags text is a run of `error[E....]: msg` blocks: code, message, the
+# `--> path:L:C` position and the one source line each quotes. Records the
+# tree lacks are the "lag" records; the records left over must be the tree's
+# own, byte for byte and in order. A static or keyword record that the tree
+# also reports (a field named `as`, a bare `as(`) is not removed, so it still
+# has to appear in the tree's text.
+explainDiagsLag() {
+  local ternary=0
+  [ -n "${3:-}" ] && grep -qE '\? *<[A-Za-z].*#' -- "$3" && ternary=1
+  awk -v ternary="$ternary" '
+    function load(txt, arr,    n, lines, i, cur, c, src) {
+      sub(/\n+$/, "", txt)
+      n = split(txt, lines, "\n"); cur = 0; arr["n"] = 0
+      for (i = 1; i <= n; i++) {
+        if (lines[i] ~ /^error\[E[0-9]+\]: /) {
+          cur = ++arr["n"]; arr["text", cur] = lines[i]
+          arr["code", cur] = substr(lines[i], 7, index(lines[i], "]") - 7)
+          arr["msg", cur] = substr(lines[i], index(lines[i], "]: ") + 3)
+          arr["line", cur] = 0; arr["col", cur] = 0; arr["src", cur] = ""
+        } else if (cur > 0) {
+          arr["text", cur] = arr["text", cur] "\n" lines[i]
+          if (match(lines[i], /^ *--> .*:[0-9]+:[0-9]+$/)) {
+            c = lines[i]; sub(/^.*:[0-9]+:/, "", c); arr["col", cur] = c + 0
+            c = lines[i]; sub(/:[0-9]+$/, "", c); sub(/^.*:/, "", c); arr["line", cur] = c + 0
+          } else if (match(lines[i], /^ *[0-9]+ [|] /)) {
+            arr["src", cur] = substr(lines[i], RSTART + RLENGTH)
+          }
+        }
+      }
+    }
+    function isEof(arr, k) {
+      return arr["code", k] == "E0021" && arr["msg", k] ~ /, found end of file$/
+    }
+    # The head of a `static` method in an enum body: the oracle takes `static`
+    # for the member name and wants `(` where the real name stands.
+    function isStatic(arr, k,    s, pre, id) {
+      s = arr["src", k]
+      if (arr["code", k] != "E0021" || arr["msg", k] != "expected " q "(" q ", found an identifier") { return 0 }
+      if (!match(s, /static[ \t]+[A-Za-z_][A-Za-z0-9_]*/)) { return 0 }
+      pre = substr(s, 1, RSTART - 1); id = substr(s, RSTART, RLENGTH); sub(/^static[ \t]+/, "", id)
+      return pre ~ /^[ \t]*(export[ \t]+)?$/ && arr["col", k] == RSTART + RLENGTH - length(id)
+    }
+    function isKeyword(arr, k,    s, name, after) {
+      s = arr["src", k]; name = arr["msg", k]
+      if (arr["code", k] != "E0021" || name !~ /^.[A-Za-z]+. is a reserved keyword$/) { return 0 }
+      sub(/ is a reserved keyword$/, "", name); name = substr(name, 2, length(name) - 2)
+      if (arr["col", k] < 1 || substr(s, arr["col", k], length(name)) != name) { return 0 }
+      after = substr(s, arr["col", k] + length(name), 1)
+      return after == "(" || after == "<"
+    }
+    # The oracle recovers from a static head with the cascade of E0021 errors
+    # still on that line; none of them is a truncation error.
+    function inCascade(arr, k, head) {
+      return arr["code", k] == "E0021" && !isEof(arr, k) && arr["line", k] == arr["line", head]
+    }
+    function arm(kind,    i, rest, nlag, head) {
+      nlag = 0; rest = 0
+      for (i = 1; i <= A["n"]; i++) {
+        if ((kind == "static" && isStatic(A, i)) || (kind == "kw" && isKeyword(A, i))) {
+          nlag++; head = i
+          if (kind == "static") { while (i < A["n"] && inCascade(A, i + 1, head)) { i++ } }
+          continue
+        }
+        rest++
+        if (rest > B["n"] || A["text", i] != B["text", rest]) { return 0 }
+      }
+      return nlag > 0 && rest == B["n"]
+    }
+    function panicArm(    i) {
+      if (!ternary || ta != "panic: slice bounds out of range\n") { return 0 }
+      for (i = 1; i <= B["n"]; i++) { if (!isEof(B, i)) { return 0 } }
+      return 1
+    }
+    BEGIN { q = "\047" }
+    FNR == 1 { fi++ }
+    fi == 1 { ta = ta $0 "\n"; next }
+    { tb = tb $0 "\n" }
+    END {
+      load(ta, A); load(tb, B)
+      if (arm("static")) { print "6403-enum-static-method-presyntax"; exit 0 }
+      if (arm("kw")) { print "7035-keyword-member-name-presyntax"; exit 0 }
+      if (panicArm()) { print "6421-ternary-jsx-hash-oracle-panic"; exit 0 }
+      exit 1
+    }
+  ' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
+}
+
+# explainFmtJsxApostrophe <oracle_fmt> <tree_fmt> -- the `fmt` signature
+# 7380-jsx-text-apostrophe-stray-semicolon. Prints the name and returns 0 when
+# the two outputs have the same line count and every differing line is the
+# tree's line plus a trailing `;` in the oracle's, the tree's line being a
+# closing tag (`</name>`) whose element holds an apostrophe; else prints
+# nothing, returns 1. At least one line must differ (the caller only asks when
+# the outputs differ).
+explainFmtJsxApostrophe() {
+  awk '
+    FNR == 1 { fi++ }
+    fi == 1 { a[++na] = $0; next }
+    { b[++nb] = $0 }
+    END {
+      if (na != nb) { exit 1 }
+      for (i = 1; i <= na; i++) {
+        if (a[i] == b[i]) { continue }
+        if (a[i] != b[i] ";" || b[i] !~ /<[A-Za-z][^<]*\047[^<]*<\/[A-Za-z][A-Za-z0-9_.]*>$/) { exit 1 }
+        nd++
+      }
+      if (nd == 0) { exit 1 }
+      print "7380-jsx-text-apostrophe-stray-semicolon"; exit 0
+    }
+  ' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
+}
+
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
-# and returns 0, or prints nothing and returns 1 if none does. No signature is
-# registered, so it returns 1 for every kind.
+# and returns 0, or prints nothing and returns 1 if none does. `file` is the
+# input the tree ran on, read only by the `diags` panic arm.
 explainMismatch() {
+  case "$3" in
+    diags) explainDiagsLag "$1" "$2" "${4:-}"; return ;;
+    fmt) explainFmtJsxApostrophe "$1" "$2"; return ;;
+  esac
   return 1
 }
 
@@ -242,8 +385,14 @@ explainMismatch() {
 # function does not list can never be checked for going dead, and one it lists
 # that explainMismatch no longer prints would make that check fail on every
 # run. Kept in sync by hand, and selfhost-ir-signatures-selfcheck.sh asserts
-# the list matches the `print "..."` statements in this file. None are
-# declared, so it prints nothing for every kind.
+# the list matches the `print "..."` statements in this file.
 declaredSignatureNames() {
+  local diags="6403-enum-static-method-presyntax 7035-keyword-member-name-presyntax 6421-ternary-jsx-hash-oracle-panic"
+  local fmt="7380-jsx-text-apostrophe-stray-semicolon"
+  case "${1:-}" in
+    diags) printf '%s\n' $diags ;;
+    fmt) printf '%s\n' $fmt ;;
+    "") printf '%s\n' $diags $fmt ;;
+  esac
   return 0
 }

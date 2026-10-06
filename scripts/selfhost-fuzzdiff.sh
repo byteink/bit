@@ -111,6 +111,12 @@ for f in $(find stdlib examples _tests_/cases _tests_/imports -name '*.bit' | so
       # Undecided: this truncation was never compared. Counted, never a MATCH.
       timeout=$((timeout + 1))
       [ -z "$firsthang" ] && firsthang="$f@$n(SIGALRM after ${TIMEOUT_S}s x2, seed=$src bit2=$brc)"
+    elif [ "$src" -ne 0 ] && [ "$brc" -eq 0 ] && [ -n "$(explainMismatch "$(cat "$TMP/seed.out")" "$(cat "$TMP/b2.out")" diags "$TMP/m.bit")" ]; then
+      # The ORACLE crashed and bit2 did not, and the pair matches a declared
+      # `diags` signature (scripts/selfhost-ir-signatures.sh): a panic in the
+      # pinned release that this tree already fixed. Invariant 1 is about
+      # bit2, so it is untouched; a bit2 crash never reaches this arm.
+      explained=$((explained + 1))
     elif [ "$brc" -ne 0 ] || [ "$src" -ne 0 ]; then
       # A non-alarm non-zero exit is a CRASH: invariant 1 says bit2 must not
       # crash on any input. A real failure, distinct from an undecided timeout.
@@ -127,7 +133,7 @@ for f in $(find stdlib examples _tests_/cases _tests_/imports -name '*.bit' | so
       fi
       case "$same" in
         0) match=$((match + 1)) ;;
-        1) if [ -n "$(explainMismatch "$(cat "$TMP/seed.out")" "$(cat "$TMP/b2.out")" diags)" ]; then
+        1) if [ -n "$(explainMismatch "$(cat "$TMP/seed.out")" "$(cat "$TMP/b2.out")" diags "$TMP/m.bit")" ]; then
              # A declared `diags` signature (scripts/selfhost-ir-signatures.sh):
              # the oracle predates syntax this truncation still contains.
              explained=$((explained + 1))
