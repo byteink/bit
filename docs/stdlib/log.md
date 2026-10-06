@@ -7,18 +7,20 @@ writes the message and the facts as separate fields, so a person reads
 `msg="draft published" id=41 took=312ms` and a machine reads
 `{"msg":"draft published","id":41,"took":312000000}`, from the same call.
 
-The design follows Go's `log/slog`: a `Logger` turns each call into a
-`Record` and hands it to a `Handler`, which decides where the bytes go.
+A `Logger` level method returns a `Record`; typed methods add the facts to it
+and `log(msg)` writes it through a `Handler`, which decides where the bytes
+go. The message comes last because it is what finishes the record: `log` is
+the one call that writes, so the line reads as what it does.
 
 <!-- doctest: per-block -->
 
 ```bit
-import { Logger, TextHandler, Str, Int, Duration } from "std/log"
+import { Logger, TextHandler } from "std/log"
 import { stdout } from "std/io"
 
 fn main() {
   let log = Logger(TextHandler(stdout(), timestamps = false))
-  log.info("draft published", Int("id", 41), Str("author", "ada"), Duration("took", 312000000))
+  log.info().int("id", 41).str("author", "ada").duration("took", 312000000).log("draft published")
 }
 ```
 
@@ -40,70 +42,80 @@ import { stdout } from "std/io"
 
 fn main() {
   let log = Logger(TextHandler(stdout(), LevelWarn, false))
-  log.info("not shown")
-  log.warn("disk at 91 percent")
-  log.log(LevelInfo + 2, "also not shown: below LevelWarn")
+  log.info().log("not shown")
+  log.warn().log("disk at 91 percent")
+  log.at(LevelInfo + 2).log("also not shown: below LevelWarn")
+  if (log.enabled(LevelWarn)) {
+    log.error().log("shown")
+  }
+  log.debug().log("not shown either")
   println(levelName(LevelInfo + 2)) // INFO+2
 }
 ```
 
 A level is a plain `int`, so `LevelInfo + 2` is a "notice" level of your own
-and `levelName` renders it as `INFO+2`. `Logger.log(level, msg, attrs...)` is
-the one core; `debug`, `info`, `warn` and `error` are it with the level filled
-in.
+and `levelName` renders it as `INFO+2`. `Logger.at(level)` is the one core;
+`debug()`, `info()`, `warn()` and `error()` are it with the level filled in.
 
 ## Attributes
 
-An attribute is a key and a typed value. The constructors are `Str`, `Int`,
-`Float`, `Bool`, `Duration` (nanoseconds, as everywhere in Bit), `Time`,
-`Err` and `Group`. Typed values matter because the JSON handler writes `1500`
-as a number and `"1500"` as a string, and your pipeline can tell them apart.
+An attribute is a key and a typed value, added with `str`, `int`, `float`,
+`bool`, `duration` (nanoseconds, as everywhere in Bit), `time`, `err` and
+`group`. Typed values matter because the JSON handler writes `1500` as a
+number and `"1500"` as a string, and your pipeline can tell them apart.
 
 ```bit
-import { Logger, JsonHandler, Str, Int, Float, Bool, Duration, Time, Err, Group } from "std/log"
+import { Logger, JsonHandler, attrs } from "std/log"
 import { stdout } from "std/io"
 import { now } from "std/time"
 
 fn main() {
   let log = Logger(JsonHandler(stdout(), timestamps = false))
-  log.error(
-    "publish failed",
-    Int("draft", 41),
-    Float("score", 0.5),
-    Bool("retry", true),
-    Duration("took", 1500000000),
-    Time("scheduled", now()),
-    Err(newError("tags table locked")),
-    Group("author", Str("name", "ada"), Int("posts", 12)),
-  )
+  let r = log.error().int("draft", 41).float("score", 0.5).bool("retry", true)
+  r = r.duration("took", 1500000000).time("scheduled", now()).err(newError("tags table locked"))
+  r.group("author", attrs().str("name", "ada").int("posts", 12)).log("publish failed")
 }
 ```
 
-`Err(e)` writes the error's message under the key `error`; pass a second
-argument to rename it. `Group` nests: `author.name=ada` in text,
-`{"author":{"name":"ada"}}` in JSON. A group with no attributes is left out.
+`err(e)` writes the error's message under the key `error`; pass a second
+argument to rename it. `group` nests the attributes of a record built with
+`attrs()`: `author.name=ada` in text, `{"author":{"name":"ada"}}` in JSON. A
+group with no attributes is left out. `attrs()` has no logger, so calling
+`log` on it panics; it exists for `group` and `with`.
 
-An empty key panics at the call, because a field with no name is a bug in the
-caller and the log is the wrong place to discover it. The fields of an `Attr`
-(`key`, `kind`, `num`, `flt`, `str`, `group`) are readable, so a handler of
-your own can switch on `kind`.
+An empty key panics at the call, enabled or not, because a field with no name
+is a bug in the caller and the log is the wrong place to discover it.
+
+## What a line costs
+
+A record holds its first five attributes in its own fields, so an enabled
+line with up to five costs two objects, the record and the line, whatever
+those attributes are; the next five fill one chained record, and a group
+holds its members as `Attr`s.
+When the level is off, the level method returns a shared record that keeps
+nothing, so the whole chain allocates nothing and needs no `enabled` guard:
+measured with `BIT_GC_STATS=1`, a disabled call carrying three attributes
+costs 0 objects. What the arguments cost
+to compute is still paid: `enabled` guards a value that is expensive to
+build. A record is written only by `log(msg)`, so a chain without it writes
+nothing.
 
 ## Children: `with` and `withGroup`
 
 Every line of one request should carry the request id. `with` returns a child
-logger that adds attributes to everything it writes, and `withGroup` nests
-what comes after it. The parent is not changed.
+logger that adds attributes, built with `attrs()`, to everything it writes,
+and `withGroup` nests what comes after it. The parent is not changed.
 
 ```bit
-import { Logger, TextHandler, Str, Int } from "std/log"
+import { Logger, TextHandler, attrs } from "std/log"
 import { stdout } from "std/io"
 
 fn main() {
   let root = Logger(TextHandler(stdout(), timestamps = false))
-  let req = root.with(Str("req", "a41"))
-  let db = req.withGroup("db").with(Str("table", "drafts"))
-  db.info("query", Int("rows", 3))
-  req.info("done")
+  let req = root.with(attrs().str("req", "a41"))
+  let db = req.withGroup("db").with(attrs().str("table", "drafts"))
+  db.info().int("rows", 3).log("query")
+  req.info().log("done")
 }
 ```
 
@@ -138,50 +150,26 @@ log is the only place a failure could be reported.
 it. Set your own once, at startup, before spawning tasks.
 
 ```bit
-import { Logger, JsonHandler, LevelDebug, Str, getDefault, setDefault } from "std/log"
+import { Logger, JsonHandler, LevelDebug, getDefault, setDefault } from "std/log"
 import { stderr } from "std/io"
 
 fn main() {
   setDefault(Logger(JsonHandler(stderr(), LevelDebug)))
-  getDefault().debug("starting", Str("service", "inkwell"))
+  getDefault().debug().str("service", "inkwell").log("starting")
 }
 ```
 
 Calling `setDefault` a second time panics: two parts of a program fighting
 over the default is a bug to find, not to paper over.
 
-## Cost of a disabled call
-
-`logger.debug("msg")` with debug turned off asks the handler one question,
-compares the level, and returns: no `Record`, no allocation. Measured with
-`BIT_GC_STATS=1` over 10000 calls it allocates the same bytes as 0 calls.
-
-Attributes are built before the call, so `log.debug("x", Int("i", i))` allocates
-for the `Int` and the argument list even when debug is off. On a hot path
-guard it:
-
-```bit
-import { Logger, TextHandler, LevelDebug, Int } from "std/log"
-import { stderr } from "std/io"
-
-fn main() {
-  let log = Logger(TextHandler(stderr()))
-  let i = 0
-  while (i < 3) {
-    if (log.enabled(LevelDebug)) {
-      log.debug("tick", Int("i", i))
-    }
-    i = i + 1
-  }
-}
-```
-
 ## Your own handler
 
 `Handler` has four methods: `enabled(level)`, `handle(record)`,
-`with(attrs)` and `withGroup(name)`. A `Record` has `time`, `level`, `msg` and
-`attrs`. Implement them to route records to a metrics counter, a network
-sink, or a test double.
+`with(attrs)` and `withGroup(name)`. A `Record` answers `unixNanos()`,
+`level()`, `message()` and `attrs()`; `attrs()` builds an `Attr` (`key`,
+`kind`, `num`, `flt`, `str`, `group`) for each attribute on every call, which
+the shipped handlers never do. Implement them to route records to a metrics
+counter, a network sink, or a test double.
 
 ```bit
 import { Logger, Handler, Record, Attr, LevelInfo } from "std/log"
@@ -192,7 +180,9 @@ class Counter {
     return level >= LevelInfo
   }
   export handle(r: Record): ()! {
-    this.n = this.n + 1
+    if (r.level() >= LevelInfo && r.message() != "" && r.unixNanos() > 0) {
+      this.n = this.n + len(r.attrs())
+    }
   }
   export with(attrs: []Attr): Handler {
     return this
@@ -204,8 +194,8 @@ class Counter {
 
 fn main() {
   let c = Counter{ n = 0 }
-  Logger(c).info("counted")
-  println("${c.n}") // 1
+  Logger(c).info().int("a", 1).int("b", 2).log("counted")
+  println("${c.n}") // 2
 }
 ```
 
@@ -229,34 +219,36 @@ The call-site API: a `Handler` plus the level methods. Build one with
 
 A logger writing through `h`.
 
-### `Logger.log(level: int, msg: string, ...attrs: Attr)`
+### `Logger.at(level: int): Record`
 
-Writes one record at `level` if the handler enables it.
+A record at `level` to add attributes to and write with `log(msg)`; a shared
+record that keeps nothing when `level` is disabled.
 
-### `Logger.debug(msg: string, ...attrs: Attr)`
+### `Logger.debug(): Record`
 
-`log` at `LevelDebug`.
+`at(LevelDebug)`.
 
-### `Logger.info(msg: string, ...attrs: Attr)`
+### `Logger.info(): Record`
 
-`log` at `LevelInfo`.
+`at(LevelInfo)`.
 
-### `Logger.warn(msg: string, ...attrs: Attr)`
+### `Logger.warn(): Record`
 
-`log` at `LevelWarn`.
+`at(LevelWarn)`.
 
-### `Logger.error(msg: string, ...attrs: Attr)`
+### `Logger.error(): Record`
 
-`log` at `LevelError`.
+`at(LevelError)`.
 
 ### `Logger.enabled(level: int): bool`
 
-Whether a record at `level` would be written. Use it to guard calls whose
-attributes are expensive to build.
+Whether a record at `level` would be written. Use it to guard a value that is
+expensive to compute.
 
-### `Logger.with(...attrs: Attr): Logger`
+### `Logger.with(fields: Record): Logger`
 
-A child logger that adds `attrs` to every record.
+A child logger that adds the attributes of `fields`, built with `attrs()`, to
+every record.
 
 ### `Logger.withGroup(name: string): Logger`
 
@@ -293,7 +285,8 @@ offset such as `"INFO+2"`.
 
 ### `Attr`
 
-A key and a typed value. Read-only fields: `key`, `kind`, `num`, `flt`, `str`,
+A key and a typed value, as `Record.attrs()` and `Handler.with` hand them to a
+handler of your own. Read-only fields: `key`, `kind`, `num`, `flt`, `str`,
 `group`.
 
 ### `Kind`
@@ -301,41 +294,66 @@ A key and a typed value. Read-only fields: `key`, `kind`, `num`, `flt`, `str`,
 Which field of an `Attr` holds its value: `String`, `Int`, `Float`, `Bool`,
 `Duration`, `Time`, `Error` or `Group`.
 
-### `Str(key: string, value: string): Attr`
+### `Record`
+
+The builder a level method returns, and what a handler receives. It holds
+its attributes five to a record, in its own fields.
+
+### `attrs(): Record`
+
+A record with no logger, for `group` and `Logger.with`. `log` on it panics.
+
+### `Record.str(key: string, value: string): Record`
 
 A string attribute.
 
-### `Int(key: string, value: int): Attr`
+### `Record.int(key: string, value: int): Record`
 
 An integer attribute.
 
-### `Float(key: string, value: f64): Attr`
+### `Record.float(key: string, value: f64): Record`
 
 A float attribute. JSON writes a non-finite value as `null`.
 
-### `Bool(key: string, value: bool): Attr`
+### `Record.bool(key: string, value: bool): Record`
 
 A boolean attribute.
 
-### `Duration(key: string, nanos: int): Attr`
+### `Record.duration(key: string, nanos: int): Record`
 
 A duration in nanoseconds.
 
-### `Time(key: string, at: Timestamp): Attr`
+### `Record.time(key: string, at: Timestamp): Record`
 
 A point in time, written as RFC 3339.
 
-### `Err(e: error, key: string = "error"): Attr`
+### `Record.err(e: error, key: string = "error"): Record`
 
 An error's message.
 
-### `Group(key: string, ...attrs: Attr): Attr`
+### `Record.group(key: string, members: Record): Record`
 
-Attributes nested under `key`.
+The attributes of `members` nested under `key`.
 
-### `Record`
+### `Record.log(msg: string)`
 
-What one call produced: `time`, `level`, `msg`, `attrs`.
+Writes the record with `msg`, or nothing when its level was disabled.
+
+### `Record.unixNanos(): int`
+
+Nanoseconds since the Unix epoch at which the record was made.
+
+### `Record.level(): int`
+
+The record's level.
+
+### `Record.message(): string`
+
+The message `log` was given.
+
+### `Record.attrs(): []Attr`
+
+Every attribute in order, as a fresh `Attr` each.
 
 ### `Handler`
 
