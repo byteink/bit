@@ -147,7 +147,7 @@ function paramNames(s, names,    inner, parts, k, n) {
 }
 function argsOf(l,    s) { s = substr(l, index(l, "(") + 1); return substr(s, 1, length(s) - 1) }
 function resolveVal(x, P, A, np,    k) {
-  if (x ~ /^\{[^}]*\}$/) { return x }
+  if (x ~ /^\{[^\175]*\}$/) { return x }
   for (k = 1; k <= np; k++) { if (P[k] == x) { return A[k] } }
   return ""
 }
@@ -231,7 +231,7 @@ function loopAt(a, n, j,    h, t, e, i, k, args, B2, back, acc, ref, es, src, Ri
   if (np2 != lpNe) { return 0 }
   split("", XM)
   for (k = 1; k <= lpNe; k++) {
-    if (lpE[k] ~ /^\{[^}]*\}$/) { XM[P2[k]] = lpE[k]; continue }
+    if (lpE[k] ~ /^\{[^\175]*\}$/) { XM[P2[k]] = lpE[k]; continue }
     ii = 0
     for (i = 1; i <= lpNp; i++) { if (lpP[i] == lpE[k]) { ii = i } }
     if (!ii) { return 0 }
