@@ -71,11 +71,22 @@ import { onX64 } from "../syscalls"
 // the loads write -- and it is exactly the kind of change an instruction count
 // argues against (-1.6%) and cycles pay for (-17.3%).
 
-// Claims `slot` of table `ctrl` for a key not already present. Shared by
-// `rtMapSet`'s two arms so the `used`/`len` accounting has ONE definition:
-// `used` counts slots consumed from EMPTY, so reusing a TOMB leaves it alone —
-// that is what makes tombstones cost capacity until the next grow rather than
-// forever.
+// Claims the EMPTY `slot` of table `ctrl` for a key not already present.
+// Shared by `rtMapSet`'s two arms so the `used`/`len` accounting has ONE
+// definition: `used` counts slots consumed from EMPTY, which is every claim.
+//
+// A TOMBSTONE IS NEVER CLAIMED (#5813), so a slot is bound to one key from its
+// claim until the table is replaced by a grow. The comma-ok read is two calls,
+// `bit_rt_map_slot` returning the address of the slot's value word and
+// `bit_rt_map_val_at` loading it, and a plain read has the same gap between
+// its key compare and its value load. A `delete(K)` and an insert of K2 into
+// K's slot inside that gap made the reader return K2's value for K: an ABA no
+// re-check can close at the second call, which is handed no key
+// (maptable.bit). With the slot bound to K, a reader that matched K gets K's
+// value, or what `delete` leaves in the word: nothing for a scalar value (the
+// word keeps K's last value, and the read linearises before the delete), the
+// zero word for a traced one (`rtMapDelete`). The price is that deleted slots
+// count against `used` until the next grow, which `mapGrow` already reclaims.
 //
 // `ctrl` is the table the caller probed, never a reload (maptable.bit), and
 // the CALLER writes the key and value words first: that is what keeps this at
@@ -83,9 +94,7 @@ import { onX64 } from "../syscalls"
 // is what a racing probe matches on, is the entry's last write rather than its
 // first.
 @nosplit fn mapClaimSlot(m: int, ctrl: int, slot: int, tag: int) {
-  if (loadByte(ctrl + slot) == ctrlEmpty) {
-    storeWord(m + mapUsed, loadWord(m + mapUsed) + 1)
-  }
+  storeWord(m + mapUsed, loadWord(m + mapUsed) + 1)
   storeByte(ctrl + slot, tag)
   storeWord(m + mapLen, loadWord(m + mapLen) + 1)
 }
@@ -116,9 +125,7 @@ import { onX64 } from "../syscalls"
 // THE GROW TEST RUNS BEFORE THE PROBE, and the order
 // is observable: growing first means the slot the probe returns is a slot in the
 // NEW table. Probing first and then growing would insert at a stale index.
-// Reusing a TOMB keeps `used` unchanged — only an EMPTY slot is newly consumed,
-// which is what makes tombstones cost capacity until the next grow rather than
-// forever.
+// Every insert consumes an EMPTY slot, never a TOMB (`mapClaimSlot`).
 export @nosplit @symbol("bit_rt_map_set") fn rtMapSet(m: int, key: int, val: int) {
   if (m == 0) {
     panicNilMapWrite()
@@ -137,24 +144,19 @@ export @nosplit @symbol("bit_rt_map_set") fn rtMapSet(m: int, key: int, val: int
     let keys = loadWord(ctrl + tblKeys)
     let i = int(hs & u64(mask))
     let tag = mapCtrlTag(hs)
-    let ins = -1 // the insert position: first TOMB, else the EMPTY that stops us
     let steps = 0
     // Bounded by `cap`: the load-factor ceiling guarantees an EMPTY slot exists.
     while (steps < vcap) {
       let c = loadByte(ctrl + i)
-      // EMPTY (0) and TOMB (1) are the only ctrl values below `ctrlFullBit`, so
-      // one compare separates "no key here" from "a key to check".
-      if (c < ctrlFullBit) {
-        if (ins < 0) {
-          ins = i
-        }
-        if (c == ctrlEmpty) {
-          storeWord(keys + ins * 8, key)
-          storeWord(loadWord(ctrl + tblVals) + ins * 8, val)
-          mapClaimSlot(m, ctrl, ins, tag)
-          return
-        }
-      } else if (c == tag) {
+      // A TOMB is stepped over like a FULL slot of another tag: its key is
+      // gone, and `tag` always has bit 7 set, so `c == tag` rejects it.
+      if (c == ctrlEmpty) {
+        storeWord(keys + i * 8, key)
+        storeWord(loadWord(ctrl + tblVals) + i * 8, val)
+        mapClaimSlot(m, ctrl, i, tag)
+        return
+      }
+      if (c == tag) {
         if (loadWord(keys + i * 8) == key) {
           storeWord(loadWord(ctrl + tblVals) + i * 8, val)
           return
@@ -285,12 +287,24 @@ export @nosplit @symbol("bit_rt_map_slot") fn rtMapSlot(m: int, key: int): int {
   return mapValToken(ctrl, r)
 }
 
+// Drops the value word of a deleted slot, but only a TRACED one. The drop is not
+// tidiness: a ref buffer's word left behind would keep a removed value
+// reachable and unreclaimable until the next grow. A scalar word is garbage to
+// nobody, and leaving it means a reader that matched the key before the delete
+// returns the key's last value, not a zero (`mapClaimSlot`, #5813).
+@nosplit fn mapDropVal(m: int, ctrl: int, slot: int) {
+  if (loadWord(m + mapValIsRef) != 0) {
+    storeWord(loadWord(ctrl + tblVals) + slot * 8, 0)
+  }
+}
+
 // `bit_rt_map_delete`: `delete(m, key)` — a no-op if absent.
 //
-// Leaves a TOMBSTONE (reclaimed at the next grow) and DROPS THE SLOT'S KEY AND
-// VALUE WORDS. The drop is not tidiness: those words live in traced ref buffers,
-// so leaving them would keep a removed key or value reachable and unreclaimable
-// for the lifetime of the map.
+// Leaves a TOMBSTONE (reclaimed at the next grow, never reused by an insert) and
+// DROPS THE SLOT'S KEY WORD, and its value word when that is traced. The drop is
+// not tidiness: those words live in traced ref buffers, so leaving them would
+// keep a removed key or value reachable and unreclaimable for the lifetime of
+// the table.
 export @nosplit @symbol("bit_rt_map_delete") fn rtMapDelete(m: int, key: int) {
   if (m == 0) {
     return
@@ -318,7 +332,7 @@ export @nosplit @symbol("bit_rt_map_delete") fn rtMapDelete(m: int, key: int) {
         if (loadWord(keys + i * 8) == key) {
           storeByte(ctrl + i, ctrlTomb)
           storeWord(keys + i * 8, 0)
-          storeWord(loadWord(ctrl + tblVals) + i * 8, 0)
+          mapDropVal(m, ctrl, i)
           storeWord(m + mapLen, loadWord(m + mapLen) - 1)
           return
         }
@@ -336,6 +350,6 @@ export @nosplit @symbol("bit_rt_map_delete") fn rtMapDelete(m: int, key: int) {
   }
   storeByte(ctrl + slot, ctrlTomb)
   storeWord(loadWord(ctrl + tblKeys) + slot * 8, 0)
-  storeWord(loadWord(ctrl + tblVals) + slot * 8, 0)
+  mapDropVal(m, ctrl, slot)
   storeWord(m + mapLen, loadWord(m + mapLen) - 1)
 }

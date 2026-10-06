@@ -4000,9 +4000,13 @@ the handle of a string CONSTANT, which is static for the life of the process.
   ADVISORY, never a correctness input — `n <= 0` or an `n*8` overflow both fall
   back to `mapInitCap` and the map still grows normally past whatever `n`
   under-promised (`mapCapForHint`, `runtime/root/maps.bit`).
-- **Delete** leaves a `TOMB` and zeroes the slot's key/value words (dropping the
-  refs so a removed entry becomes collectable); the tombstone is reclaimed at the
-  next grow.
+- **Delete** leaves a `TOMB` and zeroes the slot's key word, and its value word
+  when `val_is_ref` (dropping the refs so a removed entry becomes collectable);
+  the tombstone is reclaimed at the next grow. An insert never claims a `TOMB`,
+  only an `EMPTY` slot, so a slot belongs to one key until the table is replaced
+  and a reader holding that slot (the `map_slot` token, or `map_get` between its
+  key compare and its value load) cannot be handed another key's value by a
+  racing `delete` + insert (#5813).
 - **Nil.** Reads on a nil map (`?*MapHeader == null`) yield the zero word /
   `false` / `0`; `map_set` on a nil map is fatal (SPEC §11.2, Go semantics).
 - **Two-result read** (`let (v, ok) = m[k]`, §12.6) is ONE probe: `map_slot`
