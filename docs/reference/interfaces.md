@@ -300,8 +300,60 @@ fn demo(store: Store) {
 }
 ```
 
-The target of `.()` also has to be a class: only a class carries methods, so
-only a class can be the concrete type behind an interface value.
+A class target asks "is this exactly that class?". Only a class (or a boxed
+enum) can be the concrete type behind an interface value, so a target that
+could never be one is a compile-time error.
+
+The target can also be another interface. Then the question is "does the value
+behind this interface also implement that one?", which lets a function use an
+optional capability of whatever it was handed. A `Store` that can also report
+its size:
+
+```bit
+interface Store {
+  save(id: string, body: string),
+}
+
+interface Sized {
+  size(): int,
+}
+
+class MemoryStore {
+  bodies: map<string, string>
+  export save(id: string, body: string) {
+    this.bodies[id] = body
+  }
+  export size(): int {
+    return len(this.bodies)
+  }
+}
+
+class NullStore {
+  export save(id: string, body: string) {}
+}
+
+fn describe(store: Store): string {
+  let (s, ok) = store.(Sized)
+  if (ok) {
+    return "${s.size()} item(s)"
+  }
+  return "size unknown"
+}
+
+fn main() {
+  let a: Store = MemoryStore{}
+  let b: Store = NullStore{}
+  a.save("x", "1")
+  println(describe(a))
+  println(describe(b))
+}
+```
+
+`Store` does not declare `size`, yet the assertion compiles: whether the
+dynamic type has it is only known when the program runs. The answer is
+remembered per type and interface, so asking again in a loop is a lookup and
+allocates nothing. The one-result form `store.(Sized)` panics when the answer
+is no.
 
 ## When not to reach for an interface
 

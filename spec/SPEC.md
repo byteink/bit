@@ -5024,10 +5024,16 @@ assignment (like the map/channel two-result forms).
     method the target declares, matched by **name AND signature** (parameter
     and result types) - a method that only shares a name with the target's is
     not a match, and `ok` is `false`. An interface declaring no methods is
-    satisfied by every non-nil value.
-- A target that cannot satisfy the receiver's interface is a **compile-time
-  error**: the assertion could never succeed, so it is rejected rather than left
-  to report `false` forever.
+    satisfied by every non-nil value. The receiver's own interface does not
+    limit the answer: `w.(io.ReaderFrom)` asks about the dynamic type behind `w`,
+    which may carry methods `w`'s static type does not declare, so an
+    interface target is always accepted at compile time and decided at run
+    time against the dynamic type's method table. The verdict is cached per
+    (dynamic type, interface) pair: a repeated assertion is a lookup, not a
+    method-set walk, and allocates nothing (`runtime/ABI.md` §2.2b).
+- A **class or boxed-enum** target that cannot satisfy the receiver's interface
+  is a **compile-time error**: the assertion could never succeed, so it is
+  rejected rather than left to report `false` forever.
 - On a mismatch the two-result form yields the target type's **zero value**
   (§13.4) - a live instance for a class or a boxed enum, never `nil` - and
   never the un-narrowed receiver. The value is typed as the target, so

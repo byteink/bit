@@ -69,9 +69,20 @@ names `Options.metrics`, at startup and not on a send.
 `transport` is the scheme of the transport that took the attempt: `smtps`,
 `smtp`, `resend`, `postmark`, `sendgrid`, `mailgun`, `log`, `file` or `outbox`;
 `failover` for what happens around a [second route](failover.md) and not in one
-of its transports; `custom` for a transport you wrote yourself. It is never a
-host, a user name, a key or an address, so the number of series stays small and
-nothing private reaches a dashboard.
+of its transports. A transport you wrote yourself is labelled by its
+`scheme()` method when it has one, and `custom` when it has none or it returns
+an empty string:
+
+```bit ignore
+class QueueTransport {
+  // ...deliver, signs, check and close as any Transport...
+  export scheme(): string { return "queue" }
+}
+```
+
+Return a short fixed name. This package's own labels are never a host, a user
+name, a key or an address, so the number of series stays small and nothing
+private reaches a dashboard; for your own transport that is yours to keep true.
 
 `result` is one word per kind of `MailError`, and two for success:
 
