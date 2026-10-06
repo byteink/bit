@@ -1,0 +1,147 @@
+// pkg/authz/webmap.test.bit — what a client sees of an authz failure through
+// pkg/web's `App.handle` (the real router and the real failure mapping), and
+// what the server log holds instead. Denied is a 403, a row the subject may
+// not read a 404, an unreachable store a 503; the body of each carries
+// neither the deciding policy nor the table. The policy goes to the log, once,
+// as one INFO line; NotFound leaves none and a store outage is one ERROR.
+
+import { Request, Response } from "std/http"
+import { App, Config } from "web"
+import { contains, join } from "std/strings"
+
+@table("articles") class WmArticle {
+  @id
+  id: i64
+  authorId: string
+}
+
+class WmUser {
+  export id: string,
+  export roles: []string,
+}
+
+class WmSink {
+  lines: []string
+  export log(line: string) {
+    this.lines = append(this.lines, line)
+  }
+}
+
+const wmPolicy: string = "PublishOwnTeam"
+
+fn wmAuthz(sink: WmSink): Authz<Action> {
+  let a = Authz<Action>() catch e {
+    panic("Authz: ${e.message()}")
+  }
+  let _ = a.resource<WmArticle>() catch e {
+    panic(e.message())
+  }
+  let own = Policy<WmUser, Action>(wmPolicy, (p, user) => {
+    p.can<WmArticle>([Action.Read], eq("authorId", Value.Text(user.id)))
+    p.cannot<WmArticle>([Action.Publish])
+  })
+  let _ = a.role<WmUser>("author", [own]) catch e {
+    panic(e.message())
+  }
+  let _ = a.logTo(sink)
+  return a
+}
+
+fn wmApp(authz: Authz<Action>): App {
+  let app = App(Config{ secret = "test-secret" })
+  let sara = Option<Subject>.Some(WmUser{ id = "sara", roles = ["author"] })
+  app.get("/publish", (c) => {
+    authz.check<WmArticle>(sara, Action.Publish, WmArticle{ id = 1, authorId = "sara" })?
+    return c.text("published")
+  })
+  app.get("/read", (c) => {
+    let tom = WmArticle{ id = 2, authorId = "tom" }
+    if (!authz.can<WmArticle>(sara, Action.Read, tom)) {
+      fail NotFound{}
+    }
+    return c.text(tom.authorId)
+  })
+  app.get("/related", (c) => {
+    let _ = authz.hasRelation("user:sara", "editor", "shelf:f0")?
+    return c.text("related")
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+fn wmGet(app: App, path: string): Response {
+  return app.handle(Request{ method = "GET", path = path, headers = "", body = "" })
+}
+
+fn wmLines(sink: WmSink, needle: string): int {
+  let n = 0
+  for l of sink.lines {
+    if (contains(l, needle)) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+test "a denial is a 403 with the generic body, one INFO line names the policy" {
+  let sink = WmSink{ lines = []string(0) }
+  let app = wmApp(wmAuthz(sink))
+  let res = wmGet(app, "/publish")
+  assert(res.status == 403, "status ${res.status} of 403")
+  assert(res.body == "{\"status\":403,\"error\":\"forbidden\"}", "body: ${res.body}")
+  assert(!contains(res.body, wmPolicy), "body names the policy: ${res.body}")
+  assert(!contains(res.body, "articles"), "body names the table: ${res.body}")
+  assert(!contains(res.body, "WmArticle"), "body names the class: ${res.body}")
+  let text = join(sink.lines, "\n")
+  assert(wmLines(sink, "policy=${wmPolicy}") == 1, "policy lines: ${text}")
+  let want = "[authz] info denied action=Publish resource=WmArticle subject=sara policy=${wmPolicy}"
+  assert(sink.lines[0] == want, text)
+}
+
+test "a row the subject may not read is a 404 and logs nothing" {
+  let sink = WmSink{ lines = []string(0) }
+  let app = wmApp(wmAuthz(sink))
+  let res = wmGet(app, "/read")
+  assert(res.status == 404, "status ${res.status} of 404")
+  assert(res.body == "{\"status\":404,\"error\":\"not found\"}", "body: ${res.body}")
+  assert(!contains(res.body, wmPolicy), "body names the policy: ${res.body}")
+  assert(!contains(res.body, "articles"), "body names the table: ${res.body}")
+  assert(
+    wmLines(sink, "policy=${wmPolicy}") == 0,
+    "NotFound named a policy: ${join(sink.lines, "|")}",
+  )
+  assert(wmLines(sink, "info denied") == 0, "NotFound logged a denial: ${join(sink.lines, "|")}")
+}
+
+test "a store outage is a 503 with a generic body and one ERROR line" {
+  let sink = WmSink{ lines = []string(0) }
+  let a = graph()
+  a.relations = Down{}
+  let _ = a.logTo(sink)
+  let app = wmApp(a)
+  let res = wmGet(app, "/related")
+  assert(res.status == 503, "status ${res.status} of 503")
+  assert(
+    res.body == "{\"status\":503,\"error\":\"authorization unavailable\"}",
+    "body: ${res.body}",
+  )
+  assert(!contains(res.body, wmPolicy), "body names the policy: ${res.body}")
+  assert(!contains(res.body, "articles"), "body names the table: ${res.body}")
+  assert(
+    wmLines(sink, "[authz] ERROR store unavailable") == 1,
+    "ERROR lines: ${join(sink.lines, "|")}",
+  )
+}
+
+test "a subject id with a line break cannot forge a second log line" {
+  let sink = WmSink{ lines = []string(0) }
+  let a = wmAuthz(sink)
+  let evil = Option<Subject>.Some(WmUser{ id = "sara\n[authz] info denied x", roles = ["author"] })
+  a.check<WmArticle>(evil, Action.Publish, WmArticle{ id = 1, authorId = "x" }) catch e {
+    assert(e.message() == "forbidden", e.message())
+  }
+  assert(len(sink.lines) == 1, "lines: ${len(sink.lines)} of 1")
+  assert(!contains(sink.lines[0], "\n"), "line break in the log line: ${sink.lines[0]}")
+}
