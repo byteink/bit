@@ -10,7 +10,7 @@
 // (`netBuildQuery`/`netParseAnswer`) to a nameserver passed in as a
 // parameter. NONE of that is touched or reimplemented here.
 //
-// `nameserverFromAdapters` is what is actually new (#3589's whole point):
+// `nameserversFromAdapters` is what is actually new (#3589's whole point):
 // Windows has no `/etc/resolv.conf` for ../linux/netabi.bit's
 // `readResolvConf` + ../../net's `netFirstNameserver` to read. The
 // equivalent is `GetAdaptersAddresses` (iphlpapi.dll) -- a linked list of
@@ -19,7 +19,8 @@
 
 import {
   netDnsId, netBuildQuery, netParseAnswer, netMaxDnsMsg,
-  netNsTimeoutOff, dnsBytes, getU64Le, netSockAddrOctets,
+  netNsTimeoutOff, dnsBytes, getU64Le, netNsAttemptsOff, netNsConfOff, netNsConfLenOff,
+  netAdapterDnsServers, netMaxAdapterDns,
 } from "../../net"
 
 // ---------------------------------------------------------------------------
@@ -74,12 +75,12 @@ export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(timeoutMs:
 // straight through; a hostname is queried against the nameserver at
 // `ns[0..4]`, ONE attempt waiting at most the window the resolve block `ns`
 // carries after its address (`netNsTimeoutOff`, `std/net`'s, #6350). The attempt
-// count is the caller's (`netAbiResolveW`, ./netabi.bit), which goes round the
+// count is the caller's (`netResolvePasses`, ./netabi.bit), which goes round the
 // nameserver list once per attempt.
 //
 // THE NAMESERVER IS A PARAMETER RATHER THAN DISCOVERED HERE, matching
 // ../linux/udp.bit's and ../darwin/dns.bit's identical contract: discovery
-// is a platform call (`nameserverFromAdapters`, below), kept out of this
+// is a platform call (`nameserversFromAdapters`, below), kept out of this
 // function so it can be pointed at an in-process fake nameserver for
 // testing without depending on the real network.
 export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(
@@ -152,36 +153,6 @@ extern fn GetAdaptersAddresses(
 
 const errorBufferOverflow: int = 111
 
-// IP_ADAPTER_ADDRESSES field offsets on x64 (iptypes.h): an 8-byte union at
-// offset 0 (ULONG Length + IF_INDEX IfIndex, sized to match the struct's own
-// `ULONGLONG Alignment` union member), then five pointers in declaration
-// order (Next, AdapterName, FirstUnicastAddress, FirstAnycastAddress,
-// FirstMulticastAddress) before FirstDnsServerAddress; OperStatus follows
-// DnsSuffix/Description/FriendlyName (pointers), PhysicalAddress[8],
-// PhysicalAddressLength, Flags, Mtu and IfType (four more ULONGs).
-const iaaNextOff: int = 8
-const iaaFirstDnsServerOff: int = 48
-const iaaOperStatusOff: int = 104
-
-// IF_OPER_STATUS (ifdef.h): IfOperStatusUp. Only an adapter reporting this
-// is trusted for a nameserver -- a disabled/disconnected adapter can still
-// carry a stale DNS entry.
-const ifOperStatusUp: int = 1
-
-// IP_ADAPTER_DNS_SERVER_ADDRESS field offsets on x64 (iptypes.h): an 8-byte
-// union at offset 0 (ULONG Length + DWORD Reserved), Next (pointer) at
-// offset 8, then an inline SOCKET_ADDRESS (LPSOCKADDR lpSockaddr at offset
-// 16; INT iSockaddrLength at offset 24, unused here -- the family byte
-// inside the pointed-to sockaddr is what this file checks instead).
-const dnsAddrNextOff: int = 8
-const dnsAddrSockaddrPtrOff: int = 16
-
-// Bounded walks (Power of 10 rule 2): a corrupt or circular list cannot
-// hang this function, the same defensive-depth reasoning ../../net.bit's
-// `netSkipName` states for a wire format this runtime does not control.
-const maxAdaptersWalk: int = 256
-const maxDnsServersWalk: int = 64
-
 // Buffer sizing for the retry loop below (Power of 10 rule 3: bounded,
 // never grows without limit). 16 KiB is Microsoft's own documented starting
 // guess; 256 KiB is a hard ceiling far past any real adapter count.
@@ -189,22 +160,25 @@ const gaaInitialWords: int = 2048
 const gaaMaxWords: int = 32768
 const gaaMaxAttempts: int = 3
 
-// The first IPv4 DNS server address configured on any UP adapter, written
-// to `out`. Returns false if the call fails or no adapter has one.
+// Every IPv4 DNS server address configured on any UP adapter, deduplicated, in
+// adapter order, written to `list` as packed four-byte addresses (room for
+// `cap`). Returns how many; 0 when the call fails or no adapter has one. The
+// parse is `netAdapterDnsServers` (../adapters.bit), a platform-free walk
+// `_tests_/stress/netadapters` runs over a hand-built chain.
 //
 // POLL-FREE (#1658/#3924): refused `@nosplit` purely because it allocates the
 // MANAGED `[]i64(words)`/`[]i64(1)` scratch below -- E0075 forbids allocation
 // outright, and that is the whole reason, not a raw address surviving
 // anything. `buf`/`bufPtr` are read within THIS iteration only: the two paths
-// that use `bufPtr` (`return firstDnsIpv4(bufPtr, out)` on success, `return
-// false` on a fatal GetAdaptersAddresses error) both leave the function
-// without taking the loop's back edge again, and the one path that DOES take
-// the back edge (ERROR_BUFFER_OVERFLOW, to retry with a bigger `words`) never
-// reads `buf`/`bufPtr` again -- it discards them and allocates a fresh,
-// larger buffer next iteration. So no poll is ever reached while a live use
-// of the raw address remains outstanding; see `pollFreeExceptions`'s (g4)
-// group in `_tests_/bit/pollfree/exceptions.bit`, the identical shape.
-fn nameserverFromAdapters(out: *u8): bool {
+// that use `bufPtr` (`return netAdapterDnsServers(...)` on success, `return 0`
+// on a fatal GetAdaptersAddresses error) both leave the function without taking
+// the loop's back edge again, and the one path that DOES take the back edge
+// (ERROR_BUFFER_OVERFLOW, to retry with a bigger `words`) never reads
+// `buf`/`bufPtr` again -- it discards them and allocates a fresh, larger buffer
+// next iteration. So no poll is ever reached while a live use of the raw
+// address remains outstanding; see `pollFreeExceptions`'s (g4b) group in
+// `_tests_/bit/pollfree/exceptions2.bit`, the identical shape.
+fn nameserversFromAdapters(list: *u8, cap: int): int {
   let words = gaaInitialWords
   let attempt = 0
   // Bounded (Power of 10): the adapter list can change between two calls
@@ -223,10 +197,10 @@ fn nameserverFromAdapters(out: *u8): bool {
       ),
     )
     if (rc == 0) {
-      return firstDnsIpv4(bufPtr, out)
+      return netAdapterDnsServers(bufPtr, list, cap)
     }
     if (rc != errorBufferOverflow) {
-      return false
+      return 0
     }
     let needed = getU32Le(sizeBytes, 0)
     words = (needed + 7) / 8
@@ -235,46 +209,5 @@ fn nameserverFromAdapters(out: *u8): bool {
     }
     attempt = attempt + 1
   }
-  return false
-}
-
-// Walks the IP_ADAPTER_ADDRESSES list starting at `firstAdapter`, and for
-// each UP adapter its FirstDnsServerAddress list, returning the first IPv4
-// (AF_INET) server address found. GetAdaptersAddresses' DNS server list is
-// NOT filtered by the Family this file requests -- Microsoft's own
-// documented behaviour is that it can carry IPv6 entries even when only
-// IPv4 was asked for -- so every entry's own address family is checked
-// here rather than trusted from the call's `Family` argument.
-// POLL-FREE (#1658/#3924): `@nosplit`, and correctly so -- it allocates
-// nothing and every callee it reaches (`getU32Le`/`getU64Le`/`bytesAt`/
-// `netSockAddrFamily`/`netSockAddrOctets`, `runtime/net/sock.bit` and
-// `runtime/net/windows/sock.bit`) is `@nosplit` already, so no cascade. The
-// two raw ints it walks (`adapter`, `dnsAddr`) point into Win32 memory
-// (`GetAdaptersAddresses`' own `IP_ADAPTER_ADDRESSES` linked list) that the
-// caller passed in as `firstAdapter: int`, not a GC object this function
-// itself owns -- but the caller's backing array IS GC memory (see
-// `nameserverFromAdapters`'s own note), so removing this function's back-edge
-// polls is what keeps that array's collection-under-a-live-reference hazard
-// from ever existing, rather than merely arguing it does not fire today.
-@nosplit fn firstDnsIpv4(firstAdapter: int, out: *u8): bool {
-  let adapter = firstAdapter
-  let steps = 0
-  while (adapter != 0 && steps < maxAdaptersWalk) {
-    if (getU32Le(bytesAt(adapter), iaaOperStatusOff) == ifOperStatusUp) {
-      let dnsAddr = getU64Le(bytesAt(adapter), iaaFirstDnsServerOff)
-      let dsteps = 0
-      while (dnsAddr != 0 && dsteps < maxDnsServersWalk) {
-        let sa = getU64Le(bytesAt(dnsAddr), dnsAddrSockaddrPtrOff)
-        if (sa != 0 && netSockAddrFamily(bytesAt(sa)) == afInet()) {
-          netSockAddrOctets(bytesAt(sa), out)
-          return true
-        }
-        dnsAddr = getU64Le(bytesAt(dnsAddr), dnsAddrNextOff)
-        dsteps = dsteps + 1
-      }
-    }
-    adapter = getU64Le(bytesAt(adapter), iaaNextOff)
-    steps = steps + 1
-  }
-  return false
+  return 0
 }
