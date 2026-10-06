@@ -1,0 +1,340 @@
+// pkg/jobs/sql.bit — a `Store` (store.bit) backed by a `std/sql.Pool` on
+// PostgreSQL or MySQL 8.0.1+, using `SELECT ... FOR UPDATE SKIP LOCKED` so N
+// workers polling concurrently never claim the same row (#6082, #7320, epic
+// #4023).
+//
+// ONE STORE, TWO DIALECTS. `SqlStore(pool)` asks the server what it is once,
+// at construction (`detectDialect`), and keeps the answer. `Pool` carries no
+// driver name and `std/sql` knows no dialect (stdlib/sql/tx.bit's header), and
+// `SELECT version()` is the one statement both engines answer: PostgreSQL
+// reports `PostgreSQL 18.6 ...`, MySQL `8.4.0`. The server's own answer also
+// carries the version, which is what lets construction REFUSE a MySQL older
+// than 8.0.1, the first release with `SKIP LOCKED`, instead of failing on the
+// first `claim` with a syntax error under load. MariaDB is refused by name: its
+// `SKIP LOCKED` arrived with a different version line and this package is not
+// run against it.
+//
+// ONLY TWO STATEMENTS DIFFER PER ENGINE, besides the DDL: `claim` (below) and
+// the lease queries (sqllocker.bit). `enqueue`, `complete`, `retry` and
+// `deadLetter` are plain `UPDATE`/`INSERT` text that both engines accept;
+// `std/sql` takes numbered `$n` placeholders whatever the database and the
+// MySQL driver renders them into `?` (pkg/mysql/rewrite.bit).
+//
+// `Pool`, NOT `pkg/postgres`/`pkg/mysql` DIRECTLY: the application builds one
+// with `pool(adapter(), Datasource{...})` and hands it in. `_tests_/bit/
+// jobslive.bit`'s live proof is what pulls in both drivers.
+//
+// TRANSACTIONS GO THROUGH `txValueAt`, NEVER `Pool.begin` DIRECTLY —
+// `Pool.begin` is unexported by design (#3979, stdlib/sql/tx.bit's own
+// header): every `?` between a hand-written `begin` and `commit` is an
+// early return that skips the rollback and leaks the pooled connection.
+//
+// ONE QUERY FOR BOTH "ready" AND "abandoned" (store.bit's header): `claim`'s
+// `WHERE` clause accepts a row that is either newly available
+// (`claimed_until <= now`, true for a never-claimed row whose default is 0)
+// or a stale claim whose visibility window elapsed — a worker-crash
+// re-claim needs no separate method or schedule, just the same predicate
+// evaluated on the next poll.
+
+import { Pool, Tx, Rows, Value, Isolation, asInt, asText, txValueAt } from "std/sql"
+import { hasPrefix, contains, parseInt } from "std/strings"
+
+// The SQL engines `SqlStore` and `SqlLocker` speak.
+export enum Dialect { Postgres, MySql }
+
+// The lowest MySQL release with `SELECT ... FOR UPDATE SKIP LOCKED`
+// (https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-1.html).
+const mysqlMajor: int = 8
+const mysqlPatch: int = 1
+
+// What `SELECT version()` said, as the dialect it names, or a failure naming
+// the server and what this package needs. Pure, so `sql.test.bit` can feed it
+// every version string without a server.
+fn dialectOfVersion(version: string): Dialect! {
+  if (hasPrefix(version, "PostgreSQL ")) {
+    return Dialect.Postgres
+  }
+  if (contains(version, "MariaDB")) {
+    fail newError("jobs: SqlStore does not support MariaDB (the server reported '${version}'); use PostgreSQL or MySQL 8.0.1 or newer")
+  }
+  let parts = versionNumbers(version)
+  if (len(parts) != 3) {
+    fail newError("jobs: SqlStore supports PostgreSQL and MySQL 8.0.1 or newer; the server reported '${version}'")
+  }
+  if (!mysqlHasSkipLocked(parts)) {
+    fail newError("jobs: MySQL ${version} is too old for SqlStore: claiming jobs needs SELECT ... FOR UPDATE SKIP LOCKED, which MySQL has had since 8.0.1")
+  }
+  return Dialect.MySql
+}
+
+fn mysqlHasSkipLocked(parts: []int): bool {
+  if (parts[0] != mysqlMajor) {
+    return parts[0] > mysqlMajor
+  }
+  if (parts[1] != 0) {
+    return true
+  }
+  return parts[2] >= mysqlPatch
+}
+
+// The leading `major.minor.patch` of a MySQL version string (`8.4.0`,
+// `5.7.44-log`, `8.0.36-0ubuntu0.22.04.1`), or an empty slice when the text
+// does not start with three dotted numbers.
+fn versionNumbers(version: string): []int {
+  let out = []int(0)
+  let rest = version
+  let i = 0
+  while (i < 3) {
+    let n = leadingDigits(rest)
+    if (n == 0) {
+      return []int(0)
+    }
+    let part = parseInt(rest[0:n]) catch _ {
+      return []int(0)
+    }
+    out = append(out, part)
+    rest = rest[n:len(rest)]
+    if (i < 2) {
+      if (!hasPrefix(rest, ".")) {
+        return []int(0)
+      }
+      rest = rest[1:len(rest)]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn leadingDigits(s: string): int {
+  let n = 0
+  while (n < len(s) && s[n] >= u8(48) && s[n] <= u8(57)) {
+    n = n + 1
+  }
+  return n
+}
+
+// Asks the server which engine it is: the one round trip construction costs.
+fn detectDialect(db: Pool): Dialect! {
+  let rows = db.query("SELECT version()", []Value(0))?
+  let has = rows.next()?
+  if (!has) {
+    rows.close()
+    fail newError("jobs: the database returned no version")
+  }
+  let version = asText(rows.value(0))?
+  rows.close()
+  return dialectOfVersion(version)?
+}
+
+// Run once against a fresh database before a `SqlStore` is used. A LIST, not
+// one multi-statement string: the extended protocol (what every `std/sql`
+// driver call goes through) refuses more than one command per prepared
+// statement, so `migrate` below runs each entry as its own `exec`. A list
+// also means neither this file nor an application running these by hand has
+// to split on `;` — fragile the moment a future statement's own text ever
+// contains one (a string literal, a comment). Not run by this package itself:
+// the application controls its own migration tooling and ordering.
+// A `[]string` is a reference type and cannot be a top-level `const`
+// (SPEC §11.11: module-level state holds only untraced scalars) — a
+// function returning a fresh slice each call is the ordinary alternative,
+// the same shape `defaultOptions()`-style constructors use elsewhere.
+//
+// MySQL has no partial index and no `CREATE INDEX IF NOT EXISTS`, so its index
+// is part of `CREATE TABLE IF NOT EXISTS` and leads with the two flags the
+// claim filters on. Its lease keys are `utf8mb4_bin`: the default collation is
+// case- and accent-insensitive, which would make `Report@1` and `report@1` one
+// lease.
+export fn migrationStatements(dialect: Dialect): []string {
+  match (dialect) {
+    Postgres => return postgresMigration()
+    MySql => return mysqlMigration()
+  }
+}
+
+fn postgresMigration(): []string {
+  return [
+      "CREATE TABLE IF NOT EXISTS bit_jobs (\n" +
+      "  id BIGSERIAL PRIMARY KEY,\n" +
+      "  name TEXT NOT NULL,\n" +
+      "  payload TEXT NOT NULL,\n" +
+      "  attempts BIGINT NOT NULL DEFAULT 0,\n" +
+      "  max_attempts BIGINT NOT NULL,\n" +
+      "  available_at BIGINT NOT NULL,\n" +
+      "  claimed_until BIGINT NOT NULL DEFAULT 0,\n" +
+      "  done BOOLEAN NOT NULL DEFAULT FALSE,\n" +
+      "  dead_lettered BOOLEAN NOT NULL DEFAULT FALSE,\n" +
+      "  dead_reason TEXT NOT NULL DEFAULT ''\n" +
+      ")",
+      "CREATE INDEX IF NOT EXISTS bit_jobs_claimable ON bit_jobs (available_at)\n" +
+      "  WHERE NOT done AND NOT dead_lettered",
+      "CREATE TABLE IF NOT EXISTS bit_schedule_leases (\n" +
+      "  lease_key TEXT PRIMARY KEY,\n" +
+      "  holder TEXT NOT NULL,\n" +
+      "  expires_at BIGINT NOT NULL,\n" +
+      "  seq BIGSERIAL\n" +
+      ")",
+  ]
+}
+
+fn mysqlMigration(): []string {
+  return [
+      "CREATE TABLE IF NOT EXISTS bit_jobs (\n" +
+      "  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,\n" +
+      "  name VARCHAR(255) NOT NULL,\n" +
+      "  payload LONGTEXT NOT NULL,\n" +
+      "  attempts BIGINT NOT NULL DEFAULT 0,\n" +
+      "  max_attempts BIGINT NOT NULL,\n" +
+      "  available_at BIGINT NOT NULL,\n" +
+      "  claimed_until BIGINT NOT NULL DEFAULT 0,\n" +
+      "  done BOOLEAN NOT NULL DEFAULT FALSE,\n" +
+      "  dead_lettered BOOLEAN NOT NULL DEFAULT FALSE,\n" +
+      "  dead_reason TEXT NULL,\n" +
+      "  INDEX bit_jobs_claimable (done, dead_lettered, available_at)\n" +
+      ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+      "CREATE TABLE IF NOT EXISTS bit_schedule_leases (\n" +
+      "  lease_key VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,\n" +
+      "  holder VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,\n" +
+      "  expires_at BIGINT NOT NULL,\n" +
+      "  seq BIGINT NOT NULL AUTO_INCREMENT,\n" +
+      "  UNIQUE KEY bit_schedule_leases_seq (seq)\n" +
+      ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+  ]
+}
+
+// Runs the migration of the dialect `db`'s server speaks, in order — a
+// convenience for tests and small apps; anything with its own migration tool
+// can run `migrationStatements(Dialect.Postgres)` or `(Dialect.MySql)` itself
+// instead. Fails like `SqlStore(db)` does on a server it does not support.
+export fn migrate(db: Pool): ()! {
+  let dialect = detectDialect(db)?
+  for stmt of migrationStatements(dialect) {
+    db.exec(stmt, []Value(0))?
+  }
+}
+
+// A `Store` (store.bit) over one `Pool`. `Pool` is already safe for
+// concurrent callers (its own header: a checkout-and-return pool), so one
+// `SqlStore` may back every worker in a `Queue`.
+export class SqlStore {
+  db: Pool
+  dialect: Dialect
+
+  // A fresh store over an already-open pool. Fails when the server is not
+  // PostgreSQL or MySQL 8.0.1+ (`detectDialect`), so a store the server cannot
+  // serve never exists.
+  init(db: Pool)! {
+    this.db = db
+    this.dialect = detectDialect(db)?
+  }
+
+  export enqueue(name: string, payload: string, availableAt: int, maxAttempts: int): ()! {
+    this.db.exec(
+      "INSERT INTO bit_jobs (name, payload, max_attempts, available_at) VALUES ($1, $2, $3, $4)",
+      [Value.Text(name), Value.Text(payload), Value.Int(maxAttempts), Value.Int(availableAt)],
+    )?
+  }
+
+  export claim(visibilityTimeout: int): Option<ClaimedJob>! {
+    let nowNs = now().ns
+    match (this.dialect) {
+      Postgres => return claimPostgres(this.db, nowNs, visibilityTimeout)?
+      MySql => return claimMysql(this.db, nowNs, visibilityTimeout)?
+    }
+  }
+
+  export complete(id: int): ()! {
+    this.db.exec("UPDATE bit_jobs SET done = true WHERE id = $1", [Value.Int(id)])?
+  }
+
+  export retry(id: int, availableAt: int): ()! {
+    this.db.exec(
+      "UPDATE bit_jobs SET available_at = $1, claimed_until = 0 WHERE id = $2",
+      [Value.Int(availableAt), Value.Int(id)],
+    )?
+  }
+
+  export deadLetter(id: int, reason: string): ()! {
+    this.db.exec(
+      "UPDATE bit_jobs SET dead_lettered = true, dead_reason = $1 WHERE id = $2",
+      [Value.Text(reason), Value.Int(id)],
+    )?
+  }
+}
+
+// PostgreSQL's claim is ONE statement and one round trip: an `UPDATE` over a
+// `SKIP LOCKED` subquery, `RETURNING` the claimed row. The statement is its own
+// transaction, so the row lock the subquery takes lives exactly as long as the
+// update.
+const claimPostgresSql: string = "UPDATE bit_jobs SET attempts = attempts + 1, claimed_until = $2 " +
+  "WHERE id = (SELECT id FROM bit_jobs " +
+  "WHERE NOT done AND NOT dead_lettered AND available_at <= $1 AND claimed_until <= $1 " +
+  "ORDER BY available_at LIMIT 1 FOR UPDATE SKIP LOCKED) " +
+  "RETURNING id, name, payload, attempts, max_attempts"
+
+fn claimPostgres(db: Pool, nowNs: int, visibilityTimeout: int): Option<ClaimedJob>! {
+  let rows = db.query(claimPostgresSql, [Value.Int(nowNs), Value.Int(nowNs + visibilityTimeout)])?
+  let has = rows.next()?
+  if (!has) {
+    rows.close()
+    return Option.None
+  }
+  let job = readClaimRow(rows)?
+  rows.close()
+  return Option.Some(job)
+}
+
+// MySQL has no `UPDATE ... RETURNING`, so its claim cannot be one statement: it
+// is one transaction of two, `SELECT ... FOR UPDATE SKIP LOCKED` then an
+// `UPDATE` by id (BEGIN, SET ISOLATION, SELECT, UPDATE, COMMIT on the wire).
+// READ COMMITTED, so the scan takes record locks and no gap locks and a
+// concurrent `enqueue` is never blocked behind a claim.
+const claimMysqlSql: string = "SELECT id, name, payload, attempts, max_attempts FROM bit_jobs " +
+  "WHERE done = FALSE AND dead_lettered = FALSE AND available_at <= $1 AND claimed_until <= $1 " +
+  "ORDER BY available_at LIMIT 1 FOR UPDATE SKIP LOCKED"
+
+fn claimMysql(db: Pool, nowNs: int, visibilityTimeout: int): Option<ClaimedJob>! {
+  return txValueAt<Option<ClaimedJob>>(db, Isolation.ReadCommitted, (t) => {
+    return claimMysqlLocked(t, nowNs, visibilityTimeout)?
+  })?
+}
+
+// The SELECT-then-UPDATE inside `claimMysql`'s transaction.
+fn claimMysqlLocked(t: Tx, nowNs: int, visibilityTimeout: int): Option<ClaimedJob>! {
+  let rows = t.query(claimMysqlSql, [Value.Int(nowNs)])?
+  let has = rows.next()?
+  if (!has) {
+    rows.close()
+    return Option.None
+  }
+  let row = readClaimRow(rows)?
+  rows.close()
+  t.exec(
+    "UPDATE bit_jobs SET attempts = $1, claimed_until = $2 WHERE id = $3",
+    [Value.Int(row.attempts + 1), Value.Int(nowNs + visibilityTimeout), Value.Int(row.id)],
+  )?
+  return Option.Some(
+    ClaimedJob{
+      id = row.id,
+      name = row.name,
+      payload = row.payload,
+      attempts = row.attempts + 1,
+      maxAttempts = row.maxAttempts,
+    },
+  )
+}
+
+// The five columns both claims select, in this order.
+fn readClaimRow(rows: Rows): ClaimedJob! {
+  let id = asInt(rows.value(0))?
+  let name = asText(rows.value(1))?
+  let payload = asText(rows.value(2))?
+  let attempts = asInt(rows.value(3))?
+  let maxAttempts = asInt(rows.value(4))?
+  return ClaimedJob{
+    id = id,
+    name = name,
+    payload = payload,
+    attempts = attempts,
+    maxAttempts = maxAttempts,
+  }
+}

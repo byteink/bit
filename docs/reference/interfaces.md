@@ -54,9 +54,8 @@ fn main() {
 ```
 
 `MemoryStore` never mentions `Store` in its own declaration. It satisfies
-`Store` by having a `save` and a `load` with the right signatures. A future
-`PostgresStore` would satisfy the same interface the same way, and callers
-would not need to change at all.
+`Store` by having a `save` and a `load` with the right signatures. A database-backed store would satisfy the same
+interface the same way, and callers would not need to change at all.
 
 ## Requiring a field
 

@@ -47,7 +47,7 @@ queue over a store, `register` tells it what to do with a job type, and
 ```bit
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { PostgresStore, migrate, open, Options, Queue } from "jobs"
+import { SqlStore, migrate, open, Options, Queue } from "jobs"
 
 @job("send-welcome") @json class SendWelcome {
   userId: i64,
@@ -61,7 +61,7 @@ fn sendWelcomeEmail(userId: i64): ()! {
 fn openJobQueue(databaseUrl: string): Queue! {
   let db = pool(adapter(), Datasource{ uri = databaseUrl })?
   migrate(db)?
-  let store = PostgresStore(db)
+  let store = SqlStore(db)?
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?
@@ -73,7 +73,7 @@ fn openJobQueue(databaseUrl: string): Queue! {
 `@job("send-welcome")` gives `SendWelcome` a stable name that survives
 renaming the class - the queue dispatches by that name, never by a typed
 string you write yourself. `@json` is required because the payload has to
-cross the store as text. `migrate` creates the table `PostgresStore`
+cross the store as text. `migrate` creates the tables `SqlStore`
 needs; running it more than once is safe. A standalone worker process is
 the simplest way to run this - `openJobQueue`, then `q.run()` starts the
 pool and blocks until something stops it:

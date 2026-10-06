@@ -38,13 +38,13 @@ workers that pick them up, run them, and retry the ones that fail.
 A job is a class with a stable name and a JSON-shaped payload. `open`
 builds a queue over a `Store`; `register` tells it what to do with a job
 type; `enqueue` adds one. `jobs` ships no default store (this package's own
-README), so every runnable example on this page opens a `PostgresStore` -
-see [PostgreSQL](postgres.md) for what `migrate` and `PostgresStore` do.
+README), so every runnable example on this page opens a `SqlStore` -
+see [PostgreSQL and MySQL](sql.md) for what `migrate` and `SqlStore` do.
 
 ```bit
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { PostgresStore, PermanentFailure, migrate, open, Options, Store } from "jobs"
+import { SqlStore, PermanentFailure, migrate, open, Options, Store } from "jobs"
 
 @job("send-welcome") @json class SendWelcome {
   userId: i64,
@@ -53,7 +53,7 @@ import { PostgresStore, PermanentFailure, migrate, open, Options, Store } from "
 fn main(): ()! {
   let db = pool(adapter(), Datasource{ uri = "postgres://localhost/myapp" })?
   migrate(db)?
-  let store = PostgresStore(db)
+  let store = SqlStore(db)?
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?
@@ -79,7 +79,7 @@ because the payload has to cross the store as text.
 
 A worker process is one shape. Often you want jobs running inside the same
 process as your web server instead - `start`/`stop` do that. `store` here
-is the same `PostgresStore` `main` above already opened:
+is the same `SqlStore` `main` above already opened:
 
 ```bit
 fn runAlongsideWebServer(store: Store): ()! {
@@ -204,6 +204,6 @@ for the work to finish.
 
 ## Next
 
-[PostgreSQL](postgres.md): a real `Store`, the migration, writing your own
+[PostgreSQL and MySQL](sql.md): a real `Store`, the migration, writing your own
 store, and why a handler that runs the same job twice must produce the
 same result.

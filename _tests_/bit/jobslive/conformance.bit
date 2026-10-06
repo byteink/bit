@@ -1,0 +1,294 @@
+// _tests_/bit/jobslive/conformance.bit — the `Store` and `Locker` conformance
+// suite (#7320). One suite, written against the two interfaces only
+// (pkg/jobs/store.bit, pkg/jobs/schedule.bit): `main.bit` runs it against live
+// PostgreSQL and live MySQL 8 today, and a Redis store (#7321) calls the same
+// two functions with its own `Store` and `Locker`, so every backend is held to
+// one definition of "correct". Nothing here reads a table, a key or a clock of
+// any engine: a check that needed to would not be portable.
+//
+// Every failure PANICS with a line starting `CONFORMANCE FAILED`, naming the
+// case and the numbers, so `bit run` exits non-zero and the harness reports it.
+//
+// Each case drains the queue first and leaves it empty, so cases neither
+// depend on their order nor on what a previous proof left behind.
+//
+// This file is copied beside `main.bit` into the scratch project
+// `_tests_/bit/jobslive.bit` generates, and resolves "jobs" through that
+// project's `bit.lock`.
+
+import { Mutex, WaitGroup } from "std/sync"
+import { sleep, Millisecond } from "std/time"
+import { Store, Locker, ClaimedJob } from "jobs"
+
+const workers: int = 6
+const jobsPerRun: int = 30
+// Long enough that two calls in a row stay inside it over a tunnelled database
+// (a fresh connection's TLS handshake alone took more than the 150 ms this
+// started at); `mustNotClaim` after a claim would otherwise reclaim by expiry.
+const visibility: int = 600 * Millisecond
+// Past `visibility`, with room for a loaded machine.
+const pastVisibility: int = 1500 * Millisecond
+
+fn refuse(label: string, what: string) {
+  panic("CONFORMANCE FAILED: ${label}: ${what}")
+}
+
+fn claimNow(store: Store, timeout: int, label: string): Option<ClaimedJob> {
+  return store.claim(timeout) catch e {
+    panic("CONFORMANCE FAILED: ${label}: claim: ${e.message()}")
+  }
+}
+
+fn enqueueNow(store: Store, name: string, payload: string, availableAt: int, maxAttempts: int) {
+  store.enqueue(name, payload, availableAt, maxAttempts) catch e {
+    panic("CONFORMANCE FAILED: enqueue ${name}: ${e.message()}")
+  }
+}
+
+fn completeNow(store: Store, id: int, label: string) {
+  store.complete(id) catch e {
+    panic("CONFORMANCE FAILED: ${label}: complete: ${e.message()}")
+  }
+}
+
+// A claim that must hit a row, at `attempts` attempts.
+fn mustClaim(store: Store, timeout: int, attempts: int, label: string): ClaimedJob {
+  match (claimNow(store, timeout, label)) {
+    None => panic("CONFORMANCE FAILED: ${label}: expected a claimable job, the queue answered None")
+    Some(job) => {
+      if (job.attempts != attempts) {
+        refuse(label, "attempts = ${job.attempts}, want ${attempts}")
+      }
+      return job
+    }
+  }
+}
+
+fn mustNotClaim(store: Store, label: string) {
+  match (claimNow(store, visibility, label)) {
+    None => {}
+    Some(job) => refuse(label, "claimed job ${job.id} (${job.name}) that must not be claimable")
+  }
+}
+
+// Claims and completes everything claimable, so a case starts on an empty
+// queue. Bounded: a store that keeps handing rows back forever fails here
+// instead of hanging.
+fn drain(store: Store) {
+  let n = 0
+  while (n < 1000) {
+    match (claimNow(store, visibility, "drain")) {
+      None => return
+      Some(job) => completeNow(store, job.id, "drain")
+    }
+    n = n + 1
+  }
+  refuse("drain", "the queue still had claimable jobs after 1000 claims")
+}
+
+fn caseRoundTrip(store: Store) {
+  drain(store)
+  enqueueNow(store, "conf-roundtrip", "{\"k\":1}", 0, 3)
+  let job = mustClaim(store, visibility, 1, "round trip")
+  if (job.name != "conf-roundtrip" || job.payload != "{\"k\":1}" || job.maxAttempts != 3) {
+    refuse("round trip", "got ${job.name} ${job.payload} max ${job.maxAttempts}")
+  }
+  mustNotClaim(store, "round trip: a claimed job is leased")
+  completeNow(store, job.id, "round trip")
+  sleep(pastVisibility)
+  mustNotClaim(store, "round trip: a completed job never returns")
+}
+
+fn caseNotYetAvailable(store: Store) {
+  drain(store)
+  enqueueNow(store, "conf-later", "{}", now().ns + 200 * Millisecond, 3)
+  mustNotClaim(store, "not yet available")
+  sleep(pastVisibility)
+  let job = mustClaim(store, 10000 * Millisecond, 1, "available after its time")
+  completeNow(store, job.id, "not yet available")
+}
+
+fn caseOldestFirst(store: Store) {
+  drain(store)
+  enqueueNow(store, "conf-second", "{}", 2, 3)
+  enqueueNow(store, "conf-first", "{}", 1, 3)
+  let a = mustClaim(store, 10000 * Millisecond, 1, "oldest first, 1st")
+  let b = mustClaim(store, 10000 * Millisecond, 1, "oldest first, 2nd")
+  if (a.name != "conf-first" || b.name != "conf-second") {
+    refuse("oldest first", "claimed ${a.name} then ${b.name}")
+  }
+  completeNow(store, a.id, "oldest first")
+  completeNow(store, b.id, "oldest first")
+}
+
+fn caseVisibilityReclaim(store: Store) {
+  drain(store)
+  enqueueNow(store, "conf-crash", "{}", 0, 5)
+  let first = mustClaim(store, visibility, 1, "visibility: first claim")
+  mustNotClaim(store, "visibility: inside the window")
+  sleep(pastVisibility)
+  let again = mustClaim(store, visibility, 2, "visibility: reclaim after the window")
+  if (again.id != first.id) {
+    refuse("visibility", "reclaimed job ${again.id}, the abandoned one was ${first.id}")
+  }
+  completeNow(store, again.id, "visibility")
+}
+
+fn caseRetry(store: Store) {
+  drain(store)
+  enqueueNow(store, "conf-retry", "{}", 0, 5)
+  let first = mustClaim(store, 10000 * Millisecond, 1, "retry: first claim")
+  store.retry(first.id, now().ns + 200 * Millisecond) catch e {
+    panic("CONFORMANCE FAILED: retry: ${e.message()}")
+  }
+  mustNotClaim(store, "retry: before its new availability")
+  sleep(pastVisibility)
+  let second = mustClaim(store, 10000 * Millisecond, 2, "retry: after its new availability")
+  completeNow(store, second.id, "retry")
+}
+
+fn caseDeadLetter(store: Store) {
+  drain(store)
+  enqueueNow(store, "conf-dead", "{}", 0, 1)
+  let job = mustClaim(store, visibility, 1, "dead letter: claim")
+  store.deadLetter(job.id, "conformance") catch e {
+    panic("CONFORMANCE FAILED: deadLetter: ${e.message()}")
+  }
+  sleep(pastVisibility)
+  mustNotClaim(store, "dead letter: a dead-lettered job never returns")
+}
+
+// What the concurrent claimers saw: every id handed out, and how many times an
+// id that was already out was handed out again.
+class claimLog {
+  mu: Mutex,
+  seen: map<int, int>,
+  ids: []int,
+  dupes: int,
+  errors: int,
+}
+
+fn record(log: claimLog, job: ClaimedJob) {
+  log.mu.lock()
+  if (log.seen[job.id] > 0) {
+    log.dupes = log.dupes + 1
+  } else {
+    log.seen[job.id] = 1
+    log.ids = append(log.ids, job.id)
+  }
+  log.mu.unlock()
+}
+
+fn claimLoop(store: Store, log: claimLog, wg: WaitGroup) {
+  while (true) {
+    let got = store.claim(60000 * Millisecond) catch _ {
+      log.mu.lock()
+      log.errors = log.errors + 1
+      log.mu.unlock()
+      wg.done()
+      return
+    }
+    match (got) {
+      None => {
+        wg.done()
+        return
+      }
+      Some(job) => record(log, job)
+    }
+  }
+}
+
+// N workers claim concurrently from `jobsPerRun` jobs: every job is handed out
+// exactly once, none twice, none lost.
+fn caseConcurrentClaims(store: Store) {
+  drain(store)
+  let i = 0
+  while (i < jobsPerRun) {
+    enqueueNow(store, "conf-concurrent", "{\"i\":${i}}", 0, 3)
+    i = i + 1
+  }
+  let log = claimLog{ mu = Mutex(), seen = map<int, int>(), ids = []int(0), dupes = 0, errors = 0 }
+  let wg = WaitGroup()
+  wg.add(i64(workers))
+  let w = 0
+  while (w < workers) {
+    spawn claimLoop(store, log, wg)
+    w = w + 1
+  }
+  wg.wait()
+  if (log.errors != 0 || log.dupes != 0 || len(log.ids) != jobsPerRun) {
+    refuse(
+      "concurrent claims",
+      "${workers} workers: ${len(log.ids)} distinct jobs (want ${jobsPerRun}), ${log.dupes} handed out twice, ${log.errors} failed claims",
+    )
+  }
+  for id of log.ids {
+    completeNow(store, id, "concurrent claims")
+  }
+}
+
+// The `Store` conformance suite: enqueue and claim, a job that is not due yet,
+// oldest first, a visibility timeout that reclaims an abandoned job, retry,
+// dead letter, and N workers that never double-claim.
+export fn runStoreConformance(store: Store) {
+  caseRoundTrip(store)
+  caseNotYetAvailable(store)
+  caseOldestFirst(store)
+  caseVisibilityReclaim(store)
+  caseRetry(store)
+  caseDeadLetter(store)
+  caseConcurrentClaims(store)
+  drain(store)
+}
+
+fn acquireNow(l: Locker, key: string, holder: string, nowNs: int, expiresAt: int): bool {
+  return l.tryAcquire(key, holder, nowNs, expiresAt) catch e {
+    panic("CONFORMANCE FAILED: tryAcquire ${key} ${holder}: ${e.message()}")
+  }
+}
+
+fn expectLease(got: bool, want: bool, label: string) {
+  if (got != want) {
+    refuse(label, "tryAcquire returned ${got}, want ${want}")
+  }
+}
+
+// The `Locker` conformance suite, with two lockers over the same backing store
+// (two instances of one fleet): the lease is exclusive while live, renewable by
+// its holder, handed over once it expires, and `lastTick` remembers the newest
+// tick. Every time is the caller's, so the suite never sleeps.
+export fn runLockerConformance(a: Locker, b: Locker) {
+  let key = "conf-lease@100"
+  expectLease(acquireNow(a, key, "a", 10, 20), true, "lease: a takes a free key")
+  expectLease(acquireNow(b, key, "b", 15, 25), false, "lease: b is refused a live lease")
+  expectLease(acquireNow(a, key, "a", 12, 22), true, "lease: the holder renews")
+  expectLease(acquireNow(b, key, "b", 21, 31), false, "lease: renewal moved the expiry")
+  expectLease(acquireNow(b, key, "b", 22, 32), true, "lease: b takes over once it expired")
+  expectLease(acquireNow(a, key, "a", 23, 33), false, "lease: a lost it to b")
+  let tick = a.lastTick("conf-lease") catch e {
+    panic("CONFORMANCE FAILED: lastTick: ${e.message()}")
+  }
+  if (tick != 100) {
+    refuse("lastTick", "got ${tick}, want 100")
+  }
+  expectLease(
+    acquireNow(a, "conf-lease@200", "a", 40, 50),
+    true,
+    "lease: a later tick is its own key",
+  )
+  let newest = b.lastTick("conf-lease") catch e {
+    panic("CONFORMANCE FAILED: lastTick: ${e.message()}")
+  }
+  if (newest != 200) {
+    refuse("lastTick", "after tick 200 got ${newest}, want 200")
+  }
+  let none = b.lastTick("conf-no-such-schedule") catch e {
+    panic("CONFORMANCE FAILED: lastTick: ${e.message()}")
+  }
+  if (none != 0 || a.window() < 1) {
+    refuse(
+      "lastTick",
+      "an unknown schedule must report 0 (got ${none}) and window() >= 1 (got ${a.window()})",
+    )
+  }
+}

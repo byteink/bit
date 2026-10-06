@@ -1,0 +1,224 @@
+// pkg/jobs/sqllocker.bit — a `Locker` (schedule.bit) over a `std/sql.Pool` on
+// PostgreSQL or MySQL 8.0.1+ (#6083, #7320). The dialect comes from the
+// server exactly as `SqlStore`'s does (sql.bit's `detectDialect`), so a store
+// and its locker over one pool always agree.
+//
+// The lease is a ROW with an expiry, not an advisory lock (PostgreSQL) or
+// `GET_LOCK` (MySQL): both belong to one connection and `Pool` does not
+// promise the same connection across two calls, and a connection returned to
+// the pool would carry the lock to the next borrower.
+
+import { Pool, Value, Isolation, asInt, asText, txValueAt } from "std/sql"
+import { lastIndexOf } from "std/strings"
+
+// The queries over a schedule's lease rows. `$1` is the schedule id and its
+// "@" (`<id>@`); a row counts only when what follows is all digits, so a
+// schedule whose id merely starts with another's never reads the other's
+// ticks. `pruneSql` drops every row but the newest `$2` BY ARRIVAL (`seq`)
+// and the row of the newest tick.
+const ofSchedulePostgres: string = "starts_with(lease_key, $1::text) AND substr(lease_key, length($1::text) + 1) ~ '^[0-9]{1,19}$'"
+const tickOfPostgres: string = "substr(lease_key, length($1::text) + 1)::bigint"
+const lastTickPostgres: string = "SELECT coalesce(max(" +
+  tickOfPostgres +
+  "), 0) FROM bit_schedule_leases WHERE " +
+  ofSchedulePostgres
+const prunePostgres: string = "DELETE FROM bit_schedule_leases WHERE lease_key IN (" +
+  "SELECT lease_key FROM bit_schedule_leases WHERE " +
+  ofSchedulePostgres +
+  " ORDER BY seq DESC OFFSET $2) " +
+  "AND lease_key <> (SELECT lease_key FROM bit_schedule_leases WHERE " +
+  ofSchedulePostgres +
+  " ORDER BY " +
+  tickOfPostgres +
+  " DESC LIMIT 1)"
+
+// MySQL's spelling. No `starts_with` or `~`: the prefix is `LEFT(...)` and the
+// all-digits test is "no byte outside 0-9" (ICU's `$` would also accept a
+// trailing newline, PostgreSQL's does not). At most 19 digits, the width of a
+// signed BIGINT and of a nanosecond timestamp (about 1.8e18); `CAST ... AS
+// SIGNED` clamps a 19-digit value past 9.2e18 where PostgreSQL's `::bigint`
+// fails, and no clock reaches that.
+// `IN (... OFFSET n)` is not allowed in MySQL, nor is selecting from the table
+// being deleted: `prune` therefore compares `seq` with the one row at `OFFSET
+// $2` and reads both subqueries through a derived table with a `LIMIT`, which
+// MySQL materializes instead of merging.
+const ofScheduleMysql: string = "LEFT(lease_key, CHAR_LENGTH($1)) = $1 " +
+  "AND CHAR_LENGTH(lease_key) BETWEEN CHAR_LENGTH($1) + 1 AND CHAR_LENGTH($1) + 19 " +
+  "AND SUBSTRING(lease_key, CHAR_LENGTH($1) + 1) NOT REGEXP '[^0-9]'"
+const tickOfMysql: string = "CAST(SUBSTRING(lease_key, CHAR_LENGTH($1) + 1) AS SIGNED)"
+const lastTickMysql: string = "SELECT COALESCE(MAX(" +
+  tickOfMysql +
+  "), 0) FROM bit_schedule_leases WHERE " +
+  ofScheduleMysql
+const pruneMysql: string = "DELETE FROM bit_schedule_leases WHERE " +
+  ofScheduleMysql +
+  " AND seq <= (SELECT seq FROM (SELECT seq FROM bit_schedule_leases WHERE " +
+  ofScheduleMysql +
+  " ORDER BY seq DESC LIMIT 1 OFFSET $2) AS cut)" +
+  " AND lease_key <> (SELECT lease_key FROM (SELECT lease_key FROM bit_schedule_leases WHERE " +
+  ofScheduleMysql +
+  " ORDER BY " +
+  tickOfMysql +
+  " DESC LIMIT 1) AS newest)"
+
+// The database clock in whole microseconds (`SqlLocker.serverNowNs`).
+const serverNowPostgres: string = "SELECT (extract(epoch from clock_timestamp()) * 1000000)::bigint"
+const serverNowMysql: string = "SELECT TIMESTAMPDIFF(MICROSECOND, TIMESTAMP '1970-01-01 00:00:00', UTC_TIMESTAMP(6))"
+
+// PostgreSQL's acquire: one `INSERT ... ON CONFLICT DO UPDATE ... WHERE`, so two
+// instances racing for one key are serialized by the row lock and exactly one
+// sees a returned row: the conflict branch only rewrites a row that is ours
+// already or has expired. `$4` is the caller's clock.
+const acquirePostgres: string = "INSERT INTO bit_schedule_leases (lease_key, holder, expires_at) VALUES ($1, $2, $3) " +
+  "ON CONFLICT (lease_key) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at, " +
+  "seq = nextval(pg_get_serial_sequence('bit_schedule_leases', 'seq')) " +
+  "WHERE bit_schedule_leases.holder = EXCLUDED.holder OR bit_schedule_leases.expires_at <= $4 " +
+  "RETURNING holder"
+
+// MySQL's acquire is a transaction of three statements, because MySQL's
+// `ON DUPLICATE KEY UPDATE` cannot both condition the rewrite on the old row
+// and draw a fresh `seq` (an AUTO_INCREMENT is only drawn by an INSERT): delete
+// the row if it is ours or expired, insert it unless a live one is there, then
+// read who holds it. Under READ COMMITTED the DELETE of an absent row takes no
+// gap lock, so two instances racing for a new key meet only at the unique key:
+// one inserts, the other's insert waits for the commit and then finds the row
+// (and no-ops). Winning means the row's holder is us, exactly as PostgreSQL's
+// conflict branch treats a row that is ours already.
+const releaseMysql: string = "DELETE FROM bit_schedule_leases WHERE lease_key = $1 AND (holder = $2 OR expires_at <= $3)"
+const insertMysql: string = "INSERT INTO bit_schedule_leases (lease_key, holder, expires_at) VALUES ($1, $2, $3) " +
+  "ON DUPLICATE KEY UPDATE lease_key = lease_key"
+const holderMysql: string = "SELECT holder FROM bit_schedule_leases WHERE lease_key = $1"
+
+// A `Locker` (schedule.bit) over one `Pool`: a lease row per key with an
+// expiry.
+//
+// The rows are also the durable record of every tick ever fired, which is
+// what `lastTick` reads. Expiry therefore never deletes a row (a fleet down
+// for a day would forget its last tick); the table stays bounded by
+// dropping all but the newest `keep` rows of a schedule, plus the row of its
+// newest tick, each time one wins a tick. "Newest" is by ARRIVAL (`seq`, a
+// sequence every win and takeover draws from), never by tick value or by
+// `expires_at`: both come from the writer's clock, and an instance whose
+// clock ran ahead would otherwise rank above every correct tick and evict
+// the lease a correct instance had just won, so the tick fired twice
+// (#6371). So a row lives until `keep` later leases of its schedule were
+// won, and a schedule never holds more than `keep + 1` rows. A per-tick key
+// is never asked for again once its tick has passed, so older rows only cost
+// space. The window is also how far behind a slow instance can be and still
+// find a tick already taken, so `Queue.schedule`/`every` refuse a
+// `Missed.RunAll` cap above it (`window`).
+export class SqlLocker {
+  db: Pool
+  keep: int
+  dialect: Dialect
+
+  // A fresh locker over an already-open pool. `migrate` creates its table.
+  // `keep` is how many lease rows to retain per schedule; it must be at least
+  // 1, and `open` fails with the value named when the locker reports less
+  // (`window`), rather than this constructor quietly picking another. Fails
+  // when the server is not PostgreSQL or MySQL 8.0.1+, like `SqlStore(db)`.
+  init(db: Pool, keep: int = 1024)! {
+    this.db = db
+    this.keep = keep
+    this.dialect = detectDialect(db)?
+  }
+
+  export tryAcquire(key: string, holder: string, nowNs: int, expiresAt: int): bool! {
+    let won = false
+    match (this.dialect) {
+      Postgres => won = acquirePg(this.db, key, holder, nowNs, expiresAt)?
+      MySql => won = acquireMy(this.db, key, holder, nowNs, expiresAt)?
+    }
+    if (won) {
+      this.prune(key)?
+    }
+    return won
+  }
+
+  export lastTick(key: string): int! {
+    let rows = this.db.query(this.lastTickSql(), [Value.Text(key + "@")])?
+    let has = rows.next()?
+    if (!has) {
+      rows.close()
+      return 0
+    }
+    let tick = asInt(rows.value(0))?
+    rows.close()
+    return tick
+  }
+
+  export window(): int {
+    return this.keep
+  }
+
+  // The database's clock in nanoseconds since the epoch. PostgreSQL:
+  // `clock_timestamp()`, not `now()`, which it documents as the START of the
+  // current transaction (https://www.postgresql.org/docs/current/functions-datetime.html,
+  // section 9.9.5, "Current Date/Time"). MySQL: `UTC_TIMESTAMP(6)` differenced
+  // against the epoch, with no `UNIX_TIMESTAMP` call, which would read the
+  // session time zone and be an hour off inside a daylight-saving overlap. The microseconds are read as an integer
+  // (`extract` returns `numeric` from PostgreSQL 14 and a double before, and a
+  // double holds 1.7e15 exactly but not 1.7e18) and scaled here.
+  export serverNowNs(): int! {
+    let sql = serverNowPostgres
+    if (this.dialect == Dialect.MySql) {
+      sql = serverNowMysql
+    }
+    let rows = this.db.query(sql, []Value(0))?
+    let has = rows.next()?
+    if (!has) {
+      rows.close()
+      fail newError("jobs: the database returned no clock reading")
+    }
+    let micros = asInt(rows.value(0))?
+    rows.close()
+    return micros * 1000
+  }
+
+  lastTickSql(): string {
+    if (this.dialect == Dialect.MySql) {
+      return lastTickMysql
+    }
+    return lastTickPostgres
+  }
+
+  // Drops every lease row of `key`'s schedule but the newest `keep` by
+  // arrival and the row of its newest tick.
+  prune(key: string): ()! {
+    let at = lastIndexOf(key, "@")
+    if (at < 0) {
+      return
+    }
+    let sql = prunePostgres
+    if (this.dialect == Dialect.MySql) {
+      sql = pruneMysql
+    }
+    this.db.exec(sql, [Value.Text(key[0:at + 1]), Value.Int(this.keep)])?
+  }
+}
+
+fn acquirePg(db: Pool, key: string, holder: string, nowNs: int, expiresAt: int): bool! {
+  let rows = db.query(
+    acquirePostgres,
+    [Value.Text(key), Value.Text(holder), Value.Int(expiresAt), Value.Int(nowNs)],
+  )?
+  let won = rows.next()?
+  rows.close()
+  return won
+}
+
+fn acquireMy(db: Pool, key: string, holder: string, nowNs: int, expiresAt: int): bool! {
+  return txValueAt<bool>(db, Isolation.ReadCommitted, (t) => {
+    t.exec(releaseMysql, [Value.Text(key), Value.Text(holder), Value.Int(nowNs)])?
+    t.exec(insertMysql, [Value.Text(key), Value.Text(holder), Value.Int(expiresAt)])?
+    let rows = t.query(holderMysql, [Value.Text(key)])?
+    let has = rows.next()?
+    if (!has) {
+      rows.close()
+      return false
+    }
+    let current = asText(rows.value(0))?
+    rows.close()
+    return current == holder
+  })?
+}
