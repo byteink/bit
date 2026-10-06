@@ -175,8 +175,10 @@ fn main(): ()! {
 }
 ```
 
-If you skip the load, the script's future fails with `RedisError.NoScript`
-when you call `get()`; nothing else in the batch is affected.
+If you skip the load, `exec()` fails with `RedisError.NoScript`, the first
+server error of the batch. The pipeline still reads every reply it asked for,
+so the connection goes back to the pool clean, but no future is filled: load
+the script and queue the batch again.
 
 ## Scripts that only read
 
