@@ -948,7 +948,9 @@ fn main() {
   method may still be named `static`. Writing `static fn name(...)` (this
   form's original, retired spelling) is rejected with `E0172` and a hint to
   drop `fn`; the class form takes no `fn`, exactly like an in-body instance
-  method (§10.4) and an interface's static requirement below.
+  method (§10.4) and an interface's static requirement below. An enum body
+  declares a static the same way (§14.7), and there `static` is not usable as
+  a variant name (**E0191**).
 - `this` is not bound inside a static method's body; referencing it is
   `E0040` ("undefined name"), the same diagnostic a top-level function's
   body gets for the same reason.
@@ -1984,7 +1986,7 @@ method_sig     = IDENT signature .
 field_sig      = IDENT ":" type .                        (* §14.3 *)
 static_method_sig = "static" IDENT signature .           (* §10.4.1 *)
 enum_decl      = "enum" IDENT [ generic_params ] "{" [ enum_member { ( ";" | "," ) enum_member } [ ";" | "," ] ] "}" .
-enum_member    = enum_variant | method_decl .            (* method_decl, §10.4 *)
+enum_member    = enum_variant | method_decl | static_method_decl .  (* §10.4, §10.4.1 *)
 enum_variant   = IDENT [ "(" type { "," type } ")" ] .   (* optional payload; §14.7 *)
 ```
 
@@ -5107,6 +5109,20 @@ enum Ticket {
   an enum with the right methods satisfies an interface exactly as a class
   does - a value of that enum type is then storable wherever the interface
   is expected, dispatched dynamically like any other interface value.
+- An enum body may also declare **static methods** (`enum_member`'s
+  `static_method_decl` alternative, §10.4.1), with the semantics a class's
+  static has: `static name(...)` has no `this`, is called through the enum's
+  name (`E.name(...)`), has its declared result type, and may call the enum's
+  other statics and the instance methods of any value it builds. A static is not
+  a variant: it adds no case to a `match` (§13.8), whose exhaustiveness is over
+  the variants alone. `static` introduces the member, so a variant cannot be
+  named `static` (**E0191**, whether bare or with a payload). On a generic enum
+  the static is called through an instantiation (`Option<i64>.of(1)`) or the bare
+  name, which infers the type parameters from the arguments exactly as for a
+  generic class (§10.4.1, §15.3; **E0068** when a parameter the method depends
+  on is bound by no argument); a static mentioning none of them needs nothing. A static
+  reached through a namespace import of its enum is refused like a variant
+  there (**E0070**): import the enum by name.
 - Every enum whose variants all carry no payload (a **C-like** enum, §14.6)
   that is not generic and has at least one variant has three compiler-synthesized
   members, so a program can turn a value into its variant name, list the
@@ -7002,7 +7018,7 @@ use_stmt      = "use" IDENT { "," IDENT } .
 trait_method  = [ "export" ] IDENT [ generic_params ] signature [ block ] .
 trait_field   = [ "export" ] IDENT ":" type .
 enum_decl     = "enum" IDENT [ generic_params ] "{" [ enum_member { fsep enum_member } [ fsep ] ] "}" .
-enum_member   = enum_variant | method_decl .
+enum_member   = enum_variant | method_decl | static_method_decl .
 enum_variant  = IDENT [ "(" type { "," type } ")" ] .
 
 generic_params= "<" generic_param { "," generic_param } ">" .

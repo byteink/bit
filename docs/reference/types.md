@@ -189,6 +189,98 @@ A few edges:
   number of variants. Call `__variants()` once and keep the slice when you
   need it in a loop.
 
+## Static methods on an enum {#enum-statics}
+
+A `Status` read back from a form field or a config file arrives as text, and
+the code that turns the text into a `Status` belongs with the enum, not in a
+free function that has to be found. A `static` method in the enum body is that
+function: it belongs to the enum, has no `this`, and is called through the
+enum's own name, exactly like a class's static method
+([Static Methods](static-methods.md)).
+
+```bit
+enum Status {
+  Draft
+  Published
+  Archived
+
+  static parse(text: string): Status {
+    if (text == "published") {
+      return Status.Published
+    }
+    if (text == "archived") {
+      return Status.Archived
+    }
+    return Status.fallback()
+  }
+
+  static fallback(): Status {
+    return Status.Draft
+  }
+
+  label(): string {
+    return match (this) {
+      Draft => "draft"
+      Published => "published"
+      Archived => "archived"
+    }
+  }
+}
+
+fn main() {
+  println(Status.parse("published").label()) // published
+  println(Status.parse("oops").label())      // draft
+}
+```
+
+`Status.parse` has the result type it declares (`Status`); a static is not a
+variant, so the `match` in `label` is exhaustive with three arms and needs none
+for `parse` or `fallback`. A static may call the enum's other statics, and
+instance methods on any value it builds. `export static` makes it visible
+outside the module, as for a class.
+
+A generic enum's static is written through an instantiation or, when its
+arguments bind the type parameters, through the bare name:
+
+```bit
+enum Lookup<T> {
+  Missing
+  Found(T)
+
+  static just(v: T): Lookup<T> {
+    return Lookup<T>.Found(v)
+  }
+
+  static none(): Lookup<T> {
+    return Lookup<T>.Missing
+  }
+
+  static arity(): int {
+    return 1
+  }
+
+  isFound(): bool {
+    return match (this) {
+      Missing => false
+      Found(v) => true
+    }
+  }
+}
+
+fn main() {
+  let a = Lookup.just(3)                   // T = int, from the argument
+  let b = Lookup<string>.none()            // T written, nothing to infer it from
+  println("${Lookup.arity()}")             // mentions no T: the bare name is enough
+  println("${a.isFound()} ${b.isFound()}") // true false
+}
+```
+
+`Lookup.none()` alone is **E0068**: no argument binds `T`, so the error names the
+parameter and the written form.
+
+`static` introduces a static method here, so a variant cannot be named `static`
+(**E0191**). A method named `static` in the body is still allowed.
+
 ## Next
 
 A `map<string, string>` can only hold a title per id. [Classes](classes.md)
