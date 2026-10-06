@@ -660,6 +660,31 @@ noise is exactly why they need the 1.5x slack in the first place - so a
 two-sided band is not sound for either, and re-recording those two stays a
 written convention rather than something the gate checks for you.
 
+### Live database gates without local Docker
+
+The live gates (`test-package-orm-live`, `-redis-live`, `-jobs-live`,
+`-mail-live`, `-s3-live`, the book-ink and web-guides harnesses) start their
+servers as throwaway containers through `_tests_/bit/dockerlive`. When the
+local Docker daemon is down or too slow, point them at an ssh host with
+Docker:
+
+```text
+BIT_LIVE_DOCKER_HOST=<ssh host> ./make test-package-orm-live
+```
+
+The host must accept key-based ssh without a prompt (`BatchMode`) and have a
+working `docker` for that user. With the variable set, every docker call runs
+as `ssh -n <host> docker ...`, the host's `/tmp/benchlock` directory lock is
+held from the first `docker run` until the harness cleans up (a gate waits up
+to 30 minutes for another holder), each published port gets an `ssh -N -L`
+tunnel that the harness waits on until `127.0.0.1:<port>` accepts, and a
+`-v dir:target` bind mount is copied to the host first. The URIs the harness
+hands the tests point at the local tunnel ports. Cleanup removes the
+containers, kills the tunnels, deletes the copied directories and releases the
+lock on success and on failure. A `SIGKILL` of the harness skips it: remove a
+leftover `/tmp/benchlock` on the host by hand once nothing of yours is
+running. Unset, nothing changes and the gates use the local daemon.
+
 ### Race detection
 
 Decided: whether an optional deeper race-detection gate - the
