@@ -4866,8 +4866,10 @@ x^128+x^7+x^2+x+1, #7385). Every exported function first calls
 `bit_rt_crypto_hwcaps()`) before issuing PMULL or PCLMULQDQ, for the same
 "optional extension, SIGILL otherwise" reason §21d documents for AES.
 
-**NO CALLER YET**, same as §21d — these pins exist for later work to wire
-`stdlib/crypto/gcm.bit` through.
+On arm64 the fold is one PMULL/PMULL2 asm loop (#7403): twisted H and its
+powers H^2..H^4 are computed once per call, four blocks share one reduction,
+and one asm call folds at most 4096 blocks so the Bit loop reaches a
+safepoint. `stdlib/crypto/gcm.bit` calls both pins when `AesGcm.pmull` is set.
 
 **The algorithm.** PMULL always treats a 64-bit register as LSB-first (bit 0
 = coefficient of x^0); GHASH's own bit order (SP 800-38D §6.3) is MSB-first
