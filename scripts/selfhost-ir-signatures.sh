@@ -215,8 +215,9 @@
 # Their derivations (`canonK`/`shiftOk`/`moveTramp`,
 # `explainTestFunctions`, `nilWalk`, `rangeWalk`/`explainSwitchPostOpt`,
 # `byteRange`, `explainDiagsPresyntax`, `explainTableSynthTypes`, `licmWalk`)
-# are preserved in git history at this file's state before #7164, and
-# scripts/ir-signatures-walk.sh, which held the walks, is deleted.
+# are preserved in git history at this file's state before #7164, and the
+# scripts/ir-signatures-walk.sh that held the walks was deleted then (the name
+# is reused by #7449 below for the 0.39.0 walks).
 #
 # Declared (#7451) against the 0.39.0 oracle; retires at the next repin. Four
 # signatures, all in the `diags` and `fmt` kinds, each the oracle failing on
@@ -248,6 +249,58 @@
 # A new entry must satisfy the rules in the header: an exact identity, derived
 # from FULL dumps (the oracle's from `sh scripts/stage0.sh`, the tree's from
 # `bit-out/bin/bit`), never an excerpt.
+
+#
+# Declared (#7449) against the 0.39.0 oracle; retires at the next repin. Seven
+# signatures in the `ir`, `iropt` and `types` kinds. diffir, diffiropt and
+# difftypes were red on 15 corpus files (MATCH=1116 MISMATCH=15, difftypes 2);
+# in every one the tree is correct and the oracle is the older compiler. Each
+# file was built with the tree and run to its `.expected` before it was declared.
+# The identity is exact over the FULL dumps: constants are erased, the oracle's
+# functions get the named rewrite, ids are renumbered, and every function must
+# then agree byte for byte (see ir-signatures-walk.sh), so a second,
+# unrelated difference on an explained file still fails.
+#
+#   7408-assert-ok-nil-compare (`ir`, `iropt`). #7408 takes the ok of a type
+#     assertion as `v != nil`; the oracle calls `rt_call iface_as_ok()` straight
+#     after `iface_as`, `iface_as_enum` or the interface test. Rewrite: that call
+#     becomes `icmp_ne bool <the assertion result>, nil`. Files: run_type_assert,
+#     run_chan_close_zero_object, run_generic_type_assert,
+#     run_map_commaok_present_null, panic_enum_type_assert_boxed,
+#     examples/interfaces/interfaces.bit, stdlib/http/requesterror.bit.
+#   7406-iface-implements-call (`ir`, `iropt`). #7406 replaces the per-method
+#     `rt_call iface_has` chain of an interface assertion by one
+#     `iface_implements(recv, "id,id")` with the ids as a pooled string. Rewrite:
+#     a chain whose links each feed only the next becomes the const_string and
+#     that call. Files: panic_iface_assert_iface, run_iface_assert_iface,
+#     run_field_attr_all, run_type_assert_ok_nil (these also carry 7408).
+#   7377-append-spread-bulk-move (`ir`, `iropt`). #7377 lowers
+#     `append(dst, ...src)` to one `rt_call slice_append_slice(dst, src, is_ref,
+#     elem_size)`; the oracle emits a header, a body holding exactly one
+#     `slice_append` and an exit block. Rewrite: the loop (index from 0, stepping
+#     by 1, every other value passed through) becomes that call and the exit
+#     block continues the entry block. Files: run_append_spread,
+#     decimal_collections.
+#   7387-self-result-oracle-omits-function (`ir`, `iropt`). #7387 lowers an
+#     interface method whose result is `Self`; the oracle never lowered the
+#     function that calls one. Identity: the oracle lacks only functions the
+#     tree has, each holding a `call_iface` whose result type is its receiver
+#     type, and the rest agree. File: run_iface_self_result.
+#   7383-arrow-oracle-leaks-type-param (`ir`, `iropt`). #7383 types an untyped
+#     arrow parameter from a generic method; the oracle leaves `<T>` and
+#     `<invalid>` in a closure header and never lowered `main`. Identity: the
+#     leaky oracle closures and every tree function the oracle lacks (all `main`
+#     or `closure$N`) are dropped and the rest agree. In `iropt` only the function
+#     headers are compared: the oracle has no `main`, so whole-program
+#     specialization of the callees (closure inlining) legitimately differs there,
+#     and the bodies are proven by the `ir` row. File: arrow_generic_method_recv.
+#   7387-self-result-types, 7383-arrow-param-types (`types`): the same two
+#     changes in `--dump-types`; see explainLagTypes (ir-signatures-walk.sh).
+#     Files: run_iface_self_result and arrow_generic_method_recv.
+#
+# shellcheck source=scripts/ir-signatures-walk.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-walk.sh"
+irWalkAwk
 
 # explainDiagsLag <oracle_diags> <tree_diags> <input_file> -- the three `diags`
 # signatures declared against the 0.39.0 oracle. Prints the name and returns 0
@@ -366,6 +419,13 @@ explainFmtJsxApostrophe() {
   ' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
 }
 
+# explainIrLag <oracle_ir> <tree_ir> <ir|iropt> -- the five `ir`/`iropt` signatures above,
+# via IR_WALK_AWK (ir-signatures-walk.sh). Prints the name and returns 0, or prints nothing
+# and returns 1.
+explainIrLag() {
+  LC_ALL=C awk -v kind="$3" "${IR_WALK_AWK}" <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
+}
+
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. `file` is the
@@ -374,6 +434,8 @@ explainMismatch() {
   case "$3" in
     diags) explainDiagsLag "$1" "$2" "${4:-}"; return ;;
     fmt) explainFmtJsxApostrophe "$1" "$2"; return ;;
+    types) explainLagTypes "$1" "$2"; return ;;
+    ir|iropt) explainIrLag "$1" "$2" "$3"; return ;;
   esac
   return 1
 }
@@ -389,10 +451,14 @@ explainMismatch() {
 declaredSignatureNames() {
   local diags="6403-enum-static-method-presyntax 7035-keyword-member-name-presyntax 6421-ternary-jsx-hash-oracle-panic"
   local fmt="7380-jsx-text-apostrophe-stray-semicolon"
+  local types="7387-self-result-types 7383-arrow-param-types"
+  local ir="7408-assert-ok-nil-compare 7406-iface-implements-call 7377-append-spread-bulk-move 7387-self-result-oracle-omits-function 7383-arrow-oracle-leaks-type-param"
   case "${1:-}" in
     diags) printf '%s\n' $diags ;;
     fmt) printf '%s\n' $fmt ;;
-    "") printf '%s\n' $diags $fmt ;;
+    types) printf '%s\n' $types ;;
+    ir|iropt) printf '%s\n' $ir ;;
+    "") printf '%s\n' $diags $fmt $types $ir ;;
   esac
   return 0
 }
