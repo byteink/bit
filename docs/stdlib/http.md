@@ -771,9 +771,19 @@ connections.
 
 As the package-level `post`, using this client's configuration.
 
-### `Client.request(method: string, url: string, body: string): Response!`
+### `Client.request(method: string, url: string, body: Body, timeoutMs: int = 0): Response!`
 
-As the package-level `request`, using this client's configuration.
+As the package-level `request`, using this client's configuration, with the
+body typed: `Body.Text(s)` for a string, `Body.Bytes(b)` for bytes sent as
+they are. A `timeoutMs` above 0 bounds the whole request as
+`Client.requestTimeout` does.
+
+### `Body`
+
+A request body for `Client.request`: `Text(string)`, or `Bytes([]byte)`,
+which is never copied, so a large upload such as a `FormBody.body` costs no
+memory beyond itself. The slice is the caller's: it must not change until
+the request returns.
 
 ### `Client.requestWith(method: string, url: string, headers: []Header, body: string): Response!`
 
@@ -791,13 +801,6 @@ As `Client.post`, bounded by one deadline.
 ### `Client.requestTimeout(method: string, url: string, body: string, timeoutMs: int): Response!`
 
 As `Client.request`, bounded by one deadline.
-
-### `Client.requestBytes(method: string, url: string, body: []byte, timeoutMs: int = 0): Response!`
-
-As `Client.requestTimeout`, or `Client.request` when `timeoutMs` is 0, with a
-`[]byte` body sent as it is: no copy is made, so a large upload such as a
-`FormBody.body` costs no memory beyond itself. `body` must not change until
-the call returns.
 
 ### `ClientRequest`
 
@@ -1386,10 +1389,10 @@ copied into it, not concatenated. Fails when nothing was added.
 
 What `build` returns: `contentType`, the value of the request's
 `Content-Type` header with the boundary in it, and `body`, a `[]byte` that
-`Client.requestBytes` sends as it is.
+`Client.request` sends as it is in a `Body.Bytes`.
 
 ```bit
-import { Client, FormBuilder, Response, Form, parseMultipart, defaultLimits } from "std/http"
+import { Body, Client, FormBuilder, Response, Form, parseMultipart, defaultLimits } from "std/http"
 import { indexOf } from "std/strings"
 
 fn upload(url: string, avatar: []byte): Response! {
@@ -1399,7 +1402,7 @@ fn upload(url: string, avatar: []byte): Response! {
   let out = form.build()?
   let c = Client()
   c.setHeader("Content-Type", out.contentType)?
-  return c.requestBytes("POST", url, out.body)?
+  return c.request("POST", url, Body.Bytes(out.body))?
 }
 
 // The server's side of the same body: `boundary=` is the last part of
