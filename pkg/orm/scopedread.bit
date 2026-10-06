@@ -1,0 +1,136 @@
+// pkg/orm/scopedread.bit — the read chain of `ScopedRepo<T>` (#7036, epic
+// #6984, design D6): "reads filter (rules become SQL), a row you cannot read
+// is 404". The methods are declared on the class (`pkg/orm/scoped.bit`), each
+// a one-line call into here, the same "keep the class, move the body" shape
+// `pkg/orm/reposql.bit` uses for `Repo<T>`.
+//
+// Every terminal call asks `guard.filter(actor, GuardOp.Read, table, dialect,
+// firstParam)` once and appends the answer to the inner repository's own
+// conditions, so the cost over a plain `Repo<T>` is one filter call and one
+// clause append per terminal call, never work per row.
+//
+//   - `firstParam` is `len(inner.args) + 1`, so the fragment's `$n` continues
+//     the numbering `where`/`after` already used; its arguments are appended
+//     in order, after theirs.
+//   - `All` adds nothing; `None` returns an empty result without running SQL
+//     (`find` fails with the guard's `notFound`); a filter error is returned
+//     as is, never turned into an unfiltered read (fail closed).
+//   - The fragment is wrapped in parentheses and ANDed with the chain's own
+//     clauses and with the soft-delete clause (`repoWhereSql`,
+//     `pkg/orm/reposql.bit`), so an `or` inside a rule cannot widen them.
+//   - A guard that does not `protects` the table is not asked; a `ScopedRepo`
+//     with no guard at all reads like a plain `Repo<T>`.
+//
+// The fragment keeps the `$n` spelling on every server: the MySQL adapter
+// rewrites `$n` to `?` for the whole statement (`pkg/mysql/rewrite.bit`), and
+// it counts parameters from the `$n` it finds, so a guard that writes a bare
+// `?` for MySQL makes that statement fail with the adapter's parameter-count
+// error rather than run unfiltered.
+
+// The actor a guest is checked as: no id, but still an actor (design D10).
+class guestActor {
+  id: string,
+}
+
+fn scopedActor<T: Tabled>(self: ScopedRepo<T>): Actor {
+  match (self.actor) {
+    Some(a) => return a
+    None => return guestActor{ id = "" }
+  }
+}
+
+// A copy of `self` over `inner`, the one place a chain method rebuilds a
+// `ScopedRepo` so none of them can drop the guard, the actor or the tenant.
+fn scopedWith<T: Tabled>(self: ScopedRepo<T>, inner: Repo<T>): ScopedRepo<T> {
+  return ScopedRepo<T>{
+    inner = inner,
+    guard = self.guard,
+    actor = self.actor,
+    tenant = self.tenant,
+  }
+}
+
+// `inner` with the guard's read filter appended, or `None` when the guard
+// says the actor may read no row.
+fn scopedNarrow<T: Tabled>(self: ScopedRepo<T>): Option<Repo<T>>! {
+  self.inner.checkErr()?
+  match (self.guard) {
+    Some(g) => return narrowWith<T>(self, g)?
+    None => return Option<Repo<T>>.Some(self.inner)
+  }
+}
+
+fn narrowWith<T: Tabled>(self: ScopedRepo<T>, g: Guard): Option<Repo<T>>! {
+  if (!g.protects(T.__tableName())) {
+    return Option<Repo<T>>.Some(self.inner)
+  }
+  let first = len(self.inner.args) + 1
+  let f = g.filter(scopedActor<T>(self), GuardOp.Read, T.__tableName(), self.inner.dialect, first)?
+  match (f) {
+    All => return Option<Repo<T>>.Some(self.inner)
+    None => return Option<Repo<T>>.None
+    Sql(fragment, args) => return Option<Repo<T>>.Some(withFragment<T>(self.inner, fragment, args))
+  }
+}
+
+fn withFragment<T: Tabled>(inner: Repo<T>, fragment: string, args: []Value): Repo<T> {
+  let r = inner.next()
+  for a of args {
+    r.args = append(r.args, a)
+  }
+  r.wheres = append(r.wheres, "(${fragment})")
+  return r
+}
+
+fn scopedAll<T: Tabled>(self: ScopedRepo<T>): []T! {
+  match (scopedNarrow<T>(self)?) {
+    Some(r) => return r.all()?
+    None => return []T(0)
+  }
+}
+
+fn scopedFirst<T: Tabled>(self: ScopedRepo<T>): Option<T>! {
+  match (scopedNarrow<T>(self)?) {
+    Some(r) => return r.first()?
+    None => return Option<T>.None
+  }
+}
+
+fn scopedCount<T: Tabled>(self: ScopedRepo<T>): int! {
+  match (scopedNarrow<T>(self)?) {
+    Some(r) => return r.count()?
+    None => return 0
+  }
+}
+
+fn scopedFind<T: Tabled>(self: ScopedRepo<T>, id: Value): T! {
+  match (self.guard) {
+    Some(g) => return findGuarded<T>(self, g, id)?
+    None => return self.inner.find(id)?
+  }
+}
+
+// `where(pk, id)` + the guard's filter + `limit 2`. A row the actor may not
+// read and a row that does not exist both end in `g.notFound(table)`, so the
+// answer never says which. The chain's own `where` clauses narrow the lookup
+// further and are never dropped.
+fn findGuarded<T: Tabled>(self: ScopedRepo<T>, g: Guard, id: Value): T! {
+  self.inner.checkErr()?
+  self.inner.singleKeyColumn()?
+  let field = keyFields(self.inner.desc())[0].name
+  let byId = scopedWith<T>(self, self.inner.where(field, id))
+  match (scopedNarrow<T>(byId)?) {
+    Some(r) => return oneVisible<T>(r.limit(2).all()?, g)?
+    None => fail g.notFound(T.__tableName())
+  }
+}
+
+fn oneVisible<T: Tabled>(rows: []T, g: Guard): T! {
+  if (len(rows) == 0) {
+    fail g.notFound(T.__tableName())
+  }
+  if (len(rows) > 1) {
+    fail newError("orm: more than one row in '${T.__tableName()}' matches the given id")
+  }
+  return rows[0]
+}

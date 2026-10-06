@@ -161,5 +161,67 @@ fn forgotToScope(db: Db): ()! {
   a client error. Tables the guard does not protect, and a `Db` opened with
   no guard, are unchanged.
 
+## Reading through a ScopedRepo
+
+A `ScopedRepo<T>` has the same read chain as `Repo<T>`: `where`, `orderBy`,
+`limit`, `offset`, `after`, `withDeleted`, and the terminal calls `all`,
+`first`, `count` and `find`, with the same names and the same arguments. There
+is no second API to learn. What changes is that each terminal call first asks
+the guard `filter(actor, GuardOp.Read, table, dialect, firstParam)` and adds
+the answer to the statement:
+
+```bit
+import { Dir, ScopedRepo } from "orm"
+
+// SELECT * FROM draft WHERE body = $1 AND (author_id = $2)
+// ORDER BY id DESC LIMIT 10 OFFSET 20
+fn page(mine: ScopedRepo<Draft>): []Draft! {
+  return mine.where("body", "outline").orderBy("id", Dir.Desc).limit(10).offset(20).all()?
+}
+
+fn nextPage(mine: ScopedRepo<Draft>, lastId: i64): []Draft! {
+  return mine.orderBy("id").after(lastId).limit(10).all()?
+}
+
+fn oldestDraft(mine: ScopedRepo<Draft>): Option<Draft>! {
+  return mine.orderBy("id").first()?
+}
+
+fn howMany(mine: ScopedRepo<Draft>): int! {
+  return mine.count()?
+}
+
+fn trashAndAll(mine: ScopedRepo<Draft>): []Draft! {
+  return mine.withDeleted().all()?
+}
+
+fn openDraft(mine: ScopedRepo<Draft>, id: i64): Draft! {
+  return mine.find(id)?
+}
+```
+
+- `firstParam` is the number after the last placeholder the chain already
+  used (`len(args) + 1`), so a fragment numbered from it slots in after
+  `where` and `after`. The fragment goes in parentheses and is ANDed with the
+  chain's own conditions and with the soft-delete condition, so an `or` inside
+  a rule cannot widen them.
+- Write the fragment with `$n` placeholders on MySQL as well. The MySQL
+  adapter turns every `$n` of the statement into `?`, and it counts
+  parameters from the `$n` it finds; a bare `?` makes the statement fail
+  with a parameter-count error, never run unfiltered.
+- `GuardFilter.All` adds nothing. `GuardFilter.None` answers without running
+  any SQL: `all` returns `[]`, `first` returns `None`, `count` returns `0`.
+- A guard error (a rule it cannot turn into SQL, a store it cannot read) is
+  returned as it is. A read is never run unfiltered because the filter
+  failed.
+- A table the guard does not `protects` is not filtered, and a guest is asked
+  with an actor whose `id` is empty.
+
+`find(id)` is `where(key, id)` plus the filter plus `limit 2`. When no row
+comes back, it fails with the guard's `notFound(table)`. A row the actor may
+not read and a row that does not exist give the same answer, so the error
+never tells a caller that a draft exists. Make `notFound` a 404 and never a
+403; `denied` is for writes.
+
 Where to go next: [Querying](query.md) for the chain a guard narrows, and
 [Raw SQL and transactions](raw.md) for the handles that carry it.
