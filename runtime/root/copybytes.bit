@@ -1,39 +1,65 @@
-// `copyBytes`'s path for ends that are not both 8-aligned (#7446). Sibling
-// file, same module: see root.bit's `copyBytes` for the contract and the
-// "Bit has no unaligned word load" constraint this file works within.
+// `copyBytes` (root.bit): `n` bytes from `src` to `dst`, ascending, bounded by
+// `n`. Nothing is read or written past `n`, so a string ending exactly on a
+// page boundary cannot fault.
 //
-// THE COST IT REMOVES. A TLS record's fragment sits 5 bytes into its record,
-// so sealing one and serving its plaintext are each a 16 KiB copy with ends
-// at different alignments. Bytewise, that was about as costly on x86-64 as
-// the whole AES-GCM pass over the same record.
+// ALIGNMENT IS TESTED, NEVER ASSUMED (#4350): `wordAt` MASKS its argument to
+// an 8-byte boundary (`../gc/mem.bit`), and Bit has no unaligned word load at
+// all — `*i64` arithmetic scales by 8 and there is no pointer-to-pointer
+// conversion (SPEC §11.4). Either end can sit at an odd offset: a string VIEW
+// (`allocStringView`), or a slice view appended into in place.
 //
-// THE SHAPE. Peel bytes until `dst` is 8-aligned. If `src` is then aligned
-// too, move whole words. Otherwise build each destination word from two
-// ALIGNED source words: the high `8 - r` bytes of one and the low `r` bytes
-// of the next, `r = src & 7`, little-endian on both targets. Every load is an
-// aligned word that holds at least one byte of the source, so no load crosses
-// a page boundary that the bytes being copied do not already touch. Peeled
-// tail bytes finish the copy.
+// THE PATHS, in `copyBytes`'s order. (1) x86-64 only: one `rep movsb` at
+// `repMovsbMin` bytes, or at two words when the ends are not both aligned.
+// (2) Ends not both aligned: a bytewise prefix. When the shifted word path
+// applies (arm64, at least two words, `copyBytesWantsShifted`) it stops at
+// `dst`'s next word boundary; otherwise it is the whole copy. Past the prefix,
+// if `src` sits at another offset `r`, each destination word is built from two
+// ALIGNED source words, the high `8 - r` bytes of one and the low `r` bytes of
+// the next, little-endian on both targets. Every load is an aligned word that
+// holds at least one byte of the source, so no load crosses a page the copied
+// bytes do not touch. (3) Whole words when both ends are now aligned: from the
+// start, or past a prefix that aligned both. Past the shifted words fewer than
+// eight bytes remain, so this step moves none there. The pointers are walked
+// forward, paying the mask once at the head, the shape `zeroBytes` uses
+// (`../gc/gcalloc.bit`, #4045). (4) The tail, one byte at a time.
 //
-// OVERLAP. Taken only when the regions are disjoint or `dst <= src`. For
-// `dst <= src` the aligned destination word written in step k never lies
-// above the aligned source word read in step k, so no source byte is
-// overwritten before it is read: the result is the bytewise loop's result.
+// WHY THE MISALIGNED PATHS EXIST (#7446). A TLS record's fragment sits 5 bytes
+// into its record, so sealing one and serving its plaintext are each a 16 KiB
+// copy with ends at different alignments. Bytewise, that was about as costly
+// on x86-64 as the whole AES-GCM pass over the same record.
+//
+// OVERLAP. The shifted words are taken only when the regions are disjoint or
+// `dst <= src`. For `dst <= src` the aligned destination word written in step
+// k never lies above the aligned source word read in step k, so no source byte
+// is overwritten before it is read: the result is the bytewise loop's. Whole
+// words with both ends at one offset give the bytewise result for every
+// overlap, and so does `rep movsb`, which is defined as the ascending byte
+// loop.
+//
+// NO CALL, NO FRAME ON ARM64 (#7459). Every helper here is a small leaf the
+// inliner splices, and every loop is written in `copyBytes` itself: a helper
+// holding a loop stays a call, and one call left in the body gives every copy,
+// the 3-byte ones included, a frame and its saves. The order of the steps is
+// also what fits the shifted loop in the caller-saved registers: one path
+// joins around it (the aligned one), and its count is masked to zero rather
+// than branched around when `r == 0`.
 
 import { onX64 } from "../syscalls"
 
-// ON X86-64 A LONG COPY IS ONE `rep movsb`. With ERMSB/FSRM the string unit
-// moves a cache line per step at any alignment of either end, where the word
-// loops in `copyBytes` move eight bytes; below `repMovsbMin` its startup costs
-// more than it saves. `rep movsb` is defined as the ascending byte loop, so its
-// result is the byte loop's for every overlap `copyBytes` admits. DF is clear
-// at every call boundary on both x86-64 ABIs. `onX64()` folds to the target,
-// so arm64 keeps the word loops and never reaches the trap.
+// ON X86-64 A LONG OR MISALIGNED COPY IS ONE `rep movsb`. With ERMSB/FSRM
+// the string unit moves a cache line per step at any alignment of either end,
+// where the aligned word loop in `copyBytes` moves eight bytes; below
+// `repMovsbMin` its startup costs more than that loop saves. A misaligned copy
+// takes it from two words up: the shifted loop it would otherwise need does
+// not fit x86-64's caller-saved registers once a variable shift claims rcx, so
+// keeping it would give every copy a frame. DF is clear at every call boundary
+// on both x86-64 ABIs.
 const repMovsbMin: int = 512
 
-// Whether `copyBytes(dst, src, n)` takes `copyBytesRepMovsb`.
-@nosplit fn copyBytesWantsRepMovsb(n: int): bool {
-  return n >= repMovsbMin && onX64()
+// Whether `copyBytes(dst, src, n)` is one `rep movsb`. `onX64()` comes first
+// so that the whole test folds to false on arm64, taking the trap with it.
+@nosplit fn copyBytesWantsRepMovsb(dst: int, src: int, n: int): bool {
+  return onX64() && (n >= repMovsbMin || (n >= 16 && ((dst | src) & 7) != 0))
 }
 
 // `rep movsb`: `n` bytes from `src` to `dst`, ascending. Encoding checked
@@ -51,56 +77,12 @@ const repMovsbMin: int = 512
   }
 }
 
-// Whether `copyBytes(dst, src, n)` takes `copyBytesUnaligned`: at least two
-// words to move, an end off alignment, and an overlap the upward walk
-// already handles.
-@nosplit fn copyBytesWantsUnaligned(dst: int, src: int, n: int): bool {
-  if (n < 16 || ((dst | src) & 7) == 0) {
-    return false
-  }
-  return dst <= src || dst >= src + n
-}
-
-// Copies `n` (>= 16) bytes from `src` to `dst` as the header describes.
-@nosplit fn copyBytesUnaligned(dst: int, src: int, n: int) {
-  let head = (8 - (dst & 7)) & 7
-  let i = 0
-  while (i < head) {
-    storeByte(dst + i, loadByte(src + i))
-    i = i + 1
-  }
-  let words = (n - head) >> 3
-  copyWordsShifted(dst + head, src + head, words)
-  i = head + words * 8
-  while (i < n) {
-    storeByte(dst + i, loadByte(src + i))
-    i = i + 1
-  }
-}
-
-// Moves `words` words to the 8-aligned `dst` from `src`, which may sit at
-// any offset `r` within its aligned word.
-@nosplit fn copyWordsShifted(dst: int, src: int, words: int) {
-  let d = wordAt(dst)
-  let e = d + words
-  let s = wordAt(src)
-  let r = src & 7
-  if (r == 0) {
-    while (d != e) {
-      *d = *s
-      d = d + 1
-      s = s + 1
-    }
-    return
-  }
-  let rs = u64(r * 8)
-  let ls = u64(64 - r * 8)
-  let lo = u64(*s)
-  while (d != e) {
-    s = s + 1
-    let hi = u64(*s)
-    *d = i64((lo >> rs) | (hi << ls))
-    lo = hi
-    d = d + 1
-  }
+// Whether `copyBytes`, its ends not both 8-aligned, moves the middle as
+// words: on arm64 only, at least two words to move, and `dst` not inside the
+// `n` bytes above `src`, the one overlap where the upward walk would read a
+// byte it already overwrote. That overlap test is one unsigned compare,
+// `dst - src` in `1 ..= n - 1`; Bit addresses never reach the sign bit.
+// `!onX64()` comes first so that the test folds to false on x86-64.
+@nosplit fn copyBytesWantsShifted(dst: int, src: int, n: int): bool {
+  return !onX64() && n >= 16 && u64(dst - src - 1) >= u64(n - 1)
 }
