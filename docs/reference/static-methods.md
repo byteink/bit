@@ -93,6 +93,9 @@ fn take(j: Job) { // error[E0170]: 'Job' declares a static requirement and
                   // generic bound ('T: Job')
 ```
 
+An enum body takes `static` methods the same way, called through the enum's
+name (`Status.parse("draft")`): see [Static methods on an enum](types.md#enum-statics).
+
 ## When not to use a static method
 
 If the logic needs the instance's own data - `Draft.recordView()` reading and
