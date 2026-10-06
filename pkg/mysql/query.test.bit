@@ -457,3 +457,162 @@ test "decodeRow: 0xFB decodes to Value.Null regardless of the column's type" {
   }
   assert(s == "hi", "column 1 is not 'hi'")
 }
+
+// A server that answers COM_STMT_PREPARE with statement id 7 (no parameters, no
+// columns), COM_STMT_EXECUTE with `reply`, and COM_STMT_CLOSE with nothing —
+// the protocol sends none. It records every command as its first byte, then the
+// statement id for the two that carry one, so a test reads the exact order the
+// client sent them in (#7440).
+class stmtServer {
+  out: string
+  seq: int
+  sent: []string
+  executeReply: []string
+  readUp(n: int): string! {
+    let take = n
+    if (take > len(this.out)) {
+      take = len(this.out)
+    }
+    let head = this.out[0:take]
+    this.out = this.out[take:len(this.out)]
+    return head
+  }
+
+  writeAll(s: string): ()! {
+    let payload = s[4:len(s)]
+    let cmd = int([]byte(payload)[0])
+    this.seq = int([]byte(s)[3]) + 1
+    if (cmd == comStmtPrepare) {
+      this.sent = append(this.sent, "prepare")
+      // 0x00, statement id 7, 0 columns, 0 params, filler, 0 warnings.
+      this.reply(bytesOf([]int{ 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }))
+      return
+    }
+    let id = readLe(payload, 1, 4)?
+    if (cmd == comStmtExecute) {
+      this.sent = append(this.sent, "execute ${id}")
+      for p of this.executeReply {
+        this.reply(p)
+      }
+      return
+    }
+    if (cmd == comStmtClose) {
+      this.sent = append(this.sent, "close ${id}")
+      return
+    }
+    this.sent = append(this.sent, "other ${cmd}")
+  }
+
+  reply(payload: string) {
+    this.out = this.out + framePacket(payload, this.seq)
+    this.seq = this.seq + 1
+  }
+
+  shut() {}
+}
+
+fn stmtConn(s: stmtServer, limit: int): myConn {
+  return myConn{
+    w = myWire{ r = myReader{ s = s, buf = "" }, s = s, seq = 0 },
+    info = serverInfo{
+      family = "mysql", version = "8.4.0", versionMajor = 8, capabilities = 0, scramble = "",
+      plugin = "",
+    },
+    closed = false,
+    cache = newStmtCache(limit),
+    ansi = false,
+  }
+}
+
+fn stmtOkPacket(): string {
+  return bytesOf([]int{ 0, 0, 0, 2, 0, 0, 0 })
+}
+
+fn serverErrPacket(): string {
+  return bytesOf([]int{ 255, 38, 4, 35, 52, 50, 48, 48, 48 }) + "no"
+}
+
+fn stmtServerReplying(reply: []string): stmtServer {
+  return stmtServer{ out = "", seq = 0, sent = []string(0), executeReply = reply }
+}
+
+fn noMarkers(sqlText: string): rewritten {
+  return rewritten{ text = sqlText, order = []int(0) }
+}
+
+fn sentIs(s: stmtServer, want: []string): bool {
+  if (len(s.sent) != len(want)) {
+    return false
+  }
+  let i = 0
+  while (i < len(want)) {
+    if (s.sent[i] != want[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+test "an uncached exec closes its statement after the reply, by the prepared id" {
+  let s = stmtServerReplying([]string{ stmtOkPacket() })
+  let c = stmtConn(s, 0)
+  let res = execPrepared(c, noMarkers("update t set a = 1"), []Value(0)) catch e {
+    panic("execPrepared: ${e.message()}")
+  }
+  assert(res.affected == 0, "affected: ${res.affected}")
+  assert(sentIs(s, []string{ "prepare", "execute 7", "close 7" }), "sent: ${join(s.sent, " | ")}")
+}
+
+test "an uncached query closes its statement only after the last row packet" {
+  // One column (LONG "id"), one row (the int 5), then the closing EOF.
+  let def = bytesOf([]int{ 1, 100, 0, 0, 0, 2, 105, 100, 0 }) +
+    bytesOf([]int{ 12, 63, 0, 4, 0, 0, 0, 3, 32, 0, 0, 0, 0 })
+  let eof = bytesOf([]int{ 254, 0, 0, 0, 0 })
+  let s = stmtServerReplying(
+    []string{ bytesOf([]int{ 1 }), def, eof, bytesOf([]int{ 0, 0, 5, 0, 0, 0 }), eof },
+  )
+  let c = stmtConn(s, 0)
+  let res = execPrepared(c, noMarkers("select id from t"), []Value(0)) catch e {
+    panic("execPrepared: ${e.message()}")
+  }
+  assert(len(res.rows.rows) == 1, "rows: ${len(res.rows.rows)}")
+  assert(len(s.out) == 0, "${len(s.out)} reply bytes were left unread before the close")
+  assert(sentIs(s, []string{ "prepare", "execute 7", "close 7" }), "sent: ${join(s.sent, " | ")}")
+}
+
+test "a failed execute still closes the uncached statement" {
+  let s = stmtServerReplying([]string{ serverErrPacket() })
+  let c = stmtConn(s, 0)
+  let failed = false
+  execPrepared(c, noMarkers("update t set a = 1"), []Value(0)) catch _ {
+    failed = true
+  }
+  assert(failed, "the server's ERR packet was not reported")
+  assert(sentIs(s, []string{ "prepare", "execute 7", "close 7" }), "sent: ${join(s.sent, " | ")}")
+}
+
+test "an arity mismatch after the prepare closes the statement and never executes" {
+  // The server prepared 0 parameters for a statement the rewrite gave one `?`.
+  let s = stmtServerReplying([]string{ stmtOkPacket() })
+  let c = stmtConn(s, 0)
+  let failed = false
+  execPrepared(c, rewritten{ text = "select ?", order = []int{ 1 } }, []Value{ Value.Int(1) }) catch _ {
+    failed = true
+  }
+  assert(failed, "the arity mismatch was not reported")
+  assert(sentIs(s, []string{ "prepare", "close 7" }), "sent: ${join(s.sent, " | ")}")
+}
+
+test "a cached statement stays open and is reused without a second prepare" {
+  let s = stmtServerReplying([]string{ stmtOkPacket() })
+  let c = stmtConn(s, 4)
+  let i = 0
+  while (i < 2) {
+    execPrepared(c, noMarkers("update t set a = 1"), []Value(0)) catch e {
+      panic("execPrepared: ${e.message()}")
+    }
+    i = i + 1
+  }
+  assert(sentIs(s, []string{ "prepare", "execute 7", "execute 7" }), "sent: ${join(s.sent, " | ")}")
+}
