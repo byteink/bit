@@ -1,0 +1,139 @@
+// The parse half of Windows nameserver discovery (#7470): every IPv4 DNS server
+// configured on an adapter that is up, read out of a `GetAdaptersAddresses`
+// result (iphlpapi.dll). Same module as ./net.bit (`runtime/net/`), so
+// ./sock.bit's `getU8`/`getU32Le`/`getU64Le`/`bytesAt`/`netSockAddrOctets` are in
+// scope unchanged.
+//
+// WHY A PLATFORM-FREE FILE FOR A WINDOWS STRUCTURE. The call itself is an
+// `extern fn` in ../windows/dns.bit, which only a Windows build can compile, so
+// a parse written beside it could be tested nowhere but on the Windows box.
+// This is pure byte arithmetic over a list of 64-bit pointers: it takes the
+// address of the first `IP_ADAPTER_ADDRESSES` and reads memory, so
+// `_tests_/stress/netadapters` hands it a chain it built by hand and asserts the
+// exact list. The offsets are Windows x64/arm64's (iptypes.h), and the address
+// family byte is Windows' `ADDRESS_FAMILY` (a u16, AF_INET 2): nothing here
+// reads them off the host, so it parses the same on every target.
+//
+// The result is a packed list of four-byte addresses, in adapter order then in
+// each adapter's own server order, with a repeat dropped: two adapters that name
+// the same resolver (a VPN beside the LAN) are one server, and asking it twice
+// per pass would only spend a window.
+
+// IP_ADAPTER_ADDRESSES field offsets (iptypes.h): an 8-byte union at offset 0
+// (ULONG Length + IF_INDEX IfIndex, sized to match the struct's own
+// `ULONGLONG Alignment` union member), then five pointers in declaration order
+// (Next, AdapterName, FirstUnicastAddress, FirstAnycastAddress,
+// FirstMulticastAddress) before FirstDnsServerAddress; OperStatus follows
+// DnsSuffix/Description/FriendlyName (pointers), PhysicalAddress[8],
+// PhysicalAddressLength, Flags, Mtu and IfType (four more ULONGs).
+const iaaNextOff: int = 8
+const iaaFirstDnsServerOff: int = 48
+const iaaOperStatusOff: int = 104
+
+// IF_OPER_STATUS (ifdef.h): IfOperStatusUp. Only an adapter reporting this is
+// trusted for a nameserver -- a disabled/disconnected adapter can still carry a
+// stale DNS entry.
+const ifOperStatusUp: int = 1
+
+// IP_ADAPTER_DNS_SERVER_ADDRESS field offsets (iptypes.h): an 8-byte union at
+// offset 0 (ULONG Length + DWORD Reserved), Next (pointer) at offset 8, then an
+// inline SOCKET_ADDRESS (LPSOCKADDR lpSockaddr at offset 16; INT
+// iSockaddrLength at offset 24, unused here -- the family inside the
+// pointed-to sockaddr is what this file checks instead).
+const dnsAddrNextOff: int = 8
+const dnsAddrSockaddrPtrOff: int = 16
+
+// Windows' AF_INET, the low byte of the sockaddr's u16 family.
+const winAfInet: int = 2
+
+// Bounded walks (Power of 10 rule 2): a corrupt or circular list cannot hang
+// the parse, the same defensive depth `netSkipName` has for a wire format this
+// runtime does not control.
+const maxAdaptersWalk: int = 256
+const maxDnsServersWalk: int = 64
+
+// Room for this many servers in the list the parse fills. resolv.conf(5) reads
+// three; Windows hosts with more than a handful are a VPN's doing, and a pass
+// over sixteen resolvers is already past any useful retry budget.
+export const netMaxAdapterDns: int = 16
+
+// True when the four bytes at `addr` are already among the first `count`
+// entries of `list`.
+@nosplit fn netAdapterDnsListed(list: *u8, count: int, addr: *u8): bool {
+  let i = 0
+  while (i < count) {
+    let same = true
+    let k = 0
+    while (k < 4) {
+      if (getU8(list, i * 4 + k) != getU8(addr, k)) {
+        same = false
+      }
+      k = k + 1
+    }
+    if (same) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Appends the IPv4 address in the sockaddr at `sa` to `list[count..)` unless it
+// is another family, a repeat, or the list is full. Returns the new count.
+@nosplit fn netAdapterDnsAdd(sa: *u8, list: *u8, count: int, cap: int): int {
+  if (sa == nil || count >= cap) {
+    return count
+  }
+  if (getU8(sa, 0) != winAfInet || getU8(sa, 1) != 0) {
+    return count
+  }
+  let slot = list + count * 4
+  netSockAddrOctets(sa, slot)
+  if (netAdapterDnsListed(list, count, slot)) {
+    return count
+  }
+  return count + 1
+}
+
+// One adapter's `FirstDnsServerAddress` chain, appended to the list.
+// GetAdaptersAddresses' server list is NOT filtered by the Family the call
+// asked for -- Microsoft documents that it can carry IPv6 entries even when only
+// IPv4 was requested -- so each entry's own family is checked, not trusted.
+@nosplit fn netAdapterDnsChain(adapter: int, list: *u8, count: int, cap: int): int {
+  let n = count
+  let entry = getU64Le(bytesAt(adapter), iaaFirstDnsServerOff)
+  let steps = 0
+  while (entry != 0 && steps < maxDnsServersWalk) {
+    n = netAdapterDnsAdd(bytesAt(getU64Le(bytesAt(entry), dnsAddrSockaddrPtrOff)), list, n, cap)
+    entry = getU64Le(bytesAt(entry), dnsAddrNextOff)
+    steps = steps + 1
+  }
+  return n
+}
+
+// Every IPv4 DNS server on every UP adapter of the list starting at
+// `firstAdapter`, deduplicated, written to `list` as packed four-byte addresses
+// (room for `cap`, at most `netMaxAdapterDns` of them are ever worth having).
+// Returns how many.
+//
+// POLL-FREE (#1658/#3924): `@nosplit`, and correctly so -- it allocates nothing
+// and every callee is `@nosplit`. The two raw ints it walks point into Win32
+// memory (`GetAdaptersAddresses`' own linked list), passed in as `firstAdapter`
+// by a caller whose backing array stays live across this call.
+export @symbol("bit_rt_port_net_adapter_dns_servers") @nosplit fn netAdapterDnsServers(
+  firstAdapter: int,
+  list: *u8,
+  cap: int,
+): int {
+  let adapter = firstAdapter
+  let count = 0
+  let steps = 0
+  while (adapter != 0 && steps < maxAdaptersWalk) {
+    if (getU32Le(bytesAt(adapter), iaaOperStatusOff) == ifOperStatusUp) {
+      count = netAdapterDnsChain(adapter, list, count, cap)
+    }
+    adapter = getU64Le(bytesAt(adapter), iaaNextOff)
+    steps = steps + 1
+  }
+  return count
+}

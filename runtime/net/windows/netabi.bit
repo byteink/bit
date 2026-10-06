@@ -246,19 +246,37 @@ export @symbol("bit_rt_net_udp_recv") fn netAbiUdpRecv(fd: int, max: int): int {
 // DNS (ABI.md §20)
 // ---------------------------------------------------------------------------
 
-// One attempt per pass, up to `attempts` passes, each over every nameserver
-// Windows reports to this resolver: today ONE (`nameserverFromAdapters` returns
-// the first IPv4 server of the first UP adapter), so pass-major order (resolv.conf(5)
-// `attempts`, #6350) and the old server-major order coincide here; the loop is
-// shaped as the Linux/Darwin walk (`netResolvePasses`, ../linux/netabi.bit) so a
-// second server is a second inner iteration. True once one attempt answers.
-@nosplit fn netResolvePasses(host: *u8, hostLen: int, ns: *u8, out: *u8, attempts: int): bool {
+// resolv.conf(5) `attempts` (#6350): pass 1 asks EVERY nameserver Windows
+// reports (`nameserversFromAdapters`, ./dns.bit), then pass 2 asks every one
+// again, up to the block's attempt count, and the first A record wins. With the
+// first server unreachable the second is asked after ONE window, not after all
+// the first's attempts -- the walk `netResolvePasses` has on Linux and Darwin
+// (../linux/netabi.bit), over the address list instead of a conf text.
+//
+// The list is the resolve block's own: `netNsConfOff` points at packed
+// four-byte addresses and `netNsConfLenOff` is their byte length, where the
+// other providers keep resolv.conf text. Each is copied into the block's address
+// (offset 0), the slot `netResolveHost` reads.
+@nosplit fn netResolvePasses(host: *u8, hostLen: int, ns: *u8, out: *u8): bool {
+  let list = u8At(getU64Le(ns, netNsConfOff))
+  let count = getU64Le(ns, netNsConfLenOff) / 4
+  let passes = getU64Le(ns, netNsAttemptsOff)
   let pass = 0
-  // Bounded (Power of 10): `attempts` is at most `netDnsArgMax`.
-  while (pass < attempts) {
+  // Bounded (Power of 10): `passes` is at most `netDnsArgMax` and `count` at
+  // most `netMaxAdapterDns`.
+  while (pass < passes) {
     pass = pass + 1
-    if (netResolveHost(host, hostLen, ns, out)) {
-      return true
+    let at = 0
+    while (at < count) {
+      let k = 0
+      while (k < 4) {
+        putU8(ns, k, getU8(list, at * 4 + k))
+        k = k + 1
+      }
+      if (netResolveHost(host, hostLen, ns, out)) {
+        return true
+      }
+      at = at + 1
     }
   }
   return false
@@ -281,6 +299,32 @@ export @symbol("bit_rt_net_udp_recv") fn netAbiUdpRecv(fd: int, max: int): int {
     return false
   }
   return netDnsArgsOk(timeoutMs, attempts)
+}
+
+// The hostname path of `netAbiResolveW`: discovers the nameservers, then walks
+// them (`netResolvePasses`). The resolve block holds the per-attempt window, the
+// attempt count and the discovered list, all in this frame's MANAGED scratch,
+// held across the blocking calls below.
+fn netResolveAdapters(host: *u8, hostLen: int, timeoutMs: int, attempts: int, out: *u8): bool {
+  let listBuf = []i64(scratchWords(netMaxAdapterDns * 4))
+  let list = u8At(int(ptrOf(listBuf)))
+  let count = nameserversFromAdapters(list, netMaxAdapterDns)
+  if (count == 0) {
+    keepAlive(listBuf)
+    return false
+  }
+  // Allocated after the discovery, which allocates itself, so no allocation
+  // sits between this block's address and its last use below.
+  let nsBuf = []i64(scratchWords(netNsBlockBytes))
+  let ns = u8At(int(ptrOf(nsBuf)))
+  putU64Le(ns, netNsTimeoutOff, timeoutMs)
+  putU64Le(ns, netNsAttemptsOff, attempts)
+  putU64Le(ns, netNsConfOff, int(list))
+  putU64Le(ns, netNsConfLenOff, count * 4)
+  let ok = netResolvePasses(host, hostLen, ns, out)
+  keepAlive(nsBuf)
+  keepAlive(listBuf)
+  return ok
 }
 
 // `bit_rt_net_resolve_w`: the first IPv4 A-record for the host
@@ -315,15 +359,9 @@ export @symbol("bit_rt_net_resolve_w") fn netAbiResolveW(
   let octets = []i64(1)
   let out = u8At(int(ptrOf(octets)))
   let host = u8At(hostWords)
-  if (!netParseIpv4(host, hostLen, out)) {
-    // The resolve block: the address `nameserverFromAdapters` writes, then the
-    // per-attempt window (`netNsTimeoutOff`).
-    let nsBuf = []i64(scratchWords(netNsBlockBytes))
-    let ns = u8At(int(ptrOf(nsBuf)))
-    putU64Le(ns, netNsTimeoutOff, timeoutMs)
-    if (!nameserverFromAdapters(ns) || !netResolvePasses(host, hostLen, ns, out, attempts)) {
-      return 0 - 1
-    }
+  if (!netParseIpv4(host, hostLen, out) &&
+    !netResolveAdapters(host, hostLen, timeoutMs, attempts, out)) {
+    return 0 - 1
   }
   return netFormatOctets(out, u8At(outWords))
 }

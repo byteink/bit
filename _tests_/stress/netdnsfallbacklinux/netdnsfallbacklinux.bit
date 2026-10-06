@@ -1,14 +1,25 @@
-// DNS fallback: a dead first nameserver, a slow second one (#6338). Its own
-// program, split out of ../netsockdarwin, so a DNS stall cannot be confused
-// with that file's unrelated socket coverage.
+// DNS fallback and nameserver order, Linux (#6338, #6350, #7470): the twin of
+// ../netdnsfallback, which runs the same properties against the Darwin provider.
+// A dead first nameserver and a slow second one must still resolve, and the walk
+// must go round the nameserver LIST (A B A B), for A records (`netResolvePasses`)
+// and for TXT (`netTxtPasses`).
 //
-// #6338's own acceptance: the resolver must fall through a nameserver that
-// refuses the connection to one that answers, and must tolerate that one
-// taking up to 150ms -- comfortably inside the 2000ms attempt window the test
-// puts in its nameserver block (`ipBytes`).
+// Linux-only by construction, hence the `linux-only` marker: it binds
+// runtime/net/linux, which reaches the kernel through `syscall` (SPEC 11.8), and
+// it makes its own raw socket/bind/getsockname/setsockopt/recvfrom/sendto/
+// nanosleep calls the same way. Where the Darwin file declares libSystem
+// externs, this one issues the syscalls, with the Linux `sockaddr_in` layout
+// (sin_family a u16 at byte 0, no sin_len) and the Linux SOL_SOCKET (1) and
+// SO_RCVTIMEO (20).
+//
+// THIS FILE IS A DELIBERATE NEAR-COPY OF ITS TWIN, for the reason
+// ../netsocklinux gives: the properties must be identical for a divergence to
+// mean a platform difference, and the only way to share them is a provider
+// indirection, which is precisely the layer under test. Anything that diverges
+// beyond the imports, the raw socket calls and this header is a bug.
+//
 // Both servers are local UDP stubs on ephemeral ports: `netResolveHost`'s
-// `port` parameter exists precisely so this needs no root to bind 53 (see
-// its own header, ../../../runtime/net/darwin/dns.bit).
+// `port` parameter exists precisely so this needs no root to bind 53.
 //
 // This program runs under `BIT_GC=stress` (#6341): `netResolveHost` parks the
 // client on the netpoller while it waits, so the collector's rendezvous
@@ -16,44 +27,36 @@
 // behind a client sitting in a kernel call.
 //
 // THE SLOW STUB'S OWN SOCKET IS RAW AND BLOCKING, NOT `netBindUdp`'s
-// non-blocking + spin-retry shape, and that is load-bearing, not style.
-// This responder thread has no scheduler task to park on, so `netRecvFrom`
-// takes its unscheduled SPIN branch (`netMaxSpins`, no wall-clock
-// backstop), which is slow to notice a datagram under `BIT_GC=stress`. A
-// genuinely blocking `recvfrom` (SO_RCVTIMEO) is a real kernel wait: it wakes
-// at OS scheduling latency the instant the datagram is there, never spinning.
+// non-blocking + spin-retry shape, for ../netdnsfallback's reason: this
+// responder thread has no scheduler task to park on, so `netRecvFrom` would take
+// its unscheduled SPIN branch, which is slow to notice a datagram under
+// `BIT_GC=stress`. A genuinely blocking `recvfrom` (SO_RCVTIMEO) is a real
+// kernel wait that wakes the instant the datagram is there.
 //
 // THE STUB'S KERNEL WAITS ARE BRACKETED (`gcBlockingBegin`/`gcBlockingEnd`,
-// runtime/ABI.md §5), and that is the fix for #6412, not a nicety. A thread
-// started through `threadStart` holds a mutator slot that reads `running` for
-// as long as it executes; the blocking `recvfrom` and the `nanosleep` have no
-// safepoint, so unbracketed they held the slot `running` until the datagram
-// arrived (up to its 30s bound). The client collects at every safepoint under
-// `BIT_GC=stress` and its first collection, BEFORE its query is sent, then
-// waited on the stub while the stub waited on the query: beside a CPU hog the
-// world stayed stopped 20-30s (`pausemaxns` 21.7s, `rdvns` 30s, measured),
-// the stub's recv timed out unanswered and the resolver reported
-// "fallback false" after 3 x 2000ms. The region holds no managed reference
-// (module words and raw buffers only), which is the bracket's precondition.
+// runtime/ABI.md §5), for #6412's reason (../netdnsfallback has the account): a
+// blocking `recvfrom` and a `nanosleep` have no safepoint, so unbracketed they
+// hold the stub's mutator slot `running` and the client's first collection
+// waits on a stub that is waiting on the client's query. The region holds no
+// managed reference (module words and raw buffers only), which is the bracket's
+// precondition.
 
-import { netBindUdp, netSockLocalPort, netClose, netResolveHost, netResolvePasses } from "../../../runtime/net/darwin"
-import { netTxtPasses } from "../../../runtime/net/darwin"
+import { netBindUdp, netSockLocalPort, netClose, netResolveHost, netResolvePasses } from "../../../runtime/net/linux"
+import { netTxtPasses } from "../../../runtime/net/linux"
 import { putU64Le, netNsTimeoutOff, netNsAttemptsOff } from "../../../runtime/net"
 import { netNsPortOff, netNsPortStepOff, netNsConfOff, netNsConfLenOff } from "../../../runtime/net"
 import { threadJoin, threadJoinDone, threadRunning } from "../../../runtime/thread"
-import { threadStart, threadRelease } from "../../../runtime/thread/darwin"
-import { parkSleepNs, parkMonoNs } from "../../../runtime/park/darwin"
+import { threadStart, threadRelease } from "../../../runtime/thread/linux"
+import { parkSleepNs, parkMonoNs } from "../../../runtime/park/linux"
+import { sysSocket, sysBind, sysGetSockName, sysSetSockOpt } from "../../../runtime/syscalls"
+import { sysRecvFrom, sysSendTo, sysNanosleep, sysClose } from "../../../runtime/syscalls"
 import { gcBlockingBegin, gcBlockingEnd } from "../../../runtime/gc"
 import { stwCollections, stwAbandonedCount, stwPauses, stwPauseMaxNs, stwRdvNs } from "../../../runtime/stw"
 
-extern fn socket(domain: i32, ty: i32, proto: i32): i32
-extern fn bind(fd: i32, sa: *u8, salen: i32): i32
-extern fn getsockname(fd: i32, sa: *u8, salen: *u8): i32
-extern fn setsockopt(fd: i32, lvl: i32, name: i32, val: *u8, len: i32): i32
-extern fn recvfrom(fd: i32, buf: *u8, n: i64, flags: i32, sa: *u8, salen: *u8): i64
-extern fn sendto(fd: i32, buf: *u8, n: i64, flags: i32, sa: *u8, salen: i32): i64
-extern fn bit_rt_fs_close(fd: i64): i64
-extern fn nanosleep(req: *u8, rem: *u8): i32
+// Linux's SOL_SOCKET and SO_RCVTIMEO (asm-generic/socket.h, the same on x86_64
+// and aarch64).
+const solSocketLinux: int = 1
+const soRcvTimeoLinux: int = 20
 
 const slowDelayMinNs: int = 150000000
 const dnsAttemptMs: int = 2000
@@ -134,7 +137,7 @@ fn clear(base: *u8, n: int) {
 
 // "127.0.0.1", byte by byte -- this module never holds a managed string,
 // because every buffer that reaches the kernel crosses as `*u8` plus a byte
-// count (matching ../netsockdarwin.bit's own `writeLoopback`).
+// count (matching ../netsocklinux.bit's own `writeLoopback`).
 fn writeLoopback(base: *u8): int {
   putByte(base, 0, 49)
   putByte(base, 1, 50)
@@ -150,7 +153,7 @@ fn writeLoopback(base: *u8): int {
 
 // "localhost" -- a name `netParseIpv4` refuses, so `netResolveHost` cannot
 // take its literal-address shortcut and must actually query a nameserver
-// (matching ../netsockdarwin.bit's own `writeHostname`).
+// (matching ../netsocklinux.bit's own `writeHostname`).
 fn writeHostname(base: *u8): int {
   putByte(base, 0, 108)
   putByte(base, 1, 111)
@@ -168,14 +171,28 @@ fn sleepAdapt(ns: int) {
   parkSleepNs(ns, ptrOf(joinSleepScratch))
 }
 
-// `sockaddr_in` (POSIX) ON DARWIN: sin_len@0, sin_family@1 (AF_INET=2),
-// sin_port@2 (u16 BE), sin_addr@4 (four octets) -- the same 16-byte layout
-// ../../../runtime/net/darwin/sock.bit's own header documents, verified there
-// with a compiled `offsetof`/`printf` probe against this Mac's real
-// `<netinet/in.h>`.
+fn monoNs(): int {
+  return parkMonoNs(ptrOf(joinSleepScratch))
+}
+
+fn stubMonoNs(): int {
+  return parkMonoNs(ptrOf(stubMonoScratch))
+}
+
+fn closeFd(fd: int) {
+  let _ = int(syscall(sysClose(), i64(fd)))
+}
+
+// `sockaddr_in` ON LINUX: sin_family@0 (a u16, AF_INET=2, little-endian, so
+// byte 0 is 2 and byte 1 is 0), sin_port@2 (u16 BE), sin_addr@4 (four octets):
+// 16 bytes, the layout ../../../runtime/net/linux/sock.bit documents. There is
+// no sin_len, which is the Darwin file's byte 0.
 let rawSaBuf: [2]i64
 let rawTvBuf: [2]i64
 let rawLenBuf: [1]i64
+// `parkMonoNs`/`parkSleepNs` take a caller-owned 2-word scratch (#2318), one per
+// OS thread: the main thread's (`monoNs`) and the responder's (`stubMonoNs`).
+let stubMonoScratch: [2]i64
 
 fn rawSaBytes(): *u8 { return bytesAt(int(ptrOf(rawSaBuf))) }
 fn rawTvBytes(): *u8 { return bytesAt(int(ptrOf(rawTvBuf))) }
@@ -199,26 +216,34 @@ fn rawPutI64Le(base: *u8, off: int, v: int) {
 // Returns `fd * 100000 + port` (a test-only packing -- both are small,
 // positive, and neither is a wire value), or -1 on any failure.
 fn rawUdpBind(): int {
-  let fd = int(socket(i32(2), i32(2), i32(0)))
+  let fd = int(syscall(sysSocket(), 2, 2, 0))
   if (fd < 0) {
     return 0 - 1
   }
   clear(rawTvBytes(), 16)
   putByte(rawTvBytes(), 0, 30)
-  if (int(setsockopt(i32(fd), i32(65535), i32(4102), rawTvBytes(), i32(16))) < 0) {
+  if (int(
+      syscall(
+        sysSetSockOpt(), i64(fd), i64(solSocketLinux), i64(soRcvTimeoLinux),
+        i64(int(rawTvBytes())), 16,
+      ),
+    ) <
+    0) {
+    closeFd(fd)
     return 0 - 1
   }
   let sa = rawSaBytes()
   clear(sa, 16)
-  putByte(sa, 0, 16)
-  putByte(sa, 1, 2)
+  putByte(sa, 0, 2)
   putByte(sa, 4, 127)
   putByte(sa, 7, 1)
-  if (int(bind(i32(fd), sa, i32(16))) < 0) {
+  if (int(syscall(sysBind(), i64(fd), i64(int(sa)), 16)) < 0) {
+    closeFd(fd)
     return 0 - 1
   }
   putByte(rawLenBytes(), 0, 16)
-  if (int(getsockname(i32(fd), sa, rawLenBytes())) < 0) {
+  if (int(syscall(sysGetSockName(), i64(fd), i64(int(sa)), i64(int(rawLenBytes())))) < 0) {
+    closeFd(fd)
     return 0 - 1
   }
   let port = getByte(sa, 2) * 256 + getByte(sa, 3)
@@ -231,7 +256,12 @@ fn rawUdpBind(): int {
 // scratch that the reply's OWN address fill (`rawSendTo`) overwrites next.
 fn rawRecvFrom(fd: int, buf: *u8): int {
   putByte(rawLenBytes(), 0, 16)
-  return int(recvfrom(i32(fd), buf, i64(dnsStubMax), i32(0), rawSaBytes(), rawLenBytes()))
+  return int(
+    syscall(
+      sysRecvFrom(), i64(fd), i64(int(buf)), i64(dnsStubMax), 0,
+      i64(int(rawSaBytes())), i64(int(rawLenBytes())),
+    ),
+  )
 }
 
 fn rawPeerPort(): int {
@@ -241,13 +271,14 @@ fn rawPeerPort(): int {
 fn rawSendTo(fd: int, buf: *u8, n: int, port: int): int {
   let sa = rawSaBytes()
   clear(sa, 16)
-  putByte(sa, 0, 16)
-  putByte(sa, 1, 2)
+  putByte(sa, 0, 2)
   putByte(sa, 2, port / 256)
   putByte(sa, 3, port % 256)
   putByte(sa, 4, 127)
   putByte(sa, 7, 1)
-  return int(sendto(i32(fd), buf, i64(n), i32(0), sa, i32(16)))
+  return int(
+    syscall(sysSendTo(), i64(fd), i64(int(buf)), i64(n), 0, i64(int(sa)), 16),
+  )
 }
 
 // The fixed test answer, RFC 5737 TEST-NET-3 (203.0.113.7): unroutable, so a
@@ -303,13 +334,13 @@ fn writeStubTxt(reply: *u8, qlen: int): int {
 
 fn slowDnsWaitForGo() {
   let i = 0
-  let t0 = parkMonoNs()
+  let t0 = stubMonoNs()
   while (i < respMaxWait) {
     if (atomicLoad(ptrOf(slowGoWords)) != 0) {
       i = respMaxWait
     } else {
       i = i + 1
-      if (i % respClockEvery == 0 && parkMonoNs() - t0 > respMaxWaitNs) {
+      if (i % respClockEvery == 0 && stubMonoNs() - t0 > respMaxWaitNs) {
         i = respMaxWait
       }
     }
@@ -322,8 +353,7 @@ fn slowDnsWaitForGo() {
 fn slowDnsDelay() {
   clear(rawTvBytes(), 16)
   rawPutI64Le(rawTvBytes(), 8, slowDelayMinNs)
-  let none: *u8 = nil
-  let _ = int(nanosleep(rawTvBytes(), none))
+  let _ = int(syscall(sysNanosleep(), i64(int(rawTvBytes())), 0))
 }
 
 // Builds `writeStubAnswer`'s canned A record (or `writeStubTxt`'s TXT one, when
@@ -352,14 +382,14 @@ export fn slowDnsResponderEntry(arg: *byte): *byte {
   slowDnsWaitForGo()
   gcBlockingBegin()
   let got = rawRecvFrom(int(slowRespFd), dnsQueryBytes())
-  diagStubRecvNs = parkMonoNs()
+  diagStubRecvNs = stubMonoNs()
   let peerPort = rawPeerPort()
   slowDnsDelay()
   gcBlockingEnd()
   if (got > 0) {
     slowWrote = i64(slowDnsReply(int(slowRespFd), got, peerPort))
   }
-  diagStubSendNs = parkMonoNs()
+  diagStubSendNs = stubMonoNs()
   atomicStore(ptrOf(slowDoneWords), i32(0))
   let z: *byte = nil
   return z
@@ -404,15 +434,15 @@ fn dnsFallbackProps(hostLen: int, badLen: int): bool {
   putU64Le(ipBytes(), netNsAttemptsOff, dnsAttempts)
 
   clear(octBytes(), 4)
-  let t0 = parkMonoNs()
+  let t0 = monoNs()
   let slowResolved = netResolveHost(badHostBytes(), badLen, ipBytes(), slowPort, octBytes())
-  diagSlowNs = parkMonoNs() - t0
+  diagSlowNs = monoNs() - t0
   let slowOk = packed >= 0 && slowResolved && isStubAnswer(octBytes())
 
   clear(octBytes(), 4)
-  let t1 = parkMonoNs()
+  let t1 = monoNs()
   let deadOk = !netResolveHost(badHostBytes(), badLen, ipBytes(), deadPort, octBytes())
-  diagDeadNs = parkMonoNs() - t1
+  diagDeadNs = monoNs() - t1
 
   let stubOk = stopStub(h, slowFd)
   diagSlowOk = slowOk
@@ -440,10 +470,10 @@ fn stopStub(h: int, slowFd: int): bool {
     ptrOf(slowDoneWords),
     120000000000,
     sleepAdapt,
-    parkMonoNs,
+    monoNs,
   ) == threadJoinDone
   let released = threadRelease(h)
-  let _ = int(bit_rt_fs_close(i64(slowFd)))
+  closeFd(slowFd)
   diagJoined = joined
   return h != 0 && joined && released && int(slowWrote) > 0
 }
@@ -468,7 +498,7 @@ fn putText(base: *u8, off: int, text: string): int {
 // stub's port must be the higher one: rebind until it is.
 //
 // The same walk is run for A records (`netResolvePasses`) and for TXT
-// (`netTxtPasses`, runtime/net/darwin/txt.bit, #7470): the stub answers the
+// (`netTxtPasses`, runtime/net/linux/txt.bit, #7470): the stub answers the
 // record type the query asks for. Each is its own verdict, `order` and
 // `txtorder`, so swapping either walk's loops fails its own line.
 //
@@ -499,7 +529,7 @@ fn bindOrdered(hostLen: int): bool {
       netClose(ordBlackFd)
     }
     if (ordStub >= 0) {
-      let _ = int(bit_rt_fs_close(i64(ordStub / 100000)))
+      closeFd(ordStub / 100000)
     }
   }
   return false
@@ -544,9 +574,9 @@ fn dnsOrderProps(hostLen: int, badLen: int, txt: bool): bool {
   let blackPort = netSockLocalPort(ordBlackFd)
   let stubPort = ordStub % 100000
   let h = startStub(ordStub / 100000)
-  let t0 = parkMonoNs()
+  let t0 = monoNs()
   diagOrderOk = orderResolve(txt, badLen, blackPort, stubPort)
-  diagOrderNs = parkMonoNs() - t0
+  diagOrderNs = monoNs() - t0
   let stubOk = stopStub(h, ordStub / 100000)
   netClose(ordBlackFd)
   let inTime = ms(diagOrderNs) >= orderWindowMs * 9 / 10 &&
