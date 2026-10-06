@@ -76,6 +76,10 @@ fn main(): ()! {
   [A second route](failover.md).
 * **`redirect`** is for staging: every mail goes to that one address and to
   nobody else. See [Staging mail](redirect.md).
+* **`pool`** is how many SMTP sessions `open` keeps for reuse, 4 by default.
+  See [Reusing connections](pool.md).
+* **`metrics`** and **`tracer`** count and trace every send, and are off when
+  unset. See [Watching the mail](observe.md).
 
 `Options{}` is a valid setup. More fields arrive with the parts of the package
 that need them, always with a default, so code written today keeps working.
@@ -164,7 +168,30 @@ are in [Messages](messages.md).
 `Outbox.sent()` returns a `Sent` for each mail taken, oldest first: the
 `message` as you wrote it, the `raw` bytes a real transport would have sent, and
 the `receipt`. It is a copy; mail sent later does not change a list you already
-hold. Any number of tasks can send through one `Outbox` at once.
+hold. Any number of tasks can send through one `Outbox` at once. A helper that
+checks one mail takes a `Sent`:
+
+```bit
+import { Mailer, Message, Options, Outbox, Sent } from "mail"
+import { contains } from "std/strings"
+
+fn isWelcome(s: Sent): bool {
+  return s.message.subject == "Welcome to Inkwell" && contains(s.raw, "Subject: Welcome to Inkwell")
+}
+
+fn main(): ()! {
+  let box = Outbox()
+  let mailer = Mailer(box, Options{ from = "Inkwell <hello@inkwell.dev>" })?
+  mailer.send(
+    Message{ to = ["sara@example.com"], subject = "Welcome to Inkwell", text = "Hello." },
+  )?
+  println("${isWelcome(box.sent()[0])} ${box.sent()[0].receipt.accepted[0]}")
+  mailer.close()
+  return
+}
+```
+
+That prints `true sara@example.com`.
 
 ```bit
 import { Mailer, Message, Options, Outbox } from "mail"
@@ -203,7 +230,8 @@ it once, when no send is running.
 ## Your own transport
 
 A transport is any class with `deliver`, `signs`, `check` and `close`; there is nothing to
-implement or register. `deliver` gets a `Delivery` (the `message`, the
+implement or register. The interface they satisfy is `Transport`, which is what
+`Mailer(...)` takes. `deliver` gets a `Delivery` (the `message`, the
 `envelope` with every address including `bcc`, the `messageId` and the final
 `raw` bytes) and returns a `Receipt` or a `MailError`. It may be called from
 many tasks at once. `signs` says whether the `raw` bytes are the bytes that
@@ -216,7 +244,7 @@ sending anything, and fails with the error a delivery would fail with at that
 step; `Mailer.verify` calls it. See [Checking the setup at boot](verify.md).
 
 ```bit
-import { Delivery, Mailer, MailError, Message, Options, Receipt, Rejection, Reply } from "mail"
+import { Delivery, Mailer, MailError, Message, Options, Receipt, Rejection, Reply, Transport } from "mail"
 
 // Takes every address except one a policy forbids.
 class Screened {
@@ -260,10 +288,8 @@ class Screened {
 }
 
 fn main(): ()! {
-  let mailer = Mailer(
-    Screened{ blocked = "lee@example.com" },
-    Options{ from = "Inkwell <hello@inkwell.dev>" },
-  )?
+  let transport: Transport = Screened{ blocked = "lee@example.com" }
+  let mailer = Mailer(transport, Options{ from = "Inkwell <hello@inkwell.dev>" })?
   let r = mailer.send(
     Message{
       to = ["sara@example.com", "lee@example.com"],
@@ -330,6 +356,8 @@ fn main(): ()! {
 
 ## Where to go next
 
-The package front page is [README](../README.md). The message a mailer sends is
+The package front page is [README](../README.md), and
+[Send a welcome email](getting-started.md) walks one mail through all of this
+from `log://` to production. The message a mailer sends is
 in [Messages](messages.md), and the addresses in it in
 [Addresses](addresses.md).

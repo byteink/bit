@@ -5,6 +5,7 @@ bitlang.org's sidebar reads it in.
 
 | Chapter | Covers |
 |---|---|
+| [Send a welcome email](getting-started.md) | `open(env("MAIL_URL"))` on Inkwell's welcome mail: the first send with `log://`, `parseAddress` on the sign-up form, `Receipt`, HTML from a pkg/web JSX component with its text part written for you, a PDF and an inline logo, `inReplyTo` threads, an `Invite` and its `Method.Cancel`, the errors a welcome mail meets, and the same code in production with a provider URL, DKIM and `verify()` |
 | [Addresses](addresses.md) | `parseAddress` and `parseAddressList` on Inkwell's sign-up form, `Address` and its display name, what is refused and why, `MailError` |
 | [Messages](messages.md) | the `Message` class on Inkwell's publish mail: every field, threading, `Message-ID`, `Auto-Submitted`, what is refused |
 | [The Mailer](mailer.md) | `Mailer`, `Options`, `send` and `render` on Inkwell's welcome mail: startup checks, the `Outbox` test transport, writing a `Transport`, `Receipt`, `MailError` |
