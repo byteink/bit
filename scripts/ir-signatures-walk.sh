@@ -614,11 +614,38 @@ function normStrict(s, k, isO, kind,    a, n, t, cdef, c, i, j, key, keys, nk) {
     n = eraseConsts(a, n)
   }
   renumber(a, n)
+  if (gSlot) { slotErase(a, n, isO) }
   return joinLines(a, n)
+}
+# slotErase -- #7482: the interface method slot of every `call_iface %r.K(` is printed as `{slot}` and K
+# appended to the oracle list (isO) or the tree list, in program order; slotsOk then judges the pairs.
+function slotErase(a, n, isO,    i, p, q) {
+  for (i = 1; i <= n; i++) {
+    if (!match(a[i], /call_iface %n[0-9]+\.[0-9]+\(/)) { continue }
+    p = substr(a[i], 1, RSTART + RLENGTH - 1); q = index(p, ".")
+    if (isO) { gSa[++gSan] = substr(p, q + 1, length(p) - q - 1) } else { gSb[++gSbn] = substr(p, q + 1, length(p) - q - 1) }
+    a[i] = substr(p, 1, q) "{slot}(" substr(a[i], RSTART + RLENGTH)
+  }
+}
+# slotsOk -- the K pairs of slotErase: one site per site, one tree slot per oracle slot and back, and
+# every slot that moved moved up by the same amount, at least one did (gSlotHit).
+function slotsOk(    i, d, d0, fw, bw) {
+  if (gSan != gSbn) { return 0 }
+  split("", fw); split("", bw); d0 = ""; gSlotHit = 0
+  for (i = 1; i <= gSan; i++) {
+    if ((gSa[i] in fw) && fw[gSa[i]] != gSb[i]) { return 0 }
+    if ((gSb[i] in bw) && bw[gSb[i]] != gSa[i]) { return 0 }
+    fw[gSa[i]] = gSb[i]; bw[gSb[i]] = gSa[i]
+    d = gSb[i] - gSa[i]
+    if (d == 0) { continue }
+    if (d < 0 || (d0 != "" && d != d0)) { return 0 }
+    d0 = d; gSlotHit = 1
+  }
+  return gSlotHit
 }
 # strictIr -- every function of the oracle side s equals the tree side t once each oracle neg pair and run
 # chain is folded, with every other line, constant values included, byte for byte after renumbering;
-# true only when at least one fold fired.
+# true only when at least one fold fired (or, with gSlot, whatever the slots then prove).
 function strictIr(s, t,    k) {
   compile(s, 1); compile(t, 1)
   if (fcnt[s] != fcnt[t]) { return 0 }
@@ -626,7 +653,7 @@ function strictIr(s, t,    k) {
   for (k = 1; k <= fcnt[s]; k++) {
     if (fname[s, k] != fname[t, k] || normStrict(s, k, 1, "ir") != normStrict(t, k, 0, "ir")) { return 0 }
   }
-  return gFolded > 0
+  return gFolded > 0 || gSlot
 }
 # strictOpt -- the optimized dumps A and B, given that strictIr proved the pre-opt pair of the same file:
 # every function agrees once constants are erased and ids renumbered, and holds the same distinct
@@ -647,14 +674,23 @@ function strictOpt(    k, t, n, a, na, nb, ca) {
   }
   return 1
 }
-function explainStrict() {
+function strictOnce() {
   if (kind == "ir") { return strictIr("A", "B") }
   if (nC == 0 || nD == 0 || !parseRaw("C", LC, nC) || !parseRaw("D", LD, nD)) { return 0 }
   return strictIr("C", "D") && strictOpt()
 }
+# explainStrict -- 7069 as it stands; failing that, #7482 on top of it: the same proof with the interface
+# method slots erased and judged by slotsOk. The name of the signature, or "".
+function explainStrict() {
+  gSlot = 0
+  if (strictOnce()) { return "7069-neg-literal-const" }
+  gSlot = 1; gSan = 0; gSbn = 0; split("", gSa); split("", gSb)
+  if (strictOnce() && slotsOk()) { return "7482-aliased-generic-iface-slot" }
+  return ""
+}
 function explainIr(    nm) {
   if (!parseRaw("A", LA, nA) || !parseRaw("B", LB, nB)) { return "" }
-  if (explainStrict()) { return "7069-neg-literal-const" }
+  if ((nm = explainStrict()) != "") { return nm }
   split("", rdrop); compile("A"); compile("B")
   if (sameLists(0) && (nm = hitName()) != "") { return nm }
   split("", rdrop)
@@ -681,9 +717,9 @@ END {
 '
 }
 
-# explainLagTypes <oracle_types> <tree_types> -- the two `types` signatures declared against the
+# explainLagTypes <oracle_types> <tree_types> -- the three `types` signatures declared against the
 # 0.39.0 oracle. Prints the name and returns 0 when the dumps have the same number of lines and
-# every line that differs is the same `L:C: expr:` with a different type, of one of two shapes;
+# every line that differs is the same `L:C: expr:` with a different type, of one of three shapes;
 # else prints nothing and returns 1.
 #   7387-self-result-types: the oracle type is `Self` or `<error>` (an interface method whose
 #     result is `Self`, or what is called on it) and the tree type is neither; at least one
@@ -691,11 +727,48 @@ END {
 #   7383-arrow-param-types: expr is a bare name (an arrow parameter), the oracle type is one
 #     capital letter (the unsubstituted type parameter) or `<error>`, and the tree type is not
 #     `<error>`; at least one oracle type is the capital letter.
+#   7482-aliased-generic-types: #7482 instantiates a generic class imported under an alias
+#     (`import { Pool as P }`); the oracle types its uses as the bare template. Every differing
+#     type is the oracle text with each bare generic name `N` grown to `N<args>` and each lone
+#     capital letter (the unsubstituted parameter) replaced by a type (lagMatch); at least one
+#     bare name grew.
 explainLagTypes() {
   awk '
     FNR == 1 { fi++ }
     fi == 1 { a[++na] = $0; next }
     { b[++nb] = $0 }
+    function isId(c) { return c ~ /^[A-Za-z0-9_]$/ }
+    # prevc -- the character before position i of s, or empty at the start (bwk awk reads substr(s, 0, 1) as the first character).
+    function prevc(s, i) { return (i > 1) ? substr(s, i - 1, 1) : "" }
+    # lagMatch -- the tree type t is the oracle type o with every bare generic name `N` followed by a
+    # `<args>` group and every lone capital letter replaced by one balanced type. Sets lagBare to
+    # the number of groups added. Each step moves i or j, so the loops end within length(o) + length(t).
+    function lagMatch(o, t,    i, j, lo, lt, co, ct, k, d, e) {
+      i = 1; j = 1; lo = length(o); lt = length(t); lagBare = 0
+      while (i <= lo || j <= lt) {
+        co = substr(o, i, 1); ct = substr(t, j, 1)
+        if (co != "" && co == ct) { i++; j++; continue }
+        if (ct == "<" && isId(prevc(o, i)) && co != "<") {
+          d = 0; k = j
+          do { e = substr(t, k++, 1); if (e == "<") { d++ } else if (e == ">") { d-- } } while (d > 0 && k <= lt)
+          if (d != 0) { return 0 }
+          j = k; lagBare++; continue
+        }
+        if (co ~ /^[A-Z]$/ && !isId(prevc(o, i)) && !isId(substr(o, i + 1, 1))) {
+          d = 0; k = j
+          while (k <= lt) {
+            e = substr(t, k, 1)
+            if (d == 0 && (e ~ /[]>)]/ || (e ~ /[,!?]/ && e == substr(o, i + 1, 1)))) { break }
+            if (e ~ /[[<(]/) { d++ } else if (e ~ /[]>)]/) { d-- }
+            k++
+          }
+          if (k == j || d != 0) { return 0 }
+          j = k; i++; continue
+        }
+        return 0
+      }
+      return 1
+    }
     # cut -- s into the prefix through its last ": " and the type, in cutP and cutT.
     function cut(s,    i) {
       for (i = length(s) - 1; i > 0; i--) { if (substr(s, i, 2) == ": ") { cutP = substr(s, 1, i + 1); cutT = substr(s, i + 2); return 1 } }
@@ -703,7 +776,7 @@ explainLagTypes() {
     }
     END {
       if (na != nb) { exit 1 }
-      selfOk = 1; arrowOk = 1; selfN = 0; arrowN = 0
+      selfOk = 1; arrowOk = 1; selfN = 0; arrowN = 0; instOk = 1; instN = 0
       for (i = 1; i <= na; i++) {
         if (a[i] == b[i]) { continue }
         if (!cut(a[i])) { exit 1 }
@@ -714,9 +787,11 @@ explainLagTypes() {
         if (tb ~ /<error>|^Self$/) { exit 1 }
         if (ta != "Self" && ta != "<error>") { selfOk = 0 } else if (ta == "Self") { selfN++ }
         if (expr !~ /^[a-z_][A-Za-z0-9_]*$/ || (ta !~ /^[A-Z]$/ && ta != "<error>")) { arrowOk = 0 } else if (ta != "<error>") { arrowN++ }
+        if (lagMatch(ta, tb)) { instN += lagBare } else { instOk = 0 }
       }
       if (selfOk && selfN > 0) { print "7387-self-result-types"; exit 0 }
       if (arrowOk && arrowN > 0) { print "7383-arrow-param-types"; exit 0 }
+      if (instOk && instN > 0) { print "7482-aliased-generic-types"; exit 0 }
       exit 1
     }
   ' <(printf '%s\n' "$1") <(printf '%s\n' "$2")

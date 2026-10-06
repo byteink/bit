@@ -331,6 +331,30 @@
 #     run_debug_neg_literal_min, run_slice_lit_inline_fill, run_slice_u8_store_inline and
 #     decimal_to_int_roundtrip. A file that also holds another named lag below keeps that name.
 #
+#
+# Declared (#7505) against the 0.39.0 oracle; retires at the next repin. #7482 instantiates a
+# generic class imported under an alias (`import { Pool as P }`; std/sql/pool.bit does it since
+# #6024). The oracle keys the instantiation on the alias, finds no type parameters, and returns
+# the bare template: its methods are referenced and never emitted. Measured by building the tree
+# without cc924d944 (compiler/checkinst.bit reverted, the corpus unchanged) against the tree with
+# it: only the files below move, and their stage0 text is the reverted tree's. Two signatures:
+#
+#   7482-aliased-generic-types (`types`). Every line that differs is the same `L:C: expr:` and
+#     the tree type is the oracle type with each bare generic name `N` grown to `N<args>` and each
+#     lone capital letter (the unsubstituted parameter) replaced by one balanced type (lagMatch,
+#     ir-signatures-walk.sh); at least one bare name grew. Files: run_import_alias_generic_local,
+#     run_import_alias_generic_pool, stdlib/sql/pool.bit.
+#   7482-aliased-generic-iface-slot (`ir`, `iropt`). The instantiation interns its method names
+#     in the global interface method table, so every later `call_iface %r.K(` has a larger K. The
+#     proof is 7069's (`ir`: neg pairs folded, every function equal; `iropt`: constants erased,
+#     the pre-opt proof first) with K printed as `{slot}`, plus the K pairs in program order:
+#     one site per site, one tree slot per oracle slot and back, every slot that moved moved up by
+#     the same amount, and at least one moved. No fold is required: this is the proof by itself for
+#     a file with no negative literal. Files: run_sql_row_find, run_sql_row_persisted,
+#     run_table_belongsto_fromrow, run_table_static_members (273 -> 290).
+#   The object-level half, the extra safepoints of the emitted instance, is in
+#   scripts/safepoint-signatures.sh.
+#
 # shellcheck source=scripts/ir-signatures-walk.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-walk.sh"
 irWalkAwk
@@ -485,8 +509,8 @@ explainMismatch() {
 declaredSignatureNames() {
   local diags="6403-enum-static-method-presyntax 7035-keyword-member-name-presyntax 6421-ternary-jsx-hash-oracle-panic"
   local fmt="7380-jsx-text-apostrophe-stray-semicolon"
-  local types="7387-self-result-types 7383-arrow-param-types"
-  local ir="7408-assert-ok-nil-compare 7406-iface-implements-call 7377-append-spread-bulk-move 7387-self-result-oracle-omits-function 7383-arrow-oracle-leaks-type-param 7069-neg-literal-const"
+  local types="7387-self-result-types 7383-arrow-param-types 7482-aliased-generic-types"
+  local ir="7408-assert-ok-nil-compare 7406-iface-implements-call 7377-append-spread-bulk-move 7387-self-result-oracle-omits-function 7383-arrow-oracle-leaks-type-param 7069-neg-literal-const 7482-aliased-generic-iface-slot"
   case "${1:-}" in
     diags) printf '%s\n' $diags ;;
     fmt) printf '%s\n' $fmt ;;
