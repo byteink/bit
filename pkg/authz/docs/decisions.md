@@ -195,6 +195,32 @@ fn main(): ()! {
 This prints `[authz] debug deny Delete on Article subject=sam policy=NoDeletes
 reason=denied by rule`. With no sink nothing is logged and no line is built.
 
+`check` is what a handler calls, and a refusal by it logs one INFO line in
+place of the debug line: `[authz] info denied action=Delete resource=Article
+subject=sam policy=NoDeletes`. It names the subject's id and the deciding
+policy and nothing else: no attribute value, no row, no request body. A row the
+subject may not read is a `NotFound` and leaves no line, because a hidden row
+is the normal outcome. A relationship store that cannot be reached logs one
+`[authz] ERROR store unavailable` line, and the client gets a 503 that names
+no store. The client sees `forbidden`, `not found` or `authorization
+unavailable` and never the policy or the table: pkg/web maps by `status()` and
+`message()`, so nothing here is registered with it.
+
+The sink is any class with `log(line: string)`. The standard library has no
+logger, so the usual one writes to stderr, and the same class can be given to
+`logTo`, to pkg/orm's `Logger` and to pkg/web's `Config.logs`, which puts the
+three logs in one stream:
+
+```bit
+class StderrLines {
+  export log(line: string) {
+    eprint(line + "\n")
+  }
+}
+```
+
+then `authz.logTo(StderrLines{})`.
+
 ## A broken rule is not a quiet no
 
 `validatePolicy` and `role` check a policy for one probe user, and a policy
