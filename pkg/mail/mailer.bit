@@ -5,6 +5,8 @@
 
 import { lookupTxt } from "std/net"
 import { now } from "std/time"
+import { Queue } from "jobs"
+import { Span } from "std/trace"
 
 // Sends mail through a transport. Build it once at startup:
 //
@@ -26,6 +28,10 @@ export class Mailer {
   name: string
   // What `Options.metrics` and `Options.tracer` record; off when neither is set.
   obs: Observer
+  // Where `send` puts mail when `Options.queue` is set, and how many deliveries
+  // the job is tried for.
+  queue: Option<Queue>
+  attempts: int
 
   init(t: Transport, opts: Options = Options{})!MailError {
     checkOptions(opts)?
@@ -46,6 +52,21 @@ export class Mailer {
     this.pace.obs = obs
     this.lookup = lookupTxt
     this.name = "transport"
+    this.queue = opts.queue
+    this.attempts = opts.retry.attempts
+    this.registerQueue()
+  }
+
+  // With `Options.queue`, teaches the queue's workers to deliver a queued send
+  // through this `Mailer`. Registering twice for one queue replaces the first,
+  // so a queue belongs to one `Mailer`.
+  registerQueue() {
+    match (this.queue) {
+      None => {}
+      Some(q) => q.register<queuedMail>((j: queuedMail) => {
+        deliverQueued(this, j)?
+      })
+    }
   }
 
   // Renders `m`, signs it with `Options.dkim` and delivers it. A message that
@@ -57,12 +78,17 @@ export class Mailer {
   // it reports them. With `Options.redirect` the transport gets the redirected
   // message (redirect.bit) and the `Receipt` lists the redirect address only.
   // With `Options.metrics` or `Options.tracer` the send is counted and traced
-  // (observe.bit).
+  // (observe.bit). With `Options.queue` the mail is only enqueued (queue.bit):
+  // the `Receipt` has `queued` set and the delivery happens on a worker.
   export send(m: Message): Receipt!MailError {
     let sp = this.obs.start("mail.send")
     let d = this.prepare(m) catch e {
       this.obs.refused(sp, e)
       fail e
+    }
+    match (this.queue) {
+      Some(q) => return this.enqueue(q, sp, d)?
+      None => {}
     }
     // The one place retries and rate apply: a queue that owns its own retries
     // (pkg/jobs) hands the transport the Delivery without going through `pace`.
@@ -70,6 +96,20 @@ export class Mailer {
       this.obs.endSend(sp, d, failure(e))
       fail e
     }
+    this.obs.endSend(sp, d, success(r))
+    return r
+  }
+
+  // Puts `d` on `q` and reports it queued. A queue that cannot take it fails
+  // `Transient`, the mail having gone nowhere, so the caller may send again.
+  enqueue(q: Queue, sp: Option<Span>, d: Delivery): Receipt!MailError {
+    q.enqueue(queuedMailOf(d, !this.t.signs()), 0, this.attempts) catch e {
+      let refusal = MailError.Transient(Reply{ text = "queue: ${e.message()}" })
+      this.obs.refused(sp, refusal)
+      fail refusal
+    }
+    let r = Receipt{ id = d.messageId, queued = true }
+    this.obs.count(this.obs.scheme, success(r))
     this.obs.endSend(sp, d, success(r))
     return r
   }

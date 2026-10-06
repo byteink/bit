@@ -1,0 +1,471 @@
+// pkg/mail/queue.test.bit — `Options.queue`: a send is enqueued before any
+// transport is called, a worker delivers it through the same transport, a
+// `Transient` delivery is retried with the same bytes, a permanent refusal and
+// an `Unknown` outcome go to the dead-letter list on the first attempt, and a
+// message that is refused fails in the caller with nothing enqueued. The store
+// is an in-memory `Store` whose retries come due at once, so no test waits for
+// pkg/jobs' backoff; it records what pkg/jobs asked for.
+
+import { Mutex } from "std/sync"
+import { contains, join } from "std/strings"
+import { Millisecond, now, sleep, parseRfc3339 } from "std/time"
+import { Registry } from "std/metrics"
+import { jsonParse, jsonGet, jsonAsString } from "std/json"
+import { Queue, ClaimedJob, Store, Options as JobsOptions, open as openQueue } from "jobs"
+
+class quRow {
+  id: int,
+  name: string,
+  payload: string,
+  attempts: int,
+  maxAttempts: int,
+  availableAt: int,
+  done: bool,
+  dead: bool,
+  reason: string,
+}
+
+class quStore {
+  rows: []quRow
+  mu: Mutex
+  // The delay pkg/jobs asked for on each retry, in nanoseconds from now.
+  delays: []int
+  refuse: bool
+
+  enqueue(name: string, payload: string, availableAt: int, maxAttempts: int): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (this.refuse) {
+      fail newError("store is down")
+    }
+    this.rows = append(
+      this.rows,
+      quRow{
+        id = len(this.rows) + 1, name = name, payload = payload, attempts = 0,
+        maxAttempts = maxAttempts, availableAt = availableAt, done = false, dead = false,
+        reason = "",
+      },
+    )
+  }
+
+  claim(visibilityTimeout: int): Option<ClaimedJob>! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let at = now().ns
+    let i = 0
+    while (i < len(this.rows)) {
+      let r = this.rows[i]
+      if (!r.done && !r.dead && r.availableAt <= at) {
+        r.attempts = r.attempts + 1
+        r.availableAt = at + visibilityTimeout
+        this.rows[i] = r
+        return Option.Some(
+          ClaimedJob{
+            id = r.id, name = r.name, payload = r.payload, attempts = r.attempts,
+            maxAttempts = r.maxAttempts,
+          },
+        )
+      }
+      i = i + 1
+    }
+    return Option.None
+  }
+
+  complete(id: int): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let r = this.rows[id - 1]
+    r.done = true
+    this.rows[id - 1] = r
+  }
+
+  retry(id: int, availableAt: int): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.delays = append(this.delays, availableAt - now().ns)
+    let r = this.rows[id - 1]
+    r.availableAt = 0
+    this.rows[id - 1] = r
+  }
+
+  deadLetter(id: int, reason: string): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let r = this.rows[id - 1]
+    r.dead = true
+    r.reason = reason
+    this.rows[id - 1] = r
+  }
+
+  row(id: int): quRow {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.rows[id - 1]
+  }
+
+  count(): int {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return len(this.rows)
+  }
+
+  settled(): bool {
+    this.mu.lock()
+    defer this.mu.unlock()
+    for r of this.rows {
+      if (!r.done && !r.dead) {
+        return false
+      }
+    }
+    return true
+  }
+}
+
+fn quStoreNew(): quStore {
+  return quStore{ rows = []quRow(0), mu = Mutex(), delays = []int(0), refuse = false }
+}
+
+// A transport that answers with `fails[n]` on its n-th delivery, then takes the
+// mail, and keeps every Delivery it was given. `sign` is what `signs()` says.
+class quScript {
+  fails: []MailError
+  seen: []Delivery
+  mu: Mutex
+  sign: bool
+
+  deliver(d: Delivery): Receipt!MailError {
+    this.mu.lock()
+    let n = len(this.seen)
+    this.seen = append(this.seen, d)
+    this.mu.unlock()
+    if (n < len(this.fails)) {
+      fail this.fails[n]
+    }
+    return Receipt{ id = d.messageId, accepted = d.envelope.to }
+  }
+
+  calls(): int {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return len(this.seen)
+  }
+
+  signs(): bool {
+    return this.sign
+  }
+
+  check(): ()!MailError {}
+
+  close() {}
+}
+
+fn quTransport(fails: []MailError): quScript {
+  return quScript{ fails = fails, seen = []Delivery(0), mu = Mutex(), sign = true }
+}
+
+fn quQueue(store: Store): Queue {
+  return openQueue(store, JobsOptions{ workers = 1, pollInterval = 2 * Millisecond }) catch e {
+    panic("open: ${e.message()}")
+  }
+}
+
+fn quMailer(t: Transport, q: Queue, o: Options): Mailer {
+  o.from = "Inkwell <hello@inkwell.dev>"
+  o.queue = Option.Some(q)
+  return Mailer(t, o) catch e {
+    panic("Mailer: ${e.message()}")
+  }
+}
+
+fn quMessage(): Message {
+  return Message{
+    to = ["Sara Ali <sara@example.com>"],
+    subject = "Welcome to Inkwell",
+    text = "Hello Sara.",
+    id = "welcome-1",
+  }
+}
+
+fn quSend(m: Mailer): Receipt {
+  return m.send(quMessage()) catch e {
+    panic("send: ${e.message()}")
+  }
+}
+
+// The text of the failure of `m.send(msg)`, or "ok".
+fn quFailure(m: Mailer, msg: Message): string {
+  m.send(msg) catch e {
+    return e.message()
+  }
+  return "ok"
+}
+
+// The text of the failure of `Mailer(t, o)`, or "ok".
+fn quConfig(o: Options): string {
+  Mailer(quTransport([]), o) catch e {
+    return e.message()
+  }
+  return "ok"
+}
+
+// Runs the queue's worker until every row is done or dead-lettered, at most 5 s.
+fn quDrain(q: Queue, store: quStore) {
+  q.start()
+  let waited = 0
+  while (!store.settled() && waited < 5000) {
+    sleep(2 * Millisecond)
+    waited = waited + 2
+  }
+  q.stop()
+  assert(store.settled(), "the worker did not settle the queue in 5 s")
+}
+
+test "send enqueues and returns queued before the transport is called" {
+  let store = quStoreNew()
+  let q = quQueue(store)
+  let t = quTransport([])
+  let m = quMailer(t, q, Options{})
+  let r = quSend(m)
+  assert(r.queued, "Receipt.queued is false")
+  assert(r.id == "<welcome-1@inkwell.dev>", r.id)
+  assert(t.calls() == 0, "the transport was called by send")
+  assert(store.count() == 1, "rows: ${store.count()}")
+  assert(store.row(1).name == "bitlang.mail.send", store.row(1).name)
+  quDrain(q, store)
+  assert(t.calls() == 1, "deliveries: ${t.calls()}")
+  assert(store.row(1).done, "the job was not completed")
+  assert(contains(t.seen[0].raw, "Hello Sara."), "raw lost the body")
+  assert(t.seen[0].messageId == "<welcome-1@inkwell.dev>", t.seen[0].messageId)
+  assert(
+    join(t.seen[0].envelope.to, ",") == "sara@example.com",
+    "envelope: ${join(t.seen[0].envelope.to, ",")}",
+  )
+}
+
+test "Transient twice then success delivers three times, the same bytes each time" {
+  let store = quStoreNew()
+  let q = quQueue(store)
+  let later = MailError.Transient(Reply{ code = 451, text = "try later" })
+  let t = quTransport([later, later])
+  let m = quMailer(t, q, Options{})
+  let _ = quSend(m)
+  quDrain(q, store)
+  assert(t.calls() == 3, "deliveries: ${t.calls()}")
+  assert(
+    t.seen[1].raw == t.seen[0].raw && t.seen[2].raw == t.seen[0].raw,
+    "the bytes changed between attempts",
+  )
+  assert(t.seen[2].messageId == t.seen[0].messageId, "the Message-ID changed between attempts")
+  let row = store.row(1)
+  assert(row.done && !row.dead, "done ${row.done} dead ${row.dead}")
+  assert(row.attempts == 3, "attempts: ${row.attempts}")
+  assert(len(store.delays) == 2, "pkg/jobs retried ${len(store.delays)} times")
+  assert(store.delays[0] < 1100000000, "first backoff ${store.delays[0]}")
+}
+
+test "Rejected is dead-lettered after one attempt" {
+  let store = quStoreNew()
+  let q = quQueue(store)
+  let t = quTransport([MailError.Rejected(Reply{ code = 550, text = "no such user" })])
+  let m = quMailer(t, q, Options{})
+  let _ = quSend(m)
+  quDrain(q, store)
+  let row = store.row(1)
+  assert(row.dead && !row.done, "dead ${row.dead} done ${row.done}")
+  assert(row.attempts == 1, "attempts: ${row.attempts}")
+  assert(contains(row.reason, "550"), row.reason)
+  assert(t.calls() == 1, "deliveries: ${t.calls()}")
+}
+
+test "Auth is dead-lettered after one attempt" {
+  let store = quStoreNew()
+  let q = quQueue(store)
+  let t = quTransport([MailError.Auth(Reply{ code = 535, text = "bad login" })])
+  let m = quMailer(t, q, Options{})
+  let _ = quSend(m)
+  quDrain(q, store)
+  assert(
+    store.row(1).dead && store.row(1).attempts == 1,
+    "dead ${store.row(1).dead} attempts ${store.row(1).attempts}",
+  )
+}
+
+test "Unknown is dead-lettered after one attempt, never repeated" {
+  let store = quStoreNew()
+  let q = quQueue(store)
+  let t = quTransport([MailError.Unknown(Reply{ text = "connection reset" })])
+  let m = quMailer(t, q, Options{})
+  let _ = quSend(m)
+  quDrain(q, store)
+  let row = store.row(1)
+  assert(row.dead && row.attempts == 1, "dead ${row.dead} attempts ${row.attempts}")
+  assert(contains(row.reason, "may have been delivered"), row.reason)
+  assert(contains(row.reason, "connection reset"), row.reason)
+  assert(t.calls() == 1, "deliveries: ${t.calls()}")
+}
+
+test "Options.retry.attempts is the job's attempt limit" {
+  let store = quStoreNew()
+  let q = quQueue(store)
+  let later = MailError.Transient(Reply{ code = 451, text = "try later" })
+  let t = quTransport([later, later, later, later])
+  let m = quMailer(t, q, Options{ retry = Retry{ attempts = 2 } })
+  let _ = quSend(m)
+  assert(store.row(1).maxAttempts == 2, "maxAttempts: ${store.row(1).maxAttempts}")
+  quDrain(q, store)
+  assert(t.calls() == 2, "deliveries: ${t.calls()}")
+  assert(store.row(1).dead, "the job was not dead-lettered after its last attempt")
+}
+
+test "a message with no recipient fails in the caller and enqueues nothing" {
+  let store = quStoreNew()
+  let q = quQueue(store)
+  let t = quTransport([])
+  let m = quMailer(t, q, Options{})
+  let got = quFailure(m, Message{ subject = "Hi", text = "Hello" })
+  assert(contains(got, "recipient"), got)
+  assert(store.count() == 0, "rows: ${store.count()}")
+  assert(t.calls() == 0, "the transport was called")
+}
+
+test "a store that is down fails the send Transient" {
+  let store = quStoreNew()
+  store.refuse = true
+  let q = quQueue(store)
+  let m = quMailer(quTransport([]), q, Options{})
+  let got = quFailure(m, quMessage())
+  assert(contains(got, "temporary failure") && contains(got, "store is down"), got)
+}
+
+test "a transport that builds the mail itself gets the whole Message back" {
+  let store = quStoreNew()
+  let q = quQueue(store)
+  let t = quTransport([])
+  t.sign = false
+  let m = quMailer(t, q, Options{})
+  let start = parseRfc3339("2026-10-12T09:00:00Z") catch _ {
+    panic("time")
+  }
+  let end = parseRfc3339("2026-10-12T09:30:00Z") catch _ {
+    panic("time")
+  }
+  let sent = Message{
+    to = ["Sara Ali <sara@example.com>"],
+    cc = ["kim@example.com"],
+    bcc = ["audit@inkwell.dev"],
+    subject = "Welcome to Inkwell",
+    text = "Hello Sara.",
+    html = "<p>Hello <img src=\"cid:logo\"></p>",
+    attachments = [Attachment{ name = "logo.png", data = [0, 1, 254, 255], cid = "logo" }],
+    headers = { "X-Run": "7" },
+    tags = { "campaign": "welcome" },
+    unsubscribe = Unsubscribe{ url = "https://inkwell.dev/u/7f3a9c" },
+    id = "welcome-2",
+    invite = Option<Invite>.Some(
+      Invite{
+        uid = "u1@inkwell.dev", start = start, end = end, summary = "Standup",
+        method = Method.Cancel, sequence = 2,
+      },
+    ),
+  }
+  m.send(sent) catch e {
+    panic("send: ${e.message()}")
+  }
+  quDrain(q, store)
+  assert(t.calls() == 1, "deliveries: ${t.calls()}")
+  let got = t.seen[0].message
+  assert(
+    got.subject == sent.subject && got.html == sent.html && got.id == "welcome-2",
+    "text fields",
+  )
+  assert(len(got.attachments) == 1, "attachments: ${len(got.attachments)}")
+  let a = got.attachments[0]
+  assert(a.name == "logo.png" && a.cid == "logo", "attachment ${a.name} ${a.cid}")
+  assert(
+    len(a.data) == 4 && a.data[0] == 0 && a.data[2] == 254 && a.data[3] == 255,
+    "attachment bytes",
+  )
+  assert(got.headers["X-Run"] == "7" && got.tags["campaign"] == "welcome", "maps")
+  assert(got.unsubscribe.url == "https://inkwell.dev/u/7f3a9c", "unsubscribe")
+  assert(
+    join(got.bcc, ",") == "audit@inkwell.dev" && join(got.cc, ",") == "kim@example.com",
+    "recipients",
+  )
+  match (got.invite) {
+    None => panic("the invite was lost")
+    Some(v) => {
+      assert(v.uid == "u1@inkwell.dev" && v.sequence == 2, "invite ${v.uid} ${v.sequence}")
+      assert(v.start.ns == start.ns && v.end.ns == end.ns, "invite times")
+      assert(v.method == Method.Cancel, "invite method")
+    }
+  }
+}
+
+test "a transport that sends the bytes as they are gets no second copy of the Message" {
+  let store = quStoreNew()
+  let q = quQueue(store)
+  let m = quMailer(quTransport([]), q, Options{})
+  let _ = quSend(m)
+  assert(contains(store.row(1).payload, "\"message\":null"), store.row(1).payload)
+}
+
+test "metrics count the enqueue as queued and the worker's delivery under its own result" {
+  let store = quStoreNew()
+  let q = quQueue(store)
+  let reg = Registry(100)
+  let t = quTransport([MailError.Transient(Reply{ code = 451, text = "try later" })])
+  let m = quMailer(t, q, Options{ metrics = Option.Some(reg) })
+  let _ = quSend(m)
+  let before = reg.exposition()
+  assert(contains(before, "mail_sent_total{transport=\"custom\",result=\"queued\"} 1"), before)
+  assert(!contains(before, "result=\"ok\""), before)
+  quDrain(q, store)
+  let after = reg.exposition()
+  assert(contains(after, "mail_sent_total{transport=\"custom\",result=\"transient\"} 1"), after)
+  assert(contains(after, "mail_sent_total{transport=\"custom\",result=\"ok\"} 1"), after)
+  assert(contains(after, "mail_sent_total{transport=\"custom\",result=\"queued\"} 1"), after)
+}
+
+test "Options.retry.base and max are refused with a queue, they would be ignored" {
+  let q = quQueue(quStoreNew())
+  let got = quConfig(
+    Options{ queue = Option.Some(q), retry = Retry{ attempts = 3, base = 5, max = 50 } },
+  )
+  assert(
+    contains(got, "Options.retry.base and Options.retry.max do not apply with Options.queue"),
+    got,
+  )
+  assert(
+    quConfig(Options{ queue = Option.Some(q), retry = Retry{ attempts = 4 } }) == "ok",
+    "attempts alone is accepted",
+  )
+}
+
+test "non-ASCII text and a binary attachment reach the worker as the bytes that were enqueued" {
+  let store = quStoreNew()
+  let q = quQueue(store)
+  let t = quTransport([])
+  let m = quMailer(t, q, Options{})
+  let sent = Message{
+    to = ["Sara Ali <sara@example.com>"],
+    subject = "Willkommen, Zoë ☃",
+    text = "héllo ☃ 你好 \"quoted\" \\ back",
+    attachments = [
+      Attachment{
+        name = "a.bin",
+        data = [0, 255, 10, 13, 128],
+        contentType = "application/octet-stream",
+      },
+    ],
+  }
+  m.send(sent) catch e {
+    panic("send: ${e.message()}")
+  }
+  let payload = jsonParse(store.row(1).payload) catch e {
+    panic("payload: ${e.message()}")
+  }
+  let queued = unwrap(jsonAsString(unwrap(jsonGet(payload, "raw"))))
+  quDrain(q, store)
+  assert(t.calls() == 1, "deliveries: ${t.calls()}")
+  assert(t.seen[0].raw == queued, "the worker's bytes differ from the enqueued ones")
+}

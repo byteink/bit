@@ -1,0 +1,261 @@
+// pkg/mail/queue.bit — `Options.queue`: every send made durable through
+// pkg/jobs, see docs/queue.md.
+//
+// `send` still validates, renders and signs in the caller, so a developer's
+// mistake (no recipient, a bad address, a From that aligns with no DKIM key)
+// fails where it was made and nothing is enqueued. What goes into the queue is
+// the finished `Delivery`: the exact bytes, the envelope and the Message-ID,
+// so every attempt, on whichever worker, sends the same mail and an API
+// transport's idempotency key (the Message-ID) is the same on every try. A
+// worker builds a `Delivery` back from the job and hands it to the same
+// transport chain; the retries a `Mailer` makes itself (`Options.retry`) are
+// off, because pkg/jobs backs off between attempts and counts them.
+//
+// What the worker's failure means to pkg/jobs:
+//   * `Transient`: the job fails and pkg/jobs retries it with its backoff.
+//   * `Unknown`: the provider may already have taken the mail, and sending it
+//     again can deliver it twice, so it is not retried. It is dead-lettered with
+//     the reason; whoever reads the list decides.
+//   * everything else (`Rejected`, `Auth`, `Invalid`, `Config`): the same answer
+//     next time, dead-lettered on the first attempt.
+
+import { PermanentFailure } from "jobs"
+import { Envelope } from "std/smtp"
+import { Timestamp, parseRfc3339 } from "std/time"
+import { encodeBase64, decodeBase64 } from "std/crypto"
+
+// An attachment as a job carries it. `@json` writes a `[]byte` as an array of
+// numbers, so the bytes travel as base64 text instead.
+@json class queuedAttachment {
+  name: string,
+  data: string,
+  contentType: string,
+  cid: string,
+}
+
+// An invite as a job carries it; `start` and `end` are RFC 3339 text.
+@json class queuedInvite {
+  uid: string,
+  start: string,
+  end: string,
+  summary: string,
+  location: string,
+  description: string,
+  organizer: string,
+  attendees: []string,
+  method: Method,
+  sequence: int,
+}
+
+// The `Message` a transport that builds the mail itself (an API) reads, in the
+// shapes `@json` accepts.
+@json class queuedMessage {
+  from: string,
+  to: []string,
+  cc: []string,
+  bcc: []string,
+  replyTo: []string,
+  subject: string,
+  text: string,
+  html: string,
+  attachments: []queuedAttachment,
+  headers: map<string, string>,
+  unsubscribeUrl: string,
+  unsubscribeMailto: string,
+  tags: map<string, string>,
+  inReplyTo: string,
+  references: []string,
+  id: string,
+  invite: Option<queuedInvite>,
+}
+
+// One send, as the queue stores it. `message` is set only when the transport
+// does not send `raw` as it is (`Transport.signs()` false): the others never
+// read it, and carrying every attachment twice would double the row.
+@job("bitlang.mail.send") @json class queuedMail {
+  raw: string,
+  messageId: string,
+  from: string,
+  to: []string,
+  message: Option<queuedMessage>,
+}
+
+fn queuedAttachmentOf(a: Attachment): queuedAttachment {
+  return queuedAttachment{
+    name = a.name,
+    data = encodeBase64(a.data),
+    contentType = a.contentType,
+    cid = a.cid,
+  }
+}
+
+fn queuedInviteOf(v: Invite): queuedInvite {
+  return queuedInvite{
+    uid = v.uid,
+    start = v.start.toString(),
+    end = v.end.toString(),
+    summary = v.summary,
+    location = v.location,
+    description = v.description,
+    organizer = v.organizer,
+    attendees = v.attendees,
+    method = v.method,
+    sequence = v.sequence,
+  }
+}
+
+fn queuedMessageOf(m: Message): queuedMessage {
+  let attachments: []queuedAttachment = []
+  for a of m.attachments {
+    attachments = append(attachments, queuedAttachmentOf(a))
+  }
+  let invite: Option<queuedInvite> = Option.None
+  match (m.invite) {
+    Some(v) => invite = Option.Some(queuedInviteOf(v))
+    None => {}
+  }
+  return queuedMessage{
+    from = m.from,
+    to = m.to,
+    cc = m.cc,
+    bcc = m.bcc,
+    replyTo = m.replyTo,
+    subject = m.subject,
+    text = m.text,
+    html = m.html,
+    attachments = attachments,
+    headers = m.headers,
+    unsubscribeUrl = m.unsubscribe.url,
+    unsubscribeMailto = m.unsubscribe.mailto,
+    tags = m.tags,
+    inReplyTo = m.inReplyTo,
+    references = m.references,
+    id = m.id,
+    invite = invite,
+  }
+}
+
+// The job for `d`. A transport that sends `raw` as it is needs no `Message`.
+fn queuedMailOf(d: Delivery, withMessage: bool): queuedMail {
+  let msg: Option<queuedMessage> = Option.None
+  if (withMessage) {
+    msg = Option.Some(queuedMessageOf(d.message))
+  }
+  return queuedMail{
+    raw = d.raw,
+    messageId = d.messageId,
+    from = d.envelope.from,
+    to = d.envelope.to,
+    message = msg,
+  }
+}
+
+fn attachmentOf(q: queuedAttachment): Attachment!MailError {
+  let bytes = decodeBase64(q.data) catch e {
+    fail MailError.Invalid("queued attachment ${q.name}: ${e.message()}")
+  }
+  return Attachment{ name = q.name, data = bytes, contentType = q.contentType, cid = q.cid }
+}
+
+fn timestampOf(field: string, s: string): Timestamp!MailError {
+  return parseRfc3339(s) catch e {
+    fail MailError.Invalid("queued invite ${field}: ${e.message()}")
+  }
+}
+
+fn inviteOf(q: queuedInvite): Invite!MailError {
+  return Invite{
+    uid = q.uid,
+    start = timestampOf("start", q.start)?,
+    end = timestampOf("end", q.end)?,
+    summary = q.summary,
+    location = q.location,
+    description = q.description,
+    organizer = q.organizer,
+    attendees = q.attendees,
+    method = q.method,
+    sequence = q.sequence,
+  }
+}
+
+fn messageOf(q: queuedMessage): Message!MailError {
+  let attachments: []Attachment = []
+  for a of q.attachments {
+    attachments = append(attachments, attachmentOf(a)?)
+  }
+  let invite: Option<Invite> = Option.None
+  match (q.invite) {
+    Some(v) => invite = Option.Some(inviteOf(v)?)
+    None => {}
+  }
+  return Message{
+    from = q.from,
+    to = q.to,
+    cc = q.cc,
+    bcc = q.bcc,
+    replyTo = q.replyTo,
+    subject = q.subject,
+    text = q.text,
+    html = q.html,
+    attachments = attachments,
+    headers = q.headers,
+    unsubscribe = Unsubscribe{ url = q.unsubscribeUrl, mailto = q.unsubscribeMailto },
+    tags = q.tags,
+    inReplyTo = q.inReplyTo,
+    references = q.references,
+    id = q.id,
+    invite = invite,
+  }
+}
+
+// The `Delivery` a worker hands the transport. Without a stored `Message` the
+// transport is one that sends `raw` as it is, and a `Message` carrying the
+// recipients is all a log or a file needs of it.
+fn deliveryOf(j: queuedMail): Delivery!MailError {
+  let msg = Message{ from = j.from, to = j.to }
+  match (j.message) {
+    Some(q) => msg = messageOf(q)?
+    None => {}
+  }
+  return Delivery{
+    message = msg,
+    envelope = Envelope{ from = j.from, to = j.to },
+    messageId = j.messageId,
+    raw = j.raw,
+  }
+}
+
+// What pkg/jobs is told about a failed delivery: `Transient` is handed back
+// as it is, so the job is retried; every other kind is permanent, and `Unknown`
+// must be, since a repeat can deliver the mail twice.
+fn jobFailure(e: MailError): error {
+  match (e) {
+    Transient(_) => return e
+    _ => return PermanentFailure{ reason = e.message() }
+  }
+}
+
+// Refuses an `Options` that sets `queue` and a `retry` it would ignore. The
+// attempts are the job's `maxAttempts`; pkg/jobs' backoff replaces the waits.
+fn checkQueue(o: Options): ()!MailError {
+  match (o.queue) {
+    None => return
+    Some(_) => {}
+  }
+  let r = o.retry
+  let def = Retry{}
+  if (r.base != def.base || r.max != def.max) {
+    fail MailError.Config("Options.retry.base and Options.retry.max do not apply with Options.queue: pkg/jobs backs off between attempts; set Options.retry.attempts alone")
+  }
+}
+
+// The job `Mailer` registers on its queue: delivers one queued send, once,
+// through the same transport and pace as an inline one.
+fn deliverQueued(m: Mailer, j: queuedMail): ()! {
+  let d = deliveryOf(j) catch e {
+    fail jobFailure(e)
+  }
+  m.pace.once(m.t, d) catch e {
+    fail jobFailure(e)
+  }
+}
