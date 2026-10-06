@@ -301,24 +301,30 @@
 #
 # Declared (#7069) against the 0.39.0 oracle; retires at the next repin. One signature, in the
 # `ir` and `iropt` kinds. #7069 lowers `-N` for an integer literal to the one `const_int T -N`;
-# the oracle emits `neg T (const_int T N)`. The identity is exact over the FULL dumps (see
-# ir-signatures-walk.sh): constants are erased, and each oracle `neg` of a literal that fits T is
-# replaced by the literal `-N`, as is a negative switch label, so a run of labels the oracle kept
-# as an icmp_eq/bor chain (`case -5, -4, -3:`) becomes the `sub`/`icmp_ule` range test #7058
-# emits. Every function must then agree byte for byte, so a second, unrelated difference on an
-# explained file still fails.
+# the oracle emits `%a = const_int T N` then `%b = neg T %a`. Constant VALUES are never erased:
 #
-#   7069-neg-literal-const (`ir`, `iropt`). Files: ir_switch_case_range, run_switch_range,
-#     run_debug_neg_literal_min, run_slice_lit_inline_fill, run_slice_u8_store_inline,
-#     decimal_to_int_roundtrip and 121 more that hold a negative literal: 127 files, 127 `ir`
-#     rows and 31 `iropt` rows over `stdlib examples _tests_/cases _tests_/imports`. Post-opt the oracle
-#     folds `neg` of a literal itself, so there only the place the constant is defined differs and
-#     the erasure removes it. The one exception is the type minimum (`-9223372036854775808`,
-#     `-128`): the oracle cannot fold its `neg`, the tree has a constant and folds what follows
-#     it, so in `iropt` a function whose oracle text keeps such a `neg` is compared by header only,
-#     like 7383 above, and its body is proven by the `ir` row. A function that agrees once constants
-#     are erased and ids renumbered, with none of the other named rewrites firing, is explained by
-#     this name too: that is the `iropt` shape above, where only constant placement moved.
+#   ir. Every function of the oracle dump must equal the tree's byte for byte after ids are
+#     renumbered and two folds are applied to the ORACLE text: (1) a `const_int T N` directly
+#     followed by the `neg T` that alone uses it becomes the one `const_int T -N` (same signed
+#     type, exact negation; the minimum of T negates to itself, and a value that does not fit T
+#     is not folded); (2) the icmp_eq/bor chain over constants that forms one contiguous run with
+#     at least one negative label, which the oracle could not range because a label was a `neg`,
+#     becomes the const/sub/const/icmp_ule range test #7058 emits, the label constants kept. At
+#     least one fold must fire, so a changed constant, a dropped `neg` of a non-literal or any
+#     other difference fails.
+#   iropt. Given the pre-opt dumps of the same file (explainMismatch's fifth and sixth
+#     arguments, which selfhost-diffdump.sh supplies) and the `ir` proof of the whole file, each
+#     function must agree once constants are erased from the text and ids renumbered AND hold the
+#     same set of distinct (type, value) const_int pairs. Where the oracle function holds a `neg`
+#     of the exact minimum of a type (`-128` for i8, ...), which it cannot fold, the tree folds
+#     what follows it and the bodies cannot match: that function alone is compared by header,
+#     its body being the one the `ir` proof covers.
+#
+#   7069-neg-literal-const. Files, measured against the 0.39.0 oracle over `stdlib examples
+#     _tests_/cases _tests_/imports` (the differentials' corpus, with their skip rules): 127
+#     files, 127 `ir` and 31 `iropt` rows, among them ir_switch_case_range, run_switch_range,
+#     run_debug_neg_literal_min, run_slice_lit_inline_fill, run_slice_u8_store_inline and
+#     decimal_to_int_roundtrip. A file that also holds another named lag below keeps that name.
 #
 # shellcheck source=scripts/ir-signatures-walk.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-walk.sh"
@@ -441,14 +447,15 @@ explainFmtJsxApostrophe() {
   ' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
 }
 
-# explainIrLag <oracle_ir> <tree_ir> <ir|iropt> -- the five `ir`/`iropt` signatures above,
-# via IR_WALK_AWK (ir-signatures-walk.sh). Prints the name and returns 0, or prints nothing
-# and returns 1.
+# explainIrLag <oracle_ir> <tree_ir> <ir|iropt> [<oracle_ir_pre> <tree_ir_pre>] -- the six `ir`/`iropt`
+# signatures above, via IR_WALK_AWK (ir-signatures-walk.sh). The two pre-opt dumps of the same file
+# are read only for `iropt`, by 7069-neg-literal-const, which holds an optimized dump to the exact
+# pre-opt proof. Prints the name and returns 0, or prints nothing and returns 1.
 explainIrLag() {
-  LC_ALL=C awk -v kind="$3" "${IR_WALK_AWK}" <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
+  LC_ALL=C awk -v kind="$3" "${IR_WALK_AWK}" <(printf '%s\n@@@BIT2@@@\n%s\n@@@PREA@@@\n%s\n@@@PREB@@@\n%s\n' "$1" "$2" "${4:-}" "${5:-}")
 }
 
-# explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
+# explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file [oracle_pre tree_pre]]
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. `file` is the
 # input the tree ran on, read only by the `diags` panic arm.
@@ -457,7 +464,7 @@ explainMismatch() {
     diags) explainDiagsLag "$1" "$2" "${4:-}"; return ;;
     fmt) explainFmtJsxApostrophe "$1" "$2"; return ;;
     types) explainLagTypes "$1" "$2"; return ;;
-    ir|iropt) explainIrLag "$1" "$2" "$3"; return ;;
+    ir|iropt) explainIrLag "$1" "$2" "$3" "${5:-}" "${6:-}"; return ;;
   esac
   return 1
 }

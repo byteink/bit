@@ -585,7 +585,14 @@ run_ir() {
       # above explainMismatch). Only an UNEXPLAINED divergence is a
       # regression — this is the #3125 fix, so a real lowering improvement
       # like #3107's no longer fails this gate by construction.
-      sig=$(explainMismatch "$want" "$b2" "$NAME" "$f")
+      # `iropt` is also given the file's two pre-opt dumps: 7069-neg-literal-const
+      # explains an optimized dump only on top of the exact pre-opt proof.
+      preo=""; pret=""
+      if [ "$NAME" = iropt ]; then
+        preo=$("$ORACLE" --dump-ir-pre "$f" 2>&1)
+        pret=$("$BIT2" --dump-ir-pre "$f" 2>&1)
+      fi
+      sig=$(explainMismatch "$want" "$b2" "$NAME" "$f" "$preo" "$pret")
       if [ -n "$sig" ]; then
         echo "$f${sep}explained by declared signature '$sig'" >>"$work/explained"
       else
