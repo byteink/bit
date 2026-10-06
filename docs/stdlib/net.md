@@ -85,6 +85,36 @@ side's own deadline elapsed, rather than the peer closing cleanly. Every
 `read()` call overwrites it, so it is meaningful only right after one -
 meaningless before the first `read()` on this `Conn`.
 
+### `Conn.readInto(buf: []byte, max: int): int!`
+
+`read` allocates a fresh buffer and a fresh string on every call. A loop that
+reads a long stream pays for both on every pass. `readInto` reads into a buffer
+the caller owns and reuses, and allocates nothing in proportion to the data.
+It returns how many bytes landed at `buf[0:n]`, with `0` for a clean close.
+
+It reads at most `max` bytes, and never more than `len(buf)` whatever `max`
+says. The next call overwrites `buf`, so take the bytes out first. A hard I/O
+error fails `"read failed"`. With a deadline set (`setDeadline`) it behaves as
+`readDeadlineInto` does, and an elapsed deadline fails `"read timed out"`.
+Use it instead of `read` when you want bytes, not a `string`, or when the
+read runs once per request:
+
+```bit
+import { Conn } from "std/net"
+
+// Count a stream's bytes through one reused 4 KiB buffer.
+fn countBytes(c: Conn): int! {
+  let buf = []byte(4096)
+  let total = 0
+  let n = c.readInto(buf, len(buf))?
+  while (n > 0) {
+    total = total + n
+    n = c.readInto(buf, len(buf))?
+  }
+  return total
+}
+```
+
 ### `Conn.write(s: string): ()!`
 
 Writes all of `s`, parking until every byte is written or, once

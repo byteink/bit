@@ -237,6 +237,32 @@ Reads up to `n` plaintext bytes.
 
 Writes plaintext; it leaves the connection encrypted.
 
+### `TlsConn.readInto(buf: []byte, max: int): int!`
+
+`read` returns a fresh slice on every call. `readInto` copies the next
+plaintext into a buffer the caller owns and reuses: up to `max` bytes, never
+more than `len(buf)`, landing at `buf[0:n]`. It allocates nothing in proportion
+to the data, and `0` is the end of the stream, as an empty `read` is. Like
+`read`, it runs the handshake first if that has not happened yet. The next
+call overwrites `buf`, so take the bytes out before calling again. Use it
+for a long stream or a per-request read loop:
+
+```bit
+import { TlsConn } from "std/tls"
+
+// Count the bytes of a stream through one reused buffer.
+fn countBytes(c: TlsConn): int! {
+  let buf = []byte(4096)
+  let total = 0
+  let n = c.readInto(buf, len(buf))?
+  while (n > 0) {
+    total = total + n
+    n = c.readInto(buf, len(buf))?
+  }
+  return total
+}
+```
+
 ### `TlsConn.close()`
 
 Closes the connection.
