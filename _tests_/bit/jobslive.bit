@@ -1,12 +1,12 @@
 // _tests_/bit/jobslive.bit — `./make test-package-jobs-live` (#6082, epic
-// #4023, #7320). Provisions its OWN throwaway PostgreSQL AND MySQL 8
-// containers (the same pattern as `redislive.bit`, #6021, and `ormlive.bit`):
+// #4023, #7320, #7436). Provisions its OWN throwaway PostgreSQL, MySQL 8 AND
+// MariaDB 11 containers (the same pattern as `redislive.bit`, #6021, and `ormlive.bit`):
 // `docker run --rm -d`, readiness polled with `pg_isready` / `mysqladmin
-// ping`, each URL handed in turn as argv to `_tests_/bit/jobslive/main.bit`
+// ping` / `mariadb-admin ping`, each URL handed in turn as argv to `_tests_/bit/jobslive/main.bit`
 // (run from a generated scratch project, see `writeScratchProject` below),
 // then always removed. `main.bit` runs the same `Store`/`Locker` conformance
 // suite (`_tests_/bit/jobslive/conformance.bit`) and the same scheduler proofs
-// against both engines; the gate fails if either fails. `pkg/jobs`'s
+// against every engine; the gate fails if any fails. `pkg/jobs`'s
 // `interface Job` declares a `static` requirement (#6091).
 //
 // IMAGE: `postgres:18.6` (the newest 18.x patch as of 2026-09-28 per Docker
@@ -22,6 +22,10 @@
 // already pin (the current 8.4 LTS). The MySQL 5.7 refusal is not run live: the
 // image has no arm64 build, and `pkg/jobs/sql.test.bit` proves the refusal
 // against a server that reports `5.7.44`.
+//
+// MARIADB IS `mariadb:11.8`, the newest 11.x long-term-support series (11.4 is
+// the previous one); MariaDB has had `SKIP LOCKED` since 10.6, the floor
+// `pkg/jobs/sql.test.bit` proves against a server that reports `10.5.27`.
 //
 // THE IMAGE ITSELF IS KEPT, never deleted (redislive.bit's own header: not
 // a one-off throwaway install, this gate depends on it every run). Only the
@@ -45,6 +49,10 @@
 //              no container (Docker is not needed). The databases must be empty
 //              or hold only this suite's own tables; the URIs are the same
 //              shape `main.bit` takes as argv.
+//   BIT_JOBS_LIVE_MARIADB_URI
+//              optional, only with the two above: a `mysql://` URI of a MariaDB
+//              server, run as a third engine. Unset, the run says it skipped
+//              MariaDB.
 
 import { output } from "std/process"
 import { env, envOr, exit } from "std/os"
@@ -58,10 +66,12 @@ import {
 
 const image: string = "postgres@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"
 const myImage: string = "mysql:8.4"
+const mariaImage: string = "mariadb:11.8"
 const myRootPassword: string = "bit-jobs-live-pw"
 const myDatabase: string = "jobs_live"
 const pgUriVar: string = "BIT_JOBS_LIVE_PG_URI"
 const myUriVar: string = "BIT_JOBS_LIVE_MYSQL_URI"
+const mariaUriVar: string = "BIT_JOBS_LIVE_MARIADB_URI"
 const runLabel: string = "bit.jobs.live=1"
 // Pairs with `runLabel` on the container this run starts (see
 // `startPostgres` below): the owning process's own pid, learned via
@@ -211,6 +221,50 @@ fn startMysql(bin: string, name: string, ownerLabel: string): int! {
   return port
 }
 
+// The MariaDB image ships `mariadb-admin`, not `mysqladmin`, and takes
+// `MARIADB_*` environment variables; it listens on 3306 like MySQL.
+fn mariadbReady(bin: string, name: string): bool {
+  let i = 0
+  while (i < readyAttempts) {
+    let r = output(
+      bin,
+      [
+        "exec",
+        name,
+        "mariadb-admin",
+        "ping",
+        "-h127.0.0.1",
+        "-uroot",
+        "-p${myRootPassword}",
+        "--silent",
+      ],
+      dockerQuickTimeoutMs,
+    )
+    if (r.exitCode == 0) {
+      return true
+    }
+    sleep(readyDelayMs * Millisecond)
+    i = i + 1
+  }
+  return false
+}
+
+fn startMariadb(bin: string, name: string, ownerLabel: string): int! {
+  dockerRun(
+    bin,
+    [
+      "run", "--rm", "-d", "--name", name, "--label", runLabel, "--label", ownerLabel,
+      "-p", "127.0.0.1:0:3306", "-e", "MARIADB_ROOT_PASSWORD=${myRootPassword}",
+      "-e", "MARIADB_DATABASE=${myDatabase}", mariaImage,
+    ],
+  )?
+  let port = hostPort(bin, name, "3306/tcp")?
+  if (!mariadbReady(bin, name)) {
+    fail newError("${name}: mariadb-admin ping never succeeded within ${readyAttempts * readyDelayMs}ms")
+  }
+  return port
+}
+
 fn cleanup(bin: string, names: []string) {
   for name of names {
     output(bin, ["rm", "-f", name], dockerRunTimeoutMs)
@@ -262,16 +316,28 @@ fn runLiveTests(bitPath: string, repo: string, url: string, scratchDir: string):
   return relay(r, "jobslive", testRunTimeoutMs)
 }
 
-// Both engines in turn through `main.bit`; a failure on the first still runs
-// the second so one run reports both.
-fn runBoth(bitPath: string, repo: string, pgUrl: string, myUrl: string): int {
+// One engine through `main.bit`, named in the output.
+fn runEngine(bitPath: string, repo: string, label: string, url: string): int {
+  print("jobslive: ${label}\n")
   let tmp = envOr("TMPDIR", "/tmp")
-  print("jobslive: PostgreSQL\n")
-  let rc = runLiveTests(bitPath, repo, pgUrl, "${tmp}/bit-jobs-live-${uuidFormat(uuidV4())}")
-  print("jobslive: MySQL\n")
-  let myRc = runLiveTests(bitPath, repo, myUrl, "${tmp}/bit-jobs-live-${uuidFormat(uuidV4())}")
+  return runLiveTests(bitPath, repo, url, "${tmp}/bit-jobs-live-${uuidFormat(uuidV4())}")
+}
+
+// Every engine in turn; a failure on one still runs the rest so one run
+// reports all. `mariaUrl` is empty when no MariaDB server was given.
+fn runAll(bitPath: string, repo: string, pgUrl: string, myUrl: string, mariaUrl: string): int {
+  let rc = runEngine(bitPath, repo, "PostgreSQL", pgUrl)
+  let myRc = runEngine(bitPath, repo, "MySQL", myUrl)
   if (rc == 0) {
     rc = myRc
+  }
+  if (len(mariaUrl) == 0) {
+    print("jobslive: MariaDB skipped (${mariaUriVar} is not set)\n")
+    return rc
+  }
+  let mariaRc = runEngine(bitPath, repo, "MariaDB", mariaUrl)
+  if (rc == 0) {
+    rc = mariaRc
   }
   return rc
 }
@@ -286,7 +352,7 @@ fn main() {
   let givenPg = env(pgUriVar)
   let givenMy = env(myUriVar)
   if (len(givenPg) > 0 && len(givenMy) > 0) {
-    exit(runBoth(bitPath, repo, givenPg, givenMy))
+    exit(runAll(bitPath, repo, givenPg, givenMy, env(mariaUriVar)))
     return
   }
   if (len(givenPg) > 0 || len(givenMy) > 0) {
@@ -300,7 +366,8 @@ fn main() {
   let runId = uuidFormat(uuidV4())
   let pgName = "bit-jobs-live-pg-${runId}"
   let myName = "bit-jobs-live-mysql-${runId}"
-  let names = [pgName, myName]
+  let mariaName = "bit-jobs-live-mariadb-${runId}"
+  let names = [pgName, myName, mariaName]
 
   let pid = selfPid() catch e {
     eprint("jobslive: ${e.message()}\n")
@@ -322,9 +389,17 @@ fn main() {
     return
   }
 
+  let mariaPort = startMariadb(bin, mariaName, ownerLabel) catch e {
+    eprint("jobslive: ${e.message()}\n")
+    cleanup(bin, names)
+    exit(1)
+    return
+  }
+
   let pgUrl = "postgres://postgres@127.0.0.1:${pgPort}/postgres"
   let myUrl = "mysql://root:${myRootPassword}@127.0.0.1:${myPort}/${myDatabase}"
-  let rc = runBoth(bitPath, repo, pgUrl, myUrl)
+  let mariaUrl = "mysql://root:${myRootPassword}@127.0.0.1:${mariaPort}/${myDatabase}"
+  let rc = runAll(bitPath, repo, pgUrl, myUrl, mariaUrl)
   cleanup(bin, names)
   exit(rc)
 }

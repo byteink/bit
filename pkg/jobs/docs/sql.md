@@ -1,4 +1,4 @@
-# PostgreSQL and MySQL
+# PostgreSQL, MySQL and MariaDB
 
 <!-- doctest: per-block -->
 <!-- doctest: deps postgres mysql -->
@@ -7,8 +7,8 @@
 `store` without saying what one is. There is no default: an in-memory
 queue silently loses every pending job on deploy and behaves differently
 on one instance than on three, so you always pick one. `SqlStore` is
-the one this package ships, and it runs on PostgreSQL and on MySQL 8.0.1 or
-newer.
+the one this package ships, and it runs on PostgreSQL, on MySQL 8.0.1 or
+newer and on MariaDB 10.6 or newer.
 
 ## The simplest thing that works
 
@@ -16,7 +16,8 @@ newer.
 anything else in your app - and needs two tables, created by
 `migrate` before the first `open`. The pool decides the database: build it
 with `postgres`'s adapter and you are on PostgreSQL, with `mysql`'s and you
-are on MySQL. Nothing else in your code changes:
+are on MySQL or MariaDB (the one adapter speaks to both). Nothing else in your
+code changes:
 
 ```bit
 import { pool, Datasource } from "std/sql"
@@ -33,7 +34,7 @@ fn main(): ()! {
 }
 ```
 
-The same program on MySQL changes the adapter and the URL:
+The same program on MySQL or MariaDB changes the adapter and the URL:
 
 ```bit
 import { pool, Datasource } from "std/sql"
@@ -57,12 +58,13 @@ refused, with the reason, instead of failing on the first claim under load:
 
 ```text
 jobs: MySQL 5.7.44 is too old for SqlStore: claiming jobs needs SELECT ... FOR UPDATE SKIP LOCKED, which MySQL has had since 8.0.1
-jobs: SqlStore does not support MariaDB (the server reported '10.11.2-MariaDB'); use PostgreSQL or MySQL 8.0.1 or newer
+jobs: MariaDB 10.5.27-MariaDB is too old for SqlStore: claiming jobs needs SELECT ... FOR UPDATE SKIP LOCKED, which MariaDB has had since 10.6
 ```
 
 `migrate` runs `migrationStatements(dialect)` - a plain `[]string`, one entry
 per statement, in order - for the dialect the server reported. The `Dialect`
-enum names the two, `Dialect.Postgres` and `Dialect.MySql`:
+enum names the two, `Dialect.Postgres` and `Dialect.MySql`; MariaDB takes the
+`MySql` one:
 
 ```bit
 import { migrationStatements, Dialect } from "jobs"
@@ -88,7 +90,7 @@ table.
 
 ## How a claim works on each engine
 
-Both engines use `SELECT ... FOR UPDATE SKIP LOCKED`, so several workers -
+Every engine uses `SELECT ... FOR UPDATE SKIP LOCKED`, so several workers -
 even across several instances of your app - can poll the same table at once and
 never claim the same row twice, and a worker that crashes mid-job loses its
 claim automatically once its visibility timeout elapses, letting another
@@ -96,7 +98,8 @@ worker pick the job back up.
 
 What differs is the number of round trips. PostgreSQL claims in one statement,
 an `UPDATE` over the `SKIP LOCKED` subquery that returns the claimed row with
-`RETURNING`. MySQL has no `RETURNING`, so it claims in one transaction: the
+`RETURNING`. MySQL has no `RETURNING`, and neither does MariaDB's `UPDATE` before
+13.0, so both claim in one transaction: the
 `SELECT ... FOR UPDATE SKIP LOCKED`, then an `UPDATE` of that row by id. The
 transaction runs at READ COMMITTED, so the scan locks the row it takes and no
 gap, and a worker enqueueing a job never waits for a claim.

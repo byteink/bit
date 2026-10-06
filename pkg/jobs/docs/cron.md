@@ -297,7 +297,7 @@ database's own clock, `serverNowNs()`, at most once a minute, and compares it
 with its own. `SqlLocker` reads `clock_timestamp()` on PostgreSQL, the actual current
 time, and not `now()`, which PostgreSQL defines as the start of the current
 transaction ([Date/Time Functions](https://www.postgresql.org/docs/current/functions-datetime.html),
-section 9.9.5); on MySQL it reads `UTC_TIMESTAMP(6)`. When the two differ by more than 30 seconds, that instance
+section 9.9.5); on MySQL and MariaDB it reads `UTC_TIMESTAMP(6)`. When the two differ by more than 30 seconds, that instance
 fires no scheduled tick until they agree, and says so once:
 
 ```text
@@ -408,7 +408,7 @@ Register every schedule right after `open`, before either call.
   the two would share a lease and fire twice.
 - A scheduled job is an ordinary job, delivered at least once. A handler
   that runs the same tick twice must produce the same result, as described
-  in [PostgreSQL and MySQL](sql.md).
+  in [PostgreSQL, MySQL and MariaDB](sql.md).
 - `every` takes nanoseconds, like `enqueue`'s `delay`; `15 * Minute` is the
   readable form. A period of zero or less fails.
 - `L`, `W` and `#` (last day of month, nearest weekday, nth weekday) are
@@ -423,5 +423,5 @@ once per deploy rather than once per tick, use a migration.
 
 ## Next
 
-[PostgreSQL and MySQL](sql.md) covers the store and the lease table behind
+[PostgreSQL, MySQL and MariaDB](sql.md) covers the store and the lease table behind
 `SqlLocker`, and why handlers must be idempotent.
