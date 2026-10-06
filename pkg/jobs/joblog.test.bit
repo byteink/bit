@@ -1,0 +1,197 @@
+// pkg/jobs/joblog.test.bit — `Options.logger`: the records a `Queue` writes
+// to std/log (joblog.bit, docs/logging.md) over a capture sink: the INFO
+// `job started` and `job done`, the WARN `job retry`, the ERROR `job failed
+// permanently`, the WARN `cron tick dropped`, and that no record holds a job
+// payload. The clock-skew and clock-back records are asserted in skew.test.bit
+// and clockback.test.bit.
+//
+// `fakeStore`, `newFakeStore` and `newTestQueue` are jobs.test.bit's;
+// `newFakeClock`, `newFakeLocker`, `bindServerClock`, `t0`, `mustEvery` and
+// `runDue`'s fixtures are scheduler.test.bit's.
+
+import { TextHandler, LevelDebug, LevelError } from "std/log"
+import { trimRight, join } from "std/strings"
+
+// A payload no record may ever hold.
+const lgSecret: string = "sara@example.com"
+
+@job("test-mail") @json class MailJob {
+  to: string,
+}
+
+// A std/log `Sink` that keeps each finished record, trailing newline dropped.
+class LgSink {
+  lines: []string
+  export write(s: string): ()! {
+    this.lines = append(this.lines, trimRight(s, "\n"))
+  }
+}
+
+fn lgSink(): LgSink {
+  return LgSink{ lines = []string(0) }
+}
+
+// A text handler without timestamps, so a record reads back byte for byte.
+fn lgLogger(sink: LgSink, level: int): Logger {
+  return Logger(TextHandler(sink, level, false))
+}
+
+fn lgAll(sink: LgSink): string {
+  return join(sink.lines, "\n")
+}
+
+// A queue on a fake clock whose records go to `sink` at DEBUG.
+fn lgQueueOn(store: fakeStore, clock: Clock, locker: Locker, sink: LgSink): Queue {
+  bindServerClock(locker, clock)
+  let q = open(
+    store,
+    Options{
+      workers = 1,
+      pollInterval = 5 * Millisecond,
+      locker = locker,
+      clock = clock,
+      instanceId = "a",
+      logger = Option.Some(lgLogger(sink, LevelDebug)),
+    },
+  ) catch e {
+    panic("open: ${e.message()}")
+  }
+  return q
+}
+
+// A queue on `store` whose records go to `sink` at `level`, with the handler
+// for `MailJob` registered to run `handle`.
+fn lgWorkerQueue(store: fakeStore, sink: LgSink, level: int, handle: (MailJob) => ()!): Queue {
+  let q = open(
+    store,
+    Options{
+      workers = 1,
+      pollInterval = 5 * Millisecond,
+      logger = Option.Some(lgLogger(sink, level)),
+    },
+  ) catch e {
+    panic("open: ${e.message()}")
+  }
+  q.register<MailJob>(handle) catch e {
+    panic("register: ${e.message()}")
+  }
+  return q
+}
+
+// Enqueues one `MailJob` for the secret address, claims it and runs it once.
+fn lgRunOnce(q: Queue, store: fakeStore, maxAttempts: int) {
+  q.enqueue(MailJob{ to = lgSecret }, 0, maxAttempts) catch e {
+    panic("enqueue: ${e.message()}")
+  }
+  let claimed = store.claim(30000000000) catch e {
+    panic("claim: ${e.message()}")
+  }
+  match (claimed) {
+    None => panic("expected a claimable row")
+    Some(cj) => processOne(q, cj, newWorkerRand())
+  }
+}
+
+fn lgNoPayload(sink: LgSink) {
+  assert(!contains(lgAll(sink), lgSecret), "the payload is in the log:\n${lgAll(sink)}")
+  assert(!contains(lgAll(sink), "example.com"), "the payload is in the log:\n${lgAll(sink)}")
+}
+
+test "a job that succeeds writes INFO job started and job done with the attempt and the duration" {
+  let store = newFakeStore()
+  let sink = lgSink()
+  let q = lgWorkerQueue(store, sink, LevelDebug, (job: MailJob) => {})
+  lgRunOnce(q, store, 5)
+  assert(len(sink.lines) == 2, "want two records, got:\n${lgAll(sink)}")
+  assert(
+    sink.lines[0] == "level=INFO msg=\"job started\" job=test-mail attempt=1",
+    "got ${sink.lines[0]}",
+  )
+  let done = "level=INFO msg=\"job done\" job=test-mail attempt=1 took="
+  assert(hasPrefix(sink.lines[1], done), "got ${sink.lines[1]}")
+  lgNoPayload(sink)
+}
+
+test "a job that fails with attempts left writes WARN job retry with the error" {
+  let store = newFakeStore()
+  let sink = lgSink()
+  let q = lgWorkerQueue(store, sink, LevelDebug, (job: MailJob) => {
+    fail newError("provider says try later")
+  })
+  lgRunOnce(q, store, 3)
+  assert(len(sink.lines) == 2, "want two records, got:\n${lgAll(sink)}")
+  let want = "level=WARN msg=\"job retry\" job=test-mail attempt=1 error=\"provider says try later\""
+  assert(sink.lines[1] == want, "got ${sink.lines[1]}")
+  lgNoPayload(sink)
+}
+
+test "a permanent failure writes one ERROR job failed permanently line, and the payload is not in it" {
+  let store = newFakeStore()
+  let sink = lgSink()
+  let q = lgWorkerQueue(store, sink, LevelError, (job: MailJob) => {
+    fail PermanentFailure{ reason = "the provider refused the address" }
+  })
+  lgRunOnce(q, store, 5)
+  let want = "level=ERROR msg=\"job failed permanently\" job=test-mail attempt=1 error=\"the provider refused the address\""
+  assert(len(sink.lines) == 1, "want one record at ERROR, got:\n${lgAll(sink)}")
+  assert(sink.lines[0] == want, "got ${sink.lines[0]}")
+  assert(store.byId(1).deadLettered, "the row must be dead-lettered")
+  lgNoPayload(sink)
+}
+
+test "a job out of attempts writes ERROR job failed permanently, not job retry" {
+  let store = newFakeStore()
+  let sink = lgSink()
+  let q = lgWorkerQueue(store, sink, LevelDebug, (job: MailJob) => {
+    fail newError("still down")
+  })
+  lgRunOnce(q, store, 1)
+  let want = "level=ERROR msg=\"job failed permanently\" job=test-mail attempt=1 error=\"still down\""
+  assert(sink.lines[len(sink.lines) - 1] == want, "got:\n${lgAll(sink)}")
+  assert(!contains(lgAll(sink), "job retry"), "no retry is left:\n${lgAll(sink)}")
+}
+
+test "a dropped cron tick writes the WARN cron tick dropped line with the job, the policy and the window" {
+  let store = newFakeStore()
+  let clock = newFakeClock(t0)
+  let sink = lgSink()
+  let q = lgQueueOn(store, clock, nil, sink)
+  q.every(Minute, MailJob{ to = lgSecret }, missed = Missed.Skip) catch e {
+    panic("every: ${e.message()}")
+  }
+  clock.advance(5 * Minute)
+  runDue(q, clock.nowNs())
+  let first = Timestamp{ ns = 1001 * Minute }.toString()
+  let last = Timestamp{ ns = 1004 * Minute }.toString()
+  let want = "level=WARN msg=\"cron tick dropped\" job=test-mail schedule=\"${q.entries[0].id}\" policy=Missed.Skip missed=4 enqueued=0 from=${first} to=${last}"
+  assert(len(sink.lines) == 1, "want one record, got:\n${lgAll(sink)}")
+  assert(sink.lines[0] == want, "got ${sink.lines[0]}\nwant ${want}")
+  lgNoPayload(sink)
+}
+
+test "a failing schedule pass writes ERROR cron schedule failed" {
+  let store = newFakeStore()
+  let clock = newFakeClock(t0)
+  let locker = newFakeLocker()
+  let sink = lgSink()
+  let q = lgQueueOn(store, clock, locker, sink)
+  mustEvery(q, Missed.RunOnce)
+  locker.acquireFails = true
+  clock.advance(Minute)
+  runDue(q, clock.nowNs())
+  assert(len(sink.lines) == 1, "want one record, got:\n${lgAll(sink)}")
+  assert(
+    hasPrefix(sink.lines[0], "level=ERROR msg=\"cron schedule failed\" schedule="),
+    "got ${sink.lines[0]}",
+  )
+}
+
+test "a logger whose level is above a record's drops it, and Options.logger defaults to None" {
+  let store = newFakeStore()
+  let sink = lgSink()
+  let q = lgWorkerQueue(store, sink, LevelError, (job: MailJob) => {})
+  lgRunOnce(q, store, 5)
+  assert(len(sink.lines) == 0, "an ERROR logger wrote:\n${lgAll(sink)}")
+  let bare = newTestQueue(newFakeStore())
+  assert(!isSome(bare.opts.logger), "Options.logger must default to None")
+}

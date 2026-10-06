@@ -23,7 +23,7 @@
 // real job class satisfies the wider bound for free.
 
 import { Json, jsonEncode, jsonParse, jsonDecode } from "std/json"
-import { now, sleep, zone, Millisecond } from "std/time"
+import { now, sleep, zone, monotonic, Millisecond } from "std/time"
 import { uuidV4, format as uuidFormat } from "std/uuid"
 import { WaitGroup, AtomicI64 } from "std/sync"
 import { runRecovering } from "std/runtime"
@@ -70,6 +70,12 @@ export class Options {
   export instanceId: string = "",
   // The scheduler's time source; nil is the wall clock. Tests inject one.
   export clock: Clock,
+  // Where the queue writes its records (docs/logging.md): a std/log `Logger`.
+  // Set, it gets `job started` and `job done` for every job as well. Unset,
+  // the two per-job INFO records write nothing and the operational ones (a
+  // failed or retried job, a dropped cron tick, a clock problem) go to
+  // std/log's `getDefault()`. No record holds a job payload.
+  export logger: Option<Logger> = Option.None,
 }
 
 fn requireOptions(opts: Options): Options! {
@@ -201,7 +207,8 @@ export class Queue {
     let trig = newCronTrigger(expr, zn)?
     let id = scheduleId(T.__jobName(), expr, zn.name)
     requireSchedulable(this, id, missed)?
-    let e = newEntry(id, trig, missed, tickEnqueuer<T>(this.store, job, 5), this.clock)?
+    let spec = schedSpec{ id = id, job = T.__jobName(), trig = trig, missed = missed }
+    let e = newEntry(spec, tickEnqueuer<T>(this.store, job, 5), this.clock)?
     addEntry(this, e)?
   }
 
@@ -215,7 +222,8 @@ export class Queue {
     let id = scheduleId(T.__jobName(), "every ${period}", "UTC")
     requireSchedulable(this, id, missed)?
     let trig: trigger = intervalTrigger{ periodNs = period }
-    let e = newEntry(id, trig, missed, tickEnqueuer<T>(this.store, job, 5), this.clock)?
+    let spec = schedSpec{ id = id, job = T.__jobName(), trig = trig, missed = missed }
+    let e = newEntry(spec, tickEnqueuer<T>(this.store, job, 5), this.clock)?
     addEntry(this, e)?
   }
 
@@ -295,7 +303,7 @@ fn workerLoop(q: Queue) {
   let rng = newWorkerRand()
   while (q.running.load() == 1) {
     let claimed = q.store.claim(q.opts.visibilityTimeout) catch e {
-      eprint("jobs: claim failed: ${e.message()}\n")
+      logClaimFailed(q, e)
       sleep(q.opts.pollInterval)
       continue
     }
@@ -314,12 +322,13 @@ fn workerLoop(q: Queue) {
 fn processOne(q: Queue, cj: ClaimedJob, rng: Rand) {
   let (handle, ok) = q.handlers[cj.name]
   if (!ok) {
-    reportOutcome(
-      () => q.store.deadLetter(cj.id, "no handler registered for '${cj.name}'"),
-      cj.name,
-    )
+    deadLetterJob(q, cj, "no handler registered for '${cj.name}'")
     return
   }
+  logJobStarted(q, cj)
+  // One clock read per job, taken whether or not `job done` is on: cheaper
+  // than asking the logger first, and nothing next to the claim's round trip.
+  let start = monotonic()
   let failed: error
   let (panicked, msg) = runRecovering(() => {
     handle(cj.payload) catch e {
@@ -334,23 +343,31 @@ fn processOne(q: Queue, cj: ClaimedJob, rng: Rand) {
   if (failed != nil) {
     let (perm, permanent) = failed.(PermanentFailure)
     if (permanent) {
-      reportOutcome(() => q.store.deadLetter(cj.id, perm.reason), cj.name)
+      deadLetterJob(q, cj, perm.reason)
       return
     }
     failJob(q, cj, failed.message(), rng)
     return
   }
-  reportOutcome(() => q.store.complete(cj.id), cj.name)
+  logJobDone(q, cj, start)
+  reportOutcome(q, () => q.store.complete(cj.id), cj.name)
 }
 
 // Retries cj if it has attempts left, otherwise dead-letters it with reason.
 fn failJob(q: Queue, cj: ClaimedJob, reason: string, rng: Rand) {
   if (cj.attempts >= cj.maxAttempts) {
-    reportOutcome(() => q.store.deadLetter(cj.id, reason), cj.name)
+    deadLetterJob(q, cj, reason)
     return
   }
+  logJobRetry(q, cj, reason)
   let availableAt = now().ns + backoffDelay(cj.attempts, rng)
-  reportOutcome(() => q.store.retry(cj.id, availableAt), cj.name)
+  reportOutcome(q, () => q.store.retry(cj.id, availableAt), cj.name)
+}
+
+// Moves cj to the dead-letter list with reason, and says so.
+fn deadLetterJob(q: Queue, cj: ClaimedJob, reason: string) {
+  logJobFailed(q, cj, reason)
+  reportOutcome(q, () => q.store.deadLetter(cj.id, reason), cj.name)
 }
 
 // The worker loop's own acknowledgements (complete/retry/deadLetter) are
@@ -361,10 +378,11 @@ fn failJob(q: Queue, cj: ClaimedJob, reason: string, rng: Rand) {
 // worker thread over it. `op` is a closure, not a raw fallible value —
 // `T!E` cannot be held in a variable or parameter (SPEC §18.2).
 fn reportOutcome(
+  q: Queue,
   op: () => ()!,
   name: string,
 ) {
   op() catch e {
-    eprint("jobs: acknowledging '${name}' failed: ${e.message()}\n")
+    logAckFailed(q, name, e)
   }
 }

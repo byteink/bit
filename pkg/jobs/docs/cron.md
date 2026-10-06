@@ -136,8 +136,28 @@ whichever comes first. Every other tick is on time and is always enqueued,
 whatever `missed` says. So the newest due tick is missed only when it is over
 a minute late, and an older one is missed as soon as the tick after it is
 due: `every(1 * Second)` after a three second stall has two missed ticks and
-one on time. Each tick the policy drops is logged to stderr, once, with the
-schedule, the window of missed ticks and how many were enqueued.
+one on time. Each tick the policy drops is logged once, as a `WARN` record
+`cron tick dropped` with the job, the schedule, the policy, the window of missed
+ticks and how many were enqueued. The record goes to `Options.logger`, or to
+std/log's process default when none is set ([Watching the queue](logging.md)):
+
+```bit
+import { SqlStore, Queue, open, Options } from "jobs"
+import { Logger, TextHandler, LevelWarn } from "std/log"
+import { stderr } from "std/io"
+import { Pool } from "std/sql"
+
+fn digestQueue(db: Pool): Queue! {
+  let logger = Logger(TextHandler(stderr(), LevelWarn))
+  return open(SqlStore(db)?, Options{ logger = Option.Some(logger) })?
+}
+```
+
+With `Missed.Skip` after the app was down for two nights it writes
+
+```text
+level=WARN msg="cron tick dropped" job=nightly-digest schedule="nightly-digest|0 2 * * *|America/New_York" policy=Missed.Skip missed="more than 1" enqueued=0 from=2026-03-01T07:00:00Z to=2026-03-03T07:00:00Z
+```
 
 - `Missed.Skip` drops every missed tick. Use it when only the freshest
   answer matters, like a cache warm-up.
@@ -157,8 +177,8 @@ does not list those ticks. It finds the newest tick at or before now, walks
 back from the newest missed one by at most as many ticks as the policy keeps,
 and enqueues them oldest first, then the tick that is on time, all in one
 pass. `Missed.RunOnce` there enqueues two jobs, never one per chunk of
-the outage. The log line gives the exact number of missed ticks for `every`,
-and `more than 3 tick(s)` for a cron expression, whose ticks are not counted
+the outage. The `missed` attribute gives the exact number of missed ticks for `every`,
+and `more than 3` for a cron expression, whose ticks are not counted
 when the policy keeps three.
 
 The nightly digest runs at 02:00, and the app is down across that run:
@@ -301,11 +321,11 @@ section 9.9.5); on MySQL and MariaDB it reads `UTC_TIMESTAMP(6)`. When the two d
 fires no scheduled tick until they agree, and says so once:
 
 ```text
-jobs: this instance's clock is 35064h0m0s away from the database clock; not firing scheduled ticks until they agree
-jobs: this instance's clock agrees with the database clock again; firing scheduled ticks
+level=WARN msg="cron clock skewed from the database, not firing ticks" skew=126230400s
+level=INFO msg="cron clock agrees with the database again, firing ticks"
 ```
 
-The first line is an instance whose clock is four years off. Its workers keep
+The first record is an instance whose clock is four years off. Its workers keep
 running jobs, and it fires again within a minute of the clock being corrected,
 with the ticks that came due handled by the `missed` policy. If the database
 cannot be asked, nothing fires on that pass and the next one asks again. With no

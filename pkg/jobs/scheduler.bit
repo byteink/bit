@@ -77,6 +77,8 @@ class systemClock {
 // tick not yet handled, and the closure that enqueues its job for a tick.
 class entry {
   id: string,
+  // The `@job` name, for the records `joblog.bit` writes about this schedule.
+  job: string,
   trig: trigger,
   missed: Missed,
   next: int,
@@ -89,13 +91,23 @@ class entry {
   noted: int,
 }
 
+// What `schedule` and `every` register: the schedule's identity, the job it
+// enqueues, what ticks it and how it catches up.
+class schedSpec {
+  id: string,
+  job: string,
+  trig: trigger,
+  missed: Missed,
+}
+
 // A schedule whose first tick is the first one strictly after "now".
-fn newEntry(id: string, trig: trigger, missed: Missed, fire: (int) => ()!, clock: Clock): entry! {
-  let first = trig.nextAfterNs(clock.nowNs())?
+fn newEntry(spec: schedSpec, fire: (int) => ()!, clock: Clock): entry! {
+  let first = spec.trig.nextAfterNs(clock.nowNs())?
   return entry{
-    id = id,
-    trig = trig,
-    missed = missed,
+    id = spec.id,
+    job = spec.job,
+    trig = spec.trig,
+    missed = spec.missed,
     next = first,
     fire = fire,
     synced = false,
@@ -161,7 +173,7 @@ fn syncEntry(q: Queue, e: entry, nowNs: int): ()! {
   if (q.locker != nil) {
     let last = q.locker.lastTick(e.id)?
     if (last - nowNs > scheduleClockBackStep) {
-      eprint(lastTickIgnoredMessage(e.id, last, last - nowNs))
+      logLastTickIgnored(q, e, last, last - nowNs)
     } else if (last > 0) {
       e.next = e.trig.nextAfterNs(last)?
     }
@@ -175,24 +187,26 @@ fn syncEntry(q: Queue, e: entry, nowNs: int): ()! {
 // the first tick following `nowNs`; when it is, the clock moved back past at
 // least one tick. A step of `scheduleClockBackStep` or more is a correction:
 // `e` is re-anchored to the first tick after `nowNs`. A smaller one re-runs
-// nothing and `e` waits. Both return the line to log, "" when none is owed.
-fn checkClock(e: entry, nowNs: int): string! {
+// nothing and `e` waits. Both are logged (`logClockBack`), the waiting one
+// once per `next`.
+fn checkClock(q: Queue, e: entry, nowNs: int): ()! {
   let expected = e.trig.nextAfterNs(nowNs)?
   let gap = e.next - expected
   if (gap <= 0) {
-    return ""
+    return
   }
   if (gap >= scheduleClockBackStep) {
     let was = e.next
     e.next = expected
     e.noted = expected
-    return clockBackMessage(e.id, was, gap, true, expected)
+    logClockBack(q, e, was, gap, true)
+    return
   }
   if (e.noted == e.next) {
-    return ""
+    return
   }
   e.noted = e.next
-  return clockBackMessage(e.id, e.next, gap, false, expected)
+  logClockBack(q, e, e.next, gap, false)
 }
 
 // Handles every tick of `e` due at `nowNs`, per `planCatchUp`: the work is the
@@ -204,7 +218,7 @@ fn handleDue(q: Queue, e: entry, nowNs: int): ()! {
   if (plan.dropped) {
     // The dropped ticks are decided: log them once and step past them, so a
     // failed store pass below retries from the first tick it keeps.
-    eprint(missedMessage(e.id, plan, e.missed))
+    logTickDropped(q, e, plan, e.missed)
     e.next = plan.after
     if (len(plan.fire) > 0) {
       e.next = plan.fire[0]
@@ -219,10 +233,7 @@ fn handleDue(q: Queue, e: entry, nowNs: int): ()! {
 
 fn runEntry(q: Queue, e: entry, nowNs: int): ()! {
   syncEntry(q, e, nowNs)?
-  let note = checkClock(e, nowNs)?
-  if (note != "") {
-    eprint(note)
-  }
+  checkClock(q, e, nowNs)?
   if (e.next <= nowNs) {
     handleDue(q, e, nowNs)?
   }
@@ -230,12 +241,12 @@ fn runEntry(q: Queue, e: entry, nowNs: int): ()! {
 
 // Compares this instance's clock with the locker's, at most once per
 // `scheduleSkewCheckEvery` (a `nowNs` before the last check, a clock that
-// stepped back, asks again). Sets `q.skewed` and returns the line to log when
-// that state changed, "" otherwise; a failed read leaves the state as it was.
-fn checkSkew(q: Queue, nowNs: int): string! {
-  let since = nowNs - q.skewAt
-  if (q.skewKnown && since >= 0 && since < scheduleSkewCheckEvery) {
-    return ""
+// stepped back, asks again). Sets `q.skewed` and logs it when that state
+// changed; a failed read leaves the state as it was.
+fn checkSkew(q: Queue, nowNs: int): ()! {
+  let age = nowNs - q.skewAt
+  if (q.skewKnown && age >= 0 && age < scheduleSkewCheckEvery) {
+    return
   }
   let server = q.locker.serverNowNs()?
   q.skewAt = nowNs
@@ -246,13 +257,14 @@ fn checkSkew(q: Queue, nowNs: int): string! {
   }
   let bad = skew > scheduleMaxSkew
   if (bad == q.skewed) {
-    return ""
+    return
   }
   q.skewed = bad
   if (bad) {
-    return skewMessage(skew)
+    logSkewed(q, skew)
+    return
   }
-  return skewClearedMessage()
+  logSkewCleared(q)
 }
 
 // Whether this pass may fire ticks: true with no `Locker`, else when the
@@ -261,12 +273,9 @@ fn clocksAgree(q: Queue, nowNs: int): bool {
   if (q.locker == nil) {
     return true
   }
-  let note = checkSkew(q, nowNs) catch err {
-    eprint("jobs: cannot read the database clock, not firing scheduled ticks: ${err.message()}\n")
+  checkSkew(q, nowNs) catch err {
+    logClockUnreadable(q, err)
     return false
-  }
-  if (note != "") {
-    eprint(note)
   }
   return !q.skewed
 }
@@ -283,7 +292,7 @@ fn runDue(q: Queue, nowNs: int): int {
   let wake = 0
   for e of q.entries {
     runEntry(q, e, nowNs) catch err {
-      eprint("jobs: schedule '${e.id}' failed: ${err.message()}\n")
+      logScheduleFailed(q, e, err)
     }
     if (wake == 0 || e.next < wake) {
       wake = e.next
