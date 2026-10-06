@@ -5,9 +5,10 @@ that one in five of them failed: the provider answered "not now" to a burst, the
 retry loop from [Retries and pace](retry.md) absorbed most of it, and the rest
 went into a log nobody read. A dashboard that shows sends by result, how long a
 delivery takes and how often the mailer had to retry would have shown it on the
-first day. `Options.metrics` and `Options.tracer` feed one. Both are off until
-you set them, and off costs nothing: the mailer reads no clock, builds no label
-and starts no span.
+first day. `Options.metrics` and `Options.tracer` feed one, and `Options.logger`
+writes the same events as log lines for the day you need to know which send it
+was. All three are off until you set them, and off costs nothing: the mailer
+reads no clock, builds no label, starts no span and writes no record.
 
 <!-- doctest: per-block -->
 
@@ -146,5 +147,70 @@ A send that the server delayed once is one `mail.send` span and two
 
 A failed attempt or send sets the span's status to error. No span or label holds
 an address, so a trace backend never receives one.
+
+## One log record per event
+
+Metrics say that one in five failed; a log line says when and why. Give the
+mailer a `Logger` from `std/log` and it writes one record for each thing worth
+knowing. The handler you built decides whether a record is text or JSON and
+where it goes, the same as everywhere else in the program.
+
+```bit
+import { Mailer, Message, Options, Outbox } from "mail"
+import { Logger, JsonHandler, LevelInfo } from "std/log"
+import { stdout } from "std/io"
+
+fn main(): ()! {
+  let logger = Logger(JsonHandler(stdout(), LevelInfo, false))
+  let mailer = Mailer(
+    Outbox(),
+    Options{ from = "Inkwell <hello@inkwell.dev>", logger = Option.Some(logger) },
+  )?
+  mailer.send(
+    Message{
+      to = ["Sara Ali <sara@example.com>"],
+      subject = "Welcome to Inkwell",
+      text = "Hello Sara. Write your first note at https://inkwell.dev/new",
+    },
+  )?
+  mailer.close()
+  return
+}
+```
+
+That prints one line, with `took` in nanoseconds:
+
+```text
+{"level":"INFO","msg":"mail sent","transport":"outbox","recipients":1,"took":18250}
+```
+
+The four records, each with the `transport` scheme from [the labels](#the-labels):
+
+| Level | `msg` | Written when | Other attributes |
+|---|---|---|---|
+| `INFO` | `mail sent` | a transport took a delivery attempt | `recipients`, `took` |
+| `WARN` | `mail retry` | an attempt failed `Transient` and the send goes again | `attempt` (from 1), `error` |
+| `ERROR` | `mail failed` | a send ended in failure, after any retries | `error` |
+| `WARN` | `mail refused` | a message was turned away before any transport saw it | `reason` |
+
+A send the server delays once and the second try delivers writes `mail retry`
+and then `mail sent`. A send the server refuses for good writes `mail failed`
+alone; a message with no subject writes `mail refused`, because no transport
+was asked. With [`Options.queue`](queue.md) the worker writes `mail sent` or
+`mail failed` for the delivery it makes, and the enqueue writes nothing, since
+nothing has been sent yet.
+
+No record holds an address, a subject or a body. `recipients` is a count, and
+the `error` and `reason` text is the error's message with every address in it
+replaced by `[address]`, because a server's reply and a refusal both echo what
+they were given:
+
+```text
+level=ERROR msg="mail failed" transport=smtps error="mail: rejected: 550 5.1.1 <[address]>: Recipient address rejected"
+```
+
+There is no switch that turns the redaction off. A logger that is unset writes
+nothing and costs nothing; a logger whose level is above a record's drops it
+without building it, so an `ERROR` logger pays nothing for `mail sent`.
 
 Next: [Checking the setup at boot](verify.md).
