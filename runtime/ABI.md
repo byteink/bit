@@ -3007,7 +3007,7 @@ defined exactly once).
 | `bit_rt_auxv`         | `() -> i64` (§19)                                      |
 | `bit_rt_net_listen`   | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_local_port` | `(fd: i64) -> i64` (§20)                             |
-| `bit_rt_net_peer_ip_w` | `(fd: i64) -> i64` (§20, the connected peer's IPv4 address PACKED into one integer; `-1` when `fd` has no peer. Reached through a plain `extern fn`, the same class as the deadline entries below, not the compiler-recognized builtins the rows around it lower to) |
+| `bit_rt_net_peer_addr_w` | `(fd: i64, outWords: usize) -> i64` (§20, #7410: the connected peer's address written into the caller's own 16-byte `outWords` buffer in the IPv6 wire form, an IPv4 peer as its IPv4-mapped `::ffff:a.b.c.d`; `0`, or `-1` when `fd` has no peer. Reached through a plain `extern fn`, the same class as the deadline entries below, not the compiler-recognized builtins the rows around it lower to) |
 | `bit_rt_net_accept`   | `(fd: i64) -> i64` (§20)                               |
 | `bit_rt_net_dial`     | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_dial_deadline_w` | `(hostWords: usize, hostLen: i64, port: i64, deadlineNs: i64) -> i64` (§20, `bit_rt_net_dial` bounded by ONE absolute monotonic `deadlineNs` on `bit_rt_time_mono_ns`'s clock rather than parking forever; `host` crosses as a packed `[]byte`'s backing plus a length (§2) because §11.7 admits no `string` across an `extern fn`. fd, `-1` hard failure, `-2` timed out) |
@@ -4466,41 +4466,45 @@ bit_rt_net_read_bytes_w(fd, outWords, cap) -> n // up to cap bytes into outWords
 bit_rt_net_write(fd, s)         -> n     // all of s (retried internally). -1 on error
 ```
 
-**THE PEER ADDRESS IS PACKED, NOT A DOTTED QUAD.**
-`bit_rt_net_peer_ip_w(fd)` returns the connected peer's IPv4 address with the
-FIRST OCTET IN THE HIGH BYTE — 127.0.0.1 is `0x7F000001`, 2130706433 — or `-1`
-for every "there is no peer": an unconnected or listening socket (ENOTCONN), a
-closed one (EBADF), and a peer whose family is not AF_INET (the four bytes at
-`sin_addr` mean something else in every other family, so it is checked rather
-than assumed). The whole 0..0xFFFFFFFF range is non-negative in a 64-bit `int`,
-so the sentinel cannot collide with a real address; 0.0.0.0 is a legal answer,
-not an error.
+**THE PEER ADDRESS IS 16 RAW BYTES, NOT TEXT.**
+`bit_rt_net_peer_addr_w(fd, outWords)` writes the connected peer's address into
+the caller's 16-byte buffer in the IPv6 wire form and returns `0`, or `-1` for
+every "there is no peer": an unconnected or listening socket (ENOTCONN), a
+closed one (EBADF), and a peer whose family is neither AF_INET nor AF_INET6
+(the bytes at `sin_addr` mean something else in every other family, so the
+family is checked rather than assumed). An AF_INET peer is written
+IPv4-mapped, `::ffff:a.b.c.d` (ten zero bytes, `ff ff`, the four octets), so a
+`::` listener's mapped peer and an IPv4 socket's peer are the same 16 bytes and
+the one rendering rule in `std/net` (`stdlib/net/ipaddr.bit`: mapped prints as
+the dotted quad, anything else per RFC 5952) gives one client one string.
 
-It is packed rather than formatted, unlike `bit_rt_net_udp_sender_host` below,
-so that all three wrappers stay `@nosplit`: formatting means allocating a
-managed octet scratch and a string, which costs four entries in
+It is raw bytes rather than formatted, unlike `bit_rt_net_udp_sender_host`
+below, so that all three wrappers stay `@nosplit`: formatting means allocating
+a managed octet scratch and a string, which costs four entries in
 `_tests_/bit/pollfree`'s REVIEWED exception list (§5's hazard of a raw GC
-address held across a poll). `std/net`'s `Conn.peerIp()` spells the quad
-instead, where string interpolation is free.
+address held across a poll). `std/net`'s `Conn.peerIp()` renders them instead,
+where string work is free. `outWords` crosses as a packed `[]byte` backing the
+caller holds live with `keepAlive`, and is written before the wrapper returns.
 
-Two layers, both real symbols. `bit_rt_port_net_peer_ip(fd: i64) -> i64` is the
-port-level primitive, bound as `getpeername(2)` in all three providers
+Two layers, both real symbols. `bit_rt_port_net_peer_addr(fd: i64, out: *u8) ->
+i64` is the port-level primitive, bound as `getpeername(2)` into a
+`sockaddr_in6`-sized scratch in all three providers
 (`runtime/net/{darwin,linux,windows}/sock.bit`) rather than captured in the
 accept loop, whose `sockaddr` out-parameter stays NULL — it is per fd, so
 `bit_rt_net_accept` above is unchanged and a DIALED socket answers too.
 
 ```
-bit_rt_net_peer_ip_w(fd)        -> ipv4  // the peer's IPv4, PACKED. -1 when there is no peer
+bit_rt_net_peer_addr_w(fd, out) -> 0|-1  // the peer's address, 16 bytes IPv6 wire form (IPv4 mapped). -1 when there is no peer
 ```
 
-`bit_rt_net_peer_ip_w` is the ABI wrapper over it, one per provider's
+`bit_rt_net_peer_addr_w` is the ABI wrapper over it, one per provider's
 `netabi.bit`. **The `_w` suffix says `std/net` reaches it through a plain
 `extern fn` — the same class as `bit_rt_net_dial_deadline_w` and
 `bit_rt_net_shutdown_sock_w` below, not the class `bit_rt_net_local_port` above
 belongs to, and like those two it is documented here rather than in §9's
 emitted-symbol table.** A compiler-recognized builtin exists for the signatures
 an `extern` cannot express (§11.7 admits no `string` across that boundary; the
-chan-typed timer arm is the other case), and `(i64) -> i64` is not one. A
+chan-typed timer arm is the other case), and `(i64, *byte) -> i64` is not one. A
 builtin could not have been used from `stdlib/**` before the next stage0 repin
 in any case: `make selfhost` compiles the whole stdlib with the PINNED stage0,
 and `compiler/pmfetch.bit` pulls `std/http` -> `std/net` into that build, so a

@@ -14,6 +14,14 @@ request header and never will: `X-Forwarded-For`, `X-Real-IP` and `Forwarded`
 are client-supplied strings, so keying a rate limit, a ban or an audit record
 on one keys it on whatever the caller chose to send.
 
+For an IPv4 client it is a dotted quad (`"192.0.2.7"`), for an IPv6 client RFC
+5952 text (`"::1"`, `"2001:db8::7"`: lowercase, the longest zero run collapsed to
+`::`). A client that reaches a dual-stack (`::`) listener over IPv4 shows up as
+the same plain IPv4 address, not `::ffff:192.0.2.7`, so one client is one string
+for `byIp`, the login throttles and the logs whichever way the socket was opened.
+The type is `string` either way. HTTP/3 requests carry `""` as before: that path
+has no connected socket to ask.
+
 Behind a reverse proxy, `c.peer()` is therefore the proxy's address, which is
 correct rather than a bug - trusting a forwarding header is only sound when
 the proxy is known to overwrite it and the app is unreachable except through

@@ -1190,8 +1190,9 @@ stream. Never blocks.
 
 ### `ByteStream.peer(): string`
 
-The peer's IPv4 address in dotted form, or `""` when the connection cannot name
-one.
+The peer's address as `Conn.peerIp` renders it (a dotted quad for IPv4, RFC 5952
+for IPv6, an IPv4-mapped peer as its IPv4 address), or `""` when the connection
+cannot name one.
 
 ### `ByteStream.unread(extra: string)`
 

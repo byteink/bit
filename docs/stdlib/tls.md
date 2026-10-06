@@ -294,7 +294,7 @@ The peer's certificate chain as raw DER, end-entity certificate first.
 
 ### `TlsConn.peerIp(): string!`
 
-The peer's IPv4 address, forwarded from the underlying socket.
+The peer's address, forwarded from the underlying socket: see `Conn.peerIp` in the `std/net` page.
 
 ### `TlsConn.setDeadline(deadlineNs: int)`
 

@@ -6,8 +6,8 @@ green thread per connection" server costs one `Task` per connection, not one OS
 thread. Every operation that can fail returns `T!` - propagate with `?` or handle
 with `catch`.
 
-Addresses are dotted-quad IPv4 literals (`"127.0.0.1"`), not hostnames: this
-module does not resolve hostnames. It also has no TLS - put a terminating
+Addresses are IP literals, dotted-quad IPv4 (`"127.0.0.1"`) or IPv6 (`"::1"`),
+not hostnames: this module does not resolve hostnames. It also has no TLS - put a terminating
 proxy in front before exposing a public port.
 
 <!-- doctest: per-block -->
@@ -161,13 +161,40 @@ actually closes; a keep-alive protocol needs its own framing layer instead.
 
 ### `Conn.peerIp(): string!`
 
-The peer's address as a dotted quad, `"127.0.0.1"`. IPv4 only, like every other
-address in this module.
+The peer's address as text: a dotted quad for an IPv4 peer (`"127.0.0.1"`), RFC
+5952 for an IPv6 one (`"::1"`, `"2001:db8::7"`: lowercase, no leading zeros in a
+group, the longest run of zero groups collapsed to `::`). The return type is
+still `string!`; only the set of values grew, so a caller that already treated
+the result as an opaque key needs no change.
+
+An IPv4-mapped peer (`::ffff:192.0.2.7`, how a `::` listener sees a client that
+connected over IPv4) is reported as the IPv4 address it maps to, `"192.0.2.7"`.
+One client therefore has one string whether the listener is dual-stack or IPv4
+only, which is what a rate-limit key needs; `net.IP.String` in Go does the same.
 
 Fails rather than returning a placeholder when there is no peer to name: a `Conn`
 you have already closed, one whose peer hung up hard, or a peer whose address
-family is not IPv4. Code that logs or rate-limits by address needs to see that
-difference, since a sentinel string would bucket every unknown peer together.
+family is neither IPv4 nor IPv6. Code that logs or rate-limits by address needs
+to see that difference, since a sentinel string would bucket every unknown peer
+together.
+
+```bit
+import { listen, dial } from "std/net"
+
+// The address a client reaches the server from, as the server sees it.
+fn clientAddr(): string! {
+  let l = listen("::", 0)?
+  let port = l.port()?
+  let c = dial("::1", port)?
+  let a = l.accept()?
+  let seen = a.peerIp()?
+  a.close()
+  c.close()
+  l.close()
+  // "::1" for the dial above, "127.0.0.1" had it dialed 127.0.0.1.
+  return seen
+}
+```
 
 ### `Conn.close()`
 
