@@ -78,7 +78,8 @@ that fails with a plain error writes one `ERROR` record carrying the method,
 the path and the real message, while the client receives only
 `Internal Server Error`. A level above `LevelInfo` silences the request records
 and keeps the errors. When the level is off, `logger()` builds nothing and
-allocates nothing per request.
+allocates nothing per request; when it is on, a request costs three objects
+more than a quiet one: the clock reading, the record and the line.
 
 ### Upgrading from `logs`
 
