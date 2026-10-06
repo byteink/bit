@@ -153,6 +153,187 @@ X
   expect "" "$(explainMismatch "$chain_o" "${chain_t//0,1/0,2}" ir)" "iface_implements with other ids"
   expect "" "$(explainMismatch "$chain_o" "${chain_t//iface_implements/iface_has}" iropt)" "iface_has kept by the tree"
   expect "" "$(explainMismatch "$chain_o" "$chain_t" types)" "an IR identity never explains a types dump"
+  # 7069-neg-literal-const. `ir` holds every line, constant values included, to the oracle
+  # text with each neg pair folded; `iropt` needs the pre-opt pair of the same file as well.
+  neg_pre_o=$(cat <<'X'
+func f(%0: i32) i32 {
+bb0(%0: i32):
+  %1 = const_int i32 5
+  %2 = neg i32 %1
+  %3 = const_int i32 7
+  %4 = add i32 %0, %2
+  %5 = add i32 %4, %3
+  ret %5
+}
+X
+)
+  neg_pre_t=$(cat <<'X'
+func f(%0: i32) i32 {
+bb0(%0: i32):
+  %1 = const_int i32 -5
+  %2 = const_int i32 7
+  %3 = add i32 %0, %1
+  %4 = add i32 %3, %2
+  ret %4
+}
+X
+)
+  neg_post_o=$(cat <<'X'
+func f(%0: i32) i32 {
+bb0(%0: i32):
+  %1 = const_int i32 7
+  %2 = const_int i32 -5
+  %3 = add i32 %0, %2
+  %4 = add i32 %3, %1
+  ret %4
+}
+X
+)
+  expect 7069-neg-literal-const "$(explainMismatch "$neg_pre_o" "$neg_pre_t" ir)" "ir: neg of a literal became one negative const_int"
+  expect "" "$(explainMismatch "$neg_pre_o" "${neg_pre_t//-5/-6}" ir)" "ir: a changed constant (5 became 6)"
+  expect "" "$(explainMismatch "$neg_pre_o" "${neg_pre_t//const_int i32 7/const_int i32 8}" ir)" "ir: another constant changed"
+  expect "" "$(explainMismatch "$neg_pre_o" "${neg_pre_t//add i32 %3, %2/sub i32 %3, %2}" ir)" "ir: a different operation"
+  expect "" "$(explainMismatch "$neg_pre_o" "${neg_pre_t//  ret %4/  %5 = const_int i32 9
+  ret %4}" ir)" "ir: an extra dead constant"
+  expect "" "$(explainMismatch "$neg_pre_o" "$neg_pre_o" ir)" "ir: nothing folded"
+  expect 7069-neg-literal-const "$(explainMismatch "$neg_post_o" "$neg_pre_t" iropt x "$neg_pre_o" "$neg_pre_t")" "iropt: only where a constant is defined moved"
+  expect "" "$(explainMismatch "$neg_post_o" "$neg_pre_t" iropt)" "iropt: without the pre-opt dumps"
+  expect "" "$(explainMismatch "$neg_post_o" "${neg_pre_t//-5/-6}" iropt x "$neg_pre_o" "${neg_pre_t//-5/-6}")" "iropt: a changed constant (5 became 6), pre-opt pair too"
+  expect "" "$(explainMismatch "$neg_post_o" "${neg_pre_t//-5/-6}" iropt x "$neg_pre_o" "$neg_pre_t")" "iropt: a changed constant (5 became 6), pre-opt pair exact"
+  expect "" "$(explainMismatch "$neg_post_o" "${neg_pre_t//  ret %4/  %5 = const_int i32 9
+  ret %4}" iropt x "$neg_pre_o" "$neg_pre_t")" "iropt: an extra dead constant"
+  expect "" "$(explainMismatch "$neg_post_o" "${neg_pre_t//add i32 %3, %2/sub i32 %3, %2}" iropt x "$neg_pre_o" "$neg_pre_t")" "iropt: a different operation"
+  # a neg of a non-literal dropped by the tree is not the fold
+  nolit_o=$(cat <<'X'
+func f(%0: i32) i32 {
+bb0(%0: i32):
+  %1 = neg i32 %0
+  ret %1
+}
+X
+)
+  nolit_t=$(cat <<'X'
+func f(%0: i32) i32 {
+bb0(%0: i32):
+  ret %0
+}
+X
+)
+  expect "" "$(explainMismatch "$nolit_o" "$nolit_t" ir)" "ir: a neg of a non-literal dropped"
+  expect "" "$(explainMismatch "$nolit_o" "$nolit_t" iropt x "$nolit_o" "$nolit_t")" "iropt: a neg of a non-literal dropped"
+  # the type minimum: optimized, the oracle cannot fold its neg and the tree folds what follows,
+  # so only the header is compared, and only given the exact pre-opt proof
+  min_pre_o=$(cat <<'X'
+func f() i8 {
+bb0():
+  %1 = const_int i8 128
+  %2 = neg i8 %1
+  ret %2
+}
+X
+)
+  min_pre_t=$(cat <<'X'
+func f() i8 {
+bb0():
+  %1 = const_int i8 -128
+  ret %1
+}
+X
+)
+  min_post_o=$(cat <<'X'
+func f() i8 {
+bb0():
+  %1 = const_int i8 -128
+  %2 = neg i8 %1
+  %3 = const_int i8 3
+  %4 = add i8 %2, %3
+  ret %4
+}
+X
+)
+  min_post_t=$(cat <<'X'
+func f() i8 {
+bb0():
+  %1 = const_int i8 3
+  ret %1
+}
+X
+)
+  expect 7069-neg-literal-const "$(explainMismatch "$min_post_o" "$min_post_t" iropt x "$min_pre_o" "$min_pre_t")" "iropt: the type minimum, header only"
+  expect "" "$(explainMismatch "$min_post_o" "$min_post_t" iropt x "$min_pre_o" "${min_pre_t//-128/-127}")" "iropt: the type minimum without the pre-opt proof"
+  expect "" "$(explainMismatch "$min_post_o" "${min_post_t//func f() i8/func f() i16}" iropt x "$min_pre_o" "$min_pre_t")" "iropt: the type minimum, other header"
+  expect "" "$(explainMismatch "${min_post_o//-128/-127}" "$min_post_t" iropt x "${min_pre_o//128/127}" "${min_pre_t//-128/-127}")" "iropt: a neg of a value that is not the minimum keeps its body compared"
+  range_pre_o=$(cat <<'X'
+func f(%0: i32) bool {
+bb0(%0: i32):
+  %1 = const_int i32 3
+  %2 = neg i32 %1
+  %3 = const_int i32 2
+  %4 = neg i32 %3
+  %5 = icmp_eq bool %0, %2
+  %6 = icmp_eq bool %0, %4
+  %7 = bor bool %5, %6
+  br %7, bb1(), bb2()
+bb1():
+  ret %7
+bb2():
+  ret %7
+}
+X
+)
+  range_pre_t=$(cat <<'X'
+func f(%0: i32) bool {
+bb0(%0: i32):
+  %1 = const_int i32 -3
+  %2 = const_int i32 -2
+  %3 = const_int u32 4294967293
+  %4 = sub u32 %0, %3
+  %5 = const_int u32 1
+  %6 = icmp_ule bool %4, %5
+  br %6, bb1(), bb2()
+bb1():
+  ret %6
+bb2():
+  ret %6
+}
+X
+)
+  range_post_o=$(cat <<'X'
+func f(%0: i32) bool {
+bb0(%0: i32):
+  %1 = const_int i32 -3
+  %2 = const_int i32 -2
+  %3 = icmp_eq bool %0, %1
+  %4 = icmp_eq bool %0, %2
+  %5 = bor bool %3, %4
+  br %5, bb1(), bb2()
+bb1():
+  ret %5
+bb2():
+  ret %5
+}
+X
+)
+  range_post_t=$(cat <<'X'
+func f(%0: i32) bool {
+bb0(%0: i32):
+  %1 = const_int u32 4294967293
+  %2 = sub u32 %0, %1
+  %3 = const_int u32 1
+  %4 = icmp_ule bool %2, %3
+  br %4, bb1(), bb2()
+bb1():
+  ret %4
+bb2():
+  ret %4
+}
+X
+)
+  expect 7069-neg-literal-const "$(explainMismatch "$range_pre_o" "$range_pre_t" ir)" "ir: negative labels became one range test"
+  expect "" "$(explainMismatch "$range_pre_o" "${range_pre_t//u32 1/u32 2}" ir)" "ir: range test with a wider width"
+  expect "" "$(explainMismatch "$range_pre_o" "${range_pre_t//4294967293/4294967294}" ir)" "ir: range test from another first label"
+  expect 7069-neg-literal-const "$(explainMismatch "$range_post_o" "$range_post_t" iropt x "$range_pre_o" "$range_pre_t")" "iropt: negative labels became one range test"
+  expect "" "$(explainMismatch "$range_post_o" "${range_post_t//u32 1/u32 2}" iropt x "$range_pre_o" "$range_pre_t")" "iropt: range test with a wider width"
   loop_o=$(cat <<'X'
 func f(%0: []i64, %1: []i64, %2: i64, %3: i64) []i64 {
 bb0(%0: []i64, %1: []i64, %2: i64, %3: i64):

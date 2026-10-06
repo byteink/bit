@@ -298,6 +298,34 @@
 #     changes in `--dump-types`; see explainLagTypes (ir-signatures-walk.sh).
 #     Files: run_iface_self_result and arrow_generic_method_recv.
 #
+#
+# Declared (#7069) against the 0.39.0 oracle; retires at the next repin. One signature, in the
+# `ir` and `iropt` kinds. #7069 lowers `-N` for an integer literal to the one `const_int T -N`;
+# the oracle emits `%a = const_int T N` then `%b = neg T %a`. Constant VALUES are never erased:
+#
+#   ir. Every function of the oracle dump must equal the tree's byte for byte after ids are
+#     renumbered and two folds are applied to the ORACLE text: (1) a `const_int T N` directly
+#     followed by the `neg T` that alone uses it becomes the one `const_int T -N` (same signed
+#     type, exact negation; the minimum of T negates to itself, and a value that does not fit T
+#     is not folded); (2) the icmp_eq/bor chain over constants that forms one contiguous run with
+#     at least one negative label, which the oracle could not range because a label was a `neg`,
+#     becomes the const/sub/const/icmp_ule range test #7058 emits, the label constants kept. At
+#     least one fold must fire, so a changed constant, a dropped `neg` of a non-literal or any
+#     other difference fails.
+#   iropt. Given the pre-opt dumps of the same file (explainMismatch's fifth and sixth
+#     arguments, which selfhost-diffdump.sh supplies) and the `ir` proof of the whole file, each
+#     function must agree once constants are erased from the text and ids renumbered AND hold the
+#     same set of distinct (type, value) const_int pairs. Where the oracle function holds a `neg`
+#     of the exact minimum of a type (`-128` for i8, ...), which it cannot fold, the tree folds
+#     what follows it and the bodies cannot match: that function alone is compared by header,
+#     its body being the one the `ir` proof covers.
+#
+#   7069-neg-literal-const. Files, measured against the 0.39.0 oracle over `stdlib examples
+#     _tests_/cases _tests_/imports` (the differentials' corpus, with their skip rules): 127
+#     files, 127 `ir` and 31 `iropt` rows, among them ir_switch_case_range, run_switch_range,
+#     run_debug_neg_literal_min, run_slice_lit_inline_fill, run_slice_u8_store_inline and
+#     decimal_to_int_roundtrip. A file that also holds another named lag below keeps that name.
+#
 # shellcheck source=scripts/ir-signatures-walk.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-walk.sh"
 irWalkAwk
@@ -419,14 +447,15 @@ explainFmtJsxApostrophe() {
   ' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
 }
 
-# explainIrLag <oracle_ir> <tree_ir> <ir|iropt> -- the five `ir`/`iropt` signatures above,
-# via IR_WALK_AWK (ir-signatures-walk.sh). Prints the name and returns 0, or prints nothing
-# and returns 1.
+# explainIrLag <oracle_ir> <tree_ir> <ir|iropt> [<oracle_ir_pre> <tree_ir_pre>] -- the six `ir`/`iropt`
+# signatures above, via IR_WALK_AWK (ir-signatures-walk.sh). The two pre-opt dumps of the same file
+# are read only for `iropt`, by 7069-neg-literal-const, which holds an optimized dump to the exact
+# pre-opt proof. Prints the name and returns 0, or prints nothing and returns 1.
 explainIrLag() {
-  LC_ALL=C awk -v kind="$3" "${IR_WALK_AWK}" <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
+  LC_ALL=C awk -v kind="$3" "${IR_WALK_AWK}" <(printf '%s\n@@@BIT2@@@\n%s\n@@@PREA@@@\n%s\n@@@PREB@@@\n%s\n' "$1" "$2" "${4:-}" "${5:-}")
 }
 
-# explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
+# explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file [oracle_pre tree_pre]]
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. `file` is the
 # input the tree ran on, read only by the `diags` panic arm.
@@ -435,7 +464,7 @@ explainMismatch() {
     diags) explainDiagsLag "$1" "$2" "${4:-}"; return ;;
     fmt) explainFmtJsxApostrophe "$1" "$2"; return ;;
     types) explainLagTypes "$1" "$2"; return ;;
-    ir|iropt) explainIrLag "$1" "$2" "$3"; return ;;
+    ir|iropt) explainIrLag "$1" "$2" "$3" "${5:-}" "${6:-}"; return ;;
   esac
   return 1
 }
@@ -452,7 +481,7 @@ declaredSignatureNames() {
   local diags="6403-enum-static-method-presyntax 7035-keyword-member-name-presyntax 6421-ternary-jsx-hash-oracle-panic"
   local fmt="7380-jsx-text-apostrophe-stray-semicolon"
   local types="7387-self-result-types 7383-arrow-param-types"
-  local ir="7408-assert-ok-nil-compare 7406-iface-implements-call 7377-append-spread-bulk-move 7387-self-result-oracle-omits-function 7383-arrow-oracle-leaks-type-param"
+  local ir="7408-assert-ok-nil-compare 7406-iface-implements-call 7377-append-spread-bulk-move 7387-self-result-oracle-omits-function 7383-arrow-oracle-leaks-type-param 7069-neg-literal-const"
   case "${1:-}" in
     diags) printf '%s\n' $diags ;;
     fmt) printf '%s\n' $fmt ;;

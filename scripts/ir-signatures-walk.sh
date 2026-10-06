@@ -93,6 +93,188 @@ function hasParse(l,    r, p) {
   gT = typeAfterCall(l)
   return 1
 }
+# limStr -- 2^(bits-1) of the signed type t as decimal text; values are kept as text throughout, since
+# awk numbers lose the last digits of an i64.
+function limStr(t) {
+  return (t == "i8") ? "128" : (t == "i16") ? "32768" : (t == "i32") ? "2147483648" : "9223372036854775808"
+}
+# cmpInt -- -1, 0 or 1 as decimal text a is below, equal to or above b.
+function cmpInt(a, b,    na, nb, r) {
+  na = (a ~ /^-/); nb = (b ~ /^-/)
+  if (na != nb) { return na ? -1 : 1 }
+  if (na) { a = substr(a, 2); b = substr(b, 2) }
+  r = (length(a) != length(b)) ? (length(a) < length(b) ? -1 : 1) : (a < b ? -1 : (a > b ? 1 : 0))
+  return na ? -r : r
+}
+# predDigits -- d - 1 for the digits d of a positive number, no leading zero.
+function predDigits(d,    i, c, x, out) {
+  out = ""; c = 1
+  for (i = length(d); i >= 1; i--) {
+    x = substr(d, i, 1) - c
+    if (x < 0) { x = 9; c = 1 } else { c = 0 }
+    out = x out
+  }
+  sub(/^0+/, "", out)
+  return out
+}
+# succInt -- a + 1 as decimal text, for a in the i64 range.
+function succInt(a,    d, i, c, out) {
+  if (a ~ /^-/) {
+    d = substr(a, 2)
+    return (d == "1") ? "0" : "-" predDigits(d)
+  }
+  out = ""; c = 1
+  for (i = length(a); i >= 1; i--) {
+    d = substr(a, i, 1) + c
+    if (d == 10) { d = 0; c = 1 } else { c = 0 }
+    out = d out
+  }
+  return (c ? "1" : "") out
+}
+# negLit -- the literal `-N` of the signed type t for the oracle `neg t (const_int t N)`, or "" when
+# #7069 does not fold it: N must be non-negative and fit t, or already be the minimum of t (the
+# wrapped literal, whose negation is itself).
+function negLit(t, v,    lim) {
+  lim = limStr(t)
+  if (v ~ /^-/) { return (v == "-" lim) ? v : "" }
+  if (cmpInt(v, lim) > 0) { return "" }
+  return (v == "0") ? "0" : "-" v
+}
+# constDefs -- cdef[%id] = "T V" for every `%id = const_int T V` line of a[1..n].
+function constDefs(a, n, cdef,    i, p) {
+  split("", cdef)
+  for (i = 1; i <= n; i++) {
+    if (a[i] ~ /^  %[0-9]+ = const_int [A-Za-z_][A-Za-z0-9_]* -?[0-9]+$/) { split(a[i], p, " "); cdef[p[1]] = p[4] " " p[5] }
+  }
+}
+# foldPairs -- #7069, pre-opt: the oracle lowers `-N` as `%a = const_int T N` immediately followed by
+# `%b = neg T %a`, %a used by nothing else; the tree emits the one `%b = const_int T -N`. Exact: T is
+# the same signed type and N is negated, so nothing but that pair changes. Counts gFolded.
+function foldPairs(a, n,    i, p, q, r, out, m) {
+  m = 0
+  for (i = 1; i <= n; i++) {
+    if (i < n && a[i] ~ /^  %[0-9]+ = const_int i(8|16|32|64) -?[0-9]+$/ && a[i + 1] ~ /^  %[0-9]+ = neg i(8|16|32|64) %[0-9]+$/) {
+      split(a[i], p, " "); split(a[i + 1], q, " ")
+      if (q[5] == p[1] && q[4] == p[4] && useCount(a, n, p[1]) == 2 && (r = negLit(p[4], p[5])) != "") {
+        out[++m] = "  " q[1] " = const_int " p[4] " " r; i++; gFolded++; continue
+      }
+    }
+    out[++m] = a[i]
+  }
+  for (i = 1; i <= m; i++) { a[i] = out[i] }
+  for (i = m + 1; i <= n; i++) { delete a[i] }
+  return m
+}
+# hasMinNeg -- a[1..n] holds a `neg T %c` of a constant that is exactly the minimum of the signed type T
+# (the literal `128` of an i8 as stored, or `-128`).
+function hasMinNeg(a, n,    i, q, cdef, d) {
+  constDefs(a, n, cdef)
+  for (i = 1; i <= n; i++) {
+    if (a[i] !~ /^  %[0-9]+ = neg i(8|16|32|64) %[0-9]+$/) { continue }
+    split(a[i], q, " ")
+    if (!(q[5] in cdef)) { continue }
+    split(cdef[q[5]], d, " ")
+    if (d[1] == q[4] && (d[2] == limStr(d[1]) || d[2] == "-" limStr(d[1]))) { return 1 }
+  }
+  return 0
+}
+# eqParse -- `%e = icmp_eq bool %s, %c` with %c a signed-int constant of cdef and %s not one: sets gE gS
+# gT gV gC.
+function eqParse(l, cdef,    p, d) {
+  if (l !~ /^  %[0-9]+ = icmp_eq bool %[0-9]+, %[0-9]+$/) { return 0 }
+  split(l, p, " ")
+  gE = p[1]; gS = p[5]; sub(/,$/, "", gS); gC = p[6]
+  if ((gS in cdef) || !(gC in cdef)) { return 0 }
+  split(cdef[gC], d, " ")
+  if (d[1] !~ /^i(8|16|32|64)$/) { return 0 }
+  gT = d[1]; gV = d[2]
+  return 1
+}
+# borParse -- `%b = bor bool %x, %y`: sets gB gB1 gB2.
+function borParse(l,    p) {
+  if (l !~ /^  %[0-9]+ = bor bool %[0-9]+, %[0-9]+$/) { return 0 }
+  split(l, p, " ")
+  gB = p[1]; gB1 = p[5]; sub(/,$/, "", gB1); gB2 = p[6]
+  return 1
+}
+# runLen -- how many labels the chain starting at a[i] holds: `eq, eq, bor, (eq, bor)*` over one
+# subject and type, each bor joining the previous result with the next compare. A repeated label
+# is one compare the optimizer shared, so its bor names an earlier compare of the chain. Sets
+# rcLast (the result id), rcT rcS, rcVals[1..n], rcIds (the label constants) and rcLen (lines);
+# 0 when a[i] starts no chain of two.
+function runLen(a, n, i, cdef,    j, cnt, last, e2, v2, ev) {
+  if (!eqParse(a[i], cdef)) { return 0 }
+  rcS = gS; rcT = gT; last = gE; cnt = 1; split("", rcVals); rcVals[1] = gV
+  split("", ev); ev[gE] = gV; split("", rcIds); rcIds[gC] = 1
+  j = i + 1
+  while (j <= n) {
+    if (eqParse(a[j], cdef) && gS == rcS && gT == rcT && j + 1 <= n) {
+      e2 = gE; v2 = gV; rcIds[gC] = 1
+      if (!borParse(a[j + 1]) || gB1 != last || gB2 != e2) { break }
+      ev[e2] = v2; rcVals[++cnt] = v2; last = gB; j += 2
+    } else if (borParse(a[j]) && gB1 == last && (gB2 in ev)) {
+      rcVals[++cnt] = ev[gB2]; last = gB; j++
+    } else { break }
+  }
+  rcLast = last; rcLen = j - i
+  return cnt < 2 ? 0 : cnt
+}
+# runLines -- the four lines of the range test #7058 emits for the chain, or "" when it is no run
+# #7069 ranges: the labels must fit the type and be contiguous, at least one negative (a run of
+# non-negative labels was ranged by the oracle already), and at most 256.
+function runLines(cnt,    lim, bits, lo, hi, k, v, neg, u, mlo, f0, f1, f2, has, distinct) {
+  bits = (rcT == "i8") ? 8 : (rcT == "i16") ? 16 : (rcT == "i32") ? 32 : 64
+  if (cnt > 256) { return "" }
+  lim = limStr(rcT); lo = rcVals[1]; hi = lo; neg = 0; distinct = 0
+  split("", has)
+  for (k = 1; k <= cnt; k++) {
+    v = rcVals[k]
+    if (cmpInt(v, "-" lim) < 0 || cmpInt(v, lim) >= 0) { return "" }
+    if (v ~ /^-/) { neg = 1 }
+    if (cmpInt(v, lo) < 0) { lo = v }
+    if (cmpInt(v, hi) > 0) { hi = v }
+    if (!(v in has)) { has[v] = 1; distinct++ }
+  }
+  if (!neg) { return "" }
+  for (k = 1; k <= cnt; k++) { if (rcVals[k] != hi && !(succInt(rcVals[k]) in has)) { return "" } }
+  u = "u" substr(rcT, 2)
+  mlo = (bits == 64 || lo !~ /^-/) ? lo : sprintf("%d", lo + 2 ^ bits)
+  f0 = "%" (9000000 + ++gFresh); f1 = "%" (9000000 + ++gFresh); f2 = "%" (9000000 + ++gFresh)
+  return "  " f0 " = const_int " u " " mlo "\n  " f1 " = sub " u " " rcS ", " f0 "\n  " f2 " = const_int " u " " (distinct - 1) "\n  " rcLast " = icmp_ule bool " f1 ", " f2
+}
+# dropDead -- the const_int lines of a[1..n] whose id is in ids and that nothing uses any more.
+function dropDead(a, n, ids,    i, m, out, id) {
+  m = 0
+  for (i = 1; i <= n; i++) {
+    id = defId(a[i])
+    if (id in ids && a[i] ~ / = const_int / && useCount(a, n, id) == 1) { continue }
+    out[++m] = a[i]
+  }
+  for (i = 1; i <= m; i++) { a[i] = out[i] }
+  for (i = m + 1; i <= n; i++) { delete a[i] }
+  return m
+}
+# foldRange -- #7069: a run of negative switch labels the oracle kept as an icmp_eq/bor chain, because a
+# label was `neg (const_int)`, is the one range test the tree emits (#7058): const, sub, const,
+# icmp_ule at the unsigned type. Pre-opt the tree keeps the label constants (keepLabels); optimized,
+# the ones nothing else uses are gone. Counts gFolded.
+function foldRange(a, n, keepLabels,    i, k, cnt, rep, ln, out, m, cdef, ids, fired) {
+  constDefs(a, n, cdef); m = 0; fired = 0; split("", ids)
+  for (i = 1; i <= n; i++) {
+    cnt = runLen(a, n, i, cdef)
+    rep = (cnt > 0) ? runLines(cnt) : ""
+    if (rep == "") { out[++m] = a[i]; continue }
+    split(rep, ln, "\n")
+    for (k = 1; k <= 4; k++) { out[++m] = ln[k] }
+    for (k in rcIds) { ids[k] = 1 }
+    i += rcLen - 1; fired = 1
+  }
+  if (!fired) { return n }
+  for (k = 1; k <= m; k++) { a[k] = out[k] }
+  for (k = m + 1; k <= n; k++) { delete a[k] }
+  gFolded++
+  return keepLabels ? m : dropDead(a, m, ids)
+}
 # chainRewrite -- #7406: the per-method of the 0.39.0 oracle `iface_has` chain becomes the one
 # `const_string "ids"` + `iface_implements(recv, ids)`. A link continues the chain only when the
 # previous result has exactly that one use.
@@ -292,7 +474,7 @@ function parseRaw(s, L, n,    i, k, nm) {
 }
 # compile -- the functions of side s not in rdrop, `$t` ids canonical over exactly those, each one
 # normalized: constants erased, the oracle hunks rewritten, ids renumbered.
-function compile(s,    k, n, L, t, parts, np, j, a, m) {
+function compile(s, raw,    k, n, L, t, parts, np, j, a, m) {
   n = 0
   for (k = 1; k <= rcnt[s]; k++) {
     if ((s SUBSEP k) in rdrop) { continue }
@@ -309,10 +491,12 @@ function compile(s,    k, n, L, t, parts, np, j, a, m) {
     fraw[s, m] = fraw[s, m] L[j] "\n"
   }
   fcnt[s] = m
+  if (raw) { return }
   for (k = 1; k <= m; k++) { procFn(s, k) }
 }
 function procFn(s, k,    a, n, t, i) {
   t = fraw[s, k]; sub(/\n$/, "", t); n = split(t, a, "\n")
+  if (s == "A") { if (kind == "ir") { n = foldPairs(a, n) } n = foldRange(a, n, 1) }
   n = eraseConsts(a, n)
   split("", gHit)
   if (s == "A") { n = chainRewrite(a, n); n = okRewrite(a, n); n = loopRewrite(a, n) }
@@ -391,8 +575,64 @@ function selfOmit(    k, any) {
   }
   return any
 }
+# normStrict -- function k of side s as the strict arm compares it: for the oracle (isO) every neg pair
+# (pre-opt only) and run chain folded; optimized, constants are erased and gCS holds the sorted
+# distinct (type, value) pairs of its const_int lines instead. Constant VALUES are never erased
+# from a pre-opt dump: `ir` compares every line.
+function normStrict(s, k, isO, kind,    a, n, t, cdef, c, i, j, key, keys, nk) {
+  t = fraw[s, k]; sub(/\n$/, "", t); n = split(t, a, "\n")
+  if (isO) { if (kind == "ir") { n = foldPairs(a, n) } n = foldRange(a, n, kind == "ir") }
+  gCS = ""
+  if (kind == "iropt") {
+    constDefs(a, n, cdef); nk = 0
+    for (c in cdef) { if (!(cdef[c] in keys)) { keys[cdef[c]] = 1; nk++; srt[nk] = cdef[c] } }
+    for (i = 2; i <= nk; i++) { key = srt[i]; for (j = i - 1; j >= 1 && srt[j] > key; j--) { srt[j + 1] = srt[j] } srt[j + 1] = key }
+    for (i = 1; i <= nk; i++) { gCS = gCS srt[i] "\n" }
+    split("", srt)
+    n = eraseConsts(a, n)
+  }
+  renumber(a, n)
+  return joinLines(a, n)
+}
+# strictIr -- every function of the oracle side s equals the tree side t once each oracle neg pair and run
+# chain is folded, with every other line, constant values included, byte for byte after renumbering;
+# true only when at least one fold fired.
+function strictIr(s, t,    k) {
+  compile(s, 1); compile(t, 1)
+  if (fcnt[s] != fcnt[t]) { return 0 }
+  gFolded = 0
+  for (k = 1; k <= fcnt[s]; k++) {
+    if (fname[s, k] != fname[t, k] || normStrict(s, k, 1, "ir") != normStrict(t, k, 0, "ir")) { return 0 }
+  }
+  return gFolded > 0
+}
+# strictOpt -- the optimized dumps A and B, given that strictIr proved the pre-opt pair of the same file:
+# every function agrees once constants are erased and ids renumbered, and holds the same distinct
+# (type, value) constant pairs (a duplicate definition is shared by the optimizer, so the count is
+# not compared). Only where the oracle function holds a `neg` of the exact minimum of a type, which
+# it cannot fold, the tree folds what follows it and the bodies cannot match: that function is
+# compared by header alone, and its body is the one the pre-opt proof covers.
+function strictOpt(    k, t, n, a, na, nb, ca) {
+  compile("A", 1); compile("B", 1)
+  if (fcnt["A"] != fcnt["B"]) { return 0 }
+  for (k = 1; k <= fcnt["A"]; k++) {
+    if (fname["A", k] != fname["B", k]) { return 0 }
+    t = fraw["A", k]; sub(/\n$/, "", t); n = split(t, a, "\n")
+    if (hasMinNeg(a, n)) { if (fhead["A", k] != fhead["B", k]) { return 0 } continue }
+    na = normStrict("A", k, 1, "iropt"); ca = gCS
+    nb = normStrict("B", k, 0, "iropt")
+    if (na != nb || ca != gCS) { return 0 }
+  }
+  return 1
+}
+function explainStrict() {
+  if (kind == "ir") { return strictIr("A", "B") }
+  if (nC == 0 || nD == 0 || !parseRaw("C", LC, nC) || !parseRaw("D", LD, nD)) { return 0 }
+  return strictIr("C", "D") && strictOpt()
+}
 function explainIr(    nm) {
   if (!parseRaw("A", LA, nA) || !parseRaw("B", LB, nB)) { return "" }
+  if (explainStrict()) { return "7069-neg-literal-const" }
   split("", rdrop); compile("A"); compile("B")
   if (sameLists(0) && (nm = hitName()) != "") { return nm }
   split("", rdrop)
@@ -402,8 +642,12 @@ function explainIr(    nm) {
   return ""
 }
 side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
+side == 1 && $0 == "@@@PREA@@@" { side = 2; next }
+side == 2 && $0 == "@@@PREB@@@" { side = 3; next }
 side == 0 { nA++; LA[nA] = $0; next }
-{ nB++; LB[nB] = $0 }
+side == 1 { nB++; LB[nB] = $0; next }
+side == 2 { nC++; LC[nC] = $0; next }
+{ nD++; LD[nD] = $0 }
 END {
   if (kind != "ir" && kind != "iropt") { exit 1 }
   nm = explainIr()
