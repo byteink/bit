@@ -44,3 +44,84 @@
     atomicSub(c, 1)
   }
 }
+
+// Work became visible after this worker published itself parked (`sleep.bit`'s
+// `schedIdlePark`): become the one spinner that looks for it, and report false
+// when a spinner already exists, which leaves the work to that spinner's own
+// re-probe. True means do not wait. A waker that claimed the word first
+// (`schedWakeParkedPeer`, 1 -> 0) already woke this worker, so the unit just
+// taken is handed back and the worker still loops to look.
+@nosplit fn schedSpinAgain(s: *i64, p: *i32): bool {
+  let c = schedSpinAddr(s)
+  if (atomicLoad(c) != 0 || !atomicCmpxchg(c, 0, 1)) {
+    return false
+  }
+  if (!atomicCmpxchg(p, 1, parkSpinner)) {
+    atomicSub(c, 1)
+  }
+  return true
+}
+
+// How many probe rounds a spinner makes after its find-work pass fails before
+// it parks (Go's spinning `findRunnable`). Each round costs at least one
+// `schedSpinPause`, so a spinner that sees nothing lives tens of microseconds:
+// long enough that a lock handoff or a ping-pong readies many tasks under one
+// wake, short enough to stay well inside the collector's rendezvous spin.
+const spinnerRounds: int = 16
+
+// The pause between probes, and the grace before a peer's next-run slot is
+// taken: about 1-3us of loads on this worker's own park word, a line no other
+// worker writes on the hot path. Go's `runqgrab` sleeps 3us there, because a
+// channel handoff readies a task and blocks a few hundred nanoseconds later.
+const spinGraceLoads: int = 2048
+
+// Wait about one grace period without touching any peer's line. Ends early when
+// a waker claims this worker's word, which means there is work.
+@nosplit fn schedSpinPause(w: *i64) {
+  let p = workerParkAddr(w)
+  let v = atomicLoad(p)
+  let k = 0
+  while (k < spinGraceLoads && atomicLoad(p) == v) {
+    k = k + 1
+  }
+}
+
+// Take peer `v`'s next-run slot only when the SAME task is still in it after a
+// grace (Go's `runqsteal` with `stealRunNextG`). The owner readied it and is
+// about to run it; taking it at once is the cross-core migration #3264
+// removed, and what doubled channel ping-pong under the first #7404 wake.
+@nosplit fn rnStealGrace(w: *i64, v: *i64): int {
+  let t = atomicLoad(v + wkRunNext)
+  if (t == 0) {
+    return 0
+  }
+  schedSpinPause(w)
+  if (atomicCmpxchg(v + wkRunNext, t, 0)) {
+    return t
+  }
+  return 0
+}
+
+// A spinner's search after its find-work pass failed: up to `spinnerRounds`
+// rounds of a pause, the queue probe and a graced next-run steal. Returns 0
+// at once for a worker that is not a spinner, and 0 when the rounds run out,
+// after which the worker parks through `schedIdlePark`.
+@nosplit fn schedSpinSearch(w: *i64, s: *i64): int {
+  let p = workerParkAddr(w)
+  let k = 0
+  while (k < spinnerRounds && atomicLoad(p) == parkSpinner) {
+    k = k + 1
+    schedSpinPause(w)
+    if (schedWorkPending(w)) {
+      let t = schedFindWork(w)
+      if (t != 0) {
+        return t
+      }
+    }
+    let t = schedStealRunNext(w, s)
+    if (t != 0) {
+      return t
+    }
+  }
+  return 0
+}
