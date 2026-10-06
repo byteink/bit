@@ -19,18 +19,23 @@
 // on Linux); only `rel`'s resolution against `root`'s dirfd is walked with
 // `O_NOFOLLOW` refusing every component.
 //
-// UNCONDITIONAL PER-COMPONENT `openat` WALK OF `rel`, not `openat2`/
-// `RESOLVE_BENEATH` with an `ENOSYS` fallback: opening each component
-// against the fd the PREVIOUS component's own open just returned (rather
-// than re-resolving the remaining suffix from `root` every time) is exactly
-// as race-free as `openat2`'s single syscall — a parent renamed or swapped
-// for a symlink after this walk has already opened it by fd can no longer
-// change what that fd names — just more syscalls per open. Deferred the
-// single-syscall `openat2` fast path as a follow-up perf ticket rather than
-// spending this one's budget on the kernel `struct open_how` marshaling;
-// this walk already meets the race and containment acceptance on kernels
-// with no `openat2` at all (< 5.6), which an `openat2`-only implementation
-// would not.
+// TWO PATHS, ONE POLICY (#5809). The FAST path is one `openat2(2)` syscall
+// with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS` (Linux
+// 5.6+): the kernel resolves all of `rel` against `root`'s dirfd and refuses
+// a `..` that climbs out, a symlink in ANY component (the leaf included) and
+// a magic link, atomically. The FALLBACK is the per-component `openat` walk
+// `openBeneathWalk` below, run when the kernel cannot answer: `ENOSYS`
+// (< 5.6), `EPERM` (a seccomp filter that denies unknown syscalls, the old
+// docker default), `E2BIG` (a struct size the kernel rejects) or `EAGAIN`
+// (the kernel could not rule out a racing rename; the walk can). The walk
+// opens each component against the fd the PREVIOUS component's own open
+// returned, so it is exactly as race-free as `openat2`'s single syscall,
+// just more syscalls per open, and it meets the race and containment
+// acceptance on kernels with no `openat2` at all. Any OTHER `openat2` error
+// is a refusal, never a reason to retry through the walk: the two paths
+// share one policy (refuse every symlink and every `..`), so they agree on
+// what to refuse and a fallback adds no new way to succeed. `rtFsOpenBeneathWalkW`
+// exports the walk alone so a test can run both paths on any kernel.
 //
 // `atFdCwd`, `wordsPathZ`, `isX64`, `sysClose`, `sysFstat`, `sysOpen`,
 // `fsStatBuf`, `fsScratchSlot`, `fsStatSlotWords`, `statSizeOff`,
@@ -83,6 +88,35 @@ const sIfreg: int = 32768 // 0o100000
 // `O_DIRECTORY`, which `O_NONBLOCK` cannot affect either way.
 const oNonBlock: int = 2048
 
+// `openat2(2)` (#5809). Every value below was measured with a throwaway C
+// probe (`<linux/openat2.h>`, `<sys/syscall.h>`, `offsetof`) built and run in
+// `gcc:latest` on x86_64-linux, NOT transcribed from memory: `SYS_openat2` =
+// 437 (the asm-generic table, so the same number on aarch64, which has no
+// legacy table), `sizeof(struct open_how)` = 24 with `flags`@0 `mode`@8
+// `resolve`@16 (three u64), `RESOLVE_NO_MAGICLINKS` = 2,
+// `RESOLVE_NO_SYMLINKS` = 4, `RESOLVE_BENEATH` = 8. `RESOLVE_NO_SYMLINKS`
+// is the policy the walk already has (`O_NOFOLLOW` on every component:
+// ANY symlink refused, in-root ones too, not just escaping ones) and implies
+// `RESOLVE_NO_MAGICLINKS`; both are passed so the intent survives a reader
+// who forgets the implication.
+const sysOpenat2: int = 437
+const openHowBytes: int = 24
+const resolveNoMagicLinks: int = 2
+const resolveNoSymlinks: int = 4
+const resolveBeneath: int = 8
+
+// `-errno` values `openat2` answers that mean "this kernel cannot answer,
+// use the walk" (see the header): EPERM, E2BIG, EAGAIN, ENOSYS. Identical on
+// x86-64 and aarch64 (`asm-generic/errno-base.h`, `errno.h`).
+const errPerm: int = 1
+const errE2big: int = 7
+const errAgain: int = 11
+const errNoSys: int = 38
+
+// `openBeneathFast`'s "not answered, run the walk" result: distinct from -1
+// (refused) and from every fd.
+const openFallback: int = 0 - 2
+
 @nosplit fn oDirectoryVal(): int {
   if (isX64()) {
     return oDirectoryX64
@@ -128,15 +162,21 @@ const oNonBlock: int = 2048
 }
 
 // Whether the NUL-terminated C path `p` (`n` bytes, not counting the NUL)
-// contains a bare `..` COMPONENT anywhere. The `O_NOFOLLOW` walk below
-// refuses a symlink in `rel`'s resolution, but `..` is an ordinary
-// directory entry, never a symlink — it resolves straight through and
-// would climb out of `root` with no symlink involved at all. This is the
-// runtime's OWN containment check, independent of `stdlib/fs/secure/
-// secure.bit`'s lexical `std/path.contains` call: a security primitive
-// does not get to assume every future caller remembers to run that check
-// first. BOUNDED (Power of 10 rule 2): by `n`, `p`'s own length.
-@nosplit fn hasDotDotComponent(p: int, n: int): bool {
+// contains a bare `..` COMPONENT anywhere, or an EMPTY component before its
+// last (`a//b`). `..` is an ordinary directory entry, never a symlink, so
+// the walk's `O_NOFOLLOW` does not stop it: it resolves straight through and
+// would climb out of `root` with no symlink involved at all (`RESOLVE_BENEATH`
+// catches it on the fast path; this check is the walk's only defence, and
+// keeps the two paths agreeing). `a//b` is refused so the two paths agree on
+// it as well: the walk's `openat(fd, "")` fails `ENOENT`, while `openat2`
+// collapses repeated slashes and would serve it. A single trailing slash is
+// not refused here: both paths then end on a directory and `fdIsDir` refuses
+// it. This is the runtime's OWN containment check, independent of
+// `stdlib/fs/secure/secure.bit`'s lexical `std/path.contains` call: a
+// security primitive does not get to assume every future caller remembers to
+// run that check first. BOUNDED (Power of 10 rule 2): by `n`, `p`'s own
+// length.
+@nosplit fn hasUnsafeComponent(p: int, n: int): bool {
   let i = 0
   let start = 0
   while (i <= n) {
@@ -145,11 +185,49 @@ const oNonBlock: int = 2048
       if (clen == 2 && loadByte(p + start) == 46 && loadByte(p + start + 1) == 46) {
         return true
       }
+      if (clen == 0 && i < n) {
+        return true
+      }
       start = i + 1
     }
     i = i + 1
   }
   return false
+}
+
+// Whether `rc`, a raw `openat2` return, says the kernel could not answer
+// (header: ENOSYS, EPERM, E2BIG, EAGAIN) rather than refused.
+@nosplit fn at2Unavailable(rc: int): bool {
+  return rc == 0 - errNoSys || rc == 0 - errPerm || rc == 0 - errE2big || rc == 0 - errAgain
+}
+
+// The fast path: ONE `openat2(rootFd, rel, {O_NOFOLLOW|O_NONBLOCK, 0,
+// BENEATH|NO_SYMLINKS|NO_MAGICLINKS}, 24)`. The `open_how` is marshaled into
+// this worker's `fsStatBuf` slot (18 words, three used; free here, `fdIsDir`
+// below reuses it only after the syscall returned). `O_NOFOLLOW|O_NONBLOCK`
+// are the walk's own leaf flags (`O_NONBLOCK` so a FIFO leaf cannot block the
+// open, #5798); `mode` must be 0 without `O_CREAT`. Returns `openFallback`
+// with `rootFd` STILL OPEN when the kernel cannot answer; otherwise closes
+// `rootFd` and returns the fd, or -1 for any refusal, a directory result
+// included.
+@nosplit fn openBeneathFast(rootFd: int, rel: int): int {
+  let how = int(ptrOf(fsStatBuf)) + fsScratchSlot() * fsStatSlotWords * 8
+  storeWord(how, oNoFollowVal() | oNonBlock)
+  storeWord(how + 8, 0)
+  storeWord(how + 16, resolveBeneath | resolveNoSymlinks | resolveNoMagicLinks)
+  let rc = int(syscall(sysOpenat2, i64(rootFd), i64(rel), i64(how), i64(openHowBytes)))
+  if (at2Unavailable(rc)) {
+    return openFallback
+  }
+  syscall(sysClose(), i64(rootFd))
+  if (rc < 0) {
+    return 0 - 1
+  }
+  if (fdIsDir(rc)) {
+    syscall(sysClose(), i64(rc))
+    return 0 - 1
+  }
+  return rc
 }
 
 // Walk the NUL-terminated, RELATIVE C path `rel` (`n` bytes) against the
@@ -207,17 +285,19 @@ const oNonBlock: int = 2048
   return sysOpenAt(atFdCwd, p, oDirectoryVal())
 }
 
-// `bit_rt_fs_open_beneath_w`: open `root` (the `rootN`-byte packed path at
-// `rootWords`, following its own symlinks, via ./fs.bit's `sysOpen`-style
-// `O_DIRECTORY` open) then walk `rel` (the `relN`-byte packed path at
-// `relWords`) against it, refusing a symlink or a `..` in any component
-// (`openBeneathWalk`/`hasDotDotComponent` above). The caller —
+// Shared body of the two exports below: open `root` (the `rootN`-byte packed
+// path at `rootWords`, following its own symlinks, via `openDirFollowingP`'s
+// `O_DIRECTORY` open) then resolve `rel` (the `relN`-byte packed path at
+// `relWords`) beneath it, refusing a symlink or a `..` in any component.
+// `useFast` selects `openBeneathFast` first (falling back to the walk when
+// the kernel cannot answer) or the walk alone. The caller —
 // `stdlib/fs/secure/secure.bit`'s `openBeneath` — has already run
 // `std/path`'s `join`+`contains` on `root`/`rel` to refuse a lexical `..`
-// escape before this call reaches the kernel at all; `hasDotDotComponent`
-// is this primitive's own second, independent check.
-export @nosplit @symbol("bit_rt_fs_open_beneath_w") fn rtFsOpenBeneathW(
-  rootWords: int, rootN: int, relWords: int, relN: int,
+// escape before this call reaches the kernel at all; `hasUnsafeComponent`
+// is this primitive's own second, independent check, and runs before either
+// path so neither can be handed one. fd, or -1.
+@nosplit fn openBeneathImpl(
+  rootWords: int, rootN: int, relWords: int, relN: int, useFast: bool,
 ): int {
   let rootP = wordsPathZ(rootWords, rootN)
   if (rootP == 0) {
@@ -231,15 +311,39 @@ export @nosplit @symbol("bit_rt_fs_open_beneath_w") fn rtFsOpenBeneathW(
   // already consumed by `sysOpenAt` above, so computing `relP` into the
   // same slot next is safe reuse, not a clobber.
   let relP = wordsPathZ(relWords, relN)
-  if (relP == 0 || loadByte(relP) == 47 || hasDotDotComponent(relP, relN)) {
+  if (relP == 0 || loadByte(relP) == 47 || hasUnsafeComponent(relP, relN)) {
     syscall(sysClose(), i64(rootFd))
     return 0 - 1
   }
-  let rc = openBeneathWalk(rootFd, relP, relN)
-  if (rc < 0) {
+  let fd = openFallback
+  if (useFast) {
+    fd = openBeneathFast(rootFd, relP)
+  }
+  if (fd == openFallback) {
+    fd = openBeneathWalk(rootFd, relP, relN)
+  }
+  if (fd < 0) {
     return 0 - 1
   }
-  return rc
+  return fd
+}
+
+// `bit_rt_fs_open_beneath_w`: `openBeneathImpl` with the `openat2` fast path
+// (one syscall for `rel` on Linux 5.6+, the walk otherwise).
+export @nosplit @symbol("bit_rt_fs_open_beneath_w") fn rtFsOpenBeneathW(
+  rootWords: int, rootN: int, relWords: int, relN: int,
+): int {
+  return openBeneathImpl(rootWords, rootN, relWords, relN, true)
+}
+
+// `bit_rt_fs_open_beneath_walk_w` (#5809): the same primitive forced onto the
+// per-component walk, so `stdlib/fs/secure/secure.test.bit` can prove every
+// escape shape against the fallback on a kernel that has `openat2`. Not
+// declared by `std/fs/secure` itself; only that test file declares it.
+export @nosplit @symbol("bit_rt_fs_open_beneath_walk_w") fn rtFsOpenBeneathWalkW(
+  rootWords: int, rootN: int, relWords: int, relN: int,
+): int {
+  return openBeneathImpl(rootWords, rootN, relWords, relN, false)
 }
 
 // `bit_rt_fs_fstat_w`: `fd`'s metadata via `fstat(2)` — the same 6-word
@@ -308,7 +412,7 @@ export @nosplit @symbol("bit_rt_fs_open_dir_w") fn rtFsOpenDirW(words: int, n: i
 // contain one; this only guards a future caller that hands this primitive
 // something other than one listed name), and not `.`/`..` (`walkBeneath`'s
 // own listing, `rtFsListDirFdW` below, already excludes both, the same
-// defense-in-depth reasoning `hasDotDotComponent` above gives for
+// defense-in-depth reasoning `hasUnsafeComponent` above gives for
 // `rtFsOpenBeneathW`'s `rel`). BOUNDED (Power of 10 rule 2): by `n`.
 @nosplit fn isSingleSafeComponent(p: int, n: int): bool {
   if (n == 0) {
