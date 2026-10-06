@@ -90,7 +90,8 @@ is a bug in the caller and the log is the wrong place to discover it.
 
 A record holds its first five attributes in its own fields, so an enabled
 line with up to five costs two objects, the record and the line, whatever
-those attributes are; each one past five, and a group, is one `Attr` more.
+those attributes are; the next five fill one chained record, and a group
+holds its members as `Attr`s.
 When the level is off, the level method returns a shared record that keeps
 nothing, so the whole chain allocates nothing and needs no `enabled` guard:
 measured with `BIT_GC_STATS=1`, a disabled call carrying three attributes
@@ -295,8 +296,8 @@ Which field of an `Attr` holds its value: `String`, `Int`, `Float`, `Bool`,
 
 ### `Record`
 
-The builder a level method returns, and what a handler receives. Its first
-five attributes live in its own fields.
+The builder a level method returns, and what a handler receives. It holds
+its attributes five to a record, in its own fields.
 
 ### `attrs(): Record`
 
