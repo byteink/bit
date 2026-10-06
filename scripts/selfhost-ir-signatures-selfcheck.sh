@@ -504,6 +504,57 @@ X
   expect "" "$(explainMismatch "45:28: r: T
 9:1: f: int" "45:28: r: Row
 9:1: f: i64" types)" "a second, unrelated types difference"
+  # --- 7482: an aliased generic import (`import { Pool as P }`) ---
+  expect 7482-aliased-generic-types "$(explainMismatch "13:7: c: Pool
+14:7: l: Lease<T>
+15:7: n: Pool<T>!" "13:7: c: Pool<slot>
+14:7: l: Lease<slot>
+15:7: n: Pool<[]slot>!" types)" "a bare template and its parameter, grown to the instance"
+  expect 7482-aliased-generic-types "$(explainMismatch "11:7: a: Box
+13:13: a.swap(9): T" "11:7: a: Box<i64>
+13:13: a.swap(9): i64" types)" "a bare template and a method result"
+  expect "" "$(explainMismatch "14:7: l: Lease<T>" "14:7: l: Lease<slot>" types)" "a parameter alone, with no bare template grown"
+  expect "" "$(explainMismatch "11:7: a: Box" "11:7: a: Bag<i64>" types)" "a template grown into another name"
+  expect "" "$(explainMismatch "11:7: a: Box" "11:7: a: Boxes<i64>" types)" "a template whose name only starts the tree name"
+  expect "" "$(explainMismatch "11:7: a: Box<int>" "11:7: a: Box<i64>" types)" "a type argument that is not a lone capital letter"
+  expect "" "$(explainMismatch "11:7: a: Box" "11:7: a: Box<i64" types)" "an unbalanced argument list"
+  expect "" "$(explainMismatch "11:7: a: Box" "11:7: a: <error>" types)" "a tree type that is an error"
+  expect "" "$(explainMismatch "11:7: a: Box
+9:1: f: int" "11:7: a: Box<i64>
+9:1: f: i64" types)" "a second, unrelated types difference"
+  expect "" "$(explainMismatch "11:7: a: Box" "12:7: a: Box<i64>" types)" "a template at another line"
+  slot_o=$(cat <<'X'
+func f(%0: Namer, %1: Namer) []string {
+bb0(%0: Namer, %1: Namer):
+  %2 = call_iface %0.0() []string
+  %3 = call_iface %1.273() []string
+  %4 = call_iface %0.273() []string
+  ret %4
+}
+X
+)
+  slot_t=${slot_o//.273()/.290()}
+  expect 7482-aliased-generic-iface-slot "$(explainMismatch "$slot_o" "$slot_t" ir)" "interface method slots all moved up by the same amount"
+  expect 7482-aliased-generic-iface-slot "$(explainMismatch "$slot_o" "$slot_t" iropt x "$slot_o" "$slot_t")" "the same, post-opt over the pre-opt proof"
+  expect "" "$(explainMismatch "$slot_o" "$slot_o" ir)" "slots that did not move"
+  expect "" "$(explainMismatch "$slot_o" "${slot_o//.273()/.250()}" ir)" "slots that moved down"
+  expect "" "$(explainMismatch "$slot_o" "${slot_t/= call_iface %0.290()/= call_iface %0.291()}" ir)" "one oracle slot sent to two tree slots"
+  expect "" "$(explainMismatch "$slot_o" "${slot_t/= call_iface %1.290()/= call_iface %1.292()}" ir)" "a different shift at another site"
+  slot_two_o=$(cat <<'X'
+func f(%0: Namer) []string {
+bb0(%0: Namer):
+  %1 = call_iface %0.0() []string
+  %2 = call_iface %0.1() []string
+  ret %2
+}
+X
+)
+  expect 7482-aliased-generic-iface-slot "$(explainMismatch "$slot_two_o" "${slot_two_o//.1()/.2()}" ir)" "one slot moved, the other kept"
+  expect "" "$(explainMismatch "$slot_two_o" "${slot_two_o//.0()/.1()}" ir)" "two oracle slots sent to one tree slot"
+  expect "" "$(explainMismatch "$slot_o" "${slot_t/  ret %4/  %5 = call_iface %0.0() []string
+  ret %4}" ir)" "a call_iface the oracle does not have"
+  expect "" "$(explainMismatch "$slot_o" "${slot_t//[]string/string}" ir)" "slots moved and a result type changed"
+  expect "" "$(explainMismatch "$slot_o" "${slot_t/call_iface/call}" ir)" "a slot call that is no longer an interface call"
 
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
