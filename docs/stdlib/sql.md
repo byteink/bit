@@ -414,10 +414,33 @@ driver's own.
 
 A single logical database connection, as handed back by `Registry.open`:
 `query(sqlText, params): Rows!`, `exec(sqlText, params): int!`,
-`prepare(sqlText): Stmt!`, `begin(): Tx!`, `close()`. `query` runs SQL
+`prepare(sqlText): Stmt!`, `begin(opts: TxOptions): Tx!`, `close()`. `query` runs SQL
 expected to produce a row set; `exec` runs SQL expected only to change rows
 and reports how many were affected. Several green threads may hold and use
 the same `Conn` at once.
+
+### `TxOptions`
+
+What a transaction is opened with, passed to `Conn.begin` so the driver emits
+its own dialect's one correct form: `isolation: Isolation` and `readOnly:
+bool`. The zero value is the database's own defaults, and `Isolation.Default`
+is variant 0 for exactly that reason. `tx`/`txAt` build it from the level they
+were given; a driver reads it:
+
+```text
+begin(opts: TxOptions): Tx! {
+  let level = isolationName(opts.isolation)   // "" for Isolation.Default
+  // Postgres: BEGIN ISOLATION LEVEL <level> [READ ONLY], one statement.
+  // MySQL: SET TRANSACTION ISOLATION LEVEL <level>, then
+  //        START TRANSACTION [READ ONLY]; it refuses the SET once open.
+}
+```
+
+### `isolationName(level: Isolation): string`
+
+The SQL spelling of `level` (`"READ COMMITTED"`, `"SERIALIZABLE"`, ...), or `""`
+for `Isolation.Default`, which asks the database for nothing. Drivers use it
+to build their `begin` statements.
 
 ### `Rows`
 

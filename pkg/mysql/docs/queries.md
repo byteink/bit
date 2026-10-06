@@ -75,12 +75,12 @@ fn transferCents(db: Pool, fromId: string, toId: string, cents: int): ()! {
 ```
 
 `Conn.begin` sends `START TRANSACTION` over `COM_QUERY`; `commit`/`rollback`
-send `COMMIT`/`ROLLBACK` on that same connection. Isolation levels are
-`std/sql`'s job (`db.txAt`): it sends `SET TRANSACTION ISOLATION LEVEL ...` as
-the first statement of the transaction, which MySQL itself refuses once a
-transaction is open, so the driver ends the still-empty transaction, sets the
-level and opens it again. The level covers that one transaction. The same
-statement after any other statement fails with the server's error 1568.
+send `COMMIT`/`ROLLBACK` on that same connection. A level given with
+`db.txAt` reaches `begin` in the `TxOptions`, and the driver sends `SET
+TRANSACTION ISOLATION LEVEL ...` first, then `START TRANSACTION`, because MySQL
+refuses the statement once a transaction is open. The level covers that one
+transaction. The same statement typed inside a transaction goes to the server
+unchanged and fails with error 1568.
 
 ## The single-packet limit
 

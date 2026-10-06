@@ -94,9 +94,10 @@ fn transferCents(db: Pool, fromId: string, toId: string, cents: int): ()! {
 }
 ```
 
-`Conn.begin` sends plain `BEGIN`; `commit`/`rollback` send `COMMIT`/
-`ROLLBACK` on that same connection. Isolation levels are `std/sql`'s own
-job (`db.txAt`), not a statement this driver builds itself.
+`Conn.begin` sends one statement, `BEGIN`, with `ISOLATION LEVEL ...` and
+`READ ONLY` appended when the `TxOptions` ask for them (a level given with
+`db.txAt` arrives that way); `commit`/`rollback` send `COMMIT`/`ROLLBACK` on
+that same connection.
 
 ## Where to go next
 
