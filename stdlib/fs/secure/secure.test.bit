@@ -236,3 +236,146 @@ test "removeAll on a top-level symlink unlinks it without following it" {
     "removeAll followed the top-level symlink and deleted outside the tree",
   )
 }
+
+// ---- the runtime's own containment, fast path AND fallback (#5809) ----
+//
+// `openBeneath` above runs `std/path`'s lexical `contains` BEFORE the
+// runtime, so a `..` test through it never reaches the kernel. These call
+// the runtime primitive directly (`bit_rt_fs_open_beneath_w`, declared by
+// secure.bit, a sibling in this module) and its forced-fallback twin, so
+// every shape is proven against BOTH Linux paths: the single `openat2` and
+// the per-component walk. On Darwin both symbols are the one
+// `O_NOFOLLOW_ANY` implementation; on Windows both refuse everything.
+
+// Only this file declares the walk-only entry point: nothing that imports
+// "std/fs/secure" for real needs the symbol to exist in its libbitrt.
+extern fn bit_rt_fs_open_beneath_walk_w(root: *byte, rootN: int, rel: *byte, relN: int): i64
+
+fn rawOpen(root: string, rel: string, fast: bool): i64 {
+  let rootW = []byte(root)
+  let relW = []byte(rel)
+  if (fast) {
+    return bit_rt_fs_open_beneath_w(ptrOf(rootW), len(root), ptrOf(relW), len(rel))
+  }
+  return bit_rt_fs_open_beneath_walk_w(ptrOf(rootW), len(root), ptrOf(relW), len(rel))
+}
+
+fn pathName(fast: bool): string {
+  if (fast) {
+    return "openat2 fast path"
+  }
+  return "walk fallback"
+}
+
+fn assertRefused(root: string, rel: string, fast: bool) {
+  let fd = rawOpen(root, rel, fast)
+  if (fd >= 0) {
+    let f = File{ fd = fd }
+    f.close()
+    panic("${pathName(fast)} served root=${root} rel=${rel} (fd ${fd}) instead of refusing it")
+  }
+}
+
+fn assertServes(root: string, rel: string, want: string, fast: bool) {
+  let fd = rawOpen(root, rel, fast)
+  assert(fd >= 0, "${pathName(fast)} refused ${rel}")
+  let f = File{ fd = fd }
+  defer f.close()
+  let got = f.readAll() catch e {
+    panic("readAll: ${e.message()}")
+  }
+  assert(got == want, "${pathName(fast)} ${rel}: expected ${want}, got '${got}'")
+}
+
+// root/ { real.txt, a/b.txt, a/up -> outside, in-link -> real.txt,
+// dirlink -> a, outfile -> <dir>/secret.txt, outdir -> <dir>/outside,
+// relfile -> ../secret.txt }; <dir>/secret.txt and <dir>/outside/secret.txt
+// are the bytes that must never be served.
+fn escapeFixture(tag: string): string {
+  let dir = scratchDir(tag)
+  mustMkdir(dir)
+  mustWrite("${dir}/secret.txt", "OUTSIDE")
+  mustMkdir("${dir}/outside")
+  mustWrite("${dir}/outside/secret.txt", "OUTSIDE")
+  let root = "${dir}/root"
+  mustMkdir(root)
+  mustWrite("${root}/real.txt", "INSIDE")
+  mustMkdir("${root}/a")
+  mustWrite("${root}/a/b.txt", "INSIDE")
+  mustLink("${dir}/outside", "${root}/a/up")
+  mustLink("real.txt", "${root}/in-link")
+  mustLink("a", "${root}/dirlink")
+  mustLink("${dir}/secret.txt", "${root}/outfile")
+  mustLink("${dir}/outside", "${root}/outdir")
+  mustLink("../secret.txt", "${root}/relfile")
+  return dir
+}
+
+fn assertEscapesRefused(root: string, fast: bool) {
+  // `..` escapes, the climbing and the merely-lexical alike.
+  assertRefused(root, "..", fast)
+  assertRefused(root, "../secret.txt", fast)
+  assertRefused(root, "a/../../secret.txt", fast)
+  assertRefused(root, "a/../../outside/secret.txt", fast)
+  assertRefused(root, "a/..", fast)
+  // An absolute `rel`, inside the root's own prefix or not.
+  assertRefused(root, "/etc/hostname", fast)
+  assertRefused(root, "${root}/real.txt", fast)
+  // Symlinks: absolute and relative, leaf and intermediate, escaping and
+  // in-root (the policy refuses every symlink, not only escaping ones).
+  assertRefused(root, "outfile", fast)
+  assertRefused(root, "relfile", fast)
+  assertRefused(root, "outdir/secret.txt", fast)
+  assertRefused(root, "a/up/secret.txt", fast)
+  assertRefused(root, "in-link", fast)
+  assertRefused(root, "dirlink/b.txt", fast)
+  // A directory leaf, and a doubled slash (the paths must agree on it).
+  assertRefused(root, "a", fast)
+  assertRefused(root, "a/", fast)
+  assertRefused(root, "a//b.txt", fast)
+  assertRefused(root, "missing.txt", fast)
+}
+
+fn assertInsideServed(root: string, fast: bool) {
+  assertServes(root, "real.txt", "INSIDE", fast)
+  assertServes(root, "a/b.txt", "INSIDE", fast)
+  assertServes(root, "a/./b.txt", "INSIDE", fast)
+}
+
+test "open_beneath fast path refuses every escape shape and serves inside files" {
+  let dir = escapeFixture("esc-fast")
+  defer removeAllLogged(dir)
+  assertInsideServed("${dir}/root", true)
+  assertEscapesRefused("${dir}/root", true)
+}
+
+test "open_beneath fallback walk refuses every escape shape and serves inside files" {
+  let dir = escapeFixture("esc-walk")
+  defer removeAllLogged(dir)
+  assertInsideServed("${dir}/root", false)
+  assertEscapesRefused("${dir}/root", false)
+}
+
+// Magic links (`/proc/self/exe`, `/proc/self/fd/N`, `/proc/self/cwd`) jump
+// to a path the process names, not one under the root. A root of
+// `/proc/self` makes them reachable as ordinary components; both paths must
+// refuse (`O_NOFOLLOW` on the walk, `RESOLVE_NO_SYMLINKS|NO_MAGICLINKS` on
+// the fast path). Where `/proc` does not exist the root open itself fails,
+// which is a refusal too.
+fn assertMagicLinksRefused(fdNum: i64, fast: bool) {
+  assertRefused("/proc/self", "exe", fast)
+  assertRefused("/proc/self", "cwd", fast)
+  assertRefused("/proc/self", "cwd/anything", fast)
+  assertRefused("/proc/self", "fd/${fdNum}", fast)
+}
+
+test "open_beneath refuses magic links on both paths" {
+  let dir = escapeFixture("magic")
+  defer removeAllLogged(dir)
+  let f = openBeneath("${dir}/root", "real.txt") catch e {
+    panic("openBeneath: ${e.message()}")
+  }
+  defer f.close()
+  assertMagicLinksRefused(f.fd, true)
+  assertMagicLinksRefused(f.fd, false)
+}
