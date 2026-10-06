@@ -59,7 +59,7 @@ move it. Counting from the left instead is the classic vulnerability. A list
 shorter than `hops` falls back to `c.peer()` rather than to anything the
 header claimed.
 
-A store outage is logged through `Config.logs` and the request is **served**
+A store outage is logged through `Config.logger` and the request is **served**
 - failing closed would turn a counter outage into an outage of the app the
 limiter protects. Two registrations with the same policy, store and key
 function share one bucket; set `name` on `Limit` to keep two limiters apart
@@ -108,11 +108,13 @@ allowlist of types that actually compress.
 
 ## Logging
 
-`logger()` writes one line per request - timestamp, method, the matched
-route pattern (not the raw path), status, and how long the downstream chain
-took. Five space-separated fields and nothing else: the framework's default
-log line cannot leak a credential into a file that ships to a third-party
-aggregator.
+`logger()` writes one `INFO` record per request through `Config.logger`
+(`getDefault()` when unset): `method`, `path` (the matched route pattern, not
+the raw path), `status`, and `took`, a `Duration` for the downstream chain.
+Four attributes and nothing else: the framework's default record cannot leak
+a credential into a file that ships to a third-party aggregator. A request
+whose chain failed carries `failed=true` instead of `status`. See
+[Configuration](configuration.md#logging) for choosing the handler.
 
 ## Tracing
 

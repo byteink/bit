@@ -56,14 +56,14 @@ after it to time everything that follows.
 
 ## Logging every request
 
-`logger()` writes one line per request to stderr (or wherever `Config.logs`
-points): the time, the method, the matched route, the status and how long
-the whole chain took.
+`logger()` writes one `INFO` record per request through the app's
+`Config.logger` (the `std/log` default on stderr when you set none): the
+method, the matched route, the status and how long the whole chain took.
 
 ```
 $ curl -s http://127.0.0.1:8080/health
 $ tail -1 inkwell.log
-2026-09-27T19:55:43Z GET /health 200 0ms
+time=2026-09-27T19:55:43Z level=INFO msg=request method=GET path=/health status=200 took=412us
 ```
 
 It logs the route *pattern* (`/articles/:id`), never the concrete request

@@ -206,10 +206,10 @@ no store. The client sees `forbidden`, `not found` or `authorization
 unavailable` and never the policy or the table: pkg/web maps by `status()` and
 `message()`, so nothing here is registered with it.
 
-The sink is any class with `log(line: string)`. The standard library has no
-logger, so the usual one writes to stderr, and the same class can be given to
-`logTo`, to pkg/orm's `Logger` and to pkg/web's `Config.logs`, which puts the
-three logs in one stream:
+The sink is any class with `log(line: string)`. The usual one writes to
+stderr, and the same class can be given to `logTo` and to pkg/orm's `Logger`,
+which puts the two logs in one stream (pkg/web writes through `std/log`'s
+`Logger`, set with `Config.logger`):
 
 ```bit
 class StderrLines {
