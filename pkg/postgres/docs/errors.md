@@ -5,15 +5,15 @@ the shape you need, and decide what to do by `sqlState()`, never by parsing
 the message text:
 
 ```bit
-import { Pool, Value } from "std/sql"
+import { ExecResult, Pool, Value } from "std/sql"
 
 interface SqlError { message(): string, sqlState(): string }
 
-fn retry(): int! {
-  return 0
+fn retry(): ExecResult! {
+  return ExecResult{ rowsAffected = 0 }
 }
 
-fn execWithRetry(db: Pool, sql: string, params: []Value): int! {
+fn execWithRetry(db: Pool, sql: string, params: []Value): ExecResult! {
   return db.exec(sql, params) catch e {
     let (pg, ok) = e.(SqlError)
     if (!ok || (pg.sqlState() != "40001" && pg.sqlState() != "40P01")) {
