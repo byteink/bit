@@ -771,9 +771,19 @@ connections.
 
 As the package-level `post`, using this client's configuration.
 
-### `Client.request(method: string, url: string, body: string): Response!`
+### `Client.request(method: string, url: string, body: Body, timeoutMs: int = 0): Response!`
 
-As the package-level `request`, using this client's configuration.
+As the package-level `request`, using this client's configuration, with the
+body typed: `Body.Text(s)` for a string, `Body.Bytes(b)` for bytes sent as
+they are. A `timeoutMs` above 0 bounds the whole request as
+`Client.requestTimeout` does.
+
+### `Body`
+
+A request body for `Client.request`: `Text(string)`, or `Bytes([]byte)`,
+which is never copied, so a large upload such as a `FormBody.body` costs no
+memory beyond itself. The slice is the caller's: it must not change until
+the request returns.
 
 ### `Client.requestWith(method: string, url: string, headers: []Header, body: string): Response!`
 
@@ -1362,9 +1372,10 @@ LF or a NUL in `name` cannot be quoted and would end the header line, so
 ### `FormBuilder.file(name: string, filename: string, contentType: string, content: []byte): ()!`
 
 Adds a file part announced as `filename` and declared as `contentType`
-(`application/octet-stream` when empty), holding `content` exactly. `name`
-and `filename` are quoted as in `field`; `file` fails on a CR, a LF or a NUL
-in `name`, `filename` or `contentType`.
+(`application/octet-stream` when empty), holding `content` exactly. `content`
+is kept as it is, not copied, until `build` copies it into the body, so do not
+change it before then. `name` and `filename` are quoted as in `field`; `file`
+fails on a CR, a LF or a NUL in `name`, `filename` or `contentType`.
 
 ### `FormBuilder.build(): FormBody!`
 
@@ -1372,16 +1383,18 @@ Returns the body and its `Content-Type`. The boundary is `bit-form-` and 128
 bits from the system CSPRNG in hex, drawn again for every `build`, and it is
 searched for in every part's headers and content: a candidate that occurs in
 a part is dropped for the next, and eight in a row fail the build. The body
-is written into one buffer allocated at its final size, so a large file is
-copied into it, not concatenated. Fails when nothing was added.
+is written into one buffer allocated at its final size, and each part's bytes
+are copied into it once: a 25 MiB file costs 25 MiB, not three times that.
+Fails when nothing was added.
 
 ### `FormBody`
 
 What `build` returns: `contentType`, the value of the request's
-`Content-Type` header with the boundary in it, and `body`.
+`Content-Type` header with the boundary in it, and `body`, a `[]byte` that
+`Client.request` sends as it is in a `Body.Bytes`.
 
 ```bit
-import { Client, FormBuilder, Response, Form, parseMultipart, defaultLimits } from "std/http"
+import { Body, Client, FormBuilder, Response, Form, parseMultipart, defaultLimits } from "std/http"
 import { indexOf } from "std/strings"
 
 fn upload(url: string, avatar: []byte): Response! {
@@ -1391,7 +1404,7 @@ fn upload(url: string, avatar: []byte): Response! {
   let out = form.build()?
   let c = Client()
   c.setHeader("Content-Type", out.contentType)?
-  return c.request("POST", url, out.body)?
+  return c.request("POST", url, Body.Bytes(out.body))?
 }
 
 // The server's side of the same body: `boundary=` is the last part of
@@ -1401,7 +1414,7 @@ fn readBack(avatar: []byte): Form! {
   form.file("avatar", "ada.png", "image/png", avatar)?
   let out = form.build()?
   let at = indexOf(out.contentType, "boundary=")
-  return parseMultipart([]byte(out.body), out.contentType[at + 9:], defaultLimits())?
+  return parseMultipart(out.body, out.contentType[at + 9:], defaultLimits())?
 }
 ```
 

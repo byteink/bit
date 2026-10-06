@@ -467,7 +467,7 @@ fn poolKey(u: Url, extras: RequestExtras): string {
 // the exchange; an h2 stream does not (`maxH2Streams` bounds those). A reused connection that fails is retried once on a fresh
 // one for an idempotent method only; a POST fails with the error it got, a
 // `RequestError` whose `sent` says whether the server may have the request.
-fn exchangeOrigin(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+fn exchangeOrigin(method: string, u: Url, body: Body, extras: RequestExtras): Response! {
   if (u.https) {
     match (extras.pool.h2.take(poolKey(u, extras), monotonic().ns)) {
       Shared(e) => return reuseH2(e, method, u, body, extras)?
@@ -480,7 +480,7 @@ fn exchangeOrigin(method: string, u: Url, body: string, extras: RequestExtras): 
 // `exchangeOrigin` for a request whose origin has a live shared h2 connection
 // `e` (reference held for the caller): a stream on it, retried once on a fresh
 // connection when the stream failed and `method` may be repeated.
-fn reuseH2(e: h2Entry, method: string, u: Url, body: string, extras: RequestExtras): Response! {
+fn reuseH2(e: h2Entry, method: string, u: Url, body: Body, extras: RequestExtras): Response! {
   let res = runH2(e, method, u, body, extras) catch err {
     if (!isIdempotent(method)) {
       fail err
@@ -494,7 +494,7 @@ fn reuseH2(e: h2Entry, method: string, u: Url, body: string, extras: RequestExtr
 
 // `exchangeFresh` for a caller that holds no slot yet: claims one for the
 // exchange, which hands it back before a stream starts if the origin is h2.
-fn exchangeCapped(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+fn exchangeCapped(method: string, u: Url, body: Body, extras: RequestExtras): Response! {
   let slot = extras.pool.acquire(poolKey(u, extras), extras.deadline) catch e {
     fail unsentError(e)
   }
@@ -505,7 +505,7 @@ fn exchangeCapped(method: string, u: Url, body: string, extras: RequestExtras): 
 // The HTTP/1.1 half of `exchangeOrigin`: a parked connection, else a dial. The
 // slot is claimed before the idle list is read, so a request that waited finds
 // the connection whose return woke it.
-fn exchangeParked(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+fn exchangeParked(method: string, u: Url, body: Body, extras: RequestExtras): Response! {
   let key = poolKey(u, extras)
   let slot = extras.pool.acquire(key, extras.deadline) catch e {
     fail unsentError(e)
@@ -513,8 +513,7 @@ fn exchangeParked(method: string, u: Url, body: string, extras: RequestExtras): 
   defer slot.release()
   match (extras.pool.take(key, monotonic().ns)) {
     Hit(s) => {
-      let req = buildRequest(method, u, extras.block, body, false)
-      let res = runOn(s, key, req, method, extras) catch e {
+      let (res, keep) = sendOn(s, u, method, body, extras) catch e {
         if (!isIdempotent(method)) {
           fail e
         }
@@ -522,6 +521,7 @@ fn exchangeParked(method: string, u: Url, body: string, extras: RequestExtras): 
           fail afterSent(again)
         }
       }
+      parkOrShut(s, key, keep, extras)
       return res
     }
     Miss => return exchangeFresh(method, u, body, extras, slot)?
@@ -534,7 +534,7 @@ fn exchangeParked(method: string, u: Url, body: string, extras: RequestExtras): 
 fn exchangeFresh(
   method: string,
   u: Url,
-  body: string,
+  body: Body,
   extras: RequestExtras,
   slot: connSlot,
 ): Response! {
@@ -542,8 +542,7 @@ fn exchangeFresh(
     let conn = dialConn(u, extras.deadline) catch e {
       fail unsentError(e)
     }
-    let req = buildRequest(method, u, extras.block, body, false)
-    return runOn(netStream{ conn = conn }, poolKey(u, extras), req, method, extras)?
+    return runOn(netStream{ conn = conn }, u, method, body, extras)?
   }
   let d = dialOrigin(poolKey(u, extras), u, extras) catch e {
     fail unsentError(e)
@@ -553,10 +552,7 @@ fn exchangeFresh(
       slot.release()
       return runH2(e, method, u, body, extras)?
     }
-    Plain(tc) => {
-      let req = buildRequest(method, u, extras.block, body, false)
-      return runOn(tlsStream{ conn = tc }, poolKey(u, extras), req, method, extras)?
-    }
+    Plain(tc) => { return runOn(tlsStream{ conn = tc }, u, method, body, extras)? }
   }
 }
 
@@ -574,33 +570,53 @@ fn dialTlsConn(u: Url, cfg: TlsConfig, deadline: int): TlsConn! {
   return tlsDialDeadline(u.host, u.port, cfg, deadline)?
 }
 
-// Writes `req` on `s`, reads the response, and parks `s` in `extras.pool` when
-// it can carry another request, else closes it — on every exit, so a failed or
-// timed-out exchange never leaks the socket. A parked connection has its
-// deadline cleared first.
-fn runOn(
-  s: byteStream,
-  key: string,
-  req: string,
-  method: string,
-  extras: RequestExtras,
-): Response! {
-  s.setIdleDeadline(extras.deadline)
-  let (res, keep) = exchangeKeep(s, req, method, extras.maxBody) catch e {
-    s.shut()
-    fail sentError(e)
-  }
-  if (!keep) {
-    s.shut()
-    return res
-  }
-  s.setIdleDeadline(0)
-  extras.pool.put(key, s, monotonic().ns)
+// `sendOn` then `parkOrShut`, for a connection dialed for this request: one
+// with no pool key in hand yet.
+fn runOn(s: byteStream, u: Url, method: string, body: Body, extras: RequestExtras): Response! {
+  let (res, keep) = sendOn(s, u, method, body, extras)?
+  parkOrShut(s, poolKey(u, extras), keep, extras)
   return res
 }
 
-fn exchangeKeep(s: byteStream, req: string, method: string, maxBody: int): (Response, bool)! {
-  s.writeStr(req)?
+// Writes `method u` with `body` on `s` and reads the response, both bounded by
+// `extras.deadline`. `s` is closed when either fails, so a failed or timed-out
+// exchange never leaks the socket; the bool says whether `s` can carry another
+// request, for `parkOrShut`.
+fn sendOn(
+  s: byteStream,
+  u: Url,
+  method: string,
+  body: Body,
+  extras: RequestExtras,
+): (Response, bool)! {
+  let req = buildRequest(method, u, extras.block, body, false)
+  s.setIdleDeadline(extras.deadline)
+  let r = exchangeKeep(s, req, body, method, extras.maxBody) catch e {
+    s.shut()
+    fail sentError(e)
+  }
+  return r
+}
+
+// Parks `s` in `extras.pool` under the origin's `key`, its deadline cleared,
+// when `keep` says it can carry another request; closes it otherwise.
+fn parkOrShut(s: byteStream, key: string, keep: bool, extras: RequestExtras) {
+  if (!keep) {
+    s.shut()
+    return
+  }
+  s.setIdleDeadline(0)
+  extras.pool.put(key, s, monotonic().ns)
+}
+
+fn exchangeKeep(
+  s: byteStream,
+  req: string,
+  body: Body,
+  method: string,
+  maxBody: int,
+): (Response, bool)! {
+  writeRequest(s, req, body)?
   let r = readResponseKeep(s, method, maxBody)?
   return r
 }
