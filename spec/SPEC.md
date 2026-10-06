@@ -119,7 +119,7 @@ assigned to but never read; it discards a value (e.g. `let (_, ok) = <-c`).
 
 ### 5.2 Keywords
 
-Reserved; may not be used as identifiers:
+Reserved; may not be used as identifiers (member names, §12.5):
 
 ```
 as      asm     break     case       catch   chan
@@ -3601,6 +3601,13 @@ compile error.
 `a.b` selects a class field or a method value. `t.0`, `t.1`, … select tuple
 elements by index (the index is an `INT_LIT`, checked against the tuple arity).
 Method values are closures bound to their receiver.
+
+A reserved word (§5.2) is a legal member name in two positions (#7035), so an
+API can use the natural verb when it is reserved: after a `.` the word is glued
+to (`db.as(user)`), and as the name of a method declaration, in a class body or
+an interface, when `(` or `<` follows it (`export as(a: Actor)`). A field named
+by a reserved word stays rejected, and so does a reserved word on the line after
+a `.`; every other identifier position is unchanged.
 
 When the receiver is a **type name** rather than a value, `T.name` selects one
 of two things: a variant of the enum `T` (`E.A`, `E.C(1)`, §14.7), or a static
