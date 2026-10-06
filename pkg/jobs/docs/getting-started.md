@@ -44,7 +44,7 @@ see [PostgreSQL](postgres.md) for what `migrate` and `PostgresStore` do.
 ```bit
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { PostgresStore, migrate, open, Options, Store } from "jobs"
+import { PostgresStore, PermanentFailure, migrate, open, Options, Store } from "jobs"
 
 @job("send-welcome") @json class SendWelcome {
   userId: i64,
@@ -129,6 +129,32 @@ you to inspect and requeue by hand.
 
 The arguments can also be named: `enqueue(SendWelcome{ userId = 1 },
 maxAttempts = 5)` leaves `delay` at its default of 0.
+
+## Giving up at once: PermanentFailure
+
+Some failures are the same on every try: the provider refused the address
+for good. Retrying only delays the dead-letter list and hammers the
+provider. A handler that knows a retry cannot help fails with a
+`PermanentFailure`, and the job goes to the dead-letter list on that attempt,
+whatever `maxAttempts` was:
+
+```bit
+fn runGivingUp(store: Store): ()! {
+  let q = open(store, Options{ workers = 4 })?
+  q.register<SendWelcome>((job: SendWelcome) => {
+    if (job.userId < 0) {
+      fail PermanentFailure{ reason = "user ${job.userId} does not exist" }
+    }
+    sendWelcomeEmail(job.userId)?
+  })
+  q.enqueue(SendWelcome{ userId = -1 }, 0, 5)?
+  q.run()?
+  return
+}
+```
+
+`reason` is what the dead-letter list records. Every other failure is still
+retried with backoff.
 
 ## Sharp edge: an unregistered job name is dead-lettered, loudly
 
