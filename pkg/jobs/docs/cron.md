@@ -40,10 +40,10 @@ fn main(): ()! {
   let q = open(PostgresStore(db), Options{ workers = 4 })?
   q.register<NightlyDigest>((job: NightlyDigest) => {
     sendDigest(job.list)?
-  })
+  })?
   q.register<PruneDrafts>((job: PruneDrafts) => {
     pruneDrafts(job.olderThanDays)?
-  })
+  })?
   q.schedule(
     "0 2 * * *",
     NightlyDigest{ list = "readers" },
