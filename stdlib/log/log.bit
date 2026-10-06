@@ -1,0 +1,252 @@
+// Bit standard library — std/log: levels, attributes, records and the Handler
+// interface.
+//
+// A structured, leveled logger shaped after Go's log/slog: a `Logger` turns
+// one call into a `Record` (time, level, message, attributes) and hands it to
+// a `Handler`, which decides whether the level is enabled and where the bytes
+// go. `TextHandler` (text.bit) and `JsonHandler` (json.bit) are the two
+// shipped handlers; `Logger` and the process default live in logger.bit.
+//
+// This file also holds the module's only imports: imports are per module, so
+// the sibling files use these names without importing them again.
+
+import { Timestamp, now } from "std/time"
+import { Mutex } from "std/sync"
+import { stderr } from "std/io"
+import {
+  jsonAppendRaw,
+  jsonAppendKey,
+  jsonAppendString,
+  jsonAppendInt,
+  jsonAppendFloat,
+  jsonAppendBool,
+} from "std/json"
+
+// --- levels ---------------------------------------------------------------
+
+// A level is a plain int so an application can name its own between the
+// four. The gaps (4 apart) are slog's: room for `LevelInfo + 2` ("notice")
+// without a new type.
+export const LevelDebug: int = -4
+export const LevelInfo: int = 0
+export const LevelWarn: int = 4
+export const LevelError: int = 8
+
+// "DEBUG", "INFO", "WARN" or "ERROR" for the four named levels; any other
+// level reads as the nearest named level below it plus the distance, so
+// `LevelInfo + 2` is "INFO+2" and `LevelDebug - 4` is "DEBUG-4".
+export fn levelName(level: int): string {
+  if (level < LevelInfo) {
+    return offsetName("DEBUG", level - LevelDebug)
+  }
+  if (level < LevelWarn) {
+    return offsetName("INFO", level - LevelInfo)
+  }
+  if (level < LevelError) {
+    return offsetName("WARN", level - LevelWarn)
+  }
+  return offsetName("ERROR", level - LevelError)
+}
+
+fn offsetName(name: string, delta: int): string {
+  if (delta == 0) {
+    return name
+  }
+  if (delta > 0) {
+    return "${name}+${delta}"
+  }
+  return "${name}${delta}"
+}
+
+// --- attributes -----------------------------------------------------------
+
+// Which field of an `Attr` carries its value. A Duration is nanoseconds in
+// `num`; a Time is nanoseconds since the Unix epoch in `num` and its RFC 3339
+// text in `str`; an Error is the error's message in `str`.
+export enum Kind { String, Int, Float, Bool, Duration, Time, Error, Group }
+
+// One key and one typed value. Build them with `Str`, `Int`, `Float`, `Bool`,
+// `Duration`, `Time`, `Err` and `Group`; a handler of your own reads `kind`
+// and the field that kind names.
+export class Attr {
+  export readonly key: string,
+  export readonly kind: Kind,
+  export readonly num: int,
+  export readonly flt: f64,
+  export readonly str: string,
+  export readonly group: []Attr,
+}
+
+fn requireKey(key: string) {
+  if (key == "") {
+    panic("log: an attribute key must not be empty")
+  }
+}
+
+export fn Str(key: string, value: string): Attr {
+  requireKey(key)
+  return Attr{ key = key, kind = Kind.String, num = 0, flt = 0.0, str = value, group = []Attr(0) }
+}
+
+export fn Int(key: string, value: int): Attr {
+  requireKey(key)
+  return Attr{ key = key, kind = Kind.Int, num = value, flt = 0.0, str = "", group = []Attr(0) }
+}
+
+export fn Float(key: string, value: f64): Attr {
+  requireKey(key)
+  return Attr{ key = key, kind = Kind.Float, num = 0, flt = value, str = "", group = []Attr(0) }
+}
+
+export fn Bool(key: string, value: bool): Attr {
+  requireKey(key)
+  let n = 0
+  if (value) {
+    n = 1
+  }
+  return Attr{ key = key, kind = Kind.Bool, num = n, flt = 0.0, str = "", group = []Attr(0) }
+}
+
+// `nanos` is a duration in nanoseconds, the unit std/time uses everywhere.
+export fn Duration(key: string, nanos: int): Attr {
+  requireKey(key)
+  return Attr{
+    key = key,
+    kind = Kind.Duration,
+    num = nanos,
+    flt = 0.0,
+    str = "",
+    group = []Attr(0),
+  }
+}
+
+export fn Time(key: string, at: Timestamp): Attr {
+  requireKey(key)
+  return Attr{
+    key = key,
+    kind = Kind.Time,
+    num = at.ns,
+    flt = 0.0,
+    str = at.toString(),
+    group = []Attr(0),
+  }
+}
+
+// An error's message under `key` ("error" unless you say otherwise).
+export fn Err(e: error, key: string = "error"): Attr {
+  requireKey(key)
+  return Attr{
+    key = key,
+    kind = Kind.Error,
+    num = 0,
+    flt = 0.0,
+    str = e.message(),
+    group = []Attr(0),
+  }
+}
+
+// Nests `attrs` under `key`: `key.sub=...` in text, `{"key":{"sub":...}}` in
+// JSON. A group with no attributes is left out of the output.
+export fn Group(key: string, ...attrs: Attr): Attr {
+  requireKey(key)
+  return Attr{ key = key, kind = Kind.Group, num = 0, flt = 0.0, str = "", group = attrs }
+}
+
+// --- records and handlers -------------------------------------------------
+
+// Everything one log call produced, handed to `Handler.handle`.
+export class Record {
+  export readonly time: Timestamp,
+  export readonly level: int,
+  export readonly msg: string,
+  export readonly attrs: []Attr,
+}
+
+// Where records go. `enabled` is asked first, with only the level, so a
+// disabled call never builds a `Record`. `with` and `withGroup` return a
+// child handler and leave the receiver untouched.
+export interface Handler {
+  enabled(level: int): bool,
+  handle(r: Record): ()!,
+  with(attrs: []Attr): Handler,
+  withGroup(name: string): Handler,
+}
+
+// Anything a handler can write a finished line to. `std/io`'s `Writer`
+// satisfies it, so does any class with a `write(s: string): ()!` method.
+export interface Sink {
+  write(s: string): ()!,
+}
+
+// --- shared handler state -------------------------------------------------
+
+// One nesting level: the group name that opened it ("" for the root) and the
+// attributes added while it was the innermost group.
+class frame {
+  group: string,
+  attrs: []Attr,
+}
+
+fn rootFrames(): []frame {
+  return []frame{ frame{ group = "", attrs = []Attr(0) } }
+}
+
+// `frames` with `attrs` added to the innermost group; `frames` itself is not
+// modified, a child handler shares nothing mutable with its parent.
+fn framesWith(frames: []frame, attrs: []Attr): []frame {
+  let last = len(frames) - 1
+  let out = []frame(0)
+  let i = 0
+  while (i < last) {
+    out = append(out, frames[i])
+    i = i + 1
+  }
+  out = append(
+    out,
+    frame{ group = frames[last].group, attrs = concatAttrs(frames[last].attrs, attrs) },
+  )
+  return out
+}
+
+fn framesGroup(frames: []frame, name: string): []frame {
+  requireKey(name)
+  let out = []frame(0)
+  let i = 0
+  while (i < len(frames)) {
+    out = append(out, frames[i])
+    i = i + 1
+  }
+  return append(out, frame{ group = name, attrs = []Attr(0) })
+}
+
+fn concatAttrs(a: []Attr, b: []Attr): []Attr {
+  let out = []Attr(0)
+  let i = 0
+  while (i < len(a)) {
+    out = append(out, a[i])
+    i = i + 1
+  }
+  i = 0
+  while (i < len(b)) {
+    out = append(out, b[i])
+    i = i + 1
+  }
+  return out
+}
+
+// Writes one finished line, holding `mu` so lines from two tasks never
+// interleave on a sink that is not itself atomic.
+fn writeLine(mu: Mutex, out: Sink, line: string): ()! {
+  mu.lock()
+  out.write(line) catch e {
+    mu.unlock()
+    fail e
+  }
+  mu.unlock()
+}
+
+fn requireSink(out: Sink) {
+  if (out == nil) {
+    panic("log: a handler needs a sink; pass std/io's stderr() or any class with write(s: string): ()!")
+  }
+}
