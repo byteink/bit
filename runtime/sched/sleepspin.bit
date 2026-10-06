@@ -1,0 +1,197 @@
+// The spinner half of the idle wake (#7404), split out of `sleep.bit`, which
+// is at the 800-line limit. Same module. Sorts after `sleep.bit` and before
+// `task.bit` and `workerrun.bit`, so `schedUnpark` still inlines its wake.
+//
+// Go's `ready` -> `wakep` rule: a task made runnable where only its waker's
+// worker can see it wakes ONE parked peer, and none while a woken peer is
+// still looking. `wkPark` holds `parkSpinner` or `parkNapper` on the worker
+// holding that unit; worker 0's `wkSpinning` holds the same state while the
+// unit is held and 0 while it is free, so a ready can tell a spinner that is
+// looking from a napper that is asleep. `sleep.bit`'s `schedIdlePark` carries
+// the no-lost-wakeup argument.
+
+// The scheduler's spinner unit, on worker 0 (`wkSpinning`).
+@nosplit fn schedSpinAddr(s: *i64): *i64 {
+  return schedWorkerAt(s, 0) + wkSpinning
+}
+
+// Give the unit back. An exchange, not a store: the release must be a full
+// barrier before the probe that follows it, or a ready that read the unit as
+// held could publish work this worker's probe does not see.
+@nosplit fn schedSpinRelease(s: *i64) {
+  let _ = atomicXchg(schedSpinAddr(s), 0)
+}
+
+// A spinner found work (Go's `resetspinning`). A ready that saw this spinner
+// skipped its own wake, and its publish is ordered before this decrement, so
+// the probe after it sees that work; hand it to a parked peer, or it would
+// wait for a park timeout while this worker runs something else.
+@nosplit fn schedSpinDone(s: *i64) {
+  schedSpinRelease(s)
+  if (schedWorkSeen(s) != 0) {
+    schedWakeSpinner(s)
+  }
+}
+
+// A task was made runnable where only the running worker can see it — its own
+// next-run slot (`schedUnpark`) — so wake one parked peer that may steal it,
+// unless a woken peer is already looking (Go's `ready` -> `wakep`, #7404).
+// Without it the task waited until its waker blocked or a parked peer's
+// `idleParkMaxNs` timeout ran, measured at up to 190ms for a waker that keeps
+// running. One spinner at a time is what keeps a lock handoff from paying a
+// wake per handoff: the spinner releases its unit in `schedSpinDone` or
+// `schedIdlePark`, and both hand on any work a skipped ready left.
+@nosplit fn schedWakeSpinner(s: *i64) {
+  if (atomicLoad(s + scIdleCount) <= 0) {
+    return
+  }
+  let c = schedSpinAddr(s)
+  if (atomicLoad(c) != 0 || !atomicCmpxchg(c, 0, int(parkSpinner))) {
+    return
+  }
+  if (!schedWakePeerAs(s, parkSpinner)) {
+    schedSpinRelease(s)
+  }
+}
+
+// Work became visible after this worker published itself parked (`sleep.bit`'s
+// `schedIdlePark`): take the one unit as `to` (`parkSpinner` or `parkNapper`),
+// and report false when another worker holds it, which leaves the work to that
+// worker's own re-probe. A waker that claimed the word first
+// (`schedWakeParkedPeer`, 1 -> 0) already woke this worker, so the unit just
+// taken is handed back and the worker still loops to look.
+@nosplit fn schedSpinAgain(s: *i64, p: *i32, to: i32): bool {
+  let c = schedSpinAddr(s)
+  if (atomicLoad(c) != 0 || !atomicCmpxchg(c, 0, int(to))) {
+    return false
+  }
+  if (!atomicCmpxchg(p, 1, to)) {
+    schedSpinRelease(s)
+  }
+  return true
+}
+
+// One nap of the napper (`schedNapOn`): the bound on how long a task whose
+// running owner never gets to it waits for a peer, against the 1ms target.
+const spinNapNs: int = 250000
+
+// How many naps in a row whose probe saw no work at all a napper takes before
+// it gives its unit up and parks (`schedNapOn`): about 1ms of quiet. A probe
+// that sees a peer's slot occupied starts the count again.
+const napEmptyMax: i32 = 4
+
+// A napper's find-work pass came back empty (`sleep.bit`'s `schedIdlePark`,
+// #7404). It keeps its unit and probes again, so a lock handoff or a
+// ping-pong keeps skipping its wakes instead of paying one each time the
+// probe catches the slot empty. Work it can take now (queued, or a peer's slot
+// whose task sat still through a grace) ends the turn without a nap, and the
+// next pass takes it: a ready that landed between that pass and this probe
+// waits no nap. A slot that keeps changing is a handoff in progress, so the
+// napper naps; a probe that sees nothing counts toward `napEmptyMax`. Returns
+// false, still holding the unit, when that count runs out: the caller then
+// releases it and probes again before it parks.
+@nosplit fn schedNapOn(s: *i64, w: *i64, p: *i32): bool {
+  let seen = schedWorkSeen(s)
+  if (seen == seenQueued || (seen == seenSlot && schedRunNextPass(w, s, false) != 0)) {
+    atomicStore(p, parkNapper)
+    return true
+  }
+  let next = parkNapper
+  if (seen == 0) {
+    next = atomicLoad(p) + 1
+  }
+  if (next - parkNapper >= napEmptyMax) {
+    return false
+  }
+  atomicStore(p, next)
+  let _ = bit_rt_port_park_wait(p, next, spinNapNs, w + wkSleepReq)
+  return true
+}
+
+// The spinner state `schedIdlePark` claims after its probe saw `seen`.
+@nosplit fn spinStateFor(seen: int): i32 {
+  if (seen == seenSlot) {
+    return parkNapper
+  }
+  return parkSpinner
+}
+
+// How many probe rounds a spinner makes after its find-work pass fails before
+// it parks (Go's spinning `findRunnable`). Each round costs at least one
+// `schedSpinPause`, so a spinner that sees nothing lives tens of microseconds:
+// long enough that a lock handoff or a ping-pong readies many tasks under one
+// wake, short enough to stay well inside the collector's rendezvous spin.
+const spinnerRounds: int = 16
+
+// The pause between probes, and the grace before a peer's next-run slot is
+// taken: about 1-3us of loads on this worker's own park word, a line no other
+// worker writes on the hot path. Go's `runqgrab` sleeps 3us there, because a
+// channel handoff readies a task and blocks a few hundred nanoseconds later.
+const spinGraceLoads: int = 2048
+
+// How many times `rnStealGrace` reads the slot across its grace.
+const graceSamples: int = 8
+
+// Spin `loads` loads without touching any peer's line. Ends early when a waker
+// claims this worker's word, which means there is work.
+@nosplit fn schedSpinPause(w: *i64, loads: int) {
+  let p = workerParkAddr(w)
+  let v = atomicLoad(p)
+  let k = 0
+  while (k < loads && atomicLoad(p) == v) {
+    k = k + 1
+  }
+}
+
+// The task in peer `v`'s next-run slot when the SAME task sat in it for the
+// whole grace, else 0; `rnStealGrace` takes it only then (Go's `runqsteal`
+// with `stealRunNextG`). The owner readied it and is about to run it; taking
+// it at once is the cross-core migration #3264 removed. One compare at the end
+// is not enough: a ping-pong puts the same task back in the slot every few
+// hundred nanoseconds, so the slot is read `graceSamples` times and any
+// change, an empty read included, answers 0.
+@nosplit fn rnSteady(w: *i64, v: *i64): int {
+  let t = atomicLoad(v + wkRunNext)
+  let k = 0
+  while (t != 0 && k < graceSamples) {
+    k = k + 1
+    schedSpinPause(w, spinGraceLoads / graceSamples)
+    if (atomicLoad(v + wkRunNext) != t) {
+      return 0
+    }
+  }
+  return t
+}
+
+// `rnSteady`'s task, taken from the slot when `take` is set.
+@nosplit fn rnStealGrace(w: *i64, v: *i64, take: bool): int {
+  let t = rnSteady(w, v)
+  if (t == 0 || !take || atomicCmpxchg(v + wkRunNext, t, 0)) {
+    return t
+  }
+  return 0
+}
+
+// A spinner's search after its find-work pass failed: up to `spinnerRounds`
+// rounds of a pause, the queue probe and a graced next-run steal. Returns 0
+// at once for a worker that is not a spinner, and 0 when the rounds run out,
+// after which the worker parks through `schedIdlePark`.
+@nosplit fn schedSpinSearch(w: *i64, s: *i64): int {
+  let p = workerParkAddr(w)
+  let k = 0
+  while (k < spinnerRounds && atomicLoad(p) == parkSpinner) {
+    k = k + 1
+    schedSpinPause(w, spinGraceLoads)
+    if (schedWorkPending(w)) {
+      let t = schedFindWork(w)
+      if (t != 0) {
+        return t
+      }
+    }
+    let t = schedStealRunNext(w, s)
+    if (t != 0) {
+      return t
+    }
+  }
+  return 0
+}

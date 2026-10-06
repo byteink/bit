@@ -295,16 +295,39 @@ export const schedMaxWorkers: int = 32
   return z + int(w + wkPark) / 4
 }
 
+// `wkPark` after a ready's wake claimed this worker (#7404): awake, looking for
+// work, and holding one unit of the scheduler's spinner count. Only the owning
+// worker moves the word OUT of this state; wakers only ever move it out of 1.
+const parkSpinner: i32 = 2
+
+// `wkPark` of a worker napping on a task seen only in a peer's next-run slot
+// (`sleepspin.bit`'s `schedNapOn`): it holds the spinner unit, so a ready skips
+// its wake and costs two loads, and it does not repeat the spinner's search
+// when it wakes. `parkNapper + k` is the same state after `k` naps in a row
+// whose probe saw no work, up to `napEmptyMax`.
+const parkNapper: i32 = 3
+
 // Arm this worker to park. MUST be called before its find-work pass, not after —
-// see the header's interleaving argument.
+// see the header's interleaving argument. A spinner stays a spinner: it is
+// already looking, so no producer needs to claim it, and its count is released
+// only where it finds work or parks.
 export @nosplit @symbol("bit_rt_port_sched_idle_arm") fn schedIdleArm(w: *i64) {
-  atomicStore(workerParkAddr(w), 1)
+  let p = workerParkAddr(w)
+  if (atomicLoad(p) >= parkSpinner) {
+    return
+  }
+  atomicStore(p, 1)
 }
 
 // Found work instead. Clear the arm so a producer does not spend its one wake on
-// a worker that is already running.
+// a worker that is already running. One exchange, not a store: its old value
+// says whether this worker held the spinner unit, which a waker may have
+// granted between any load and a store, and a store would erase that claim.
 export @nosplit @symbol("bit_rt_port_sched_idle_disarm") fn schedIdleDisarm(w: *i64) {
-  atomicStore(workerParkAddr(w), 0)
+  if (atomicXchg(workerParkAddr(w), 0) < parkSpinner) {
+    return
+  }
+  schedSpinDone(taskAt(*(w + wkSched)))
 }
 
 // Park until claimed, or until `idleParkMaxNs` elapses.
@@ -316,15 +339,37 @@ export @nosplit @symbol("bit_rt_port_sched_idle_disarm") fn schedIdleDisarm(w: *
 // reach a safepoint, so the collector must see it as blocking or every rendezvous
 // waits it out.
 //
-// The word is cleared unconditionally on the way out, whichever way the wait
-// ended: woken, timed out, or returned immediately.
+// The word leaves the park at 0, at `parkSpinner` when a ready's wake or
+// `schedSpinAgain` claimed it, or at a napper state; it is never left armed.
+//
+// THE RE-CHECK AFTER THE COUNT IS THE NO-LOST-WAKEUP ARGUMENT (#7404). A
+// producer publishes, then reads `scIdleCount` and the spinner count, and skips
+// its wake when it sees no parked worker or a spinner. This worker bumps
+// `scIdleCount`, drops its spinner unit, THEN probes every queue and next-run
+// slot. All of it is sequentially consistent, so a producer whose read missed
+// this worker published before the probe, and the probe sees the work. Queued
+// work makes this worker the one spinner (`schedSpinAgain`) or, when a spinner
+// already exists, parks it: that spinner probes again after its own release.
+// Work seen only in a peer's next-run slot makes this worker the napper, which
+// keeps the unit and probes again while it holds it (`schedNapOn`), so the
+// unit is released only through this same release-then-probe.
 export @nosplit @symbol("bit_rt_port_sched_idle_park") fn schedIdlePark(s: *i64, w: *i64) {
+  let p = workerParkAddr(w)
   atomicAdd(s + scIdleCount, 1)
-  // #3914: `w + wkSleepReq` — see `bit_rt_port_park_wait`'s own declaration
-  // above for why this is safe to share with `parkSleepNs`'s identical use of
-  // the same two words.
-  let _ = bit_rt_port_park_wait(workerParkAddr(w), 1, idleParkMaxNs, w + wkSleepReq)
-  atomicStore(workerParkAddr(w), 0)
+  if (atomicLoad(p) < parkNapper || !schedNapOn(s, w, p)) {
+    if (atomicLoad(p) >= parkSpinner) {
+      atomicStore(p, 1)
+      schedSpinRelease(s)
+    }
+    let seen = schedWorkSeen(s)
+    // #3914: `w + wkSleepReq` — see `bit_rt_port_park_wait`'s own declaration
+    // above for why this is safe to share with `parkSleepNs`'s identical use of
+    // the same two words.
+    if (seen == 0 || !schedSpinAgain(s, p, spinStateFor(seen))) {
+      let _ = bit_rt_port_park_wait(p, 1, idleParkMaxNs, w + wkSleepReq)
+    }
+  }
+  let _ = atomicCmpxchg(p, 1, 0)
   atomicSub(s + scIdleCount, 1)
 }
 
@@ -653,6 +698,12 @@ export @nosplit @symbol("bit_rt_port_sched_timer_missed_wake") fn schedTimerMiss
 // woken — the caller then owes worker 0 nothing, because the worker that will
 // run the work is already on its way.
 @nosplit fn schedWakeParkedPeer(s: *i64): bool {
+  return schedWakePeerAs(s, 0)
+}
+
+// Claim one armed peer by moving its word from 1 to `to` (0, or `parkSpinner`
+// for a ready's wake), and wake it.
+@nosplit fn schedWakePeerAs(s: *i64, to: i32): bool {
   if (atomicLoad(s + scIdleCount) <= 0) {
     return false
   }
@@ -660,7 +711,7 @@ export @nosplit @symbol("bit_rt_port_sched_timer_missed_wake") fn schedTimerMiss
   let i = 0
   while (i < n && i < schedMaxWorkers) {
     let p = workerParkAddr(schedWorkerAt(s, i))
-    if (atomicCmpxchg(p, 1, 0)) {
+    if (atomicCmpxchg(p, 1, to)) {
       let _ = bit_rt_port_park_wake(p, false)
       return true
     }
