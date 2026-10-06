@@ -19,7 +19,7 @@
 // wait for a park timeout while this worker runs something else.
 @nosplit fn schedSpinDone(s: *i64) {
   atomicSub(schedSpinAddr(s), 1)
-  if (schedWorkVisible(s)) {
+  if (schedWorkSeen(s) != 0) {
     schedWakeSpinner(s)
   }
 }
@@ -62,6 +62,19 @@
   return true
 }
 
+// The nap of a worker whose park probe saw work only in a peer's next-run
+// slot (`sleep.bit`'s `schedIdlePark`): the bound on how long a task its
+// running owner never gets to waits for a peer, against the 1ms target.
+const spinNapNs: int = 250000
+
+// How long `schedIdlePark` waits after its probe saw `seen`.
+@nosplit fn idleWaitNs(seen: int): int {
+  if (seen == seenSlot) {
+    return spinNapNs
+  }
+  return idleParkMaxNs
+}
+
 // How many probe rounds a spinner makes after its find-work pass fails before
 // it parks (Go's spinning `findRunnable`). Each round costs at least one
 // `schedSpinPause`, so a spinner that sees nothing lives tens of microseconds:
@@ -75,28 +88,37 @@ const spinnerRounds: int = 16
 // channel handoff readies a task and blocks a few hundred nanoseconds later.
 const spinGraceLoads: int = 2048
 
-// Wait about one grace period without touching any peer's line. Ends early when
-// a waker claims this worker's word, which means there is work.
-@nosplit fn schedSpinPause(w: *i64) {
+// How many times `rnStealGrace` reads the slot across its grace.
+const graceSamples: int = 8
+
+// Spin `loads` loads without touching any peer's line. Ends early when a waker
+// claims this worker's word, which means there is work.
+@nosplit fn schedSpinPause(w: *i64, loads: int) {
   let p = workerParkAddr(w)
   let v = atomicLoad(p)
   let k = 0
-  while (k < spinGraceLoads && atomicLoad(p) == v) {
+  while (k < loads && atomicLoad(p) == v) {
     k = k + 1
   }
 }
 
-// Take peer `v`'s next-run slot only when the SAME task is still in it after a
+// Take peer `v`'s next-run slot only when the SAME task sat in it for the whole
 // grace (Go's `runqsteal` with `stealRunNextG`). The owner readied it and is
 // about to run it; taking it at once is the cross-core migration #3264
-// removed, and what doubled channel ping-pong under the first #7404 wake.
+// removed. One compare at the end is not enough: a ping-pong puts the same task
+// back in the slot every few hundred nanoseconds, so the slot is read
+// `graceSamples` times and any change, an empty read included, aborts.
 @nosplit fn rnStealGrace(w: *i64, v: *i64): int {
   let t = atomicLoad(v + wkRunNext)
-  if (t == 0) {
-    return 0
+  let k = 0
+  while (t != 0 && k < graceSamples) {
+    k = k + 1
+    schedSpinPause(w, spinGraceLoads / graceSamples)
+    if (atomicLoad(v + wkRunNext) != t) {
+      return 0
+    }
   }
-  schedSpinPause(w)
-  if (atomicCmpxchg(v + wkRunNext, t, 0)) {
+  if (t != 0 && atomicCmpxchg(v + wkRunNext, t, 0)) {
     return t
   }
   return 0
@@ -111,7 +133,7 @@ const spinGraceLoads: int = 2048
   let k = 0
   while (k < spinnerRounds && atomicLoad(p) == parkSpinner) {
     k = k + 1
-    schedSpinPause(w)
+    schedSpinPause(w, spinGraceLoads)
     if (schedWorkPending(w)) {
       let t = schedFindWork(w)
       if (t != 0) {
