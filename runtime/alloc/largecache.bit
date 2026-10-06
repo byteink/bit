@@ -1,0 +1,215 @@
+// The large-mapping cache (#7445). Sibling of `./alloc.bit`, same module (SPEC
+// §17.1); its state words are declared there beside the rest of the heap block.
+//
+// WHAT IT FIXES. A request above `allocMaxSmall` gets a mapping of its own, and
+// until this file every such mapping went back to the OS the moment its object
+// was swept. `net.Conn.read(65536)` allocates two per call, so a 100 MiB read
+// loop paid 3,212 `mmap` + 3,195 `munmap` and a zero-fill fault per page of
+// every buffer, and ran 9x slower than `readInto` on x86-64 Linux (#7405).
+//
+// THE SHAPE IS THE STANDARD ONE: a size-classed free-span cache with a
+// scavenger behind it. Freed mappings sit on one LIFO list per size class; a
+// request rounds its length up to its class (`allocLargeClassLen`), so every
+// entry on a list fits every request for it and a take is one pop. Classes
+// are four per doubling of the page count, so the rounding costs at most a
+// quarter of the request, and costs it in address space only: the pages past
+// the body are never written, so they never become resident.
+//
+// TWO BOUNDS, BOTH REQUIRED. A push that would take the cache past
+// `allocLargeCacheBytes` is refused and the caller unmaps the mapping at once,
+// so retained memory never exceeds that figure whatever the program's peak was
+// (#2325). And every collection ages the cache (`heapLargeCacheAgeLocked`):
+// an entry no request took between two collections goes back to the OS at
+// the second, so a program whose large churn stops keeps none of it past its
+// next collection. The age is the GC epoch, not a clock: entries are stamped
+// when pushed, and a list is newest-first, so its stale entries are a suffix.
+// When the OS refuses a fresh mapping, the caller drains the whole cache
+// (`heapLargeCacheDrainLocked`) and retries before reporting exhaustion.
+//
+// The allocator cannot call the OS (see `./alloc.bit`), so as with the span
+// cache this file keeps only addresses: the age and drain hand back a chain of
+// unlinked entries for `runtime/gc` to unmap.
+//
+// AN ENTRY IS THE MAPPING ITSELF. Its first three words hold its length, the
+// next entry and its stamp, written over a prologue and header whose object is
+// already dead and off every list the collector reads.
+
+// Bytes the cache may hold. 16 MiB covers the large bytes a default-paced
+// collection cycle frees (the trigger floor is 4 MiB) several times over, and
+// stays small next to the address space and faults it saves.
+export const allocLargeCacheBytes: int = 16777216
+
+// Classes: page counts 1..8 exactly, then four per doubling up to 512 pages.
+const allocLargeExactBins: int = 8
+const allocLargeMaxPages: int = 512
+const allocLargeBins: int = 32
+
+// Word offsets inside a cached mapping.
+const lcLen: int = 0
+const lcNext: int = 1
+const lcStamp: int = 2
+
+// The class of a mapping of `pages` pages, or -1 when it is too large to cache.
+@nosplit fn allocLargeBin(pages: int): int {
+  if (pages <= allocLargeExactBins) {
+    return pages - 1
+  }
+  if (pages > allocLargeMaxPages) {
+    return -1
+  }
+  // The largest k with 2^k < pages; at most five steps (k = 3..8).
+  let k = 3
+  while (k < 8 && (1 << (k + 1)) < pages) {
+    k = k + 1
+  }
+  let j = (pages - 1 - (1 << k)) >> (k - 2)
+  return allocLargeExactBins + (k - 3) * 4 + j
+}
+
+// The page count of class `bin`, the inverse of `allocLargeBin`.
+@nosplit fn allocLargeBinPages(bin: int): int {
+  if (bin < allocLargeExactBins) {
+    return bin + 1
+  }
+  let k = 3 + ((bin - allocLargeExactBins) >> 2)
+  let j = (bin - allocLargeExactBins) & 3
+  return (1 << k) + ((j + 1) << (k - 2))
+}
+
+// The length to map for a request already rounded to `nbytes` whole pages: its
+// class's length when the cache can hold it, else `nbytes` unchanged.
+export @nosplit @symbol("bit_rt_alloc_large_class_len") fn allocLargeClassLen(
+  nbytes: int,
+  pageSize: int,
+): int {
+  let bin = allocLargeBin(nbytes / pageSize)
+  if (bin < 0) {
+    return nbytes
+  }
+  return allocLargeBinPages(bin) * pageSize
+}
+
+// The class a cached entry of `nbytes` belongs to, or -1 when it has none: too
+// large, or not exactly a class length, which would break "every entry fits
+// every request of its class".
+@nosplit fn allocLargeEntryBin(nbytes: int, pageSize: int): int {
+  let bin = allocLargeBin(nbytes / pageSize)
+  if (bin < 0 || allocLargeBinPages(bin) * pageSize != nbytes) {
+    return -1
+  }
+  return bin
+}
+
+// Keep the mapping at `mapBase` (`nbytes` long) for reuse. CALLER MUST HOLD THE
+// LOCK. Returns 1 if kept, 0 if the caller must unmap it itself.
+export @nosplit @symbol("bit_rt_heap_large_cache_push_locked") fn heapLargeCachePushLocked(
+  h: *i64,
+  mapBase: int,
+  nbytes: int,
+  pageSize: int,
+): int {
+  let bin = allocLargeEntryBin(nbytes, pageSize)
+  let bytes = *(h + heapLargeCacheBytesWord)
+  if (bin < 0 || bytes + nbytes > allocLargeCacheBytes) {
+    return 0
+  }
+  let e = allocWordAt(mapBase)
+  let head = h + heapLargeBinsWord + bin
+  *(e + lcLen) = nbytes
+  *(e + lcNext) = *head
+  *(e + lcStamp) = *(h + heapLargeCacheEpochWord)
+  *head = mapBase
+  *(h + heapLargeCacheBytesWord) = bytes + nbytes
+  return 1
+}
+
+// A cached mapping of exactly `nbytes` (a class length from
+// `allocLargeClassLen`), or 0 when its class is empty. CALLER MUST HOLD THE
+// LOCK. The memory is NOT zeroed: the collector zeroes every body it hands out.
+export @nosplit @symbol("bit_rt_heap_large_cache_take_locked") fn heapLargeCacheTakeLocked(
+  h: *i64,
+  nbytes: int,
+  pageSize: int,
+): int {
+  let bin = allocLargeEntryBin(nbytes, pageSize)
+  if (bin < 0) {
+    return 0
+  }
+  let head = h + heapLargeBinsWord + bin
+  let got = *head
+  if (got == 0) {
+    return 0
+  }
+  let e = allocWordAt(got)
+  *head = *(e + lcNext)
+  *(h + heapLargeCacheBytesWord) = *(h + heapLargeCacheBytesWord) - *(e + lcLen)
+  return got
+}
+
+// Unlink class `bin`'s entries stamped before `minStamp` and push them onto
+// `chain`; returns the new chain head. A list is newest-first and the epoch
+// only rises, so the stale entries are exactly a suffix of it.
+@nosplit fn heapLargeBinCut(h: *i64, bin: int, minStamp: int, chain: int): int {
+  let link = h + heapLargeBinsWord + bin
+  let cur = *link
+  // Bounded: one step per entry, and the cache holds at most
+  // `allocLargeCacheBytes` of whole pages.
+  while (cur != 0 && *(allocWordAt(cur) + lcStamp) >= minStamp) {
+    link = allocWordAt(cur) + lcNext
+    cur = *link
+  }
+  *link = 0
+  let out = chain
+  while (cur != 0) { // bounded: the suffix just detached
+    let e = allocWordAt(cur)
+    let next = *(e + lcNext)
+    *(e + lcNext) = out
+    *(h + heapLargeCacheBytesWord) = *(h + heapLargeCacheBytesWord) - *(e + lcLen)
+    out = cur
+    cur = next
+  }
+  return out
+}
+
+// Every entry stamped before `minStamp`, unlinked, as one chain.
+@nosplit fn heapLargeCacheCut(h: *i64, minStamp: int): int {
+  let chain = 0
+  let bin = 0
+  while (bin < allocLargeBins) { // bounded: allocLargeBins iterations
+    chain = heapLargeBinCut(h, bin, minStamp, chain)
+    bin = bin + 1
+  }
+  return chain
+}
+
+// The scavenger, once per collection after the sweep has pushed what it freed.
+// CALLER MUST HOLD THE LOCK. Returns, unlinked, every entry an earlier
+// collection pushed that no request has taken since, and opens a new epoch.
+// The caller unmaps the chain (`heapLargeCacheNext`, `heapLargeCacheLen`).
+export @nosplit @symbol("bit_rt_heap_large_cache_age_locked") fn heapLargeCacheAgeLocked(h: *i64): int {
+  let epoch = *(h + heapLargeCacheEpochWord)
+  let chain = heapLargeCacheCut(h, epoch)
+  *(h + heapLargeCacheEpochWord) = epoch + 1
+  return chain
+}
+
+// Every cached entry, unlinked, as one chain: for teardown and for a mapping
+// the OS refused. CALLER MUST HOLD THE LOCK.
+export @nosplit @symbol("bit_rt_heap_large_cache_drain_locked") fn heapLargeCacheDrainLocked(h: *i64): int {
+  return heapLargeCacheCut(h, *(h + heapLargeCacheEpochWord) + 1)
+}
+
+// The entry after `addr` on a chain the two functions above returned, 0 at the end.
+export @nosplit @symbol("bit_rt_heap_large_cache_next") fn heapLargeCacheNext(addr: int): int {
+  return *(allocWordAt(addr) + lcNext)
+}
+
+// The mapped length of the entry at `addr`.
+export @nosplit @symbol("bit_rt_heap_large_cache_len") fn heapLargeCacheLen(addr: int): int {
+  return *(allocWordAt(addr) + lcLen)
+}
+
+// Bytes the cache holds right now.
+export @nosplit @symbol("bit_rt_heap_large_cached_bytes") fn heapLargeCachedBytes(h: *i64): int {
+  return *(h + heapLargeCacheBytesWord)
+}
