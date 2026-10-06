@@ -35,8 +35,8 @@ value you passed for `id` is never sent; `@table` excludes the primary key
 from the `INSERT` column list and reads it back from what the database
 generated. On PostgreSQL that is one statement, `INSERT ... RETURNING *`.
 MySQL has no `RETURNING`, so there `insert` (and `insertAll`) run the
-`INSERT`, ask the same connection for `LAST_INSERT_ID()`, and `SELECT` the
-rows back by those ids, all inside one transaction; what you get back is the
+`INSERT`, whose reply carries the first id MySQL generated, and `SELECT` the
+rows back by those ids: two statements, no transaction; what you get back is the
 row as MySQL stored it, defaults and triggers included, exactly as on
 PostgreSQL. The `@id` column must be `AUTO_INCREMENT` there (`t.id()` makes
 it so), or the insert fails naming that. `update` takes the whole row and writes every column back by

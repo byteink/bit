@@ -1,105 +1,90 @@
-// pkg/orm/mysqlinsert.bit — INSERT on MySQL (#7417). MySQL 8 has no
-// `INSERT ... RETURNING` (MariaDB 10.5+ does), so the one statement
-// Postgres runs becomes four on one connection, inside one transaction (the
-// caller's own, when it already holds one), so `LAST_INSERT_ID()` is this
-// call's own:
+// pkg/orm/mysqlinsert.bit — INSERT on MySQL (#7417, #7427). MySQL 8 has no
+// `INSERT ... RETURNING` (MariaDB 10.5+ does), so the one statement Postgres
+// runs becomes two on one connection:
 //
-//   select last_insert_id(0)                         -- forget the previous insert's id
-//   insert into t (...) values (...), (...)
-//   select last_insert_id(), @@auto_increment_increment
-//   select * from t where id in (...) order by id    -- the rows as stored
+//   insert into t (...) values (...), (...)          -- the OK packet carries the first id
+//   select * from t where <the ids it generated> order by id
 //
 // The rows come from a SELECT, never from the values the caller sent, so
 // database-side work (triggers, column defaults, type rounding) shows up
-// exactly as Postgres's RETURNING shows it.
+// exactly as Postgres's RETURNING shows it. No transaction is opened: the
+// INSERT is one statement, so it is atomic on its own, and the generated id
+// comes back in the INSERT's own OK packet (`ExecResult.lastInsertId`), so
+// nothing has to run between the two statements on the same session.
 //
-// THE FIRST ID IS ENOUGH. `LAST_INSERT_ID()` after a multi-row INSERT is the
-// FIRST generated id. The statement this package builds names no value for
-// the auto-increment column, and for such a "simple insert" InnoDB reserves
-// the whole block at once under every `innodb_autoinc_lock_mode` (0, 1 and
-// the 8.x default, 2): MySQL's "InnoDB AUTO_INCREMENT Lock Modes" page
-// states that only a mixed-mode insert (some rows naming an id) can leave a
-// gap inside one statement. Row `i` therefore has id `first + i * step`,
-// where `step` is `@@auto_increment_increment` (1 unless the server is
-// configured for multi-primary replication). Ids ascend with the VALUES
-// list, so `order by id` is insert order.
-//
-// `last_insert_id(0)` BEFORE the insert is what keeps a table whose `@id`
-// column is not AUTO_INCREMENT from being read back through the id a
-// previous statement left on this pooled connection: the insert generates
-// nothing, the id stays 0, and `mysqlGeneratedIds` fails loudly.
+// THE FIRST ID IS ENOUGH. The OK packet's last_insert_id after a multi-row
+// INSERT is the FIRST generated id, and 0 when the statement generated none.
+// The statement this package builds names no value for the auto-increment
+// column, and for such a "simple insert" InnoDB reserves the whole block at
+// once under every `innodb_autoinc_lock_mode` (0, 1 and the 8.x default, 2):
+// MySQL's "InnoDB AUTO_INCREMENT Lock Modes" page states that only a
+// mixed-mode insert (some rows naming an id) can leave a gap inside one
+// statement. Row `i` therefore has id `first + i * step`, where `step` is the
+// session's `@@auto_increment_increment` (1 unless the server is configured
+// for multi-primary replication). The SELECT reads `step` itself, on the
+// connection the INSERT ran on (a `Pool` is pinned for the two statements),
+// so no cached copy can disagree with the session that generated the ids.
+// Ids ascend with the VALUES list, so `order by id` is insert order.
 //
 // A COMPOSITE KEY names its values itself (`generatedIdField` is empty), so
 // each row is re-selected by the key it was inserted with.
 //
-// `Data`, `Value`, `Rows`, `TableDesc`, `FieldDesc`, `generatedIdField`,
-// `keyFields`, `columnName`, `valueFor`, `join`, `asInt` and `newError` are
-// declared or imported by this package's other files (SPEC §17.1).
+// `Data`, `Value`, `Rows`, `Pool`, `ExecResult`, `TableDesc`, `FieldDesc`,
+// `generatedIdField`, `keyFields`, `columnName`, `valueFor`, `join` and
+// `newError` are declared or imported by this package's other files (SPEC
+// §17.1).
 
 // Runs the INSERT for `chunk` and returns its rows read back as `T`, in
-// insert order. On a `Pool` the statements run in one transaction, which
-// pins a connection and also rolls the INSERT back if the read-back fails.
-// A caller's own transaction is already one connection; a nested `tx` there
-// would be a savepoint, which the MySQL prepared-statement protocol refuses
-// (error 1295), so the statements run on it directly.
+// insert order. On a `Pool` both statements run on one pinned connection,
+// with no BEGIN/COMMIT; a caller's own transaction is already one
+// connection, so the statements run on it directly.
 fn mysqlInsert<T: Tabled>(db: Data, desc: TableDesc, chunk: []map<string, Value>): []T! {
-  let (_, isPool) = db.(Pool)
+  let (asPool, isPool) = db.(Pool)
   if (!isPool) {
     return mysqlInsertOn<T>(db, desc, chunk)?
   }
-  return runTxValue<[]T>(db, (t) => {
-    return mysqlInsertOn<T>(t, desc, chunk)?
+  // The annotation is what lets the closure below be inferred as
+  // `(Executor) => []T!` (as runner.bit's `pinned` call says).
+  let p: Pool = asPool
+  return p.pinned<[]T>((c) => {
+    return mysqlInsertOn<T>(c, desc, chunk)?
   })?
 }
 
 // The statements themselves, on the one connection `db` stands for.
 fn mysqlInsertOn<T: Tabled>(db: Data, desc: TableDesc, chunk: []map<string, Value>): []T! {
   let (sqlText, args) = insertValuesSql(desc, chunk)
+  let res = db.exec(sqlText, args)?
   if (generatedIdField(desc) == "") {
-    db.exec(sqlText, args)?
     return mysqlReadByKey<T>(db, desc, chunk)?
   }
-  mysqlForgetInsertId(db)?
-  db.exec(sqlText, args)?
-  return mysqlReadByIds<T>(db, desc, len(chunk))?
+  return mysqlReadByIds<T>(db, desc, mysqlFirstId(res, desc.table)?, len(chunk))?
 }
 
-// A SELECT, not an exec: a statement that returns a result set.
-fn mysqlForgetInsertId(db: Data): ()! {
-  let rows = db.query("select last_insert_id(0)", []Value(0))?
-  rows.close()
-}
-
-// `(first generated id, step)` of the INSERT that just ran on `db`'s
-// connection.
-fn mysqlGeneratedIds(db: Data, table: string): (int, int)! {
-  let rows = db.query("select last_insert_id(), @@auto_increment_increment", []Value(0))?
-  defer rows.close()
-  if (!rows.next()?) {
-    fail newError("orm: insert into '${table}': LAST_INSERT_ID() returned no row")
+// The first id the INSERT generated, from its own OK packet. 0 means it
+// generated none: the `@id` column is not AUTO_INCREMENT, and reading rows
+// back by any id would return someone else's.
+fn mysqlFirstId(res: ExecResult, table: string): int! {
+  match (res.lastInsertId) {
+    Some(id) => {
+      if (id > 0) {
+        return id
+      }
+      fail newError("orm: insert into '${table}' generated no id (last_insert_id = ${id}); the '@id' column must be AUTO_INCREMENT on MySQL")
+    }
+    None => {
+      fail newError("orm: insert into '${table}': the driver reported no generated id")
+    }
   }
-  let first = asInt(rows.value(0))?
-  let step = asInt(rows.value(1))?
-  if (first <= 0 || step <= 0) {
-    fail newError("orm: insert into '${table}' generated no id (LAST_INSERT_ID() = ${first}); the '@id' column must be AUTO_INCREMENT on MySQL")
-  }
-  return (first, step)
 }
 
-// The `n` rows the INSERT generated ids for, ascending by id.
-fn mysqlReadByIds<T: Tabled>(db: Data, desc: TableDesc, n: int): []T! {
-  let (first, step) = mysqlGeneratedIds(db, desc.table)?
+// The `n` rows the INSERT generated ids for, ascending by id: `first`, then
+// every `@@auto_increment_increment`-th id after it, `n` in all.
+fn mysqlReadByIds<T: Tabled>(db: Data, desc: TableDesc, first: int, n: int): []T! {
   let keyCol = columnName(keyFields(desc)[0])
-  let marks = []string(0)
-  let ids = []Value(0)
-  let i = 0
-  while (i < n) {
-    ids = append(ids, Value.Int(first + i * step))
-    marks = append(marks, "$${i + 1}")
-    i = i + 1
-  }
-  let sqlText = "select * from ${desc.table} where ${keyCol} in (${join(marks, ", ")}) order by ${keyCol}"
-  let out = mysqlReadAll<T>(db, sqlText, ids)?
+  let step = "@@auto_increment_increment"
+  let sqlText = "select * from ${desc.table} where ${keyCol} >= $1 and ${keyCol} <= $1 + $2 * ${step} and mod(${keyCol}, ${step}) = mod($1, ${step}) order by ${keyCol}"
+  let out = mysqlReadAll<T>(db, sqlText, []Value{ Value.Int(first), Value.Int(n - 1) })?
   if (len(out) != n) {
     fail newError("orm: insert into '${desc.table}' wrote ${n} rows but ${len(out)} were found by generated id ${first}")
   }

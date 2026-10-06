@@ -1,6 +1,7 @@
 // pkg/orm/mysqlinsert.test.bit — #7417: `Repo<T>.insert`/`insertAll` on MySQL.
 // MySQL 8 has no `INSERT ... RETURNING`, so the dialect runs the INSERT, then
-// reads the rows back with `LAST_INSERT_ID()` and a SELECT (mysqlinsert.bit).
+// reads the rows back with one SELECT by the id the INSERT's own OK packet
+// reported (mysqlinsert.bit, #7427).
 // The recorded-statement tests below pin that sequence per dialect against a
 // fake driver; the live proofs at the bottom run the same program on a real
 // PostgreSQL and a real MySQL and fail on any field that differs from the one
@@ -22,13 +23,14 @@
 
 class miCall { kind: string, sql: string, args: []Value }
 
-// A fake MySQL connection: every statement recorded in order, `query` routed
-// by what it asks for. `first`/`step` answer the id query, `found` is what
-// the read-back SELECT returns; the transaction shares the recorder.
+// A fake MySQL connection: every statement recorded in order, BEGIN/COMMIT/
+// ROLLBACK included. `first` is the id every exec reports (`noId`: none at
+// all, as a driver without the report), `found` is what the read-back SELECT
+// returns; the transaction shares the recorder.
 class miAdapter {
   calls: []miCall
   first: int
-  step: int
+  noId: bool
   found: [][]Value
   cols: []string
 
@@ -39,18 +41,19 @@ class miAdapter {
 
 fn miQuery(a: miAdapter, sqlText: string, params: []Value): wrRows {
   a.calls = append(a.calls, miCall{ kind = "query", sql = sqlText, args = params })
-  if (hasPrefix(sqlText, "select last_insert_id(0)")) {
-    return wrRows{ cols = ["0"], data = [[Value.Int(0)]], i = -1 }
-  }
-  if (hasPrefix(sqlText, "select last_insert_id(),")) {
-    return wrRows{ cols = ["a", "b"], data = [[Value.Int(a.first), Value.Int(a.step)]], i = -1 }
-  }
   return wrRows{ cols = a.cols, data = a.found, i = -1 }
 }
 
 fn miExec(a: miAdapter, sqlText: string, params: []Value): ExecResult {
   a.calls = append(a.calls, miCall{ kind = "exec", sql = sqlText, args = params })
-  return ExecResult{ rowsAffected = 1 }
+  if (a.noId) {
+    return ExecResult{ rowsAffected = 1 }
+  }
+  return ExecResult{ rowsAffected = 1, lastInsertId = Option.Some(a.first) }
+}
+
+fn miRecord(a: miAdapter, kind: string) {
+  a.calls = append(a.calls, miCall{ kind = kind, sql = kind, args = []Value(0) })
 }
 
 class miConn {
@@ -69,6 +72,7 @@ class miConn {
   }
 
   begin(opts: TxOptions): Tx! {
+    miRecord(this.a, "begin")
     return miTx{ a = this.a }
   }
 
@@ -86,14 +90,18 @@ class miTx {
     return miExec(this.a, sqlText, params)
   }
 
-  commit(): ()! {}
+  commit(): ()! {
+    miRecord(this.a, "commit")
+  }
 
-  rollback(): ()! {}
+  rollback(): ()! {
+    miRecord(this.a, "rollback")
+  }
 }
 
-fn newMiAdapter(first: int, step: int): miAdapter {
+fn newMiAdapter(first: int): miAdapter {
   return miAdapter{
-    calls = []miCall(0), first = first, step = step, found = [][]Value(0), cols = [
+    calls = []miCall(0), first = first, noId = false, found = [][]Value(0), cols = [
       "id",
       "name",
       "email",
@@ -129,61 +137,56 @@ fn miNoReturning(a: miAdapter) {
   }
 }
 
-test "mysql insert: INSERT, then LAST_INSERT_ID() and a SELECT by that id, no RETURNING" {
-  let a = newMiAdapter(41, 1)
+test "mysql insert: the INSERT, then one SELECT by the id its OK packet carried; no transaction" {
+  let a = newMiAdapter(41)
   a.found = [miAccountRow(41, "ada")]
   let got = miAccountRepo(a, miMysql()).insert(miAccount("ada")) catch e {
     assert(false, "insert: ${e.message()}")
     return
   }
   assert(got.id == 41 && got.name == "ada", "id ${got.id} name ${got.name}")
-  assert(len(a.calls) == 4, "expected 4 statements, got ${len(a.calls)}")
-  assert(a.calls[0].sql == "select last_insert_id(0)", "got: ${a.calls[0].sql}")
-  assert(a.calls[1].kind == "exec", "the INSERT is an exec")
+  assert(len(a.calls) == 2, "expected 2 statements, got ${len(a.calls)}")
+  assert(a.calls[0].kind == "exec", "the INSERT is an exec")
   assert(
-    a.calls[1].sql == "insert into account (name, email) values ($1, $2)",
-    "got: ${a.calls[1].sql}",
+    a.calls[0].sql == "insert into account (name, email) values ($1, $2)",
+    "got: ${a.calls[0].sql}",
   )
+  assert(a.calls[1].sql == miSelectById, "got: ${a.calls[1].sql}")
   assert(
-    a.calls[2].sql == "select last_insert_id(), @@auto_increment_increment",
-    "got: ${a.calls[2].sql}",
-  )
-  assert(
-    a.calls[3].sql == "select * from account where id in ($1) order by id",
-    "got: ${a.calls[3].sql}",
-  )
-  assert(
-    len(a.calls[3].args) == 1 && valueText(a.calls[3].args[0]) == "41",
-    "the SELECT binds the first id",
+    valueText(a.calls[1].args[0]) == "41" && valueText(a.calls[1].args[1]) == "0",
+    "the SELECT binds the first id and n - 1",
   )
   miNoReturning(a)
 }
 
-test "mysql insertAll: one INSERT for the chunk, ids first + i*step, rows back in insert order" {
-  let a = newMiAdapter(10, 2)
+test "mysql insertAll: one INSERT for the chunk, one SELECT for its ids, no BEGIN/COMMIT" {
+  let a = newMiAdapter(10)
   a.found = [miAccountRow(10, "a"), miAccountRow(12, "b"), miAccountRow(14, "c")]
   let got = miAccountRepo(a, miMysql()).insertAll([miAccount("a"), miAccount("b"), miAccount("c")]) catch e {
     assert(false, "insertAll: ${e.message()}")
     return
   }
   assert(len(got) == 3 && got[0].name == "a" && got[2].name == "c", "rows out of order or missing")
+  assert(len(a.calls) == 2, "expected 2 statements, got ${len(a.calls)}")
   assert(
-    a.calls[1].sql == "insert into account (name, email) values ($1, $2), ($3, $4), ($5, $6)",
-    "got: ${a.calls[1].sql}",
+    a.calls[0].sql == "insert into account (name, email) values ($1, $2), ($3, $4), ($5, $6)",
+    "got: ${a.calls[0].sql}",
   )
-  let sel = a.calls[3]
-  assert(sel.sql == "select * from account where id in ($1, $2, $3) order by id", "got: ${sel.sql}")
+  let sel = a.calls[1]
+  assert(sel.sql == miSelectById, "got: ${sel.sql}")
   assert(
-      valueText(sel.args[0]) == "10" &&
-      valueText(sel.args[1]) == "12" &&
-      valueText(sel.args[2]) == "14",
-    "ids must be first + i * step",
+    valueText(sel.args[0]) == "10" && valueText(sel.args[1]) == "2",
+    "ids are first + i * the session's step, i < 3",
   )
   miNoReturning(a)
 }
 
+// The read-back: every `@@auto_increment_increment`-th id from the first,
+// `n` in all, with the step read by the session that generated them.
+const miSelectById: string = "select * from account where id >= $1 and id <= $1 + $2 * @@auto_increment_increment and mod(id, @@auto_increment_increment) = mod($1, @@auto_increment_increment) order by id"
+
 test "postgres insert and insertAll keep RETURNING: one statement, no id round trip" {
-  let a = newMiAdapter(0, 1)
+  let a = newMiAdapter(0)
   a.found = [miAccountRow(7, "ada")]
   let got = miAccountRepo(a, ServerDialect.Postgres).insert(miAccount("ada")) catch e {
     assert(false, "insert: ${e.message()}")
@@ -195,7 +198,7 @@ test "postgres insert and insertAll keep RETURNING: one statement, no id round t
     a.calls[0].sql == "insert into account (name, email) values ($1, $2) returning *",
     "got: ${a.calls[0].sql}",
   )
-  let b = newMiAdapter(0, 1)
+  let b = newMiAdapter(0)
   b.found = [miAccountRow(7, "a"), miAccountRow(8, "b")]
   miAccountRepo(b, ServerDialect.Postgres).insertAll([miAccount("a"), miAccount("b")]) catch e {
     assert(false, "insertAll: ${e.message()}")
@@ -209,7 +212,7 @@ test "postgres insert and insertAll keep RETURNING: one statement, no id round t
 }
 
 test "mysql insert inside a caller's transaction reads its id back on that transaction, no savepoint" {
-  let a = newMiAdapter(3, 1)
+  let a = newMiAdapter(3)
   a.found = [miAccountRow(3, "ada")]
   let d = Db{
     pool = pool(a, Datasource{ host = "fake" }) catch e {
@@ -228,6 +231,8 @@ test "mysql insert inside a caller's transaction reads its id back on that trans
   }
   assert(id == 3, "id ${id}")
   miNoReturning(a)
+  assert(len(a.calls) == 4, "BEGIN, INSERT, SELECT, COMMIT, got ${len(a.calls)}")
+  assert(a.calls[0].kind == "begin" && a.calls[3].kind == "commit", "only the caller's own tx")
   for c of a.calls {
     assert(
       !contains(c.sql, "SAVEPOINT"),
@@ -237,7 +242,7 @@ test "mysql insert inside a caller's transaction reads its id back on that trans
 }
 
 test "mysql insert of a composite key re-selects each row by the key it carried" {
-  let a = newMiAdapter(0, 1)
+  let a = newMiAdapter(0)
   a.cols = ["a", "b", "label"]
   a.found = [[Value.Int(1), Value.Int(2), Value.Text("x")]]
   let p = pool(a, Datasource{ host = "fake" }) catch e {
@@ -271,7 +276,7 @@ test "mysql insert of a composite key re-selects each row by the key it carried"
 }
 
 test "mysql insert fails loudly when the INSERT generated no id or the read-back is short" {
-  let a = newMiAdapter(0, 1)
+  let a = newMiAdapter(0)
   miAccountRepo(a, miMysql()).insert(miAccount("ada")) catch e {
     assert(contains(e.message(), "AUTO_INCREMENT"), "got: ${e.message()}")
     return
@@ -280,13 +285,23 @@ test "mysql insert fails loudly when the INSERT generated no id or the read-back
 }
 
 test "mysql insertAll fails when fewer rows are found than were written" {
-  let a = newMiAdapter(5, 1)
+  let a = newMiAdapter(5)
   a.found = [miAccountRow(5, "a")]
   miAccountRepo(a, miMysql()).insertAll([miAccount("a"), miAccount("b")]) catch e {
     assert(contains(e.message(), "wrote 2 rows but 1 were found"), "got: ${e.message()}")
     return
   }
   assert(false, "a short read-back must fail")
+}
+
+test "mysql insert fails when the driver reports no generated id at all" {
+  let a = newMiAdapter(5)
+  a.noId = true
+  miAccountRepo(a, miMysql()).insert(miAccount("a")) catch e {
+    assert(contains(e.message(), "reported no generated id"), "got: ${e.message()}")
+    return
+  }
+  assert(false, "an id the driver never reported must fail, never read another row")
 }
 
 // ---- live: the same program on PostgreSQL and on MySQL ----
