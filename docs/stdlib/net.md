@@ -191,7 +191,8 @@ fn clientAddr(): string! {
   a.close()
   c.close()
   l.close()
-  return seen   // "::1"
+  // "::1" for the dial above, "127.0.0.1" had it dialed 127.0.0.1.
+  return seen
 }
 ```
 
