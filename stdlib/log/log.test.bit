@@ -1,0 +1,279 @@
+// stdlib/log tests: levels and the filter, byte-exact text and JSON for every
+// attribute kind, log injection, with/withGroup children, the process default
+// and the disabled-call allocation floor (the byte count is proven by a
+// BIT_GC_STATS run recorded on the ticket, since a test cannot read the GC).
+
+import { Timestamp, now } from "std/time"
+import { contains } from "std/strings"
+import { runRecovering } from "std/runtime"
+
+// A sink that keeps every write, so a test can read the exact bytes.
+class capture {
+  out: string
+  writes: int
+  export write(s: string): ()! {
+    this.out = this.out + s
+    this.writes = this.writes + 1
+  }
+}
+
+fn newCapture(): capture {
+  return capture{ out = "", writes = 0 }
+}
+
+fn textLogger(c: capture, level: int): Logger {
+  return Logger(TextHandler(c, level, false))
+}
+
+fn jsonLogger(c: capture, level: int): Logger {
+  return Logger(JsonHandler(c, level, false))
+}
+
+test "levelName names the four levels and offsets the rest" {
+  assert(levelName(LevelDebug) == "DEBUG", levelName(LevelDebug))
+  assert(levelName(LevelInfo) == "INFO", levelName(LevelInfo))
+  assert(levelName(LevelWarn) == "WARN", levelName(LevelWarn))
+  assert(levelName(LevelError) == "ERROR", levelName(LevelError))
+  assert(levelName(LevelInfo + 2) == "INFO+2", levelName(LevelInfo + 2))
+  assert(levelName(LevelDebug - 4) == "DEBUG-4", levelName(LevelDebug - 4))
+  assert(levelName(LevelDebug + 3) == "DEBUG+3", levelName(LevelDebug + 3))
+  assert(levelName(LevelError + 1) == "ERROR+1", levelName(LevelError + 1))
+}
+
+test "each level method writes its own level and the filter drops the rest" {
+  let c = newCapture()
+  let l = textLogger(c, LevelWarn)
+  l.debug("d")
+  l.info("i")
+  l.warn("w")
+  l.error("e")
+  l.log(LevelWarn + 2, "custom")
+  l.log(LevelInfo + 2, "below")
+  assert(c.out == "level=WARN msg=w\nlevel=ERROR msg=e\nlevel=WARN+2 msg=custom\n", c.out)
+  assert(c.writes == 3, "one write per record")
+  assert(l.enabled(LevelError))
+  assert(!l.enabled(LevelInfo))
+}
+
+test "debug level lets every named level through" {
+  let c = newCapture()
+  let l = textLogger(c, LevelDebug)
+  l.debug("d")
+  l.info("i")
+  assert(c.out == "level=DEBUG msg=d\nlevel=INFO msg=i\n", c.out)
+}
+
+test "text output is byte exact for every attribute kind" {
+  let c = newCapture()
+  let l = textLogger(c, LevelInfo)
+  l.info(
+    "hello world",
+    Str("s", "plain"),
+    Str("empty", ""),
+    Str("spaced", "a b"),
+    Int("n", -42),
+    Float("f", 1.5),
+    Bool("yes", true),
+    Bool("no", false),
+    Duration("d", 1500000000),
+    Duration("ms", 340000000),
+    Duration("neg", -2500),
+    Time("t", Timestamp{ ns = 0 }),
+    Err(newError("boom")),
+    Group("g", Str("a", "1"), Group("h", Int("b", 2))),
+  )
+  let want = "level=INFO msg=\"hello world\" s=plain empty=\"\" spaced=\"a b\" n=-42 f=1.5 yes=true no=false d=1.5s ms=340ms neg=-2.5us t=1970-01-01T00:00:00Z error=boom g.a=1 g.h.b=2\n"
+  assert(c.out == want, c.out)
+}
+
+test "json output is byte exact for every attribute kind" {
+  let c = newCapture()
+  let l = jsonLogger(c, LevelInfo)
+  l.info(
+    "hello",
+    Str("s", "plain"),
+    Int("n", -42),
+    Float("f", 1.5),
+    Float("whole", 2.0),
+    Bool("yes", true),
+    Bool("no", false),
+    Duration("d", 1500000000),
+    Time("t", Timestamp{ ns = 0 }),
+    Err(newError("boom")),
+    Group("g", Str("a", "1"), Group("h", Int("b", 2))),
+    Group("empty"),
+  )
+  let want = "{\"level\":\"INFO\",\"msg\":\"hello\",\"s\":\"plain\",\"n\":-42,\"f\":1.5,\"whole\":2.0,\"yes\":true,\"no\":false,\"d\":1500000000,\"t\":\"1970-01-01T00:00:00Z\",\"error\":\"boom\",\"g\":{\"a\":\"1\",\"h\":{\"b\":2}}}\n"
+  assert(c.out == want, c.out)
+}
+
+test "a newline, quote or control byte in a value cannot forge a second line" {
+  let evil = "x\nlevel=ERROR msg=forged\r\t\"q\"\\ \u{1}"
+  let c = newCapture()
+  textLogger(c, LevelInfo).info(evil, Str(evil, evil))
+  let lines = 0
+  let i = 0
+  while (i < len(c.out)) {
+    if (c.out[i] == '\n') {
+      lines = lines + 1
+    }
+    i = i + 1
+  }
+  assert(lines == 1, "text: exactly one line, got ${lines}: ${c.out}")
+  assert(c.out[len(c.out) - 1] == '\n', "text: the one newline ends the line")
+  let cj = newCapture()
+  jsonLogger(cj, LevelInfo).info(evil, Str(evil, evil))
+  let jl = 0
+  i = 0
+  while (i < len(cj.out)) {
+    if (cj.out[i] == '\n') {
+      jl = jl + 1
+    }
+    i = i + 1
+  }
+  assert(jl == 1, "json: exactly one line, got ${jl}: ${cj.out}")
+}
+
+test "a bare newline or carriage return alone is escaped, not written" {
+  let c = newCapture()
+  textLogger(c, LevelInfo).info("a\nb", Str("k", "x\ny"), Str("r", "p\rq"))
+  assert(c.out == "level=INFO msg=\"a\\nb\" k=\"x\\ny\" r=\"p\\rq\"\n", c.out)
+}
+
+test "text quoting: bare when safe, JSON-escaped when not" {
+  let c = newCapture()
+  textLogger(c, LevelInfo).info(
+    "m",
+    Str("a", "x=y"),
+    Str("b", "q\"r"),
+    Str("c", "t\tu"),
+    Str("d k", "v"),
+  )
+  assert(c.out == "level=INFO msg=m a=\"x=y\" b=\"q\\\"r\" c=\"t\\tu\" \"d k\"=v\n", c.out)
+}
+
+test "with and withGroup children keep their attributes and leave the parent alone" {
+  let c = newCapture()
+  let root = textLogger(c, LevelInfo)
+  let req = root.with(Str("req", "7"))
+  let db = req.withGroup("db").with(Str("table", "drafts"))
+  db.info("q", Int("rows", 3))
+  req.info("r")
+  root.info("p")
+  let want = "level=INFO msg=q req=7 db.table=drafts db.rows=3\nlevel=INFO msg=r req=7\nlevel=INFO msg=p\n"
+  assert(c.out == want, c.out)
+}
+
+test "json children nest groups and drop an empty one" {
+  let c = newCapture()
+  let root = jsonLogger(c, LevelInfo)
+  let db = root.with(Str("req", "7")).withGroup("db").with(Str("table", "drafts"))
+  db.info("q", Int("rows", 3))
+  db.withGroup("empty").info("e")
+  root.withGroup("unused").info("u")
+  let want = "{\"level\":\"INFO\",\"msg\":\"q\",\"req\":\"7\",\"db\":{\"table\":\"drafts\",\"rows\":3}}\n{\"level\":\"INFO\",\"msg\":\"e\",\"req\":\"7\",\"db\":{\"table\":\"drafts\"}}\n{\"level\":\"INFO\",\"msg\":\"u\"}\n"
+  assert(c.out == want, c.out)
+}
+
+test "the time field is RFC 3339 and comes first" {
+  let c = newCapture()
+  Logger(TextHandler(c)).info("m")
+  assert(c.out[0:5] == "time=", c.out)
+  assert(contains(c.out, "Z level=INFO msg=m\n"), c.out)
+  let cj = newCapture()
+  Logger(JsonHandler(cj)).info("m")
+  assert(cj.out[0:9] == "{\"time\":\"", cj.out)
+  assert(contains(cj.out, "Z\",\"level\":\"INFO\",\"msg\":\"m\"}\n"), cj.out)
+}
+
+test "an empty key or group name panics" {
+  let (p1, m1) = runRecovering(() => {
+    Str("", "v")
+  })
+  assert(p1 && contains(m1, "key must not be empty"), m1)
+  let (p2, m2) = runRecovering(() => {
+    Group("")
+  })
+  assert(p2 && contains(m2, "key must not be empty"), m2)
+  let (p3, m3) = runRecovering(() => {
+    textLogger(newCapture(), LevelInfo).withGroup("")
+  })
+  assert(p3 && contains(m3, "key must not be empty"), m3)
+}
+
+test "a nil handler and a nil sink are refused at construction" {
+  let (p1, m1) = runRecovering(() => {
+    Logger(nil)
+  })
+  assert(p1 && contains(m1, "Logger needs a handler"), m1)
+  let (p2, m2) = runRecovering(() => {
+    TextHandler(nil)
+  })
+  assert(p2 && contains(m2, "needs a sink"), m2)
+  let (p3, m3) = runRecovering(() => {
+    JsonHandler(nil)
+  })
+  assert(p3 && contains(m3, "needs a sink"), m3)
+}
+
+test "a handler of your own plugs in through the interface" {
+  let h = tally{ n = 0 }
+  let l = Logger(h)
+  l.info("a")
+  l.debug("b")
+  l.warn("c")
+  assert(h.n == 2, "debug is disabled by the handler")
+}
+
+class tally {
+  n: int
+  export enabled(level: int): bool {
+    return level >= LevelInfo
+  }
+  export handle(r: Record): ()! {
+    this.n = this.n + 1
+  }
+  export with(attrs: []Attr): Handler {
+    return this
+  }
+  export withGroup(name: string): Handler {
+    return this
+  }
+}
+
+test "a failing sink drops the line instead of crashing the caller" {
+  let l = Logger(TextHandler(brokenSink{ n = 0 }, LevelInfo, false))
+  l.info("lost")
+  l.info("lost again")
+}
+
+class brokenSink {
+  n: int
+  export write(s: string): ()! {
+    fail newError("closed pipe")
+  }
+}
+
+test "the process default is a Logger and setDefault replaces it once" {
+  assert(getDefault().enabled(LevelInfo), "default logs at info")
+  assert(!getDefault().enabled(LevelDebug), "default hides debug")
+  let c = newCapture()
+  setDefault(textLogger(c, LevelDebug))
+  getDefault().debug("now captured")
+  assert(c.out == "level=DEBUG msg=\"now captured\"\n", c.out)
+  let (p, m) = runRecovering(() => {
+    setDefault(textLogger(c, LevelDebug))
+  })
+  assert(p && contains(m, "setDefault called twice"), m)
+}
+
+test "ten thousand disabled calls write nothing" {
+  let c = newCapture()
+  let l = textLogger(c, LevelError)
+  let i = 0
+  while (i < 10000) {
+    l.debug("never")
+    i = i + 1
+  }
+  assert(c.writes == 0, "disabled calls reach no sink")
+}

@@ -93,6 +93,7 @@ Modules are grouped by what you reach for them to do.
 |---|---|---|
 | [testing](testing.md) | `"std/testing"` | Assertions for `bit test` |
 | [prof](prof.md) | `"std/prof"` | In-process CPU sampling profiler (aarch64-macos only) |
+| [log](log.md) | `"std/log"` | Structured leveled logging - typed attributes, text and JSON handlers, a process default |
 | [trace](trace.md) | `"std/trace"` | Distributed tracing - spans, W3C `traceparent` propagation, an OTLP/HTTP exporter |
 
 ## Conventions
