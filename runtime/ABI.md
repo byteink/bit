@@ -2182,8 +2182,12 @@ is incremental/generational collection when pause times matter.
 
 Three things are returned, and all three are live paths today:
 
-- a **large block** (over `allocMaxSmall`, 16 KiB) is `munmap`ed by `gcHeapFree`
-  the moment it is freed, since it was mapped individually;
+- a **large block** (over `allocMaxSmall`, 16 KiB) is mapped individually, its
+  length rounded up to one of four classes per doubling up to 512 pages. When
+  freed it is kept for the next request of its class while the large cache
+  holds under 16 MiB (#7445), and `munmap`ed otherwise. A cached block goes
+  back to the OS at the first collection that finds it still unused, at
+  `gcDeinit`, and whenever the OS refuses a fresh mapping;
 - an **entirely-free owned span** is unlinked by `heapReclaimSpansLocked` and
   then either parked in the 64-slot cross-class span cache, or pushed onto the
   span free list, which resets it with `MAP_FIXED` at the same address — the OS
