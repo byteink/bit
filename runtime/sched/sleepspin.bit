@@ -62,10 +62,42 @@
   return true
 }
 
-// The nap of a worker whose park probe saw work only in a peer's next-run
-// slot (`sleep.bit`'s `schedIdlePark`): the bound on how long a task its
-// running owner never gets to waits for a peer, against the 1ms target.
+// One nap of the napper (`schedNapOn`): the bound on how long a task whose
+// running owner never gets to it waits for a peer, against the 1ms target.
 const spinNapNs: int = 250000
+
+// How many naps in a row whose probe saw no work at all a napper takes before
+// it gives its unit up and parks (`schedNapOn`): about 1ms of quiet. A probe
+// that sees a peer's slot occupied starts the count again.
+const napEmptyMax: i32 = 4
+
+// A napper's find-work pass came back empty (`sleep.bit`'s `schedIdlePark`,
+// #7404). It keeps its unit and probes again, so a lock handoff or a
+// ping-pong keeps skipping its wakes instead of paying one each time the
+// probe catches the slot empty. Work it can take now (queued, or a peer's slot
+// whose task sat still through a grace) ends the turn without a nap, and the
+// next pass takes it: a ready that landed between that pass and this probe
+// waits no nap. A slot that keeps changing is a handoff in progress, so the
+// napper naps; a probe that sees nothing counts toward `napEmptyMax`. Returns
+// false, still holding the unit, when that count runs out: the caller then
+// releases it and probes again before it parks.
+@nosplit fn schedNapOn(s: *i64, w: *i64, p: *i32): bool {
+  let seen = schedWorkSeen(s)
+  if (seen == seenQueued || (seen == seenSlot && schedRunNextPass(w, s, false) != 0)) {
+    atomicStore(p, parkNapper)
+    return true
+  }
+  let next = parkNapper
+  if (seen == 0) {
+    next = atomicLoad(p) + 1
+  }
+  if (next - parkNapper >= napEmptyMax) {
+    return false
+  }
+  atomicStore(p, next)
+  let _ = bit_rt_port_park_wait(p, next, spinNapNs, w + wkSleepReq)
+  return true
+}
 
 // The spinner state `schedIdlePark` claims after its probe saw `seen`.
 @nosplit fn spinStateFor(seen: int): i32 {
@@ -102,13 +134,14 @@ const graceSamples: int = 8
   }
 }
 
-// Take peer `v`'s next-run slot only when the SAME task sat in it for the whole
-// grace (Go's `runqsteal` with `stealRunNextG`). The owner readied it and is
-// about to run it; taking it at once is the cross-core migration #3264
-// removed. One compare at the end is not enough: a ping-pong puts the same task
-// back in the slot every few hundred nanoseconds, so the slot is read
-// `graceSamples` times and any change, an empty read included, aborts.
-@nosplit fn rnStealGrace(w: *i64, v: *i64): int {
+// The task in peer `v`'s next-run slot when the SAME task sat in it for the
+// whole grace, else 0; `rnStealGrace` takes it only then (Go's `runqsteal`
+// with `stealRunNextG`). The owner readied it and is about to run it; taking
+// it at once is the cross-core migration #3264 removed. One compare at the end
+// is not enough: a ping-pong puts the same task back in the slot every few
+// hundred nanoseconds, so the slot is read `graceSamples` times and any
+// change, an empty read included, answers 0.
+@nosplit fn rnSteady(w: *i64, v: *i64): int {
   let t = atomicLoad(v + wkRunNext)
   let k = 0
   while (t != 0 && k < graceSamples) {
@@ -118,7 +151,13 @@ const graceSamples: int = 8
       return 0
     }
   }
-  if (t != 0 && atomicCmpxchg(v + wkRunNext, t, 0)) {
+  return t
+}
+
+// `rnSteady`'s task, taken from the slot when `take` is set.
+@nosplit fn rnStealGrace(w: *i64, v: *i64, take: bool): int {
+  let t = rnSteady(w, v)
+  if (t == 0 || !take || atomicCmpxchg(v + wkRunNext, t, 0)) {
     return t
   }
   return 0
