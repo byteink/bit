@@ -1372,9 +1372,10 @@ LF or a NUL in `name` cannot be quoted and would end the header line, so
 ### `FormBuilder.file(name: string, filename: string, contentType: string, content: []byte): ()!`
 
 Adds a file part announced as `filename` and declared as `contentType`
-(`application/octet-stream` when empty), holding `content` exactly. `name`
-and `filename` are quoted as in `field`; `file` fails on a CR, a LF or a NUL
-in `name`, `filename` or `contentType`.
+(`application/octet-stream` when empty), holding `content` exactly. `content`
+is kept as it is, not copied, until `build` copies it into the body, so do not
+change it before then. `name` and `filename` are quoted as in `field`; `file`
+fails on a CR, a LF or a NUL in `name`, `filename` or `contentType`.
 
 ### `FormBuilder.build(): FormBody!`
 
@@ -1382,8 +1383,9 @@ Returns the body and its `Content-Type`. The boundary is `bit-form-` and 128
 bits from the system CSPRNG in hex, drawn again for every `build`, and it is
 searched for in every part's headers and content: a candidate that occurs in
 a part is dropped for the next, and eight in a row fail the build. The body
-is written into one buffer allocated at its final size, so a large file is
-copied into it, not concatenated. Fails when nothing was added.
+is written into one buffer allocated at its final size, and each part's bytes
+are copied into it once: a 25 MiB file costs 25 MiB, not three times that.
+Fails when nothing was added.
 
 ### `FormBody`
 
