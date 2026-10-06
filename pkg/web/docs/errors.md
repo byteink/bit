@@ -24,7 +24,7 @@ mistake later on the response path.
 
 A failure that does not satisfy `HttpError` - a plain `newError(...)`, a
 database driver's own error type - is mapped to a `500` with a generic body
-and the real message logged through `Config.logs` (stderr when none is set).
+and the real message logged as an `ERROR` record through `Config.logger` (std/log's default, on stderr, when none is set).
 That is the security property the whole design turns on: an error becomes
 client-visible only by opting in with a type that says `status()` and
 `message()`, never by accident.
