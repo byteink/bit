@@ -153,13 +153,17 @@ This prints `true false`.
 
 ## Logging the reason
 
-The deciding policy never reaches the client, but you will want it. Give the
-handle a sink, a class with one `log(line: string)` method, and every
-decision logs a line with the action, resource, subject, outcome and policy:
+The deciding policy never reaches the client, but you will want it. Authz
+writes through `std/log`: one `Logger` type for the whole program, and the
+handler you built decides whether a record is text or JSON and where it goes.
+`logTo` gives a handle its logger; a handle without one writes to std/log's
+process default, which drops everything below `INFO`:
 
 ```bit
 import { Authz, Policy, Subject } from "authz"
 import { Tabled } from "orm"
+import { Logger, TextHandler, LevelDebug } from "std/log"
+import { stdout } from "std/io"
 
 enum Action { Manage, Read, Create, Update, Delete, Publish }
 
@@ -173,12 +177,6 @@ class User {
   export roles: []string,
 }
 
-class Lines {
-  export log(line: string) {
-    println(line)
-  }
-}
-
 fn main(): ()! {
   let lockedDown = Policy<User, Action>("NoDeletes", (p, user) => {
     p.cannot<Article>([Action.Delete])
@@ -186,39 +184,51 @@ fn main(): ()! {
   let authz = Authz<Action>()?
   authz.resource<Article>()?
   authz.role<User>("staff", [lockedDown])?
-  authz.logTo(Lines{})
+  authz.logTo(Logger(TextHandler(stdout(), LevelDebug, false)))
   let sam = Option<Subject>.Some(User{ id = "sam", roles = ["staff"] })
   authz.can<Article>(sam, Action.Delete, Article{ id = 1 })
 }
 ```
 
-This prints `[authz] debug deny Delete on Article subject=sam policy=NoDeletes
-reason=denied by rule`. With no sink nothing is logged and no line is built.
+This prints `level=DEBUG msg=decision outcome=deny action=Delete
+resource=Article subject=sam policy=NoDeletes reason="denied by rule"`. A
+level the logger has off builds nothing: with the default logger the `can` call
+writes nothing and allocates nothing for a record.
 
-`check` is what a handler calls, and a refusal by it logs one INFO line in
-place of the debug line: `[authz] info denied action=Delete resource=Article
-subject=sam policy=NoDeletes`. It names the subject's id and the deciding
-policy and nothing else: no attribute value, no row, no request body. A row the
-subject may not read is a `NotFound` and leaves no line, because a hidden row
-is the normal outcome. A relationship store that cannot be reached logs one
-`[authz] ERROR store unavailable` line, and the client gets a 503 that names
-no store. The client sees `forbidden`, `not found` or `authorization
-unavailable` and never the policy or the table: pkg/web maps by `status()` and
-`message()`, so nothing here is registered with it.
+`check` is what a handler calls, and a refusal by it writes one `INFO` record
+in place of the `DEBUG` one:
 
-The sink is any class with `log(line: string)`. The usual one writes to
-stderr (pkg/web and pkg/orm write through `std/log`'s `Logger`, set with
-`Config.logger` and `Options.logger`):
-
-```bit
-class StderrLines {
-  export log(line: string) {
-    eprint(line + "\n")
-  }
-}
+```text
+level=INFO msg=denied action=Delete resource=Article subject=sam policy=NoDeletes
 ```
 
-then `authz.logTo(StderrLines{})`.
+It names the subject's id and the deciding policy and nothing else: no
+attribute value, no row, no request body. The handler quotes and escapes each
+value, so a subject id holding a line break cannot start a line of its own. A
+row the subject may not read is a `NotFound` and leaves no record, because a
+hidden row is the normal outcome. A relationship store that cannot be reached
+writes one `ERROR` record, `msg="store unavailable"
+error="authorization unavailable"`, and the client gets a 503 that names no
+store. The client sees `forbidden`, `not found` or `authorization unavailable`
+and never the policy or the table: pkg/web maps by `status()` and `message()`,
+so nothing here is registered with it.
+
+### Upgrading from `LogSink`
+
+`logTo` used to take a `LogSink`, a class with one `log(line: string)` method,
+and write hand-formatted `[authz] ...` lines. The `LogSink` interface is
+removed in favour of std/log's `Logger`: pre-1.0 and a breaking change for the
+package, so a minor release.
+
+- `authz.logTo(sink)` becomes `authz.logTo(Logger(TextHandler(out)))`, where
+  `out` has `write(s: string): ()!` (a std/log `Sink`) instead of
+  `log(line: string)`.
+- A handle with no `logTo` used to log nothing; it now writes its `INFO` and
+  `ERROR` records to the process default logger.
+- The lines `[authz] debug deny ...`, `[authz] info denied ...`,
+  `[authz] ERROR store unavailable` and `[authz] ERROR invalid policy: ...`
+  are the records `msg=decision`, `msg=denied`, `msg="store unavailable"` and
+  `msg="invalid policy"`, each with `key=value` attributes.
 
 ## A broken rule is not a quiet no
 
@@ -233,9 +243,9 @@ mistake is logged at ERROR the first time. It is a refusal, never a grant.
 ## Sharp edges
 
 - `can` is false for a broken rule, so test your policies with `check` or
-  watch the sink.
+  watch the `ERROR` records.
 - A rule on `all` allows every resource, including ones you register later.
-- The log line names the policy; it is for the server log only. `Denied`
+- The `denied` record names the policy; it is for the server log only. `Denied`
   keeps the policy for `deciding()` and not for `message()`.
 - The first check for a user runs the policy closures (`rolesOf`) and keeps
   the rules, indexed by resource and action. Every later check for a user of
