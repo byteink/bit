@@ -430,6 +430,12 @@ Method {                         // extern class, 16 bytes, 8-aligned
   id producer (this table's construction, `v.(I)`'s narrowing, and every
   ordinary `call_iface`/`Op.CallValue` trampoline site) reads the same key
   so the id space stays self-consistent.
+- **`Self` in an interface signature (#7387).** An interface's `dup(): Self`
+  renders `Self` in that key where the implementing class's `dup(): A` renders
+  `A`, so the class's table also carries the method under the interface's key
+  whenever binding `Self` to the class yields the class's own signature
+  (`selfSlots`, `compiler/lowermethodtable.bit`). A program with no such
+  interface adds no slot and mints no id.
 - Each method's `fn` takes the receiver (the object body pointer) as its leading
   argument, then the call's own arguments — identical to a static method call.
 - Entries are unordered; `methods_len` may be 0 (a type with no methods).

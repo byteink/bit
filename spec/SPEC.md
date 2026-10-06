@@ -2372,6 +2372,14 @@ its own, narrower `Self` (§10.7): the same spelling, but resolved once, at
 `use` time, to the single class that names the trait - not left abstract for
 every future implementer the way an interface's is.
 
+`Self` may be a method's result as well as a parameter. Called through a value
+of the interface, `c.dup()` with `dup(): Self` yields the interface type; called
+through a type parameter `T: Cloner` it yields `T`, which each instantiation
+maps to its own class. A value of type parameter `S: Named` is assignable to
+`Named`, its own bound (or to any interface that bound carries the methods of):
+an instantiation whose argument cannot be an interface value, a bare-tag enum,
+is **E0041** at the call that supplied it (§14.3).
+
 ### 11.4 Raw Pointers (unmanaged subset)
 
 - **Raw pointer** `*T`: a single machine word holding the address of a `T`. It is
