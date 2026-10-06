@@ -5,8 +5,7 @@
 // `Conn` and knows about transactions. `Pool<T>` keeps the same four rules
 // for ANY expensive-to-create, bounded-lifetime resource — a Redis
 // connection (pkg/redis), an HTTP/2 stream, anything — with no knowledge of
-// what `T` is. A follow-up (filed with this ticket) moves std/sql onto this
-// type; it is NOT touched here.
+// what `T` is. stdlib/sql/pool.bit now holds one of these (#6024).
 //
 // THE FOUR RULES (stdlib/sql/pool.bit's own header, restated with no SQL
 // left in them):
@@ -14,8 +13,8 @@
 //   1. A resource stays pinned to the one caller holding it for its whole
 //      life. There is no transaction concept here to pin a SECOND value to
 //      — the rule collapses to "the pool never hands the same checked-out
-//      resource to two callers at once", which `checkedOut` (below) makes
-//      structural: a resource lives in `idle` XOR `checkedOut` XOR `dead`,
+//      resource to two callers at once", which `Lease.out` (below) makes
+//      structural: a resource lives in `idle` XOR out with a caller XOR `dead`,
 //      never two of the three, and `acquire`/`release` are the only door
 //      between them.
 //   2. `release(lease, ok = false)` closes the resource instead of reusing
@@ -65,8 +64,10 @@
 // (stdlib/sql/config.bit's own comment). `Lease<T>` is the fix: it is what
 // `acquire` hands out and `release` takes back, carries the bookkeeping
 // alongside `.value` for exactly as long as the caller holds it, and is
-// looked up by its own pool-assigned `id` (an `i64`, always comparable) —
-// O(1), no field-equality anywhere. `with` (below) never exposes `Lease<T>`
+// told apart from a stale or foreign one by its own `out` and `home` fields
+// (`i64` and `bool`, always comparable) — O(1), no field-equality and no
+// per-checkout map insert and delete (#6024 measured that at ~55 ns of a
+// ~210 ns checkout). `with` (below) never exposes `Lease<T>`
 // at all: it keeps the lease itself and only ever passes `.value` to `f`.
 
 import { Mono, monotonic, since, after, Millisecond } from "std/time"
@@ -84,6 +85,14 @@ export class Lease<T> {
   born: Mono,
   // When it was last parked in `idle` — `maxIdleTime` from here.
   idleAt: Mono,
+  // Held by a caller right now. Set when the pool lends it, cleared by
+  // `release`, both under the pool's mutex: a second `release` of the same
+  // lease finds it clear. This is rule 1's "never lent to two callers at
+  // once", and what the pool's `checkedOut` count is the sum of.
+  out: bool,
+  // The issuing pool's `Pool.home`: a lease released to a pool that did not
+  // lend it carries someone else's.
+  home: i64,
 }
 
 // A caller parked waiting for a resource. `ch` has capacity 1 and exactly
@@ -112,6 +121,11 @@ export class PoolOptions {
   // `acquireTimeout`, which is a config mistake `acquire`'s own failure
   // message already surfaces, not a reason to fail construction.
   export maxSize: i64 = 10,
+  // How many resources may sit idle: above this, a released resource is
+  // closed instead of parked (stdlib/sql's `Datasource.maxIdle`, #6024). A
+  // negative value is no cap beyond `maxSize`, which already bounds `idle`;
+  // 0 parks nothing.
+  export maxIdle: i64 = -1,
   // How many idle resources `maxIdleTime` is not allowed to reap below —
   // once popping the next idle candidate for reuse would drop the idle
   // count under this floor, that candidate is exempt from the idle-time
@@ -155,10 +169,14 @@ export class Pool<T> {
   // Resources taken out of service, waiting to be closed by `reap` with the
   // mutex NOT held. Guarded by `mu`.
   dead: []Lease<T>
-  // Every lease currently held by a caller, keyed by its own `id` — the
-  // lookup `release` uses instead of matching on `T` (this file's header).
-  // Guarded by `mu`.
-  checkedOut: map<i64, Lease<T>>
+  // How many leases are held by callers right now (`Lease.out`). Guarded by
+  // `mu`.
+  numOut: i64
+  // This pool's identity, stamped into every lease it mints (`Lease.home`):
+  // the address of `tag`, a one-element slice the pool keeps alive for its
+  // own lifetime, so no two live pools share one.
+  tag: []i64
+  home: i64
   // Physical resources in existence: checked out, idle, or reserved by a
   // caller that holds a `Dial` claim. Guarded by `mu`.
   numOpen: i64
@@ -174,7 +192,9 @@ export class Pool<T> {
     this.idle = []Lease<T>(0)
     this.waiters = []waiter<T>(0)
     this.dead = []Lease<T>(0)
-    this.checkedOut = map<i64, Lease<T>>()
+    this.numOut = 0
+    this.tag = []i64(1)
+    this.home = i64(ptrOf(this.tag))
     this.numOpen = 0
     this.seq = 0
     this.closed = false
@@ -199,12 +219,7 @@ export class Pool<T> {
       _ => c = first
     }
     match (c) {
-      Got(lease) => {
-        this.mu.lock()
-        this.checkedOut[lease.id] = lease
-        this.mu.unlock()
-        return lease
-      }
+      Got(lease) => return lease
       Dial => return this.dial()?
       Closed => fail newError("std/sync: pool: the pool is closed")
       Wait(_) => fail newError("std/sync: pool: park returned a second Wait")
@@ -221,22 +236,26 @@ export class Pool<T> {
     ok: bool,
   ) {
     this.mu.lock()
-    let (s, found) = this.checkedOut[lease.id]
-    if (found) {
-      delete(this.checkedOut, lease.id)
-    }
-    if (!found) {
+    if (!lease.out || lease.home != this.home) {
       this.mu.unlock()
       this.closeFn(lease.value)
       return
     }
-    if (!ok || this.closed || expired(s.born, this.opts.maxLifetime) || !this.healthyFn(s.value)) {
-      this.retireLocked(s)
+    lease.out = false
+    this.numOut = this.numOut - 1
+    if (!ok ||
+      this.closed ||
+      expired(lease.born, this.opts.maxLifetime) ||
+      !this.healthyFn(lease.value)) {
+      this.retireLocked(lease)
     } else {
-      this.parkLocked(s)
+      this.parkLocked(lease)
     }
+    let retired = len(this.dead) > 0
     this.mu.unlock()
-    this.reap()
+    if (retired) {
+      this.reap()
+    }
   }
   // Acquires, runs `f`, and releases on every path — including a failing
   // `f`, which retires the resource (`ok = false`) rather than risk reusing
@@ -275,7 +294,7 @@ export class Pool<T> {
     this.mu.lock()
     let st = PoolStats{
       open = this.numOpen, idle = len(this.idle),
-      checkedOut = len(this.checkedOut), waiting = len(this.waiters),
+      checkedOut = this.numOut, waiting = len(this.waiters),
     }
     this.mu.unlock()
     return st
@@ -300,6 +319,7 @@ export class Pool<T> {
     while (len(this.idle) > 0) {
       let lease = this.popIdleLocked()
       if (this.usableLocked(lease)) {
+        this.lendLocked(lease)
         return Claim<T>.Got(lease)
       }
       this.retireLocked(lease)
@@ -392,25 +412,44 @@ export class Pool<T> {
       fail e
     }
     let now = monotonic()
-    let lease = Lease<T>{ value = t, id = id, born = now, idleAt = now }
+    let lease = Lease<T>{
+      value = t,
+      id = id,
+      born = now,
+      idleAt = now,
+      out = false,
+      home = this.home,
+    }
     this.mu.lock()
-    this.checkedOut[id] = lease
+    this.lendLocked(lease)
     this.mu.unlock()
     return lease
   }
   // A healthy, unexpired resource: to the longest-waiting caller if there
-  // is one, else onto the idle list. There is no idle-list cap distinct
-  // from `maxSize` — `idle` can never exceed `numOpen`, which `maxSize`
-  // already bounds.
+  // is one, else onto the idle list — or, the list being at `maxIdle`,
+  // retired.
   parkLocked(
     s: Lease<T>,
   ) {
     if (len(this.waiters) > 0) {
+      this.lendLocked(s)
       this.grantLocked(Claim<T>.Got(s))
+      return
+    }
+    if (this.opts.maxIdle >= 0 && len(this.idle) >= this.opts.maxIdle) {
+      this.retireLocked(s)
       return
     }
     s.idleAt = monotonic()
     this.idle = append(this.idle, s)
+  }
+  // Marks `lease` as held by a caller. Every path that hands one out goes
+  // through here, so `out` and `numOut` cannot drift apart.
+  lendLocked(
+    lease: Lease<T>,
+  ) {
+    lease.out = true
+    this.numOut = this.numOut + 1
   }
   // Takes `s` out of service: queued for closing outside the mutex, and its
   // place in `numOpen` passed on.
