@@ -1,0 +1,401 @@
+// The channel-timer pool, split out of `timer.bit` (#7442, at its 800-line
+// ceiling) as a sibling, so the same module: nothing below changed but its home.
+
+// ---------------------------------------------------------------------------
+// Channel timers — expiry SENDS on a channel instead of waking a task (#2665)
+// ---------------------------------------------------------------------------
+//
+// A second entry kind, deliberately NOT an addition to the `TimerQueue`
+// above: that queue is intrusive on `Task` fields (`taskTimerNext`,
+// `taskDeadline`) and a channel-timer entry has no task and no stack to be
+// intrusive INTO. It also cannot live on the `Scheduler` block itself —
+// `schedWords` (16) is asserted exactly by
+// `_tests_/stress/schedspawnowner.bit`'s `schedWords == 16 && workerWords ==
+// 292`, so growing it moves every caller's raw offset arithmetic. Storage is
+// instead a fixed, PROCESS-GLOBAL pool, the same shape `schedPollPending`
+// above already uses and for the same reason: there is one live scheduler
+// per production process, and a stress harness's private second one only
+// makes a stale entry MORE conservative (it just occupies a slot), never
+// wrong.
+//
+// A FIXED CAP, not a GC-backed growable list: `runtime/sched` cannot import
+// `runtime/gc`'s bump reserve either — `runtime/gc/gcmark.bit` imports
+// `schedStackHeadroom` from here, so the reverse is the identical E0044 cycle
+// `runtime/chan` hits (verified directly, the same way). `schedTimerChanArm`
+// RETURNS 0 ON EXHAUSTION rather than growing — see its own comment; that is
+// the documented contract, not a shortfall.
+//
+// THE ARM/CANCEL/RESET SPLIT ACROSS TWO MECHANISMS is deliberate, not
+// inconsistent: only `schedTimerChanArm` takes a `chan<T>` argument, and a
+// `chan<T>` value cannot cross a plain `extern fn` boundary at all (E0077 —
+// "the C ABI has no representation for a GC-managed Bit value"), so it has to
+// be a compiler-recognized builtin, reached the same way `close(c)` is
+// (`compiler/lowerprim.bit`'s `primRtName`). Cancel and reset take only
+// scalars and are reached the plain way `bit_rt_net_dial_deadline_w` is: an
+// `extern fn` declared wherever they are called.
+
+// One entry, `ctEntryWords` apart in `chanTimerPool`.
+const ctEntryWords: int = 6
+// 0 free, 1 pending, 2 pending and firing: a periodic slot whose expiry send is
+// in flight. `schedTimerChanCancel` waits out state 2, which is what makes a
+// `true` from it a promise that no further tick is sent (#7442).
+const ctState: int = 0
+const ctDeadline: int = 1
+const ctPeriod: int = 2
+const ctChan: int = 3 // raw channel handle (int), opaque here — never
+// dereferenced in this file, only forwarded to
+// `bit_rt_port_chan_try_send_drop`
+const ctGen: int = 4 // bumped on every arm; guards a cancel/reset call
+// against an id from a slot that has since been
+// cancelled and reused by a DIFFERENT timer
+const ctNext: int = 5 // free-list link while ctState == 0, 1-based (0 = end)
+
+// 32768 slots * 6 words: ~1.5 MB of zero-initialized process memory, reserved
+// once at link time rather than grown — comfortably above the epic's own
+// 20000-concurrent-timer measurement, and a slot is ~48 bytes against the
+// ~110 KB a spawned-thread timeout costs today.
+const ctCap: int = 32768
+let chanTimerPool: [196608]i64
+let chanTimerFreeHead: [1]i64
+let chanTimerHigh: [1]i64
+let chanTimerLockWord: [1]i64
+// How many slots are currently pending (state 1 or 2). A dedicated counter
+// rather than a scan: `schedCheckDeadlock` (worker.bit) reads this on every
+// idle turn a single-worker program takes, the same frequency
+// `schedTimerAny`/`schedPollPendingCount` are already read at, so this
+// answers in O(1) rather than re-deriving it from `chanTimerHigh` each time.
+let chanTimerPendingCount: [1]i64
+
+@nosplit fn chanTimerPendingAddr(): *i64 {
+  return ptrOf(chanTimerPendingCount)
+}
+
+// Bumped by every successful `rtSchedTimerChanArm`, under the same lock — see
+// `schedTimerChanExpire`'s use of it for the lost-update race this closes
+// (#5845).
+let chanTimerArmSeq: [1]i64
+
+@nosplit fn chanTimerArmSeqAddr(): *i64 {
+  return ptrOf(chanTimerArmSeq)
+}
+
+// A program parked ONLY on a channel timer (no task on the sleeping-task
+// list `schedTimerAny` sees, since a channel timer has no task) must not
+// read as deadlocked. `schedCheckDeadlock` checks this exactly where it
+// checks `schedTimerAny`/`schedPollPendingCount` — see its own header.
+export @nosplit @symbol("bit_rt_port_sched_timer_chan_count") fn schedTimerChanCount(): int {
+  return atomicLoad(chanTimerPendingAddr())
+}
+
+@nosplit fn chanTimerLockAddr(): *i32 {
+  return lockOf(ptrOf(chanTimerLockWord), 0)
+}
+
+@nosplit fn chanTimerFreeHeadAddr(): *i64 {
+  return ptrOf(chanTimerFreeHead)
+}
+
+@nosplit fn chanTimerHighAddr(): *i64 {
+  return ptrOf(chanTimerHigh)
+}
+
+@nosplit fn ctEntryAt(slot: int): *i64 {
+  return ptrOf(chanTimerPool) + slot * ctEntryWords
+}
+
+// Always > 0, so 0 stays the documented "arm failed" sentinel. Decodable back
+// to `(slot, gen)` by `ctLookupPending` without a lookup table.
+@nosplit fn ctMakeId(slot: int, gen: int): int {
+  return gen * ctCap + slot + 1
+}
+
+// Claim a free slot under `chanTimerLockAddr()`. Prefers the free list (O(1),
+// recycles a cancelled/fired slot) and falls back to extending the
+// never-shrinks high-water mark. -1 when the pool is exhausted.
+@nosplit fn chanTimerClaimSlot(): int {
+  let head = *chanTimerFreeHeadAddr()
+  if (head != 0) {
+    let slot = head - 1
+    *chanTimerFreeHeadAddr() = *(ctEntryAt(slot) + ctNext)
+    return slot
+  }
+  let high = atomicLoad(chanTimerHighAddr())
+  if (high >= ctCap) {
+    return -1
+  }
+  atomicStore(chanTimerHighAddr(), high + 1)
+  return high
+}
+
+// MUST BE CALLED WITH `chanTimerLockAddr()` HELD, by any caller that just
+// published a new-or-moved deadline into the pool (#5845): lowers `dlChans`
+// to the earlier of its current value and `deadlineNs` (`earlierDeadline`,
+// never upward — a too-early `dlChans` costs one spurious wake, never a
+// missed one) and bumps `chanTimerArmSeqAddr()`, the signal
+// `schedTimerChanExpire`'s own publish reads to tell "my scan saw everything"
+// from "something changed under me, do not trust my `earliest` outright" (see
+// that function's header for the full argument). Both `rtSchedTimerChanArm`
+// and `schedTimerChanReset` call this — a reset that moves a pending entry
+// EARLIER while worker 0 sleeps on the old bound is the identical bug on a
+// different entry point.
+@nosplit fn chanTimerLowerDeadline(deadlineNs: int) {
+  let cur = atomicLoad(nextDeadlineAddr() + dlChans)
+  atomicStore(nextDeadlineAddr() + dlChans, earlierDeadline(cur, deadlineNs))
+  atomicAdd(chanTimerArmSeqAddr(), 1)
+}
+
+// `runtime/sched/timer.bit`'s half of #2665: inserts a queue entry that, at
+// expiry, does a non-blocking send of `true` on `c` (dropped if `c` is full —
+// see `chanTrySendDrop`'s header, `runtime/chan/chanops.bit`). If `periodNs`
+// is positive the entry re-arms itself at `deadline + periodNs` on every
+// expiry instead of being freed (`schedTimerChanExpire` below); a
+// non-positive `periodNs` fires once and frees its slot. Returns a timer id
+// greater than 0, or 0 if the pool is exhausted (`ctCap` slots all pending).
+//
+// `c` is `int` here — the raw channel handle `compiler/lowercall.bit`'s
+// generic `primRtName` path hands an `Op.RtCall` argument as, exactly like
+// `chan_close`'s `cv`. This function is never called through an ordinary Bit
+// call expression (only the compiler's own lowering reaches it by this
+// symbol), so a `chan<bool>`-typed signature here would be misleading rather
+// than safe.
+export @nosplit @symbol("bit_rt_sched_timer_chan_arm") fn rtSchedTimerChanArm(
+  deadlineNs: int,
+  c: int,
+  periodNs: int,
+): int {
+  let cell = chanTimerLockAddr()
+  spinAcquire(cell)
+  let slot = chanTimerClaimSlot()
+  if (slot < 0) {
+    spinRelease(cell)
+    return 0
+  }
+  let e = ctEntryAt(slot)
+  let gen = *(e + ctGen) + 1
+  *(e + ctGen) = gen
+  *(e + ctState) = 1
+  *(e + ctDeadline) = deadlineNs
+  *(e + ctPeriod) = periodNs
+  *(e + ctChan) = c
+  atomicAdd(chanTimerPendingAddr(), 1)
+  chanTimerLowerDeadline(deadlineNs)
+  spinRelease(cell)
+  schedTimerTrace(ttArm, deadlineNs, slot)
+  chanTimerWake()
+  return ctMakeId(slot, gen)
+}
+
+// The slot `id` names, iff it is still pending (state 1 or 2) AND `id`'s
+// generation matches the slot's current occupant — -1 for an unknown id, an id whose slot has
+// since fired-and-freed-and-been-reused, or an id whose slot is still free.
+// MUST BE CALLED WITH `chanTimerLockAddr()` HELD: the generation/state check
+// and the caller's use of the result must be one atomic read, or a concurrent
+// cancel between the check and the use would race exactly the bug this
+// guards against.
+@nosplit fn ctLookupPending(id: int): int {
+  if (id <= 0) {
+    return -1
+  }
+  let idx = id - 1
+  let slot = idx % ctCap
+  let gen = idx / ctCap
+  let e = ctEntryAt(slot)
+  if (*(e + ctState) == 0 || *(e + ctGen) != gen) {
+    return -1
+  }
+  return slot
+}
+
+// Frees `slot` onto the head of the free list. Caller holds the lock.
+// Caller holds `chanTimerLockAddr()` and has already verified the slot was
+// PENDING (state 1 or 2) — freeing an already-free slot would double-count the
+// decrement below against `schedTimerChanArm`'s single increment.
+@nosplit fn ctFreeSlot(slot: int) {
+  *(ctEntryAt(slot) + ctState) = 0
+  *(ctEntryAt(slot) + ctNext) = *chanTimerFreeHeadAddr()
+  *chanTimerFreeHeadAddr() = slot + 1
+  atomicSub(chanTimerPendingAddr(), 1)
+}
+
+// Removes the entry `id` names. Returns `true` when it was still pending
+// (and is now cancelled), `false` when it already fired or `id` is unknown —
+// exactly the race `cancel` racing `expire` must resolve one way or the
+// other, never both.
+//
+// A `true` MEANS NO FURTHER TICK IS SENT (#7442), the contract of Go's
+// `Ticker.Stop`: a tick already sitting in the channel may remain, none that
+// is still in flight lands after this returns. A periodic slot whose expiry
+// send is under way is in state 2 (`chanTimerExpireSlot`), and cancel waits
+// for that send to finish rather than freeing the slot underneath it. The wait
+// is bounded by one non-blocking `bit_rt_port_chan_try_send_drop`, which never
+// parks and never takes this lock, so the sender always reaches its store of
+// state 1. The lock is dropped between looks so the sender's own `ctState`
+// store and every other slot's arm, expire and reset proceed meanwhile.
+export @nosplit @symbol("bit_rt_sched_timer_chan_cancel") fn schedTimerChanCancel(id: int): bool {
+  let cell = chanTimerLockAddr()
+  while (true) {
+    spinAcquire(cell)
+    let slot = ctLookupPending(id)
+    if (slot < 0) {
+      spinRelease(cell)
+      return false
+    }
+    if (atomicLoad(ctEntryAt(slot) + ctState) == 1) {
+      ctFreeSlot(slot)
+      spinRelease(cell)
+      return true
+    }
+    spinRelease(cell)
+    spinBackoff(parkMinBackoffNs)
+  }
+}
+
+// Moves a pending entry to a new absolute deadline. `false` when `id` is
+// unknown (already fired, or never valid) — the same lookup `cancel` uses, so
+// the two report unknown-ness identically. A slot in state 2 (expiry send in
+// flight) is moved too: reset writes only `ctDeadline`, which the sender never
+// touches after its re-arm, so the two cannot lose each other's update. Same shape as
+// `rtSchedTimerChanArm` deliberately (#5845): moving a deadline EARLIER while
+// worker 0 sleeps on the old bound is the identical bug arming one is, so
+// this calls the same two helpers, in the same order.
+export @nosplit @symbol("bit_rt_sched_timer_chan_reset") fn schedTimerChanReset(
+  id: int,
+  deadlineNs: int,
+): bool {
+  let cell = chanTimerLockAddr()
+  spinAcquire(cell)
+  let slot = ctLookupPending(id)
+  if (slot < 0) {
+    spinRelease(cell)
+    return false
+  }
+  *(ctEntryAt(slot) + ctDeadline) = deadlineNs
+  chanTimerLowerDeadline(deadlineNs)
+  spinRelease(cell)
+  schedTimerTrace(ttReset, deadlineNs, slot)
+  chanTimerWake()
+  return true
+}
+
+// PINNED (ABI.md §9), reached the same way `bit_rt_panic` is from this
+// module (see `worker.bit`): `runtime/chan` already imports `runtime/sched`,
+// so the reverse `import` is the E0044 cycle this avoids by never taking one.
+extern fn bit_rt_port_chan_try_send_drop(ch: int, value: int): bool
+
+// One entry's worth of work, done under the pool lock only for the
+// state/deadline read and whatever mutation follows — the send itself runs
+// OUTSIDE the lock, matching `schedTimerExpire`'s own rule that unparking (an
+// operation that can wake a peer) never happens while a timer lock is held.
+// A one-shot entry (`period <= 0`) is freed before the send, not after: the
+// send cannot fail as far as this pool is concerned (`chanTrySendDrop` drops
+// rather than erroring), so there is no outcome that should leave it pending.
+// (So `Timer.stop()` is false once the timer is due, and the value arrives.)
+//
+// A PERIODIC entry is re-armed AND marked state 2 under the lock, sent on
+// outside it, and only then returned to state 1 (#7442). Re-arming and
+// releasing before the send left a window in which `schedTimerChanCancel` saw
+// state 1, freed the slot and returned true, and the send then landed: a tick
+// after a successful `Ticker.stop()`. Cancel now waits out state 2, so the send
+// and the cancel are mutually exclusive. A sweep that finds state 2 returns the
+// slot's deadline without firing it: the send in flight is the expiry.
+//
+// RETURNS THIS SLOT'S REMAINING FUTURE DEADLINE, or 0 when it has none — free,
+// or a one-shot that just fired and was released. A periodic entry reports the
+// deadline it was just re-armed to, not the one that expired, so the sweep's
+// answer is what is still owed rather than what has already been paid. This is
+// the same read the state/deadline check above already does, under the same
+// acquisition of the same lock; see the next-known-deadline section above for
+// what the caller does with it.
+@nosplit fn chanTimerExpireSlot(slot: int, now: int): int {
+  let cell = chanTimerLockAddr()
+  spinAcquire(cell)
+  let e = ctEntryAt(slot)
+  let state = *(e + ctState)
+  if (state == 0) {
+    spinRelease(cell)
+    return 0
+  }
+  let deadline = *(e + ctDeadline)
+  if (state == 2 || deadline > now) {
+    spinRelease(cell)
+    return deadline
+  }
+  let c = *(e + ctChan)
+  let period = *(e + ctPeriod)
+  let rearmed = 0
+  if (period > 0) {
+    rearmed = now + period
+    *(e + ctDeadline) = rearmed
+    *(e + ctState) = 2
+  } else {
+    ctFreeSlot(slot)
+  }
+  spinRelease(cell)
+  schedTimerTrace(ttFire, deadline, now)
+  let _ = bit_rt_port_chan_try_send_drop(c, 1)
+  if (period > 0) {
+    atomicStore(e + ctState, 1)
+  }
+  schedTimerTrace(ttSent, 1, slot)
+  return rearmed
+}
+
+// Sweeps every slot ever claimed (`[0, chanTimerHigh)`) for one due, sends its
+// `true` and re-arms or frees it, and publishes the earliest deadline still
+// owed by this pool for the park bound above. Called from the same idle-path
+// sites `schedTimerExpire` is; unlike that function there is no task to
+// `gqPop` afterward. Bounded by `ctCap` (Power of 10).
+//
+// #5845: WRAPPING THE STORE IN `chanTimerLockAddr()` ALONE DOES NOT MAKE THIS
+// EXACT — read this before touching the publish below. Unlike `timerPartition`
+// (`dlTasks`, #5843), which holds `scTimerLock` for its ENTIRE walk and so
+// can never interleave with `schedTimerPush`'s own use of that same lock,
+// this sweep takes and drops `chanTimerLockAddr()` ONE SLOT AT A TIME
+// (`chanTimerExpireSlot`) — the lock around the final store only orders the
+// two stores against each other, it does not make the LATER store the more
+// accurate one. A sweep that scans past a slot before `rtSchedTimerChanArm`
+// claims it, finishes after a second sweep triggered by that arm's wake, and
+// publishes its own `earliest` — which never saw the new deadline — would
+// overwrite the second sweep's correct, tighter answer with a stale, LATER
+// one. A too-EARLY publish only costs a spurious wake; a too-LATE one is the
+// bug this whole ticket is about, so `rtSchedTimerChanArm` already lowers
+// `dlChans` itself (`earlierDeadline`, never upward) the instant it arms, and
+// bumps `chanTimerArmSeqAddr()` under the same lock. Reading that sequence
+// before the scan and comparing it after is what lets THIS publish tell "no
+// arm raced me, my `earliest` is exact" from "one did, my `earliest` may be
+// missing a deadline `dlChans` already has, so publish the smaller of the
+// two" — never an unconditional overwrite either way.
+export @nosplit @symbol("bit_rt_port_sched_timer_chan_expire") fn schedTimerChanExpire(now: int) {
+  let cell = chanTimerLockAddr()
+  spinAcquire(cell)
+  let seqStart = atomicLoad(chanTimerArmSeqAddr())
+  // `high` is read AFTER `seqStart`, inside the same lock hold (#6429): an arm
+  // that claims a never-used slot raises `high` and bumps the sequence under
+  // this lock, so either it completed before this read (the scan below covers
+  // its slot) or it bumps the sequence after it (the publish below merges).
+  // Read BEFORE `seqStart` it left a window: a stale `high` that misses the
+  // new slot, then a `seqStart` that already includes the arm's bump, published
+  // `dlChans` = 0 over the arm's deadline and the timer waited out a parked
+  // peer's `idleParkMaxNs` (the first arm of a run, 98ms, x86 under CPU hogs).
+  let high = atomicLoad(chanTimerHighAddr())
+  if (high > ctCap) {
+    high = ctCap
+  }
+  spinRelease(cell)
+
+  let earliest = 0
+  let slot = 0
+  while (slot < high) {
+    earliest = earlierDeadline(earliest, chanTimerExpireSlot(slot, now))
+    slot = slot + 1
+  }
+
+  spinAcquire(cell)
+  if (atomicLoad(chanTimerArmSeqAddr()) == seqStart) {
+    atomicStore(nextDeadlineAddr() + dlChans, earliest)
+  } else {
+    let cur = atomicLoad(nextDeadlineAddr() + dlChans)
+    atomicStore(nextDeadlineAddr() + dlChans, earlierDeadline(earliest, cur))
+  }
+  spinRelease(cell)
+}

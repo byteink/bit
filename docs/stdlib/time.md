@@ -862,12 +862,21 @@ fn pollFiveTimes(): int {
 | `Timer.stop(): bool` | cancels; `true` if it was still pending. Does not drain `.c` |
 | `Timer.reset(d): bool` | re-arms; `false`, with no effect, if it already fired |
 | `Ticker(d: int)` | repeating timer; `.c` receives `true` every `d` nanoseconds until stopped |
-| `Ticker.stop(): bool` | cancels; after this, `.c` receives no further ticks |
+| `Ticker.stop(): bool` | cancels; `true` if it was still pending. After a `true`, no tick is sent, though one already in `.c` stays there until received |
 | `tick(d: int): chan<bool>` | receives `true` every `d` nanoseconds, forever - there is no way to stop it, so its slot leaks for the program's life; prefer `Ticker(d)` when it must ever stop |
 
 In a loop, prefer `Timer(d)` and `Timer.reset` over a fresh `after` each
 iteration, which otherwise accumulates one live slot per iteration between
 fires.
+
+`Ticker.stop` follows Go's `Ticker.Stop`. When it returns `true`, no tick is
+sent after it returns: a send that is under way when `stop` is called is waited
+out, never left to land afterwards. A tick that was already delivered before
+`stop` returned is still in `.c`; drain it with `select { case <- t.c: default: }`
+if the channel is reused. `stop` returns `false` for a ticker that was
+already stopped. A `Timer` differs on purpose: it is released at the instant it
+fires, so `Timer.stop` is `false` once the timer is due, and its value arrives
+even when the `stop` call began first.
 
 A `Ticker` is not a scheduler: it fires on an interval from the moment it
 was armed, drifts under load, and knows nothing about calendars or zones.
@@ -1885,7 +1894,7 @@ A repeating timer; `.c` receives `true` every interval until stopped. See [Timer
 
 ### `Ticker.stop(): bool`
 
-Cancels this timer; returns whether it was still pending.
+Cancels this ticker; returns whether it was still pending. After a `true`, no further tick is sent; a tick already sitting in `.c` stays until received. See [Timer channels](#timer-channels).
 
 
 ## Timer reference
