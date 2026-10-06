@@ -25,6 +25,29 @@ Binds a listening socket to `host:port`. Pass port `0` to let the kernel choose 
 free port, then read it back with `port()` - the reliable way to bind in a test,
 since choosing a number yourself races every other process on the machine.
 
+`"0.0.0.0"` listens on every IPv4 interface, and `"::"` on every interface,
+IPv4 and IPv6 alike, on every platform: a client dialing `127.0.0.1` reaches a
+`"::"` listener and `peerIp` reports it as `"127.0.0.1"`. Windows sockets are
+IPv6-only by default, so the runtime clears `IPV6_V6ONLY` itself when it binds
+`"::"` instead of relying on the OS default (Go's `net` does the same). A
+specific IPv6 address such as `"::1"` is bound as given and takes IPv6 clients
+only.
+
+```bit
+import { listen, dial } from "std/net"
+
+// One listener for both families; each client reaches it on its own address.
+fn bothFamilies(): ()! {
+  let l = listen("::", 0)?
+  let port = l.port()?
+  let v4 = dial("127.0.0.1", port)?
+  let v6 = dial("::1", port)?
+  v4.close()
+  v6.close()
+  l.close()
+}
+```
+
 ### `Listener.port(): int!`
 
 The port the listener is actually bound to. Meaningful even when `0` was
