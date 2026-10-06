@@ -4655,6 +4655,13 @@ buggy:
   actually stored there, never a fabricated bit pattern. *Which* writer's
   value a racing reader sees is unspecified - that is the race itself, and the
   fix is always one of the edges above, not this guarantee.
+- A racing read of a **map** entry (`m[k]` or `let (v, ok) = m[k]`) against a
+  `delete(m, k)` or an insert is covered by the same guarantee, applied per
+  key: it observes `k` absent, or a value stored under `k` - the last value `k`
+  held, or the zero value `V` after a delete - and never the value of another
+  key. The guarantee is for readers: two threads that write one map still race
+  (`len` and the table's bookkeeping are plain words), so a map written from
+  several threads needs a lock (edge 6).
 - A racing access to a value **wider than one word** - a class assigned as a
   whole, a slice header `{ptr, len, cap}`, a `string` header `{ptr, len}`, or a
   multi-return tuple - **can tear**: a reader can observe a mix of words from

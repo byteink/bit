@@ -4002,7 +4002,10 @@ the handle of a string CONSTANT, which is static for the life of the process.
   under-promised (`mapCapForHint`, `runtime/root/maps.bit`).
 - **Delete** leaves a `TOMB` and zeroes the slot's key word, and its value word
   when `val_is_ref` (dropping the refs so a removed entry becomes collectable);
-  the tombstone is reclaimed at the next grow. An insert never claims a `TOMB`,
+  the tombstone is reclaimed at the next grow, which rehashes at the SAME `cap`
+  while the live count is at most 5/8 of it and doubles otherwise, so a steady
+  set under insert/delete churn keeps a fixed table and pays an amortized O(1)
+  rehash per insert (#5813). An insert never claims a `TOMB`,
   only an `EMPTY` slot, so a slot belongs to one key until the table is replaced
   and a reader holding that slot (the `map_slot` token, or `map_get` between its
   key compare and its value load) cannot be handed another key's value by a
