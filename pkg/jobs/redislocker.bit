@@ -1,0 +1,184 @@
+// pkg/jobs/redislocker.bit — a `Locker` (schedule.bit) over a Redis 7+ server
+// through pkg/redis (#7321), the counterpart of `SqlLocker` (sqllocker.bit)
+// with the same rules.
+//
+// A LEASE IS A KEY WITH A TOKEN, CHECKED BY A SCRIPT. The single-instance
+// Redis lock pattern: the value is `<expiresAt>|<holder>`, the holder string
+// is the token, and acquiring, renewing and taking over an expired lease are
+// ONE script that reads the key and writes it, so two instances racing for
+// one key are serialized by the server and exactly one sees a win. A holder
+// may rewrite its own lease (renewal); anyone else may only when the stored
+// `expiresAt <= nowNs`.
+//
+// THE EXPIRY IS THE CALLER'S CLOCK, NOT A `PX` TTL. `Locker.tryAcquire`'s
+// contract (schedule.bit) is that "an implementation never reads a clock of
+// its own": `nowNs` and `expiresAt` come from `Options.clock`, which a test
+// moves by hand and a skewed instance gets wrong. A server-side TTL would
+// make the lease vanish on real time and let a second instance re-fire a tick
+// the first already enqueued, so the keys carry no TTL; the table is bounded
+// by pruning instead (below), exactly as `SqlLocker`'s rows are.
+//
+// A TICK IS REMEMBERED, NOT EXPIRED. A lease key is per tick
+// (`<schedule>@<tick>`); every win also records the tick in a per-schedule
+// sorted set ordered by ARRIVAL (a counter, never a tick value or a clock: an
+// instance whose clock ran ahead must not outrank correct ticks, #6371), and
+// the newest tick by VALUE in `last`. After a win everything but the newest
+// `keep` arrivals and the newest tick is deleted, so a schedule holds at most
+// `keep + 1` lease keys. Tick values are compared as decimal strings in Lua:
+// a Lua number is a double and a 19-digit nanosecond tick is not exact in one.
+//
+// KEYS, under the store's prefix `P` (one hash tag, see redis.bit):
+//   P:lease:<schedule>@<tick>   `<expiresAt>|<holder>`
+//   P:ticks:<schedule>          sorted set, member tick, score arrival
+//   P:last:<schedule>           the newest tick, as decimal text
+//   P:leaseseq                  INCR counter for arrivals
+
+import { Client, Script, luaInt, asStrings } from "redis"
+import { lastIndexOf, parseInt } from "std/strings"
+
+// A tick is the digits after a lease key's last "@", at most 19 of them: the
+// width of a signed 64-bit nanosecond timestamp.
+const maxTickDigits: int = 19
+
+// KEYS: lease, ticks, last, seq. ARGV: holder, nowNs, expiresAt, tick ("" when
+// the key is not a tick), keep, lease key prefix, schedule. The comparison
+// `le(a, b)` is `a <= b` on non-negative decimal strings.
+const acquireSrc: string = `
+local function norm(s)
+  local n = string.gsub(s, '^0+', '')
+  if n == '' then return '0' end
+  return n
+end
+local function le(a, b)
+  a = norm(a)
+  b = norm(b)
+  if #a ~= #b then return #a < #b end
+  return a <= b
+end
+local cur = redis.call('GET', KEYS[1])
+if cur then
+  local exp, holder = string.match(cur, '^(%d+)|(.*)$')
+  if exp and holder ~= ARGV[1] and not le(exp, ARGV[2]) then
+    return 0
+  end
+end
+redis.call('SET', KEYS[1], ARGV[3] .. '|' .. ARGV[1])
+local tick = ARGV[4]
+if tick == '' then
+  return 1
+end
+redis.call('ZADD', KEYS[2], redis.call('INCR', KEYS[4]), tick)
+local last = redis.call('GET', KEYS[3])
+if not last or not le(tick, last) then
+  redis.call('SET', KEYS[3], tick)
+  last = tick
+end
+local keep = tonumber(ARGV[5])
+local card = redis.call('ZCARD', KEYS[2])
+if card > keep then
+  for _, m in ipairs(redis.call('ZRANGE', KEYS[2], 0, card - keep - 1)) do
+    if m ~= last then
+      redis.call('ZREM', KEYS[2], m)
+      redis.call('DEL', ARGV[6] .. ARGV[7] .. '@' .. m)
+    end
+  end
+end
+return 1
+`
+
+// A `Locker` (schedule.bit) over one pkg/redis `Client`. See this file's
+// header for the layout and why the expiry is the caller's clock.
+export class RedisLocker {
+  client: Client
+  prefix: string
+  keep: int
+  seqKey: string
+  acquireScript: Script
+
+  // A fresh locker. `keep` is how many newest arrivals of a schedule's leases
+  // to retain; it must be at least 1 (`open` fails with the value named when
+  // the locker reports less, `window`). `prefix` must carry a hash tag and
+  // the server must be Redis 7+, as for `RedisStore`; the same prefix as the
+  // store keeps both in one slot.
+  init(client: Client, prefix: string = defaultPrefix, keep: int = 1024)! {
+    requireHashTag(prefix)?
+    requireRedis7(client)?
+    this.client = client
+    this.prefix = prefix
+    this.keep = keep
+    this.seqKey = prefix + ":leaseseq"
+    this.acquireScript = Script(acquireSrc)
+  }
+
+  export tryAcquire(key: string, holder: string, nowNs: int, expiresAt: int): bool! {
+    if (nowNs < 0 || expiresAt < 0) {
+      fail newError("jobs: RedisLocker: lease times must not be negative (now ${nowNs}, expires ${expiresAt})")
+    }
+    let (schedule, tick) = splitLeaseKey(key)
+    let won = this.acquireScript.run(
+      this.client,
+      luaInt,
+      keys = [
+        "${this.prefix}:lease:${key}",
+        "${this.prefix}:ticks:${schedule}",
+        "${this.prefix}:last:${schedule}",
+        this.seqKey,
+      ],
+      args = [
+        holder, "${nowNs}", "${expiresAt}", tick, "${this.keep}", this.prefix + ":lease:",
+        schedule,
+      ],
+    )?
+    return won == 1
+  }
+
+  export lastTick(key: string): int! {
+    let got = this.client.get("${this.prefix}:last:${key}")?
+    match (got) {
+      None => return 0
+      Some(tick) => return parseInt(tick)?
+    }
+  }
+
+  export window(): int {
+    return this.keep
+  }
+
+  // The server's clock in nanoseconds since the epoch: `TIME`, whole
+  // microseconds, so exact.
+  export serverNowNs(): int! {
+    let r = this.client.command(["TIME"])?
+    let parts = asStrings(r, "TIME")?
+    if (len(parts) != 2) {
+      fail newError("jobs: RedisLocker: TIME returned ${len(parts)} fields, want 2")
+    }
+    return parseInt(parts[0])? * 1000000000 + parseInt(parts[1])? * 1000
+  }
+}
+
+// A lease key `<schedule>@<tick>` as (schedule, tick); a key without a valid
+// tick (no "@", or non-digits, or more than 19 of them after it) is its own
+// schedule with an empty tick, a lease that is never pruned or remembered.
+// Pure: redis.test.bit calls it directly.
+fn splitLeaseKey(key: string): (string, string) {
+  let at = lastIndexOf(key, "@")
+  if (at < 0) {
+    return (key, "")
+  }
+  let tick = key[at + 1:len(key)]
+  if (len(tick) < 1 || len(tick) > maxTickDigits || !allDigits(tick)) {
+    return (key, "")
+  }
+  return (key[0:at], tick)
+}
+
+fn allDigits(s: string): bool {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] < u8(48) || s[i] > u8(57)) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}

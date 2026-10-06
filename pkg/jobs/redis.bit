@@ -1,0 +1,315 @@
+// pkg/jobs/redis.bit — a `Store` (store.bit) backed by a Redis 7+ server
+// through pkg/redis (#7321, epic #4023).
+//
+// EVERY STEP IS ONE LUA SCRIPT. A job spans three keys (its hash, the ready
+// set, the in-flight set), so each `Store` method is one `Script` (EVALSHA,
+// loaded on first use) that touches them all inside one atomic server-side
+// step: no client-side read-then-write, nothing for a second worker to
+// interleave with. `claim` is one round trip.
+//
+// LAYOUT, under one prefix `P` (default `{jobs}`):
+//   P:seq          INCR counter: the next job id
+//   P:job:<id>     hash: name, payload, attempts, max; plus reason, deadAt
+//                  once dead-lettered
+//   P:ready        sorted set, member id, score availableAt
+//   P:flight       sorted set, member id, score = the instant the claim
+//                  expires (server now + visibility timeout)
+//   P:dead         sorted set, member id, score = when it was dead-lettered
+//
+// THE PREFIX MUST CARRY A HASH TAG (`{jobs}`, `{myapp:jobs}`). Redis Cluster
+// hashes only the text inside the braces, so every key above lands in one
+// slot and one script can touch them all; the constructor refuses a prefix
+// without one rather than letting a cluster fail the first `claim`. The job
+// hashes are named inside the script (their ids are only known there), the
+// same pattern BullMQ and Sidekiq use; on a cluster that works because the
+// tag puts them in the declared keys' slot.
+//
+// THE CLOCK IS THE SERVER'S. `claim`, `deadLetter` and the reclaim all read
+// `redis.call('TIME')` inside the script, so a worker whose clock is wrong can
+// neither claim a job early nor reclaim another worker's job before its
+// visibility timeout ran out. The one client clock in the system is the
+// `availableAt` a caller passes to `enqueue`/`retry`, and it is turned into a
+// DELAY before it is stored: the call sends its own `now` too, and a time in
+// the caller's future becomes "server now + (availableAt - caller now)". A
+// retry in 30 s is 30 s on the server's clock whatever the two clocks read, so
+// a worker (or a Redis host) whose clock drifted shifts nothing. A time not in
+// the future is stored as given: those jobs are due, and their own order
+// (oldest `availableAt` first) is kept.
+//
+// ONE CLAIM FOR "ready" AND "abandoned" (store.bit's header): the script first
+// takes an in-flight entry whose claim expired (a worker that crashed
+// mid-job), else the oldest ready entry; either way the entry moves to the
+// in-flight set with a fresh expiry and its attempt count rises by one.
+//
+// A caller's clock must still agree with itself, nothing more: it is read
+// twice in one call and only the difference is used.
+//
+// SCORES ARE DOUBLES. A sorted-set score is an IEEE double, which holds an
+// integer exactly up to 2^53 (9.0e15), and a nanosecond timestamp today is
+// 1.8e18. A timestamp is therefore kept to the double's resolution there, 256
+// ns: two jobs whose `availableAt` differ by less than that tie (broken by id,
+// as a string), and a job can become claimable up to 256 ns early. Ids and
+// attempt counts are exact: they live in a counter and a hash, not in a score.
+
+import { Client, Reply, Script, luaInt, luaStrings } from "redis"
+import { indexOf, parseInt } from "std/strings"
+
+// The default key prefix: one hash tag, so a cluster keeps every key together.
+export const defaultPrefix: string = "{jobs}"
+
+// The first Redis release whose scripts replicate their effects, which is what
+// lets a script read `TIME` and then write.
+const minRedisMajor: int = 7
+
+// Lua shared by enqueue and retry: `due(availableAt, callerNow)` is the score
+// to store. Both are the caller's clock, in nanoseconds.
+const dueFn: string = `
+local function due(at, callerNow)
+  at = tonumber(at)
+  callerNow = tonumber(callerNow)
+  if at <= callerNow then
+    return at
+  end
+  local t = redis.call('TIME')
+  return t[1] * 1000000000 + t[2] * 1000 + (at - callerNow)
+end
+`
+
+// KEYS: seq, ready. ARGV: prefix, name, payload, availableAt, maxAttempts,
+// the caller's now.
+const enqueueSrc: string = dueFn +
+  `
+local id = redis.call('INCR', KEYS[1])
+redis.call('HSET', ARGV[1] .. ':job:' .. id, 'name', ARGV[2], 'payload', ARGV[3], 'attempts', 0, 'max', ARGV[5])
+redis.call('ZADD', KEYS[2], due(ARGV[4], ARGV[6]), id)
+return id
+`
+
+// KEYS: ready, flight. ARGV: prefix, visibility timeout in ns. Returns {} when
+// nothing is claimable, else {id, name, payload, attempts, max}.
+const claimSrc: string = `
+local t = redis.call('TIME')
+local now = t[1] * 1000000000 + t[2] * 1000
+local from = KEYS[2]
+local id = redis.call('ZRANGEBYSCORE', from, '-inf', now, 'LIMIT', 0, 1)[1]
+if not id then
+  from = KEYS[1]
+  id = redis.call('ZRANGEBYSCORE', from, '-inf', now, 'LIMIT', 0, 1)[1]
+end
+if not id then
+  return {}
+end
+local jk = ARGV[1] .. ':job:' .. id
+local job = redis.call('HMGET', jk, 'name', 'payload', 'max')
+if not job[1] then
+  redis.call('ZREM', from, id)
+  return {}
+end
+local attempts = redis.call('HINCRBY', jk, 'attempts', 1)
+redis.call('ZREM', KEYS[1], id)
+redis.call('ZADD', KEYS[2], now + ARGV[2], id)
+return {id, job[1], job[2], tostring(attempts), job[3]}
+`
+
+// KEYS: ready, flight. ARGV: prefix, id.
+const completeSrc: string = `
+redis.call('ZREM', KEYS[1], ARGV[2])
+redis.call('ZREM', KEYS[2], ARGV[2])
+redis.call('DEL', ARGV[1] .. ':job:' .. ARGV[2])
+return 1
+`
+
+// KEYS: ready, flight. ARGV: prefix, id, availableAt, the caller's now. A job
+// that no longer exists is not resurrected.
+const retrySrc: string = dueFn +
+  `
+if redis.call('EXISTS', ARGV[1] .. ':job:' .. ARGV[2]) == 0 then
+  return 0
+end
+redis.call('ZREM', KEYS[2], ARGV[2])
+redis.call('ZADD', KEYS[1], due(ARGV[3], ARGV[4]), ARGV[2])
+return 1
+`
+
+// KEYS: ready, flight, dead. ARGV: prefix, id, reason.
+const deadLetterSrc: string = `
+redis.call('ZREM', KEYS[1], ARGV[2])
+redis.call('ZREM', KEYS[2], ARGV[2])
+local jk = ARGV[1] .. ':job:' .. ARGV[2]
+if redis.call('EXISTS', jk) == 0 then
+  return 0
+end
+local t = redis.call('TIME')
+local now = t[1] * 1000000000 + t[2] * 1000
+redis.call('HSET', jk, 'reason', ARGV[3], 'deadAt', string.format('%.0f', now))
+redis.call('ZADD', KEYS[3], now, ARGV[2])
+return 1
+`
+
+// A `Store` (store.bit) over one pkg/redis `Client`. `Client` is a connection
+// pool, safe for concurrent callers, so one `RedisStore` may back every worker
+// of a `Queue`.
+export class RedisStore {
+  client: Client
+  // The key names, exported so an operator (or a test) can look at a queue
+  // with redis-cli: `ZRANGE <deadKey> 0 -1` lists what was dead-lettered.
+  export prefix: string
+  export readyKey: string
+  export flightKey: string
+  export deadKey: string
+  seqKey: string
+  enqueueScript: Script
+  claimScript: Script
+  completeScript: Script
+  retryScript: Script
+  deadScript: Script
+
+  // A store over an open client. `prefix` names every key (see this file's
+  // header) and must contain a hash tag. Fails when the server is older than
+  // Redis 7, so a server the scripts cannot run on never gets a store.
+  init(client: Client, prefix: string = defaultPrefix)! {
+    requireHashTag(prefix)?
+    requireRedis7(client)?
+    this.client = client
+    this.prefix = prefix
+    this.seqKey = prefix + ":seq"
+    this.readyKey = prefix + ":ready"
+    this.flightKey = prefix + ":flight"
+    this.deadKey = prefix + ":dead"
+    this.enqueueScript = Script(enqueueSrc)
+    this.claimScript = Script(claimSrc)
+    this.completeScript = Script(completeSrc)
+    this.retryScript = Script(retrySrc)
+    this.deadScript = Script(deadLetterSrc)
+  }
+
+  export enqueue(name: string, payload: string, availableAt: int, maxAttempts: int): ()! {
+    this.enqueueScript.run(
+      this.client,
+      luaInt,
+      keys = [this.seqKey, this.readyKey],
+      args = [this.prefix, name, payload, "${availableAt}", "${maxAttempts}", "${now().ns}"],
+    )?
+  }
+
+  export claim(visibilityTimeout: int): Option<ClaimedJob>! {
+    let got = this.claimScript.run(
+      this.client,
+      luaStrings,
+      keys = [this.readyKey, this.flightKey],
+      args = [this.prefix, "${visibilityTimeout}"],
+    )?
+    if (len(got) == 0) {
+      return Option.None
+    }
+    return Option.Some(claimedOf(got)?)
+  }
+
+  export complete(id: int): ()! {
+    this.completeScript.run(
+      this.client,
+      luaInt,
+      keys = [this.readyKey, this.flightKey],
+      args = [this.prefix, "${id}"],
+    )?
+  }
+
+  export retry(id: int, availableAt: int): ()! {
+    this.retryScript.run(
+      this.client,
+      luaInt,
+      keys = [this.readyKey, this.flightKey],
+      args = [this.prefix, "${id}", "${availableAt}", "${now().ns}"],
+    )?
+  }
+
+  export deadLetter(id: int, reason: string): ()! {
+    this.deadScript.run(
+      this.client,
+      luaInt,
+      keys = [this.readyKey, this.flightKey, this.deadKey],
+      args = [this.prefix, "${id}", reason],
+    )?
+  }
+}
+
+// The five fields `claimSrc` returns, in order.
+fn claimedOf(got: []string): ClaimedJob! {
+  if (len(got) != 5) {
+    fail newError("jobs: RedisStore: claim returned ${len(got)} fields, want 5")
+  }
+  return ClaimedJob{
+    id = parseInt(got[0])?,
+    name = got[1],
+    payload = got[2],
+    attempts = parseInt(got[3])?,
+    maxAttempts = parseInt(got[4])?,
+  }
+}
+
+// A prefix is usable when it holds `{tag}` with at least one character
+// between the first `{` and the next `}`: the exact text Redis Cluster hashes.
+fn requireHashTag(prefix: string): ()! {
+  let lbrace = indexOf(prefix, "{")
+  if (lbrace >= 0) {
+    let inside = indexOf(prefix[lbrace + 1:len(prefix)], "}")
+    if (inside > 0) {
+      return
+    }
+  }
+  fail newError("jobs: the Redis key prefix '${prefix}' has no hash tag; use one like '{jobs}' so a cluster keeps every key in one slot")
+}
+
+// The version `INFO server` reports (`7.2.4`), or "" when the text carries
+// none. Valkey and Redis both report one. Pure, so redis.test.bit feeds it
+// every shape without a server.
+fn redisVersion(info: string): string {
+  let tag = "redis_version:"
+  let at = indexOf(info, tag)
+  if (at < 0) {
+    return ""
+  }
+  let rest = info[at + len(tag):len(info)]
+  let end = indexOf(rest, "\r")
+  if (end < 0) {
+    end = indexOf(rest, "\n")
+  }
+  if (end < 0) {
+    return rest
+  }
+  return rest[0:end]
+}
+
+// The leading number of a version string, or 0 when it has none.
+fn redisMajor(version: string): int {
+  let dot = indexOf(version, ".")
+  if (dot <= 0) {
+    return 0
+  }
+  return parseInt(version[0:dot]) catch _ {
+    return 0
+  }
+}
+
+// The text of an `INFO` reply: a bulk string under RESP2, a verbatim string
+// under RESP3, which is what pkg/redis negotiates by default.
+fn infoText(r: Reply): string! {
+  match (r) {
+    Verbatim(_, text) => return text
+    Bulk(body) => {
+      match (body) {
+        Some(text) => return text
+        None => fail newError("jobs: the Redis server's INFO reply was null")
+      }
+    }
+    Simple(text) => return text
+    _ => fail newError("jobs: the Redis server's INFO reply was not text")
+  }
+}
+
+fn requireRedis7(client: Client): ()! {
+  let version = redisVersion(infoText(client.command(["INFO", "server"])?)?)
+  if (redisMajor(version) < minRedisMajor) {
+    fail newError("jobs: the Redis store needs Redis ${minRedisMajor} or newer (its scripts read TIME and then write); the server reported redis_version '${version}'")
+  }
+}
