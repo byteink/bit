@@ -1,0 +1,163 @@
+// The Windows resolver asks an IPv6 nameserver (#7480): `netResolvePasses`
+// (runtime/net/windows/netabi.bit) is handed a one-entry list holding `::1` and
+// resolves a name through a fake nameserver bound on [::1]. Before #7480 an IPv6
+// adapter server was dropped at discovery and the Windows resolver could only
+// dial AF_INET, so a host whose first DNS server is IPv6 (Tailscale's
+// `fd7a:115c:a1e0::53` on the test box) asked it nothing.
+//
+// WINDOWS-ONLY, HAND-RUN FROM `_tests_/bit/windowssmoke.bit`, and placed as a
+// subdirectory of `_tests_/stress/thread/` for the reason ../gcthreadswindows
+// states: nothing imports it, so the stress corpus walker never loads it.
+//
+//   BIT_LIBBITRT=<archive> bit build _tests_/stress/thread/dnsv6windows \
+//     --target x86_64-windows -o <out>.exe
+//
+// The stub is a spawned task on a raw Winsock socket (the runtime's UDP bind
+// takes IPv4 only), blocking in `recvfrom` on its own worker thread while the
+// main thread sits in the resolver's own blocking receive. That needs a second
+// worker, so the harness runs this with BIT_WORKERS=4; with one, the stub's
+// blocking receive starves the task that would send the query. It answers the one
+// query with `1.2.3.4`. The walk's inputs are the resolve block a caller of
+// `bit_rt_net_resolve_w` never sees: the window, the attempt count, the port the
+// stub bound (`netNsPortOff`) and the list of `netAdapterDnsStride` (20) byte
+// entries.
+//
+// Prints `dnsv6 ok 1.2.3.4` on success; anything else is a `dnsv6 FAIL` line, a
+// failure the harness reports with the program's whole output.
+
+extern fn socket(af: i32, ty: i32, proto: i32): i64
+extern fn bind(s: i64, name: *byte, namelen: i32): i32
+extern fn getsockname(s: i64, name: *byte, namelen: *i32): i32
+extern fn setsockopt(s: i64, level: i32, optname: i32, optval: *byte, optlen: i32): i32
+extern fn recvfrom(s: i64, buf: *byte, len: i32, flags: i32, name: *byte, namelen: *i32): i32
+extern fn sendto(s: i64, buf: *byte, len: i32, flags: i32, name: *byte, namelen: i32): i32
+extern fn closesocket(s: i64): i32
+extern fn WSAGetLastError(): i32
+extern fn bit_rt_port_net_resolve_passes(host: int, hostLen: int, ns: int, out: int): bool
+
+// winsock2.h / ws2ipdef.h.
+const afInet6: int = 23
+const sockDgram: int = 2
+const ipprotoUdp: int = 17
+const solSocket: int = 65535
+const soRcvTimeo: int = 4102
+const sa6Len: int = 28
+
+// The resolve block (`netNsBlockBytes`, runtime/net/net.bit) is eight words:
+// the address (two), the window, the attempts, the port, the port step, the list
+// pointer and its byte length.
+const nsWindow: int = 2
+const nsAttempts: int = 3
+const nsPort: int = 4
+const nsStep: int = 5
+const nsList: int = 6
+const nsListLen: int = 7
+const entryBytes: int = 20
+const answerBytes: int = 16
+const queryMax: int = 512
+
+let stubPort: [1]i64
+let stubAnswered: [1]i64
+let stubLen: [1]i32
+
+// ::1, `sockaddr_in6`: the family (a little-endian u16) at 0, the address at 8.
+fn loopback6(sa: []byte) {
+  sa[0] = 23
+  sa[23] = 1
+}
+
+// A five second receive timeout, so a failed run ends instead of hanging.
+fn armTimeout(s: i64) {
+  let t = []byte(4)
+  t[0] = 136
+  t[1] = 19
+  let _ = setsockopt(s, i32(solSocket), i32(soRcvTimeo), ptrOf(t), i32(4))
+  keepAlive(t)
+}
+
+// The reply to `q[0..n)`: the query's own bytes with the response and
+// recursion-available flags and one answer, `1.2.3.4`, a compression pointer to
+// the question's name. Returns the reply's length.
+fn answer(q: []byte, n: int): int {
+  q[2] = 129
+  q[3] = 128
+  q[7] = 1
+  let rr = [192, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]
+  let i = 0
+  while (i < answerBytes) {
+    q[n + i] = u8(rr[i])
+    i = i + 1
+  }
+  return n + answerBytes
+}
+
+fn stub() {
+  let s = socket(i32(afInet6), i32(sockDgram), i32(ipprotoUdp))
+  let sa = []byte(sa6Len)
+  loopback6(sa)
+  if (int(bind(s, ptrOf(sa), i32(sa6Len))) != 0) {
+    print("dnsv6 FAIL stub bind\n")
+    return
+  }
+  stubLen[0] = i32(sa6Len)
+  let _ = getsockname(s, ptrOf(sa), ptrOf(stubLen))
+  armTimeout(s)
+  atomicAdd(ptrOf(stubPort), int(sa[2]) * 256 + int(sa[3]))
+  let q = []byte(queryMax)
+  let from = []byte(sa6Len)
+  stubLen[0] = i32(sa6Len)
+  let n = int(
+    recvfrom(s, ptrOf(q), i32(queryMax - answerBytes), i32(0), ptrOf(from), ptrOf(stubLen)),
+  )
+  if (n < 12) {
+    print("dnsv6 FAIL stub recv ${n} wsa=${int(WSAGetLastError())}\n")
+    return
+  }
+  let m = answer(q, n)
+  let _ = sendto(s, ptrOf(q), i32(m), i32(0), ptrOf(from), i32(sa6Len))
+  atomicAdd(ptrOf(stubAnswered), 1)
+  let _ = closesocket(s)
+}
+
+fn main() {
+  spawn stub()
+  let polls = 0
+  while (int(atomicLoad(ptrOf(stubPort))) == 0 && polls < 5000) {
+    timeSleepNs(1000000)
+    polls = polls + 1
+  }
+  let port = int(atomicLoad(ptrOf(stubPort)))
+  if (port == 0) {
+    print("dnsv6 FAIL stub never bound\n")
+    return
+  }
+  let host = []byte(12)
+  let name = "example.test"
+  let i = 0
+  while (i < 12) {
+    host[i] = name[i]
+    i = i + 1
+  }
+  // A list entry is the 16-byte IPv6 wire form then a four-byte scope id: ::1, scope 0.
+  let list = []byte(entryBytes)
+  list[15] = 1
+  let ns = []i64(8)
+  ns[nsWindow] = 5000
+  ns[nsAttempts] = 1
+  ns[nsPort] = port
+  ns[nsStep] = 0
+  ns[nsList] = int(ptrOf(list))
+  ns[nsListLen] = entryBytes
+  let out = []byte(8)
+  let ok = bit_rt_port_net_resolve_passes(int(ptrOf(host)), 12, int(ptrOf(ns)), int(ptrOf(out)))
+  keepAlive(host)
+  keepAlive(list)
+  keepAlive(ns)
+  let addr = "${int(out[0])}.${int(out[1])}.${int(out[2])}.${int(out[3])}"
+  let served = int(atomicLoad(ptrOf(stubAnswered)))
+  if (ok && addr == "1.2.3.4" && served == 1) {
+    print("dnsv6 ok ${addr}\n")
+    return
+  }
+  print("dnsv6 FAIL resolved=${ok} addr=${addr} answered=${served}\n")
+}

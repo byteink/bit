@@ -19,8 +19,9 @@
 
 import {
   netDnsId, netBuildQuery, netParseAnswer, netMaxDnsMsg,
-  netNsTimeoutOff, dnsBytes, getU64Le, netNsAttemptsOff, netNsConfOff, netNsConfLenOff,
-  netAdapterDnsServers, netMaxAdapterDns,
+  netNsTimeoutOff, netNsPortOff, netNsPortStepOff, netNsAttemptsOff, netNsConfOff,
+  netNsConfLenOff, netAdapterDnsStride, dnsBytes, getU64Le, netAdapterDnsServers,
+  netMaxAdapterDns, netAdapterEntryScopeOff, netSa6ScopeOff,
 } from "../../net"
 
 // ---------------------------------------------------------------------------
@@ -45,13 +46,16 @@ import {
 // below purely as defence in depth.
 @nosplit fn wsaEtimedout(): int { return 10060 }
 
-// A BLOCKING socket with SO_RCVTIMEO, matching ../darwin/dns.bit's own
-// rationale exactly: DNS is an occasional millisecond cost, so a bounded
-// receive timeout buys a real error on packet loss without putting
-// timer-driven wakes on the poller. Blocks the calling worker for up to
-// `timeoutMs` on a lost packet.
-export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(timeoutMs: int): int {
-  let fd = wsaRc(int(socket(i32(afInet()), i32(sockDgram()), i32(ipprotoUdp()))))
+// A BLOCKING UDP socket of address `family` (`afInet()` or `afInet6()`) with
+// SO_RCVTIMEO, matching ../darwin/dns.bit's own rationale exactly: DNS is an
+// occasional millisecond cost, so a bounded receive timeout buys a real error on
+// packet loss without putting timer-driven wakes on the poller. Blocks the
+// calling worker for up to `timeoutMs` on a lost packet.
+export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(
+  family: int,
+  timeoutMs: int,
+): int {
+  let fd = wsaRc(int(socket(i32(family), i32(sockDgram()), i32(ipprotoUdp()))))
   if (fd < 0) {
     return 0 - 1
   }
@@ -71,47 +75,88 @@ export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(timeoutMs:
   return fd
 }
 
+// True when the list entry at `e` (`netAdapterDnsStride` bytes, ../adapters.bit)
+// is an IPv4 server: the IPv4-mapped form `::ffff:a.b.c.d`.
+@nosplit fn netEntryIsV4(e: *u8): bool {
+  let k = 0
+  while (k < 10) {
+    if (getU8(e, k) != 0) {
+      return false
+    }
+    k = k + 1
+  }
+  return getU8(e, 10) == 255 && getU8(e, 11) == 255
+}
+
+// Lays the nameserver `entry` out as a `sockaddr_in` or `sockaddr_in6` asked on
+// `port`, in the per-worker scratch `sa6Bytes()`. Returns the address's length,
+// the `namelen` `sendto` wants. A link-local server's scope id rides along, or
+// the datagram has no interface to leave on.
+@nosplit fn netEntrySockAddr(entry: *u8, port: int): int {
+  if (netEntryIsV4(entry)) {
+    netFillSockAddr(sa6Bytes(), entry + 12, port)
+    return saLen
+  }
+  netFillSockAddr6(sa6Bytes(), entry, port)
+  putU32Le(sa6Bytes(), netSa6ScopeOff, getU32Le(entry, netAdapterEntryScopeOff))
+  return sa6Len
+}
+
+// Sends the query to the address `netEntrySockAddr` laid out and waits for the
+// one reply on `fd`. True when an answer carries an A record, written to `out`.
+// A timeout, a hard error, a malformed answer and one with no A record all leave
+// it false: the caller's next pass is the retry.
+@nosplit fn netDnsExchange(fd: int, qlen: int, salen: int, out: *u8): bool {
+  let query = dnsBytes()
+  if (wsaRc(int(sendto(i64(fd), query, i32(qlen), i32(0), sa6Bytes(), i32(salen)))) < 0) {
+    return false
+  }
+  let reply = dnsBytes() + netMaxDnsMsg
+  let noneAddr: *u8 = nil
+  let noneLen: *i32 = nil
+  let got = wsaRc(int(recvfrom(i64(fd), reply, i32(netMaxDnsMsg), i32(0), noneAddr, noneLen)))
+  return got >= 0 && netParseAnswer(reply, got, netDnsId, out)
+}
+
 // Resolve `host` to an IPv4 address, written to `out`. A dotted quad passes
-// straight through; a hostname is queried against the nameserver at
-// `ns[0..4]`, ONE attempt waiting at most the window the resolve block `ns`
-// carries after its address (`netNsTimeoutOff`, `std/net`'s, #6350). The attempt
-// count is the caller's (`netResolvePasses`, ./netabi.bit), which goes round the
+// straight through; a hostname is queried against the nameserver `entry` (one
+// entry of the list `nameserversFromAdapters` fills, IPv4 or IPv6), asked on the
+// port the resolve block `ns` carries at `netNsPortOff` and waiting at most the
+// window it carries after its address (`netNsTimeoutOff`, `std/net`'s, #6350),
+// ONE attempt. Still an A-record query over either transport. The attempt count
+// is the caller's (`netResolvePasses`, ./netabi.bit), which goes round the
 // nameserver list once per attempt.
 //
-// THE NAMESERVER IS A PARAMETER RATHER THAN DISCOVERED HERE, matching
-// ../linux/udp.bit's and ../darwin/dns.bit's identical contract: discovery
-// is a platform call (`nameserversFromAdapters`, below), kept out of this
-// function so it can be pointed at an in-process fake nameserver for
-// testing without depending on the real network.
+// THE NAMESERVER AND ITS PORT ARE PARAMETERS RATHER THAN DISCOVERED HERE,
+// matching ../linux/udp.bit's and ../darwin/dns.bit's identical contract:
+// discovery is a platform call (`nameserversFromAdapters`, below), kept out of
+// this function so it can be pointed at an in-process fake nameserver on an
+// ephemeral port for testing without depending on the real network
+// (`_tests_/bit/windowssmoke.bit` does).
 export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(
   host: *u8,
   hostLen: int,
   ns: *u8,
+  entry: *u8,
   out: *u8,
 ): bool {
   if (netParseIpv4(host, hostLen, out)) {
     return true
   }
-  let query = dnsBytes()
-  let qlen = netBuildQuery(query, netMaxDnsMsg, host, hostLen, netDnsId)
+  let qlen = netBuildQuery(dnsBytes(), netMaxDnsMsg, host, hostLen, netDnsId)
   if (qlen < 0) {
     return false
   }
-  let fd = netDnsSocket(getU64Le(ns, netNsTimeoutOff))
+  let family = afInet6()
+  if (netEntryIsV4(entry)) {
+    family = afInet()
+  }
+  let fd = netDnsSocket(family, getU64Le(ns, netNsTimeoutOff))
   if (fd < 0) {
     return false
   }
-  netFillSockAddr(saBytes2(), ns, 53)
-  let ok = false
-  if (wsaRc(int(sendto(i64(fd), query, i32(qlen), i32(0), saBytes2(), i32(saLen)))) >= 0) {
-    let reply = dnsBytes() + netMaxDnsMsg
-    let noneAddr: *u8 = nil
-    let noneLen: *i32 = nil
-    let got = wsaRc(int(recvfrom(i64(fd), reply, i32(netMaxDnsMsg), i32(0), noneAddr, noneLen)))
-    // A timeout, a hard error, a malformed answer and one with no A record all
-    // leave `ok` false: the caller's next pass is the retry.
-    ok = got >= 0 && netParseAnswer(reply, got, netDnsId, out)
-  }
+  let salen = netEntrySockAddr(entry, getU64Le(ns, netNsPortOff))
+  let ok = netDnsExchange(fd, qlen, salen, out)
   netClose(fd)
   return ok
 }
@@ -160,9 +205,10 @@ const gaaInitialWords: int = 2048
 const gaaMaxWords: int = 32768
 const gaaMaxAttempts: int = 3
 
-// Every IPv4 DNS server address configured on any UP adapter, deduplicated, in
-// adapter order, written to `list` as packed four-byte addresses (room for
-// `cap`). Returns how many; 0 when the call fails or no adapter has one. The
+// Every DNS server address, IPv4 or IPv6, configured on any UP adapter,
+// deduplicated, in adapter order, written to `list` as packed
+// `netAdapterDnsStride`-byte entries (room for `capacity`). Returns how many; 0 when
+// the call fails or no adapter has one. The
 // parse is `netAdapterDnsServers` (../adapters.bit), a platform-free walk
 // `_tests_/stress/netadapters` runs over a hand-built chain.
 //
@@ -178,7 +224,7 @@ const gaaMaxAttempts: int = 3
 // next iteration. So no poll is ever reached while a live use of the raw
 // address remains outstanding; see `pollFreeExceptions`'s (g4b) group in
 // `_tests_/bit/pollfree/exceptions2.bit`, the identical shape.
-fn nameserversFromAdapters(list: *u8, cap: int): int {
+fn nameserversFromAdapters(list: *u8, capacity: int): int {
   let words = gaaInitialWords
   let attempt = 0
   // Bounded (Power of 10): the adapter list can change between two calls
@@ -197,7 +243,7 @@ fn nameserversFromAdapters(list: *u8, cap: int): int {
       ),
     )
     if (rc == 0) {
-      return netAdapterDnsServers(bufPtr, list, cap)
+      return netAdapterDnsServers(bufPtr, list, capacity)
     }
     if (rc != errorBufferOverflow) {
       return 0

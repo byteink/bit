@@ -1,8 +1,8 @@
-// The parse half of Windows nameserver discovery (#7470): every IPv4 DNS server
-// configured on an adapter that is up, read out of a `GetAdaptersAddresses`
-// result (iphlpapi.dll). Same module as ./net.bit (`runtime/net/`), so
-// ./sock.bit's `getU8`/`getU32Le`/`getU64Le`/`bytesAt`/`netSockAddrOctets` are in
-// scope unchanged.
+// The parse half of Windows nameserver discovery (#7470, #7480): every DNS
+// server, IPv4 or IPv6, configured on an adapter that is up, read out of a
+// `GetAdaptersAddresses` result (iphlpapi.dll). Same module as ./net.bit
+// (`runtime/net/`), so ./sock.bit's `getU8`/`getU32Le`/`putU32Le`/`getU64Le`/
+// `bytesAt`/`netSockAddrPutMapped4`/`netSockAddrPutV6` are in scope unchanged.
 //
 // WHY A PLATFORM-FREE FILE FOR A WINDOWS STRUCTURE. The call itself is an
 // `extern fn` in ../windows/dns.bit, which only a Windows build can compile, so
@@ -14,10 +14,17 @@
 // family byte is Windows' `ADDRESS_FAMILY` (a u16, AF_INET 2): nothing here
 // reads them off the host, so it parses the same on every target.
 //
-// The result is a packed list of four-byte addresses, in adapter order then in
-// each adapter's own server order, with a repeat dropped: two adapters that name
-// the same resolver (a VPN beside the LAN) are one server, and asking it twice
-// per pass would only spend a window.
+// Site-local `fec0::/10` servers are left out (`netAdapterSiteLocal`).
+//
+// The result is a packed list of `netAdapterDnsStride`-byte entries, in adapter
+// order then in each adapter's own server order, with a repeat dropped: two
+// adapters that name the same resolver (a VPN beside the LAN) are one server, and
+// asking it twice per pass would only spend a window. An entry is the 16-byte
+// IPv6 wire form (an IPv4 server as its IPv4-mapped `::ffff:a.b.c.d`, the form
+// `bit_rt_net_peer_addr_w` uses) then the four-byte little-endian scope id, which
+// a link-local `fe80::` server needs for the datagram to leave on the right
+// interface and which is 0 for everything else. ONE list shape for both
+// families, so the resolver's walk and `std/net`'s budget count the same thing.
 
 // IP_ADAPTER_ADDRESSES field offsets (iptypes.h): an 8-byte union at offset 0
 // (ULONG Length + IF_INDEX IfIndex, sized to match the struct's own
@@ -43,8 +50,18 @@ const ifOperStatusUp: int = 1
 const dnsAddrNextOff: int = 8
 const dnsAddrSockaddrPtrOff: int = 16
 
-// Windows' AF_INET, the low byte of the sockaddr's u16 family.
+// Windows' AF_INET and AF_INET6, the low byte of the sockaddr's u16 family.
 const winAfInet: int = 2
+const winAfInet6: int = 23
+
+// `sockaddr_in6.sin6_scope_id` (ws2ipdef.h): after the 2-byte family, 2-byte port,
+// 4-byte flow info and 16-byte address.
+export const netSa6ScopeOff: int = 24
+const netSa6AddrOff: int = 8
+
+// One list entry: sixteen address bytes, then the scope id.
+export const netAdapterDnsStride: int = 20
+export const netAdapterEntryScopeOff: int = 16
 
 // Bounded walks (Power of 10 rule 2): a corrupt or circular list cannot hang
 // the parse, the same defensive depth `netSkipName` has for a wire format this
@@ -57,15 +74,15 @@ const maxDnsServersWalk: int = 64
 // over sixteen resolvers is already past any useful retry budget.
 export const netMaxAdapterDns: int = 16
 
-// True when the four bytes at `addr` are already among the first `count`
-// entries of `list`.
+// True when the entry at `addr` is already among the first `count` entries of
+// `list`.
 @nosplit fn netAdapterDnsListed(list: *u8, count: int, addr: *u8): bool {
   let i = 0
   while (i < count) {
     let same = true
     let k = 0
-    while (k < 4) {
-      if (getU8(list, i * 4 + k) != getU8(addr, k)) {
+    while (k < netAdapterDnsStride) {
+      if (getU8(list, i * netAdapterDnsStride + k) != getU8(addr, k)) {
         same = false
       }
       k = k + 1
@@ -78,42 +95,74 @@ export const netMaxAdapterDns: int = 16
   return false
 }
 
-// Appends the IPv4 address in the sockaddr at `sa` to `list[count..)` unless it
-// is another family, a repeat, or the list is full. Returns the new count.
-@nosplit fn netAdapterDnsAdd(sa: *u8, list: *u8, count: int, cap: int): int {
-  if (sa == nil || count >= cap) {
+// True when the `sockaddr_in6` at `sa` is in the site-local range `fec0::/10`
+// (RFC 3879 deprecated it). Windows hands every adapter without an IPv6 server
+// the placeholders `fec0:0:0:ffff::1` to `::3`, which no host answers and which
+// `ipconfig` does not list: asking them would spend a window each per pass, and
+// `std/net` would budget those windows too.
+@nosplit fn netAdapterSiteLocal(sa: *u8): bool {
+  return getU8(sa, netSa6AddrOff) == 254 && getU8(sa, netSa6AddrOff + 1) / 64 == 3
+}
+
+// Writes the server in the sockaddr at `sa` to the entry at `slot`. False when
+// the family is neither AF_INET nor AF_INET6.
+@nosplit fn netAdapterDnsEntry(sa: *u8, slot: *u8): bool {
+  if (getU8(sa, 1) != 0) {
+    return false
+  }
+  let fam = getU8(sa, 0)
+  if (fam == winAfInet) {
+    netSockAddrPutMapped4(sa, slot)
+    putU32Le(slot, netAdapterEntryScopeOff, 0)
+    return true
+  }
+  if (fam == winAfInet6 && !netAdapterSiteLocal(sa)) {
+    netSockAddrPutV6(sa, slot)
+    putU32Le(slot, netAdapterEntryScopeOff, getU32Le(sa, netSa6ScopeOff))
+    return true
+  }
+  return false
+}
+
+// Appends the server in the sockaddr at `sa` to `list[count..)` unless it is
+// another family, a repeat, or the list is full. Returns the new count.
+@nosplit fn netAdapterDnsAdd(sa: *u8, list: *u8, count: int, capacity: int): int {
+  if (sa == nil || count >= capacity) {
     return count
   }
-  if (getU8(sa, 0) != winAfInet || getU8(sa, 1) != 0) {
+  let slot = list + count * netAdapterDnsStride
+  if (!netAdapterDnsEntry(sa, slot)) {
     return count
   }
-  let slot = list + count * 4
-  netSockAddrOctets(sa, slot)
   if (netAdapterDnsListed(list, count, slot)) {
     return count
   }
   return count + 1
 }
 
-// One adapter's `FirstDnsServerAddress` chain, appended to the list.
-// GetAdaptersAddresses' server list is NOT filtered by the Family the call
-// asked for -- Microsoft documents that it can carry IPv6 entries even when only
-// IPv4 was requested -- so each entry's own family is checked, not trusted.
-@nosplit fn netAdapterDnsChain(adapter: int, list: *u8, count: int, cap: int): int {
+// One adapter's `FirstDnsServerAddress` chain, appended to the list. Each
+// entry's own family is checked, not trusted: a socket address of any other
+// family is skipped.
+@nosplit fn netAdapterDnsChain(adapter: int, list: *u8, count: int, capacity: int): int {
   let n = count
   let entry = getU64Le(bytesAt(adapter), iaaFirstDnsServerOff)
   let steps = 0
   while (entry != 0 && steps < maxDnsServersWalk) {
-    n = netAdapterDnsAdd(bytesAt(getU64Le(bytesAt(entry), dnsAddrSockaddrPtrOff)), list, n, cap)
+    n = netAdapterDnsAdd(
+      bytesAt(getU64Le(bytesAt(entry), dnsAddrSockaddrPtrOff)),
+      list,
+      n,
+      capacity,
+    )
     entry = getU64Le(bytesAt(entry), dnsAddrNextOff)
     steps = steps + 1
   }
   return n
 }
 
-// Every IPv4 DNS server on every UP adapter of the list starting at
-// `firstAdapter`, deduplicated, written to `list` as packed four-byte addresses
-// (room for `cap`, at most `netMaxAdapterDns` of them are ever worth having).
+// Every DNS server on every UP adapter of the list starting at `firstAdapter`,
+// deduplicated, written to `list` as packed `netAdapterDnsStride`-byte entries
+// (room for `capacity`, at most `netMaxAdapterDns` of them are ever worth having).
 // Returns how many.
 //
 // POLL-FREE (#1658/#3924): `@nosplit`, and correctly so -- it allocates nothing
@@ -123,14 +172,14 @@ export const netMaxAdapterDns: int = 16
 export @symbol("bit_rt_port_net_adapter_dns_servers") @nosplit fn netAdapterDnsServers(
   firstAdapter: int,
   list: *u8,
-  cap: int,
+  capacity: int,
 ): int {
   let adapter = firstAdapter
   let count = 0
   let steps = 0
   while (adapter != 0 && steps < maxAdaptersWalk) {
     if (getU32Le(bytesAt(adapter), iaaOperStatusOff) == ifOperStatusUp) {
-      count = netAdapterDnsChain(adapter, list, count, cap)
+      count = netAdapterDnsChain(adapter, list, count, capacity)
     }
     adapter = getU64Le(bytesAt(adapter), iaaNextOff)
     steps = steps + 1
