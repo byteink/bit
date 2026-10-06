@@ -1,0 +1,513 @@
+// pkg/orm/mysqlinsert.test.bit — #7417: `Repo<T>.insert`/`insertAll` on MySQL.
+// MySQL 8 has no `INSERT ... RETURNING`, so the dialect runs the INSERT, then
+// reads the rows back with `LAST_INSERT_ID()` and a SELECT (mysqlinsert.bit).
+// The recorded-statement tests below pin that sequence per dialect against a
+// fake driver; the live proofs at the bottom run the same program on a real
+// PostgreSQL and a real MySQL and fail on any field that differs from the one
+// expected table both engines must produce.
+//
+// `Account` (./testdrivers.test.bit, `account (id, name, email)`), `Pool`/
+// `Datasource`/`Conn`/`Rows`/`Stmt`/`Tx`/`Value`/`pool` (./data.test.bit),
+// `hasPrefix` (./db.bit) and `env`/`envOr`/`run`/`findRepoRoot`/`scratchDir`/
+// `resetDir` (./testenv.test.bit) are already declared or imported package-
+// wide by sibling files, SPEC §17.1.
+
+@table class MiPair {
+  @id
+  a: i64
+  @id
+  b: i64
+  label: string
+}
+
+class miCall { kind: string, sql: string, args: []Value }
+
+// A fake MySQL connection: every statement recorded in order, `query` routed
+// by what it asks for. `first`/`step` answer the id query, `found` is what
+// the read-back SELECT returns; the transaction shares the recorder.
+class miAdapter {
+  calls: []miCall
+  first: int
+  step: int
+  found: [][]Value
+  cols: []string
+
+  connect(cfg: Datasource): Conn! {
+    return miConn{ a = this }
+  }
+}
+
+fn miQuery(a: miAdapter, sqlText: string, params: []Value): wrRows {
+  a.calls = append(a.calls, miCall{ kind = "query", sql = sqlText, args = params })
+  if (hasPrefix(sqlText, "select last_insert_id(0)")) {
+    return wrRows{ cols = ["0"], data = [[Value.Int(0)]], i = -1 }
+  }
+  if (hasPrefix(sqlText, "select last_insert_id(),")) {
+    return wrRows{ cols = ["a", "b"], data = [[Value.Int(a.first), Value.Int(a.step)]], i = -1 }
+  }
+  return wrRows{ cols = a.cols, data = a.found, i = -1 }
+}
+
+fn miExec(a: miAdapter, sqlText: string, params: []Value): int {
+  a.calls = append(a.calls, miCall{ kind = "exec", sql = sqlText, args = params })
+  return 1
+}
+
+class miConn {
+  a: miAdapter
+
+  query(sqlText: string, params: []Value): Rows! {
+    return miQuery(this.a, sqlText, params)
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    return miExec(this.a, sqlText, params)
+  }
+
+  prepare(sqlText: string): Stmt! {
+    fail newError("fake: prepare not supported")
+  }
+
+  begin(): Tx! {
+    return miTx{ a = this.a }
+  }
+
+  close() {}
+}
+
+class miTx {
+  a: miAdapter
+
+  query(sqlText: string, params: []Value): Rows! {
+    return miQuery(this.a, sqlText, params)
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    return miExec(this.a, sqlText, params)
+  }
+
+  commit(): ()! {}
+
+  rollback(): ()! {}
+}
+
+fn newMiAdapter(first: int, step: int): miAdapter {
+  return miAdapter{
+    calls = []miCall(0), first = first, step = step, found = [][]Value(0), cols = [
+      "id",
+      "name",
+      "email",
+    ],
+  }
+}
+
+fn miMysql(): ServerDialect {
+  return ServerDialect.Mysql(MysqlVersion{ major = 8, minor = 4 })
+}
+
+fn miAccountRepo(a: miAdapter, d: ServerDialect): Repo<Account> {
+  let p = pool(a, Datasource{ host = "fake" }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  return Repo<Account>{
+    db = p, dialect = d, wheres = []string(0), args = []Value(0), orderBys = []string(0),
+    limitN = 0, hasLimit = false, offsetN = 0, hasOffset = false, errText = "",
+  }
+}
+
+fn miAccountRow(id: int, name: string): []Value {
+  return [Value.Int(id), Value.Text(name), Value.Text(name + "@x.com")]
+}
+
+fn miAccount(name: string): Account {
+  return Account{ id = 0, name = name, email = name + "@x.com" }
+}
+
+fn miNoReturning(a: miAdapter) {
+  for c of a.calls {
+    assert(!contains(c.sql, "returning"), "MySQL has no RETURNING, sent: ${c.sql}")
+  }
+}
+
+test "mysql insert: INSERT, then LAST_INSERT_ID() and a SELECT by that id, no RETURNING" {
+  let a = newMiAdapter(41, 1)
+  a.found = [miAccountRow(41, "ada")]
+  let got = miAccountRepo(a, miMysql()).insert(miAccount("ada")) catch e {
+    assert(false, "insert: ${e.message()}")
+    return
+  }
+  assert(got.id == 41 && got.name == "ada", "id ${got.id} name ${got.name}")
+  assert(len(a.calls) == 4, "expected 4 statements, got ${len(a.calls)}")
+  assert(a.calls[0].sql == "select last_insert_id(0)", "got: ${a.calls[0].sql}")
+  assert(a.calls[1].kind == "exec", "the INSERT is an exec")
+  assert(
+    a.calls[1].sql == "insert into account (name, email) values ($1, $2)",
+    "got: ${a.calls[1].sql}",
+  )
+  assert(
+    a.calls[2].sql == "select last_insert_id(), @@auto_increment_increment",
+    "got: ${a.calls[2].sql}",
+  )
+  assert(
+    a.calls[3].sql == "select * from account where id in ($1) order by id",
+    "got: ${a.calls[3].sql}",
+  )
+  assert(
+    len(a.calls[3].args) == 1 && valueText(a.calls[3].args[0]) == "41",
+    "the SELECT binds the first id",
+  )
+  miNoReturning(a)
+}
+
+test "mysql insertAll: one INSERT for the chunk, ids first + i*step, rows back in insert order" {
+  let a = newMiAdapter(10, 2)
+  a.found = [miAccountRow(10, "a"), miAccountRow(12, "b"), miAccountRow(14, "c")]
+  let got = miAccountRepo(a, miMysql()).insertAll([miAccount("a"), miAccount("b"), miAccount("c")]) catch e {
+    assert(false, "insertAll: ${e.message()}")
+    return
+  }
+  assert(len(got) == 3 && got[0].name == "a" && got[2].name == "c", "rows out of order or missing")
+  assert(
+    a.calls[1].sql == "insert into account (name, email) values ($1, $2), ($3, $4), ($5, $6)",
+    "got: ${a.calls[1].sql}",
+  )
+  let sel = a.calls[3]
+  assert(sel.sql == "select * from account where id in ($1, $2, $3) order by id", "got: ${sel.sql}")
+  assert(
+      valueText(sel.args[0]) == "10" &&
+      valueText(sel.args[1]) == "12" &&
+      valueText(sel.args[2]) == "14",
+    "ids must be first + i * step",
+  )
+  miNoReturning(a)
+}
+
+test "postgres insert and insertAll keep RETURNING: one statement, no id round trip" {
+  let a = newMiAdapter(0, 1)
+  a.found = [miAccountRow(7, "ada")]
+  let got = miAccountRepo(a, ServerDialect.Postgres).insert(miAccount("ada")) catch e {
+    assert(false, "insert: ${e.message()}")
+    return
+  }
+  assert(got.id == 7, "id ${got.id}")
+  assert(len(a.calls) == 1, "expected 1 statement, got ${len(a.calls)}")
+  assert(
+    a.calls[0].sql == "insert into account (name, email) values ($1, $2) returning *",
+    "got: ${a.calls[0].sql}",
+  )
+  let b = newMiAdapter(0, 1)
+  b.found = [miAccountRow(7, "a"), miAccountRow(8, "b")]
+  miAccountRepo(b, ServerDialect.Postgres).insertAll([miAccount("a"), miAccount("b")]) catch e {
+    assert(false, "insertAll: ${e.message()}")
+    return
+  }
+  assert(len(b.calls) == 1, "expected 1 statement, got ${len(b.calls)}")
+  assert(
+    b.calls[0].sql == "insert into account (name, email) values ($1, $2), ($3, $4) returning *",
+    "got: ${b.calls[0].sql}",
+  )
+}
+
+test "mysql insert inside a caller's transaction reads its id back on that transaction, no savepoint" {
+  let a = newMiAdapter(3, 1)
+  a.found = [miAccountRow(3, "ada")]
+  let d = Db{
+    pool = pool(a, Datasource{ host = "fake" }) catch e {
+      panic("pool: ${e.message()}")
+    },
+    dialect = miMysql(),
+  }
+  let id = 0
+  d.tx((tx) => {
+    let got = tx.table<Account>().insert(miAccount("ada"))?
+    id = got.id
+    return
+  }) catch e {
+    assert(false, "tx: ${e.message()}")
+    return
+  }
+  assert(id == 3, "id ${id}")
+  miNoReturning(a)
+  for c of a.calls {
+    assert(
+      !contains(c.sql, "SAVEPOINT"),
+      "a savepoint is refused by MySQL's prepared protocol, sent: ${c.sql}",
+    )
+  }
+}
+
+test "mysql insert of a composite key re-selects each row by the key it carried" {
+  let a = newMiAdapter(0, 1)
+  a.cols = ["a", "b", "label"]
+  a.found = [[Value.Int(1), Value.Int(2), Value.Text("x")]]
+  let p = pool(a, Datasource{ host = "fake" }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  let repo = Repo<MiPair>{
+    db = p, dialect = miMysql(), wheres = []string(0), args = []Value(0), orderBys = []string(0),
+    limitN = 0, hasLimit = false, offsetN = 0, hasOffset = false, errText = "",
+  }
+  let got = repo.insertAll(
+    [MiPair{ a = 1, b = 2, label = "x" }, MiPair{ a = 1, b = 3, label = "y" }],
+  ) catch e {
+    assert(false, "insertAll: ${e.message()}")
+    return
+  }
+  assert(len(got) == 2, "expected 2 rows, got ${len(got)}")
+  assert(
+    a.calls[0].sql == "insert into mi_pair (a, b, label) values ($1, $2, $3), ($4, $5, $6)",
+    "got: ${a.calls[0].sql}",
+  )
+  assert(
+    a.calls[1].sql == "select * from mi_pair where a = $1 and b = $2",
+    "got: ${a.calls[1].sql}",
+  )
+  assert(
+    valueText(a.calls[1].args[1]) == "2" && valueText(a.calls[2].args[1]) == "3",
+    "each row selects its own key",
+  )
+  assert(len(a.calls) == 3, "no id round trip for a caller-supplied key, got ${len(a.calls)}")
+  miNoReturning(a)
+}
+
+test "mysql insert fails loudly when the INSERT generated no id or the read-back is short" {
+  let a = newMiAdapter(0, 1)
+  miAccountRepo(a, miMysql()).insert(miAccount("ada")) catch e {
+    assert(contains(e.message(), "AUTO_INCREMENT"), "got: ${e.message()}")
+    return
+  }
+  assert(false, "an insert that generated no id must fail, never read another row")
+}
+
+test "mysql insertAll fails when fewer rows are found than were written" {
+  let a = newMiAdapter(5, 1)
+  a.found = [miAccountRow(5, "a")]
+  miAccountRepo(a, miMysql()).insertAll([miAccount("a"), miAccount("b")]) catch e {
+    assert(contains(e.message(), "wrote 2 rows but 1 were found"), "got: ${e.message()}")
+    return
+  }
+  assert(false, "a short read-back must fail")
+}
+
+// ---- live: the same program on PostgreSQL and on MySQL ----
+//
+// The program inserts and bulk-inserts through `Repo<T>` and fails on any
+// field that differs from the one expected table, so passing on both engines
+// is "equal field for field". It also covers what only a real server shows:
+// a trigger that rewrites a column (the row must come back as stored), a NULL
+// column, concurrent `insertAll` calls on one pool (each caller gets its own
+// rows), a rolled-back and a committed transaction, a composite key, and on
+// MySQL a key that is not AUTO_INCREMENT. A raw string: it holds no
+// interpolation (a raw string has none, SPEC §5.7).
+const insertLiveProofSource: string = `import { args } from "std/os"
+import { contains, toLower } from "std/strings"
+import { open, Db } from "orm"
+import { pool, Datasource, Value } from "std/sql"
+import { adapter as mysqlAdapter } from "mysql"
+
+@table @timestamps class Item {
+  id: i64,
+  code: string,
+  note: Option<string>,
+  qty: i64,
+  createdAt: i64,
+  updatedAt: i64,
+}
+
+@table class Pair {
+  @id
+  a: i64
+  @id
+  b: i64
+  label: string
+}
+
+@table class Plain {
+  id: i64,
+  v: string,
+}
+
+fn item(code: string, note: Option<string>, qty: i64): Item {
+  return Item{ id = 0, code = code, note = note, qty = qty, createdAt = 0, updatedAt = 0 }
+}
+
+fn noteOf(r: Item): string {
+  match (r.note) {
+    Some(s) => return s
+    None => return "-"
+  }
+}
+
+// One row, field for field: the id the database generated, the code its
+// BEFORE INSERT trigger upper-cased, the nullable note, the stamped times.
+fn same(r: Item, id: i64, code: string, note: string, qty: i64): bool {
+  return r.id == id && r.code == code && noteOf(r) == note && r.qty == qty && r.createdAt > i64(0) && r.updatedAt > i64(0)
+}
+
+fn check(ok: bool, what: string) {
+  if (!ok) {
+    panic("LIVE PROOF FAILED: " + what)
+  }
+}
+
+// 'prefix' is upper case: the trigger upper-cases what the worker inserts.
+fn worker(db: Db, prefix: string, ch: chan<string>) {
+  let lower = toLower(prefix)
+  let rows = db.table<Item>().insertAll([
+    item(lower + "1", Option<string>.None, 1),
+    item(lower + "2", Option<string>.None, 2),
+    item(lower + "3", Option<string>.None, 3),
+  ]) catch e {
+    ch <- "error:" + e.message()
+    return
+  }
+  let want = [prefix + "1", prefix + "2", prefix + "3"]
+  let i = 0
+  while (i < 3) {
+    if (len(rows) != 3 || rows[i].code != want[i] || rows[i].qty != i64(i + 1)) {
+      ch <- "wrong rows for " + prefix
+      return
+    }
+    i = i + 1
+  }
+  ch <- "ok"
+}
+
+fn main(): ()! {
+  let uri = args()[1]
+  let mysql = args()[2] == "mysql"
+  let db = open(uri)?
+  db.exec("drop table if exists item")?
+  db.exec("drop table if exists pair")?
+  db.exec("drop table if exists plain")?
+  if (mysql) {
+    db.exec("create table item (id bigint auto_increment primary key, code text not null, note text, qty bigint not null, created_at bigint not null, updated_at bigint not null)")?
+    // CREATE TRIGGER is refused by the prepared-statement protocol 'exec' always uses;
+    // a 'query' with nothing to bind goes out as COM_QUERY.
+    let raw = pool(mysqlAdapter(), Datasource{ uri = uri })?
+    raw.query("create trigger item_bi before insert on item for each row set new.code = upper(new.code)", []Value(0))?.close()
+    raw.close()
+    db.exec("create table plain (id bigint not null default 7 primary key, v text not null)")?
+  } else {
+    db.exec("create table item (id bigint generated always as identity primary key, code text not null, note text, qty bigint not null, created_at bigint not null, updated_at bigint not null)")?
+    db.exec("create or replace function item_up() returns trigger as $$ begin new.code := upper(new.code); return new; end $$ language plpgsql")?
+    db.exec("create trigger item_bi before insert on item for each row execute function item_up()")?
+  }
+  db.exec("create table pair (a bigint not null, b bigint not null, label text not null, primary key (a, b))")?
+
+  let items = db.table<Item>()
+
+  // insert: generated id, trigger-changed code, NULL note, stamped times.
+  let one = items.insert(item("a", Option<string>.None, 1))?
+  check(same(one, 1, "A", "-", 1), "insert returned the wrong row")
+
+  // insertAll of three: ids ascend with the VALUES list, nothing else moves.
+  let three = items.insertAll([
+    item("b", Option<string>.Some("n2"), 2),
+    item("c", Option<string>.None, 3),
+    item("d", Option<string>.Some("n4"), 4),
+  ])?
+  check(len(three) == 3, "insertAll returned " + "a different number of rows")
+  check(same(three[0], 2, "B", "n2", 2), "insertAll row 0")
+  check(same(three[1], 3, "C", "-", 3), "insertAll row 1")
+  check(same(three[2], 4, "D", "n4", 4), "insertAll row 2")
+  check(items.count()? == 4, "four rows stored")
+
+  // Concurrent inserts on one pool: every caller gets its own rows back.
+  let ch = chan<string>(8)
+  spawn worker(db, "WA", ch)
+  spawn worker(db, "WB", ch)
+  spawn worker(db, "WC", ch)
+  spawn worker(db, "WD", ch)
+  let n = 0
+  while (n < 4) {
+    let msg = <- ch
+    check(msg == "ok", "concurrent insertAll: " + msg)
+    n = n + 1
+  }
+  check(items.count()? == 16, "sixteen rows stored")
+
+  // A caller's transaction: a rolled-back insert leaves no row, a committed one does.
+  db.tx((tx) => {
+    tx.table<Item>().insert(item("gone", Option<string>.None, 9))?
+    fail newError("roll back")
+  }) catch _ {
+  }
+  check(items.where("code", "GONE").count()? == 0, "a rolled-back insert left a row")
+  db.tx((tx) => {
+    let kept = tx.table<Item>().insert(item("kept", Option<string>.None, 9))?
+    check(kept.code == "KEPT" && kept.id > i64(0), "insert inside a transaction")
+  })?
+  check(items.where("code", "KEPT").count()? == 1, "a committed insert is stored")
+
+  // A composite key is supplied by the caller and read back as stored.
+  let pairs = db.table<Pair>()
+  let p = pairs.insert(Pair{ a = 1, b = 2, label = "x" })?
+  check(p.a == i64(1) && p.b == i64(2) && p.label == "x", "composite insert")
+  let ps = pairs.insertAll([Pair{ a = 2, b = 1, label = "y" }, Pair{ a = 1, b = 3, label = "z" }])?
+  check(len(ps) == 2 && ps[0].label == "y" && ps[1].label == "z" && ps[1].b == i64(3), "composite insertAll order")
+
+  // MySQL only: a table whose key is not AUTO_INCREMENT (here it has a default, so the INSERT succeeds) must fail, not read
+  // back whatever id the connection last generated.
+  if (mysql) {
+    let failed = false
+    db.table<Plain>().insert(Plain{ id = 0, v = "x" }) catch e {
+      failed = contains(e.message(), "AUTO_INCREMENT")
+    }
+    check(failed, "a non-AUTO_INCREMENT key must fail naming AUTO_INCREMENT")
+  }
+
+  print("LIVE_PROOF_OK\n")
+}
+`
+
+fn runInsertLiveProof(envVar: string, name: string, engine: string) {
+  let uri = env(envVar)
+  if (uri == "") {
+    print("  skipped: ${envVar} is unset, no live server to talk to")
+    return
+  }
+  let repoRoot = findRepoRoot()
+  if (repoRoot == "") {
+    print("  skipped: cannot locate the repo root; set BIT_REPO")
+    return
+  }
+  let ormAbs = "${repoRoot}/pkg/orm"
+  let postgresAbs = "${repoRoot}/pkg/postgres"
+  let mysqlAbs = "${repoRoot}/pkg/mysql"
+  let proj = scratchDir("liveproof7417${name}")
+  mkdir(proj) catch e {
+    panic("mkdir: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.json",
+    "{\"name\": \"liveproof7417${name}\", \"dependencies\": {\"orm\": \"${ormAbs}\", \"postgres\": \"${postgresAbs}\", \"mysql\": \"${mysqlAbs}\"}}\n",
+  ) catch e {
+    panic("writeFile bit.json: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.lock",
+    "{\"orm\": {\"path\": \"${ormAbs}\", \"requires\": {}}, \"postgres\": {\"path\": \"${postgresAbs}\", \"requires\": {}}, \"mysql\": {\"path\": \"${mysqlAbs}\", \"requires\": {}}}\n",
+  ) catch e {
+    panic("writeFile bit.lock: ${e.message()}")
+  }
+  writeFile("${proj}/main.bit", insertLiveProofSource) catch e {
+    panic("writeFile main.bit: ${e.message()}")
+  }
+
+  let bin = envOr("BIT_BIN", "${repoRoot}/bit-out/bin/bit")
+  let rc = run(bin, ["run", "${proj}/main.bit", uri, engine])
+  assert(
+    rc == 0,
+    "live proof against a real ${name} server failed, rc=${rc}; run manually to see its output: ${bin} run ${proj}/main.bit '${uri}' ${engine}",
+  )
+  resetDir(proj)
+}
+
+test "live: insert and insertAll return the stored rows, field for field, on Postgres (#7417)" {
+  runInsertLiveProof("ORM_TEST_LIVE_PG_URI", "pg", "postgres")
+}
+
+test "live: insert and insertAll return the stored rows, field for field, on MySQL, which has no RETURNING (#7417)" {
+  runInsertLiveProof("ORM_TEST_LIVE_MYSQL_URI", "mysql", "mysql")
+}
