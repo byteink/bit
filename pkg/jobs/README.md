@@ -50,6 +50,8 @@ it to route the job to the right handler.
 - [Scheduled jobs](docs/cron.md): `schedule` and `every`, cron
   expressions and zones, missed-tick policies, leader election so three
   instances enqueue each tick once.
+- [Watching the queue](docs/logging.md): `Options.logger`, the std/log
+  records for a job and for the scheduler, and what is never logged.
 - [Redis](docs/redis.md): `RedisStore` and `RedisLocker` on Redis 7+, the
   keys and atomic scripts behind a claim, the hash-tag prefix for Redis
   Cluster, what Redis durability means for a queue.

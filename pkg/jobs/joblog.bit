@@ -1,0 +1,145 @@
+// pkg/jobs/joblog.bit — `Options.logger`: every record a `Queue` writes to
+// std/log, see docs/logging.md. The worker (jobs.bit) and the scheduler
+// (scheduler.bit) call these; each takes the `Queue` whose `Options.logger` it
+// resolves.
+//
+//   INFO  job started                 job=send-welcome attempt=1
+//   INFO  job done                    job=send-welcome attempt=1 took=41ms
+//   WARN  job retry                   job=send-welcome attempt=1 error="smtp: 451 try later"
+//   ERROR job failed permanently      job=send-welcome attempt=5 error="smtp: 550 refused"
+//   WARN  cron tick dropped           job=nightly-report schedule=... policy=RunOnce missed=3 enqueued=1 ...
+//
+// TWO ROUTES, ONE RULE. The two INFO lifecycle records run once per job, so
+// they are opt-in: with `Options.logger` unset they write nothing and read no
+// attribute. Everything else is an operational event a person has to see: a
+// failed job, a dropped cron tick, a clock that disagrees with the database,
+// an acknowledgement that did not land. With the logger unset those go to
+// std/log's process default (`getDefault()`, text on stderr at INFO), the
+// place the package's `eprint` lines went before, so a queue that nobody
+// configured still says when it is losing work. BullMQ, Sidekiq and Hangfire
+// all log a job's failure unconfigured and keep per-job success lines to
+// their logger setting.
+//
+// NO JOB PAYLOAD IS EVER LOGGED. A record names the job and the attempt, never
+// the JSON a job carries: it holds a customer's address, a token, whatever the
+// caller enqueued. The `error` of a failed job is the handler's own message
+// (or the panic text), so a handler must not put the payload in an error it
+// fails with.
+//
+// A level the logger has off costs nothing: std/log hands back one shared
+// record that keeps no attribute, and the records that build a string
+// (`missedName`) ask `enabled` first.
+
+import { Logger, LevelInfo, LevelWarn, LevelError, getDefault } from "std/log"
+import { Mono, since } from "std/time"
+
+// The `Logger` for the records that always print: `Options.logger` when set,
+// std/log's process default when not, resolved at each use so a `setDefault`
+// after `open` still takes effect.
+fn queueLogger(q: Queue): Logger {
+  if (isSome(q.opts.logger)) {
+    return unwrap(q.opts.logger)
+  }
+  return getDefault()
+}
+
+// A worker took `cj` and is about to run its handler.
+fn logJobStarted(q: Queue, cj: ClaimedJob) {
+  if (!isSome(q.opts.logger)) {
+    return
+  }
+  unwrap(q.opts.logger).info().str("job", cj.name).int("attempt", cj.attempts).log("job started")
+}
+
+// The handler of `cj` returned; `start` is the reading taken before it ran.
+fn logJobDone(q: Queue, cj: ClaimedJob, start: Mono) {
+  if (!isSome(q.opts.logger)) {
+    return
+  }
+  let lg = unwrap(q.opts.logger)
+  if (!lg.enabled(LevelInfo)) {
+    return
+  }
+  lg.info().str("job", cj.name).int("attempt", cj.attempts).duration("took", since(start)).log("job done")
+}
+
+// `cj` failed with `reason` and has attempts left: it will run again.
+fn logJobRetry(q: Queue, cj: ClaimedJob, reason: string) {
+  let lg = queueLogger(q)
+  if (!lg.enabled(LevelWarn)) {
+    return
+  }
+  lg.warn().str("job", cj.name).int("attempt", cj.attempts).err(newError(reason)).log("job retry")
+}
+
+// `cj` is dead-lettered with `reason`: no attempts left, a permanent failure,
+// or no handler registered for its name.
+fn logJobFailed(q: Queue, cj: ClaimedJob, reason: string) {
+  let lg = queueLogger(q)
+  if (!lg.enabled(LevelError)) {
+    return
+  }
+  lg.error().str("job", cj.name).int("attempt", cj.attempts).err(newError(reason)).log("job failed permanently")
+}
+
+// `Store.claim` failed; the worker sleeps a poll interval and asks again.
+fn logClaimFailed(q: Queue, e: error) {
+  queueLogger(q).error().err(e).log("job claim failed")
+}
+
+// The `complete`, `retry` or `deadLetter` call for `name` failed: the job stays
+// claimed until its visibility timeout lapses and another worker takes it.
+fn logAckFailed(q: Queue, name: string, e: error) {
+  queueLogger(q).error().str("job", name).err(e).log("job acknowledge failed")
+}
+
+// `policy` dropped missed ticks of `e`: the window `plan.first` to
+// `plan.last`, how many ticks it held and how many of them were enqueued.
+fn logTickDropped(q: Queue, e: entry, plan: catchUp, policy: Missed) {
+  let lg = queueLogger(q)
+  if (!lg.enabled(LevelWarn)) {
+    return
+  }
+  let r = lg.warn().str("job", e.job).str("schedule", e.id).str(
+    "policy",
+    "Missed.${missedName(policy)}",
+  )
+  r = r.str("missed", plan.count).int("enqueued", plan.kept)
+  r.time("from", Timestamp{ ns = plan.first }).time("to", Timestamp{ ns = plan.last }).log("cron tick dropped")
+}
+
+// The locker's newest tick of `e`, `last`, lies `ahead` in the future and is
+// ignored (an instance with a wrong clock wrote it).
+fn logLastTickIgnored(q: Queue, e: entry, last: int, ahead: int) {
+  let r = queueLogger(q).warn().str("schedule", e.id)
+  r.time("last_tick", Timestamp{ ns = last }).duration("ahead", ahead).log("cron last tick ignored")
+}
+
+// `e`'s next tick `was` lay `ahead` of the tick the clock implies: the clock
+// moved back. With `reanchored` the schedule moved to `e.next`, the tick the
+// clock implies; without, `e.next` is still `was` and it waits for it.
+fn logClockBack(q: Queue, e: entry, was: int, ahead: int, reanchored: bool) {
+  let r = queueLogger(q).warn().str("schedule", e.id).time("was", Timestamp{ ns = was })
+  r.time("next", Timestamp{ ns = e.next }).duration("ahead", ahead).bool("reanchored", reanchored).log("cron clock moved back")
+}
+
+// This instance's clock is `skew` (absolute) from the database's: no
+// scheduled tick fires until they agree.
+fn logSkewed(q: Queue, skew: int) {
+  queueLogger(q).warn().duration("skew", skew).log("cron clock skewed from the database, not firing ticks")
+}
+
+// The clocks agree again.
+fn logSkewCleared(q: Queue) {
+  queueLogger(q).info().log("cron clock agrees with the database again, firing ticks")
+}
+
+// The check of the two clocks failed: nothing fires on an unchecked clock.
+fn logClockUnreadable(q: Queue, e: error) {
+  queueLogger(q).error().err(e).log("cron cannot read the database clock, not firing ticks")
+}
+
+// One pass over schedule `e` failed; the next pass retries it.
+fn logScheduleFailed(q: Queue, e: entry, err: error) {
+  queueLogger(q).error().str("schedule", e.id).err(err).log("cron schedule failed")
+}
