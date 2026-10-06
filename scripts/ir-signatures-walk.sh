@@ -93,6 +93,156 @@ function hasParse(l,    r, p) {
   gT = typeAfterCall(l)
   return 1
 }
+# limStr -- 2^(bits-1) of the signed type t as decimal text; values are kept as text throughout, since
+# awk numbers lose the last digits of an i64.
+function limStr(t) {
+  return (t == "i8") ? "128" : (t == "i16") ? "32768" : (t == "i32") ? "2147483648" : "9223372036854775808"
+}
+# cmpInt -- -1, 0 or 1 as decimal text a is below, equal to or above b.
+function cmpInt(a, b,    na, nb, r) {
+  na = (a ~ /^-/); nb = (b ~ /^-/)
+  if (na != nb) { return na ? -1 : 1 }
+  if (na) { a = substr(a, 2); b = substr(b, 2) }
+  r = (length(a) != length(b)) ? (length(a) < length(b) ? -1 : 1) : (a < b ? -1 : (a > b ? 1 : 0))
+  return na ? -r : r
+}
+# succInt -- a + 1 as decimal text, for a in the i64 range.
+function succInt(a,    d, i, c, out) {
+  if (a ~ /^-/) {
+    d = substr(a, 2)
+    if (d == "1") { return "0" }
+    out = predDigits(d)
+    return "-" out
+  }
+  out = ""; c = 1
+  for (i = length(a); i >= 1; i--) {
+    d = substr(a, i, 1) + c
+    if (d == 10) { d = 0; c = 1 } else { c = 0 }
+    out = d out
+  }
+  return (c ? "1" : "") out
+}
+# predDigits -- d - 1 for the digits d of a positive number, no leading zero.
+function predDigits(d,    i, c, x, out) {
+  out = ""; c = 1
+  for (i = length(d); i >= 1; i--) {
+    x = substr(d, i, 1) - c
+    if (x < 0) { x = 9; c = 1 } else { c = 0 }
+    out = x out
+  }
+  sub(/^0+/, "", out)
+  return out
+}
+# negLit -- the literal `-N` of the signed type t for the oracle `neg t {t:N}`, or "" when #7069 does
+# not fold it: N must be non-negative and fit t, or already be the minimum of t (the wrapped literal).
+# Sets gMin when the result is that minimum.
+function negLit(t, v,    lim) {
+  lim = limStr(t); gMin = 0
+  if (v ~ /^-/) { gMin = 1; return (v == "-" lim) ? v : "" }
+  if (cmpInt(v, lim) > 0) { return "" }
+  gMin = (v == lim)
+  return (v == "0") ? "0" : "-" v
+}
+# negRewrite -- #7069: the oracle lowers `-N` as `neg t (const_int t N)`; the tree emits the one
+# `const_int t -N`. Each `neg` whose operand is a literal, as the scan sees it before any rewrite,
+# is dropped and its uses become the literal `{t:-N}`; a `neg` of a rewritten result stays.
+function negRewrite(a, n,    i, p, v, r, tab, m, out, any) {
+  split("", tab); any = 0
+  for (i = 1; i <= n; i++) {
+    if (a[i] !~ /^  %[0-9]+ = neg (i8|i16|i32|i64) \{(i8|i16|i32|i64):-?[0-9]+\}$/) { continue }
+    split(a[i], p, " ")
+    if (substr(p[5], 2, index(p[5], ":") - 2) != p[4]) { continue }
+    v = substr(p[5], index(p[5], ":") + 1); v = substr(v, 1, length(v) - 1)
+    r = negLit(p[4], v)
+    if (r == "") { continue }
+    if (gMin) { gHit["negmin"] = 1 }
+    tab[p[1]] = "{" p[4] ":" r "}"; a[i] = "@@del"; any = 1
+  }
+  if (!any) { return n }
+  m = 0
+  for (i = 1; i <= n; i++) { if (a[i] != "@@del") { out[++m] = mapLine(a[i], tab) } }
+  for (i = 1; i <= m; i++) { a[i] = out[i] }
+  for (i = m + 1; i <= n; i++) { delete a[i] }
+  gHit["neg"] = 1
+  return m
+}
+# eqParse -- `%e = icmp_eq bool %s, {T:v}` with T a signed int type: sets gE gS gT gV.
+function eqParse(l,    p) {
+  if (l !~ /^  %[0-9]+ = icmp_eq bool %[0-9]+, \{(i8|i16|i32|i64):-?[0-9]+\}$/) { return 0 }
+  split(l, p, " ")
+  gE = p[1]; gS = p[5]; sub(/,$/, "", gS)
+  gT = substr(p[6], 2, index(p[6], ":") - 2)
+  gV = substr(p[6], index(p[6], ":") + 1); gV = substr(gV, 1, length(gV) - 1)
+  return 1
+}
+# borParse -- `%b = bor bool %x, %y`: sets gB gB1 gB2.
+function borParse(l,    p) {
+  if (l !~ /^  %[0-9]+ = bor bool %[0-9]+, %[0-9]+$/) { return 0 }
+  split(l, p, " ")
+  gB = p[1]; gB1 = p[5]; sub(/,$/, "", gB1); gB2 = p[6]
+  return 1
+}
+# runLen -- how many labels the chain starting at a[i] holds: `eq, eq, bor, (eq, bor)*` over one
+# subject and type, each bor joining the previous result with the next compare. A repeated label
+# is one compare the optimizer shared, so its bor names an earlier compare of the chain. Sets
+# rcLast (the result id), rcT rcS and rcVals[1..n]; 0 when a[i] starts no chain of two.
+function runLen(a, n, i,    j, cnt, last, e2, v2, ev) {
+  if (!eqParse(a[i])) { return 0 }
+  rcS = gS; rcT = gT; last = gE; cnt = 1; split("", rcVals); rcVals[1] = gV
+  split("", ev); ev[gE] = gV
+  j = i + 1
+  while (j <= n) {
+    if (eqParse(a[j]) && gS == rcS && gT == rcT && j + 1 <= n) {
+      e2 = gE; v2 = gV
+      if (!borParse(a[j + 1]) || gB1 != last || gB2 != e2) { break }
+      ev[e2] = v2; rcVals[++cnt] = v2; last = gB; j += 2
+    } else if (borParse(a[j]) && gB1 == last && (gB2 in ev)) {
+      rcVals[++cnt] = ev[gB2]; last = gB; j++
+    } else { break }
+  }
+  rcLast = last; rcLen = j - i
+  return cnt < 2 ? 0 : cnt
+}
+# runLines -- the two lines of the range test for the chain, or "" when it is no run #7069 ranges:
+# the labels must fit the type and be contiguous, at least one negative (a run of non-negative
+# labels was ranged by the oracle already), and at most 256.
+function runLines(cnt,    lim, bits, lo, hi, k, v, neg, u, mlo, f, has, distinct) {
+  bits = (rcT == "i8") ? 8 : (rcT == "i16") ? 16 : (rcT == "i32") ? 32 : 64
+  if (cnt > 256) { return "" }
+  lim = limStr(rcT); lo = rcVals[1]; hi = lo; neg = 0; distinct = 0
+  split("", has)
+  for (k = 1; k <= cnt; k++) {
+    v = rcVals[k]
+    if (cmpInt(v, "-" lim) < 0 || cmpInt(v, lim) >= 0) { return "" }
+    if (v ~ /^-/) { neg = 1 }
+    if (cmpInt(v, lo) < 0) { lo = v }
+    if (cmpInt(v, hi) > 0) { hi = v }
+    if (!(v in has)) { has[v] = 1; distinct++ }
+  }
+  if (!neg) { return "" }
+  for (k = 1; k <= cnt; k++) { if (rcVals[k] != hi && !(succInt(rcVals[k]) in has)) { return "" } }
+  u = "u" substr(rcT, 2)
+  mlo = (bits == 64 || lo !~ /^-/) ? lo : sprintf("%d", lo + 2 ^ bits)
+  f = "%" (9000000 + ++gFresh)
+  return "  " f " = sub " u " " rcS ", {" u ":" mlo "}\n  " rcLast " = icmp_ule bool " f ", {" u ":" (distinct - 1) "}"
+}
+# rangeRewrite -- #7069: a chain of compares the oracle kept because a label was `neg (const_int)`
+# is the one range test `(subject - lo) <=u width` the tree emits (#7058) at the unsigned type.
+function rangeRewrite(a, n,    i, cnt, rep, ln, out, m, k, any) {
+  m = 0; any = 0
+  for (i = 1; i <= n; i++) {
+    cnt = runLen(a, n, i)
+    rep = (cnt > 0) ? runLines(cnt) : ""
+    if (rep == "") { out[++m] = a[i]; continue }
+    split(rep, ln, "\n"); out[++m] = ln[1]; out[++m] = ln[2]
+    i += rcLen - 1; any = 1
+  }
+  if (!any) { return n }
+  for (k = 1; k <= m; k++) { a[k] = out[k] }
+  for (k = m + 1; k <= n; k++) { delete a[k] }
+  gHit["neg"] = 1
+  return m
+}
 # chainRewrite -- #7406: the per-method of the 0.39.0 oracle `iface_has` chain becomes the one
 # `const_string "ids"` + `iface_implements(recv, ids)`. A link continues the chain only when the
 # previous result has exactly that one use.
@@ -300,7 +450,7 @@ function compile(s,    k, n, L, t, parts, np, j, a, m) {
     for (j = 1; j <= np; j++) { if (parts[j] != "") { L[++n] = parts[j] } }
   }
   canonT(L, n)
-  for (k = 1; k <= fcnt[s]; k++) { delete fname[s, k]; delete fhead[s, k]; delete fraw[s, k]; delete fnorm[s, k]; delete fhit[s, k, "chain"]; delete fhit[s, k, "ok"]; delete fhit[s, k, "loop"] }
+  for (k = 1; k <= fcnt[s]; k++) { delete fname[s, k]; delete fhead[s, k]; delete fraw[s, k]; delete fnorm[s, k]; delete fhit[s, k, "chain"]; delete fhit[s, k, "ok"]; delete fhit[s, k, "loop"]; delete fhit[s, k, "neg"]; delete fhit[s, k, "negmin"] }
   fcnt[s] = 0; m = 0
   for (j = 1; j <= n; j++) {
     if (L[j] ~ /^func /) {
@@ -315,7 +465,7 @@ function procFn(s, k,    a, n, t, i) {
   t = fraw[s, k]; sub(/\n$/, "", t); n = split(t, a, "\n")
   n = eraseConsts(a, n)
   split("", gHit)
-  if (s == "A") { n = chainRewrite(a, n); n = okRewrite(a, n); n = loopRewrite(a, n) }
+  if (s == "A") { n = negRewrite(a, n); n = rangeRewrite(a, n); n = chainRewrite(a, n); n = okRewrite(a, n); n = loopRewrite(a, n) }
   for (i in gHit) { fhit[s, k, i] = 1 }
   renumber(a, n)
   fnorm[s, k] = joinLines(a, n)
@@ -349,20 +499,20 @@ function sameLists(headersOnly,    i, a, b) {
   if (fcnt["A"] != fcnt["B"]) { return 0 }
   for (i = 1; i <= fcnt["A"]; i++) {
     if (fname["A", i] != fname["B", i]) { return 0 }
-    if (headersOnly ? fhead["A", i] != fhead["B", i] : fnorm["A", i] != fnorm["B", i]) { return 0 }
+    if ((headersOnly || (kind == "iropt" && (("A" SUBSEP i SUBSEP "negmin") in fhit))) ? fhead["A", i] != fhead["B", i] : fnorm["A", i] != fnorm["B", i]) { return 0 }
   }
   return 1
 }
 # hitName -- the signature whose hunk rewrote a surviving oracle function.
 function hitName(    k, i, names) {
-  names[1] = "chain"; names[2] = "ok"; names[3] = "loop"
-  for (i = 1; i <= 3; i++) {
+  names[1] = "chain"; names[2] = "ok"; names[3] = "loop"; names[4] = "neg"
+  for (i = 1; i <= 4; i++) {
     for (k = 1; k <= fcnt["A"]; k++) { if ((("A" SUBSEP k SUBSEP names[i]) in fhit)) { seen[names[i]] = 1 } }
   }
   if ("chain" in seen) { return "7406-iface-implements-call" }
   if ("ok" in seen) { return "7408-assert-ok-nil-compare" }
   if ("loop" in seen) { return "7377-append-spread-bulk-move" }
-  return ""
+  return "7069-neg-literal-const"
 }
 function inA(key,    k) { for (k = 1; k <= rcnt["A"]; k++) { if (rkey["A", k] == key) { return 1 } } return 0 }
 # arrowLeak -- #7383: the closure bodies of the oracle keep an unsubstituted type (`<invalid>`) and it

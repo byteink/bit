@@ -298,6 +298,28 @@
 #     changes in `--dump-types`; see explainLagTypes (ir-signatures-walk.sh).
 #     Files: run_iface_self_result and arrow_generic_method_recv.
 #
+#
+# Declared (#7069) against the 0.39.0 oracle; retires at the next repin. One signature, in the
+# `ir` and `iropt` kinds. #7069 lowers `-N` for an integer literal to the one `const_int T -N`;
+# the oracle emits `neg T (const_int T N)`. The identity is exact over the FULL dumps (see
+# ir-signatures-walk.sh): constants are erased, and each oracle `neg` of a literal that fits T is
+# replaced by the literal `-N`, as is a negative switch label, so a run of labels the oracle kept
+# as an icmp_eq/bor chain (`case -5, -4, -3:`) becomes the `sub`/`icmp_ule` range test #7058
+# emits. Every function must then agree byte for byte, so a second, unrelated difference on an
+# explained file still fails.
+#
+#   7069-neg-literal-const (`ir`, `iropt`). Files: ir_switch_case_range, run_switch_range,
+#     run_debug_neg_literal_min, run_slice_lit_inline_fill, run_slice_u8_store_inline,
+#     decimal_to_int_roundtrip and 121 more that hold a negative literal: 127 files, 127 `ir`
+#     rows and 31 `iropt` rows over `stdlib examples _tests_/cases _tests_/imports`. Post-opt the oracle
+#     folds `neg` of a literal itself, so there only the place the constant is defined differs and
+#     the erasure removes it. The one exception is the type minimum (`-9223372036854775808`,
+#     `-128`): the oracle cannot fold its `neg`, the tree has a constant and folds what follows
+#     it, so in `iropt` a function whose oracle text keeps such a `neg` is compared by header only,
+#     like 7383 above, and its body is proven by the `ir` row. A function that agrees once constants
+#     are erased and ids renumbered, with none of the other named rewrites firing, is explained by
+#     this name too: that is the `iropt` shape above, where only constant placement moved.
+#
 # shellcheck source=scripts/ir-signatures-walk.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-walk.sh"
 irWalkAwk
@@ -452,7 +474,7 @@ declaredSignatureNames() {
   local diags="6403-enum-static-method-presyntax 7035-keyword-member-name-presyntax 6421-ternary-jsx-hash-oracle-panic"
   local fmt="7380-jsx-text-apostrophe-stray-semicolon"
   local types="7387-self-result-types 7383-arrow-param-types"
-  local ir="7408-assert-ok-nil-compare 7406-iface-implements-call 7377-append-spread-bulk-move 7387-self-result-oracle-omits-function 7383-arrow-oracle-leaks-type-param"
+  local ir="7408-assert-ok-nil-compare 7406-iface-implements-call 7377-append-spread-bulk-move 7387-self-result-oracle-omits-function 7383-arrow-oracle-leaks-type-param 7069-neg-literal-const"
   case "${1:-}" in
     diags) printf '%s\n' $diags ;;
     fmt) printf '%s\n' $fmt ;;

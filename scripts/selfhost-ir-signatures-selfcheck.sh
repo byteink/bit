@@ -153,6 +153,66 @@ X
   expect "" "$(explainMismatch "$chain_o" "${chain_t//0,1/0,2}" ir)" "iface_implements with other ids"
   expect "" "$(explainMismatch "$chain_o" "${chain_t//iface_implements/iface_has}" iropt)" "iface_has kept by the tree"
   expect "" "$(explainMismatch "$chain_o" "$chain_t" types)" "an IR identity never explains a types dump"
+  neg_o=$(cat <<'X'
+func f(%0: i32) i32 {
+bb0(%0: i32):
+  %1 = const_int i32 5
+  %2 = neg i32 %1
+  %3 = add i32 %0, %2
+  ret %3
+}
+X
+)
+  neg_t=$(cat <<'X'
+func f(%0: i32) i32 {
+bb0(%0: i32):
+  %1 = const_int i32 -5
+  %2 = add i32 %0, %1
+  ret %2
+}
+X
+)
+  for kind in ir iropt; do
+    expect 7069-neg-literal-const "$(explainMismatch "$neg_o" "$neg_t" $kind)" "$kind: neg of a literal became one negative const_int"
+    expect "" "$(explainMismatch "$neg_o" "${neg_t//-5/-6}" $kind)" "$kind: a different constant"
+    expect "" "$(explainMismatch "$neg_o" "${neg_t//add/sub}" $kind)" "$kind: a different operation"
+  done
+  range_o=$(cat <<'X'
+func f(%0: i32) bool {
+bb0(%0: i32):
+  %1 = const_int i32 3
+  %2 = neg i32 %1
+  %3 = const_int i32 2
+  %4 = neg i32 %3
+  %5 = icmp_eq bool %0, %2
+  %6 = icmp_eq bool %0, %4
+  %7 = bor bool %5, %6
+  br %7, bb1(), bb2()
+bb1():
+  ret %7
+bb2():
+  ret %7
+}
+X
+)
+  range_t=$(cat <<'X'
+func f(%0: i32) bool {
+bb0(%0: i32):
+  %1 = const_int u32 4294967293
+  %2 = sub u32 %0, %1
+  %3 = const_int u32 1
+  %4 = icmp_ule bool %2, %3
+  br %4, bb1(), bb2()
+bb1():
+  ret %4
+bb2():
+  ret %4
+}
+X
+)
+  expect 7069-neg-literal-const "$(explainMismatch "$range_o" "$range_t" ir)" "negative labels became one range test"
+  expect "" "$(explainMismatch "$range_o" "${range_t//u32 1/u32 2}" ir)" "range test with a wider width"
+  expect "" "$(explainMismatch "$range_o" "${range_t//4294967293/4294967294}" ir)" "range test from another first label"
   loop_o=$(cat <<'X'
 func f(%0: []i64, %1: []i64, %2: i64, %3: i64) []i64 {
 bb0(%0: []i64, %1: []i64, %2: i64, %3: i64):
