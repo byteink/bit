@@ -22,7 +22,9 @@ explainSpreadDelta() {
   [ "$(($1 - $2))" -gt 0 ] && [ "$3" -eq 0 ] && [ "$4" -eq "$(($1 - $2))" ] || return 1
   echo "7377-bulk-spread-append"
 }
-spreadCalls() { objdump -r "$1" 2>/dev/null | grep -c 'bit_rt_slice_append_slice'; }
+spreadCalls() {
+  objdump -r "$1" 2>/dev/null | grep -c 'bit_rt_slice_append_slice'
+}
 
 # --- 7482-aliased-generic-instance-methods: against the 0.39.0 oracle; retires at the next repin
 # #7482 instantiates a generic class imported under an alias (`import { Pool as P }`;
@@ -93,12 +95,14 @@ explainInstanceDelta() {
 
 # The self-tests prove each signature here REFUSES, not only accepts (the mute button #1883 deleted
 # would explain everything). Each prints one line and returns 1 on the first FATAL.
-spreadcheck() { # $1=want ("" = refuse) $2=name, then the four explainSpreadDelta args
+# spreadcheck <want, "" = refuse> <name> <the four explainSpreadDelta args>
+spreadcheck() {
   local got
   got=$(explainSpreadDelta "$3" "$4" "$5" "$6")
   [ "$got" = "$1" ] || { echo "FATAL: spread self-test '$2': got '$got', want '$1'" >&2; return 1; }
 }
-instcheck() { # $1=want ("" = refuse) $2=name $3=oracle $4=tree $5=seed $6=self
+# instcheck <want, "" = refuse> <name> <oracle_dis> <tree_dis> <seed> <self>
+instcheck() {
   local got
   got=$(explainInstanceText "$3" "$4" "$5" "$6")
   [ "$got" = "$1" ] || { echo "FATAL: instance self-test '$2': got '$got', want '$1'" >&2; return 1; }
