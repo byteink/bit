@@ -84,6 +84,9 @@ Synchronizing a dev database straight from your entities, no migration
 file, is [`docs/sync.md`](docs/sync.md). Running your own test suite inside
 a transaction that always rolls back is
 [`docs/testing.md`](docs/testing.md).
+Restricting which rows an actor may read or write with an authorization
+layer passed as `open(url, Options{ authz = guard })` is
+[`docs/guard.md`](docs/guard.md).
 
 ## `Dialect` vs `ServerDialect`
 
