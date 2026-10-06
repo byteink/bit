@@ -825,6 +825,47 @@ Encrypts and authenticates data under this cipher - see `Aead.seal`.
 
 Decrypts and checks data under this cipher - see `Aead.open`.
 
+### `AesGcm.sealInto(dst: []byte, nonce: []byte, plaintext: []byte, aad: []byte)`
+
+`seal` allocates a new slice for every message. `sealInto` writes
+`ciphertext ‖ tag` into a `dst` the caller owns, so a sender that seals
+thousands of messages reuses one buffer. `dst` must be exactly
+`len(plaintext) + 16` bytes (slice a larger buffer to size), and `plaintext`
+may be `dst[0:len(plaintext)]` to seal in place. The nonce rules and panics are
+those of `seal`: the nonce must be 12 bytes and must never repeat under one key.
+
+```bit
+import { AesGcm } from "std/crypto"
+
+// Seal `msg` into the front of the caller's reusable `frame`.
+fn sealFrame(c: AesGcm, nonce: []byte, msg: []byte, frame: []byte): []byte {
+  let out = frame[0:len(msg) + c.overhead()]
+  c.sealInto(out, nonce, msg, []byte(0))
+  return out
+}
+```
+
+### `AesGcm.openInto(dst: []byte, nonce: []byte, ciphertext: []byte, aad: []byte): ()!`
+
+`open` allocates a new slice for every message. `openInto` writes the
+plaintext into a `dst` the caller owns, which must be exactly
+`len(ciphertext) - 16` bytes; `dst` may be
+`ciphertext[0:len(ciphertext) - 16]` to open in place. The tag is checked
+before a single byte of `dst` is written, so a failed open leaves `dst`
+untouched and never exposes unauthenticated plaintext. It fails and panics as
+`open` does.
+
+```bit
+import { AesGcm } from "std/crypto"
+
+// Open in place: the plaintext replaces the front of `sealed`.
+fn openFrame(c: AesGcm, nonce: []byte, sealed: []byte): []byte! {
+  let plain = sealed[0:len(sealed) - c.overhead()]
+  c.openInto(plain, nonce, sealed, []byte(0))?
+  return plain
+}
+```
+
 ### `AesGcm.nonceSize(): int`
 
 The nonce length this cipher requires, in bytes.
@@ -864,6 +905,47 @@ Encrypts and authenticates data under this cipher - see `Aead.seal`.
 ### `ChaChaPoly.open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!`
 
 Decrypts and checks data under this cipher - see `Aead.open`.
+
+### `ChaChaPoly.sealInto(dst: []byte, nonce: []byte, plaintext: []byte, aad: []byte)`
+
+`seal` allocates a new slice for every message. `sealInto` writes
+`ciphertext ‖ tag` into a `dst` the caller owns, so a sender that seals
+thousands of messages reuses one buffer. `dst` must be exactly
+`len(plaintext) + 16` bytes (slice a larger buffer to size), and `plaintext`
+may be `dst[0:len(plaintext)]` to seal in place. The nonce rules and panics are
+those of `seal`: the nonce must be 12 bytes and must never repeat under one key.
+
+```bit
+import { ChaChaPoly } from "std/crypto"
+
+// Seal `msg` into the front of the caller's reusable `frame`.
+fn sealFrame(c: ChaChaPoly, nonce: []byte, msg: []byte, frame: []byte): []byte {
+  let out = frame[0:len(msg) + c.overhead()]
+  c.sealInto(out, nonce, msg, []byte(0))
+  return out
+}
+```
+
+### `ChaChaPoly.openInto(dst: []byte, nonce: []byte, ciphertext: []byte, aad: []byte): ()!`
+
+`open` allocates a new slice for every message. `openInto` writes the
+plaintext into a `dst` the caller owns, which must be exactly
+`len(ciphertext) - 16` bytes; `dst` may be
+`ciphertext[0:len(ciphertext) - 16]` to open in place. The tag is checked
+before a single byte of `dst` is written, so a failed open leaves `dst`
+untouched and never exposes unauthenticated plaintext. It fails and panics as
+`open` does.
+
+```bit
+import { ChaChaPoly } from "std/crypto"
+
+// Open in place: the plaintext replaces the front of `sealed`.
+fn openFrame(c: ChaChaPoly, nonce: []byte, sealed: []byte): []byte! {
+  let plain = sealed[0:len(sealed) - c.overhead()]
+  c.openInto(plain, nonce, sealed, []byte(0))?
+  return plain
+}
+```
 
 ### `ChaChaPoly.nonceSize(): int`
 
