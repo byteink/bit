@@ -73,27 +73,21 @@
 // This port closes it from the other end. A waiter is registered BEFORE parking,
 // under the channel lock — which makes the waiter visible early rather than
 // late, so the lost-wakeup risk moves from "a waker cannot find the task" to "a
-// waker finds the task before it has finished parking". The second is
-// detectable and the first is not: `schedUnpark` compare-and-exchanges
-// `taskParked -> taskRunnable` and RETURNS FALSE when the task was not parked,
-// so a waker can see the case exactly. `chanWake` therefore waits for the
-// parking task to arrive before unparking it.
+// waker finds the task before it has finished parking". That is exactly the
+// window `schedParkArm` (`runtime/sched/task.bit`) exists for, so every
+// blocking path arms (`taskRunning -> taskParking`) BEFORE it registers a
+// waiter, and `chanWake` finishes the rendezvous from the other side: a task
+// that is already `taskParked` is unparked, and one still `taskParking` is
+// handed `taskWakePending`, which its worker delivers by requeueing instead of
+// parking (`schedWorkerRun`). Both are compare-exchanges against the one
+// `taskState` word, so one of them must observe the other and no wake is
+// dropped. `chanWake` therefore never waits: no loop, no spin under the channel
+// lock, and no bound whose exhaustion could lose a wake (#7443; it used to spin
+// up to `WAKE_MAX_SPINS` pauses on `taskParked` and then return without waking).
 //
-// WHY THAT WAIT TERMINATES, which is the only thing that makes this sound:
-// a task appears on a wait queue only while it is RUNNING (it pushed itself
-// there), and green threads here are not preemptible, so it holds its worker's
-// CPU continuously from the push to the context switch — a lock release and a
-// call. `taskParked` is stored by that worker immediately after the switch
-// saves the context. So the waited-for transition is already in flight on
-// another OS thread, with no lock in between that the waker could be holding.
-//
-// This is the SAME liveness assumption `runtime/spinlock` already makes of
-// every critical section in the runtime — that a thread holding a word another
-// thread spins on continues to be scheduled — not a new class of hazard. It is
-// bounded anyway (`WAKE_MAX_SPINS`) so that a wedged scheduler degrades into a
-// dropped wakeup rather than a hung process, and it spins on the same
-// architectural hint instructions `runtime/spinlock` and the scheduler's idle
-// backoff use.
+// A task is only ever armed here, never left armed: every arm is followed by a
+// registration and then `schedPark` on every path, so a wake is always owed
+// delivery by the worker or by the waker, never by neither.
 //
 // A WELCOME CONSEQUENCE: registering early removes the need for `setup`'s
 // recheck. `runtime/chan/` must re-test the channel condition inside the callback
@@ -140,7 +134,7 @@
 // see that file for why it moved out of the chan<->root cycle (#1612).
 
 import { spinAcquire, spinRelease, spinCellAt } from "../"
-import { taskAt, taskState, taskParked, schedUnpark, schedPark } from "../sched"
+import { taskAt, schedUnpark, schedPollUnpark, schedPark, schedParkArm } from "../sched"
 import { schedCurrentTask } from "../sched"
 import { scratchOf, schedCurrentScratch, scrCounter, scrSelDone, scrSelWinner, scrElem, scrOk } from "../sched"
 import { scrNodes, scrOrder, scrShuffled, scrRecvOk } from "../sched"
@@ -317,29 +311,24 @@ const chanMaxWaiters: int = 16777216
 // Waking a parked peer
 // ---------------------------------------------------------------------------
 //
-// See the header for why this waits and why the wait terminates. The bound
-// exists so that termination is provable by READING the loop rather than by
-// trusting the scheduler, exactly as `schedWorkerRun`'s trip bound is.
-//
-// Exhausting it drops a wakeup, which is a hang for the peer — but the only way
-// to reach it is a scheduler that has already stopped running the parking task,
-// in which case the peer was never going to be resumed anyway. Spinning forever
-// would convert that into a hung waker as well.
-const WAKE_MAX_SPINS: int = 1000000000
-
+// See the header for the rendezvous. Every task on a wait queue armed itself
+// first (`schedParkArm`), so its state is `taskParking` (not yet switched
+// away) or `taskParked` (switched away); it cannot already be `taskWakePending`
+// because a waiter is claimed and popped exactly once. `schedUnpark` takes the
+// parked case with the run-next hand-off; `schedPollUnpark` covers the armed
+// case and a park that published between the two attempts. A task in none of
+// those states broke the arm-before-register rule, and dropping its wake would
+// hang a peer silently, so that is a trap.
 @nosplit fn chanWake(s: *i64, task: int) {
-  let t = taskAt(task)
-  let n = 0
-  while (n < WAKE_MAX_SPINS) {
-    if (atomicLoad(t + taskState) == taskParked) {
-      schedUnpark(s, task)
-      return
-    }
-    asm {
-      arm64 { 0xD503203F } // yield
-      x64 { 0xF3, 0x90 }   // pause
-    }
-    n = n + 1
+  if (schedUnpark(s, task)) {
+    return
+  }
+  if (schedPollUnpark(s, task)) {
+    return
+  }
+  asm volatile {
+    arm64 { 0xD4200000 } // brk #0
+    x64 { 0x0F, 0x0B }   // ud2
   }
 }
 
