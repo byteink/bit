@@ -14,10 +14,8 @@ import { Timestamp, now } from "std/time"
 import { Mutex } from "std/sync"
 import { stderr } from "std/io"
 import {
-  jsonAppendRaw,
   jsonAppendKey,
   jsonAppendString,
-  jsonAppendInt,
   jsonAppendFloat,
   jsonAppendBool,
 } from "std/json"
@@ -36,16 +34,35 @@ export const LevelError: int = 8
 // level reads as the nearest named level below it plus the distance, so
 // `LevelInfo + 2` is "INFO+2" and `LevelDebug - 4` is "DEBUG-4".
 export fn levelName(level: int): string {
+  let base = levelBase(level)
+  return offsetName(baseName(base), level - base)
+}
+
+// The named level at or below `level`, the base its name is offset from.
+fn levelBase(level: int): int {
   if (level < LevelInfo) {
-    return offsetName("DEBUG", level - LevelDebug)
+    return LevelDebug
   }
   if (level < LevelWarn) {
-    return offsetName("INFO", level - LevelInfo)
+    return LevelInfo
   }
   if (level < LevelError) {
-    return offsetName("WARN", level - LevelWarn)
+    return LevelWarn
   }
-  return offsetName("ERROR", level - LevelError)
+  return LevelError
+}
+
+fn baseName(base: int): string {
+  if (base == LevelDebug) {
+    return "DEBUG"
+  }
+  if (base == LevelInfo) {
+    return "INFO"
+  }
+  if (base == LevelWarn) {
+    return "WARN"
+  }
+  return "ERROR"
 }
 
 fn offsetName(name: string, delta: int): string {
@@ -180,15 +197,18 @@ export interface Sink {
 
 // --- shared handler state -------------------------------------------------
 
-// One nesting level: the group name that opened it ("" for the root) and the
-// attributes added while it was the innermost group.
+// One nesting level: the group name that opened it ("" for the root), the
+// attributes added while it was the innermost group, and the text key prefix
+// every group up to it spells (`a.b.`), built once here so a record never
+// concatenates it.
 class frame {
   group: string,
+  prefix: string,
   attrs: []Attr,
 }
 
 fn rootFrames(): []frame {
-  return []frame{ frame{ group = "", attrs = []Attr(0) } }
+  return []frame{ frame{ group = "", prefix = "", attrs = []Attr(0) } }
 }
 
 // `frames` with `attrs` added to the innermost group; `frames` itself is not
@@ -203,7 +223,11 @@ fn framesWith(frames: []frame, attrs: []Attr): []frame {
   }
   out = append(
     out,
-    frame{ group = frames[last].group, attrs = concatAttrs(frames[last].attrs, attrs) },
+    frame{
+      group = frames[last].group,
+      prefix = frames[last].prefix,
+      attrs = concatAttrs(frames[last].attrs, attrs),
+    },
   )
   return out
 }
@@ -216,7 +240,8 @@ fn framesGroup(frames: []frame, name: string): []frame {
     out = append(out, frames[i])
     i = i + 1
   }
-  return append(out, frame{ group = name, attrs = []Attr(0) })
+  let prefix = frames[len(frames) - 1].prefix + name + "."
+  return append(out, frame{ group = name, prefix = prefix, attrs = []Attr(0) })
 }
 
 fn concatAttrs(a: []Attr, b: []Attr): []Attr {
@@ -234,15 +259,143 @@ fn concatAttrs(a: []Attr, b: []Attr): []Attr {
   return out
 }
 
-// Writes one finished line, holding `mu` so lines from two tasks never
-// interleave on a sink that is not itself atomic.
-fn writeLine(mu: Mutex, out: Sink, line: string): ()! {
-  mu.lock()
-  out.write(line) catch e {
+// A handler formats every record into one buffer it keeps, under its mutex,
+// so an enabled record allocates only the line it hands the sink. A buffer
+// grown past this by one huge record is dropped rather than kept for the
+// life of the handler.
+const maxKeptBuf: int = 16384
+
+// Hands `buf` to `out` as one line and releases `mu`, which the caller took
+// before formatting: holding it across both keeps the shared buffer to one
+// task and keeps lines from two tasks from interleaving on a sink that is not
+// itself atomic.
+fn writeLocked(mu: Mutex, out: Sink, buf: []byte): ()! {
+  out.write(string(buf)) catch e {
     mu.unlock()
     fail e
   }
   mu.unlock()
+}
+
+// `buf` emptied for the next record, or a fresh one when a record grew it
+// past `maxKeptBuf`.
+fn reuseBuf(buf: []byte): []byte {
+  if (cap(buf) > maxKeptBuf) {
+    return []byte(0)
+  }
+  return buf[0:0]
+}
+
+// --- formatting straight into a buffer -------------------------------------
+//
+// The handlers' scalars, appended as bytes with no intermediate string, each
+// byte-identical to the interpolation it replaces.
+
+// `v` in decimal, `"${v}"`'s bytes. Works in negative space so the most
+// negative int needs no special case.
+fn appendInt(buf: []byte, v: int): []byte {
+  let n = v
+  if (v < 0) {
+    buf = append(buf, '-')
+  } else {
+    n = -v
+  }
+  let p = 1
+  while (n / p <= -10) {
+    p = p * 10
+  }
+  while (p > 0) {
+    buf = append(buf, u8(48 - n / p % 10))
+    p = p / 10
+  }
+  return buf
+}
+
+// `v` (0 or more) zero-padded to at least `width` digits.
+fn appendPad(buf: []byte, v: int, width: int): []byte {
+  let p = 1
+  let w = 1
+  while (w < width) {
+    p = p * 10
+    w = w + 1
+  }
+  while (p > 1 && v < p) {
+    buf = append(buf, '0')
+    p = p / 10
+  }
+  buf = appendInt(buf, v)
+  return buf
+}
+
+// `levelName(level)`'s bytes.
+fn appendLevel(buf: []byte, level: int): []byte {
+  let base = levelBase(level)
+  buf = append(buf, baseName(base))
+  if (level > base) {
+    buf = append(buf, '+')
+  }
+  if (level != base) {
+    buf = appendInt(buf, level - base)
+  }
+  return buf
+}
+
+// A Timestamp's `toString()` bytes for `ns` nanoseconds since the epoch:
+// RFC 3339 in UTC, `2026-09-01T05:00:00Z`, nine fraction digits when the
+// nanoseconds are not zero. The date is Hinnant's civil-from-days, the same
+// arithmetic std/time's calendar uses.
+fn appendTime(buf: []byte, ns: int): []byte {
+  let secs = floorDiv(ns, 1000000000)
+  let nanos = ns - secs * 1000000000
+  let days = floorDiv(secs, 86400)
+  let rem = secs - days * 86400
+  let z = days + 719468
+  let era = floorDiv(z, 146097)
+  let doe = z - era * 146097
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+  let mp = (5 * doy + 2) / 153
+  let month = mp + 3
+  if (mp >= 10) {
+    month = mp - 9
+  }
+  let year = yoe + era * 400
+  if (month <= 2) {
+    year = year + 1
+  }
+  buf = appendPad(buf, year, 4)
+  buf = append(buf, '-')
+  buf = appendPad(buf, month, 2)
+  buf = append(buf, '-')
+  buf = appendPad(buf, doy - (153 * mp + 2) / 5 + 1, 2)
+  buf = append(buf, 'T')
+  buf = appendClock(buf, rem, nanos)
+  return buf
+}
+
+// `HH:MM:SS[.nnnnnnnnn]Z` for `rem` seconds into the day.
+fn appendClock(buf: []byte, rem: int, nanos: int): []byte {
+  buf = appendPad(buf, rem / 3600, 2)
+  buf = append(buf, ':')
+  buf = appendPad(buf, rem % 3600 / 60, 2)
+  buf = append(buf, ':')
+  buf = appendPad(buf, rem % 60, 2)
+  if (nanos != 0) {
+    buf = append(buf, '.')
+    buf = appendPad(buf, nanos, 9)
+  }
+  buf = append(buf, 'Z')
+  return buf
+}
+
+// `a / b` rounded toward negative infinity, for `b > 0`: an instant before
+// 1970 has a negative `ns`, and `/` truncates toward zero.
+fn floorDiv(a: int, b: int): int {
+  let q = a / b
+  if (a - q * b < 0) {
+    q = q - 1
+  }
+  return q
 }
 
 fn requireSink(out: Sink) {
