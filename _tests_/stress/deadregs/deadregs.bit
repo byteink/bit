@@ -11,9 +11,21 @@
 // pinned stage0's libbitrt.a entries carry version 1, where nothing is dead.
 // Whether the mask itself is right is the stress corpus's question: a live
 // register it misses is zeroed and the program fails under `BIT_GC=stress`.
+//
+// #7388: a task preempted at a poll yields with its frame published nowhere,
+// and class 4 scans that frame conservatively while it is switched out, so
+// `stwSafepoint` zeroes the dead words before the yield. `yieldZeroes` backdates
+// this worker's stamp so `sysmonTick` requests a preempt, polls through the live
+// entry and asserts the yield consumed the request and the words read 0. The
+// frame's `fp` points into zeroed `fakeStack`, so a collection at that poll
+// walks one empty frame. Only the default run can tell the call is missing:
+// `BIT_GC=stress` collects at that poll, and #7304 zeroes the words then.
 
 import { loadByte, loadWord, smDeadRegsAt, gcZeroDeadRegs } from "../../../runtime/gc"
 import { smFormatVersionV1 } from "../../../runtime/gc"
+import { stwSafepoint } from "../../../runtime/stw"
+import { schedCurrentWorker, taskAt, wkId, preemptStamp, sysmonTick, preemptRequested } from "../../../runtime/sched"
+import { preemptBudgetTicks } from "../../../runtime/sched"
 
 // `runtime/gc/stackmap.bit`'s `smMaxEntries`: the linear walk's own bound.
 const MAX_ENTRIES = 4194304
@@ -22,6 +34,11 @@ const MASK32 = 4294967295
 
 // A `SafepointFrame` (ABI.md §4): ret, fp, regs[32].
 let frame: [34]i64
+
+// The fake frame `yieldZeroes` hands the poll: every slot within 16 KiB of its
+// `fp` reads 0, and so does the saved `fp`, which ends the walk.
+let fakeStack: [4096]i64
+const FAKE_FP = 16384
 
 let nEntries: i64 = 0
 let nPolls: i64 = 0
@@ -138,19 +155,22 @@ fn checkEntry(base: int, off: int): int {
   return (end + 7) / 8 * 8
 }
 
-// `gcZeroDeadRegs` over a frame returning to `pc`: true when exactly the
-// words `dead` names read 0 afterwards and every other word is untouched.
-fn zeroesExactly(pc: int, dead: int): bool {
-  let f = int(ptrOf(frame))
+// A frame returning to `pc` through `fp`, regs[n] holding n + 1.
+fn fillFrame(pc: int, fp: int): int {
   frame[0] = pc
-  frame[1] = 0
+  frame[1] = fp
   let n = 0
   while (n < 32) {
     frame[2 + n] = n + 1
     n = n + 1
   }
-  gcZeroDeadRegs(f)
-  n = 0
+  return int(ptrOf(frame))
+}
+
+// True when exactly the words `dead` names read 0 and every other word, `ret`
+// included, is untouched.
+fn zeroedExactly(pc: int, dead: int): bool {
+  let n = 0
   while (n < 32) {
     let want = n + 1
     if (((dead >> n) & 1) != 0) {
@@ -162,6 +182,41 @@ fn zeroesExactly(pc: int, dead: int): bool {
     n = n + 1
   }
   return frame[0] == pc
+}
+
+// `gcZeroDeadRegs` over a frame returning to `pc` zeroes exactly `dead`.
+fn zeroesExactly(pc: int, dead: int): bool {
+  gcZeroDeadRegs(fillFrame(pc, 0))
+  return zeroedExactly(pc, dead)
+}
+
+// #7388: a poll this task yields at zeroes exactly `dead` before the yield.
+fn yieldZeroes(pc: int, dead: int): bool {
+  let raw = schedCurrentWorker()
+  if (raw == 0) {
+    return false
+  }
+  let wid = *(taskAt(raw) + wkId)
+  let f = fillFrame(pc, int(ptrOf(fakeStack)) + FAKE_FP)
+  // A negative stamp is over budget at every epoch (#4736).
+  preemptStamp(wid, 0 - preemptBudgetTicks - 1)
+  if (sysmonTick() == 0) {
+    return false
+  }
+  stwSafepoint(f)
+  return !preemptRequested(wid) && zeroedExactly(pc, dead)
+}
+
+// Both `gcZeroDeadRegs` paths over the poll the walk found: called directly,
+// and through a preempted poll's yield. Empty when both hold.
+fn zeroFailure(): string {
+  if (!zeroesExactly(deadPc, deadMask) || !zeroesExactly(0, 0)) {
+    return "gcZeroDeadRegs zeroed the wrong words"
+  }
+  if (!yieldZeroes(deadPc, deadMask)) {
+    return "a preempted poll yielded with its dead words set"
+  }
+  return ""
 }
 
 fn main() {
@@ -180,8 +235,9 @@ fn main() {
     println("deadregs: FAIL: vacuous: entries=${nEntries} polls=${nPolls} dead=${nDeadPolls}")
     return
   }
-  if (!zeroesExactly(deadPc, deadMask) || !zeroesExactly(0, 0)) {
-    println("deadregs: FAIL: gcZeroDeadRegs zeroed the wrong words")
+  let why = zeroFailure()
+  if (why != "") {
+    println("deadregs: FAIL: ${why}")
     return
   }
   println("deadregs: ok")
