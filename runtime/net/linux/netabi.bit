@@ -509,20 +509,69 @@ fn readResolvConf(bufPtr: *u8, bufCap: int): int {
   return netDnsArgsOk(timeoutMs, attempts)
 }
 
-// Asks every nameserver in /etc/resolv.conf, in order, IPv4 and IPv6, under the
-// budget `ns`'s block carries (`netNsTimeoutOff`, `netNsAttemptsOff`); the first
-// A record lands in `out` (four octets). False once every server has failed.
+// Asks the nameservers of the conf text the resolve block `ns` points at
+// (`netNsConfOff`), in order, IPv4 and IPv6, ONCE PER ATTEMPT: pass 1 asks every
+// server, then pass 2 asks every server again, up to the block's attempt count,
+// and the first A record, written to `out` (four octets), wins. That is
+// resolv.conf(5)'s `attempts` ("the number of times the resolver will send a
+// query to its name servers before giving up"), so with the first server dead
+// the second is asked after ONE window, not after all the first's attempts.
+// Each try waits a fixed window (`netNsTimeoutOff`); there is no retrans back-off.
+// False once every pass has failed.
 //
 // #6338: EVERY nameserver, not the first line only -- a single
 // `netResolveHost` call used to stop there, so a resolv.conf whose first server
 // was unreachable never got a second chance. `netResolveHost`/
-// `netResolveHost6` (this module's socket siblings) take the nameserver as a
-// parameter, so this function owns the file read and the walk.
+// `netResolveHost6` (this module's socket siblings) make ONE attempt against a
+// server they are given, so this function owns the walk.
 //
-// EVERY scratch is a MANAGED `[]i64` local (#1668): raw `rtStrAlloc` addresses
-// held across `readResolvConf`, which loops, polls and parks in `netReadSock`,
-// and across `netResolveHost`, which parks on a DNS round trip, would not be
-// named by the precise walk. `ns` and `out` are the caller's managed scratch.
+// `port` starts at the block's port and moves by its step after each server:
+// production passes 53 and 0, a test with several fake servers on one address
+// gives each its own port. The conf text, `ns` and `out` are the caller's
+// MANAGED scratch (#1668), held across the parks below; `addrLenBuf` is ours.
+export @symbol("bit_rt_port_net_resolve_passes") fn netResolvePasses(
+  host: *u8,
+  hostLen: int,
+  ns: *u8,
+  out: *u8,
+): bool {
+  let conf = u8At(getU64Le(ns, netNsConfOff))
+  let confLen = getU64Le(ns, netNsConfLenOff)
+  let passes = getU64Le(ns, netNsAttemptsOff)
+  let step = getU64Le(ns, netNsPortStepOff)
+  // `addrLenBuf` reports which address `netNextNameserver` wrote into `ns`:
+  // 4 or 16 bytes. The words after byte 16 are never touched.
+  let addrLenBuf = []i64(1)
+  let addrLenPtr = ptrOf(addrLenBuf)
+  let pass = 0
+  // Bounded (Power of 10): `passes` is at most `netDnsArgMax`, and
+  // `netNextNameserver` returns a position strictly past where it started, so
+  // each walk of the conf ends within `confLen`.
+  while (pass < passes) {
+    pass = pass + 1
+    let port = getU64Le(ns, netNsPortOff)
+    let at = 0
+    while (at >= 0) {
+      at = netNextNameserver(conf, confLen, at, ns, addrLenPtr)
+      if (at >= 0) {
+        let resolved = false
+        if (*addrLenPtr == 4) {
+          resolved = netResolveHost(host, hostLen, ns, port, out)
+        } else {
+          resolved = netResolveHost6(host, hostLen, ns, port, out)
+        }
+        if (resolved) {
+          return true
+        }
+        port = port + step
+      }
+    }
+  }
+  return false
+}
+
+// Reads /etc/resolv.conf into managed scratch and runs `netResolvePasses` over
+// it on port 53.
 fn netResolveConf(host: *u8, hostLen: int, ns: *u8, out: *u8): bool {
   let confBuf = []i64(scratchWords(resolvConfMax))
   let confPtr = u8At(int(ptrOf(confBuf)))
@@ -530,30 +579,13 @@ fn netResolveConf(host: *u8, hostLen: int, ns: *u8, out: *u8): bool {
   if (confLen <= 0) {
     return false
   }
-  // `addrLenBuf` reports which address `netNextNameserver` wrote into `ns`:
-  // 4 or 16 bytes. The budget words after byte 16 are never touched.
-  let addrLenBuf = []i64(1)
-  let addrLenPtr = ptrOf(addrLenBuf)
-  let at = 0
-  // Bounded (Power of 10): `netNextNameserver` returns a position strictly
-  // past where it started scanning, so `at` strictly increases and the walk
-  // cannot outlast `confLen`.
-  while (at >= 0) {
-    at = netNextNameserver(confPtr, confLen, at, ns, addrLenPtr)
-    if (at < 0) {
-      return false
-    }
-    let resolved = false
-    if (*addrLenPtr == 4) {
-      resolved = netResolveHost(host, hostLen, ns, 53, out)
-    } else {
-      resolved = netResolveHost6(host, hostLen, ns, out)
-    }
-    if (resolved) {
-      return true
-    }
-  }
-  return false
+  putU64Le(ns, netNsConfOff, int(confPtr))
+  putU64Le(ns, netNsConfLenOff, confLen)
+  putU64Le(ns, netNsPortOff, 53)
+  putU64Le(ns, netNsPortStepOff, 0)
+  let ok = netResolvePasses(host, hostLen, ns, out)
+  keepAlive(confBuf)
+  return ok
 }
 
 // `bit_rt_net_resolve_w`: the first IPv4 A-record for the host

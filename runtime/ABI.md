@@ -3059,7 +3059,7 @@ defined exactly once).
 | `bit_rt_net_udp_recv` | `(fd: i64, max: i64) -> *const RtBytes` (§20)          |
 | `bit_rt_net_udp_sender_host` | `() -> *const RtBytes` (§20)                    |
 | `bit_rt_net_udp_sender_port` | `() -> i64` (§20)                               |
-| `bit_rt_net_resolve_w` | `(hostWords: usize, hostLen: i64, timeoutMs: i64, attempts: i64, outWords: usize) -> i64` (§20, #6350: the first A record of the host as a dotted quad written into the caller's own `outWords` buffer (at least 16 bytes), its byte count returned; `-1` once every nameserver has failed or an argument is refused (a host of 0 or over 255 bytes, a null buffer, `timeoutMs` or `attempts` outside 1..1000000). `timeoutMs` is the receive window of ONE attempt and `attempts` how many each nameserver gets: `std/net` owns both (resolv.conf's `options timeout:N attempts:N`, defaults 5000 and 2) and the runtime keeps no default of its own. A plain `extern fn` in `stdlib/net/net.bit`, which replaced the `netResolve` compiler primitive and its `bit_rt_net_resolve` entry: a primitive's arity is baked into the compiler that emits the call, so widening it would have needed a stage0 repin (`tools/build/abiarity.bit`); an `extern` takes its arity from the source it is compiled against. Both buffers cross as packed `[]byte` backings the caller holds live with `keepAlive`) |
+| `bit_rt_net_resolve_w` | `(hostWords: usize, hostLen: i64, timeoutMs: i64, attempts: i64, outWords: usize) -> i64` (§20, #6350: the first A record of the host as a dotted quad written into the caller's own `outWords` buffer (at least 16 bytes), its byte count returned; `-1` once every nameserver has failed or an argument is refused (a host of 0 or over 255 bytes, a null buffer, `timeoutMs` or `attempts` outside 1..1000000). `timeoutMs` is the receive window of ONE try and `attempts` how many passes are made over the nameserver list (A, B, A, B: resolv.conf(5)'s meaning, so a dead first server costs one window before the second is asked; the window is fixed, no retrans back-off): `std/net` owns both (resolv.conf's `options timeout:N attempts:N`, defaults 5000 and 2) and the runtime keeps no default of its own. A plain `extern fn` in `stdlib/net/net.bit`, which replaced the `netResolve` compiler primitive and its `bit_rt_net_resolve` entry: a primitive's arity is baked into the compiler that emits the call, so widening it would have needed a stage0 repin (`tools/build/abiarity.bit`); an `extern` takes its arity from the source it is compiled against. Both buffers cross as packed `[]byte` backings the caller holds live with `keepAlive`) |
 | `bit_rt_random_bytes` | `(len: i64) -> *const RtBytes` (§21)                   |
 | `bit_rt_secure_zero`  | `(h: *SliceHeader) -> void` (§21)                      |
 | `bit_rt_crypto_aes_hw_available` | `() -> bool` (§21b)                         |
@@ -4582,8 +4582,8 @@ bit_rt_net_udp_sender_port()            -> port  // last recv's sender port, or 
 **DNS.** `resolve` returns the first A record for `host` as a dotted quad, or `""`
 on failure; a dotted-quad `host` passes straight back. It queries every
 nameserver in `/etc/resolv.conf` in order over a non-blocking UDP socket with
-bounded retransmits (`attempts` tries of `timeoutMs` each per nameserver, both
-passed in by `std/net`, which takes them from `options timeout:N attempts:N`
+bounded retransmits (`attempts` passes over the list, one try of `timeoutMs`
+per nameserver per pass, both passed in by `std/net`, which takes them from `options timeout:N attempts:N`
 in `resolv.conf` and defaults to 2 tries of 5 s as glibc does). The calling task
 parks on the netpoller with the attempt's deadline, so a lost packet neither
 holds the OS thread nor delays a stop-the-world rendezvous.

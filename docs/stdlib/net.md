@@ -426,11 +426,12 @@ fn echo(s: UdpSocket, n: int): ()! {
 ### `resolve(host: string): string!`
 
 Resolves a hostname to an IPv4 address (a dotted quad), asking each nameserver
-in `/etc/resolv.conf` in turn until one answers. A nameserver is asked up to
-`attempts` times, each attempt waiting up to `timeout` seconds: 5 seconds and 2
+in `/etc/resolv.conf` in turn until one answers. The list is gone through up to
+`attempts` times, each try waiting up to `timeout` seconds: 5 seconds and 2
 attempts unless the file says otherwise with `options timeout:N attempts:N`
-(held to 30 and 5, as glibc holds them). Windows has no such file and uses the
-defaults. A dotted-quad argument or an
+(held to 30 and 5, as glibc holds them), so a dead first nameserver costs one
+`timeout` before the second is asked. Windows has no such file and uses the
+defaults, and asks the one nameserver it discovers. A dotted-quad argument or an
 IPv6 literal (no brackets) comes back unchanged, so it is safe on an address
 that may already be numeric. A records only - no AAAA, no search domains, no
 caching. `dial` and `udpBind` take numeric addresses, so
@@ -480,7 +481,7 @@ fn publishedKey(selector: string, domain: string): string! {
 ### `resolveBudgetMs(): int`
 
 The longest `resolve` can take on this machine, in milliseconds: each
-nameserver gets its full retry budget (`attempts` times `timeout`, as
+nameserver gets its full retry budget (`attempts` tries of `timeout`, as
 `resolve` describes), so the figure grows with the number of nameservers and
 follows the `options` line in `/etc/resolv.conf`. Code that races a lookup against its own timer adds this to the
 time it allows for connecting and transferring, so slow but successful DNS is

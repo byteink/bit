@@ -2,14 +2,17 @@
 // of ../txt.bit's codec. Same module as ./udp.bit, so its `netDnsOpen`/
 // `netDnsSend`/`netDnsRecv` and ./tcpdeadline.bit's socket engine are in scope.
 //
-// ONE SERVER, ONE BUDGET. `resolveBudgetMs` (std/net) promises a caller that
-// `resolve` takes at most `attempts` x `timeoutMs` per nameserver, and a caller
-// racing a timer against `lookupTxt` is owed the same arithmetic. Both numbers
-// are std/net's, carried in the request (`netAbiLookupTxtW`, below) and held in
-// the nameserver block (`netNsBlockBytes`, ../../net). So the UDP attempts and,
-// when the reply is truncated, the TCP retry (RFC 7766) share ONE deadline per
-// server: `netTxtBudgetNs` from the moment the server is first asked. A TC
-// reply normally arrives at once, so the TCP exchange gets nearly all of it.
+// ONE TRY, ONE WINDOW; ATTEMPTS ARE PASSES. `resolveBudgetMs` (std/net) promises
+// a caller that `resolve` takes at most `attempts` x `timeoutMs` per nameserver,
+// and a caller racing a timer against `lookupTxt` is owed the same arithmetic.
+// Both numbers are std/net's, carried in the request (`netAbiLookupTxtW`, below)
+// and held in the resolve block (`netNsBlockBytes`, ../../net). Like `resolve`
+// (`netResolvePasses`, ./netabi.bit) the walk goes round the whole nameserver
+// list once per attempt, so a dead first server costs one window before the
+// second is asked (resolv.conf(5) `attempts`, #6350). A try is one UDP exchange
+// and, when the reply is truncated, the TCP retry (RFC 7766); they share ONE
+// window, `netTxtWindowNs`, from the moment the server is asked. A TC reply
+// normally arrives at once, so the TCP exchange gets nearly all of it.
 //
 // THE TCP RETRY IS IPv4 ONLY, because the runtime's TCP dial is: a truncated
 // reply from an IPv6 nameserver fails that server (the next one is tried).
@@ -21,10 +24,10 @@
 // Everything a lookup needs lives in `work` at the fixed offsets below, which is
 // what keeps each function to the five parameters the lint ceiling allows.
 
-// The per-server wall clock: the same `attempts` receive windows `resolve`
-// spends, as one deadline, read from the nameserver block `ns`.
-@nosplit fn netTxtBudgetNs(ns: *u8): int {
-  return getU64Le(ns, netNsAttemptsOff) * getU64Le(ns, netNsTimeoutOff) * 1000000
+// One try's wall clock: the receive window `resolve` waits per attempt, read
+// from the resolve block `ns`.
+@nosplit fn netTxtWindowNs(ns: *u8): int {
+  return getU64Le(ns, netNsTimeoutOff) * 1000000
 }
 
 // `work`'s layout: the TCP query (a two-byte length and at most `netMaxDnsMsg`
@@ -48,32 +51,19 @@ const netTxtMaxNsText: int = 64
 // five-parameter ceiling.
 const netTxtHeaderBytes: int = 16
 
-// UDP: up to the budget's `attempts` query/reply rounds on the connected `fd`. A lost
-// reply, a failed send, a stray datagram and a SERVFAIL each cost a round; an
-// answer, a truncation and a malformed reply end it. A hard receive error ends
-// the server.
+// UDP: ONE query/reply round on the connected `fd`. A lost reply, a failed
+// send, a stray datagram, a SERVFAIL and a hard receive error end it transient;
+// an answer, a truncation and a malformed reply end it with that result.
 @nosplit fn netTxtUdp(fd: int, work: *u8, hostLen: int, out: *u8): int {
   let gen = *netFdGenAddr(fd)
-  let timeoutMs = getU64Le(work + netTxtNsOff, netNsTimeoutOff)
-  let attempts = getU64Le(work + netTxtNsOff, netNsAttemptsOff)
-  let attempt = 0
-  // Bounded retransmits (Power of 10).
-  while (attempt < attempts) {
-    attempt = attempt + 1
-    if (netDnsSend(fd, work + netTxtHostOff, hostLen, netTypeTxt)) {
-      let got = netDnsRecv(fd, gen, timeoutMs)
-      if (got == 0 - 1) {
-        return netTxtTransient
-      }
-      if (got >= 0) {
-        let r = netParseTxt(dnsBytes() + netMaxDnsMsg, got, netDnsId, out)
-        if (r != netTxtTransient) {
-          return r
-        }
-      }
-    }
+  if (!netDnsSend(fd, work + netTxtHostOff, hostLen, netTypeTxt)) {
+    return netTxtTransient
   }
-  return netTxtTransient
+  let got = netDnsRecv(fd, gen, getU64Le(work + netTxtNsOff, netNsTimeoutOff))
+  if (got < 0) {
+    return netTxtTransient
+  }
+  return netParseTxt(dnsBytes() + netMaxDnsMsg, got, netDnsId, out)
 }
 
 // Exactly `want` bytes into `buf`, or false on end of stream, error or the
@@ -136,12 +126,12 @@ const netTxtHeaderBytes: int = 16
   return r
 }
 
-// Asks the nameserver in `work` at `netTxtNsOff` (4 bytes, or 16 when `v6`): UDP
+// Asks the nameserver in `work` at `netTxtNsOff` (4 bytes, or 16 when `v6`) ONCE: UDP
 // first, TCP when the reply says it was truncated. Returns the bytes written to
 // `out`, `netTxtMalformed`, or `netTxtTransient` for every other failure,
 // including a truncation that cannot be retried (IPv6).
 @nosplit fn netTxtServer(work: *u8, hostLen: int, v6: bool, port: int, out: *u8): int {
-  let deadline = netClockNowNs() + netTxtBudgetNs(work + netTxtNsOff)
+  let deadline = netClockNowNs() + netTxtWindowNs(work + netTxtNsOff)
   let fd = netDnsOpen(work + netTxtHostOff, hostLen, work + netTxtNsOff, port, v6)
   if (fd < 0) {
     return netTxtTransient
@@ -160,23 +150,34 @@ const netTxtHeaderBytes: int = 16
 // The seam: the nameserver is the address text the caller put in `work` at
 // `netTxtNsTextOff` (IPv4 or IPv6) and `port` is its port (a test stub cannot
 // bind 53), the way `netResolveHost`'s `ns`/`port` are parameters (./udp.bit).
+// Its one server is asked once per attempt, until a try is not transient.
 @nosplit fn netTxtFixed(work: *u8, hostLen: int, nsLen: int, port: int, out: *u8): int {
   if (port < 1 || port > 65535) {
     return netTxtTransient
   }
   let text = work + netTxtNsTextOff
-  if (netParseIpv4(text, nsLen, work + netTxtNsOff)) {
-    return netTxtServer(work, hostLen, false, port, out)
+  let v6 = false
+  if (!netParseIpv4(text, nsLen, work + netTxtNsOff)) {
+    if (!netParseIpv6(text, nsLen, work + netTxtNsOff)) {
+      return netTxtTransient
+    }
+    v6 = true
   }
-  if (netParseIpv6(text, nsLen, work + netTxtNsOff)) {
-    return netTxtServer(work, hostLen, true, port, out)
+  let passes = getU64Le(work + netTxtNsOff, netNsAttemptsOff)
+  let pass = 0
+  let r = netTxtTransient
+  // Bounded retransmits (Power of 10).
+  while (pass < passes && r == netTxtTransient) {
+    pass = pass + 1
+    r = netTxtServer(work, hostLen, v6, port, out)
   }
-  return netTxtTransient
+  return r
 }
 
-// Every nameserver in /etc/resolv.conf, in order, as `netResolveConf` (./netabi.bit)
-// walks them. The first answer wins, NXDOMAIN included; a malformed reply is
-// remembered so that if no server answers, the failure names it.
+// Every nameserver in /etc/resolv.conf, in order, once per attempt, as
+// `netResolvePasses` (./netabi.bit) walks them. The first answer wins, NXDOMAIN
+// included; a malformed reply is remembered so that if no server answers, the
+// failure names it.
 fn netTxtConf(work: *u8, hostLen: int, out: *u8): int {
   let confBuf = []i64(scratchWords(resolvConfMax))
   let confPtr = u8At(int(ptrOf(confBuf)))
@@ -186,21 +187,26 @@ fn netTxtConf(work: *u8, hostLen: int, out: *u8): int {
   }
   let addrLenBuf = []i64(1)
   let addrLenPtr = ptrOf(addrLenBuf)
+  let passes = getU64Le(work + netTxtNsOff, netNsAttemptsOff)
   let failure = netTxtTransient
-  let at = 0
+  let pass = 0
+  // Bounded (Power of 10): `passes` is at most `netDnsArgMax`, and
   // `netNextNameserver` returns a position strictly past where it started, so
-  // `at` rises and the walk ends within `confLen`.
-  while (at >= 0) {
-    at = netNextNameserver(confPtr, confLen, at, work + netTxtNsOff, addrLenPtr)
-    if (at < 0) {
-      return failure
-    }
-    let r = netTxtServer(work, hostLen, *addrLenPtr == 16, 53, out)
-    if (r >= 0) {
-      return r
-    }
-    if (r == netTxtMalformed) {
-      failure = r
+  // each walk ends within `confLen`.
+  while (pass < passes) {
+    pass = pass + 1
+    let at = 0
+    while (at >= 0) {
+      at = netNextNameserver(confPtr, confLen, at, work + netTxtNsOff, addrLenPtr)
+      if (at >= 0) {
+        let r = netTxtServer(work, hostLen, *addrLenPtr == 16, 53, out)
+        if (r >= 0) {
+          return r
+        }
+        if (r == netTxtMalformed) {
+          failure = r
+        }
+      }
     }
   }
   return failure
