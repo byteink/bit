@@ -52,7 +52,7 @@ aggregator:
 
 ```bit
 import { App, Config, logger } from "web"
-import { Logger, JsonHandler, LevelInfo, Str, getDefault } from "std/log"
+import { Logger, JsonHandler, LevelInfo, attrs, getDefault } from "std/log"
 import { stdout } from "std/io"
 
 fn withDefault(secret: string): App {
@@ -60,7 +60,7 @@ fn withDefault(secret: string): App {
 }
 
 fn withJson(secret: string): App {
-  let lg = Logger(JsonHandler(stdout(), LevelInfo)).with(Str("service", "inkwell"))
+  let lg = Logger(JsonHandler(stdout(), LevelInfo)).with(attrs().str("service", "inkwell"))
   let app = App(Config{ secret = secret, logger = Option.Some(lg) })
   app.use(logger())
   return app
@@ -73,7 +73,7 @@ With that logger, a request to `GET /health` writes
 {"time":"2026-10-06T09:14:02Z","level":"INFO","service":"inkwell","msg":"request","method":"GET","path":"/health","status":200,"took":412000}
 ```
 
-(`took` is a `Duration`: nanoseconds in JSON, `412us` in text), and a handler
+(`took` is a duration: nanoseconds in JSON, `412us` in text), and a handler
 that fails with a plain error writes one `ERROR` record carrying the method,
 the path and the real message, while the client receives only
 `Internal Server Error`. A level above `LevelInfo` silences the request records
