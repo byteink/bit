@@ -313,6 +313,43 @@ if [ "$sigfail" -ne 0 ]; then
 fi
 echo "self-test: declared-signature table — 1 accepted, 6 refused"
 
+# --- 7377-bulk-spread-append: against the 0.39.0 oracle; retires at the next repin
+# #7377 lowers `append(dst, ...src)` to ONE `rt_call slice_append_slice`; the 0.39.0
+# oracle lowers it to a per-element loop whose back edge carries a poll. So every
+# spread the tree compiles has one poll fewer, in any module the file imports
+# (--dump-ir shows only the main module, so this reads the OBJECTS). Measured at
+# main 091e74450 on all 61 mismatching files: oracle bulk calls 0, polls lost ==
+# bulk calls in the tree, and per function lost polls == the function's bulk calls
+# (stdlib/cbor, stdlib/tls, pkg/web/openapi.bit, run_append_spread.bit,
+# decimal_collections.bit); no function lost a poll without a bulk call. The bulk
+# call is an ordinary call safepoint with its own stack map and is the only place
+# the move can collect (allocBuf, before any element moves), so no root is lost.
+# A MISSING poll beyond the bulk calls is NEVER explained (ABI.md 5).
+# explainSpreadDelta <seed> <self> <oracle_bulk_calls> <bit2_bulk_calls>
+explainSpreadDelta() {
+  [ "$(($1 - $2))" -gt 0 ] && [ "$3" -eq 0 ] && [ "$4" -eq "$(($1 - $2))" ] || return 1
+  echo "7377-bulk-spread-append"
+}
+spreadCalls() { objdump -r "$1" 2>/dev/null | grep -c 'bit_rt_slice_append_slice'; }
+spreadfail=0
+spreadcheck() { # $1=want ("" = refuse) $2=name, then the four explainSpreadDelta args
+  local got
+  got=$(explainSpreadDelta "$3" "$4" "$5" "$6")
+  [ "$got" = "$1" ] || { echo "FATAL: spread self-test '$2': got '$got', want '$1'" >&2; spreadfail=1; }
+}
+spreadcheck "7377-bulk-spread-append" "seven polls lost, seven bulk calls" 734 727 0 7
+spreadcheck "" "a poll lost beyond the bulk calls" 734 726 0 7
+spreadcheck "" "a bulk call that lost no poll" 734 727 0 8
+spreadcheck "" "an EXTRA poll is not this signature" 727 734 0 7
+spreadcheck "" "the oracle already bulk-appends" 734 727 7 7
+spreadcheck "" "equal counts" 5 5 0 0
+spreadcheck "" "polls lost with no bulk call" 734 727 0 0
+if [ "$spreadfail" -ne 0 ]; then
+  echo "FATAL: the spread signature is broken; EXPLAINED would be meaningless." >&2
+  exit 2
+fi
+echo "self-test: spread signature — 1 accepted, 6 refused"
+
 # safepointSignature <file> <seed_count> <self_count>
 # Dumps both compilers' POST-opt IR for one diverging file and asks the
 # signature table about it. Prints the signature name, or nothing when the
@@ -321,7 +358,11 @@ echo "self-test: declared-signature table — 1 accepted, 6 refused"
 sig_cap_oracle="$tmp/sig.oracle"
 sig_cap_bit2="$tmp/sig.bit2"
 safepointSignature() {
-  local rc
+  local rc sp
+  sp=$(explainSpreadDelta "$2" "$3" "$(spreadCalls "$tmp/a.o")" "$(spreadCalls "$tmp/b.o")") && {
+    echo "$sp"
+    return 0
+  }
   alarmrun_retry_cap ORACLE "" "$sig_cap_oracle" "$ORACLE" --dump-ir "$1"
   rc=$?
   if [ "$rc" -ne 0 ]; then
