@@ -17,20 +17,21 @@
 //
 //   * Scalar multiplication is a Montgomery ladder: every scalar bit drives the
 //     identical `add` + `double` pair, and the two accumulators are exchanged
-//     by a branchless masked select (`nistecCselNat`) rather than a data-
+//     by a branchless masked swap (`nistecSwapPt`) rather than a data-
 //     dependent swap or an indexed table lookup. The ladder runs a fixed number
 //     of iterations (`8 * field-byte-width`), so its control flow is independent
 //     of the scalar value.
 //
 // Constant-time scope. The ladder is constant-time *by construction* at the
-// algorithm level. The underlying field arithmetic, however, is the variable-
-// width `Nat` code (schoolbook multiply, then Solinas special-prime reduction),
-// whose running time still depends on operand limb counts. Machine-level
-// constant-time field arithmetic needs the fixed-width Montgomery reduction that
-// the bigint module documents as a later optimization; until then this module,
-// like the rest of `std/crypto`, is branch-safe but not timing-flat at the limb
-// level. Secret scalars are still protected from the classic branch/index
-// side channels; do not rely on it against a limb-timing adversary yet.
+// algorithm level, and its field arithmetic is the fixed-width Montgomery code
+// of `./bigintmont.bit` (#7567). The conversions into and out of the ladder,
+// the affine conversion and point decoding still use the variable-width `Nat`
+// code (schoolbook multiply, then Solinas special-prime reduction), whose
+// running time depends on operand limb counts, as does the scalar's own
+// normalized length. Until those move too this module, like the rest of
+// `std/crypto`, is branch-safe but not timing-flat at the limb level. Secret
+// scalars are still protected from the classic branch/index side channels; do
+// not rely on it against a limb-timing adversary yet.
 //
 // Field inversion (projective -> affine) and the modular square root used to
 // decompress a point both go through `bigintModExp`, i.e. Fermat's little
@@ -384,63 +385,151 @@ fn nistecParity(y: Nat): byte {
 // ---------------------------------------------------------------------------
 // Complete projective point addition (Renes-Costello-Batina, a = -3)
 // ---------------------------------------------------------------------------
+//
+// The point routines run on the fixed-width Montgomery workspace of
+// `./bigintmont.bit`: a coordinate is exactly `len(p)` limbs in Montgomery form
+// (`v*R mod p`), and every field operation writes into a preallocated buffer.
+// The variable-width `Nat` form allocated a fresh value per field operation,
+// about 48 KB per ladder step and 24.6 MB per ECDSA verification (#7567).
+// Montgomery form commutes with addition and subtraction, so only the constants
+// `a`, `3b` and the points entering or leaving the ladder are converted.
 
-// `P + Q` for any projective points `P`, `Q` (including identity, doubling, and
-// `P + (-P)`), via RCB Algorithm 1 with `a = c.a` and `b3 = 3b`. Every step is a
-// field add/subtract/multiply; the operation sequence is transcribed verbatim
-// from the reference formula, so the intermediates carry no geometric meaning on
-// their own.
+// The workspace one point operation or scalar multiplication runs in: the
+// Montgomery context for `p`, the curve constants `a` and `3b` in Montgomery
+// form, and the RCB temporaries. Built once per operation, never shared.
+class NistecWs {
+  m: MontCtx,
+  a: []u32,
+  b3: []u32,
+  t0: []u32,
+  t1: []u32,
+  t2: []u32,
+  t3: []u32,
+  t4: []u32,
+  t5: []u32,
+  x3: []u32,
+  y3: []u32,
+  z3: []u32,
+}
+
+// A projective point whose coordinates are fixed-width Montgomery forms.
+class MontPt { x: []u32, y: []u32, z: []u32 }
+
+// `Mont(v) = v*R mod p` as a fresh `len(p)`-limb value, for `v < p`.
+fn nistecToMont(m: MontCtx, v: Nat): []u32 {
+  let out = bigintWiden(v, len(m.n))
+  bigintMontMulTo(m, out, out, m.r2)
+  return out
+}
+
+// The normalized `Nat` that the Montgomery form `v` represents.
+fn nistecFromMont(m: MontCtx, v: []u32): Nat {
+  let out = []u32(len(m.n))
+  bigintMontMulTo(m, out, v, m.one)
+  return bigintMake(out)
+}
+
+// The workspace for curve `c`.
+fn nistecWsNew(c: Curve): NistecWs {
+  let m = bigintMontNew(c.p)
+  let k = len(m.n)
+  return NistecWs{
+    m = m,
+    a = nistecToMont(m, c.a),
+    b3 = nistecToMont(m, c.b3),
+    t0 = []u32(k),
+    t1 = []u32(k),
+    t2 = []u32(k),
+    t3 = []u32(k),
+    t4 = []u32(k),
+    t5 = []u32(k),
+    x3 = []u32(k),
+    y3 = []u32(k),
+    z3 = []u32(k),
+  }
+}
+
+// The Montgomery form of a projective point with reduced coordinates.
+fn nistecMontPt(m: MontCtx, P: Jac): MontPt {
+  return MontPt{ x = nistecToMont(m, P.x), y = nistecToMont(m, P.y), z = nistecToMont(m, P.z) }
+}
+
+// The projective point a Montgomery-form point represents.
+fn nistecJacOf(m: MontCtx, P: MontPt): Jac {
+  return Jac{ x = nistecFromMont(m, P.x), y = nistecFromMont(m, P.y), z = nistecFromMont(m, P.z) }
+}
+
+// `out = P + Q` for any projective points (including identity, doubling, and
+// `P + (-P)`), via RCB Algorithm 1 with `a = c.a` and `b3 = 3b`. The operation
+// sequence is transcribed verbatim from the reference formula, so the
+// intermediates carry no geometric meaning on their own. Every primitive may
+// alias its output with an input, and the result is built in the workspace
+// and copied last, so `out` may alias `P` or `Q`. Allocates nothing.
+fn nistecMontAdd(w: NistecWs, out: MontPt, P: MontPt, Q: MontPt) {
+  let m = w.m
+  let n = m.n
+  let t0 = w.t0
+  let t1 = w.t1
+  let t2 = w.t2
+  let t3 = w.t3
+  let t4 = w.t4
+  let t5 = w.t5
+  let X3 = w.x3
+  let Y3 = w.y3
+  let Z3 = w.z3
+
+  bigintMontMulTo(m, t0, P.x, Q.x)
+  bigintMontMulTo(m, t1, P.y, Q.y)
+  bigintMontMulTo(m, t2, P.z, Q.z)
+  bigintModAddTo(t3, P.x, P.y, n)
+  bigintModAddTo(t4, Q.x, Q.y, n)
+  bigintMontMulTo(m, t3, t3, t4)
+  bigintModAddTo(t4, t0, t1, n)
+  bigintModSubTo(t3, t3, t4, n)
+  bigintModAddTo(t4, P.x, P.z, n)
+  bigintModAddTo(t5, Q.x, Q.z, n)
+  bigintMontMulTo(m, t4, t4, t5)
+  bigintModAddTo(t5, t0, t2, n)
+  bigintModSubTo(t4, t4, t5, n)
+  bigintModAddTo(t5, P.y, P.z, n)
+  bigintModAddTo(X3, Q.y, Q.z, n)
+  bigintMontMulTo(m, t5, t5, X3)
+  bigintModAddTo(X3, t1, t2, n)
+  bigintModSubTo(t5, t5, X3, n)
+  bigintMontMulTo(m, Z3, w.a, t4)
+  bigintMontMulTo(m, X3, w.b3, t2)
+  bigintModAddTo(Z3, X3, Z3, n)
+  bigintModSubTo(X3, t1, Z3, n)
+  bigintModAddTo(Z3, t1, Z3, n)
+  bigintMontMulTo(m, Y3, X3, Z3)
+  bigintModAddTo(t1, t0, t0, n)
+  bigintModAddTo(t1, t1, t0, n)
+  bigintMontMulTo(m, t2, w.a, t2)
+  bigintMontMulTo(m, t4, w.b3, t4)
+  bigintModAddTo(t1, t1, t2, n)
+  bigintModSubTo(t2, t0, t2, n)
+  bigintMontMulTo(m, t2, w.a, t2)
+  bigintModAddTo(t4, t4, t2, n)
+  bigintMontMulTo(m, t0, t1, t4)
+  bigintModAddTo(Y3, Y3, t0, n)
+  bigintMontMulTo(m, t0, t5, t4)
+  bigintMontMulTo(m, X3, t3, X3)
+  bigintModSubTo(X3, X3, t0, n)
+  bigintMontMulTo(m, t0, t3, t1)
+  bigintMontMulTo(m, Z3, t5, Z3)
+  bigintModAddTo(Z3, Z3, t0, n)
+  nistecCopyLimbs(out.x, X3)
+  nistecCopyLimbs(out.y, Y3)
+  nistecCopyLimbs(out.z, Z3)
+}
+
+// `P + Q` on the variable-width form, for the one-off addition that combines
+// the two ECDSA verification products.
 fn nistecAdd(c: Curve, p1: Jac, p2: Jac): Jac {
-  let X1 = p1.x
-  let Y1 = p1.y
-  let Z1 = p1.z
-  let X2 = p2.x
-  let Y2 = p2.y
-  let Z2 = p2.z
-  let a = c.a
-  let b3 = c.b3
-
-  let t0 = nistecFeMul(c, X1, X2)
-  let t1 = nistecFeMul(c, Y1, Y2)
-  let t2 = nistecFeMul(c, Z1, Z2)
-  let t3 = nistecFeAdd(c, X1, Y1)
-  let t4 = nistecFeAdd(c, X2, Y2)
-  t3 = nistecFeMul(c, t3, t4)
-  t4 = nistecFeAdd(c, t0, t1)
-  t3 = nistecFeSub(c, t3, t4)
-  t4 = nistecFeAdd(c, X1, Z1)
-  let t5 = nistecFeAdd(c, X2, Z2)
-  t4 = nistecFeMul(c, t4, t5)
-  t5 = nistecFeAdd(c, t0, t2)
-  t4 = nistecFeSub(c, t4, t5)
-  t5 = nistecFeAdd(c, Y1, Z1)
-  let X3 = nistecFeAdd(c, Y2, Z2)
-  t5 = nistecFeMul(c, t5, X3)
-  X3 = nistecFeAdd(c, t1, t2)
-  t5 = nistecFeSub(c, t5, X3)
-  let Z3 = nistecFeMul(c, a, t4)
-  X3 = nistecFeMul(c, b3, t2)
-  Z3 = nistecFeAdd(c, X3, Z3)
-  X3 = nistecFeSub(c, t1, Z3)
-  Z3 = nistecFeAdd(c, t1, Z3)
-  let Y3 = nistecFeMul(c, X3, Z3)
-  t1 = nistecFeAdd(c, t0, t0)
-  t1 = nistecFeAdd(c, t1, t0)
-  t2 = nistecFeMul(c, a, t2)
-  t4 = nistecFeMul(c, b3, t4)
-  t1 = nistecFeAdd(c, t1, t2)
-  t2 = nistecFeSub(c, t0, t2)
-  t2 = nistecFeMul(c, a, t2)
-  t4 = nistecFeAdd(c, t4, t2)
-  t0 = nistecFeMul(c, t1, t4)
-  Y3 = nistecFeAdd(c, Y3, t0)
-  t0 = nistecFeMul(c, t5, t4)
-  X3 = nistecFeMul(c, t3, X3)
-  X3 = nistecFeSub(c, X3, t0)
-  t0 = nistecFeMul(c, t3, t1)
-  Z3 = nistecFeMul(c, t5, Z3)
-  Z3 = nistecFeAdd(c, Z3, t0)
-  return Jac{ x = X3, y = Y3, z = Z3 }
+  let w = nistecWsNew(c)
+  let P = nistecMontPt(w.m, p1)
+  nistecMontAdd(w, P, P, nistecMontPt(w.m, p2))
+  return nistecJacOf(w.m, P)
 }
 
 // The projective point at infinity, `(0:1:0)`.
@@ -449,46 +538,38 @@ fn nistecInfinity(): Jac {
 }
 
 // ---------------------------------------------------------------------------
-// Constant-time (branchless) selection and the scalar-multiplication ladder
+// Constant-time (branchless) swap and the scalar-multiplication ladder
 // ---------------------------------------------------------------------------
 
-// Branchless select of two `Nat`s: returns `a` when `v == 1` and `b` when
-// `v == 0`, with no branch on `v`. Both operands are zero-extended to a common
-// width and every limb is combined through the mask, so the memory access
-// pattern is independent of `v`; `bigintMake` re-normalizes the result. `v` must
-// be exactly 0 or 1.
-fn nistecCselNat(v: u32, a: Nat, b: Nat): Nat {
-  let mask = u32(0) - v
-  let la = len(a.limbs)
-  let lb = len(b.limbs)
-  let m = la
-  if (lb > m) {
-    m = lb
-  }
-  let out = []u32(m)
+// `dst = src`, limb by limb, for equal widths.
+fn nistecCopyLimbs(dst: []u32, src: []u32) {
   let i = 0
-  while (i < m) {
-    let av: u32 = 0
-    if (i < la) {
-      av = a.limbs[i]
-    }
-    let bv: u32 = 0
-    if (i < lb) {
-      bv = b.limbs[i]
-    }
-    out[i] = (av & mask) | (bv & ~mask)
+  while (i < len(dst)) {
+    dst[i] = src[i]
     i = i + 1
   }
-  return bigintMake(out)
 }
 
-// Branchless select of two projective points, coordinate by coordinate.
-fn nistecCselJac(v: u32, a: Jac, b: Jac): Jac {
-  return Jac{
-    x = nistecCselNat(v, a.x, b.x),
-    y = nistecCselNat(v, a.y, b.y),
-    z = nistecCselNat(v, a.z, b.z),
+// Exchange the equal-width `a` and `b` in place when `mask` is all ones and
+// leave them when it is zero. Every limb of both is rewritten through the mask,
+// so neither a branch nor the memory access pattern depends on it.
+fn nistecSwapLimbs(mask: u32, a: []u32, b: []u32) {
+  let i = 0
+  while (i < len(a)) {
+    let t = mask & (a[i] ^ b[i])
+    a[i] = a[i] ^ t
+    b[i] = b[i] ^ t
+    i = i + 1
   }
+}
+
+// Exchange the points `P` and `Q` in place when `v == 1`, with no branch on
+// `v`. `v` must be exactly 0 or 1.
+fn nistecSwapPt(v: u32, P: MontPt, Q: MontPt) {
+  let mask = u32(0) - v
+  nistecSwapLimbs(mask, P.x, Q.x)
+  nistecSwapLimbs(mask, P.y, Q.y)
+  nistecSwapLimbs(mask, P.z, Q.z)
 }
 
 // Bit `i` of `scalar` (0 or 1), reading past the top as 0.
@@ -501,28 +582,31 @@ fn nistecScalarBit(scalar: Nat, i: int): u32 {
 }
 
 // `scalar * base` by a Montgomery ladder over the complete addition formula.
-// Invariant: `R1 = R0 + base` throughout. Each iteration performs the same
-// add + double regardless of the scalar bit; the bit only drives two branchless
-// swaps, so the sequence of field operations is fixed by `c.bits`, not by the
-// scalar. A scalar of `c.bits` or more bits has its leading windows dropped,
-// which never happens for a valid scalar (`< n < 2^bits`).
+// Invariant: `R1 = R0 + base` throughout. Each iteration swaps the accumulators
+// so the active one is `R0`, computes `R0 + R1` and `2*R0`, and swaps back, so
+// the sequence of field operations is fixed by `c.bits`, not by the scalar,
+// and the bit only drives two masked swaps. A scalar of `c.bits` or more bits
+// has its leading bits dropped, which never happens for a valid scalar
+// (`< n < 2^bits`). The workspace and the three points are the only
+// allocations; a step allocates nothing.
 fn nistecLadder(c: Curve, base: Jac, scalar: Nat): Jac {
-  let R0 = nistecInfinity()
-  let R1 = base
+  let w = nistecWsNew(c)
+  let R0 = nistecMontPt(w.m, nistecInfinity())
+  let R1 = nistecMontPt(w.m, base)
+  let S = nistecMontPt(w.m, nistecInfinity())
   let i = c.bits - 1
   while (i >= 0) {
     let bit = nistecScalarBit(scalar, i)
-    // Conditionally swap so the "active" accumulator is `A`, add and double,
-    // then swap back — all without branching on `bit`.
-    let A = nistecCselJac(bit, R1, R0)
-    let B = nistecCselJac(bit, R0, R1)
-    let sum = nistecAdd(c, A, B)
-    let dbl = nistecAdd(c, A, A)
-    R0 = nistecCselJac(bit, sum, dbl)
-    R1 = nistecCselJac(bit, dbl, sum)
+    nistecSwapPt(bit, R0, R1)
+    nistecMontAdd(w, S, R0, R1)
+    nistecMontAdd(w, R0, R0, R0)
+    let t = R1
+    R1 = S
+    S = t
+    nistecSwapPt(bit, R0, R1)
     i = i - 1
   }
-  return R0
+  return nistecJacOf(w.m, R0)
 }
 
 // Convert a projective point to affine `(x, y) = (X/Z, Y/Z)`; a zero `Z` is the
