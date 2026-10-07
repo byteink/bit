@@ -227,16 +227,18 @@ fn gcmGhashSw(h: []u64, aad: []byte, ct: []byte): []u64 {
   return acc
 }
 
-// Fold every full 16-byte block of `data[0:n]` directly from the caller's
-// buffer into `state` under the key table `hk`, then zero-pad any trailing
-// partial block into the caller's 16-byte `spare` and fold it the same way —
-// the hardware mirror of `gcmAbsorb`, one `state = (state XOR block) * H`
-// step per block. `n` (at most `len(data)`) is passed rather than resliced
-// because a reslice allocates a header (#7487).
-fn gcmAbsorbHw(hk: []byte, state: []byte, data: []byte, n: int, spare: []byte) {
+// Fold every full 16-byte block of `data[off:off + n]` directly from the
+// caller's buffer into the GHASH state `w.s` under the key table `hk`, then
+// zero-pad any trailing partial block into `w.spare` and fold it the same
+// way — the hardware mirror of `gcmAbsorb`, one `state = (state XOR block) *
+// H` step per block. `off` and `n` (`off + n` at most `len(data)`) are passed
+// rather than resliced because a reslice allocates a header (#7487).
+fn gcmAbsorbHw(w: gcmScratch, hk: []byte, data: []byte, off: int, n: int) {
+  let state = w.s
+  let spare = w.spare
   let full = n / 16
   if (full > 0) {
-    bit_rt_ghash_hw_blocks_keyed(ptrOf(hk), ptrOf(state), ptrOf(data), u64(full))
+    bit_rt_ghash_hw_blocks_keyed(ptrOf(hk), ptrOf(state), ptrOf(data) + off, u64(full))
   }
   let rem = n - full * 16
   if (rem > 0) {
@@ -244,7 +246,7 @@ fn gcmAbsorbHw(hk: []byte, state: []byte, data: []byte, n: int, spare: []byte) {
     while (i < 16) {
       spare[i] = 0
       if (i < rem) {
-        spare[i] = data[full * 16 + i]
+        spare[i] = data[off + full * 16 + i]
       }
       i = i + 1
     }
@@ -256,29 +258,46 @@ fn gcmAbsorbHw(hk: []byte, state: []byte, data: []byte, n: int, spare: []byte) {
   keepAlive(spare)
 }
 
-// GHASH_H(aad, ct[0:n]) into the 16-byte `s`, the hardware carry-less-multiply
-// mirror of `gcmGhashSw`: same recurrence, checked against it by the
-// differential in _tests_/imports/cryptogcm. Folds AAD then the ciphertext
-// (each independently block-padded, per GCM's own definition), then the
-// length block from `w.spare`, all via `bit_rt_ghash_hw_blocks_keyed` under
-// the key table `hk`, into `w.s`. `w` is caller scratch, so the call
-// allocates nothing of its own.
+// GHASH_H(aad, ct[0:n]) into the 16-byte `w.s`, the hardware
+// carry-less-multiply mirror of `gcmGhashSw`: same recurrence, checked
+// against it by the differential in _tests_/imports/cryptogcm. Folds AAD then
+// the ciphertext (each independently block-padded, per GCM's own definition),
+// then the length block, all via `bit_rt_ghash_hw_blocks_keyed` under the key
+// table `hk`. `w` is caller scratch, so the call allocates nothing of its own.
 fn gcmGhashHw(w: gcmScratch, hk: []byte, aad: []byte, ct: []byte, n: int) {
-  let s = w.s
-  let spare = w.spare
+  gcmGhashZero(w)
+  gcmAbsorbHw(w, hk, aad, 0, len(aad))
+  gcmAbsorbHw(w, hk, ct, 0, n)
+  gcmGhashLengths(w, hk, len(aad), n)
+}
+
+// `gcmGhashHw` over one frame: the AAD is `frame[0:aadLen]` and the
+// ciphertext the `n` bytes after it (`AesGcm.sealFrame`, #7560).
+fn gcmGhashFrame(w: gcmScratch, hk: []byte, frame: []byte, aadLen: int, n: int) {
+  gcmGhashZero(w)
+  gcmAbsorbHw(w, hk, frame, 0, aadLen)
+  gcmAbsorbHw(w, hk, frame, aadLen, n)
+  gcmGhashLengths(w, hk, aadLen, n)
+}
+
+// Clear the GHASH state `w.s` before the first fold.
+fn gcmGhashZero(w: gcmScratch) {
   let i = 0
   while (i < 16) {
-    s[i] = 0
+    w.s[i] = 0
     i = i + 1
   }
-  gcmAbsorbHw(hk, s, aad, len(aad), spare)
-  gcmAbsorbHw(hk, s, ct, n, spare)
-  gcmStoreWord(spare, 0, u64(len(aad)) * 8)
-  gcmStoreWord(spare, 8, u64(n) * 8)
-  bit_rt_ghash_hw_blocks_keyed(ptrOf(hk), ptrOf(s), ptrOf(spare), 1)
+}
+
+// Fold GHASH's closing block, the AAD and ciphertext bit lengths, into
+// `w.s`, built in `w.spare`.
+fn gcmGhashLengths(w: gcmScratch, hk: []byte, aadLen: int, n: int) {
+  gcmStoreWord(w.spare, 0, u64(aadLen) * 8)
+  gcmStoreWord(w.spare, 8, u64(n) * 8)
+  bit_rt_ghash_hw_blocks_keyed(ptrOf(hk), ptrOf(w.s), ptrOf(w.spare), 1)
   keepAlive(hk)
-  keepAlive(spare)
-  keepAlive(s)
+  keepAlive(w.spare)
+  keepAlive(w.s)
 }
 
 // GHASH_H(aad, ct[0:n]) into `w.s`: the ARM64 PMULL hardware path when
@@ -378,6 +397,62 @@ fn gcmGctrHw(out: []byte, cipher: Aes, w: gcmScratch, data: []byte) {
   keepAlive(cipher.roundKeys)
   keepAlive(data)
   keepAlive(out)
+}
+
+// GCTR for `AesGcm.sealFrame` on hardware AES, part one: the whole blocks of
+// `body` enciphered straight into `frame` at `off` in one
+// `bit_rt_crypto_aes_ctr32_hw` call, so the body is never copied into place
+// first, then its last `len(body) % 16` bytes moved into the frame for
+// `gcmGctrInPlace` to encipher with whatever follows them. Arguments
+// otherwise as `gcmGctrHw`.
+fn gcmGctrBody(frame: []byte, off: int, cipher: Aes, w: gcmScratch, body: []byte) {
+  let done = len(body) / 16 * 16
+  if (done > 0) {
+    w.blk[16] = byte(cipher.nr)
+    let src = ptrOf(body)
+    bit_rt_crypto_aes_ctr32_hw(
+      ptrOf(cipher.roundKeys),
+      ptrOf(w.blk),
+      src,
+      ptrOf(frame) + off,
+      done / 16,
+    )
+    keepAlive(w.blk)
+  }
+  let i = done
+  while (i < len(body)) {
+    frame[off + i] = body[i]
+    i = i + 1
+  }
+  keepAlive(cipher.roundKeys)
+  keepAlive(body)
+  keepAlive(frame)
+}
+
+// GCTR in place over `frame[from:end]`, continuing the counter in `w.ctr`:
+// whole blocks in one `bit_rt_crypto_aes_ctr32_hw` call, then the partial
+// last block against one keystream block in `w.spare`. Offsets rather than a
+// view, since a reslice allocates a header (#7487).
+fn gcmGctrInPlace(frame: []byte, from: int, end: int, cipher: Aes, w: gcmScratch) {
+  let full = (end - from) / 16
+  if (full > 0) {
+    w.blk[16] = byte(cipher.nr)
+    let p = ptrOf(frame) + from
+    bit_rt_crypto_aes_ctr32_hw(ptrOf(cipher.roundKeys), ptrOf(w.blk), p, p, full)
+    keepAlive(w.blk)
+    from = from + full * 16
+  }
+  if (from < end) {
+    cipher.encryptBlockInto(w.spare, w.ctr)
+    gcmInc32(w.ctr)
+  }
+  let k = 0
+  while (from + k < end) {
+    frame[from + k] = frame[from + k] ^ w.spare[k]
+    k = k + 1
+  }
+  keepAlive(cipher.roundKeys)
+  keepAlive(frame)
 }
 
 // GCTR keystream into `out` (its first `len(data)` bytes; `out` may be
@@ -489,6 +564,15 @@ fn gcmScratchGive(g: AesGcm, w: gcmScratch) {
   }
 }
 
+// The tag, GHASH (`w.s`) XOR AES_K(J0) (`w.ej0`), into `dst[at:at + 16]`.
+fn gcmTagInto(dst: []byte, at: int, w: gcmScratch) {
+  let k = 0
+  while (k < 16) {
+    dst[at + k] = w.s[k] ^ w.ej0[k]
+    k = k + 1
+  }
+}
+
 // The plaintext length of a sealed `ciphertext`: its length less the 16-byte
 // tag, or 0 when it is too short to carry one (`openInto` then fails).
 fn gcmPlainLen(ciphertext: []byte): int {
@@ -560,11 +644,35 @@ export class AesGcm {
     gcmCounterAfter(w.ctr, w.j0)
     gcmGctrInto(dst, this.cipher, w, plaintext)
     gcmGhash(w, this, aad, dst, n)
-    let k = 0
-    while (k < 16) {
-      dst[n + k] = w.s[k] ^ w.ej0[k]
-      k = k + 1
+    gcmTagInto(dst, n, w)
+    gcmScratchGive(this, w)
+  }
+
+  // `sealInto` for a message framed in one buffer, its body read from the
+  // caller's `body` instead of being copied into place first.
+  // `frame[0:aadLen]` is the AAD; the `n`-byte plaintext is `body` followed
+  // by the `n - len(body)` bytes already at `frame[aadLen + len(body):aadLen +
+  // n]`; `ciphertext ‖ tag` overwrites `frame[aadLen:aadLen + n + 16]`.
+  // `body` may be `frame[aadLen:aadLen + len(body)]` to seal in place; any
+  // other overlap with the bytes written panics. On hardware AES and GHASH
+  // the body is enciphered straight from `body` and nothing is allocated.
+  // Same nonce rules and panics as `seal`.
+  export sealFrame(frame: []byte, aadLen: int, nonce: []byte, body: []byte, n: int) {
+    aeadFrameCheck(frame, aadLen, body, n)
+    if (!this.pmull || !(this.cipher.hw || bit_rt_crypto_aes_hw_available())) {
+      aeadFrameFill(frame, aadLen, body)
+      this.sealInto(frame[aadLen:aadLen + n + 16], nonce, frame[aadLen:aadLen + n], frame[0:aadLen])
+      return
     }
+    assert(len(nonce) == 12, "gcm.sealFrame: nonce must be 12 bytes")
+    let w = gcmScratchTake(this)
+    gcmJ0Into(w.j0, nonce)
+    this.cipher.encryptBlockInto(w.ej0, w.j0)
+    gcmCounterAfter(w.ctr, w.j0)
+    gcmGctrBody(frame, aadLen, this.cipher, w, body)
+    gcmGctrInPlace(frame, aadLen + len(body) / 16 * 16, aadLen + n, this.cipher, w)
+    gcmGhashFrame(w, this.hk, frame, aadLen, n)
+    gcmTagInto(frame, aadLen + n, w)
     gcmScratchGive(this, w)
   }
 
