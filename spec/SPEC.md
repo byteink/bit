@@ -4939,7 +4939,10 @@ Method sets:
   (#7327).** A class with value semantics (below) has three synthesized
   methods, written per class as Bit text and checked like a declared method:
   `__sameValue(other: C): bool`, `__valueHash(): u64` and `__snapshot(): C`.
-  `__sameValue` is structural equality over every field in declaration order; a
+  `__sameValue` is structural equality over every field in declaration order,
+  except a relation field (`@hasMany`, `@hasOne`, `@belongsTo`, `@manyToMany`,
+  §10.5), which is no part of the value of a row and is neither compared,
+  hashed nor copied (a snapshot's relation field is unloaded; #7563); a
   slice is equal when the lengths match and the elements are equal pairwise, a
   map when the lengths match and every key of one is in the other with an equal
   value, an `Option<T>` when both are `None` or both are `Some` of equal
