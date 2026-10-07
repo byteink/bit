@@ -313,14 +313,6 @@ if [ "$sigfail" -ne 0 ]; then
 fi
 echo "self-test: declared-signature table — 1 accepted, 6 refused"
 
-# The two signatures that read the OBJECTS -- 7377-bulk-spread-append and
-# 7482-aliased-generic-instance-methods -- and their self-tests, in
-# scripts/safepoint-signatures.sh (this file reached the 800-line ceiling).
-# shellcheck source=scripts/safepoint-signatures.sh
-. "$(dirname -- "$0")/safepoint-signatures.sh"
-spreadSelfTests || exit 2
-instSelfTests || exit 2
-
 # safepointSignature <file> <seed_count> <self_count>
 # Dumps both compilers' POST-opt IR for one diverging file and asks the
 # signature table about it. Prints the signature name, or nothing when the
@@ -329,15 +321,7 @@ instSelfTests || exit 2
 sig_cap_oracle="$tmp/sig.oracle"
 sig_cap_bit2="$tmp/sig.bit2"
 safepointSignature() {
-  local rc sp
-  sp=$(explainSpreadDelta "$2" "$3" "$(spreadCalls "$tmp/a.o")" "$(spreadCalls "$tmp/b.o")") && {
-    echo "$sp"
-    return 0
-  }
-  sp=$(explainInstanceDelta "$tmp/a.o" "$tmp/b.o" "$2" "$3") && {
-    echo "$sp"
-    return 0
-  }
+  local rc
   alarmrun_retry_cap ORACLE "" "$sig_cap_oracle" "$ORACLE" --dump-ir "$1"
   rc=$?
   if [ "$rc" -ne 0 ]; then
