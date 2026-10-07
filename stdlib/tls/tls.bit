@@ -266,7 +266,7 @@ class tlsapiFramer {
 // `TlsConn` wrap either endpoint.
 interface tlsapiSealer {
   sealApp(plaintext: []byte): []byte!,
-  sealAppInto(dst: []byte, plaintext: []byte): int!,
+  sealAppInto(dst: []byte, src: []byte, lo: int, hi: int): int!,
   openApp(record: []byte): RecordPlaintext!,
   openAppInPlace(record: []byte): RecordPlaintext!,
   alpnProtocol(): string,
@@ -296,9 +296,11 @@ export class TlsConn {
   alpn: string
   peerCerts: [][]byte
   plain: []byte
-  // The outbound record buffer `write` seals every record into and writes
-  // from, allocated on the first `write` and reused by every later one.
+  // The outbound record buffer `write` seals every record into, allocated on
+  // the first `write` and reused, and `wrec`, the view of it the last record
+  // went out from: a reslice allocates, and full records share one length.
   wbuf: []byte
+  wrec: []byte
   closed: bool
   timedOut: bool
   // Server-accept-side deferred handshake (#5916): `handshakeDone` is true for
@@ -415,8 +417,11 @@ export class TlsConn {
       if (end > len(b)) {
         end = len(b)
       }
-      let n = this.sealer.sealAppInto(this.wbuf, b[pos:end])?
-      this.framer.connWriteBytes(this.wbuf[0:n])?
+      let n = this.sealer.sealAppInto(this.wbuf, b, pos, end)?
+      if (len(this.wrec) != n) {
+        this.wrec = this.wbuf[0:n]
+      }
+      this.framer.connWriteBytes(this.wrec)?
       pos = end
     }
   }
@@ -726,74 +731,23 @@ fn tlsapiDriveClient(f: tlsapiFramer, config: TlsClientConfig): TlsClientConn! {
 // the caller closes the socket (RFC 8446 §6.2: "both parties MUST immediately
 // close the connection" after transmitting or receiving one). An untagged `e`
 // sends nothing — see `tlsapiDriveClient`'s doc comment for why that is
-// deliberate, not a gap. Sealing can itself fail only if `h.clientHsKeys` rejects
-// the 2-byte alert body, which RFC 8446 §5.2's 2^14-byte cap never does; that
-// case, like a failed write, is swallowed rather than surfacing, for the same
-// reason `tlsapiSendAlert` swallows a write failure: this is a secondary,
-// best-effort send and must never replace or block the caller's own handshake
-// error.
+// deliberate, not a gap. Before `h.clientHsKeys` is derived there is no key to
+// seal under, so nothing is sent (#7561). Sealing can itself fail only if the
+// keys reject the 2-byte alert body, which RFC 8446 §5.2's 2^14-byte cap never
+// does; that case, like a failed write, is swallowed rather than surfacing, for
+// the same reason `tlsapiSendAlert` swallows a write failure: this is a
+// secondary, best-effort send and must never replace or block the caller's own
+// handshake error.
 fn tlsapiSendClientAlert(f: tlsapiFramer, h: TlsClientHandshake, e: error) {
   let (tagged, ok) = e.(tlsAlertFail)
   if (!ok) {
     return
   }
-  let alert = tlsAlertSealedRecord(h.clientHsKeys, tagged.desc) catch _ {
+  let keys = clientKeys(h.clientHsKeys) catch _ {
+    return
+  }
+  let alert = tlsAlertSealedRecord(keys, tagged.desc) catch _ {
     return
   }
   tlsapiSendAlert(f.conn, alert)
 }
-
-// Gather one complete server flight off the stream. The ServerHello is the first
-// non-CCS record; a HelloRetryRequest ends the flight there, and so does a
-// plaintext alert in that same slot (#2319) — a server that rejects the
-// ClientHello before any handshake key exists (no ALPN protocol in common, an
-// unsupported version, ...) sends its alert instead of a ServerHello and then
-// closes, so waiting for more bytes there would misreport the alert as a
-// mid-record truncation instead of ever handing it to the caller to decode.
-// Otherwise the encrypted authentication flight follows, and the flight is
-// complete once at least one encrypted record has been read and nothing more is
-// buffered — the server has sent its whole flight and is now waiting for the
-// client, so reading on would block. Bounded by a record budget.
-fn tlsapiReadServerFlight(f: tlsapiFramer): []byte! {
-  let flight = []byte(0)
-  let sawHello = false
-  let encCount = 0
-  let guard = 0
-  while (guard < 64) {
-    guard = guard + 1
-    let rec = f.nextRecord()?
-    flight = tlsHsPutBytes(flight, rec)
-    let t = tlsWireRecordType(rec)
-    if (t == tlsCcsType) {
-      continue
-    }
-    if (!sawHello) {
-      sawHello = true
-      if (t == recordAlert) {
-        return flight
-      }
-      if (tlsapiIsHelloRetry(rec)) {
-        return flight
-      }
-      continue
-    }
-    if (t == recordApplicationData) {
-      encCount = encCount + 1
-    }
-    if (encCount >= 1 && !f.hasBuffered()) {
-      return flight
-    }
-  }
-  fail newError("tls: server flight exceeded the record bound")
-}
-
-// Whether a plaintext handshake record carries a HelloRetryRequest. A record
-// that does not parse as a ServerHello is treated as "not a retry" so the state
-// machine, not the framer, produces the precise error.
-fn tlsapiIsHelloRetry(rec: []byte): bool {
-  let sh = parseServerHello(tlsWireRecordBody(rec)) catch _ {
-    return false
-  }
-  return isHelloRetryRequest(sh)
-}
-

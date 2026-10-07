@@ -845,6 +845,33 @@ fn sealFrame(c: AesGcm, nonce: []byte, msg: []byte, frame: []byte): []byte {
 }
 ```
 
+### `AesGcm.sealFrame(frame: []byte, aadLen: int, nonce: []byte, body: []byte, n: int)`
+
+A framed protocol sends `header ‖ ciphertext ‖ tag`, with the header as the
+AAD. With `sealInto` the sender first copies the message body into the frame
+and then slices the frame three ways, and each slice is an allocation.
+`sealFrame` takes the frame and offsets instead: `frame[0:aadLen]` is the
+AAD, the `n`-byte plaintext is `body` followed by the `n - len(body)` bytes
+already at `frame[aadLen + len(body):aadLen + n]`, and `ciphertext ‖ tag`
+overwrites `frame[aadLen:aadLen + n + 16]`. `body` may be
+`frame[aadLen:aadLen + len(body)]` to seal in place; any other overlap with
+the bytes written panics, as does a frame too short to hold the AAD, the
+plaintext and the tag. The nonce rules and panics are those of `seal`.
+
+```bit
+import { AesGcm } from "std/crypto"
+
+// Seal `msg` behind a 2-byte length header, with a type byte after it.
+fn sealTyped(c: AesGcm, nonce: []byte, msg: []byte, frame: []byte): int {
+  let n = len(msg) + 1
+  frame[0] = byte(n >> 8)
+  frame[1] = byte(n)
+  frame[2 + len(msg)] = 0x17
+  c.sealFrame(frame, 2, nonce, msg, n)
+  return 2 + n + c.overhead()
+}
+```
+
 ### `AesGcm.openInto(dst: []byte, nonce: []byte, ciphertext: []byte, aad: []byte): ()!`
 
 `open` allocates a new slice for every message. `openInto` writes the
@@ -923,6 +950,33 @@ fn sealFrame(c: ChaChaPoly, nonce: []byte, msg: []byte, frame: []byte): []byte {
   let out = frame[0:len(msg) + c.overhead()]
   c.sealInto(out, nonce, msg, []byte(0))
   return out
+}
+```
+
+### `ChaChaPoly.sealFrame(frame: []byte, aadLen: int, nonce: []byte, body: []byte, n: int)`
+
+A framed protocol sends `header ‖ ciphertext ‖ tag`, with the header as the
+AAD. With `sealInto` the sender first copies the message body into the frame
+and then slices the frame three ways, and each slice is an allocation.
+`sealFrame` takes the frame and offsets instead: `frame[0:aadLen]` is the
+AAD, the `n`-byte plaintext is `body` followed by the `n - len(body)` bytes
+already at `frame[aadLen + len(body):aadLen + n]`, and `ciphertext ‖ tag`
+overwrites `frame[aadLen:aadLen + n + 16]`. `body` may be
+`frame[aadLen:aadLen + len(body)]` to seal in place; any other overlap with
+the bytes written panics, as does a frame too short to hold the AAD, the
+plaintext and the tag. The nonce rules and panics are those of `seal`.
+
+```bit
+import { ChaChaPoly } from "std/crypto"
+
+// Seal `msg` behind a 2-byte length header, with a type byte after it.
+fn sealTyped(c: ChaChaPoly, nonce: []byte, msg: []byte, frame: []byte): int {
+  let n = len(msg) + 1
+  frame[0] = byte(n >> 8)
+  frame[1] = byte(n)
+  frame[2 + len(msg)] = 0x17
+  c.sealFrame(frame, 2, nonce, msg, n)
+  return 2 + n + c.overhead()
 }
 ```
 
