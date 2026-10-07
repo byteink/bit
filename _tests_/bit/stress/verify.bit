@@ -204,33 +204,20 @@ fn runMsg(r: int): string {
 // only moves the same failure to a higher load; it does not remove it.
 //
 // So the DEADLINE ITSELF scales with observed load, sampled fresh before every
-// bounded subprocess. `loadProbe` shells out to `uptime`/`getconf` (the same
-// idiom `scripts/arm64gate.sh` already uses for its own load reading) and turns
+// bounded subprocess. `loadProbe` (`_tests_/bit/loadscale/loadscale.bit`) turns
 // load-average-over-core-count into an integer multiplier, capped at
-// `loadScaleCap` so the bound stays a bound rather than becoming unbounded. At
-// an idle-relative load (at or under the core count) the multiplier is 1 and
-// the wall is exactly what it always was — this is a SCALE, not a raise: a
-// program whose own baseline runtime already exceeds the wall on a quiet host
-// (tracked separately, #2210) is not rescued by this, and must not be — that
-// is a different defect with a different, already-decided fix (a per-program
-// override, #2695/#2696), not something this ticket may paper over.
-const loadScaleCap: int = 8
-
-// The probe is local and near-instant (`uptime`, `getconf`, one `awk`); it gets
-// a small FIXED bound of its own, never `cx.timeoutMs` — a probe that could
-// itself hang would defeat the exact thing it exists to protect.
-const loadProbeTimeoutMs: int = 5000
-
-// One load sample: the multiplier `runScript` applies to the base deadline, and
-// the raw load-average text for the TIMED OUT message. Never fatal to obtain —
-// any failure of the probe (missing `uptime`/`getconf`, malformed output, the
-// probe itself timing out) falls back to `scale: 1`, exactly the pre-#2401
-// fixed wall, so a broken PROBE can only ever fail closed to the old behaviour,
-// never open into an unbounded one.
-class LoadProbe { scale: int, text: string }
+// `loadScaleCap` so the bound stays a bound rather than becoming unbounded; any
+// probe failure falls back to scale 1, the pre-#2401 fixed wall, so a broken
+// PROBE can only ever fail closed. At an idle-relative load (at or under the
+// core count) the multiplier is 1 and the wall is exactly what it always was —
+// this is a SCALE, not a raise: a program whose own baseline runtime already
+// exceeds the wall on a quiet host (tracked separately, #2210) is not rescued
+// by this, and must not be — that is a different defect with a different,
+// already-decided fix (a per-program override, #2695/#2696), not something this
+// ticket may paper over.
 
 // A strict unsigned-decimal parse: any non-digit, or an empty string, is -1
-// rather than a partial value silently accepted — a load probe that starts
+// rather than a partial value silently accepted — a rescale line that starts
 // returning garbage must fall back to scale 1, not misparse into a wild one.
 fn parseIntStrict(s: string): int {
   if (len(s) == 0) {
@@ -248,80 +235,6 @@ fn parseIntStrict(s: string): int {
   return v
 }
 
-// The ONE file this probe execve()s, and its content never varies: `sh
-// <body>`. It is created once per scratch dir - which `buildBaseCtx`
-// (stress.bit) makes unique per run - and never rewritten, because macOS
-// SIGKILLs the exec of an already-validated inode that has since been
-// rewritten in place (#4713 measured 0.06% per exec; #4714 saw it latch).
-// At this site that death is exit 137 with empty stdout, which reads as a
-// stress failure.
-//
-// The probe body it names stays pure DATA: `sh <path>` reads and interprets
-// that path rather than execve()ing it (#3778, `driverScript` in
-// gatefanout.bit), so rewriting the body on every call is harmless and the
-// body needs no executable bit.
-fn probeLauncher(runPath: string, scriptPath: string): bool {
-  if (fsExists(runPath)) {
-    return true
-  }
-  if (!writeText(runPath, "#!/bin/sh\nexec sh " + shQuote(scriptPath) + "\n")) {
-    return false
-  }
-  return fsChmod(runPath, 493) == 0 // 0o755
-}
-
-fn loadProbe(cx: Ctx): LoadProbe {
-  let fallback = LoadProbe{ scale = 1, text = "unknown" }
-  let outPath = cx.scratch + "/loadprobe.out"
-  let scriptPath = cx.scratch + "/loadprobe.sh"
-  let runPath = cx.scratch + "/loadprobe.run.sh"
-  // `getconf _NPROCESSORS_ONLN` and `uptime`'s load-average field are both
-  // POSIX-portable across macOS and Linux; `load averages*:` (zero or more
-  // literal 's') matches macOS's plural "averages:" and Linux's singular
-  // "average:" in one pattern, and the `[ ,]+` field split absorbs Linux's
-  // comma-separated triple so the first field never carries a trailing comma.
-  // Any parse failure on either side falls back to a safe default (1 core, 0
-  // load) rather than aborting - a mangled reading must scale DOWN toward the
-  // old fixed behaviour, never up into something unverifiable.
-  let body = "#!/bin/sh\n" +
-    "cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null)\n" +
-    "case \"$cores\" in ''|*[!0-9]*) cores=1 ;; esac\n" +
-    "load=$(uptime 2>/dev/null | sed -n 's/.*load averages*: *//p' | awk -F'[ ,]+' '{print $1}')\n" +
-    "case \"$load\" in ''|*[!0-9.]*) load=0 ;; esac\n" +
-    "awk -v l=\"$load\" -v c=\"$cores\" -v cap=" +
-    num(loadScaleCap) +
-    " 'BEGIN{r=l/c; s=int(r); if(r>s)s++; if(s<1)s=1; if(s>cap)s=cap; printf \"%d %s\\n\", s, l}' > " +
-    shQuote(outPath) +
-    "\n"
-  if (!writeText(scriptPath, body)) {
-    return fallback
-  }
-  if (!probeLauncher(runPath, scriptPath)) {
-    return fallback
-  }
-  if (osRunBounded(runPath, loadProbeTimeoutMs) != 0) {
-    return fallback
-  }
-  let t = readText(outPath)
-  if (!t.ok) {
-    return fallback
-  }
-  let line = trim(t.body)
-  let sp = indexOfAt(line, " ", 0)
-  if (sp < 0) {
-    return fallback
-  }
-  let scale = parseIntStrict(line[0:sp])
-  if (scale < 1) {
-    return fallback
-  }
-  let text = trim(line[sp + 1:])
-  if (len(text) == 0) {
-    text = "unknown"
-  }
-  return LoadProbe{ scale = scale, text = text }
-}
-
 // Write `body` as an executable `/bin/sh` script and run it under a deadline
 // scaled by CURRENTLY observed host load (#2401). A timeout is reported here,
 // once, with the scale and the load average that produced the deadline - every
@@ -337,8 +250,8 @@ fn runScript(cx: Ctx, path: string, body: string): (int, int) {
   if (fsChmod(path, 493) != 0) {
     die("cannot chmod wrapper script " + path)
   }
-  let probe = loadProbe(cx)
-  let effMs = cx.timeoutMs * probe.scale
+  let probe = loadProbe()
+  let effMs = scaledBudgetMs(cx.timeoutMs, probe)
   if (effMs > clampTimeoutMs) {
     effMs = clampTimeoutMs
   }
