@@ -4976,6 +4976,16 @@ Method sets:
   `__snapshot`. **E0313**: one of the three is called on a class that has no
   such member; the message names the first field, in declaration order, whose
   type has no value semantics.
+- **Reserved top-level names (E0314, #7564).** A top-level `fn`, `class`,
+  `interface`, `enum`, `type`, `let` or `const` whose name starts with `__`, and
+  an import alias that does (`import { a as __a }`), is **E0314**: the prefix
+  belongs to the code the compiler synthesizes into a module (`__Json`,
+  `__json_dec_C`, `__sql_row_C`), which a user declaration of the same name
+  would collide with. An `extern fn` is exempt (it names a C or OS symbol,
+  `__error`), as is every module of the standard library, which declares the
+  helpers synthesized code calls. A name inside a function body and the members
+  `__field`, `__sameValue`, `__valueHash` and `__snapshot` of a class are not
+  top-level names and stay legal.
 - `S` must be a **class or enum** type (or another interface, or `nil`). An
   interface value *is* the receiver's object pointer - there is no boxed
   scalar - so only a type that is already a reference (§13.3) can sit behind
