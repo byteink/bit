@@ -6184,7 +6184,10 @@ symbol's doc comment lines, `"\n"`-joined, or `""` when it has none:
 **`--fields`** (off by default) additionally reports each exported class's own
 fields, in declaration order, as the extra kind `field` with name `Recv.field`
 (for example `Point.x`); it changes neither form's shape for a module whose
-classes report no fields this way.
+classes report no fields this way. Fields are reported whether or not they
+carry `export`; in the plain form a field without `export` is printed as
+`private field Recv.field <type>`, so a consumer that wants only the fields
+other modules can read keeps the lines that start with `field`.
 
 ### 17.9 Package Workspace
 
