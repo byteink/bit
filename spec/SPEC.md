@@ -1214,6 +1214,10 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
 - The compiler resolves `Json`/`JsonEntry`, the names the member is written
   in terms of, itself, loading `"std/json"` as an implicit dependency - no
   import is required (#6244); **E0142** needs `BIT_IMPLICIT_SYNTH_IMPORTS=0`.
+  The member is written against reserved local aliases (`__Json`, `__JsonEntry`),
+  so a `Json` the module declares or imports itself is never touched, and the
+  compiler's import does not bind `Json`/`JsonEntry` for the module's own code:
+  code that names either imports it from `"std/json"` (#7558).
 - **The mark is opt-in and it is the consent.** A class without `@json` has no
   `toJson` at all. Synthesizing for every class would expose a field the moment
   someone adds one to a type nobody meant to serialize.
