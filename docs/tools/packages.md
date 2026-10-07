@@ -191,6 +191,16 @@ content-addressed by commit. A warm cache means a fully locked build never
 touches the network, and every cache hit is re-verified against the locked
 commit before use. Set `BIT_PKG_CACHE` to use a different cache root.
 
+## Network failures
+
+A `git ls-remote` or `git fetch` that fails for a transient reason (a timeout,
+a refused or reset connection, a DNS failure, an HTTP 5xx or 429) is tried up
+to three times, waiting about 0.5 s and then about 1 s, each wait lengthened by
+up to half again at random. Every retry prints one line to stderr naming the
+operation and git's message. An authentication failure or a missing repository
+fails on the first attempt, and a failure that survives the third attempt is
+reported as the error.
+
 ## Importing a dependency
 
 A bare import name - anything that isn't `std/...` or a relative `./`/`../`
