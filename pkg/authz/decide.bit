@@ -39,12 +39,15 @@ const guestRole: string = "guest"
 const noAllowRule: string = "no matching allow rule"
 
 // The outcome of one decision. `invalid` means `reason` is an InvalidPolicy
-// detail and the answer is a refusal made because a rule is broken.
+// detail and the answer is a refusal made because a rule is broken; `down`
+// means the relationship store failed and the answer is a refusal `check`
+// reports as StoreUnavailable.
 class Decision {
   allowed: bool,
   policy: string,
   reason: string,
   invalid: bool,
+  down: bool,
 }
 
 // What was found when a rule was last checked: 1 valid, 2 faulty; `resource`
@@ -144,7 +147,7 @@ class DecideState<A: ActionEnum> {
   // `can` makes. A valid verdict is cached as `verdict` caches it; a faulty
   // rule is left for `firstFault` to report and log in the decision's own
   // order. Rules of one policy are contiguous, so `k` is a rule's position.
-  allValidLocked(resources: []ResourceInfo, rules: []Rule<A>): bool {
+  allValidLocked(reg: Registry<A>, rules: []Rule<A>): bool {
     let prev = ""
     let k = 0
     for r of rules {
@@ -153,7 +156,7 @@ class DecideState<A: ActionEnum> {
         k = 0
       }
       let code = this.lookupLocked(r, k)
-      if (code == 0 && ruleFault<A>(resources, r) == "") {
+      if (code == 0 && ruleFault<A>(reg.resources, reg.decls, r) == "") {
         code = 1
         let _ = this.storeLocked(r, k, code)
       }
@@ -172,7 +175,7 @@ class DecideState<A: ActionEnum> {
     if (code != 0) {
       return code
     }
-    let why = ruleFault<A>(reg.resources, r)
+    let why = ruleFault<A>(reg.resources, reg.decls, r)
     code = 1
     if (why != "") {
       code = 2
@@ -224,7 +227,7 @@ fn applies<A: ActionEnum>(r: Rule<A>, className: string, want: string, wildcard:
 }
 
 fn invalidDecision(detail: string): Decision {
-  return Decision{ allowed = false, policy = "", reason = detail, invalid = true }
+  return Decision{ allowed = false, policy = "", reason = detail, invalid = true, down = false }
 }
 
 // Logs what `rolesOf` left out of `set`, when DEBUG is on.
@@ -252,7 +255,7 @@ fn firstFault<A: ActionEnum>(
       k = 0
     }
     if (st.verdict(reg, r, k) == 2) {
-      return "policy ${r.policy} rule ${k}: ${ruleFault<A>(reg.resources, r)}"
+      return "policy ${r.policy} rule ${k}: ${ruleFault<A>(reg.resources, reg.decls, r)}"
     }
     k = k + 1
   }
@@ -291,12 +294,84 @@ fn isTrueTruth(t: Truth): bool {
 // Whether `c`, a rule's condition bound to the user, holds on the row `vals`
 // read from `thing`. Unknown does not hold. `thing` is boxed only for a code
 // function (`boxRow`).
-fn condHolds<T: Tabled>(c: Cond, names: []string, vals: []Value, thing: T): bool! {
-  return isTrueTruth(evalRow(c, rowNamesFor<T>(names, vals)?, vals, boxRow<T>(c, thing))?)
+fn condHolds<T: Tabled>(
+  c: Cond,
+  names: []string,
+  vals: []Value,
+  thing: T,
+  rel: Option<RelAsker>,
+): bool! {
+  return isTrueTruth(evalRow(c, rowNamesFor<T>(names, vals)?, vals, boxRow<T>(c, thing), rel)?)
+}
+
+fn isLimit(e: error): bool {
+  let (_, limit) = e.(RelationLimit)
+  return limit
+}
+
+// What a rule whose condition could not be evaluated does to the check. A
+// relationship check that hit a bound answered nothing: an allow rule then does
+// not match (None, and the log says why), but a deny rule that did not match
+// could let an allow through, so it refuses. A broken rule is an invalid
+// policy, logged; anything else is the relationship store failing, logged and
+// reported as unavailable. Every Some is a refusal.
+fn ruleStopped<A: ActionEnum>(logger: Logger, r: Rule<A>, pos: int, e: error): Option<Decision> {
+  if (isLimit(e)) {
+    if (r.effect == Effect.Allow) {
+      logger.warn().str("policy", r.policy).int("rule", pos).str("why", e.message()).log("relationship undecided")
+      return Option<Decision>.None
+    }
+    return Option<Decision>.Some(
+      Decision{
+        allowed = false,
+        policy = r.policy,
+        reason = e.message(),
+        invalid = false,
+        down = false,
+      },
+    )
+  }
+  let (_, broken) = e.(InvalidPolicy)
+  if (broken) {
+    logger.error().str("policy", r.policy).int("rule", pos).str("why", e.message()).log("invalid policy")
+    return Option<Decision>.Some(invalidDecision("policy ${r.policy} rule ${pos}: ${e.message()}"))
+  }
+  logger.error().err(e).str("policy", r.policy).int("rule", pos).log("store unavailable")
+  return Option<Decision>.Some(
+    Decision{
+      allowed = false,
+      policy = "",
+      reason = "relationship store unavailable",
+      invalid = false,
+      down = true,
+    },
+  )
+}
+
+// Who is asking, for a decision whose rules hold a relationship test; None
+// when none does, so an ordinary decision builds nothing.
+fn askerFor<A: ActionEnum>(
+  a: Authz<A>,
+  reg: Registry<A>,
+  user: Option<Subject>,
+  rules: []Rule<A>,
+): Option<RelAsker> {
+  for r of rules {
+    if (!isTrue(r.cond) && hasRelated(r.cond)) {
+      return Option<RelAsker>.Some(newAsker(a.relations, a.limits, reg.resources, reg.decls, user))
+    }
+  }
+  return Option<RelAsker>.None
 }
 
 fn denyAll(policy: string): Decision {
-  return Decision{ allowed = false, policy = policy, reason = "denied by rule", invalid = false }
+  return Decision{
+    allowed = false,
+    policy = policy,
+    reason = "denied by rule",
+    invalid = false,
+    down = false,
+  }
 }
 
 // The rules of `slot` applied to `thing`: first matching Deny, else first
@@ -307,6 +382,7 @@ fn applySlot<A: ActionEnum, T: Tabled>(
   user: Option<Subject>,
   slot: RuleSlot<A>,
   thing: T,
+  rel: Option<RelAsker>,
 ): Decision {
   let vals: []Value
   let read = false
@@ -320,10 +396,13 @@ fn applySlot<A: ActionEnum, T: Tabled>(
         read = true
       }
       let c = boundCond<A>(logger, r, user)
-      let hit = condHolds<T>(c, slot.names, vals, thing) catch e {
-        let why = "policy ${r.policy} rule ${slot.at[i]}: ${e.message()}"
-        logger.error().str("policy", r.policy).int("rule", slot.at[i]).str("why", e.message()).log("invalid policy")
-        return invalidDecision(why)
+      let hit = condHolds<T>(c, slot.names, vals, thing, rel) catch e {
+        let stop = ruleStopped<A>(logger, r, slot.at[i], e)
+        if (isSome(stop)) {
+          return unwrap(stop)
+        }
+        i = i + 1
+        continue
       }
       if (!hit) {
         i = i + 1
@@ -417,7 +496,8 @@ fn decide<A: ActionEnum, T: Tabled>(
     }
   }
   // Bound first: a call nested in the argument list costs an allocation.
-  let d = applySlot<A, T>(logger, user, slot, thing)
+  let rel = askerFor<A>(a, set.reg, user, slot.rules)
+  let d = applySlot<A, T>(logger, user, slot, thing, rel)
   if (byCheck && !d.allowed && !d.invalid) {
     return d
   }

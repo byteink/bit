@@ -282,7 +282,7 @@ fn main(): ()! {
   let own = Clause("authorId", Op.Eq, [Value.Text("sara")])?
   let w = Where<Article>(clauses = [own])
   let a = Article{ id = 1, authorId = "sara", status = "draft" }
-  let holds = evalCond(fromWhere(w), a)? == Truth.True
+  let holds = evalCond(fromWhere<Article>(w)?, a)? == Truth.True
   println("${holds}")
 }
 ```
