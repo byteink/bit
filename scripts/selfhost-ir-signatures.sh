@@ -249,20 +249,42 @@
 # scripts/ir-signatures-walk.sh and scripts/safepoint-signatures.sh are
 # deleted.
 #
-# NO SIGNATURE IS DECLARED. `explainMismatch` below is the empty table every
-# caller still consults, so the next lowering change that outruns the oracle
-# adds its entry there instead of re-plumbing the callers. The input protocol
-# is the text the awk body of the previous revision read: the oracle's dump,
-# a line `@@@BIT2@@@`, then the tree's dump, with the kind and the corpus file
-# as `-v` variables. A new entry must satisfy the rules in the header: an
-# exact identity, derived from FULL dumps (the oracle's from
-# `sh scripts/stage0.sh`, the tree's from `bit-out/bin/bit`), never an excerpt.
+# --- Declared signatures (against the 0.40.0 oracle) ---
+#
+# Both retire at the next stage0 repin, which is the first oracle cut from a tree that carries
+# #7558 and #7562. The walks live in scripts/ir-signatures-walk.sh, sourced below.
+#
+# 7558-synth-json-alias-column-shift (`types`). #7558 (54c0b8420) binds std/json's `Json` and
+# `JsonEntry` under the reserved aliases `__Json`/`__JsonEntry` in the code a `@json` class
+# synthesizes, so the synthesized text is longer and every row the dump places on that source line
+# after the insertion moves right. The oracle and the tree must have the same row count and agree
+# on every row's line, name and type; the column may only grow, must never shrink back along the
+# line, and may move only on a source line that carries a synthesized `__json_` row. 23 corpus
+# files: the 19 under _tests_/cases/ and the four jsonattr/jsonschema* mains under
+# _tests_/imports/ (the rows `cols` and `__row` of run_table_persisted_flag.bit move because they
+# sit on the same synthesized line, after the insertion).
+#
+# 7562-packed-halfword-slices (`ir`, `iropt`). #7562 (05bb7c255, a64ce6f04) packs []i16/[]u16 at
+# 2 bytes per element: the elem_size constant of slice_new/slice_append/slice_get is 2 instead of
+# 8, an element read is `index_get buf[i]` instead of `field_get (buf + (i << 3))[0]`, a store
+# writes the narrow value instead of its word-widened `convert`, ptrOf scales by 2, a signed
+# `rt_call slice_get` returns i64 and a `convert i16` narrows it, and optappend.bit's append fast
+# path (elem_size equals the element width) now expands for these slices. Both dumps are normalized
+# (scripts/ir-signatures-walk.sh), the oracle one rewritten along exactly those shapes and the
+# tree one with the append fast path folded back, and the texts must then agree byte for byte.
+# The rewrites fire on i16/u16 only, so an i32/u32/i8/bool slice that changed, a tree that left a
+# halfword site word-strided, or any other difference anywhere in the file stays a REGRESSION.
+# 3 corpus files, on both arms: convert_widen_alias.bit, run_narrow_slice_store_widen.bit and
+# run_packed_i16_slice.bit.
 #
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
-# and returns 0, or prints nothing and returns 1 if none does. No signature is
-# registered, so it returns 1 for every kind.
+# and returns 0, or prints nothing and returns 1 if none does.
 explainMismatch() {
+  case "$3" in
+    types) explainLagTypes "$1" "$2"; return ;;
+    ir|iropt) explainIrLag "$1" "$2"; return ;;
+  esac
   return 1
 }
 
@@ -273,8 +295,22 @@ explainMismatch() {
 # function does not list can never be checked for going dead, and one it lists
 # that explainMismatch no longer prints would make that check fail on every
 # run. Kept in sync by hand, and selfhost-ir-signatures-selfcheck.sh asserts
-# the list matches the `print "..."` statements in this file. None are
-# declared, so it prints nothing for every kind.
+# the list matches the `print "..."` statements in this file and in
+# scripts/ir-signatures-walk.sh.
 declaredSignatureNames() {
+  local types="7558-synth-json-alias-column-shift"
+  local ir="7562-packed-halfword-slices"
+  case "${1:-}" in
+    types) printf '%s\n' $types ;;
+    ir|iropt) printf '%s\n' $ir ;;
+    "") printf '%s\n' $types $ir ;;
+  esac
   return 0
 }
+
+# The walks and the canonicalizer they use (scripts/selfhost-ir-canon.sh). Sourced after the
+# functions above are defined; nothing here runs until explainMismatch is called.
+# shellcheck source=scripts/selfhost-ir-canon.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/selfhost-ir-canon.sh"
+# shellcheck source=scripts/ir-signatures-walk.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-walk.sh"
