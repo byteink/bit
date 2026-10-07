@@ -37,8 +37,10 @@ set -euo pipefail
 # start, host) and `hb`, a heartbeat the holder touches while it is alive. A lock
 # whose `hb` is older than BL_STALE_MIN minutes is stale: the next acquirer
 # removes the containers labelled with the owner's token, deletes the lock and
-# says so on stderr. A lock with NO `owner` file (a bare `mkdir`, as
-# pkg/web/bench/remote.sh takes it) is never reclaimed: nothing says it is dead.
+# says so on stderr. A lock with NO `owner` file (a bare `mkdir`) is never
+# reclaimed: nothing says it is dead.
+# bl_beat's loop exits with the shell that called it, so a SIGKILLed holder goes
+# stale 5 minutes later (#7614).
 # A holder only deletes the lock it owns (token match), so a reclaimed holder
 # that wakes late cannot delete its successor's lock.
 lock_lib() {
@@ -82,7 +84,9 @@ bl_try() {
   return 1
 }
 bl_beat() {
-  ( while sleep 30; do touch "$BL/hb"; done ) </dev/null >/dev/null 2>&1 &
+  # The loop stops when the shell that took the lock is gone: a holder that is
+  # SIGKILLed runs no trap, and an orphaned loop would keep `hb` fresh forever.
+  ( p=$$; while sleep 30 && kill -0 "$p" 2>/dev/null; do touch "$BL/hb"; done ) </dev/null >/dev/null 2>&1 &
   BL_BEATPID=$!
 }
 bl_release() {
