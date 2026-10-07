@@ -528,7 +528,7 @@ holds — see the fabricated-header bug at `runtime/root/slices.bit:443-451`
 (`_tests_/cases/run_empty_slice_null_header.bit`). Packing is scoped by
 `is_ref`, not by element identity: any `is_ref == false` buffer may pack to its
 element's own byte stride (`elem_size`, §9) — `1` for `[]u8` (a non-ref,
-1-byte element, `elem_size = 1`), or a class `T`'s own body size
+1-byte element, `elem_size = 1`), `2` for `[]i16`/`[]u16` (#7562), or a class `T`'s own body size
 (`elem_size = layout.size`) when EVERY field of `T` is a non-reference scalar
 (`ptr_offsets` empty), or `16` for a `decimal` (#6570). `elem_size` is a per-call-site
 compile-time constant, never runtime state, and travels as an explicit
@@ -545,9 +545,9 @@ neither is ever called with `elem_size > 8` for a packed buffer — the
 compiler lowers a wide-element field read/write to a direct load/store at the
 field's own offset instead, and the runtime FATALs if a stride it cannot
 represent through either function ever reaches it, rather than silently
-returning or storing a truncated word. Packing a non-ref scalar narrower than
-8 bytes and wider than 1 byte (`i16`/`i32`/`bool`/...) remains future work;
-this document does not authorize it.
+returning or storing a truncated word. `i16`/`u16` pack at 2 bytes (#7562);
+for 1/2/4 the runtime moves exactly those bytes, `get` zero-extended. Packing
+`i8`/`i32`/`u32`/`bool`/`f32` waits on the FFI callers that marshal at 8.
 
 Channels (§11) and native maps (§15, `runtime/root/maps.bit`'s `allocBuf`
 callers) do **not** pack and stay word-per-element regardless of element type:
