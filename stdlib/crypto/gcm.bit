@@ -227,17 +227,18 @@ fn gcmGhashSw(h: []u64, aad: []byte, ct: []byte): []u64 {
   return acc
 }
 
-// Fold every full 16-byte block of `data` directly from the caller's buffer
-// into `state` under the key table `hk`, then zero-pad any trailing partial
-// block into the caller's 16-byte `spare` and fold it the same way — the
-// hardware mirror of `gcmAbsorb`, one `state = (state XOR block) * H` step
-// per block.
-fn gcmAbsorbHw(hk: []byte, state: []byte, data: []byte, spare: []byte) {
-  let full = len(data) / 16
+// Fold every full 16-byte block of `data[0:n]` directly from the caller's
+// buffer into `state` under the key table `hk`, then zero-pad any trailing
+// partial block into the caller's 16-byte `spare` and fold it the same way —
+// the hardware mirror of `gcmAbsorb`, one `state = (state XOR block) * H`
+// step per block. `n` (at most `len(data)`) is passed rather than resliced
+// because a reslice allocates a header (#7487).
+fn gcmAbsorbHw(hk: []byte, state: []byte, data: []byte, n: int, spare: []byte) {
+  let full = n / 16
   if (full > 0) {
     bit_rt_ghash_hw_blocks_keyed(ptrOf(hk), ptrOf(state), ptrOf(data), u64(full))
   }
-  let rem = len(data) - full * 16
+  let rem = n - full * 16
   if (rem > 0) {
     let i = 0
     while (i < 16) {
@@ -255,42 +256,43 @@ fn gcmAbsorbHw(hk: []byte, state: []byte, data: []byte, spare: []byte) {
   keepAlive(spare)
 }
 
-// GHASH_H(aad, ct) into the 16-byte `s`, the hardware carry-less-multiply
+// GHASH_H(aad, ct[0:n]) into the 16-byte `s`, the hardware carry-less-multiply
 // mirror of `gcmGhashSw`: same recurrence, checked against it by the
 // differential in _tests_/imports/cryptogcm. Folds AAD then the ciphertext
 // (each independently block-padded, per GCM's own definition), then the
-// length block from `spare`, all via `bit_rt_ghash_hw_blocks_keyed` under the
-// key table `hk`. `s` and `spare` are caller scratch, so the call allocates
-// nothing of its own.
-fn gcmGhashHw(s: []byte, hk: []byte, aad: []byte, ct: []byte, spare: []byte) {
+// length block from `w.spare`, all via `bit_rt_ghash_hw_blocks_keyed` under
+// the key table `hk`, into `w.s`. `w` is caller scratch, so the call
+// allocates nothing of its own.
+fn gcmGhashHw(w: gcmScratch, hk: []byte, aad: []byte, ct: []byte, n: int) {
+  let s = w.s
+  let spare = w.spare
   let i = 0
   while (i < 16) {
     s[i] = 0
     i = i + 1
   }
-  gcmAbsorbHw(hk, s, aad, spare)
-  gcmAbsorbHw(hk, s, ct, spare)
+  gcmAbsorbHw(hk, s, aad, len(aad), spare)
+  gcmAbsorbHw(hk, s, ct, n, spare)
   gcmStoreWord(spare, 0, u64(len(aad)) * 8)
-  gcmStoreWord(spare, 8, u64(len(ct)) * 8)
+  gcmStoreWord(spare, 8, u64(n) * 8)
   bit_rt_ghash_hw_blocks_keyed(ptrOf(hk), ptrOf(s), ptrOf(spare), 1)
   keepAlive(hk)
   keepAlive(spare)
   keepAlive(s)
 }
 
-// GHASH_H(aad, ct) into the 16-byte `s`: the ARM64 PMULL hardware path when
+// GHASH_H(aad, ct[0:n]) into `w.s`: the ARM64 PMULL hardware path when
 // `g.pmull` is true (read once at construction), else the constant-time
 // software path. Both compute the identical NIST SP 800-38D value; see
-// `gcmGhashHw`'s header for the correctness argument. `spare` is 16 bytes of
-// caller scratch.
-fn gcmGhash(s: []byte, g: AesGcm, aad: []byte, ct: []byte, spare: []byte) {
+// `gcmGhashHw`'s header for the correctness argument.
+fn gcmGhash(w: gcmScratch, g: AesGcm, aad: []byte, ct: []byte, n: int) {
   if (g.pmull) {
-    gcmGhashHw(s, g.hk, aad, ct, spare)
+    gcmGhashHw(w, g.hk, aad, ct, n)
     return
   }
-  let acc = gcmGhashSw(g.h, aad, ct)
-  gcmStoreWord(s, 0, acc[0])
-  gcmStoreWord(s, 8, acc[1])
+  let acc = gcmGhashSw(g.h, aad, ct[0:n])
+  gcmStoreWord(w.s, 0, acc[0])
+  gcmStoreWord(w.s, 8, acc[1])
 }
 
 // The pre-counter block J0 for a 96-bit nonce, nonce ‖ 0x00000001, into the
@@ -333,10 +335,13 @@ fn gcmCounterAfter(ctr: []byte, j0: []byte) {
   gcmInc32(ctr)
 }
 
-// GCTR over `data` into `out` one hardware block call per counter block: the
-// trailing partial block of the hardware route. Arguments as `gcmGctrInto`.
-fn gcmGctrBlocks(out: []byte, cipher: Aes, counter: []byte, ks: []byte, data: []byte) {
-  let off = 0
+// GCTR over `data[off:]` into `out[off:]` one hardware block call per counter
+// block, `w.spare` holding each keystream block: the trailing partial block of
+// the hardware route. `off` is passed rather than resliced because a reslice
+// allocates a header (#7487). Arguments otherwise as `gcmGctrInto`.
+fn gcmGctrBlocks(out: []byte, cipher: Aes, w: gcmScratch, data: []byte, off: int) {
+  let counter = w.ctr
+  let ks = w.spare
   while (off < len(data)) {
     cipher.encryptBlockInto(ks, counter)
     gcmInc32(counter)
@@ -353,64 +358,47 @@ fn gcmGctrBlocks(out: []byte, cipher: Aes, counter: []byte, ks: []byte, data: []
   }
 }
 
-// The 24-byte CTR block `bit_rt_crypto_aes_ctr32_hw` reads and advances:
-// `counter`'s 16 bytes, then the round count `nr` as a little-endian 64-bit
-// word (`nr` is 10, 12 or 14, so bytes 17..23 stay zero).
-fn gcmCtrBlock(counter: []byte, nr: int): []byte {
-  let blk = []byte(24)
-  let i = 0
-  while (i < 16) {
-    blk[i] = counter[i]
-    i = i + 1
-  }
-  blk[16] = byte(nr)
-  return blk
-}
-
 // GCTR on hardware AES (x86-64 AES-NI, or the ARM64 Crypto Extension when
 // `cipher.hw`): every full block in one `bit_rt_crypto_aes_ctr32_hw` call,
 // which pipelines several counter blocks per round key and XORs in the same
 // pass, then the trailing partial block through `gcmGctrBlocks`. Arguments
-// as `gcmGctrInto`; `counter` is advanced in place.
-fn gcmGctrHw(out: []byte, cipher: Aes, counter: []byte, ks: []byte, data: []byte) {
+// as `gcmGctrInto`; `w.ctr` is advanced in place, and since it is the first
+// 16 bytes of the CTR block `w.blk` the runtime advances, no copy back.
+fn gcmGctrHw(out: []byte, cipher: Aes, w: gcmScratch, data: []byte) {
   let full = len(data) / 16
   if (full > 0) {
-    let blk = gcmCtrBlock(counter, cipher.nr)
-    bit_rt_crypto_aes_ctr32_hw(ptrOf(cipher.roundKeys), ptrOf(blk), ptrOf(data), ptrOf(out), full)
-    let i = 0
-    while (i < 16) {
-      counter[i] = blk[i]
-      i = i + 1
-    }
-    keepAlive(blk)
+    w.blk[16] = byte(cipher.nr)
+    bit_rt_crypto_aes_ctr32_hw(ptrOf(cipher.roundKeys), ptrOf(w.blk), ptrOf(data), ptrOf(out), full)
+    keepAlive(w.blk)
   }
   let off = full * 16
   if (off < len(data)) {
-    gcmGctrBlocks(out[off:len(data)], cipher, counter, ks, data[off:len(data)])
+    gcmGctrBlocks(out, cipher, w, data, off)
   }
   keepAlive(cipher.roundKeys)
   keepAlive(data)
   keepAlive(out)
 }
 
-// GCTR keystream into `out` (exactly `len(data)` bytes): encipher `counter`,
-// inc32, encipher, ... and XOR the keystream into `data`. `counter` is the
-// caller's 16-byte initial counter block and is ADVANCED in place; `ks` is 16
-// bytes of caller scratch for the hardware route. `out` may be `data` itself:
-// each byte is read before the same index is written. Handles a trailing
-// partial block.
+// GCTR keystream into `out` (its first `len(data)` bytes; `out` may be
+// longer): encipher `w.ctr`, inc32, encipher, ... and XOR the keystream into
+// `data`. `w.ctr` is the caller's initial counter block and is ADVANCED in
+// place; `w.spare` is keystream scratch for the hardware route. `out` may be
+// `data` itself: each byte is read before the same index is written. Handles
+// a trailing partial block.
 //
 // Without a hardware route the keystream runs through the bitsliced
 // constant-time AES (aesct.bit), which enciphers four counter blocks at once —
 // ~100x faster than the per-byte-inverse scalar block cipher. The counter
-// sequence is byte-for-byte the same as the scalar path (start at `counter`,
+// sequence is byte-for-byte the same as the scalar path (start at `w.ctr`,
 // `gcmInc32` per block), so ciphertext is unchanged. Lanes past the data end
 // still get a valid (advanced) counter but their keystream is simply not used.
-fn gcmGctrInto(out: []byte, cipher: Aes, counter: []byte, ks: []byte, data: []byte) {
+fn gcmGctrInto(out: []byte, cipher: Aes, w: gcmScratch, data: []byte) {
   if (cipher.hw || bit_rt_crypto_aes_hw_available()) {
-    gcmGctrHw(out, cipher, counter, ks, data)
+    gcmGctrHw(out, cipher, w, data)
     return
   }
+  let counter = w.ctr
 
   let sk = aesctExpandSkey(cipher.roundKeys, cipher.nr)
   let blocks = []byte(64)
@@ -454,12 +442,52 @@ export fn hwAvailableGhash(): bool {
   return hwPmull()
 }
 
-// The per-call work area `sealInto`/`openInto` carve five 16-byte blocks from:
-// J0, AES_K(J0), the running counter, the GHASH state (then the tag), and one
-// spare block (keystream, padded tail, length block). One allocation per call
-// instead of one per block — and none kept on the key, so an `AesGcm` holds
-// only immutable state and stays safe to share between threads.
-const gcmWorkLen: int = 80
+// The work area one `sealInto`/`openInto` uses, views carved once from one
+// 88-byte buffer: J0, AES_K(J0), the GHASH state (then the tag), one spare
+// block (keystream, padded tail, length block), and `blk`, the 24-byte CTR
+// block `bit_rt_crypto_aes_ctr32_hw` reads and advances (counter ‖ round
+// count as a little-endian word), whose first 16 bytes are the running
+// counter `ctr`. A reslice allocates a header, so carving per call cost
+// more than the buffer (#7487); an `AesGcm` keeps one and lends it out, and
+// `owned` marks that one.
+class gcmScratch {
+  owned: bool,
+  j0: []byte,
+  ej0: []byte,
+  s: []byte,
+  spare: []byte,
+  blk: []byte,
+  ctr: []byte,
+}
+
+fn gcmScratchNew(owned: bool): gcmScratch {
+  let w = []byte(88)
+  let blk = w[64:88]
+  return gcmScratch{
+    owned = owned, j0 = w[0:16], ej0 = w[16:32], s = w[32:48], spare = w[48:64], blk = blk, ctr = blk[0:16],
+  }
+}
+
+// The key's own scratch when no other call holds it, else a fresh one, so
+// concurrent `seal`/`open` calls on one shared `AesGcm` never share a work
+// area. The holder is exclusive between a successful claim of `g.busy` and
+// `gcmScratchGive`, so the lazy first build of `g.work` cannot race.
+fn gcmScratchTake(g: AesGcm): gcmScratch {
+  if (!atomicCmpxchg(ptrOf(g.busy), 0, 1)) {
+    return gcmScratchNew(false)
+  }
+  if (len(g.work) == 0) {
+    g.work = [gcmScratchNew(true)]
+  }
+  return g.work[0]
+}
+
+// Release `w` if it is `g`'s own (`gcmScratchTake`); a fresh one is garbage.
+fn gcmScratchGive(g: AesGcm, w: gcmScratch) {
+  if (w.owned) {
+    atomicStore(ptrOf(g.busy), 0)
+  }
+}
 
 // The plaintext length of a sealed `ciphertext`: its length less the 16-byte
 // tag, or 0 when it is too short to carry one (`openInto` then fails).
@@ -475,13 +503,18 @@ fn gcmPlainLen(ciphertext: []byte): int {
 // GHASH's key table built from it (#7460; empty without the hardware path),
 // both derived once at construction and reused by every `seal`/`open`.
 // `pmull` caches `hwPmull()` (#2527) — whether GHASH takes the hardware
-// carry-less multiply — read once here rather than once per block. Build one
-// with `AesGcm(key)`.
+// carry-less multiply — read once here rather than once per block. `work`
+// holds, once the first call builds it, the scratch every uncontended call
+// borrows while `busy` (one atomic word) is 1 (`gcmScratchTake`, #7487), so
+// sharing an `AesGcm` between threads stays safe. Build one with
+// `AesGcm(key)`.
 export class AesGcm {
   cipher: Aes
   h: []u64
   hk: []byte
   pmull: bool
+  busy: []i64
+  work: []gcmScratch
 
   // Key an AES-GCM cipher from `key` (16, 24, or 32 bytes — AES-128/192/256, the
   // GCM/TLS variants). Fails on any other key length. The hash subkey H is derived
@@ -492,6 +525,7 @@ export class AesGcm {
     let hb = this.cipher.encryptBlock([]byte(16))
     this.h = gcmLoadBlock(hb, 0)
     this.pmull = hwPmull()
+    this.busy = []i64(1)
     this.hk = []byte(0)
     if (this.pmull) {
       this.hk = []byte(gcmHwKeysLen)
@@ -520,23 +554,18 @@ export class AesGcm {
     assert(len(nonce) == 12, "gcm.seal: nonce must be 12 bytes")
     let n = len(plaintext)
     assert(len(dst) == n + 16, "gcm.sealInto: dst must be len(plaintext) + 16 bytes")
-    let w = []byte(gcmWorkLen)
-    let j0 = w[0:16]
-    let ej0 = w[16:32]
-    let s = w[48:64]
-    let spare = w[64:80]
-    gcmJ0Into(j0, nonce)
-    this.cipher.encryptBlockInto(ej0, j0)
-    let ctr = w[32:48]
-    gcmCounterAfter(ctr, j0)
-    let ct = dst[0:n]
-    gcmGctrInto(ct, this.cipher, ctr, spare, plaintext)
-    gcmGhash(s, this, aad, ct, spare)
+    let w = gcmScratchTake(this)
+    gcmJ0Into(w.j0, nonce)
+    this.cipher.encryptBlockInto(w.ej0, w.j0)
+    gcmCounterAfter(w.ctr, w.j0)
+    gcmGctrInto(dst, this.cipher, w, plaintext)
+    gcmGhash(w, this, aad, dst, n)
     let k = 0
     while (k < 16) {
-      dst[n + k] = s[k] ^ ej0[k]
+      dst[n + k] = w.s[k] ^ w.ej0[k]
       k = k + 1
     }
+    gcmScratchGive(this, w)
   }
 
   // Open: verify and decrypt `ciphertext` (the sealed `ct ‖ tag`) under the 12-byte
@@ -564,25 +593,22 @@ export class AesGcm {
     let n = len(ciphertext) - 16
     assert(len(dst) == n, "gcm.openInto: dst must be len(ciphertext) - 16 bytes")
     let ct = ciphertext[0:n]
-    let w = []byte(gcmWorkLen)
-    let j0 = w[0:16]
-    let ej0 = w[16:32]
-    let s = w[48:64]
-    let spare = w[64:80]
-    gcmJ0Into(j0, nonce)
-    this.cipher.encryptBlockInto(ej0, j0)
-    gcmGhash(s, this, aad, ct, spare)
+    let w = gcmScratchTake(this)
+    gcmJ0Into(w.j0, nonce)
+    this.cipher.encryptBlockInto(w.ej0, w.j0)
+    gcmGhash(w, this, aad, ct, n)
     let k = 0
     while (k < 16) {
-      s[k] = s[k] ^ ej0[k]
+      w.s[k] = w.s[k] ^ w.ej0[k]
       k = k + 1
     }
-    if (!ctEq(s, ciphertext[n:len(ciphertext)])) {
+    if (!ctEq(w.s, ciphertext[n:len(ciphertext)])) {
+      gcmScratchGive(this, w)
       fail newError("gcm.open: authentication failed")
     }
-    let ctr = w[32:48]
-    gcmCounterAfter(ctr, j0)
-    gcmGctrInto(dst, this.cipher, ctr, spare, ct)
+    gcmCounterAfter(w.ctr, w.j0)
+    gcmGctrInto(dst, this.cipher, w, ct)
+    gcmScratchGive(this, w)
   }
 
   // The required nonce length in bytes: 12 (96-bit), the GCM/TLS standard.
