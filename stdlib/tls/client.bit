@@ -62,10 +62,13 @@ export class TlsClientHandshake {
   hsSec: []byte
   chs: []byte
   shs: []byte
-  serverHsKeys: RecordKeys
-  clientHsKeys: RecordKeys
+  // Unset until `clientProcessServerHello` derives their secrets (#7561).
+  serverHsKeys: Option<RecordKeys>
+  clientHsKeys: Option<RecordKeys>
   usedHrr: bool
   peerCerts: [][]byte
+  // `peerCerts[0]` parsed, once its first reader runs (`clientLeaf`, #7561).
+  leaf: Option<X509Certificate>
   alpn: string
   capSecret: []byte
   sapSecret: []byte
@@ -86,7 +89,7 @@ export class TlsClientHandshake {
   pskSuite: CipherSuite
   pskAccepted: bool
   sentEarlyData: bool
-  earlyWriteKeys: RecordKeys
+  earlyWriteKeys: Option<RecordKeys>
   export earlyDataAccepted: bool
   export hello: []byte
 
@@ -208,7 +211,7 @@ export class TlsClientHandshake {
       if (tlsWireRecordType(rec) == tlsCcsType) {
         continue
       }
-      let pt = this.serverHsKeys.open(rec)?
+      let pt = clientKeys(this.serverHsKeys)?.open(rec)?
       if (pt.contentType == recordAlert) {
         // No alert is a graceful outcome before the handshake has completed —
         // even close_notify means the server bailed with no application
@@ -303,8 +306,8 @@ export class TlsClientHandshake {
     let thSH = this.clientTh()
     this.chs = clientHandshakeTrafficSecret(alg, this.hsSec, thSH)
     this.shs = serverHandshakeTrafficSecret(alg, this.hsSec, thSH)
-    this.serverHsKeys = RecordKeys(this.suite, this.shs)?
-    this.clientHsKeys = RecordKeys(this.suite, this.chs)?
+    this.serverHsKeys = Option.Some(RecordKeys(this.suite, this.shs)?)
+    this.clientHsKeys = Option.Some(RecordKeys(this.suite, this.chs)?)
   }
 
   // Parse and authenticate the server's Handshake-level messages —
@@ -330,12 +333,13 @@ export class TlsClientHandshake {
       } else if (t == hsCertificate) {
         let cert = parseCertificate(msg)?
         this.peerCerts = clientCertDers(cert)
+        this.leaf = Option.None
         if (len(this.peerCerts) == 0) {
           fail newError("tls client: server sent an empty certificate chain")
         }
         this.transcript = tlsHsPutBytes(this.transcript, msg)
         if (!this.config.insecureSkipVerify) {
-          this.clientVerifyChain()?
+          clientVerifyChain(this)?
         }
       } else if (t == hsCertificateRequest) {
         // Client authentication is optional here (RFC 8446 §4.3.2): record the
@@ -347,7 +351,7 @@ export class TlsClientHandshake {
         this.transcript = tlsHsPutBytes(this.transcript, msg)
       } else if (t == hsCertificateVerify) {
         let cv = parseCertificateVerify(msg)?
-        this.clientVerifyCertVerify(cv)?
+        clientVerifyCertVerify(this, cv)?
         this.transcript = tlsHsPutBytes(this.transcript, msg)
       } else if (t == hsFinished) {
         let fin = parseFinished(msg)?
@@ -371,52 +375,11 @@ export class TlsClientHandshake {
     let finMsg = this.clientConsumeAuthFlight(stream)?
     let out = []byte(0)
     if (this.earlyDataAccepted) {
-      out = tlsHsPutBytes(out, this.earlyWriteKeys.seal(encodeEndOfEarlyData(), recordHandshake)?)
+      let early = clientKeys(this.earlyWriteKeys)?.seal(encodeEndOfEarlyData(), recordHandshake)?
+      out = tlsHsPutBytes(out, early)
     }
-    out = tlsHsPutBytes(out, this.clientHsKeys.seal(finMsg, recordHandshake)?)
+    out = tlsHsPutBytes(out, clientKeys(this.clientHsKeys)?.seal(finMsg, recordHandshake)?)
     return TlsClientStep{ retry = false, done = true, outbound = out }
-  }
-
-  // Verify the peer certificate chain up to a trusted root and against the SNI
-  // hostname (RFC 8446 §4.4.2), delegating to the std/crypto X.509 verifier. Any
-  // failure aborts the handshake and is re-tagged with the AlertDescription
-  // (RFC 8446 §6.2, #2320) `tlsapiDriveClient` (`tls.bit`) sends the server before
-  // closing — std/crypto's `x509VerifyChain` is a different module and cannot tag
-  // its own errors with this module's `tlsAlertFail`, so the mapping is done here,
-  // on the caught error's message.
-  clientVerifyChain(): ()! {
-    let leaf = x509Parse(this.peerCerts[0])?
-    let inter = []X509Certificate(0)
-    let i = 1
-    while (i < len(this.peerCerts)) {
-      inter = append(inter, x509Parse(this.peerCerts[i])?)
-      i = i + 1
-    }
-    x509VerifyChain(
-      leaf,
-      inter,
-      this.config.trust.roots,
-      this.config.serverName,
-      this.config.nowUnix,
-    ) catch e {
-      fail tlsAlertFail{ desc = clientAlertDescForX509(e.message()), msg = e.message() }
-    }
-  }
-
-  // Verify the server's CertificateVerify signature over the RFC 8446 §4.4.3 signed
-  // content with the leaf certificate's public key. Fails on a bad signature,
-  // tagged `decrypt_error`(51) (RFC 8446 §6.2: a handshake cryptographic operation
-  // failed) — `tlsapiDriveClient` sends this AlertDescription to the server before
-  // closing (#2320).
-  clientVerifyCertVerify(cv: CertificateVerify): ()! {
-    let leaf = x509Parse(this.peerCerts[0])?
-    let signed = tlsWireCertVerifyContent(tlsWireServerCertVerifyContext, this.clientTh())
-    if (!clientCheckSignature(cv.algorithm, leaf, signed, cv.signature)) {
-      fail tlsAlertFail{
-        desc = alertDecryptError,
-        msg = "tls client: server CertificateVerify signature is invalid",
-      }
-    }
   }
 
   // Verify the server Finished MAC in constant time (RFC 8446 §4.4.4): recompute
@@ -726,7 +689,6 @@ export fn tlsClientStart(config: TlsClientConfig): TlsClientHandshake! {
 // path ignores `extraExts` — the caller's exact ClientHello is used verbatim.
 export fn tlsClientStartExts(config: TlsClientConfig, extraExts: []Extension): TlsClientHandshake! {
   let aes128 = tlsSuiteById(TLS_AES_128_GCM_SHA256)?
-  let dummy = RecordKeys(aes128, []byte(32))?
   let h = TlsClientHandshake{
     config = config,
     offers = []clientOffer(0),
@@ -739,10 +701,11 @@ export fn tlsClientStartExts(config: TlsClientConfig, extraExts: []Extension): T
     hsSec = []byte(0),
     chs = []byte(0),
     shs = []byte(0),
-    serverHsKeys = dummy,
-    clientHsKeys = dummy,
+    serverHsKeys = Option.None,
+    clientHsKeys = Option.None,
     usedHrr = false,
     peerCerts = [][]byte(0),
+    leaf = Option.None,
     alpn = "",
     capSecret = []byte(0),
     sapSecret = []byte(0),
@@ -759,7 +722,7 @@ export fn tlsClientStartExts(config: TlsClientConfig, extraExts: []Extension): T
     pskSuite = aes128,
     pskAccepted = false,
     sentEarlyData = false,
-    earlyWriteKeys = dummy,
+    earlyWriteKeys = Option.None,
     earlyDataAccepted = false,
     hello = []byte(0),
   }
