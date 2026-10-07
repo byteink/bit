@@ -4939,7 +4939,10 @@ Method sets:
   (#7327).** A class with value semantics (below) has three synthesized
   methods, written per class as Bit text and checked like a declared method:
   `__sameValue(other: C): bool`, `__valueHash(): u64` and `__snapshot(): C`.
-  `__sameValue` is structural equality over every field in declaration order; a
+  `__sameValue` is structural equality over every field in declaration order,
+  except a relation field (`@hasMany`, `@hasOne`, `@belongsTo`, `@manyToMany`,
+  §10.5), which is no part of the value of a row and is neither compared,
+  hashed nor copied (a snapshot's relation field is unloaded; #7563); a
   slice is equal when the lengths match and the elements are equal pairwise, a
   map when the lengths match and every key of one is in the other with an equal
   value, an `Option<T>` when both are `None` or both are `Some` of equal
@@ -4973,6 +4976,16 @@ Method sets:
   `__snapshot`. **E0313**: one of the three is called on a class that has no
   such member; the message names the first field, in declaration order, whose
   type has no value semantics.
+- **Reserved top-level names (E0314, #7564).** A top-level `fn`, `class`,
+  `interface`, `enum`, `type`, `let` or `const` whose name starts with `__`, and
+  an import alias that does (`import { a as __a }`), is **E0314**: the prefix
+  belongs to the code the compiler synthesizes into a module (`__Json`,
+  `__json_dec_C`, `__sql_row_C`), which a user declaration of the same name
+  would collide with. An `extern fn` is exempt (it names a C or OS symbol,
+  `__error`), as is every module of the standard library, which declares the
+  helpers synthesized code calls. A name inside a function body and the members
+  `__field`, `__sameValue`, `__valueHash` and `__snapshot` of a class are not
+  top-level names and stay legal.
 - `S` must be a **class or enum** type (or another interface, or `nil`). An
   interface value *is* the receiver's object pointer - there is no boxed
   scalar - so only a type that is already a reference (§13.3) can sit behind
