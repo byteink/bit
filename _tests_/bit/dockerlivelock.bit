@@ -1,0 +1,217 @@
+// _tests_/bit/dockerlivelock.bit — the remote lock's lifetime proof (#7604).
+//
+//   BIT_LIVE_DOCKER_HOST=<ssh host> BIT_REPO=$PWD BIT_BIN=bit-out/bin/bit \
+//     bit-out/bin/bit run _tests_/bit/dockerlivelock.bit
+//
+// Three claims, each asserted against the real host:
+//   1. A dockerlive run SIGKILLed mid-step leaves neither /tmp/benchlock nor its
+//      labelled container: both are gone within `deadlineMs`.
+//   2. A lock whose heartbeat is over 5 minutes old is reclaimed with a message,
+//      and the owner's labelled container is removed.
+//   3. A lock with a fresh heartbeat is never reclaimed.
+// Claims 2 and 3 run scripts/x64gate.sh's `lock-lib` on the host against a
+// private BENCHLOCK_DIR, so they never touch the host's real lock. Claim 1 takes
+// the real lock (waiting for its other holders) because that is what it proves.
+// The same file is the killed process: BIT_DOCKERLIVELOCK_PROBE=<out file>
+// makes it take the lock, start one container and wait to be killed.
+// Without BIT_LIVE_DOCKER_HOST nothing runs.
+import { output } from "std/process"
+import { env, envOr, exit } from "std/os"
+import { exists, readFile, remove } from "std/fs"
+import { contains, lastIndexOf, split, trimSpace, parseInt } from "std/strings"
+import { sleep, monotonic, since, Millisecond, Second } from "std/time"
+import { dockerRun, requireDocker, selfPid, releaseDocker, remoteHostEnv } from "./dockerlive"
+
+const probeEnv: string = "BIT_DOCKERLIVELOCK_PROBE"
+const gateImage: string = "bit-linux-gate-amd64:latest"
+const deadlineMs: int = 10000
+const pollGapMs: int = 250
+const readyAttempts: int = 2400
+const sshTimeoutMs: int = 30000
+const shortMs: int = 10000
+
+fn fail1(msg: string) {
+  eprint("dockerlivelock: FAIL: ${msg}\n")
+  exit(1)
+}
+
+fn sh(script: string, args: []string): string {
+  let argv = ["-c", script, "sh"]
+  for a of args {
+    argv = append(argv, a)
+  }
+  let r = output("/bin/sh", argv, sshTimeoutMs)
+  if (r.exitCode != 0) {
+    fail1("sh failed (${r.exitCode}): ${trimSpace(r.stderr)}")
+  }
+  return r.stdout
+}
+
+// Runs `script` on the host under `sh -c`, the script carried as base64 so no quoting reaches the remote shell.
+const remoteScript: string = `b=$(printf '%s' "$2" | base64 | tr -d '\n'); /usr/bin/ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$1" "sh -c \"\$(echo $b | base64 -d)\" 2>&1"; true`
+
+fn remote(host: string, script: string): string {
+  return sh(remoteScript, [host, script])
+}
+
+fn probe(out: string) {
+  let bin = requireDocker("dockerlivelock")
+  let pid = selfPid() catch _ {
+    0
+  }
+  dockerRun(bin, ["run", "-d", "--rm", gateImage, "sleep", "600"]) catch e {
+    fail1("probe: ${e.message()}")
+  }
+  writeText(out, "${pid} ${bin}\n")
+  sleep(600 * Second)
+  releaseDocker(bin)
+}
+
+fn writeText(path: string, text: string) {
+  let _ = sh("printf '%s' \"$2\" > \"$1\"", [path, text])
+}
+
+fn readText(path: string): string {
+  if (!exists(path)) {
+    return ""
+  }
+  return readFile(path) catch _ {
+    ""
+  }
+}
+
+// Starts this file as the probe, detached; its stdout and stderr go to `log`.
+fn startProbe(out: string, log: string) {
+  let bit = envOr("BIT_BIN", "bit-out/bin/bit")
+  let file = "${env("BIT_REPO")}/_tests_/bit/dockerlivelock.bit"
+  let _ = sh(
+    "${probeEnv}=\"$1\" \"$2\" run \"$3\" >\"$4\" 2>&1 </dev/null &",
+    [out, bit, file, log],
+  )
+}
+
+fn waitFile(path: string, log: string): string {
+  let i = 0
+  while (i < readyAttempts) {
+    if (exists(path)) {
+      return trimSpace(readText(path))
+    }
+    sleep(500 * Millisecond)
+    i = i + 1
+  }
+  fail1("the probe never reported ready: ${trimSpace(readText(log))}")
+  return ""
+}
+
+// The lock owner's token on the host ("" when there is no lock), and the ids of containers labelled with `token`.
+fn lockState(host: string, token: string): string {
+  return remote(
+    host,
+    "sed -n 's/^token=//p' /tmp/benchlock/owner 2>/dev/null; echo ---; docker ps -aq --filter label=bit.live.session=${token}",
+  )
+}
+
+// Polls until the host shows neither a lock nor a container for `token`, or `deadlineMs` passes; true when gone.
+fn goneWithin(host: string, token: string): bool {
+  let start = monotonic()
+  while (since(start) / Millisecond < deadlineMs) {
+    sleep(pollGapMs * Millisecond)
+    let now = lockState(host, token)
+    if (!contains(now, token) && trimSpace(split(now, "---")[1]) == "") {
+      print("kill: lock and container gone ${since(start) / Millisecond}ms after SIGKILL\n")
+      return true
+    }
+  }
+  return false
+}
+
+// Removes the probe's local state directory: the shim and the files dockerlive keeps beside it.
+fn removeProbeState(shim: string) {
+  let stateDir = shim[0:lastIndexOf(shim, "/")]
+  remove(shim) catch _ {}
+  for f of [
+    "holder",
+    "release",
+    "closed",
+    "holder.out",
+    "holder.err",
+    "lib.sh",
+    "tunnels",
+    "staged",
+  ] {
+    remove("${stateDir}/${f}") catch _ {}
+  }
+  remove(stateDir) catch _ {}
+}
+
+fn killProof(host: string) {
+  let out = "${env("TMPDIR")}/dockerlivelock-ready-${monotonic().ns}"
+  let log = "${out}.log"
+  startProbe(out, log)
+  let parts = split(waitFile(out, log), " ")
+  let pid = parseInt(parts[0]) catch _ {
+    0
+  }
+  let shim = parts[1]
+  let stateDir = shim[0:lastIndexOf(shim, "/")]
+  let token = stateDir[lastIndexOf(stateDir, "/") + 1:]
+  let before = lockState(host, token)
+  if (!contains(before, token) || trimSpace(split(before, "---")[1]) == "") {
+    fail1("before the kill the host shows no lock or no container for ${token}: ${before}")
+  }
+  output("/bin/kill", ["-9", "${pid}"], shortMs)
+  if (!goneWithin(host, token)) {
+    fail1("lock or container of ${token} still present ${deadlineMs}ms after SIGKILL")
+  }
+  removeProbeState(shim)
+  remove(out) catch _ {}
+  remove(log) catch _ {}
+}
+
+// Common prefix of the remote lib tests: the lib, a private lock dir, one labelled container S1.
+fn libPrefix(lib: string, d: string): string {
+  return "BENCHLOCK_DIR=${d}\n${lib}\nS1=bit-dlock-s1-${monotonic().ns}\nmkdir ${d}\nprintf 'token=%s\\nwho=t\\n' \"$S1\" > ${d}/owner\ndocker run -d --rm --label bit.live.session=$S1 ${gateImage} sleep 120 >/dev/null\n"
+}
+
+fn staleProof(host: string, lib: string) {
+  let d = "/tmp/bit-bltest-stale-${monotonic().ns}"
+  let body = "touch -d '10 minutes ago' ${d}/hb\nbl_try S2 w; echo RC1=$?\nbl_try S2 w; echo RC2=$?\necho OWNER=$(sed -n 's/^token=//p' ${d}/owner)\necho LEFT=$(docker ps -aq --filter label=bit.live.session=$S1 | wc -l)\nbl_release\ndocker rm -f $(docker ps -aq --filter label=bit.live.session=$S1) >/dev/null 2>&1\nrm -rf ${d}\n"
+  let r = remote(host, "${libPrefix(lib, d)}${body}")
+  for want of ["reclaiming stale", "RC1=1", "RC2=0", "OWNER=S2", "LEFT=0"] {
+    if (!contains(r, want)) {
+      fail1("stale lock: expected '${want}' in:\n${r}")
+    }
+  }
+  print("stale: reclaimed with a message, owner container removed\n")
+}
+
+fn liveProof(host: string, lib: string) {
+  let d = "/tmp/bit-bltest-live-${monotonic().ns}"
+  let body = "touch ${d}/hb\nbl_try S2 w; echo RC1=$?\necho OWNER=$(sed -n 's/^token=//p' ${d}/owner)\necho LEFT=$(docker ps -aq --filter label=bit.live.session=$S1 | wc -l)\ndocker rm -f $(docker ps -aq --filter label=bit.live.session=$S1) >/dev/null 2>&1\nrm -rf ${d}\n"
+  let r = remote(host, "${libPrefix(lib, d)}${body}")
+  if (contains(r, "reclaiming") ||
+    !contains(r, "RC1=1") ||
+    !contains(r, "LEFT=1") ||
+    contains(r, "OWNER=S2")) {
+    fail1("a live holder was disturbed:\n${r}")
+  }
+  print("live: a fresh heartbeat is never reclaimed\n")
+}
+
+fn main() {
+  let out = envOr(probeEnv, "")
+  if (out != "") {
+    probe(out)
+    return
+  }
+  let host = envOr(remoteHostEnv, "")
+  if (host == "") {
+    print("skipped: ${remoteHostEnv} unset\n")
+    return
+  }
+  let lib = sh("/bin/sh \"$1/scripts/x64gate.sh\" lock-lib", [env("BIT_REPO")])
+  staleProof(host, lib)
+  liveProof(host, lib)
+  killProof(host)
+  print("dockerlivelock: ok\n")
+}

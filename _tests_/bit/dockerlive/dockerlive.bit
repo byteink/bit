@@ -21,9 +21,14 @@
 // `ssh -n <host> docker ...` (stdin closed: an ssh child that inherits stdin
 // eats a payload), so the harnesses' own `output(bin, ...)` calls need no
 // edit. On top of that this file adds what a remote daemon needs:
-//   - the host's `/tmp/benchlock` DIRECTORY lock (mkdir/rmdir, the lock the
-//     host's other users take) is held from the first `docker run` until
-//     `releaseDocker`;
+//   - the host's `/tmp/benchlock` DIRECTORY lock (the lock the host's other
+//     users take) is held from the first `docker run` until `releaseDocker`,
+//     by ONE ssh session (#7604): a remote holder takes the lock, the harness
+//     feeds it a heartbeat line over the session's stdin, and the holder's
+//     trap removes the run's containers and the lock when that session ends
+//     for ANY reason, SIGKILL of this process included. The acquire, heartbeat
+//     and stale-reclaim rules are scripts/x64gate.sh's `lock-lib`, the text
+//     x64gate ships in its own session, so both acquirers agree;
 //   - `hostPort` opens one `ssh -N -L` tunnel per published port, checks it
 //     accepts on 127.0.0.1, and returns the LOCAL port, so every URI a
 //     harness builds from it points at the tunnel unchanged;
@@ -31,7 +36,7 @@
 //     local path does not exist there).
 // Every harness calls `releaseDocker(bin)` from its one cleanup function,
 // AFTER its containers are removed: it kills the tunnels, removes the staged
-// directories and releases the lock, on success and on failure alike. Unset,
+// directories and ends the holder session, on success and on failure alike. Unset,
 // nothing here runs and the local behaviour is unchanged.
 //
 // `failureText` is the one place a failed child's message is built, so a
@@ -42,7 +47,7 @@ import { output, RunResult } from "std/process"
 import { envOr, exit } from "std/os"
 import { exists, mkdir, readFile, remove, writeFile } from "std/fs"
 import { dialDeadline } from "std/net"
-import { hasPrefix, hasSuffix, join, lastIndexOf, parseInt, split, trimSpace } from "std/strings"
+import { contains, hasPrefix, hasSuffix, join, lastIndexOf, parseInt, split, trimSpace } from "std/strings"
 import { sleep, monotonic, since, Millisecond } from "std/time"
 
 // A `docker` call that returns at once (info, port, ps, exec): 10 s.
@@ -258,14 +263,17 @@ export fn sweepOrphans(bin: string, runLabel: string) {
 
 export const remoteHostEnv: string = "BIT_LIVE_DOCKER_HOST"
 const sshBin: string = "/usr/bin/ssh"
-const lockDir: string = "/tmp/benchlock"
+// How the harness proves it is alive to the holder, and how long a release
+// waits for the holder's trap: 120 * 250 ms = 30 s.
+const heldMarker: string = "BENCHLOCK_HELD"
+const heldPollGapMs: int = 500
+const releaseAttempts: int = 120
+const releaseGapMs: int = 250
+const sessionLabelKey: string = "bit.live.session"
 const stagePrefix: string = "/tmp/bit-live-stage-"
 const shimName: string = "docker-remote"
-// Waiting for the lock costs nothing: 360 * 5 s = 30 min.
-const lockAttempts: int = 360
-const lockGapMs: int = 5000
-// An ssh connection failing is rc 255, never a held lock.
-const sshFailedCode: int = 255
+// Waiting for the lock costs nothing: 3600 * 500 ms = 30 min.
+const lockAttempts: int = 3600
 const tunnelTries: int = 5
 const tunnelReadyAttempts: int = 40
 const tunnelReadyGapMs: int = 250
@@ -287,6 +295,26 @@ const tunnelAliveScript: string = `case "$(ps -p "$1" -o command= 2>/dev/null)" 
 const tunnelSpawnScript: string = `/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ConnectTimeout=10 -L "$1:127.0.0.1:$2" "$3" </dev/null >/dev/null 2>&1 & echo $!`
 // Copies directory $1 to $2 on ssh host $3.
 const stageScript: string = `tar -C "$1" -cf - . | /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=10 "$3" "mkdir -p '$2' && tar -C '$2' -xf -"`
+// Starts the lock holder, detached, and prints its pid. $1 ssh host, $2 the
+// harness pid, $3 the state dir, $4 the session token. The ssh session's stdin
+// is a pipe fed by a loop that ends when the harness pid is gone or $3/release
+// exists, so the remote holder reads EOF within a second of either and its
+// trap cleans up; one `hb` line every 30 s tells it the harness is alive. The
+// ssh exit code lands in $3/closed.
+const holderSpawnScript: string = `host=$1 pid=$2 dir=$3 tok=$4
+b64=$(base64 < "$dir/lib.sh" | tr -d '\n')
+who="$(hostname):$pid:$(date +%s)"
+(
+  ( n=0
+    while kill -0 "$pid" 2>/dev/null && [ ! -e "$dir/release" ]; do
+      n=$((n + 1))
+      [ $((n % 30)) -ne 0 ] || echo hb
+      sleep 1
+    done ) |
+    /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "$host" "sh -c \"\$(echo $b64 | base64 -d); bl_hold $tok $who\"" >"$dir/holder.out" 2>"$dir/holder.err"
+  echo $? >"$dir/closed"
+) </dev/null >/dev/null 2>&1 &
+echo $!`
 
 fn remoteHost(): string {
   return envOr(remoteHostEnv, "")
@@ -354,28 +382,75 @@ fn appendLine(path: string, line: string): ()! {
   writeFile(path, "${text}${line}\n")?
 }
 
+// This run's session token: the state dir's own name, unique per run and
+// carrying the harness pid. It labels every container the run starts.
+fn sessionToken(bin: string): string {
+  let dir = stateDir(bin)
+  return dir[lastIndexOf(dir, "/") + 1:]
+}
+
+// scripts/x64gate.sh's `lock-lib`: the remote shell functions both acquirers share.
+fn lockLib(): string! {
+  let script = "${envOr("BIT_REPO", ".")}/scripts/x64gate.sh"
+  let r = output("/bin/sh", [script, "lock-lib"], dockerQuickTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("${script} lock-lib: ${failureText(r, dockerQuickTimeoutMs)}")
+  }
+  return r.stdout
+}
+
+// Starts the holder session; its stdin and lifetime belong to this process (see holderSpawnScript).
+fn spawnHolder(bin: string, host: string): ()! {
+  let dir = stateDir(bin)
+  writeFile("${dir}/lib.sh", lockLib()?)?
+  let pid = selfPid()?
+  let r = output(
+    "/bin/sh",
+    ["-c", holderSpawnScript, "sh", host, "${pid}", dir, sessionToken(bin)],
+    dockerQuickTimeoutMs,
+  )
+  if (r.exitCode != 0 || trimSpace(r.stdout) == "") {
+    fail newError(
+      "remote lock: cannot start the holder session: ${failureText(r, dockerQuickTimeoutMs)}",
+    )
+  }
+  writeFile("${dir}/holder", r.stdout)?
+}
+
+// Why the holder session ended before holding the lock.
+fn holderFailure(dir: string): string {
+  let text = trimSpace("${readText("${dir}/holder.err")}${readText("${dir}/holder.out")}")
+  return "exit ${trimSpace(readText("${dir}/closed"))}: ${text}"
+}
+
+fn readText(path: string): string {
+  if (!exists(path)) {
+    return ""
+  }
+  return readFile(path) catch _ {
+    ""
+  }
+}
+
 // Takes the host's directory lock once per run, waiting for its other holders.
 fn acquireLock(bin: string, host: string): ()! {
-  let marker = "${stateDir(bin)}/lock"
-  if (exists(marker)) {
+  let dir = stateDir(bin)
+  if (exists("${dir}/holder")) {
     return
   }
-  let why = ""
+  spawnHolder(bin, host)?
   let i = 0
   while (i < lockAttempts) {
-    let r = ssh(host, "mkdir ${lockDir}", dockerQuickTimeoutMs)
-    if (r.exitCode == 0) {
-      writeFile(marker, "held\n")?
+    if (contains(readText("${dir}/holder.out"), heldMarker)) {
       return
     }
-    why = failureText(r, dockerQuickTimeoutMs)
-    if (r.exitCode == sshFailedCode) {
-      fail newError("remote lock: ssh to the docker host failed: ${why}")
+    if (exists("${dir}/closed")) {
+      fail newError("remote lock: the holder session ended: ${holderFailure(dir)}")
     }
     i = i + 1
-    sleep(lockGapMs * Millisecond)
+    sleep(heldPollGapMs * Millisecond)
   }
-  fail newError("remote lock ${lockDir} still held after ${lockAttempts * lockGapMs / 1000}s: ${why}")
+  fail newError("remote lock /tmp/benchlock still held after ${lockAttempts * heldPollGapMs / 1000}s")
 }
 
 // Copies the host side of one `-v src:dst[:opt]` to the host and returns the spec naming the copy.
@@ -392,15 +467,15 @@ fn stageMount(bin: string, host: string, spec: string): string! {
   return join(parts, ":")
 }
 
-// `args` for a remote `docker run`: lock taken, bind mounts staged. Anything else, and every local call, unchanged.
+// `args` for a remote `docker run`: lock taken, the session label added, bind mounts staged. Anything else, and every local call, unchanged.
 fn remoteRunArgs(bin: string, args: []string): []string! {
   if (!isRemote(bin) || args[0] != "run") {
     return args
   }
   let host = remoteHost()
   acquireLock(bin, host)?
-  let out = []string(0)
-  let i = 0
+  let out = ["run", "--label", "${sessionLabelKey}=${sessionToken(bin)}"]
+  let i = 1
   while (i < len(args)) {
     if (args[i] == "-v" && i + 1 < len(args)) {
       out = append(out, "-v")
@@ -482,7 +557,24 @@ fn openTunnel(bin: string, remotePort: int): int! {
   fail newError("ssh tunnel to the docker host's port ${remotePort}: no local port became ready in ${tunnelTries} tries")
 }
 
-// Ends a remote run: kills its tunnels, removes the staged copies and releases the host lock. A harness calls it
+// Ends the holder session: `release` stops the stdin feeder, the holder reads EOF
+// and its trap removes the run's labelled containers and the lock; `closed` appears when ssh exits.
+fn endHolder(dir: string) {
+  if (!exists("${dir}/holder")) {
+    return
+  }
+  writeFile("${dir}/release", "1\n") catch _ {}
+  let i = 0
+  while (i < releaseAttempts && !exists("${dir}/closed")) {
+    sleep(releaseGapMs * Millisecond)
+    i = i + 1
+  }
+  if (!exists("${dir}/closed")) {
+    eprint("dockerlive: the lock holder session did not end within ${releaseAttempts * releaseGapMs / 1000}s\n")
+  }
+}
+
+// Ends a remote run: kills its tunnels, removes the staged copies and ends the holder session (lock and containers). A harness calls it
 // from its cleanup AFTER its containers are removed, on every path. No-op for a local docker.
 export fn releaseDocker(bin: string) {
   if (!isRemote(bin)) {
@@ -498,13 +590,18 @@ export fn releaseDocker(bin: string) {
       let _ = ssh(host, "rm -rf '${stage}'", dockerRunTimeoutMs)
     }
   }
-  if (exists("${dir}/lock")) {
-    let r = ssh(host, "rmdir ${lockDir}", dockerQuickTimeoutMs)
-    if (r.exitCode != 0) {
-      eprint("dockerlive: releasing ${lockDir}: ${failureText(r, dockerQuickTimeoutMs)}\n")
-    }
-  }
-  for f of ["lock", "tunnels", "staged", shimName] {
+  endHolder(dir)
+  for f of [
+    "holder",
+    "release",
+    "closed",
+    "holder.out",
+    "holder.err",
+    "lib.sh",
+    "tunnels",
+    "staged",
+    shimName,
+  ] {
     remove("${dir}/${f}") catch _ {}
   }
   remove(dir) catch _ {}
