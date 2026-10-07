@@ -1,0 +1,302 @@
+// pkg/authz/condrelated.bit — `related("editor")`: a condition that holds when
+// the asking user has a relationship to the object a row points at.
+//
+//   p.can<Article>([Update], fromWhere<Article>({ folder: related("editor") })?)
+//
+// reads: "the user may update an article whose folder they are an `editor`
+// of". The relationship itself is data (`authz.relate`, rebac.bit) and the
+// walk that answers it (usersets, inherited relations, bounds) is `walk`.
+//
+// THE MARKER. A condition literal lowers to std/where's `Clause`, whose values
+// are `std/sql`'s `Value`, so `related(...)` is a `Value` too: bytes that begin
+// with a NUL, which `Authz` reads back in `fromWhere` and nowhere else. A
+// marker is meaningful only on a relation field; on any other field, or under
+// an operator other than equality, `fromWhere` refuses it.
+//
+// RESOLVING THE FIELD. `fromWhere` turns `{ folder: related("editor") }` into
+// `Cond.Related(local, target, relation)` once, at policy build:
+//
+//  - `folder` is a `@belongsTo("folderId")` relation field of the class: the
+//    local column is `folderId` and the target is the field's declared class
+//    (`Folder`), which `validate` later requires to be registered;
+//  - `folderId`, the column that `@belongsTo` names, is the same relation;
+//  - the class's own `@id` field means "the user relates to THIS row": the
+//    local column is the key and the target is the class itself;
+//  - anything else, a `@belongsTo` of several columns and a composite `@id`
+//    included, is an InvalidPolicy naming the field. A request never meets it.
+//
+// EVALUATING. The local column's value `v` makes the object `folder:<v>`
+// (the class name with its first letter lowered, as tuples spell it) and the
+// asking user is `user:<id>`; the answer is `hasRelation`'s. A NULL column is
+// unknown, a guest never relates, and a column value or user id that no tuple
+// could name (not 1 to 128 printable bytes without ':' or '#') is not
+// related. A relation that is not declared, or a target nobody registered, is
+// a policy mistake and an InvalidPolicy, as everywhere. Roles play no part:
+// they are RBAC. A bound reached before an answer is a RelationLimit and a
+// store that fails is its own error; `decide.bit` fails both closed.
+
+// The bytes every marker starts with. A NUL cannot begin a name a person
+// typed, so no ordinary value reads as one on a relation field.
+const markerLead: string = "\0authz.related\0"
+
+// What `related("editor")` is in a condition literal's value slot.
+export fn related(relation: string): Value {
+  return Value.Blob([]byte(markerLead + relation))
+}
+
+// The relation a marker names, or None for any other value.
+fn markerRelation(v: Value): Option<string> {
+  return match (v) {
+    Blob(b) => relationOfBytes(b)
+    _ => Option<string>.None
+  }
+}
+
+fn relationOfBytes(b: []byte): Option<string> {
+  let s = string(b)
+  if (len(s) >= len(markerLead) && s[0:len(markerLead)] == markerLead) {
+    return Option<string>.Some(s[len(markerLead):])
+  }
+  return Option<string>.None
+}
+
+fn anyMarker(vs: []Value): bool {
+  for v of vs {
+    if (isSome(markerRelation(v))) {
+      return true
+    }
+  }
+  return false
+}
+
+// The class a relation field is declared with: `Folder` for `Folder` and for
+// `Option<Folder>`.
+fn targetClassOf(typeName: string): string {
+  return unwrapOption(stripSpaces(typeName))
+}
+
+fn hasAttr(c: FieldDesc, name: string): bool {
+  for a of c.attrs {
+    if (a.name == name) {
+      return true
+    }
+  }
+  return false
+}
+
+// A `@belongsTo`'s local columns: every argument before the first named one.
+fn belongsToArgs(c: FieldDesc): []string {
+  let out = []string(0)
+  for a of c.attrs {
+    if (a.name != "belongsTo") {
+      continue
+    }
+    let i = 0
+    while (i < len(a.args) && a.args[i] != "onDelete") {
+      out = append(out, a.args[i])
+      i = i + 1
+    }
+  }
+  return out
+}
+
+// The relation field of `cols` whose `@belongsTo` names `column`, or None.
+fn belongingTo(cols: []FieldDesc, column: string): Option<FieldDesc> {
+  for c of cols {
+    let local = belongsToArgs(c)
+    if (len(local) == 1 && local[0] == column) {
+      return Option<FieldDesc>.Some(c)
+    }
+  }
+  return Option<FieldDesc>.None
+}
+
+// The class's one `@id` field, or an InvalidPolicy when it has none or many.
+fn soleKey(cols: []FieldDesc, field: string): FieldDesc! {
+  let keys = []FieldDesc(0)
+  for c of cols {
+    if (hasAttr(c, "id")) {
+      keys = append(keys, c)
+    }
+  }
+  if (len(keys) != 1) {
+    fail InvalidPolicy{ detail = "related() on ${field}: the class has ${len(keys)} @id fields, only a single key can be related" }
+  }
+  return keys[0]
+}
+
+// A column a tuple's object id can be made of: text or an integer.
+fn checkIdColumn(cols: []FieldDesc, field: string, column: string): ()! {
+  let col = columnOf(rowColumns(cols), column)
+  if (!isSome(col)) {
+    fail InvalidPolicy{ detail = "related() on ${field}: no column ${column}" }
+  }
+  let kind = columnKind(unwrap(col).typeName)
+  if (!isSome(kind) || (unwrap(kind) != ColKind.Int && unwrap(kind) != ColKind.Text)) {
+    fail InvalidPolicy{ detail = "related() on ${field}: column ${column} is ${unwrap(col).typeName}, an object id is text or an integer" }
+  }
+}
+
+// `Cond.Related` for `field` of the class `cls` with columns `cols`.
+fn resolveRelated(cols: []FieldDesc, cls: string, field: string, relation: string): Cond! {
+  let col = columnOf(cols, field)
+  if (!isSome(col)) {
+    fail InvalidPolicy{ detail = "related() on ${field}: ${cls} has no such field" }
+  }
+  let f = unwrap(col)
+  let held = belongingTo(cols, field)
+  if (isSome(held)) {
+    f = unwrap(held)
+  }
+  if (hasAttr(f, "belongsTo")) {
+    let local = belongsToArgs(f)
+    if (len(local) != 1) {
+      fail InvalidPolicy{ detail = "related() on ${field}: @belongsTo names ${len(local)} columns, only a single-column key can be related" }
+    }
+    checkIdColumn(cols, field, local[0])?
+    return Cond.Related(local[0], targetClassOf(f.typeName), relation)
+  }
+  if (hasAttr(f, "id")) {
+    let key = soleKey(cols, field)?
+    checkIdColumn(cols, field, key.name)?
+    return Cond.Related(key.name, cls, relation)
+  }
+  fail InvalidPolicy{ detail = "related() on ${field}: ${field} is neither a @belongsTo relation nor the @id field" }
+}
+
+// The condition one `Clause` states. A marker on equality of a relation field
+// is a `Related`; a marker anywhere else is refused, never compared as bytes.
+fn clauseCond(cols: []FieldDesc, cls: string, c: Clause): Cond! {
+  if (!anyMarker(c.values)) {
+    return Cond.Cmp(c.field, c.op, litsOf(c.values))
+  }
+  let rel = markerRelation(c.values[0])
+  if (c.op != Op.Eq || len(c.values) != 1 || !isSome(rel)) {
+    fail InvalidPolicy{ detail = "related() on ${c.field}: it is the whole value of an equality, not part of a list or an operator" }
+  }
+  return resolveRelated(cols, cls, c.field, unwrap(rel))?
+}
+
+// The target and relation of `c` must be registered and declared.
+fn checkRelated(
+  resources: []ResourceInfo,
+  decls: []RelationDecl,
+  target: string,
+  relation: string,
+): ()! {
+  if (!isSome(findResource(resources, target))) {
+    fail InvalidPolicy{
+      detail = "related(${relation}): ${target} is not a registered resource (registered: ${join(
+        namesIn(resources),
+        ", ",
+      )})",
+    }
+  }
+  checkRelation("related() relation", relation)?
+  checkDeclared(decls, typeNameOf(target), relation, "related() relation")?
+}
+
+fn anyRelated(cs: []Cond): bool {
+  for c of cs {
+    if (hasRelated(c)) {
+      return true
+    }
+  }
+  return false
+}
+
+// Does `c` hold a relationship test? Reads only; allocates nothing.
+fn hasRelated(c: Cond): bool {
+  return match (c) {
+    Related(_, _, _) => true
+    And(cs) => anyRelated(cs)
+    Or(cs) => anyRelated(cs)
+    Not(inner) => hasRelated(inner)
+    Known(inner) => hasRelated(inner)
+    _ => false
+  }
+}
+
+// The asking user and everything a relationship check reads: one per decision
+// that holds a `Related`, none otherwise. `subject` is `user:<id>`, or "" for
+// a guest and for an id no tuple can name.
+class RelAsker {
+  store: RelationStore,
+  resources: []ResourceInfo,
+  decls: []RelationDecl,
+  limits: Limits,
+  subject: string,
+}
+
+fn subjectRef(user: Option<Subject>): string {
+  if (!isSome(user)) {
+    return ""
+  }
+  let id = unwrap(user).id
+  if (!idOk(id)) {
+    return ""
+  }
+  return "user:${id}"
+}
+
+fn newAsker(
+  store: RelationStore,
+  limits: Limits,
+  resources: []ResourceInfo,
+  decls: []RelationDecl,
+  user: Option<Subject>,
+): RelAsker {
+  return RelAsker{
+    store = store,
+    resources = resources,
+    decls = decls,
+    limits = limits,
+    subject = subjectRef(user),
+  }
+}
+
+// The object id a column value spells, "" when it is NULL or no id.
+fn objectIdOf(v: Value, local: string): string! {
+  return match (v) {
+    Int(i) => "${i}"
+    Text(s) => s
+    Null => ""
+    _ => unnameable(local, v)?
+  }
+}
+
+fn unnameable(local: string, v: Value): string! {
+  fail InvalidPolicy{ detail = "related(): column ${local} holds ${kindName(v)}, an object id is text or an integer" }
+}
+
+// Whether the asking user holds `relation` on `target`'s row `id`.
+fn askRelation(a: RelAsker, target: string, id: string, relation: string): Truth! {
+  if (a.subject == "" || !idOk(id)) {
+    return Truth.False
+  }
+  let t = checkTuple(a.resources, a.decls, a.subject, relation, "${typeNameOf(target)}:${id}")?
+  return bool3(walk(a.store, a.decls, a.limits, t)?)
+}
+
+// The value of column `local` of the row `names` and `vals` describe.
+fn columnValue(names: []string, vals: []Value, local: string): Value! {
+  return vals[indexOf(names, local)?]
+}
+
+// `Related(local, target, relation)` of a row whose `local` column holds `v`.
+fn evalRelated(
+  rel: Option<RelAsker>,
+  v: Value,
+  local: string,
+  target: string,
+  relation: string,
+): Truth! {
+  let id = objectIdOf(v, local)?
+  if (isNull(v)) {
+    return Truth.Unknown
+  }
+  if (!isSome(rel)) {
+    fail InvalidPolicy{ detail = "related(${relation}) needs a relationship store: evaluate it through Authz.can" }
+  }
+  return askRelation(unwrap(rel), target, id, relation)?
+}
