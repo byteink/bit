@@ -28,6 +28,84 @@
 # not for routine runs — it costs one full run per reachable box.
 set -euo pipefail
 
+# The box-wide measurement lock, as shell text that runs ON THE REMOTE HOST.
+# `x64gate.sh lock-lib` prints it; this script ships it inside every gate ssh
+# session, and _tests_/bit/dockerlive/dockerlive.bit ships the same text for its
+# remote mode, so both acquirers share ONE acquire/heartbeat/reclaim rule (#7604).
+#
+# /tmp/benchlock is a DIRECTORY (mkdir takes it) holding `owner` (token, who,
+# start, host) and `hb`, a heartbeat the holder touches while it is alive. A lock
+# whose `hb` is older than BL_STALE_MIN minutes is stale: the next acquirer
+# removes the containers labelled with the owner's token, deletes the lock and
+# says so on stderr. A lock with NO `owner` file (a bare `mkdir`, as
+# pkg/web/bench/remote.sh takes it) is never reclaimed: nothing says it is dead.
+# A holder only deletes the lock it owns (token match), so a reclaimed holder
+# that wakes late cannot delete its successor's lock.
+lock_lib() {
+  cat <<'LIB'
+BL=${BENCHLOCK_DIR:-/tmp/benchlock}
+BL_STALE_MIN=${BL_STALE_MIN:-5}
+BL_LABEL_KEY=bit.live.session
+bl_field() { sed -n "s/^$1=//p" "$BL/owner" 2>/dev/null | head -n 1; }
+bl_rm_labelled() {
+  [ -n "$1" ] || return 0
+  ids=$(docker ps -aq --filter "label=$BL_LABEL_KEY=$1" 2>/dev/null)
+  [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1
+  return 0
+}
+bl_stale() {
+  [ -f "$BL/owner" ] || return 1
+  ref=$BL/hb
+  [ -f "$ref" ] || ref=$BL/owner
+  [ -n "$(find "$ref" -mmin +"$BL_STALE_MIN" 2>/dev/null)" ]
+}
+bl_reclaim() {
+  bl_stale || return 0
+  [ -z "$(find "$BL.reclaim" -maxdepth 0 -mmin +1 2>/dev/null)" ] || rmdir "$BL.reclaim" 2>/dev/null
+  mkdir "$BL.reclaim" 2>/dev/null || return 0
+  if bl_stale; then
+    echo "benchlock: reclaiming stale $BL (no heartbeat for over ${BL_STALE_MIN}min): $(tr '\n' ' ' < "$BL/owner")" >&2
+    bl_rm_labelled "$(bl_field token)"
+    rm -rf "$BL"
+  fi
+  rmdir "$BL.reclaim"
+  return 0
+}
+bl_try() {
+  if mkdir "$BL" 2>/dev/null; then
+    printf 'token=%s\nwho=%s\nstart=%s\nhost=%s\n' "$1" "$2" "$(date +%s)" "$(hostname)" > "$BL/owner"
+    touch "$BL/hb"
+    BL_TOKEN=$1
+    return 0
+  fi
+  bl_reclaim
+  return 1
+}
+bl_beat() {
+  ( while sleep 30; do touch "$BL/hb"; done ) </dev/null >/dev/null 2>&1 &
+  BL_BEATPID=$!
+}
+bl_release() {
+  [ -z "${BL_BEATPID:-}" ] || kill "$BL_BEATPID" 2>/dev/null
+  [ -n "${BL_TOKEN:-}" ] || return 0
+  bl_rm_labelled "$BL_TOKEN"
+  [ "$(bl_field token)" != "$BL_TOKEN" ] || rm -rf "$BL"
+  return 0
+}
+bl_hold() {
+  trap bl_release EXIT
+  trap 'exit 1' HUP INT TERM PIPE
+  until bl_try "$1" "$2"; do sleep 5; done
+  echo BENCHLOCK_HELD
+  while read -r _; do touch "$BL/hb"; done
+}
+LIB
+}
+if [ "${1:-}" = "lock-lib" ]; then
+  lock_lib
+  exit 0
+fi
+
 MODE="${1:-fast}"
 RUNS="${2:-1}"
 IMAGE="bit-linux-gate-amd64:latest"
@@ -148,6 +226,7 @@ else
     exit 127
   }
 fi
+LIB_B64=$(lock_lib | base64 | tr -d '\n')
 echo "x64gate: host(s)=$(printf '%s' "${HOSTS}" | tr '\n' ' ')"
 
 # "clean" always uses an ephemeral cache, so it never needs a peer check.
@@ -197,13 +276,16 @@ while IFS= read -r host; do
     # these two variables holds a single word, so splitting is never needed:
     # an unquoted empty expansion vanishes from the command line and a
     # non-empty one is exactly one argv entry, in every POSIX-ish shell.
-    # /tmp/benchlock is the box-wide measurement lock, a DIRECTORY: mkdir takes
-    # it, rmdir releases it. It is taken here rather than by callers so no run
+    # /tmp/benchlock is the box-wide measurement lock, a DIRECTORY: bl_try takes
+    # it, bl_release deletes it (see lock_lib above). It is taken here rather than by callers so no run
     # can skip it (#5998 ran unlocked through #6001's measurement window).
     # X64GATE_LOCK_TRIES bounds the wait in 10 s tries; 360 is one hour.
+    GATE_TOKEN="x64gate-$$-$(date +%s)"
+    GATE_WHO="$(hostname):$$:$(date +%s)"
     code=$(gate_stream | ssh "${host}" "
+      eval \"\$(echo ${LIB_B64} | base64 -d)\"
       n=0
-      until mkdir /tmp/benchlock 2>/dev/null; do
+      until bl_try ${GATE_TOKEN} ${GATE_WHO}; do
         n=\$((n + 1))
         if [ \$n -ge ${X64GATE_LOCK_TRIES:-360} ]; then
           echo \"x64gate: /tmp/benchlock on \$(hostname) still held after \$((n * 10))s: \$(ls -ld /tmp/benchlock 2>&1)\" >&2
@@ -213,8 +295,9 @@ while IFS= read -r host; do
         fi
         sleep 10
       done
-      trap 'rmdir /tmp/benchlock' EXIT
+      trap bl_release EXIT
       trap 'exit 1' HUP INT TERM
+      bl_beat
       if [ \"${CACHE_MODE}\" = clean ]; then
         CACHE_FLAG=''
         CACHE_VOL=''
@@ -233,7 +316,7 @@ while IFS= read -r host; do
           CACHE_ENV=/cache
         fi
       fi
-      docker run --rm -i -e CACHE_ENV=\$CACHE_ENV \$CACHE_FLAG \$CACHE_VOL ${IMAGE} bash -c '
+      docker run --rm -i --label bit.live.session=${GATE_TOKEN} -e CACHE_ENV=\$CACHE_ENV \$CACHE_FLAG \$CACHE_VOL ${IMAGE} bash -c '
         mkdir -p /work && cd /work && tar xi &&
         BIT_STAGE0_CACHE=\$CACHE_ENV/stage0 BIT_ABI_BASELINE_DIR=${ABI_BASELINE_DIR}/runtime BIT_GATE_HEAD_SHA=${GATE_HEAD_SHA} ${GATE_ENV} ./make ${STEP} > /tmp/o 2>&1
         e=\$?

@@ -680,10 +680,22 @@ to 30 minutes for another holder), each published port gets an `ssh -N -L`
 tunnel that the harness waits on until `127.0.0.1:<port>` accepts, and a
 `-v dir:target` bind mount is copied to the host first. The URIs the harness
 hands the tests point at the local tunnel ports. Cleanup removes the
-containers, kills the tunnels, deletes the copied directories and releases the
-lock on success and on failure. A `SIGKILL` of the harness skips it: remove a
-leftover `/tmp/benchlock` on the host by hand once nothing of yours is
-running. Unset, nothing changes and the gates use the local daemon.
+containers, kills the tunnels, deletes the copied directories and ends the
+lock holder, on success and on failure.
+
+The lock and the run's containers live exactly as long as ONE ssh session:
+a remote holder takes the lock, every container the run starts carries the
+label `bit.live.session=<run token>`, and the holder's trap removes both when
+the session ends for any reason. A `SIGKILL` of the harness included: its
+ssh client dies and the host cleans up within seconds. The holder also gets a
+heartbeat line every 30 s and touches `/tmp/benchlock/hb`; an acquirer that
+finds a lock whose `hb` is over 5 minutes old removes that owner's labelled
+containers, deletes the lock and says so on stderr. `scripts/x64gate.sh`
+takes the lock with the same text (`x64gate.sh lock-lib`), so the two agree.
+A lock with no `owner` file (a bare `mkdir`, as `pkg/web/bench/remote.sh`
+takes it) is never reclaimed. `_tests_/bit/dockerlivelock.bit` proves the
+SIGKILL, stale and live cases against the host. Unset, nothing changes and the
+gates use the local daemon.
 
 ### Race detection
 
