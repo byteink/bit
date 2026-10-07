@@ -86,10 +86,11 @@
 //    would also satisfy.
 import { exists, readFile, writeFile } from "std/fs"
 import { envOr } from "std/os"
+import { split } from "std/strings"
 import { uuidV4, format as uuidFormat } from "std/uuid"
 import {
   CliEnv, Capture, Run, fatal, isFullSha, mkdirp, mustSucceed, rcGitAbsent,
-  rmrf, runBitCli, shQuote, startVanityServer, trimEol,
+  rmrf, runBitCli, shQuote, startFlakyVanityServer, startVanityServer, trimEol,
 } from "./pmvanityhelpers"
 import { runMultiPkgOrder } from "./pmvanitymulti"
 import {
@@ -172,6 +173,8 @@ fn main() {
   runMultiPkgOrder(bitExe, stdRoot, [0, 1, 2])
   runMultiPkgOrder(bitExe, stdRoot, [1, 0, 2])
   print("PASS: pmvanity — bit add resolves multiple packages from one repo at one commit, in both orders, generalizing to a third (#5586)\n")
+
+  checkVanityRetry(bitExe, stdRoot)
 }
 
 // The whole flow: build the git+HTTP fixtures, run `bit add` against them
@@ -198,31 +201,8 @@ fn checkVanityAdd(
 ) {
   let name = "vanity-add"
   let root = "/tmp/bit-pmvanity-" + uuidFormat(uuidV4())
-  let srcDir = root + "/fixture-repo"
-  mkdirp(name, srcDir)
-  writeFile(srcDir + "/greet.bit",
-    "export fn greet(): string {\n  return \"hi from vanity pkg\\n\"\n}\n") catch e {
-    fatal(name, "cannot write the fixture module: " + e.message())
-  }
-
-  let fixtureHome = root + "/fixture-home"
-  mkdirp(name, fixtureHome)
-  let noConfigPath = root + "/git-noconfig"
-  writeFile(noConfigPath, "") catch e {
-    fatal(name, "cannot write the git isolation config: " + e.message())
-  }
-
-  let ctx = FixtureCtx{ root = root, srcDir = srcDir, fixtureHome = fixtureHome, noConfigPath = noConfigPath }
-  let sha = buildFixtureRepo(name, ctx, tag)
-  assertAnnotatedTag(name, ctx, tag)
-
-  // The rewrite that makes the resolved `https://` URL fetchable offline —
-  // see the module header. `bit.lock` still records `gitRemoteUrl` itself;
-  // this file is never read by anything but `git`.
+  let sha = prepareVanityFixture(name, root, tag)
   let rewriteConfigPath = root + "/git-rewrite-config"
-  writeFile(rewriteConfigPath, "[url \"file://${srcDir}\"]\n\tinsteadOf = ${gitRemoteUrl}\n") catch e {
-    fatal(name, "cannot write the git insteadOf config: " + e.message())
-  }
 
   let doc = "bit-import: ${vanityName} git ${gitRemoteUrl}\n"
   let (srv, port) = startVanityServer(name, doc)
@@ -264,6 +244,160 @@ fn checkVanityAdd(
   })
   checkVanityAddUsage(name, cliEnv, root)
   rmrf(root)
+}
+
+// #7608: the vanity document GET shares the git calls' retry policy
+// (compiler/pmfetchretry.bit). Three scenarios, each a real `bit add` against a
+// local server that answers the first `failures` requests with `status`:
+// two 503s then the document (recovers, two printed retries); 503s forever
+// (three attempts, the last one the error); a 404 (one attempt, no retry).
+fn checkVanityRetry(bitExe: string, stdRoot: string) {
+  let name = "vanity-retry"
+  let (ok, sha) = runVanityRetryCase(
+    bitExe,
+    stdRoot,
+    VanityRetryCase{ label = "recovers", status = 503, failures = 2 },
+  )
+  if (ok.code != 0) {
+    fatal(
+      name,
+      "`bit add` exited ${ok.code}, want 0 — two 503s are within the 3 attempts\n  stderr: ${ok.stderr}",
+    )
+  }
+  assertRetryLines(name, ok.stderr, 2)
+  let want = "bit add: ${depName} -> ${vanityName}@1.0.0 (${sha})\n"
+  if (ok.stdout != want) {
+    fatal(name, "bit add stdout was '${ok.stdout}', want exactly '${want}'")
+  }
+  print("PASS: pmvanity — a vanity document fetch that fails twice with HTTP 503 is retried and then resolves (#7608)\n")
+
+  let (down, _) = runVanityRetryCase(
+    bitExe,
+    stdRoot,
+    VanityRetryCase{ label = "down", status = 503, failures = 9 },
+  )
+  if (down.code != 1) {
+    fatal(
+      name,
+      "`bit add` exited ${down.code}, want 1 — the server never recovers\n  stderr: ${down.stderr}",
+    )
+  }
+  assertRetryLines(name, down.stderr, 2)
+  assertCount(name, down.stderr, "returned error: 503", 2)
+  assertCount(name, down.stderr, "returned HTTP 503, not 200", 1)
+  print("PASS: pmvanity — a vanity document fetch that keeps failing is tried exactly 3 times, then reported (#7608)\n")
+
+  let (gone, _) = runVanityRetryCase(
+    bitExe,
+    stdRoot,
+    VanityRetryCase{ label = "gone", status = 404, failures = 9 },
+  )
+  if (gone.code != 1) {
+    fatal(
+      name,
+      "`bit add` exited ${gone.code}, want 1 — the document does not exist\n  stderr: ${gone.stderr}",
+    )
+  }
+  assertRetryLines(name, gone.stderr, 0)
+  assertCount(name, gone.stderr, "returned HTTP 404, not 200", 1)
+  print("PASS: pmvanity — a vanity document fetch answered 404 is not retried (#7608)\n")
+}
+
+class VanityRetryCase { label: string, status: int, failures: int }
+
+// One `bit add ${vanityName}@v1.0.0` against a server that fails its first
+// `failures` requests with `status`. Returns the CLI result and the fixture
+// commit's sha; the scenario's scratch root is removed before returning.
+fn runVanityRetryCase(bitExe: string, stdRoot: string, c: VanityRetryCase): (Run, string) {
+  let name = "vanity-retry-" + c.label
+  let root = "/tmp/bit-pmvanity-" + uuidFormat(uuidV4())
+  let sha = prepareVanityFixture(name, root, "v1.0.0")
+  let doc = "bit-import: ${vanityName} git ${gitRemoteUrl}\n"
+  let (srv, port) = startFlakyVanityServer(name, doc, c.status, c.failures)
+
+  let projDir = root + "/proj"
+  mkdirp(name, projDir)
+  writeFile(projDir + "/bit.json", "{}\n") catch e {
+    fatal(name, "cannot write bit.json: " + e.message())
+  }
+  let addHome = root + "/add-home"
+  mkdirp(name, addHome)
+  let addEnv = [
+    "BIT_VANITY_ORIGIN=http://127.0.0.1:${port}",
+    "GIT_CONFIG_GLOBAL=" + root + "/git-rewrite-config",
+    "GIT_CONFIG_SYSTEM=/dev/null",
+    "HOME=" + addHome,
+  ]
+  let cliEnv = CliEnv{
+    bitExe = bitExe,
+    stdRoot = stdRoot,
+    pkgCache = root + "/cache",
+    projDir = projDir,
+  }
+  let run = runBitCli(
+    name, cliEnv, addEnv,
+    ["add", "${vanityName}@v1.0.0"], Capture{
+      outPath = root + "/add.out",
+      errPath = root + "/add.err",
+    },
+  )
+  srv.close()
+  rmrf(root)
+  return run, sha
+}
+
+// Exact counts, not "contains": a retry policy that drifts either way fails.
+fn assertRetryLines(name: string, stderr: string, want: int) {
+  assertCount(name, stderr, "retrying in", want)
+}
+
+fn assertCount(name: string, text: string, needle: string, want: int) {
+  let got = len(split(text, needle)) - 1
+  if (got != want) {
+    fatal(
+      name,
+      "want ${want} occurrence(s) of '${needle}' on stderr, got ${got}\n  stderr: ${text}",
+    )
+  }
+}
+
+// The offline half of every `checkVanityAdd`-shaped scenario: a git repo under
+// `root` holding one module at an ANNOTATED `tag`, plus the scoped git config
+// (`root/git-rewrite-config`) that rewrites the document's `https://` remote
+// to it (see the module header). Returns the tagged commit's sha.
+fn prepareVanityFixture(name: string, root: string, tag: string): string {
+  let srcDir = root + "/fixture-repo"
+  mkdirp(name, srcDir)
+  writeFile(
+    srcDir + "/greet.bit",
+    "export fn greet(): string {\n  return \"hi from vanity pkg\\n\"\n}\n",
+  ) catch e {
+    fatal(name, "cannot write the fixture module: " + e.message())
+  }
+
+  let fixtureHome = root + "/fixture-home"
+  mkdirp(name, fixtureHome)
+  let noConfigPath = root + "/git-noconfig"
+  writeFile(noConfigPath, "") catch e {
+    fatal(name, "cannot write the git isolation config: " + e.message())
+  }
+
+  let ctx = FixtureCtx{
+    root = root,
+    srcDir = srcDir,
+    fixtureHome = fixtureHome,
+    noConfigPath = noConfigPath,
+  }
+  let sha = buildFixtureRepo(name, ctx, tag)
+  assertAnnotatedTag(name, ctx, tag)
+
+  // `bit.lock` still records `gitRemoteUrl` itself; this file is never read by
+  // anything but `git`.
+  let rewriteConfigPath = root + "/git-rewrite-config"
+  writeFile(rewriteConfigPath, "[url \"file://${srcDir}\"]\n\tinsteadOf = ${gitRemoteUrl}\n") catch e {
+    fatal(name, "cannot write the git insteadOf config: " + e.message())
+  }
+  return sha
 }
 
 // Writes a program that imports the fetched package and runs it — proving
