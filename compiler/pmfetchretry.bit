@@ -1,0 +1,207 @@
+// compiler/pmfetchretry.bit — retry of the git network calls compiler/
+// pmfetch*.bit make (#7608). `git ls-remote`, `git fetch` and the vanity
+// document GET (pmfetchresolvevanity.bit) are the only places the package
+// manager talks to a remote, and one connection blip there used to fail the
+// whole build: GitHub answered 200 s after a single
+// "Failed to connect to github.com port 443 after 1047 ms" that had already
+// panicked a push gate.
+//
+// The contract is Cargo's `net.retry` (default 3) and Go's module fetch:
+//   - up to `gitMaxAttempts` (3) attempts in total;
+//   - exponential backoff, 500 ms then 1000 ms, each plus up to 50% random
+//     jitter so a fleet of builds that failed together does not retry in step;
+//   - only a TRANSIENT failure is retried (`isTransientGitFailure`): a timeout,
+//     a connect/DNS/TLS/reset error, an HTTP 5xx or 429. An auth failure or a
+//     missing repository fails on the first attempt, as does anything git did
+//     not explain at all (a missing ref exits non-zero with empty output);
+//   - one stderr line per retry naming the operation, the attempt and git's own
+//     message, so the failed attempts stay visible when a later one succeeds.
+//     The last attempt's failure is not printed here: the caller reports it as
+//     its usual error, so a build that never recovers shows all three.
+//
+// ONE policy, ONE loop (`retryRemote`), two kinds of call. Both report their
+// outcome as a `GitRun`, so a vanity attempt (`vanityAttempt`) is judged by the
+// same classifier, backoff and retry line as a git subprocess; the only thing
+// that differs is how one attempt is made (`attemptRemote`). A 5xx/429 retries,
+// a 404 or any other 4xx does not.
+//
+// Same module as pmfetch.bit, so `sleep`/`Millisecond` come from its imports.
+
+import { toLower, replace } from "std/strings"
+import { randomBytes } from "std/crypto"
+
+const gitMaxAttempts: int = 3
+const gitBackoffBaseMs: int = 500
+
+// Output that says the failure is not the network's: retrying cannot help and
+// would only delay the diagnostic. Checked BEFORE the transient needles, since
+// an HTTP error page can carry both ("Could not resolve host" never appears
+// beside "not found", but "returned error: 403" beside a TLS line can).
+fn gitPermanentNeedles(): []string {
+  return [
+    "authentication failed",
+    "could not read username",
+    "could not read password",
+    "permission denied",
+    "access denied",
+    "host key verification failed",
+    "repository not found",
+    "does not appear to be a git repository",
+    "returned error: 401",
+    "returned error: 403",
+    "returned error: 404",
+    "not found",
+  ]
+}
+
+fn gitTransientNeedles(): []string {
+  return [
+    "could not resolve",
+    "temporary failure in name resolution",
+    "failed to connect",
+    "connect to host",
+    "timed out",
+    "connection reset",
+    "connection refused",
+    "connection closed",
+    "network is unreachable",
+    "no route to host",
+    "empty reply from server",
+    "the remote end hung up unexpectedly",
+    "unexpected disconnect",
+    "early eof",
+    "rpc failed",
+    "transfer closed",
+    "recv failure",
+    "send failure",
+    "http/2 stream",
+    "dial ",
+    "tls client",
+    "ssl connection",
+    "ssl_error",
+    "gnutls",
+    "returned error: 5",
+    "returned error: 429",
+  ]
+}
+
+fn mentionsAnyOf(text: string, needles: []string): bool {
+  let i = 0
+  while (i < len(needles)) {
+    if (indexOf(text, needles[i]) >= 0) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether `run` failed in a way a later attempt can plausibly cure. A
+// deadline overrun is transient (the link was slow or stalled); a clean exit is
+// not a failure at all; any other exit is judged by what git printed.
+fn isTransientGitFailure(run: GitRun): bool {
+  if (run.timedOut) {
+    return true
+  }
+  if (run.exitCode == 0) {
+    return false
+  }
+  let text = toLower(run.output)
+  if (mentionsAnyOf(text, gitPermanentNeedles())) {
+    return false
+  }
+  return mentionsAnyOf(text, gitTransientNeedles())
+}
+
+// The wait before attempt `attempt + 1` (1-based): the base doubled once per
+// attempt already made, plus `jitter` (a random byte, 0..255) scaled to under
+// half of it — [base, 1.5 * base).
+fn gitBackoffMs(attempt: int, jitter: int): int {
+  let base = gitBackoffBaseMs
+  let i = 1
+  while (i < attempt) {
+    base = base * 2
+    i = i + 1
+  }
+  return base + base * jitter / 512
+}
+
+// One line, no trailing newline: git's output with its own line breaks folded.
+fn gitFailureDetail(run: GitRun, timeoutMs: int): string {
+  if (run.timedOut) {
+    return "timed out after ${timeoutMs}ms"
+  }
+  let flat = replace(replace(pmTrim(run.output), "\r", ""), "\n", " ")
+  if (len(flat) == 0) {
+    return "exit ${run.exitCode}"
+  }
+  return flat
+}
+
+fn gitRetryLine(what: string, attempt: int, detail: string, delayMs: int): string {
+  return "pmfetch: ${what} failed (attempt ${attempt}/${gitMaxAttempts}): ${detail}; retrying in ${delayMs}ms\n"
+}
+
+// One call the policy retries. `vanityUrl` empty means a git subprocess
+// (`gitBin`, `args`); otherwise the vanity document GET of that URL, and
+// `gitBin`/`args` are unused. `timeoutMs` is each attempt's own deadline and
+// `what` names the operation in the retry line.
+class RemoteCall { what: string, timeoutMs: int, gitBin: string, args: []string, vanityUrl: string }
+
+fn attemptRemote(call: RemoteCall): GitRun! {
+  if (len(call.vanityUrl) > 0) {
+    return vanityAttempt(call.vanityUrl, call.timeoutMs)
+  }
+  let run = runGit(call.gitBin, call.args, call.timeoutMs)?
+  return run
+}
+
+// `runGit` for a call that crosses the network: the same `GitRun` back, after
+// retrying a transient failure. A launch failure (`runGit` itself failing, not
+// git) is never retried. `what` names the operation in the retry line, e.g.
+// "git ls-remote https://host/o/r.git@v1".
+fn runGitRetrying(gitBin: string, args: []string, timeoutMs: int, what: string): GitRun! {
+  let run = retryRemote(
+    RemoteCall{
+      what = what,
+      timeoutMs = timeoutMs,
+      gitBin = gitBin,
+      args = args,
+      vanityUrl = "",
+    },
+  )?
+  return run
+}
+
+// The vanity document GET of `url` under the same policy; `deadlineMs` bounds
+// each attempt.
+fn fetchVanityRetrying(url: string, deadlineMs: int): GitRun! {
+  let run = retryRemote(
+    RemoteCall{
+      what = "vanity fetch of ${url}",
+      timeoutMs = deadlineMs,
+      gitBin = "",
+      args = []string(0),
+      vanityUrl = url,
+    },
+  )?
+  return run
+}
+
+// The one retry loop: attempts `call` up to `gitMaxAttempts` times, backing off
+// and printing a line between a transient failure and the next attempt.
+fn retryRemote(call: RemoteCall): GitRun! {
+  let attempt = 1
+  while (attempt < gitMaxAttempts) {
+    let run = attemptRemote(call)?
+    if (!isTransientGitFailure(run)) {
+      return run
+    }
+    let delay = gitBackoffMs(attempt, int(randomBytes(1)[0]))
+    eprint(gitRetryLine(call.what, attempt, gitFailureDetail(run, call.timeoutMs), delay))
+    sleep(delay * Millisecond)
+    attempt = attempt + 1
+  }
+  let last = attemptRemote(call)?
+  return last
+}

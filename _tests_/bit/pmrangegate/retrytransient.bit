@@ -1,0 +1,228 @@
+// _tests_/bit/pmrangegate/retrytransient.bit — `bit add` retries a git network
+// failure that is transient and only that (#7608). Sibling of scenarios.bit and
+// harness.bit in the same module (see harness.bit's header), so every name
+// they own is used here unqualified and none is declared again.
+//
+// The incident: one "Failed to connect to github.com port 443" from `git
+// ls-remote` failed a whole push gate, and GitHub answered 200 s later. The
+// target is Cargo's `net.retry` and Go's module fetch: 3 attempts, exponential
+// backoff with jitter, a printed line per retry, and no retry for an error
+// that waiting cannot cure (compiler/pmfetchretry.bit).
+//
+// The fixture is a real git repository reached through an `ssh://` URL whose
+// "ssh" is a shell script (`core.sshCommand`): it counts its own invocations
+// in a file and fails the first N of them with a chosen message, then execs
+// the remote command so git talks to the local repository for real. One
+// `insteadOf` rewrites the `https://` URL `bit add` derives, exactly as
+// staletransitive.bit does with `file://`, so nothing here touches the network.
+// `file://` cannot play this part: a local transport has no step that can fail
+// by the script's say-so, and a transient failure that flips to success needs
+// one. Three checks, each a real `bit` subprocess:
+//
+//  1. a remote that fails twice with a connect timeout and answers the third
+//     time: `bit add` exits 0, locks the right commit, and printed exactly two
+//     retry lines (attempt 1/3 and 2/3);
+//  2. a remote that always fails the same way: exactly three attempts, exit 1,
+//     and the connect error appears once per attempt (two retry lines, then the
+//     final error);
+//  3. a remote that answers "Permission denied (publickey)": exactly one
+//     attempt, no retry line.
+
+const retryRepoName: string = "retrybase"
+const retryTransientMsg: string = "ssh: connect to host flaky port 22: Connection timed out"
+const retryAuthMsg: string = "git@flaky: Permission denied (publickey)."
+const retryAlways: int = 999
+
+fn checkRetryTransient(bitExe: string, stdRoot: string) {
+  let root = scratchRoot("retry")
+  let repo = newFixtureCtx(root, retryRepoName)
+  gitInitRepo(repo)
+  writeFile(repo.srcDir + "/a.txt", "1.0.0\n") catch e {
+    fatal("retry", "cannot write retrybase fixture: " + e.message())
+  }
+  let sha = commitAndTag(repo, "retrybase v1.0.0", "v1.0.0")
+
+  checkRetryRecovers(bitExe, stdRoot, root, repo, sha)
+  checkRetryGivesUp(bitExe, stdRoot, root, repo)
+  checkRetrySkipsAuthFailure(bitExe, stdRoot, root, repo)
+}
+
+fn checkRetryRecovers(
+  bitExe: string,
+  stdRoot: string,
+  root: string,
+  repo: FixtureCtx,
+  sha: string,
+) {
+  let name = "retry-recovers"
+  // A healthy remote first: how many connections one `bit add` opens when
+  // nothing fails (the lookup and the fetch each open at least one).
+  let healthy = newProjectCli(name, bitExe, stdRoot, root, "healthy")
+  let healthyCount = writeFlakyRemote(root, repo, "healthy", 0, retryTransientMsg)
+  let base = runRetry(healthy, root, "healthy", "add")
+  if (base.code != 0) {
+    fatal(
+      name,
+      "`bit add` against a healthy remote exited ${base.code}, want 0\n  stderr: ${base.stderr}",
+    )
+  }
+  assertOccurrences(name, base.stderr, "retrying in", 0)
+  let want = connectionCount(name, healthyCount)
+
+  let cli = newProjectCli(name, bitExe, stdRoot, root, "recovers")
+  let count = writeFlakyRemote(root, repo, "recovers", 2, retryTransientMsg)
+  let run = runRetry(cli, root, "recovers", "add")
+  if (run.code != 0) {
+    fatal(
+      name,
+      "`bit add` exited ${run.code}, want 0 — two transient failures are within the 3 attempts\n  stderr: ${run.stderr}",
+    )
+  }
+  assertOccurrences(name, run.stderr, "retrying in", 2)
+  assertOccurrences(name, run.stderr, "(attempt 1/3)", 1)
+  assertOccurrences(name, run.stderr, "(attempt 2/3)", 1)
+  assertOccurrences(name, run.stderr, "(attempt 3/3)", 0)
+  assertOccurrences(name, run.stderr, retryTransientMsg, 2)
+  let entry = readLockEntry(name, cli.projDir, retryRepoName)
+  assertJsonString(name, "bit.lock .${retryRepoName}", entry, "commit", sha)
+  assertConnectionCount(name, count, want + 2, want + 2)
+  print("PASS: pmrangegate — bit add survives two transient git ls-remote failures and prints one line per retry (#7608)\n")
+}
+
+fn checkRetryGivesUp(bitExe: string, stdRoot: string, root: string, repo: FixtureCtx) {
+  let name = "retry-gives-up"
+  let cli = newProjectCli(name, bitExe, stdRoot, root, "giveup")
+  let count = writeFlakyRemote(root, repo, "giveup", retryAlways, retryTransientMsg)
+  let run = runRetry(cli, root, "giveup", "add")
+  if (run.code != 1) {
+    fatal(
+      name,
+      "`bit add` exited ${run.code}, want 1 — the remote never answers\n  stderr: ${run.stderr}",
+    )
+  }
+  assertConnectionCount(name, count, 3, 3)
+  assertOccurrences(name, run.stderr, "retrying in", 2)
+  assertOccurrences(name, run.stderr, retryTransientMsg, 3)
+  assertOccurrences(name, run.stderr, "git ls-remote --tags failed (exit 128)", 1)
+  print("PASS: pmrangegate — a git remote that always fails is tried exactly 3 times and every attempt's error is reported (#7608)\n")
+}
+
+fn checkRetrySkipsAuthFailure(bitExe: string, stdRoot: string, root: string, repo: FixtureCtx) {
+  let name = "retry-auth"
+  let cli = newProjectCli(name, bitExe, stdRoot, root, "auth")
+  let count = writeFlakyRemote(root, repo, "auth", retryAlways, retryAuthMsg)
+  let run = runRetry(cli, root, "auth", "add")
+  if (run.code != 1) {
+    fatal(
+      name,
+      "`bit add` exited ${run.code}, want 1 — the remote refuses the credentials\n  stderr: ${run.stderr}",
+    )
+  }
+  assertConnectionCount(name, count, 1, 1)
+  assertOccurrences(name, run.stderr, "retrying in", 0)
+  assertOccurrences(name, run.stderr, retryAuthMsg, 1)
+  print("PASS: pmrangegate — an authentication failure is not retried (#7608)\n")
+}
+
+// Writes the counting "ssh" script and the git config that routes `repo`'s
+// derived https URL through it. The script fails its first `failures`
+// invocations with `msg` (exit 255, as ssh does for a connection error) and
+// from then on runs the remote command locally. Returns the counter file.
+fn writeFlakyRemote(
+  root: string,
+  repo: FixtureCtx,
+  label: string,
+  failures: int,
+  msg: string,
+): string {
+  let count = root + "/${label}.count"
+  let script = root + "/${label}-ssh.sh"
+  let body = "#!/bin/sh\n" +
+    "n=$(cat " +
+    shQuote(count) +
+    " 2>/dev/null || echo 0)\n" +
+    "n=$((n + 1))\n" +
+    "echo \"$n\" > " +
+    shQuote(count) +
+    "\n" +
+    "for last; do :; done\n" +
+    "if [ \"$n\" -le ${failures} ]; then\n" +
+    "  echo " +
+    shQuote(msg) +
+    " >&2\n" +
+    "  exit 255\n" +
+    "fi\n" +
+    "PATH=\"$(git --exec-path):$PATH\"\n" +
+    "exec /bin/sh -c \"$last\"\n"
+  writeFile(script, body) catch e {
+    fatal(label, "cannot write the flaky ssh script: " + e.message())
+  }
+  writeFile(count, "0\n") catch e {
+    fatal(label, "cannot write the connection counter: " + e.message())
+  }
+  // `ssh.variant` pins git's argv shape: left to "auto" it probes the command
+  // with `-G`, which this script would count (and fail) as a connection.
+  let cfg = "[core]\n\tsshCommand = \"/bin/sh '${script}'\"\n" +
+    "[ssh]\n\tvariant = ssh\n" +
+    "[url \"ssh://flaky${repo.srcDir}\"]\n\tinsteadOf = https://${gitHost}/${owner}/${pathBase(repo.srcDir)}.git\n"
+  writeFile(root + "/${label}.gitconfig", cfg) catch e {
+    fatal(label, "cannot write git config: " + e.message())
+  }
+  return count
+}
+
+fn runRetry(cli: CliCtx, root: string, label: string, verb: string): Run {
+  let env = [
+    "HOME=" + cli.home,
+    "GIT_CONFIG_GLOBAL=" + root + "/${label}.gitconfig",
+    "GIT_CONFIG_SYSTEM=/dev/null",
+  ]
+  let spec = staleSpec(retryRepoName, "v1.0.0")
+  return runBitCli(
+    cli,
+    env,
+    [verb, spec],
+    cli.projDir + "/${label}.out",
+    cli.projDir + "/${label}.err",
+  )
+}
+
+// The script's own count of connections git opened, not the number of retry
+// lines bit printed: it is the one witness that cannot be talked into agreeing.
+// `bit add` opens further connections after the lookup (the fetch), so a
+// recovering run is compared against a healthy run's count, plus the failures.
+fn assertConnectionCount(name: string, countPath: string, min: int, max: int) {
+  let n = connectionCount(name, countPath)
+  if (n < min || n > max) {
+    fatal(name, "the remote saw ${n} connection(s), want ${min}..${max}")
+  }
+}
+
+fn connectionCount(name: string, countPath: string): int {
+  return parseCount(name, trimEol(readFileMust(name, countPath)))
+}
+
+fn parseCount(name: string, s: string): int {
+  let n = 0
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] < '0' || s[i] > '9') {
+      fatal(name, "connection counter holds '${s}', want a number")
+    }
+    n = n * 10 + int(s[i] - '0')
+    i = i + 1
+  }
+  return n
+}
+
+// Exact, not "contains": a count that drifts either way is a retry policy
+// that changed.
+fn assertOccurrences(name: string, text: string, needle: string, want: int) {
+  let got = len(split(text, needle)) - 1
+  if (got != want) {
+    fatal(
+      name,
+      "want ${want} occurrence(s) of '${needle}' on stderr, got ${got}\n  stderr: ${text}",
+    )
+  }
+}
