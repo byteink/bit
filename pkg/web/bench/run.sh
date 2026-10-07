@@ -101,10 +101,15 @@ ship() {
 
 # --reuse skips the ship as well as the build, and has to: the shipped tree
 # replaces web/ outright, which takes express's node_modules with it.
+# remote.sh takes the box-wide /tmp/benchlock through the shared lock text
+# (#7614), which lives in scripts/ and so is not in the shipped tree: it travels
+# in the environment, base64 so no quoting survives to be wrong.
 measure() {
-  local stage=all
+  local stage=all lib
   [ "$MODE" != --reuse ] || stage=run
-  ssh "$host" "cd ~/$REMOTE_DIR/web/bench && BENCH_BIT_LABEL='$LABEL' ./remote.sh $stage" \
+  lib=$(bash "$REPO/scripts/x64gate.sh" lock-lib | base64 | tr -d '\n')
+  [ -n "$lib" ] || { echo "x64gate.sh lock-lib printed nothing" >&2; exit 1; }
+  ssh "$host" "cd ~/$REMOTE_DIR/web/bench && BENCH_LOCK_LIB_B64='$lib' BENCH_BIT_LABEL='$LABEL' ./remote.sh $stage" \
     < /dev/null
 }
 

@@ -691,9 +691,11 @@ ssh client dies and the host cleans up within seconds. The holder also gets a
 heartbeat line every 30 s and touches `/tmp/benchlock/hb`; an acquirer that
 finds a lock whose `hb` is over 5 minutes old removes that owner's labelled
 containers, deletes the lock and says so on stderr. `scripts/x64gate.sh`
-takes the lock with the same text (`x64gate.sh lock-lib`), so the two agree.
-A lock with no `owner` file (a bare `mkdir`, as `pkg/web/bench/remote.sh`
-takes it) is never reclaimed. `_tests_/bit/dockerlivelock.bit` proves the
+takes the lock with the same text (`x64gate.sh lock-lib`), so the two agree,
+and so does `pkg/web/bench/remote.sh`, which `bench/run.sh` hands the text in
+`BENCH_LOCK_LIB_B64`. The heartbeat loop exits with the shell that took the
+lock, so a `SIGKILL`ed holder goes stale after 5 minutes. A lock with no
+`owner` file (a bare `mkdir`) is never reclaimed. `_tests_/bit/dockerlivelock.bit` proves the
 SIGKILL, stale and live cases against the host. Unset, nothing changes and the
 gates use the local daemon.
 

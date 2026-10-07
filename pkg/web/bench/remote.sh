@@ -127,30 +127,30 @@ build_bit() {
 }
 
 build_gin() {
-  docker run --rm -v "$SHIP:/w" -w /w/web/bench/apps/gin \
+  drun --rm -v "$SHIP:/w" -w /w/web/bench/apps/gin \
     -e GOFLAGS=-mod=mod -e GOCACHE=/w/web/bench/out/cache/go \
     -e GOMODCACHE=/w/web/bench/out/cache/gomod golang:1-alpine \
     sh -c 'go get github.com/gin-gonic/gin@latest && go mod tidy && CGO_ENABLED=0 go build -o /w/web/bench/out/bin/ginbench .'
 }
 
 build_express() {
-  docker run --rm -v "$SHIP:/w" -w /w/web/bench/apps/express node:22-alpine \
+  drun --rm -v "$SHIP:/w" -w /w/web/bench/apps/express node:22-alpine \
     sh -c 'npm install --no-audit --no-fund --loglevel=error express'
 }
 
 build_bun() {
   # No dependencies: bun runs the source. Prove the runtime is there instead.
-  docker run --rm -v "$SHIP:/w" -w /w/web/bench/apps/bun oven/bun:1 bun --version
+  drun --rm -v "$SHIP:/w" -w /w/web/bench/apps/bun oven/bun:1 bun --version
 }
 
 build_spring() {
-  docker run --rm -v "$SHIP:/w" -w /w/web/bench/apps/spring \
+  drun --rm -v "$SHIP:/w" -w /w/web/bench/apps/spring \
     -v "$ROOT/out/cache/m2:/root/.m2" maven:3-eclipse-temurin-21-alpine \
     mvn -q -B -DskipTests package
 }
 
 build_aspnet() {
-  docker run --rm -v "$SHIP:/w" -w /w/web/bench/apps/aspnet \
+  drun --rm -v "$SHIP:/w" -w /w/web/bench/apps/aspnet \
     -e DOTNET_CLI_TELEMETRY_OPTOUT=1 -e NUGET_PACKAGES=/w/web/bench/out/cache/nuget \
     mcr.microsoft.com/dotnet/sdk:9.0 \
     dotnet publish -c Release -o /w/web/bench/out/aspnet
@@ -177,20 +177,20 @@ start_one() {
   local fw=$1 name=t5418-$fw
   docker rm -f "$name" >/dev/null 2>&1 || true
   case $fw in
-    bit) docker run -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
+    bit) drun -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
            -v "$SHIP:/w" "$BIT_RUN_IMAGE" /w/web/bench/out/bin/bitbench ;;
-    gin) docker run -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
+    gin) drun -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
            -v "$SHIP:/w" -e GIN_MODE=release golang:1-alpine /w/web/bench/out/bin/ginbench ;;
-    express) docker run -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
+    express) drun -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
            -v "$SHIP:/w" -w /w/web/bench/apps/express -e NODE_ENV=production \
            node:22-alpine node server.js ;;
-    bun) docker run -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
+    bun) drun -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
            -v "$SHIP:/w" -w /w/web/bench/apps/bun -e NODE_ENV=production \
            oven/bun:1 bun server.ts ;;
-    spring) docker run -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
+    spring) drun -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
            -v "$SHIP:/w" eclipse-temurin:21-jdk-alpine \
            java -jar /w/web/bench/apps/spring/target/springbench.jar ;;
-    aspnet) docker run -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
+    aspnet) drun -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
            -v "$SHIP:/w" -e DOTNET_ENVIRONMENT=Production \
            mcr.microsoft.com/dotnet/sdk:9.0 dotnet /w/web/bench/out/aspnet/aspnetbench.dll ;;
   esac > "$LOG/run-$fw.cid"
@@ -216,6 +216,10 @@ start_all() {
   for fw in $FRAMEWORKS; do wait_ready "$fw"; done
   say "up: $FRAMEWORKS"
 }
+
+# Every container this run starts carries the lock's session label, so a
+# reclaim of a dead run's lock removes them too (bl_rm_labelled in the lock text).
+drun() { docker run --label "$BL_LABEL_KEY=$BL_TOKEN" "$@"; }
 
 stop_all() {
   local fw
@@ -304,7 +308,7 @@ verify_affinity() {
     printf '    %-8s server pid %-7s Cpus_allowed_list=%s\n' "$fw" "$pid" "$got"
     [ "$got" = "$SERVER_CPUS" ] || return 1
   done
-  cid=$(docker run -d --network host --cpuset-cpus "$LOAD_CPUS" "$OHA_IMAGE" \
+  cid=$(drun -d --network host --cpuset-cpus "$LOAD_CPUS" "$OHA_IMAGE" \
     -z 10s -c 4 --no-tui --output-format json "http://127.0.0.1:$(port_of bit)/plaintext")
   local i got=""
   for i in $(seq 1 30); do
@@ -372,7 +376,7 @@ one_rep() {
   cpu0=$(server_cpu_ticks "$fw")
   load0=$(load_busy_ticks)
   t0=$(date +%s.%N)
-  json=$(docker run --rm --network host --cpuset-cpus "$LOAD_CPUS" "$OHA_IMAGE" \
+  json=$(drun --rm --network host --cpuset-cpus "$LOAD_CPUS" "$OHA_IMAGE" \
     -z "$dur" -c "$conn" --no-tui --output-format json "http://127.0.0.1:$port/$test") || return 1
   t1=$(date +%s.%N)
   cpu1=$(server_cpu_ticks "$fw")
@@ -480,28 +484,38 @@ versions() {
   {
     say "bit $BIT_LABEL"
     say "gin $(grep -m1 'gin-gonic/gin' "$ROOT/apps/gin/go.mod" | awk '{print $NF}')"
-    say "go $(docker run --rm golang:1-alpine go version | awk '{print $3}')"
-    say "express $(docker run --rm -v "$SHIP:/w" -w /w/web/bench/apps/express node:22-alpine \
+    say "go $(drun --rm golang:1-alpine go version | awk '{print $3}')"
+    say "express $(drun --rm -v "$SHIP:/w" -w /w/web/bench/apps/express node:22-alpine \
       node -p 'require("express/package.json").version' 2>&1 | tail -1)"
-    say "node $(docker run --rm node:22-alpine node --version)"
-    say "bun $(docker run --rm oven/bun:1 bun --version)"
+    say "node $(drun --rm node:22-alpine node --version)"
+    say "bun $(drun --rm oven/bun:1 bun --version)"
     say "springboot $(grep -m1 -A2 spring-boot-starter-parent "$ROOT/apps/spring/pom.xml" | grep version | sed 's/.*<version>\(.*\)<\/version>.*/\1/')"
-    say "jvm $(docker run --rm eclipse-temurin:21-jdk-alpine java -version 2>&1 | head -1 | cut -d'"' -f2)"
-    say "dotnet $(docker run --rm mcr.microsoft.com/dotnet/sdk:9.0 dotnet --version)"
-    say "oha $(docker run --rm "$OHA_IMAGE" --version 2>&1 | head -1 | awk '{print $NF}')"
+    say "jvm $(drun --rm eclipse-temurin:21-jdk-alpine java -version 2>&1 | head -1 | cut -d'"' -f2)"
+    say "dotnet $(drun --rm mcr.microsoft.com/dotnet/sdk:9.0 dotnet --version)"
+    say "oha $(drun --rm "$OHA_IMAGE" --version 2>&1 | head -1 | awk '{print $NF}')"
   } > "$OUT/versions.txt" 2>&1
 }
 
 # ---------------------------------------------------------------- main
 
-# /tmp/benchlock is the box-wide measurement lock, a DIRECTORY: mkdir takes it,
-# rmdir releases it, the same lock scripts/x64gate.sh takes for every gate run.
+# /tmp/benchlock is the box-wide measurement lock, a DIRECTORY, the same lock
+# scripts/x64gate.sh and the dockerlive harness take. It is taken through the
+# text `scripts/x64gate.sh lock-lib` prints (bench/run.sh ships it in
+# BENCH_LOCK_LIB_B64), so all three share ONE owner file + 30 s heartbeat +
+# 5-minute stale reclaim: a remote.sh that is SIGKILLed leaves a lock the next
+# acquirer reclaims, where a bare mkdir would leave it for good (#7614, #7604).
 # Held for the whole run, builds included, so no gate container lands on these
 # cores mid-rep. The wait is bounded in 10 s tries; 360 is one hour.
 LOCK=/tmp/benchlock
 take_lock() {
   local n=0
-  until mkdir "$LOCK" 2>/dev/null; do
+  [ -n "${BENCH_LOCK_LIB_B64:-}" ] || {
+    say "BENCH_LOCK_LIB_B64 is unset: run through bench/run.sh, which ships 'x64gate.sh lock-lib'"
+    return 1
+  }
+  eval "$(printf '%s' "$BENCH_LOCK_LIB_B64" | base64 -d)"
+  local token="remote-$$-$(date +%s)"
+  until bl_try "$token" "$(hostname):$$:$(date +%s)"; do
     n=$((n + 1))
     if [ "$n" -ge "${BENCH_LOCK_TRIES:-360}" ]; then
       say "$LOCK still held after $((n * 10))s: $(ls -ld "$LOCK" 2>&1)"
@@ -509,8 +523,9 @@ take_lock() {
     fi
     sleep 10
   done
-  trap 'stop_all; rmdir "$LOCK"' EXIT
+  trap 'stop_all; bl_release' EXIT
   trap 'exit 1' HUP INT TERM
+  bl_beat
 }
 
 # Stages, so a slow build is not repeated to re-run a fast measurement:
