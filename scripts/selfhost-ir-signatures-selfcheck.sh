@@ -9,9 +9,9 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 # shellcheck source=scripts/selfhost-ir-signatures.sh
 . "${ROOT}/scripts/selfhost-ir-signatures.sh"
 
-# Self-check: run directly (not sourced) to assert explainMismatch explains
-# nothing on any kind while no signature is declared (see scripts/selfhost-ir-
-# signatures.sh's Retirement history), and that declaredSignatureNames() stays
+# Self-check: run directly (not sourced) to assert explainMismatch explains each
+# declared signature's divergence and nothing unrelated (see scripts/selfhost-ir-
+# signatures.sh's Declared signatures), and that declaredSignatureNames() stays
 # in sync with it.
 # `bash scripts/selfhost-ir-signatures-selfcheck.sh`. Same pattern as
 # scripts/selfhost-ir-canon.sh's self-check.
@@ -21,9 +21,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 
   # Every signature this check once carried a fixture for is RETIRED; the
   # list, and the repin that retired each, is in scripts/selfhost-ir-
-  # signatures.sh's Retirement history, and the fixtures are in git history at
-  # this file's state before #6527. With nothing declared, an unrelated
-  # divergence of any shape must stay unexplained on every kind.
+  # signatures.sh's Retirement history. An unrelated divergence of any shape
+  # must stay unexplained on every kind.
   oracle_unrelated='%1 = sub %2, %3'
   bit2_unrelated='%1 = sub %2, %3
 %4 = sub %5, %6'
@@ -35,6 +34,107 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       fail=1
     fi
   done
+
+  # --- the signatures declared against the 0.40.0 oracle (#7558, #7562) ---
+  #
+  # Each fixture is a reduced copy of the real divergence; each negative variant
+  # breaks exactly one clause of the identity and must stay unexplained.
+  expect() { # <want name or ""> <got> <label>
+    if [ "$1" != "$2" ]; then
+      echo "FAIL: $3: want '$1' got '$2'"
+      fail=1
+    fi
+  }
+
+  # 7558-synth-json-alias-column-shift: only a column moves, on a synthesized line.
+  ty_o='30:135: __json_entries: []JsonEntry
+30:199: __json_a4: []Json
+30:300: cols: []string
+31:5: x: i64'
+  ty_b='30:154: __json_entries: []JsonEntry
+30:218: __json_a4: []Json
+30:319: cols: []string
+31:5: x: i64'
+  expect "7558-synth-json-alias-column-shift" "$(explainMismatch "$ty_o" "$ty_b" types)" "types: column shift"
+  expect "" "$(explainMismatch "$ty_o" "${ty_b/a4: []Json/a4: []JsonEntry}" types)" "types: a type changed"
+  expect "" "$(explainMismatch "$ty_o" "${ty_b/__json_a4/__json_a5}" types)" "types: a name changed"
+  expect "" "$(explainMismatch "$ty_o" "${ty_b/31:5:/31:6:}" types)" "types: a column moved on a line that is not synthesized"
+  expect "" "$(explainMismatch "$ty_o" "${ty_b/30:218:/30:150:}" types)" "types: a column moved left"
+  expect "" "$(explainMismatch "$ty_o" "${ty_b/30:218:/31:218:}" types)" "types: a line number changed"
+  expect "" "$(explainMismatch "$ty_o" "${ty_b/30:319:/30:300:}" types)" "types: a row after the shift did not move"
+  expect "" "$(explainMismatch "$ty_o" "$(printf '%s\n' "$ty_b" | sed 1d)" types)" "types: a row is missing"
+
+  # 7562-packed-halfword-slices: the word-strided halfword slice shapes become the packed ones.
+  ir_head='func f(%0: []u16) void {
+bb0(%0: []u16):
+  %1 = const_int i64 0
+  %2 = slice_len %0
+  %3 = icmp_ult bool %1, %2
+  br %3, bb2(), bb1()
+bb1():
+  %4 = const_string "index out of range"
+  %5 = rt_call panic(%4) void
+  unreachable
+bb2():
+  %6 = field_get %0[0] i64
+  %7 = field_get %0[16] i64
+  %8 = add i64 %7, %1'
+  ir_o="$ir_head
+  %9 = const_int i64 3
+  %10 = shl i64 %8, %9
+  %11 = add i64 %6, %10
+  %12 = field_get %11[0] u16
+  %13 = rt_call string_from_int(%12) string
+  ret
+}"
+  ir_b="$ir_head
+  %9 = index_get %6[%8] u16
+  %10 = rt_call string_from_int(%9) string
+  ret
+}"
+  expect "7562-packed-halfword-slices" "$(explainMismatch "$ir_o" "$ir_b" ir)" "ir: scaled read becomes index_get"
+  expect "7562-packed-halfword-slices" "$(explainMismatch "$ir_o" "$ir_b" iropt)" "iropt: scaled read becomes index_get"
+  expect "" "$(explainMismatch "$ir_o" "${ir_b/string_from_int/string_from_uint}" ir)" "ir: an unrelated call changed"
+  expect "" "$(explainMismatch "${ir_o//u16/u32}" "${ir_b//u16/u32}" ir)" "ir: a u32 slice is not packed"
+  expect "" "$(explainMismatch "$ir_o" "$(printf '%s\n' "$ir_b" | sed 's/index_get %6\[%8\]/index_get %6[%1]/')" ir)" "ir: the packed read takes another index"
+  expect "" "$(explainMismatch "$ir_o" "$ir_o" ir)" "ir: a tree that kept the word stride is not explained by the packing"
+  ir_new_o='bb0():
+  %0 = const_int i64 4
+  %1 = const_int i64 0
+  %2 = const_int i64 8
+  %3 = rt_call slice_new(%0, %0, %1, %2) []i16
+  %4 = const_int i16 7
+  %5 = const_int i64 0
+  %6 = convert i64 %4
+  %7 = field_get %3[0] i64
+  index_set %7[%5] = %6
+  ret'
+  ir_new_b='bb0():
+  %0 = const_int i64 4
+  %1 = const_int i64 0
+  %2 = const_int i64 2
+  %3 = rt_call slice_new(%0, %0, %1, %2) []i16
+  %4 = const_int i16 7
+  %5 = const_int i64 0
+  %6 = field_get %3[0] i64
+  index_set %6[%5] = %4
+  ret'
+  expect "7562-packed-halfword-slices" "$(explainMismatch "func g() void {
+$ir_new_o
+}" "func g() void {
+$ir_new_b
+}" ir)" "ir: elem_size 2, the narrow store"
+  expect "" "$(explainMismatch "func g() void {
+${ir_new_o//i16/i32}
+}" "func g() void {
+${ir_new_b//i16/i32}
+}" ir)" "ir: an i32 slice keeps elem_size 8"
+  ir_new_4=$(printf '%s\n' "$ir_new_b" | sed 's/%2 = const_int i64 2/%2 = const_int i64 4/')
+  expect "" "$(explainMismatch "func g() void {
+$ir_new_o
+}" "func g() void {
+$ir_new_4
+}" ir)" "ir: elem_size is neither 8 nor the packed 2"
 
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
@@ -51,7 +151,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   # one line, so `print "…"` no longer always starts the line) -- safe
   # against a false match inside `printf` because that is followed by `f`
   # then a SINGLE quote, never `print` immediately followed by a `"`.
-  want=$(grep -oE 'print "[0-9]+-[a-z-]+"' "${ROOT}/scripts/selfhost-ir-signatures.sh" |
+  want=$(grep -hoE 'print "[0-9]+-[a-z-]+"' "${ROOT}/scripts/selfhost-ir-signatures.sh" "${ROOT}/scripts/ir-signatures-walk.sh" |
     grep -oE '"[0-9]+-[a-z-]+"' | tr -d '"' | LC_ALL=C sort -u)
   if [ "$got" != "$want" ]; then
     echo "FAIL: declaredSignatureNames() is out of sync with explainMismatch's print statements"
