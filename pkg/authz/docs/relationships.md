@@ -311,6 +311,132 @@ not through the store, when the strings are not yours.
 `MemoryRelationStore(capacity = n)` bounds it: a write past `n` tuples fails
 instead of growing without limit (default 100,000).
 
+## Policies that ask about the folder
+
+A tuple answers a question about two names. Editing an article is a question
+about a row, so a policy needs the row to point at the folder. `related`
+is the condition for that: `Update` is allowed when the asking user is an
+`editor` of the object the row names. For the folder itself the row names
+itself, and the condition is `{ id: related("editor") }`; a condition literal
+lowers to std/where's `Clause`, whose value slot `related("editor")` fills,
+and `fromWhere` turns the clause into a condition:
+
+```bit
+import { Authz, Policy, Subject, fromWhere, related } from "authz"
+import { Tabled } from "orm"
+import { Clause, Op, Where } from "std/where"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Folder {
+  @id
+  id: i64
+  name: string
+}
+
+class Member {
+  export id: string,
+  export roles: []string,
+}
+
+fn main(): ()! {
+  let authz = Authz<Action>()?
+  authz.resource<Folder>()?
+  authz.relation<Folder>("editor")?
+  let mine = Clause("id", Op.Eq, [related("editor")])?
+  let cond = fromWhere<Folder>(Where<Folder>(clauses = [mine]))?
+  let editFolder = Policy<Member, Action>("EditFolder", (p, user) => {
+    p.can<Folder>([Action.Update], cond)
+  })
+  authz.role<Member>("member", [editFolder])?
+  authz.relate("user:sara", "editor", "folder:1")?
+  let launch = Folder{ id = 1, name = "launch" }
+  let sara = Option<Subject>.Some(Member{ id = "sara", roles = ["member"] })
+  let tom = Option<Subject>.Some(Member{ id = "tom", roles = ["member"] })
+  println("${authz.can<Folder>(sara, Action.Update, launch)}")
+  println("${authz.can<Folder>(tom, Action.Update, launch)}")
+}
+```
+
+This prints `true`, then `false`. The folder's `id` made the object
+`folder:1`, the user is `user:sara`, and the answer is `hasRelation`'s, so
+usersets and `inherit` count: whoever edits a parent folder edits this one.
+Roles play no part in it; they are what chose the policy.
+
+An article does not name itself, it names a folder. Its foreign key column
+`folderId` is what points there, and `{ folder: related("editor") }` on a
+`@belongsTo("folderId")` relation field means exactly that: build the object
+from the column, `folder:<folderId>`. `fromWhere` resolves the field to
+`Cond.Related(column, target, relation)` once, when the policy is built, and
+`Cond.Related` is the same condition written out:
+
+```bit
+import { Authz, Cond, Policy, Subject } from "authz"
+import { Tabled } from "orm"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Folder {
+  @id
+  id: i64
+  name: string
+}
+
+@table class Article {
+  @id
+  id: i64
+  title: string
+  folderId: Option<i64>
+}
+
+class Member {
+  export id: string,
+  export roles: []string,
+}
+
+fn main(): ()! {
+  let authz = Authz<Action>()?
+  authz.resource<Folder>()?.resource<Article>()?
+  authz.relation<Folder>("parent")?
+  authz.relation<Folder>("editor", inherit = "parent")?
+  let editShared = Policy<Member, Action>("EditShared", (p, user) => {
+    p.can<Article>([Action.Update], Cond.Related("folderId", "Folder", "editor"))
+  })
+  authz.role<Member>("member", [editShared])?
+  authz.relate("user:sara", "editor", "folder:1")?
+  authz.relate("folder:1", "parent", "folder:2")?
+  let sara = Option<Subject>.Some(Member{ id = "sara", roles = ["member"] })
+  let inFolder1 = Article{ id = 7, title = "Launch notes", folderId = Option<i64>.Some(1) }
+  let inFolder2 = Article{ id = 8, title = "Q3 plan", folderId = Option<i64>.Some(2) }
+  let inFolder9 = Article{ id = 9, title = "Elsewhere", folderId = Option<i64>.Some(9) }
+  let loose = Article{ id = 10, title = "Loose", folderId = Option<i64>.None }
+  println("${authz.can<Article>(sara, Action.Update, inFolder1)}")
+  println("${authz.can<Article>(sara, Action.Update, inFolder2)}")
+  println("${authz.can<Article>(sara, Action.Update, inFolder9)}")
+  println("${authz.can<Article>(sara, Action.Update, loose)}")
+  println("${authz.can<Article>(Option<Subject>.None, Action.Update, inFolder1)}")
+}
+```
+
+This prints `true`, `true`, `false`, `false`, `false`. Sara edits an article
+of her folder and, through `parent`, of the folder above it. Folder 9 has no
+tuple. The loose article has a NULL `folderId`, so the condition is unknown,
+which, as everywhere, does not match. A guest is `None` and never relates.
+
+`validatePolicy` and `role` refuse the mistakes at startup: a target that was
+never registered, a relation it does not declare, a column that is not text or
+an integer, and a `related` on a field that is neither a `@belongsTo`
+relation (or its column) nor the `@id`, or on a `@belongsTo` or `@id` of several
+columns. The last two are found when `fromWhere` resolves the field, so they
+fail there, with an `InvalidPolicy` that names the field.
+
+When the check cannot answer, a rule fails closed. A bound reached by an
+allow rule (`RelationLimit`) means that rule does not match, and a warning
+record says which policy and bound; a bound reached by a `cannot` rule refuses,
+because a refusal that did not match could let an allow through. A relationship
+store that cannot be reached refuses the request: `can` answers `false`, and
+`check` fails with `StoreUnavailable`.
+
 ## Sharp edges
 
 - `related` is a direct lookup; `hasRelation` follows usersets and
@@ -319,9 +445,13 @@ instead of growing without limit (default 100,000).
   about an unknown type or an undeclared relation is an `InvalidPolicy` too,
   not `false`.
 - Types are case-sensitive: `folder:launch`, never `Folder:launch`.
+- A `related` condition answers `can` and `check`. Listing rows through it
+  (`compileSql`, `filterFor` into a query) is refused until it compiles to SQL.
+- `related("editor")` the condition and `authz.related(subject, relation,
+  object)` the direct lookup are different things with one name.
 - Each step of a chain such as `authz.relation<Folder>("a")?.relation<Folder>("b")?`
   carries its own `?`.
 
 ## Next
 
-Policies can then ask whether a subject is an `editor` of a row's folder.
+[Deciding](decisions.md) has `can` and `check`, which these policies answer.
