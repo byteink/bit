@@ -2861,6 +2861,9 @@ syscall(nr, a0, a1, a2, a3, a4, a5)
   stride, so `ptrOf(xs)` of a `[]f32` is a native `float*` for C. A slice of
   references (`string`, a class, an interface, a nested slice) is **E0053**:
   its words are headers the collector traces, not a buffer a callee can read.
+  Module-level state (§11.11) follows the same element rule: a module-level
+  slice is a slice, and a module-level array or scalar cell yields the address
+  of its element 0 or of the cell itself.
 
 The compiler emits the kernel trap inline - never a call to a runtime symbol -
 using each platform's kernel ABI, which is **not** its C ABI:
