@@ -4267,8 +4267,16 @@ spawn_stmt    = "spawn" ( postfix | block ) .    (* postfix must be a call; a bl
 defer_stmt    = "defer" ( postfix | block ) .    (* postfix must be a call; a block is a closure called at once *)
 ```
 
-- Multi-assignment `a, b = b, a` evaluates all right-hand sides before assigning
-  (simultaneous). Compound assignment operators require a single lhs and rhs.
+- Multi-assignment `a, b = b, a` is simultaneous, in two phases (Go's order).
+  First, the operands of every index and field target (`a[i]`, `m[k]`, `p.f`: the
+  receiver and the index or key) and every right-hand side are evaluated, left to
+  right, targets before right-hand sides. Then the stores happen left to right,
+  each bounds-checked as a single assignment is. Targets may be locals, module
+  variables, slice or array elements, map entries and class fields, of any
+  element type: `a[i], a[j] = a[j], a[i]` swaps two elements, and builds no tuple.
+  A target named twice keeps the last store: `a[0], a[0] = 1, 2` leaves `2`. The
+  right-hand sides are values before the first store, so `i, a[i] = 1, 2` stores
+  to the old `i`. Compound assignment operators require a single lhs and rhs.
 - An `expr_stmt` is legal only if the expression has a side effect that can stand
   alone: a function call, a channel receive, an error-propagation chain (`?`), or
   a `catch` (deliberate error handling - its ok value is intentionally discarded,
