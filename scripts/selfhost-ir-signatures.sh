@@ -281,11 +281,15 @@
 # narrow prim: []i8/[]bool at 1 byte, []i32/[]u32/[]f32 at 4. The same shapes as 7562 (elem_size
 # constant, `index_get` reads, narrow stores without the word-widening `convert`, ptrOf scaling,
 # the append fast path) plus the f32 element store, which was `bitcast u32` into `rt_call
-# slice_set` and is now an inline `index_set` from the float register: unchecked (a literal's
-# fill, one `field_get s[0]` per slice and block) or behind the slice_len guard and panic block.
-# The trial that names it enables the halfword and the narrow widths together; the f32 store has
-# a trial per form. A file with any other difference stays unexplained: the optimizer-driven
-# differences of the post-opt arm (a load the oracle CSE'd that the tree re-loads) are NOT in it.
+# slice_set` and is now an inline `index_set` from the float register, and the read-back of a whole
+# f32 lvalue, which is still `rt_call slice_get` plus `bitcast f32` in places and a slice_len-guarded
+# `index_get` in others. Every spelling of an f32 element store or read, in BOTH dumps, is collapsed to
+# the pseudo-ops `f32_store s[i] = v` and `f32_load s[i] f32` (the guard, its panic block and the two
+# field_get reads go with the guarded spelling; a guard that does not match exactly stays and keeps the
+# file unexplained). The trial that names it enables the halfword and the narrow widths together. The
+# optimizer-driven differences of the post-opt arm are NOT in it: run_float32_interp,
+# run_float_slice_elems and run_packed_narrow_slices differ there by where the inline stores sit
+# relative to the following reads' guards, and stdlib/crypto/bigint.bit by a load the oracle CSE'd.
 #
 # 7637-string-from-rune-range (`ir`, `iropt`). #7637 (c8381c0c2) makes `string(rs[lo:hi])` on a
 # `[]rune` one `rt_call string_from_rune_range(rs, lo, hi)`; the oracle emitted

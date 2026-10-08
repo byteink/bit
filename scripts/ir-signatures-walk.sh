@@ -147,62 +147,72 @@ function rwCall(rest, id,   name, args, t, st, c, pre, w) {
   }
   return pre " " t
 }
+# Both sides: the buffer and offset reads of an []f32 slice are renamed so IR_F32_AWK can see them;
+# it turns every one that is not consumed by a store or a load back into the field_get it was.
+function markF32(e,   p) {
+  if (narrow != 1 || e !~ /^field_get \$[0-9]+\[(0|16)\] i64$/) { return e }
+  split(e, p, /[ \[]/)
+  if (OT[p[2]] != "[]f32") { return e }
+  return ((e ~ /\[0\] i64$/) ? "f32buf " : "f32off ") p[2]
+}
 function flushHeld() { if (HELD != "") { print HELD; HELD = "" } }
 # #7574 stores an f32 element inline from a float register; the oracle widened it through
-# `bitcast u32` into `rt_call slice_set`. The bitcast line is held until the next def: when that def
-# is the slice_set consuming it, both become the tree store (one `field_get s[0]` per slice and
-# block, then `index_set buf[i] = v`); any other next line prints the held bitcast untouched.
-# The checked form: the call becomes the slice_len / icmp_ult / br guard, the panic block and the
-# inline store (panic block first, as the lowering prints it), with block names no real one uses.
-function chkStore(S, ix,   a, b, ok, bad) {
-  a = "$" (k++); b = "$" (k++)
-  ok = "bb8" (NB++) "01"; bad = "bb8" (NB++) "01"
-  print "  " a " = slice_len " S
-  print "  " b " = icmp_ult bool " ix ", " a
-  print "  br " b ", " ok "(), " bad "()"
-  print bad "():"
-  print "  $" (k++) " = rt_call panic(" LB "const_string \"index out of range\"" RB ") void"
-  print "  unreachable"
-  print ok "():"
-  print "  $" k " = field_get " S "[0] i64"
-  print "  $" (k + 1) " = field_get " S "[16] i64"
-  print "  index_set $" k "[" LB "add i64 $" (k + 1) ", " ix RB "] = " HELDV
-  k += 2
+# `bitcast u32` into `rt_call slice_set` (the tree still does this where a lvalue is read back whole,
+# at elem_size 4 instead of 8). All the spellings are canonicalized to the pseudo-op
+# `f32_store s[i] = v`: here the oracle one (the bitcast line is held until the next def and
+# becomes the pseudo-op when that def is the slice_set consuming it, otherwise it prints untouched),
+# in IR_F32_AWK the tree one (the unchecked fill and the slice_len-guarded store).
+# The oracle read of an f32 element is `rt_call slice_get(s, i, 4) u32` and a `bitcast f32`; held the
+# same way and collapsed to `f32_load s[i] f32`, which the tree spelling (guard, then index_get) is
+# collapsed to in IR_F32_AWK.
+function f32Load(e, id,   args, c) {
+  if (narrow != 1 || e !~ /^rt_call slice_get\(/ || lastTok(e) != "u32") { return 0 }
+  args = substr(e, length("rt_call slice_get(") + 1)
+  sub(/\) u32$/, "", args)
+  c = split(args, AP, ", ")
+  if (c != 3 || AP[3] != "{const_int i64 4}" || OT[AP[1]] != "[]f32") { return 0 }
+  HELDKIND = "load"; HELDS = AP[1]; HELDI = AP[2]
+  HELDID = "$" k
+  N[id] = "$" (k++)
+  OT[N[id]] = "u32"
+  HELD = "  " N[id] " = " e
   return 1
 }
 function f32Fill(e, id,   v, args, c, S) {
-  if (side != "oracle" || narrow != 1) { return 0 }
+  if (narrow != 1) { return 0 }
   if (e ~ /^bitcast u32 / && typeOf(substr(e, 13)) == "f32") {
     flushHeld()
     HELDV = substr(e, 13)
     HELDID = "$" k
+    HELDKIND = "store"
     N[id] = "$" (k++)
     OT[N[id]] = "u32"
     HELD = "  " N[id] " = " e
     return 1
   }
-  if (HELD == "" || e !~ /^rt_call slice_set\(/ || lastTok(e) != "void") { return 0 }
+  if (HELD != "" && HELDKIND == "load" && e == "bitcast f32 " HELDID) {
+    k--
+    N[id] = "$" (k++)
+    OT[N[id]] = "f32"
+    Def[N[id]] = "f32_load " HELDS "[" HELDI "] f32"
+    print "  " N[id] " = " Def[N[id]]
+    HELD = ""
+    return 1
+  }
+  if (HELD == "" || HELDKIND != "store" || e !~ /^rt_call slice_set\(/ || lastTok(e) != "void") { return 0 }
   args = substr(e, length("rt_call slice_set(") + 1)
   sub(/\) void$/, "", args)
   c = split(args, AP, ", ")
-  if (c != 4 || AP[3] != HELDID || AP[4] != "{const_int i64 8}" || OT[AP[1]] != "[]f32") { return 0 }
+  if (c != 4 || AP[3] != HELDID || AP[4] != (side == "oracle" ? "{const_int i64 8}" : "{const_int i64 4}") || OT[AP[1]] != "[]f32") { return 0 }
   S = AP[1]
   k--
   HELD = ""
-  if (f32c == 1) { return chkStore(S, AP[2]) }
-  if (!(S in FB)) {
-    FB[S] = "$" (k++)
-    OT[FB[S]] = "i64"
-    Def[FB[S]] = "field_get " S "[0] i64"
-    print "  " FB[S] " = " Def[FB[S]]
-  }
-  print "  index_set " FB[S] "[" AP[2] "] = " HELDV
+  print "  f32_store " AP[1] "[" AP[2] "] = " HELDV
   return 1
 }
-/^func /{ flushHeld(); delete E; delete N; delete OT; delete Def; delete S2; delete FB; k = 0; print; next }
+/^func /{ flushHeld(); delete E; delete N; delete OT; delete Def; delete S2; k = 0; print; next }
 /^bb[0-9]+\(/ {
   flushHeld()
-  delete FB
   line = $0
   s = line
   while (match(s, /%[0-9]+: /)) {
@@ -231,7 +241,9 @@ function f32Fill(e, id,   v, args, c, S) {
   e = ex(line)
   if (f32Fill(e, id)) { next }
   flushHeld()
+  e = markF32(e)
   e = rwLoad(rwCall(e, id))
+  if (f32Load(e, id)) { next }
   N[id] = "$" (k++)
   OT[N[id]] = resTy(e)
   Def[N[id]] = e
@@ -314,6 +326,94 @@ function flush(   i, k, o, n) {
 /^func /{ flush(); print; next }
 { L[++n0] = $0 }
 END { flush() }'
+  IR_F32_AWK='# Stage 2b, both sides: the inline f32 element store and load (#7574) collapsed to the pseudo-ops
+# `f32_store s[i] = v` and `f32_load s[i] f32` the oracle slice_set / slice_get were canonicalized to. A store through a buffer read marked
+# f32buf is the pseudo-op; when its index is `{add i64 <f32off of the same slice>, i}` and the nine
+# lines before it are exactly the slice_len / icmp_ult / br guard with its panic block for that slice
+# and index, that guard goes too. A guard that does not match, or whose values are used elsewhere,
+# stays in the text and so keeps the file unexplained.
+function dst(l) { sub(/^  /, "", l); sub(/ = .*$/, "", l); return l }
+function usedOutside(tok, lo, hi,   j, s, i, c) {
+  for (j = 1; j <= n0; j++) {
+    if (j >= lo && j <= hi) { continue }
+    s = L[j]
+    while ((i = index(s, tok)) > 0) {
+      c = substr(s, i + length(tok), 1)
+      if (c !~ /[0-9]/) { return 1 }
+      s = substr(s, i + length(tok))
+    }
+  }
+  return 0
+}
+function guardAt(j, S, ix,   a, b, x, ok, bad) {
+  if (j < 1) { return 0 }
+  a = dst(L[j]); b = dst(L[j + 1])
+  if (L[j] != "  " a " = slice_len " S) { return 0 }
+  if (L[j + 1] != "  " b " = icmp_ult bool " ix ", " a) { return 0 }
+  x = L[j + 2]
+  if (x !~ /^  br \$[0-9]+, bb[0-9]+\(\), bb[0-9]+\(\)$/ || index(x, "br " b ", ") != 3) { return 0 }
+  sub(/^  br \$[0-9]+, /, "", x)
+  ok = x; sub(/\(\), .*$/, "", ok)
+  bad = x; sub(/^[^,]*, /, "", bad); sub(/\(\)$/, "", bad)
+  if (L[j + 3] != bad "():" || L[j + 5] != "  unreachable" || L[j + 6] != ok "():") { return 0 }
+  if (L[j + 4] !~ /^  \$[0-9]+ = rt_call panic\(\{const_string "index out of range"\}\) void$/) { return 0 }
+  return !usedOutside(a, j, j + 1) && !usedOutside(b, j + 1, j + 2) && !usedOutside(ok, j + 2, j + 6) && !usedOutside(bad, j + 2, j + 3)
+}
+function flush(   i, m, c, d, S, idx, v, q, r, inner, pfx) {
+  for (i = 1; i <= n0; i++) {
+    if (L[i] ~ /^  \$[0-9]+ = f32buf \$[0-9]+$/) { BUF[dst(L[i])] = L[i]; sub(/^.* = f32buf /, "", BUF[dst(L[i])]) }
+    if (L[i] ~ /^  \$[0-9]+ = f32off \$[0-9]+$/) { OFF[dst(L[i])] = L[i]; sub(/^.* = f32off /, "", OFF[dst(L[i])]) }
+  }
+  for (i = 1; i <= n0; i++) {
+    if (L[i] !~ /^  \$[0-9]+ = index_get \$[0-9]+\[.*\] f32$/) { continue }
+    m = L[i]; sub(/^  \$[0-9]+ = index_get /, "", m)
+    c = m; sub(/\[.*$/, "", c)
+    if (!(c in BUF)) { continue }
+    r = dst(L[i])
+    idx = substr(m, length(c) + 2, length(m) - length(c) - 2 - length(" f32"))
+    S = BUF[c]
+    pfx = ""
+    for (d in OFF) { if (OFF[d] == S && index(idx, "{add i64 " d ", ") == 1 && substr(idx, length(idx)) == "}") { pfx = "{add i64 " d ", "; break } }
+    if (pfx == "") { continue }
+    inner = substr(idx, length(pfx) + 1, length(idx) - length(pfx) - 1)
+    if (!guardAt(i - 9, S, inner) || L[i - 1] != "  " d " = f32off " S || L[i - 2] != "  " c " = f32buf " S) { continue }
+    for (q = i - 9; q < i; q++) { DEL[q] = 1 }
+    L[i] = "  " r " = f32_load " S "[" inner "] f32"
+  }
+  for (i = 1; i <= n0; i++) {
+    if (L[i] !~ /^  index_set \$[0-9]+\[.*\] = /) { continue }
+    m = L[i]; sub(/^  index_set /, "", m)
+    c = m; sub(/\[.*$/, "", c)
+    if (!(c in BUF)) { continue }
+    q = index(m, "] = ")
+    v = substr(m, q + 4)
+    idx = substr(m, length(c) + 2, q - length(c) - 2)
+    S = BUF[c]
+    pfx = ""
+    for (d in OFF) { if (OFF[d] == S && index(idx, "{add i64 " d ", ") == 1 && substr(idx, length(idx)) == "}") { pfx = "{add i64 " d ", "; break } }
+    if (pfx != "") {
+      inner = substr(idx, length(pfx) + 1, length(idx) - length(pfx) - 1)
+      if (guardAt(i - 9, S, inner) && L[i - 1] == "  " d " = f32off " S && L[i - 2] == "  " c " = f32buf " S) {
+        for (m = i - 9; m < i; m++) { DEL[m] = 1 }
+        idx = inner
+      }
+    }
+    L[i] = "  f32_store " S "[" idx "] = " v
+  }
+  for (i = 1; i <= n0; i++) {
+    if (DEL[i]) { continue }
+    if (L[i] ~ /^  \$[0-9]+ = f32(buf|off) \$[0-9]+$/) {
+      d = dst(L[i]); S = L[i]; sub(/^.* = f32(buf|off) /, "", S)
+      if (!usedOutside(d, i, i)) { continue }
+      L[i] = "  " d " = field_get " S ((L[i] ~ / = f32buf /) ? "[0]" : "[16]") " i64"
+    }
+    print L[i]
+  }
+  n0 = 0; delete L; delete DEL; delete BUF; delete OFF
+}
+/^func /{ flush(); print; next }
+{ L[++n0] = $0 }
+END { flush() }'
   IR_RENUM_AWK='# Stage 3, both sides: `$k` and `bbN` renumbered to first-appearance order, per function.
 function mapTok(s, re, pre,   out, tok) {
   out = ""
@@ -371,14 +471,14 @@ END {
 }'
 }
 
-# irTrial <oracle_text> <bit2_text> <half> <narrow> <rune> <name> [f32c] -- one normalization with the given
+# irTrial <oracle_text> <bit2_text> <half> <narrow> <rune> <name> -- one normalization with the given
 # rewrite classes enabled; prints the signature when the two dumps then agree byte for byte.
 irTrial() {
-  local o t f="-v half=$3 -v narrow=$4 -v rune=$5 -v f32c=${7:-0}"
+  local o t f="-v half=$3 -v narrow=$4 -v rune=$5"
   # shellcheck disable=SC2086
-  o=$(canon_ir_ids "$1" | LC_ALL=C awk $f -v side=oracle "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk "${IR_RENUM_AWK}") || return 1
+  o=$(canon_ir_ids "$1" | LC_ALL=C awk $f -v side=oracle "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk "${IR_F32_AWK}" | LC_ALL=C awk "${IR_RENUM_AWK}") || return 1
   # shellcheck disable=SC2086
-  t=$(canon_ir_ids "$2" | LC_ALL=C awk $f -v side=tree "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk $f "${IR_PW_AWK}${IR_FOLD_AWK}" | LC_ALL=C awk "${IR_RENUM_AWK}") || return 1
+  t=$(canon_ir_ids "$2" | LC_ALL=C awk $f -v side=tree "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk $f "${IR_PW_AWK}${IR_FOLD_AWK}" | LC_ALL=C awk "${IR_F32_AWK}" | LC_ALL=C awk "${IR_RENUM_AWK}") || return 1
   printf '%s\n@@@BIT2@@@\n%s\n' "${o}" "${t}" | LC_ALL=C awk -v which="$6" "${IR_CMP_AWK}"
 }
 
@@ -392,11 +492,9 @@ explainIrLag() {
   [ "$(canon_ir_ids "$1")" = "$(canon_ir_ids "$2")" ] && return 1
   irWalkAwk
   irTrial "$1" "$2" 1 0 0 half && return 0
-  irTrial "$1" "$2" 1 1 0 narrow 0 && return 0
-  irTrial "$1" "$2" 1 1 0 narrow 1 && return 0
+  irTrial "$1" "$2" 1 1 0 narrow && return 0
   irTrial "$1" "$2" 0 0 1 rune && return 0
-  irTrial "$1" "$2" 1 1 1 rune 0 && return 0
-  irTrial "$1" "$2" 1 1 1 rune 1 && return 0
+  irTrial "$1" "$2" 1 1 1 rune && return 0
   return 1
 }
 

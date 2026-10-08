@@ -219,6 +219,58 @@ $f32_o
 $f32_o
 }" ir)" "ir: a tree that kept the f32 slice_set is not explained by the inline store"
 
+  # 7574, the f32 element read: slice_get through bitcast, or the tree's guarded index_get. Both
+  # sides are canonicalized, so a tree that still reads through slice_get (at elem_size 4) agrees too.
+  f32_ld_o='bb0(%0: []f32):
+  %1 = const_int i64 0
+  %2 = const_int i64 8
+  %3 = rt_call slice_get(%0, %1, %2) u32
+  %4 = bitcast f32 %3
+  %5 = rt_call string_from_float(%4) string
+  ret'
+  f32_ld_chk='bb0(%0: []f32):
+  %1 = const_int i64 0
+  %2 = slice_len %0
+  %3 = icmp_ult bool %1, %2
+  br %3, bb1(), bb2()
+bb2():
+  %4 = const_string "index out of range"
+  %5 = rt_call panic(%4) void
+  unreachable
+bb1():
+  %6 = field_get %0[0] i64
+  %7 = field_get %0[16] i64
+  %8 = add i64 %7, %1
+  %9 = index_get %6[%8] f32
+  %10 = rt_call string_from_float(%9) string
+  ret'
+  expect "7574-packed-narrow-slices" "$(explainMismatch "func g() void {
+$f32_ld_o
+}" "func g() void {
+$f32_ld_chk
+}" ir)" "ir: an f32 guarded read inline"
+  expect "7574-packed-narrow-slices" "$(explainMismatch "func g() void {
+$f32_ld_o
+}" "func g() void {
+${f32_ld_o/i64 8/i64 4}
+}" ir)" "ir: an f32 read through slice_get at the packed elem_size 4"
+  expect "" "$(explainMismatch "func g() void {
+$f32_ld_o
+}" "func g() void {
+${f32_ld_o/i64 8/i64 2}
+}" ir)" "ir: an f32 read at elem_size 2 is a wrong stride"
+  expect "" "$(explainMismatch "func g() void {
+$f32_ld_o
+}" "func g() void {
+${f32_ld_chk/icmp_ult bool %1, %2/icmp_ult bool %2, %2}
+}" ir)" "ir: an f32 read whose guard tests another index"
+  expect "" "$(explainMismatch "func g() void {
+$f32_o
+}" "func g() void {
+${f32_chk/icmp_ult bool %2, %3/icmp_ult bool %3, %3}
+}" ir)" "ir: an f32 store whose guard tests another index"
+
+
   # 7637-string-from-rune-range: string(rs[lo:hi]) on a []rune.
   rr_o='func f(%0: []i32, %1: i64, %2: i64) string {
 bb0(%0: []i32, %1: i64, %2: i64):
