@@ -28,7 +28,7 @@ fn main(): ()! {
 }
 ```
 
-`r.stream(key)` is a cheap value, `{client, key}`: call it again any time you
+`r.stream(key)` is a cheap value, `{runner, key}`: call it again any time you
 need the same stream. A stream is created by its first `add`. The id has two
 parts, a millisecond timestamp and a counter, so ids sort in the order the
 events happened.
@@ -66,7 +66,7 @@ fn main(): ()! {
 }
 ```
 
-- `add(fields, id = StreamId.Auto, trim = Trim.Off, approx = true, limit = 0): string` -
+- `add(fields, id = StreamId.Auto, trim = Trim.Off, opts = TrimOpts{}): string` -
   `XADD`, returns the new id.
 - `addIfExists(...): Option<string>` - `XADD .. NOMKSTREAM`: appends only when
   the stream is already there and returns `None`, creating nothing, when it
@@ -171,14 +171,20 @@ payloads, not two options, because the server accepts one rule at a time:
 `Trim.MaxLen(n)` keeps about the newest `n` entries and `Trim.MinId(id)` drops
 entries older than `id`. `Trim.Off` is the default and means no trimming.
 
-`approx` (default true) sends `~`, which lets the server drop whole internal
-blocks at once. It is much cheaper, and the stream may keep a few more
-entries than asked. Pass `approx = false` for an exact cap. `limit` bounds
-the work one call does and needs `approx`; both mistakes fail
-`RedisError.Invalid` before anything is sent.
+How the trim runs is a `TrimOpts`, the `opts` argument of `add`, `addIfExists`
+and `trim`. Its `approx` (default true) sends `~`, which lets the server drop
+whole internal blocks at once. It is much cheaper, and the stream may keep a
+few more entries than asked. `TrimOpts{ approx = false }` is an exact cap.
+`limit` bounds the work one call does and needs `approx`; both mistakes fail
+`RedisError.Invalid` before anything is sent. `refs` is what the trim does
+with the entries' references in consumer groups, a `RefMode` (Redis 8.2 and
+later): `Keep` (the default, and it sends nothing, so it also works on older
+servers) leaves them in each group's pending list, `Drop` (`DELREF`) removes
+them there too, and `AckedOnly` (`ACKED`) trims only entries every group has
+acknowledged and stops at the first one that is still referenced.
 
 ```bit
-import { open, field, Trim, StreamId, RefMode, DelStatus } from "redis"
+import { open, field, Trim, TrimOpts, StreamId, RefMode, DelStatus } from "redis"
 
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
@@ -189,6 +195,12 @@ fn main(): ()! {
 
   let dropped = events.trim(Trim.MinId("1700000000000-0"))?
   println("${dropped} old events dropped")
+
+  // Cap exactly, and keep every event a group has not acknowledged yet.
+  let safe = TrimOpts{ approx = false, refs = RefMode.AckedOnly }
+  events.add([field("kind", "comment")], trim = Trim.MaxLen(500), opts = safe)?
+  let held = events.trim(Trim.MaxLen(500), safe)?
+  println("${held} acknowledged events dropped")
 
   let removed = events.del("1-1", "1-2")?
   println("${removed} deleted") // ids that were not there do not count
@@ -205,7 +217,7 @@ fn main(): ()! {
 }
 ```
 
-- `trim(by, approx = true, limit = 0): i64` - `XTRIM`, the entries removed;
+- `trim(by, opts = TrimOpts{}): i64` - `XTRIM`, the entries removed;
   `Trim.Off` is refused.
 - `del(...ids): i64` - `XDEL`.
 - `delete(ids, refs = RefMode.Keep): []DelStatus` - `XDELEX`. `RefMode.Keep`
@@ -263,7 +275,11 @@ fn main(): ()! {
 ```
 
 `Consumer.read(count = 0, block = -1, from = StreamId.Undelivered, noAck = false)`
-is `XREADGROUP`. `noAck` skips the pending list, for events you can afford to
+is `XREADGROUP`. `Consumer.readAny(others, count = 0, block = -1, from =
+StreamId.Undelivered, noAck = false)` reads this stream and the `others`
+(`Cursor` values, as in `Stream.readAny`) in one call and returns a
+`KeyedEntries` per stream that had something; the group name must exist on
+every one of them, and the same consumer name is used on all. `noAck` skips the pending list, for events you can afford to
 lose. With `from = StreamId.Zero` (or `At(id)`) it returns the consumer's own
 pending entries instead of new ones: the restart path, "what was I doing when
 I crashed". An entry deleted from the stream since comes back with no
@@ -412,15 +428,81 @@ fn main(): ()! {
 }
 ```
 
+`Stream.infoFull(count = 10)` is `XINFO STREAM .. FULL COUNT count`: the whole
+picture in one round trip, as a `StreamInfoFull`. Besides the counters it
+holds `entries` (the oldest `count`, as `Entry` values) and `groups`, a
+`GroupInfoFull` per group with its `pelCount`, its `pending` list of
+`PendingDelivery` (`id`, `consumer`, `deliveredAt`, `deliveries`) and its
+`consumers`, each a `ConsumerInfoFull` with `seenAt`, `activeAt` and its own
+`pending` list. `count` caps the entries and every pending list; `0` returns
+all of them. The times in this reply are unix milliseconds, as the server
+sends them; `activeAt` is `None` for a consumer that never read anything.
+
+```bit
+import { open } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let full = r.stream("inkwell:events").infoFull(count = 100)?
+  println("${full.length} entries, showing ${len(full.entries)}")
+  for g of full.groups {
+    println("${g.name}: ${g.pelCount} pending, last delivered ${g.lastDeliveredId}")
+    for c of g.consumers {
+      println("  ${c.name} holds ${len(c.pending)}, last seen at ${c.seenAt}")
+      for p of c.pending {
+        println("    ${p.id} delivered ${p.deliveries} times")
+      }
+    }
+  }
+  r.close()
+  return
+}
+```
+
+## Inside a transaction
+
+A check-and-set on a stream reads first and writes after. `tx.read.stream(key)`
+is the same `Stream` handle as `r.stream(key)`, bound to the transaction's own
+connection, so its reads run now and see the keys the transaction `WATCH`es;
+`tx.stream(key)` queues the writes. A `block` on `tx.read.stream(key)` is
+refused with `RedisError.Invalid`: the connection is held for the whole
+`WATCH` to `EXEC` window and cannot wait.
+
+```bit
+import { open, field, Future, RedisError } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let key = "inkwell:events"
+  // Append a "digest" event only while the log is shorter than 1000 entries.
+  let added = r.transaction<Future<string>>([key], (tx) => {
+    let size = tx.read.stream(key).len()?
+    if (size >= 1000) {
+      fail RedisError.Invalid("log is full")
+    }
+    return tx.stream(key).add([field("kind", "digest"), field("size", "${size}")])
+  })?
+  println("appended ${added.get()?}")
+  r.close()
+  return
+}
+```
+
 ## In a pipeline
 
 `p.stream(key)` on a `Pipeline` (and `tx.stream(key)` in a transaction) is a
-`StreamBatch`: `add`, `len`, `range`, `revRange`, `del`, `trim` and
-`ack(group, ...ids)`, each returning a `Future`. It has no blocking reads and
-no group handles; use the immediate handle for those.
+`StreamBatch`: `add`, `len`, `range`, `revRange`, `del`, `delete`, `trim` and
+`ack(group, ...ids)`, each returning a `Future`. `group(name)` is a
+`GroupBatch` with the group commands that do not block: `create`, `destroy`,
+`setId`, `createConsumer`, `delConsumer`, `ack`, `ackDelete`, `pending`,
+`pendingList`, `claim`, `claimIds`, `autoClaim` and `consumers`, the same
+names and arguments as `Group`. There are no blocking reads and no
+`XREADGROUP`, since a read that waits would stall every command queued behind
+it; use the immediate handle for those.
 
 ```bit
 import { open, field, StreamId } from "redis"
+import { Second } from "std/time"
 
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
@@ -429,8 +511,12 @@ fn main(): ()! {
   let b = p.stream("inkwell:events").add([field("kind", "comment")])
   let n = p.stream("inkwell:events").len()
   let tail = p.stream("inkwell:events").revRange(StreamId.Last, StreamId.First, 2)
+  let group = p.stream("inkwell:events").group("indexer")
+  let pending = group.pending()
+  let moved = group.autoClaim("indexer-2", 30 * Second)
   p.exec()?
   println("${a.get()?} ${b.get()?} ${n.get()?} ${len(tail.get()?)}")
+  println("${pending.get()?.count} pending, ${len(moved.get()?.entries)} claimed")
   r.close()
   return
 }
