@@ -1,0 +1,329 @@
+// stdlib/http/h3cancel.test.bit — `Cancel` over HTTP/3 (cancel.bit, h3.bit,
+// #7640): a cancel aborts just that request's QUIC stream with H3_REQUEST_CANCELLED
+// (0x010c, RFC 9114 §4.1.1), fails it with `Cancelled` within the bound, and the
+// QUIC connection and the other requests on it run on.
+//
+// The origin is a raw QUIC peer behind `h3Listen` (the same PKI as
+// h3shutdown.test.bit): it reads request streams off `H3Conn.rawConn()` and
+// writes hand-built HTTP/3 frames, so a response can stop half-way and the
+// reset a client sends can be read off the stream. `h3sdCertPem`, `h3sdKeyPem`
+// (h3shutdown.test.bit), `tls5916ClientConfig` (tls.test.bit), `boundMs`,
+// `assertWithin`, `assertCancelled`, `startCancel` (cancel.test.bit) are siblings.
+import { UdpSocket } from "std/net"
+import { Stream, StreamChunk } from "std/quic"
+
+// `:status 200` as a QPACK field section: required insert count 0, base 0, then
+// static table entry 25 (RFC 9204 appendix A).
+fn h3cHead(): []byte {
+  return [byte(1), byte(3), byte(0), byte(0), byte(217)]
+}
+
+// A DATA frame header announcing `n` payload bytes (n < 64).
+fn h3cDataHead(n: int): []byte {
+  return [byte(0), byte(n)]
+}
+
+fn h3cCat(a: []byte, b: []byte): []byte {
+  let out = []byte(0)
+  for x of a {
+    out = append(out, x)
+  }
+  for x of b {
+    out = append(out, x)
+  }
+  return out
+}
+
+// The value of the QUIC varint at `p` in `d` and how many bytes it took.
+fn h3cVarint(d: []byte, p: int): (int, int) {
+  let first = int(d[p])
+  let w = 1 << (first >> 6)
+  let v = first & 63
+  let i = 1
+  while (i < w) {
+    v = v * 256 + int(d[p + i])
+    i = i + 1
+  }
+  return (v, w)
+}
+
+// The DATA payload of a request stream's bytes: the HEADERS frame, then the DATA frame.
+fn h3cBodyOf(d: []byte): string {
+  let (n, w) = h3cVarint(d, 1)
+  let p = 1 + w + n + 1
+  let (m, w2) = h3cVarint(d, p)
+  return string(d[p + w2:p + w2 + m])
+}
+
+class h3cOrigin {
+  sock: UdpSocket,
+  port: int,
+  // How many QUIC connections the origin accepted.
+  accepts: AtomicI64,
+  // A request reached its partial response (or, `upload`, its first chunk).
+  stalled: chan<int>,
+  // The held request is answered when this receives a value.
+  hold: chan<int>,
+  // What the stalled upload's stream ended with: the reset code, or -1 for a clean end.
+  ended: chan<int>,
+  // Whether the origin stops reading a request after its first chunk.
+  upload: bool,
+}
+
+fn h3cAcceptLoop(lst: H3Listener, o: h3cOrigin) {
+  let guard = 0
+  while (guard < 8) {
+    guard = guard + 1
+    let conn = lst.accept() catch _ {
+      return
+    }
+    o.accepts.add(1)
+    spawn h3cConn(conn, o)
+  }
+}
+
+fn h3cConn(conn: H3Conn, o: h3cOrigin) {
+  let raw = conn.rawConn()
+  let guard = 0
+  while (guard < 64) {
+    guard = guard + 1
+    let s = raw.acceptStream() catch _ {
+      return
+    }
+    spawn h3cStream(s, o)
+  }
+}
+
+// Reads `s` to its end, the data and whether it ended in a reset (and its code).
+fn h3cDrain(s: Stream, first: StreamChunk): (string, int) {
+  let buf = first.data
+  let last = first
+  let guard = 0
+  while (!last.fin && guard < 100000) {
+    guard = guard + 1
+    last = s.read() catch _ {
+      return (string(buf), -2)
+    }
+    buf = h3cCat(buf, last.data)
+  }
+  if (last.reset) {
+    return (string(buf), last.resetCode)
+  }
+  return (string(buf), -1)
+}
+
+fn h3cStream(s: Stream, o: h3cOrigin) {
+  let first = s.read() catch _ {
+    return
+  }
+  // The control and QPACK streams are unidirectional: type byte 0, 2 or 3.
+  if (len(first.data) == 0 || int(first.data[0]) != 1) {
+    return
+  }
+  if (o.upload) {
+    o.stalled <- 1
+    <- o.hold
+    let (_, code) = h3cDrain(s, first)
+    o.ended <- code
+    return
+  }
+  h3cAnswer(s, first, o)
+}
+
+// Answers the request on `s`: "stall" gets half a response, anything else a whole
+// one once the test releases `o.hold`.
+fn h3cAnswer(s: Stream, first: StreamChunk, o: h3cOrigin) {
+  let (body, code) = h3cDrain(s, first)
+  if (code != -1) {
+    return
+  }
+  if (h3cBodyOf([]byte(body)) == "stall") {
+    s.write(h3cCat(h3cHead(), h3cCat(h3cDataHead(10), [byte(97), byte(98), byte(99)]))) catch _ {
+      return
+    }
+    o.stalled <- 1
+    return
+  }
+  <- o.hold
+  s.write(h3cCat(h3cHead(), h3cCat(h3cDataHead(2), [byte(111), byte(107)]))) catch _ {
+    return
+  }
+  s.finish() catch _ {
+    return
+  }
+}
+
+fn h3cStart(upload: bool): h3cOrigin! {
+  let sock = udpBind("127.0.0.1", 0)?
+  let port = sock.port()?
+  let lst = h3Listen(sock, h3sdCertPem(), h3sdKeyPem())?
+  let o = h3cOrigin{
+    sock = sock, port = port, accepts = AtomicI64(0), stalled = chan<int>(4), hold = chan<int>(4),
+    ended = chan<int>(1), upload = upload,
+  }
+  spawn h3cAcceptLoop(lst, o)
+  return o
+}
+
+fn h3cClient(): Client {
+  return Client(tls = tls5916ClientConfig())
+}
+
+fn h3cUrl(o: h3cOrigin): string {
+  return "https+h3://127.0.0.1:${o.port}/x"
+}
+
+// One request through `c`, its failure or its "status body" on `out`.
+fn h3cSend(c: Client, req: ClientRequest, out: chan<string>, errs: chan<error>) {
+  let res = c.send(req) catch e {
+    errs <- e
+    return
+  }
+  out <- "${res.status} ${res.body}"
+}
+
+// One `h3clientExchange` of `body` on the shared `conn`, under `tok`; its failure
+// goes to `errs`, its "status body" to `out`.
+class h3cCall {
+  conn: H3Conn,
+  port: int,
+  tok: Cancel,
+  errs: chan<error>,
+  out: chan<string>,
+}
+
+fn h3cOnConn(call: h3cCall, body: string) {
+  let wake = chan<int>(1)
+  let id = call.tok.wait(wake)
+  let u = Url{ host = "localhost", port = call.port, path = "/x", https = true, h3 = true }
+  let req = h3glueRequestOf("POST", u, textBody(body), "")
+  let res = h3clientExchange(call.conn, req, 0, wake) catch e {
+    call.tok.unwait(id)
+    call.errs <- e
+    return
+  }
+  call.tok.unwait(id)
+  call.out <- "${res.status} ${res.body}"
+}
+
+test "cancel aborts one request on a shared QUIC connection and the other completes on it" {
+  let o = h3cStart(false) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let conn = h3DialTls("127.0.0.1", o.port, "localhost", tls5916ClientConfig()) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  let tok = Cancel()
+  let other = Cancel()
+  let errs = chan<error>(2)
+  let out = chan<string>(2)
+  let slow = h3cCall{ conn = conn, port = o.port, tok = tok, errs = errs, out = out }
+  let fast = h3cCall{ conn = conn, port = o.port, tok = other, errs = errs, out = out }
+  spawn h3cOnConn(slow, "stall")
+  <- o.stalled
+  spawn h3cOnConn(fast, "ok")
+  let at = startCancel(tok)
+  let e = <- errs
+  assertWithin(at, "h3 cancel mid-body")
+  assertCancelled(e, "h3 cancel mid-body")
+  let (re, wrapped) = e.(RequestError)
+  assert(wrapped && re.sent, "the origin had the request, so it was sent")
+  // Only now is the other request answered: it was in flight beside the cancelled one.
+  o.hold <- 1
+  assert(<- out == "200 ok", "the other request did not complete with its whole body")
+  // And the connection takes a request after the cancel.
+  o.hold <- 1
+  spawn h3cOnConn(fast, "ok")
+  assert(<- out == "200 ok", "a request after the cancel failed")
+  assert(o.accepts.load() == 1, "accepts = ${o.accepts.load()}: the connection was not kept")
+  conn.close()
+}
+
+test "cancel of an upload sends RESET_STREAM with H3_REQUEST_CANCELLED to the origin" {
+  let o = h3cStart(true) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let conn = h3DialTls("127.0.0.1", o.port, "localhost", tls5916ClientConfig()) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  let tok = Cancel()
+  let errs = chan<error>(1)
+  let out = chan<string>(1)
+  // 256 KiB against a 32 KiB stream window: the FIN cannot have been sent.
+  spawn h3cOnConn(
+    h3cCall{ conn = conn, port = o.port, tok = tok, errs = errs, out = out },
+    repeat("u", 262144),
+  )
+  <- o.stalled
+  let at = startCancel(tok)
+  let e = <- errs
+  assertWithin(at, "h3 cancel mid-upload")
+  assertCancelled(e, "h3 cancel mid-upload")
+  sleep(100 * 1000000)
+  o.hold <- 1
+  let code = <- o.ended
+  assert(code == 268, "the origin saw ${code} on the request stream, not RESET_STREAM 0x010c (268)")
+  conn.close()
+}
+
+test "an https+h3 request with a token is sent over HTTP/3 and cancelled mid-response" {
+  let o = h3cStart(false) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = h3cClient()
+  let out = chan<string>(1)
+  let errs = chan<error>(1)
+  o.hold <- 1
+  spawn h3cSend(
+    c,
+    ClientRequest{ url = h3cUrl(o), method = "POST", body = "ok", cancel = Option.Some(Cancel()) },
+    out,
+    errs,
+  )
+  assert(<- out == "200 ok", "a token-bearing https+h3 request was not answered")
+  let tok = Cancel()
+  spawn h3cSend(
+    c,
+    ClientRequest{ url = h3cUrl(o), method = "POST", body = "stall", cancel = Option.Some(tok) },
+    out,
+    errs,
+  )
+  <- o.stalled
+  let at = startCancel(tok)
+  let e = <- errs
+  assertWithin(at, "h3 send")
+  assertCancelled(e, "h3 send")
+}
+
+test "cancel during the QUIC handshake fails the send within the bound" {
+  // A UDP socket nobody reads: the Initial is never answered.
+  let sock = udpBind("127.0.0.1", 0) catch e {
+    assert(false, "bind: ${e.message()}")
+    return
+  }
+  let port = sock.port() catch e {
+    sock.close()
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let c = h3cClient()
+  let tok = Cancel()
+  let out = chan<string>(1)
+  let errs = chan<error>(1)
+  let at = startCancel(tok)
+  spawn h3cSend(
+    c,
+    ClientRequest{ url = "https+h3://127.0.0.1:${port}/x", cancel = Option.Some(tok) },
+    out,
+    errs,
+  )
+  let e = <- errs
+  sock.close()
+  assertWithin(at, "h3 handshake")
+  assertCancelled(e, "h3 handshake")
+}

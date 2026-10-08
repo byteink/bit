@@ -60,6 +60,36 @@ fn getIndexPinned(trust: TrustStore): H3Response! {
 }
 ```
 
+Cancel one request without touching the others. `H3Conn.request` takes an
+optional channel; a value on it resets and stops just that request's QUIC stream
+with `H3_REQUEST_CANCELLED` (0x010c, RFC 9114 section 4.1.1) and fails the call
+with `H3Aborted`. The connection and every other request on it keep running. The
+same `H3Bound` that carries a deadline carries a channel that ends the QUIC
+handshake early:
+
+```bit
+import { h3DialTlsBounded, H3Bound, H3Conn, H3Request, H3Aborted, HeaderField } from "std/http3"
+import { TlsConfig } from "std/tls"
+
+fn get(conn: H3Conn, path: string, abort: chan<int>): int! {
+  let req = H3Request{
+    method = "GET", scheme = "https", authority = "example.com", path = path,
+    headers = []HeaderField(0), body = []byte(0),
+  }
+  let res = conn.request(req, Option.Some(abort))?
+  return res.status
+}
+
+fn dialAbortable(host: string, port: int, cfg: TlsConfig, wake: chan<int>): H3Conn! {
+  return h3DialTlsBounded(host, port, host, cfg, H3Bound{ deadlineNs = 0, wake = wake })?
+}
+
+fn isAborted(e: error): bool {
+  let (_, aborted) = e.(H3Aborted)
+  return aborted
+}
+```
+
 `h3Accept` is the server side of one connection on a bound UDP socket;
 `H3Conn.accept` reads the next request and `H3Conn.respond` answers it:
 
@@ -263,6 +293,18 @@ Like `h3Dial`, bounded by an absolute deadline in nanoseconds. Once the handshak
 ### `h3DialTlsDeadline(host: string, port: int, serverName: string, config: TlsConfig, deadlineNs: int): H3Conn!`
 
 `h3DialTls` bounded by an absolute deadline, exactly as `h3DialDeadline` bounds `h3Dial`.
+
+### `h3DialTlsBounded(host: string, port: int, serverName: string, config: TlsConfig, bound: H3Bound): H3Conn!`
+
+`h3DialTls` bounded by `bound`: a nonzero `deadlineNs` lowers the idle timeout as `h3DialDeadline` does, and a value on `wake` ends the wait for the QUIC handshake with `H3Aborted`, closing the connection being set up.
+
+### `H3Bound`
+
+`deadlineNs` (absolute, 0 for none) and `wake` (a `chan<int>` of capacity 1, so the sender never blocks).
+
+### `H3Aborted`
+
+What `H3Conn.request` and `h3DialTlsBounded` fail with when their channel received a value. A request that was aborted had only its own stream reset and stopped.
 
 ### `h3Accept(sock: UdpSocket, certChainPem: string, keyPem: string): H3Conn!`
 

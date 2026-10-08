@@ -45,7 +45,8 @@
 // type for the server entry point (`std/net`).
 
 import {
-  dialQuic, dialQuicTls, acceptQuic, listenQuic, Listener, Conn, Stream, StreamChunk, encodeVarint,
+  dialQuic, dialQuicTls, dialQuicTlsUntil, acceptQuic, listenQuic, Listener, Conn, Stream,
+  StreamChunk, encodeVarint, streamReadUntil, streamFinishUntil, Woken,
 } from "std/quic"
 import { UdpSocket } from "std/net"
 import { monotonic } from "std/time"
@@ -77,9 +78,11 @@ const h3SettingQpackBlockedStreams: int = 0x07
 // request stream the server never handed to application code at all (a
 // request opened after this connection's own GOAWAY, §4.1.1 — distinct from
 // `H3_REQUEST_CANCELLED`, which is for a request abandoned mid-processing,
-// not this module's case today).
+// not this module's case today). `h3ErrRequestCancelled` aborts a request
+// stream the client itself gave up on (`H3Conn.request`'s `abort`, #7640).
 const h3ErrNoError: int = 0x0100
 const h3ErrRequestRejected: int = 0x010b
+const h3ErrRequestCancelled: int = 0x010c
 
 // The bound on how many peer streams `accept` will classify before it must have
 // found a request stream — the three uni streams plus a generous margin.
@@ -157,7 +160,15 @@ export class H3Conn {
   // writes a HEADERS frame (a QPACK field section of the pseudo- and regular
   // headers) then a DATA frame for the body if any, finishes the send half, and
   // reads the response HEADERS + DATA back off the same stream.
-  export request(req: H3Request): H3Response! {
+  //
+  // `abort` is a channel a caller sends one value on to cancel just this request
+  // from another green thread (#7640): its stream is reset and stopped with
+  // H3_REQUEST_CANCELLED (0x010c, RFC 9114 §4.1.1, §8.1) and this fails with
+  // `H3Aborted`, while the connection and the other requests on it run on.
+  // Capacity 1, so the sender never blocks. A request already answered in full is
+  // not affected.
+  export request(req: H3Request, abort: Option<chan<int>> = Option.None): H3Response! {
+    let wake = h3wakeOf(abort)
     let s = this.conn.openStream()?
     let sid = s.id()
     let section = this.enc.encodeFieldSection(sid, this.enc.insertCount(), h3requestFields(req))
@@ -166,8 +177,7 @@ export class H3Conn {
       out = qpackAppendBytes(out, h3frame(h3FrameData, req.body))
     }
     s.write(out)?
-    s.finish()?
-    let buf = h3readAll(s)?
+    let buf = h3exchangeStream(s, wake)?
     return h3parseResponse(this, sid, buf)?
   }
 
@@ -202,7 +212,7 @@ export class H3Conn {
           if (sid > this.highWater) {
             this.highWater = sid
           }
-          let buf = h3readRest(s, first)?
+          let buf = h3readRest(s, first, chan<int>(1))?
           let req = h3parseRequest(this, sid, buf)?
           return H3ServerRequest{ req = req, stream = s }
         }
@@ -390,8 +400,9 @@ fn h3readFirst(s: Stream): StreamChunk! {
 }
 
 // Accumulate `s` to end of stream, seeded with an already-read `first` chunk.
-// Bounded by an iteration guard; a well-behaved peer sends FIN.
-fn h3readRest(s: Stream, first: StreamChunk): []byte! {
+// Bounded by an iteration guard; a well-behaved peer sends FIN. A value on
+// `wake` ends the read with `Woken`.
+fn h3readRest(s: Stream, first: StreamChunk, wake: chan<int>): []byte! {
   let buf = qpackAppendBytes([]byte(0), first.data)
   if (first.fin) {
     return buf
@@ -399,19 +410,13 @@ fn h3readRest(s: Stream, first: StreamChunk): []byte! {
   let guard = 0
   while (guard < 1000000) {
     guard = guard + 1
-    let chunk = s.read()?
+    let chunk = streamReadUntil(s, wake)?
     buf = qpackAppendBytes(buf, chunk.data)
     if (chunk.fin) {
       return buf
     }
   }
   fail newError("h3: stream longer than the read bound")
-}
-
-// Accumulate `s` from the start to end of stream. Used to read a full response.
-fn h3readAll(s: Stream): []byte! {
-  let first = s.read()?
-  return h3readRest(s, first)?
 }
 
 // Parse a client control stream to validate its framing (SETTINGS, and MAX_PUSH_ID
@@ -640,14 +645,13 @@ export fn h3DialTlsDeadline(
   config: TlsConfig,
   deadlineNs: int,
 ): H3Conn! {
-  let conn = dialQuicTls(host, port, serverName, config)?
-  let remaining = deadlineNs - monotonic().ns
-  if (remaining <= 0) {
-    conn.close()
-    fail newError("h3: dial ${host}:${port} timed out")
-  }
-  conn.setIdleTimeout(remaining)
-  return h3newConn(conn, true)?
+  return h3DialTlsBounded(
+    host,
+    port,
+    serverName,
+    config,
+    H3Bound{ deadlineNs = deadlineNs, wake = chan<int>(1) },
+  )?
 }
 
 // Accept one HTTP/3 connection on the bound UDP socket `sock`, using the PEM
@@ -710,7 +714,6 @@ fn h3sendGoaway(c: H3Conn, streamId: int) {
 // H3_REQUEST_REJECTED, not H3_REQUEST_CANCELLED. Best-effort: the stream may
 // already be gone by the time this runs.
 fn h3refuse(s: Stream) {
-  s.reset(h3ErrRequestRejected) catch _ {}
-  s.stopSending(h3ErrRequestRejected) catch _ {}
+  h3abortStream(s, h3ErrRequestRejected)
 }
 
