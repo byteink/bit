@@ -635,11 +635,12 @@ with a status and a body and no extra headers. A `status` of 0 returned from a
 
 The value of the first header named `name`, or `""` if it is absent.
 
-### `connect(t: Transport, cfg: Config, deadlineNs: int): Conn!`
+### `connect(t: Transport, cfg: Config, deadlineNs: int, abort: Option<chan<int>> = Option.None): Conn!`
 
 Runs the client side of the handshake over `t` and returns a `Conn` once the
 peer's settings are in effect. `deadlineNs` bounds the wait; `0` means no
-bound.
+bound. A value sent on `abort` (capacity 1) ends the wait early: the transport
+is shut down and `connect` fails with `Aborted`.
 
 ### `accept(t: Transport, cfg: Config, deadlineNs: int): Conn!`
 
