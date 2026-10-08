@@ -70,6 +70,11 @@ export class ClientRequest {
   // the body (a read that waits longer fails with a `TimeoutError`); 0 means
   // no bound.
   export timeoutMs: int = 0,
+  // `cancel()` on this token fails the request, in any phase and from any task,
+  // with `Cancelled` (cancel.bit, #6602) and shuts its connection; a `Cancel`
+  // already cancelled fails it before anything is dialed. The request is then
+  // HTTP/1.1 only.
+  export cancel: Option<Cancel> = Option.None,
 }
 
 // The error a streamed request returns when `ClientRequest.timeoutMs` ran out:
@@ -165,6 +170,9 @@ export class BodyReader {
   // read in progress was armed with.
   timeoutMs: int
   armed: int
+  // This request's registration with its `Cancel` (cancel.bit), held until the
+  // connection is parked or shut.
+  watch: connWatch
 
   // Up to `max` bytes of the body, at least 1; an EMPTY slice only at the clean
   // end of the body, and again on every later call. May return fewer than
@@ -194,8 +202,15 @@ export class BodyReader {
     }
     this.arm()
     let piece = this.pull(want) catch e {
+      let err = this.asTimeout(e)
       this.finish(readerFailed)
-      fail this.asTimeout(e)
+      fail err
+    }
+    // A cancel shuts the connection, which a read to the connection's close
+    // takes for the end of the body.
+    if (this.watch.hit()) {
+      this.finish(readerFailed)
+      fail Cancelled{ op = "read" }
     }
     if (len(piece) == 0 || this.drained()) {
       this.finish(readerEof)
@@ -241,6 +256,9 @@ export class BodyReader {
 
   // `e`, or the `TimeoutError` it is when the deadline had passed.
   asTimeout(e: error): error {
+    if (this.watch.hit()) {
+      return Cancelled{ op = "read" }
+    }
     if (this.expired()) {
       return TimeoutError{ op = "read", ms = this.timeoutMs }
     }
@@ -352,7 +370,8 @@ export class BodyReader {
   // that waited for the slot finds it. Called once, from `Open` only.
   finish(next: int) {
     this.state = next
-    if (next == readerEof && this.keep && this.stream.buffered == 0) {
+    let hit = this.watch.release()
+    if (next == readerEof && this.keep && !hit && this.stream.buffered == 0) {
       this.park()
     } else {
       this.stream.shut()
@@ -532,6 +551,10 @@ fn http1Only(cfg: TlsConfig): TlsConfig {
 
 // A connection to `u`'s origin, over TLS for https, bounded by `extras.deadline`.
 fn dialStream(u: Url, extras: RequestExtras): byteStream! {
+  match (extras.cancel) {
+    Some(tok) => { return dialCancellable(u, http1Only(extras.config), tok, extras.deadline)? }
+    None => {}
+  }
   if (u.https) {
     return tlsStream{ conn = dialTlsConn(u, http1Only(extras.config), extras.deadline)? }
   }
@@ -543,7 +566,13 @@ fn dialStream(u: Url, extras: RequestExtras): byteStream! {
 // reader's reads. A
 // response with no body is finished here: its connection is parked or shut and
 // its slot freed before the caller sees it.
-fn startStream(s: byteStream, slot: connSlot, method: string, timeoutMs: int): Response! {
+fn startStream(
+  s: byteStream,
+  slot: connSlot,
+  method: string,
+  timeoutMs: int,
+  watch: connWatch,
+): Response! {
   let cs = countedStream{ inner = s, buffered = 0 }
   let head = readStreamHead(cs, method)?
   let reader = BodyReader{
@@ -556,6 +585,7 @@ fn startStream(s: byteStream, slot: connSlot, method: string, timeoutMs: int): R
     keep = head.keep,
     timeoutMs = timeoutMs,
     armed = 0,
+    watch = watch,
   }
   if (reader.drained()) {
     reader.finish(readerEof)
@@ -579,12 +609,22 @@ class streamCall {
   method: string,
   extras: RequestExtras,
   timeoutMs: int,
+  watch: connWatch,
 }
 
-// Writes `call`'s request on `s` and starts reading its response.
+// Writes `call`'s request on `s` and starts reading its response, with `s`
+// registered under `call.watch` from the first byte written; the reader keeps
+// the registration, a failure here ends it.
 fn startCall(s: byteStream, call: streamCall): Response! {
-  writeRequest(s, call.req, call.body)?
-  return startStream(s, call.slot, call.method, call.timeoutMs)?
+  call.watch.attach(s)?
+  writeRequest(s, call.req, call.body) catch e {
+    call.watch.release()
+    fail e
+  }
+  return startStream(s, call.slot, call.method, call.timeoutMs, call.watch) catch e {
+    call.watch.release()
+    fail e
+  }
 }
 
 // `call` on a connection dialed now: the slot and the connection are released
@@ -651,6 +691,7 @@ fn openStreamOn(
     method = method,
     extras = extras,
     timeoutMs = timeoutMs,
+    watch = watchOf(extras.cancel),
   }
   match (extras.pool.take(key, monotonic().ns)) {
     Hit(s) => return startParked(s, call)?
