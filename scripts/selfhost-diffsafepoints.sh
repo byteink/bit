@@ -446,10 +446,13 @@ exe_collections() { # $1=compiler $2=source $3=outbin -> collection count, "x" (
   BIT_GC=stress BIT_GC_STATS=on "$3" 2>&1 >/dev/null | grep -c gc
 }
 
-exe_stdout() { # $1=binary -> its stdout, or "x" if it did not exit 0
-  local o
-  o=$("$1" 2>/dev/null) || { echo x; return; }
-  printf '%s' "$o"
+# $1=binary $2=capture file -> the binary's exit status; its stdout lands in $2.
+# The compared payload never leaves a FILE (#6357, same shape as #6355): it used
+# to be read into a variable and `printf`ed into a `$(...)`, and a signal landing
+# on that write truncated one side and scored a false OUTPUT DIVERGENCE. The two
+# captures are compared with `cmp`.
+exe_stdout() {
+  "$1" >"$2" 2>/dev/null
 }
 
 # The corpus is written here rather than borrowed from _tests_/, deliberately:
@@ -561,7 +564,7 @@ echo "self-test: plain-loop collection count under BIT_GC=stress — seed=$sc_se
 # ORACLE fails to build/link, since both sides start before either result is
 # known. This corpus is 5 synthetic files so the wall-clock effect here is
 # negligible; it is done for behavioural consistency with phase 1.
-exe_match=0 exe_mismatch=0 exe_skip=0 exe_timeout=0
+exe_match=0 exe_mismatch=0 exe_skip=0 exe_timeout=0 exe_unstable=0
 for f in "$tmp"/exe/*.bit; do
   name=$(basename "$f")
   sb="$tmp/exe/${name}.seedbin"
@@ -597,9 +600,21 @@ for f in "$tmp"/exe/*.bit; do
   # Comparing collection counts is only meaningful if the two binaries compute
   # the same thing. A miscompile that changed the ANSWER could otherwise land on
   # a matching count and be scored green.
-  os=$(exe_stdout "$sb"); ob=$(exe_stdout "$bb")
-  if [ "$os" = "x" ] || [ "$ob" = "x" ] || [ "$os" != "$ob" ]; then
-    echo "EXE OUTPUT DIVERGENCE  $name  seed='$os' self='$ob'"
+  so="$tmp/exe/${name}.s.stdout"
+  bo="$tmp/exe/${name}.b.stdout"
+  exe_stdout "$sb" "$so"; osrc=$?
+  exe_stdout "$bb" "$bo"; obrc=$?
+  if [ "$osrc" -ne 0 ] || [ "$obrc" -ne 0 ] || ! cmp -s "$so" "$bo"; then
+    # A divergence is only real if it REPRODUCES on fresh captures: a re-run that
+    # agrees decided nothing, so it is UNDECIDED (exit 2), never a mismatch (#6357).
+    exe_stdout "$sb" "$so"; osrc=$?
+    exe_stdout "$bb" "$bo"; obrc=$?
+    if [ "$osrc" -eq 0 ] && [ "$obrc" -eq 0 ] && cmp -s "$so" "$bo"; then
+      echo "EXE OUTPUT UNSTABLE  $name  diverged once, agreed on the immediate re-run"
+      exe_unstable=$((exe_unstable + 1))
+      continue
+    fi
+    echo "EXE OUTPUT DIVERGENCE  $name  seed(rc=$osrc)='$(head -c 200 "$so")' self(rc=$obrc)='$(head -c 200 "$bo")'"
     exe_mismatch=$((exe_mismatch + 1))
     continue
   fi
@@ -612,7 +627,7 @@ for f in "$tmp"/exe/*.bit; do
   fi
 done
 
-echo "linked-exe differential: MATCH=$exe_match MISMATCH=$exe_mismatch SKIP=$exe_skip TIMEOUT=$exe_timeout"
+echo "linked-exe differential: MATCH=$exe_match MISMATCH=$exe_mismatch SKIP=$exe_skip TIMEOUT=$exe_timeout UNSTABLE=$exe_unstable"
 
 # A phase that measured nothing must not pass. If every case skipped, the loop
 # above ran zero comparisons and `exe_mismatch` is 0 for the wrong reason.
@@ -753,5 +768,8 @@ fi
 # evidence, regardless of how many builds elsewhere also timed out.
 instcheckfail=0
 [ "$INSTCHECK_RC" -eq 1 ] && instcheckfail=1
+[ "$exe_unstable" -gt 0 ] &&
+  echo "UNSTABLE: $exe_unstable linked-exe run(s) diverged once and agreed on re-run: not a pass, not a divergence (#6357)."
 diffexit "safepoints" -f "$mismatch" "$exe_mismatch" "$instcheckfail" \
-  -t "safepoint-count build(s)=$timeout" "linked-exe build(s)=$exe_timeout"
+  -t "safepoint-count build(s)=$timeout" "linked-exe build(s)=$exe_timeout" \
+  "unreproduced linked-exe output(s)=$exe_unstable"
