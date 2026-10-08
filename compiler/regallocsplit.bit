@@ -24,16 +24,26 @@
 // SCOPE (#7635): only Int, non-reference, non-heap-derived, non-remat values
 // split. A reference's stack maps and #5847's slot clears still name one
 // location for a whole life (#7636), which is why `assertNoRefSplit` exists.
+//
+// THE THIRD PIECE (#7665): after the scan, `placeTails` moves a split value
+// back into a register `backReg` from a later block start `at2` to its end,
+// so its reads after the competing call stop reloading (Wimmer & Franz's split
+// child re-entering a register, decided after the scan rather than inside
+// it). The register must be held by NOBODY on [lo2, end], `lo2` being the
+// source of the one edge that loads it, so every other placement stands.
 
-// The split of one interval: its register before `at`, `tail` from `at` on.
-// `start`/`end` are its (alias-widened) interval, the positions an edge move
-// may be owed at.
+// The split of one interval: its register before `at`, `tail` from `at` on,
+// and from `at2` on (when >= 0) the register `backReg`. `start`/`end` are its
+// (alias-widened) interval, the positions an edge move may be owed at.
 class SplitPiece {
   vreg: int,
   start: int,
   at: int,
   end: int,
   tail: RegLoc,
+  at2: int = -1,
+  lo2: int = -1,
+  backReg: int = -1,
 }
 
 // One resolution move: `vreg` sits in `src` at an edge's source and must be
@@ -47,10 +57,20 @@ class SplitMove {
 // #7634: the one read of `locations` outside this module. `pos` is the
 // instruction position emitted or checked.
 fn locAt(res: RegAllocResult, v: int, pos: int): RegLoc {
-  if (v < len(res.splitOf) && res.splitOf[v] >= 0 && pos >= res.splits[res.splitOf[v]].at) {
-    return res.splits[res.splitOf[v]].tail
+  if (v >= len(res.splitOf) || res.splitOf[v] < 0) {
+    return res.locations[v]
   }
-  return res.locations[v]
+  return pieceLoc(res.splits[res.splitOf[v]], res.locations[v], pos)
+}
+
+fn pieceLoc(p: SplitPiece, head: RegLoc, pos: int): RegLoc {
+  if (pos < p.at) {
+    return head
+  }
+  if (p.at2 >= 0 && pos >= p.at2) {
+    return RegLoc{ isSpill = false, index = p.backReg }
+  }
+  return p.tail
 }
 
 // A read with no instruction position (frame sizing, whole-function scans,
@@ -194,13 +214,246 @@ fn splitIndex(n: int, splits: []SplitPiece, roots: []int): []int {
 fn splitEdgeMoves(res: RegAllocResult, from: int, to: int): []SplitMove {
   let out = []SplitMove(0)
   for p of res.splits {
-    if (!spans(p.start, p.end, from, to) || from < p.at == (to < p.at)) {
+    let src = locAt(res, p.vreg, from)
+    let dst = locAt(res, p.vreg, to)
+    if (!spans(p.start, p.end, from, to) ||
+      (src.isSpill == dst.isSpill && src.index == dst.index)) {
       continue
     }
-    out = append(
-      out,
-      SplitMove{ vreg = p.vreg, src = locAt(res, p.vreg, from), dst = locAt(res, p.vreg, to) },
-    )
+    out = append(out, SplitMove{ vreg = p.vreg, src = src, dst = dst })
   }
   return out
+}
+
+// What `placeTails` reads besides the Splitter: the merged intervals, the copy
+// roots, the points and register file that restrict a register, and per vreg
+// its piece's index (`splitIndex`), renewed as pieces are added.
+class TailScan {
+  scan: []LiveInterval,
+  roots: []int,
+  points: AllocPoints,
+  target: TargetRegs,
+  splitOf: []int,
+}
+
+// Gives each split piece its third piece where one pays: the earliest block
+// start `at2` after `at` that still has two distinct reads at or after it,
+// entered by exactly one edge, from the slot region, and by no back edge, so
+// the tail costs at most one load and saves at least two reloads.
+//
+// A value spilled WHOLE gets the same chance as a piece whose head is its own
+// slot (`at` = its start): it is not moved before `at2`, so the store at its
+// definition stands and the one load is the only cost.
+fn placeTails(sp: Splitter, ts: TailScan) {
+  let n0 = len(sp.pieces)
+  let k = 0
+  while (k < n0) {
+    ts.splitOf = splitIndex(len(sp.locations), sp.pieces, ts.roots)
+    placeTail(sp, ts, k, tailIv(ts, sp.pieces[k].vreg).last2)
+    k = k + 1
+  }
+  for iv of ts.scan {
+    if (spilledWhole(sp, ts, iv)) {
+      tryWholeTail(sp, ts, iv)
+    }
+  }
+}
+
+fn spilledWhole(sp: Splitter, ts: TailScan, iv: LiveInterval): bool {
+  let loc = sp.locations[iv.vreg]
+  let root = len(ts.roots) == 0 || ts.roots[iv.vreg] == iv.vreg
+  return root && splittable(iv) && loc.isSpill && loc.index >= 0
+}
+
+fn tryWholeTail(sp: Splitter, ts: TailScan, iv: LiveInterval) {
+  let loc = sp.locations[iv.vreg]
+  sp.pieces = append(
+    sp.pieces,
+    SplitPiece{ vreg = iv.vreg, start = iv.start, at = iv.start, end = iv.end, tail = loc },
+  )
+  let k = len(sp.pieces) - 1
+  ts.splitOf = splitIndex(len(sp.locations), sp.pieces, ts.roots)
+  placeTail(sp, ts, k, iv.last2)
+  if (sp.pieces[k].at2 < 0) {
+    sp.pieces = sp.pieces[0:k]
+  }
+}
+
+fn tailIv(ts: TailScan, v: int): LiveInterval {
+  for iv of ts.scan {
+    if (iv.vreg == v) {
+      return iv
+    }
+  }
+  assert(false, "#7665: a split piece names no interval")
+  return ts.scan[0]
+}
+
+fn placeTail(sp: Splitter, ts: TailScan, k: int, last2: int) {
+  let p = sp.pieces[k]
+  let b = nextBlockStart(sp.edges, p.at, p.end)
+  while (b >= 0 && b <= last2) {
+    sp.pieces[k].lo2 = tailEntry(p, b, sp.edges)
+    let r = -1
+    if (sp.pieces[k].lo2 >= 0) {
+      r = tailReg(sp, ts, k, b)
+    }
+    if (r >= 0) {
+      sp.pieces[k].at2 = b
+      sp.pieces[k].backReg = r
+      return
+    }
+    b = nextBlockStart(sp.edges, b, p.end)
+  }
+  sp.pieces[k].lo2 = -1
+}
+
+// The smallest block start in (after, end], or -1.
+fn nextBlockStart(edges: []CfgEdge, after: int, end: int): int {
+  let b = -1
+  for e of edges {
+    if (e.dstStart > after && e.dstStart <= end && (b < 0 || e.dstStart < b)) {
+      b = e.dstStart
+    }
+  }
+  return b
+}
+
+// The source position of the one edge inside `p` that enters `b` from the
+// slot region [at, b), or -1 when a back edge crosses `b`, another forward
+// edge does, or none does.
+fn tailEntry(p: SplitPiece, b: int, edges: []CfgEdge): int {
+  let lo = -1
+  for e of edges {
+    if (!spans(p.start, p.end, e.srcLast, e.dstStart) || e.srcLast < b == (e.dstStart < b)) {
+      continue
+    }
+    if (e.srcLast >= b || e.srcLast < p.at || lo >= 0) {
+      return -1
+    }
+    lo = e.srcLast
+  }
+  return lo
+}
+
+// A register nobody holds on [lo2, end] that the tail's points allow, the
+// head register first; a callee-saved register no value uses yet is refused,
+// since the prologue would pay to save it. -1 when there is none.
+fn tailReg(sp: Splitter, ts: TailScan, k: int, b: int): int {
+  let p = sp.pieces[k]
+  let file = ts.target.intRegs
+  let probe = LiveInterval{
+    vreg = p.vreg,
+    regClass = RegClass.Int,
+    start = b - 1,
+    end = p.end,
+    isRef = false,
+  }
+  let mask = fullRegMask(file.count) & intervalRegMask(probe, ts.points, ts.target)
+  let head = sp.locations[p.vreg]
+  if (!head.isSpill && tailRegFits(sp, ts, mask, head.index, k)) {
+    return head.index
+  }
+  let r = 0
+  while (r < file.count) {
+    if (tailRegFits(sp, ts, mask, r, k)) {
+      return r
+    }
+    r = r + 1
+  }
+  return -1
+}
+
+fn tailRegFits(sp: Splitter, ts: TailScan, mask: int, r: int, k: int): bool {
+  let saved = ((ts.target.intRegs.calleeSaved >> r) & 1) == 1
+  return ((mask >> r) & 1) == 1 && (!saved || regUsed(sp, ts, r)) && !regTaken(sp, ts, k, r)
+}
+
+fn regUsed(sp: Splitter, ts: TailScan, r: int): bool {
+  for iv of ts.scan {
+    let loc = sp.locations[iv.vreg]
+    if (iv.regClass == RegClass.Int && !loc.isSpill && loc.index == r) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether any Int value other than piece `k`'s holds `r` somewhere in
+// [lo, pieces[k].end].
+fn regTaken(sp: Splitter, ts: TailScan, k: int, r: int): bool {
+  for iv of ts.scan {
+    let q = ts.splitOf[iv.vreg]
+    if (iv.regClass == RegClass.Int &&
+      q != k &&
+      holdsReg(sp, iv, q, r, RegWindow{ lo = sp.pieces[k].lo2, hi = sp.pieces[k].end })) {
+      return true
+    }
+  }
+  return false
+}
+
+class RegWindow {
+  lo: int,
+  hi: int,
+}
+
+// Whether `iv` (piece `q`, or -1) holds `r` somewhere in `w`: its head up to
+// `at` when split, its tail register from `lo2` on, else its whole interval.
+fn holdsReg(sp: Splitter, iv: LiveInterval, q: int, r: int, w: RegWindow): bool {
+  let loc = sp.locations[iv.vreg]
+  let end = iv.end
+  if (q >= 0) {
+    let p = sp.pieces[q]
+    if (p.backReg == r && p.lo2 <= w.hi && p.end >= w.lo) {
+      return true
+    }
+    end = p.at
+  }
+  return !loc.isSpill && loc.index == r && iv.start <= w.hi && end >= w.lo
+}
+
+// Places the tails, then builds the stack maps the tails' registers reach.
+fn tailedStackMaps(
+  sp: Splitter, scan: []LiveInterval, roots: []int, points: AllocPoints, target: TargetRegs,
+): []StackMapEntry {
+  let ts = TailScan{
+    scan = scan,
+    roots = roots,
+    points = points,
+    target = target,
+    splitOf = []int(0),
+  }
+  placeTails(sp, ts)
+  let maps = buildStackMaps(ts.scan, sp.locations, ts.points)
+  notePollTails(maps, sp.pieces)
+  return maps
+}
+
+// An alias's reads are its root's: they share one location (`widenRoot`).
+fn mergeLastReads(root: LiveInterval, alias: LiveInterval) {
+  noteLastRead(root, alias.last1)
+  noteLastRead(root, alias.last2)
+}
+
+// #7303: a poll inside a tail must keep the tail's register in its live mask.
+// The head register stays there too: over-reporting only saves a register.
+fn notePollTails(stackMaps: []StackMapEntry, pieces: []SplitPiece) {
+  for sm of stackMaps {
+    for p of pieces {
+      if (sm.isPoll && p.at2 >= 0 && sm.pos >= p.at2 && sm.pos <= p.end) {
+        sm.live = sm.live | (1 << p.backReg)
+      }
+    }
+  }
+}
+
+// Marks every tail register in `used`, the backends' callee-saved scans: a
+// tail register may be one no other value holds.
+fn markTailRegs(res: RegAllocResult, used: []bool) {
+  for p of res.splits {
+    if (p.at2 >= 0) {
+      used[p.backReg] = true
+    }
+  }
 }
