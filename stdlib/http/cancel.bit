@@ -29,18 +29,26 @@
 //                     byte written; `cancel()` shuts it, which wakes the read
 //                     that is parked on it (`byteStream.forceClose`);
 //   * response body   the same registration lives as long as the `BodyReader`
-//                     is open; the pending `read` fails.
+//                     is open; the pending `read` fails;
+//   * HTTP/2          a request on a shared h2 connection (h2pool.bit) is not
+//                     registered with the token, because shutting that
+//                     connection would fail the other requests on it. Its wait
+//                     for a stream slot, for the response headers and for the
+//                     body is woken by the token instead (`h2clientExchange`,
+//                     h2.bit), and the engine resets just that stream with
+//                     RST_STREAM (CANCEL) and leaves the connection running
+//                     (`Conn.roundTrip`'s `abort`, stdlib/http2/abort.bit).
 //
 // Every one of them fails with `Cancelled`, found with `isCancelled(e)`: a
 // request fails with a `RequestError` (`sent` says whether the server may have
 // the request) whose `cause` is the `Cancelled`, a `BodyReader.read` fails with
-// the bare `Cancelled`. A connection a cancel touched is shut and is never
-// returned to the idle pool.
+// the bare `Cancelled`. A HTTP/1.1 connection a cancel touched is shut and is
+// never returned to the idle pool; an HTTP/2 one is neither (#7639).
 //
-// A request with a token is HTTP/1.1 only, as a streamed one is: ALPN offers
-// `http/1.1`, it never joins the shared HTTP/2 connection (closing that would
-// cancel other requests), it never upgrades to HTTP/3 and an `https+h3://` URL
-// is refused.
+// A buffered request with a token negotiates h2 or HTTP/1.1 like any other and
+// shares the origin's h2 connection. A streamed one (`Client.stream`) is HTTP/1.1
+// only: ALPN offers `http/1.1`. Neither upgrades to HTTP/3 and an `https+h3://`
+// URL is refused.
 //
 // `Mutex`, `byteStream`, `netStream`, `tlsStream`, `Conn`, `TlsConfig`,
 // `Client`, `ClientRequest`, `Response`, `Url`, `RequestError`, `dialConn`,
@@ -376,14 +384,21 @@ fn awaitDial(job: dialJob, tok: Cancel): Conn! {
   }
 }
 
-// A connection to `u`'s origin for a request under `tok`, over TLS (HTTP/1.1
-// only) for https. The TCP connection is registered with the token for the
-// whole handshake, so a cancel there shuts it and the handshake fails.
+// A connection to `u`'s origin for a request under `tok`, over TLS for https
+// (`cfg` decides the protocol: `http1Only` for a streamed request).
 fn dialCancellable(u: Url, cfg: TlsConfig, tok: Cancel, deadline: int): byteStream! {
-  let conn = dialRaced(u, tok, deadline)?
   if (!u.https) {
-    return netStream{ conn = conn }
+    return netStream{ conn = dialRaced(u, tok, deadline)? }
   }
+  return tlsStream{ conn = dialTlsCancellable(u, cfg, tok, deadline)? }
+}
+
+// A TLS connection to `u`'s origin for a request under `tok`. The TCP connection
+// is registered with the token for the whole handshake, so a cancel there shuts
+// it and the handshake fails; once this returns the token no longer reaches the
+// connection, which a shared HTTP/2 one must not be (#7639).
+fn dialTlsCancellable(u: Url, cfg: TlsConfig, tok: Cancel, deadline: int): TlsConn! {
+  let conn = dialRaced(u, tok, deadline)?
   let w = watchOf(Option.Some(tok))
   w.attach(netStream{ conn = conn }) catch e {
     conn.close()
@@ -397,12 +412,12 @@ fn dialCancellable(u: Url, cfg: TlsConfig, tok: Cancel, deadline: int): byteStre
     tc.close()
     fail Cancelled{ op = "send" }
   }
-  return tlsStream{ conn = tc }
+  return tc
 }
 
 // `Client.send(req)` for a request carrying `tok` (client.bit): the same
-// request, HTTP/1.1 only and registered with the token on every connection it
-// uses. Streamed or buffered; a buffered one follows redirects as
+// request, registered with the token on every HTTP/1.1 connection it uses and
+// woken by it on an HTTP/2 stream. Streamed or buffered; a buffered one follows redirects as
 // `Client.request` does, each hop under the token.
 fn sendWithCancel(c: Client, req: ClientRequest, tok: Cancel, stream: bool): Response! {
   if (tok.cancelled()) {
@@ -438,10 +453,10 @@ fn sendBuffered(req: ClientRequest, extras: RequestExtras): Response! {
   return followed(req.method, req.url, textBody(req.body), extras)?
 }
 
-// A redirect hop of a request under a token may not leave HTTP/1.1: `next` over
-// HTTP/3 is refused (`planHop`, redirect.bit).
+// A redirect hop of a request under a token may not go to HTTP/3: `next` over
+// it is refused (`planHop`, redirect.bit).
 fn refuseCancelledH3(next: Url, extras: RequestExtras): ()! {
   if (next.h3 && isSome(extras.cancel)) {
-    fail newError("redirect to ${urlString(next)}: a cancellable request is HTTP/1.1 only")
+    fail newError("redirect to ${urlString(next)}: a cancellable request cannot use HTTP/3")
   }
 }

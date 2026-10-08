@@ -14,6 +14,10 @@
 // core the scale is 1 and the bound is exactly 100 ms; on a loaded host the
 // scheduler may hold the woken task off a CPU, which is not what these tests own.
 import { loadProbe, scaledBudgetMs } from "../../_tests_/bit/loadscale"
+import {
+  encodeHeaders, HeadersFrame, encodeData, DataFrame, encodeSettings, SettingsFrame, Setting,
+  readFrame, Frame, decodeRstStream, frameSettings, frameHeaders, frameRstStream, flagAck,
+} from "std/http2"
 
 // Wait this long before cancelling, so the request is parked in its phase.
 const cancelDelayMs: int = 50
@@ -373,4 +377,246 @@ test "a request that finishes before the cancel keeps its connection pooled" {
     len(c.pool.idle) == 1,
     "idle = ${len(c.pool.idle)}: a finished request parks its connection",
   )
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2: a cancel resets one stream and keeps the connection (#7639)
+// ---------------------------------------------------------------------------
+//
+// An origin that speaks h2 at the frame level, so a response can stop in the
+// middle of its body and the test can see every frame the client sends back.
+// Stream 1 is the request under the token: the origin answers it with HEADERS
+// and 4 body bytes and then waits. Stream 3 is a plain request: HEADERS and
+// half its body. When the origin sees the client's RST_STREAM for stream 1 it
+// records the code, sends the rest of stream 3, and then sends DATA on stream 1
+// anyway, as a peer does that had it queued before the reset arrived. Every
+// DATA frame stays under the 16384-byte default frame size.
+
+const rawHalf: int = 10000
+
+class rawH2 {
+  l: TlsListener,
+  port: int,
+  accepts: AtomicI64,
+  heads: AtomicI64,
+  rstStream: AtomicI64,
+  rstCode: AtomicI64,
+  // Every RST_STREAM the client sent; a reply to the late DATA would be a second.
+  rstCount: AtomicI64,
+}
+
+class rawBuf { data: []byte }
+
+fn rawSend(conn: TlsConn, b: []byte) {
+  conn.write(b) catch _ {
+    return
+  }
+}
+
+fn rawCat(a: []byte, b: []byte): []byte {
+  let out = []byte(0)
+  for x of a {
+    out = append(out, x)
+  }
+  for x of b {
+    out = append(out, x)
+  }
+  return out
+}
+
+fn rawBytes(n: int): []byte {
+  let b = []byte(0)
+  let i = 0
+  while (i < n) {
+    b = append(b, byte(120))
+    i = i + 1
+  }
+  return b
+}
+
+// `:status: 200`, the one HPACK byte (RFC 7541 appendix A, index 8).
+fn rawHeaders(sid: int): []byte {
+  return encodeHeaders(
+    HeadersFrame{
+      streamId = sid, blockFragment = [byte(136)], endStream = false, endHeaders = true, padLength = -1,
+      hasPriority = false, exclusive = false, streamDependency = 0, weight = 0,
+    },
+  ) catch _ {
+    return []byte(0)
+  }
+}
+
+fn rawData(sid: int, n: int, end: bool): []byte {
+  return encodeData(DataFrame{ streamId = sid, data = rawBytes(n), endStream = end, padLength = -1 }) catch _ {
+    return []byte(0)
+  }
+}
+
+fn rawSettings(ack: bool): []byte {
+  return encodeSettings(SettingsFrame{ ack = ack, settings = []Setting(0) }) catch _ {
+    return []byte(0)
+  }
+}
+
+// The next whole frame of `rb`, reading from `conn` until there is one; None
+// when the connection ended.
+fn rawNext(conn: TlsConn, rb: rawBuf): Option<Frame> {
+  while (true) {
+    let got = readFrame(rb.data, 16384) catch _ {
+      let more = conn.read(16384) catch _ {
+        return Option.None
+      }
+      if (len(more) == 0) {
+        return Option.None
+      }
+      rb.data = rawCat(rb.data, more)
+      continue
+    }
+    rb.data = rb.data[9 + got.header.length:len(rb.data)]
+    return Option.Some(got)
+  }
+}
+
+fn rawOnFrame(conn: TlsConn, o: rawH2, f: Frame) {
+  if (f.header.ftype == frameSettings && (f.header.flags & flagAck) == 0) {
+    rawSend(conn, rawSettings(true))
+    return
+  }
+  if (f.header.ftype == frameHeaders) {
+    o.heads.add(1)
+    rawSend(conn, rawHeaders(f.header.streamId))
+    if (f.header.streamId == 1) {
+      rawSend(conn, rawData(1, 4, false))
+    } else if (o.rstStream.load() != 0) {
+      rawSend(conn, rawData(f.header.streamId, rawHalf, false))
+      rawSend(conn, rawData(f.header.streamId, rawHalf, true))
+    } else {
+      rawSend(conn, rawData(f.header.streamId, rawHalf, false))
+    }
+    return
+  }
+  if (f.header.ftype != frameRstStream) {
+    return
+  }
+  let r = decodeRstStream(f) catch _ {
+    return
+  }
+  o.rstCount.add(1)
+  if (r.streamId != 1) {
+    return
+  }
+  o.rstStream.store(r.streamId)
+  o.rstCode.store(r.errorCode)
+  rawSend(conn, rawData(3, rawHalf, true))
+  rawSend(conn, rawData(1, rawHalf, false))
+  rawSend(conn, rawData(1, rawHalf, false))
+  rawSend(conn, rawData(1, rawHalf, true))
+}
+
+fn rawServe(conn: TlsConn, o: rawH2) {
+  let rb = rawBuf{ data = []byte(0) }
+  rawSend(conn, rawSettings(false))
+  // The 24-byte client preface precedes the first frame.
+  while (len(rb.data) < 24) {
+    let more = conn.read(16384) catch _ {
+      return
+    }
+    if (len(more) == 0) {
+      return
+    }
+    rb.data = rawCat(rb.data, more)
+  }
+  rb.data = rb.data[24:len(rb.data)]
+  while (true) {
+    match (rawNext(conn, rb)) {
+      Some(f) => { rawOnFrame(conn, o, f) }
+      None => { return }
+    }
+  }
+}
+
+fn rawAccept(o: rawH2) {
+  while (true) {
+    let conn = o.l.accept() catch _ {
+      return
+    }
+    o.accepts.add(1)
+    spawn rawServe(conn, o)
+  }
+}
+
+fn startRawH2(): rawH2! {
+  let cfg = tls5916ServerConfig()?
+  cfg.alpn = ["h2", "http/1.1"]
+  let l = tlsListen("127.0.0.1", 0, cfg)?
+  let o = rawH2{
+    l = l, port = l.port()?, accepts = AtomicI64(0), heads = AtomicI64(0), rstStream = AtomicI64(0),
+    rstCode = AtomicI64(0), rstCount = AtomicI64(0),
+  }
+  spawn rawAccept(o)
+  return o
+}
+
+fn rawClient(): Client {
+  let cfg = tls5916ClientConfig()
+  cfg.alpn = ["h2", "http/1.1"]
+  return Client(tls = cfg)
+}
+
+// Polls until `a` reaches `want`, or fails after about 5 s.
+fn rawWait(a: AtomicI64, want: int, what: string) {
+  let i = 0
+  while (a.load() < want && i < 1000) {
+    sleep(5 * 1000000)
+    i = i + 1
+  }
+  assert(a.load() >= want, "${what}: ${a.load()}, wanted ${want}")
+}
+
+fn rawSendTok(c: Client, url: string, tok: Cancel, out: chan<error>) {
+  c.send(ClientRequest{ url = url, cancel = Option.Some(tok) }) catch e {
+    out <- e
+    return
+  }
+  out <- newError("the request under the token succeeded")
+}
+
+fn rawGet(c: Client, url: string, out: chan<string>) {
+  let res = c.get(url) catch e {
+    out <- "error: ${e.message()}"
+    return
+  }
+  out <- "${res.status} ${len(res.body)}"
+}
+
+test "cancel over h2 resets one stream with CANCEL and the other stream finishes on the same connection" {
+  let o = startRawH2() catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = rawClient()
+  let url = "https://127.0.0.1:${o.port}/x"
+  let tok = Cancel()
+  let slow = chan<error>(1)
+  spawn rawSendTok(c, url, tok, slow)
+  rawWait(o.heads, 1, "origin saw the request under the token")
+  let fast = chan<string>(1)
+  spawn rawGet(c, url, fast)
+  rawWait(o.heads, 2, "origin saw the second request")
+  let at = AtomicI64(monotonic().ns)
+  tok.cancel()
+  let e = <- slow
+  assertWithin(at, "h2 cancel mid-body")
+  assertCancelled(e, "h2 cancel mid-body")
+  let (re, ok) = e.(RequestError)
+  assert(ok && re.sent, "the origin had the request, so it was sent")
+  assert(<- fast == "200 ${2 * rawHalf}", "the other stream did not finish with its whole body")
+  assert(o.rstStream.load() == 1, "RST_STREAM was for stream ${o.rstStream.load()}, not 1")
+  assert(o.rstCode.load() == 8, "RST_STREAM code ${o.rstCode.load()}, not CANCEL (0x8)")
+  // The DATA the origin sent on stream 1 after the reset is ignored: no reply.
+  let again = chan<string>(1)
+  spawn rawGet(c, url, again)
+  assert(<- again == "200 ${2 * rawHalf}", "a request after the cancel failed")
+  assert(o.accepts.load() == 1, "accepts = ${o.accepts.load()}: the connection was not kept")
+  assert(o.rstCount.load() == 1, "the client sent ${o.rstCount.load()} RST_STREAM frames, not 1")
 }

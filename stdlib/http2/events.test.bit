@@ -38,6 +38,7 @@ fn btState(isClient: bool, maxBody: int): h2connState {
     nextStreamId = h2connFirstId(isClient),
     lastPeerStreamId = 0,
     openBodies = 0,
+    aborted = map<int, bool>(),
     connSendWindow = 65535,
     connRecvWindow = 1048576,
     peerInitialWindow = 65535,
@@ -501,4 +502,95 @@ test "roundTrip refuses to buffer a body under Config.streamBodies" {
     return
   }
   assert(false, "roundTrip returned ${len(res.body)} body bytes under streamBodies")
+}
+
+// --- aborting a client stream (#7639) ----------------------------------------
+
+test "h2cmdAbort resets the stream with CANCEL, returns the held credit, and the peer's late DATA is ignored" {
+  let st = btState(true, 1048576)
+  let replyCh = chan<h2connMsg>(1)
+  let s = btOpenStream(st, 1, replyCh)
+  // The response is delivered and 5000 body bytes sit unread: their connection
+  // credit is held (`h2connCreditData`), so the window is 5000 below its start.
+  s.bodyOpen = true
+  st.openBodies = 1
+  s.replied = true
+  s.recvBody = btPattern(5000)
+  st.connRecvWindow = st.connRecvWindow - 5000
+  let before = st.connRecvWindow
+  let box = chan<int>(1)
+  box <- 1
+  h2connCmdAbort(
+    st,
+    h2connCmd{
+      kind = h2cmdAbort,
+      readCh = h2connDummyRead(),
+      request = h2connZeroRequest(),
+      response = h2connZeroResponse(),
+      streamId = 0,
+      errorCode = errorCancel,
+      replyCh = h2connDummyReply(),
+      idCh = Option.Some(box),
+    },
+  )
+  assert(
+    st.connRecvWindow == before + 5000,
+    "connRecvWindow = ${st.connRecvWindow}, want ${before + 5000}",
+  )
+  let (_, present) = st.streams[1]
+  assert(!present, "the aborted stream is still in the table")
+  assert(st.openBodies == 0, "openBodies = ${st.openBodies}, want 0")
+  assert(st.activeStreams == 0, "activeStreams = ${st.activeStreams}, want 0")
+  // WINDOW_UPDATE for the credit, then RST_STREAM(CANCEL) for the stream.
+  let wu = btNextWritten(st) catch e {
+    assert(false, "no WINDOW_UPDATE was queued: ${e.message()}")
+    return
+  }
+  assert(
+    wu.header.ftype == frameWindowUpdate,
+    "first frame type ${wu.header.ftype}, want WINDOW_UPDATE",
+  )
+  let sent = btNextWritten(st) catch e2 {
+    assert(false, "no RST_STREAM was queued: ${e2.message()}")
+    return
+  }
+  let rst = decodeRstStream(sent) catch e3 {
+    assert(false, "the second frame is not RST_STREAM: ${e3.message()}")
+    return
+  }
+  assert(
+    rst.streamId == 1 && rst.errorCode == errorCancel,
+    "RST_STREAM ${rst.streamId} code ${rst.errorCode}",
+  )
+  // DATA the peer had queued before it saw the reset: dropped, its connection
+  // credit renewed, and no second RST_STREAM (RFC 9113 §5.1).
+  let late = btDataFrame(1, btPattern(3000), false) catch e4 {
+    assert(false, "building the late DATA failed: ${e4.message()}")
+    return
+  }
+  let start = st.connRecvWindow
+  h2connOnData(st, late)
+  assert(
+    st.connRecvWindow == start,
+    "connRecvWindow = ${st.connRecvWindow}, want ${start}: the late bytes were not credited back",
+  )
+  let back = btNextWritten(st) catch e5 {
+    assert(false, "no WINDOW_UPDATE for the late DATA: ${e5.message()}")
+    return
+  }
+  assert(
+    back.header.ftype == frameWindowUpdate,
+    "late DATA was answered with frame type ${back.header.ftype}",
+  )
+  assert(srDrainWrites(st) == 0, "late DATA on an aborted stream queued more frames")
+  // A stream this side did not reset is still answered with STREAM_CLOSED.
+  let stray = btDataFrame(3, btPattern(10), false) catch e6 {
+    assert(false, "building the stray DATA failed: ${e6.message()}")
+    return
+  }
+  h2connOnData(st, stray)
+  assert(
+    srDrainWrites(st) == 2,
+    "DATA on a never-aborted closed stream must be refused with RST_STREAM",
+  )
 }

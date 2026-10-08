@@ -350,9 +350,13 @@ of them. A token cancelled before `send` fails the request before anything is
 dialed, with `sent` false. A request that already finished is unaffected: its
 connection stays pooled.
 
-A request with a token is HTTP/1.1 only, as a streamed one is: it never joins
-the shared HTTP/2 connection (closing that would cancel other requests), never
-upgrades to HTTP/3, and an `https+h3://` URL, or a redirect to one, fails.
+A buffered request with a token negotiates HTTP/2 like any other and shares the
+origin's h2 connection. `cancel()` resets only that request's stream with
+`RST_STREAM` (`CANCEL`, 0x8), fails it with `Cancelled`, and leaves the
+connection and the other requests on it running; frames the server had already
+sent for the stream are ignored. A streamed request (`stream = true`) is
+HTTP/1.1 only. Neither upgrades to HTTP/3, and an `https+h3://` URL, or a
+redirect to one, fails.
 
 A `send` that waits for a free connection because the host is at
 `maxConnsPerHost` is woken by `cancel()` too: it fails with `Cancelled`, `sent`
@@ -696,8 +700,8 @@ starting from exactly the handler shown above.
 | a response over the body-size budget (32 MiB default) | the call fails before the bytes are read |
 | a `BodyReader` neither read to the end nor closed | its connection and its `maxConnsPerHost` slot stay held - `close()` it |
 | a `BodyReader` closed after a partial read | its connection is shut, never reused |
-| `Cancel.cancel()` on a request in flight | it fails with `Cancelled` and its connection is shut, never pooled |
-| a request with a `Cancel` | HTTP/1.1 only: no shared h2 connection, no HTTP/3 |
+| `Cancel.cancel()` on a request in flight | it fails with `Cancelled`; an HTTP/1.1 connection is shut and never pooled, an h2 stream is reset and its connection stays shared |
+| a request with a `Cancel` | never HTTP/3; a streamed one is also HTTP/1.1 only |
 | a redirect to another host, port or scheme | `Authorization`, `Cookie`, `Proxy-Authorization` and `WWW-Authenticate` are dropped, defaults included |
 | a redirect from `https` to `http` | the call fails - opt in with `RedirectAllow.Downgrade` |
 | a `307` or `308` with a body to another origin | the call fails - opt in with `RedirectAllow.ReplayBody` |

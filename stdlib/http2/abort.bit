@@ -1,0 +1,195 @@
+// Bit standard library — http2 module, aborting a client request from another
+// green thread: `Conn.roundTrip`'s `abort` argument (#7639). Same flat
+// `std/http2` module and namespace as `conn.bit`; `h2connAwaitReply` moved here
+// from there when it grew the abort arm.
+
+// What `Conn.roundTrip` fails with when its `abort` channel received a value:
+// the stream was reset with RST_STREAM (CANCEL, RFC 9113 §7) and only that
+// stream. The connection and every other stream on it are untouched, so a
+// caller sharing the `Conn` keeps using it and does not treat this as a dead
+// connection the way it treats any other `roundTrip` failure.
+export class Aborted {
+  export message(): string {
+    return "http2: request aborted"
+  }
+}
+
+// The most stream ids `st.aborted` remembers. A peer finishes sending on a reset
+// stream within about one round trip, so the set only has to span the resets
+// that fit in one; past this it starts over, and a DATA frame that arrives later
+// than that is answered with STREAM_CLOSED, which RFC 9113 §5.1 permits.
+const h2connAbortedMax: int = 1024
+
+// One request's way to be aborted: `wake` receives a value when the caller wants
+// the request gone, `idCh` is the mailbox its open leaves the stream id in
+// (`h2connCmd.idCh`).
+class h2connAbort {
+  cmdCh: chan<h2connCmd>,
+  wake: chan<int>,
+  idCh: chan<int>,
+}
+
+// An abort for a request on `cmdCh`, woken by `wake`; a request with nothing to
+// abort it passes None and gets a channel nothing ever sends on.
+fn h2connNewAbort(cmdCh: chan<h2connCmd>, wake: Option<chan<int>>): h2connAbort {
+  let w = chan<int>(1)
+  match (wake) {
+    Some(c) => { w = c }
+    None => {}
+  }
+  return h2connAbort{ cmdCh = cmdCh, wake = w, idCh = chan<int>(1) }
+}
+
+// Tells the loop to abort the stream this request opened. Returns at once; the
+// loop does the reset.
+fn h2connSendAbort(ab: h2connAbort) {
+  ab.cmdCh <- h2connCmd{
+    kind = h2cmdAbort,
+    readCh = h2connDummyRead(),
+    request = h2connZeroRequest(),
+    response = h2connZeroResponse(),
+    streamId = 0,
+    errorCode = errorCancel,
+    replyCh = h2connDummyReply(),
+    idCh = Option.Some(ab.idCh),
+  }
+}
+
+// Whether `ab` has been woken, taking the value if so.
+fn h2connAborted(ab: h2connAbort): bool {
+  select {
+    case _ = <- ab.wake:
+      return true
+    default:
+      return false
+  }
+}
+
+// Block until `replyCh` delivers a stream's outcome, or `deadlineNs` elapses
+// first (0 = no bound), or `ab` is woken, in which case the stream is aborted
+// and this fails with `Aborted`. The deadline is the same race `h2connAwaitReady`
+// runs for the SETTINGS wait, and needed for the identical reason: a channel
+// receive has no timer of its own, and no deadline on the transport's own reads
+// can reach it.
+//
+// This closes a real gap, not a hypothetical one: `h2connLoop`'s
+// `while (st.running)` (loop.bit) stops as soon as `h2connTerminate`
+// (events.bit) flips `st.running` — on an inbound `eof` or on a connection
+// error this side raised (#4606) — WITHOUT draining anything still queued in
+// `cmdCh`, so a `h2cmdOpen` that reaches `cmdCh` around the same moment that
+// termination runs can lose the race and sit there forever: the loop thread
+// has already returned, nothing will ever read it, and nothing will ever
+// send on the `replyCh` `roundTrip` is waiting on (#3036). Draining `cmdCh`
+// in the `eof` branch would not fully close this — a command sent AFTER the
+// loop has already left its `select` cannot be drained by a handler that
+// thread will never run again — so `roundTrip` bounds its own wait instead,
+// exactly as `h2connAwaitReady` already does for the symmetric case one step
+// earlier in the connection's lifecycle.
+fn h2connAwaitReply(replyCh: chan<h2connMsg>, deadlineNs: int, ab: h2connAbort): h2connMsg! {
+  let timeoutCh = chan<int>(1)
+  if (deadlineNs != 0) {
+    spawn h2connArmDeadline(deadlineNs, timeoutCh)
+  }
+  select {
+    case msg = <- replyCh:
+      return msg
+    case _ = <- timeoutCh:
+      fail newError("http2: timed out waiting for response")
+    case _ = <- ab.wake:
+      h2connSendAbort(ab)
+      fail Aborted{}
+  }
+}
+
+// `h2connDrainBody` for a client stream `id` whose request may be aborted: the
+// same chunk-by-chunk read, but a read parked on the loop is raced against `ab`,
+// so an abort does not wait for the next DATA frame. The wake is looked at before
+// every read too, so a body arriving as fast as it is read cannot outrun it.
+fn h2connDrainAbortable(cmdCh: chan<h2connCmd>, id: int, ab: h2connAbort): []byte! {
+  let body = []byte(0)
+  while (true) {
+    if (h2connAborted(ab)) {
+      h2connSendAbort(ab)
+      fail Aborted{}
+    }
+    select {
+      case r = <- h2connSendRead(cmdCh, id):
+        if (r.errMsg != "") {
+          fail newError(r.errMsg)
+        }
+        body = h2connAppendBytes(body, r.data)
+        if (r.eof) {
+          return body
+        }
+      case _ = <- ab.wake:
+        h2connSendAbort(ab)
+        fail Aborted{}
+    }
+  }
+}
+
+// The loop's side of `h2connCmd.idCh`: puts `id` in the mailbox of an open that
+// carries one. The box has room for it (capacity 1, one open per box).
+fn h2connNoteOpened(cmd: h2connCmd, id: int) {
+  match (cmd.idCh) {
+    Some(ch) => { ch <- id }
+    None => {}
+  }
+}
+
+// The id `h2connNoteOpened` left in `cmd.idCh`, or 0 when the command carries no
+// box or the open never made a stream. Takes it out, so a second abort of the
+// same request finds nothing.
+fn h2connOpenedId(cmd: h2connCmd): int {
+  match (cmd.idCh) {
+    Some(ch) => {
+      select {
+        case id = <- ch:
+          return id
+        default:
+          return 0
+      }
+    }
+    None => { return 0 }
+  }
+}
+
+// Remembers that this side reset `id`, for `h2connDataStreamOk` (events.bit).
+fn h2connNoteAborted(st: h2connState, id: int) {
+  if (len(st.aborted) >= h2connAbortedMax) {
+    st.aborted = map<int, bool>()
+  }
+  st.aborted[id] = true
+}
+
+// The loop's half of an abort: reset the stream the request opened with
+// RST_STREAM (CANCEL) and give back everything it held, so the connection and
+// the streams beside it run on as if it had never been opened.
+//
+// What a stream holds that the reset does not already free is the receive credit
+// of the body bytes the application had not taken (`h2connCreditData`,
+// events.bit: held until `h2connSendBody`). Nobody will take them now, so the
+// connection window gets them back here, or a few aborted downloads would walk
+// it to zero and stall every other stream. The stream's own window dies with the
+// stream. `h2connFinishReader` then drops the table entry the close kept for a
+// reader that is gone.
+//
+// A stream that already ended is not reset: RST_STREAM on a closed stream says
+// nothing the peer needs (§5.1) — only its buffered body is released. A stream
+// that is not in the table is finished and has nothing left to release.
+fn h2connCmdAbort(st: h2connState, cmd: h2connCmd) {
+  let id = h2connOpenedId(cmd)
+  let (s, ok) = st.streams[id]
+  if (!ok) {
+    return
+  }
+  if (s.bodyOpen) {
+    h2connRenewConnWindow(st, len(s.recvBody))
+  }
+  s.recvBody = []byte(0)
+  if (s.state != h2stClosed) {
+    h2connNoteAborted(st, id)
+    h2connStreamErrorMsg(st, id, cmd.errorCode, "http2: request aborted")
+  }
+  h2connFinishReader(st, s)
+}
