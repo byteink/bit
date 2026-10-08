@@ -13,7 +13,11 @@ fn sEntry(id: string, kv: []string): Reply {
 }
 
 fn capping(t: Trim, approx: bool, limit: int): Capping {
-  return Capping{ trim = t, approx = approx, limit = limit }
+  return Capping{ trim = t, approx = approx, limit = limit, refs = RefMode.Keep }
+}
+
+fn cappingRefs(t: Trim, refs: RefMode): Capping {
+  return Capping{ trim = t, approx = true, limit = 0, refs = refs }
 }
 
 fn ref(consumer: string): groupRef {
@@ -373,4 +377,187 @@ test "BUSYGROUP is the one error ensure swallows" {
   assert(isBusyGroup(RedisError.Server("BUSYGROUP", "Consumer Group name already exists")), "busy")
   assert(!isBusyGroup(RedisError.Server("ERR", "x")), "other server error")
   assert(!isBusyGroup(RedisError.Timeout), "timeout")
+}
+
+test "XADD puts the reference mode before the trim, XTRIM puts it after LIMIT" {
+  assertArgs(
+    xaddCmd("s", [field("a", "1")], StreamId.Auto, cappingRefs(Trim.MaxLen(5), RefMode.Drop)).args,
+    ["XADD", "s", "DELREF", "MAXLEN", "~", "5", "*", "a", "1"],
+  )
+  assertArgs(
+    xaddOptCmd(
+      "s",
+      [field("a", "1")],
+      StreamId.Auto,
+      cappingRefs(Trim.MinId("1-0"), RefMode.AckedOnly),
+    ).args,
+    ["XADD", "s", "NOMKSTREAM", "ACKED", "MINID", "~", "1-0", "*", "a", "1"],
+  )
+  assertArgs(
+    xtrimCmd(
+      "s",
+      Capping{ trim = Trim.MaxLen(5), approx = true, limit = 10, refs = RefMode.AckedOnly },
+    ).args,
+    ["XTRIM", "s", "MAXLEN", "~", "5", "LIMIT", "10", "ACKED"],
+  )
+  assertArgs(
+    xtrimCmd("s", cappingRefs(Trim.MinId("2-0"), RefMode.Drop)).args,
+    ["XTRIM", "s", "MINID", "~", "2-0", "DELREF"],
+  )
+  // Keep is the server's default: nothing is sent, so pre-8.2 servers still work.
+  assertArgs(
+    xtrimCmd("s", cappingRefs(Trim.MaxLen(5), RefMode.Keep)).args,
+    ["XTRIM", "s", "MAXLEN", "~", "5"],
+  )
+  let o = TrimOpts{}
+  assert(o.approx && o.limit == 0 && o.refs == RefMode.Keep, "TrimOpts defaults")
+  let c = cappingOf(Trim.MaxLen(1), TrimOpts{ approx = false, limit = 0, refs = RefMode.Drop })
+  assert(!c.approx && c.refs == RefMode.Drop, "cappingOf copies the options")
+}
+
+test "XREADGROUP over several streams lists every key, then every id" {
+  let a = Cursor{ key = "a", from = StreamId.Undelivered }
+  let b = Cursor{ key = "b", from = StreamId.Zero }
+  assertArgs(
+    xreadGroupAnyCmd(ref("c"), [a, b], 5, 2 * Second, true).args,
+    [
+      "XREADGROUP",
+      "GROUP",
+      "g",
+      "c",
+      "COUNT",
+      "5",
+      "BLOCK",
+      "2000",
+      "NOACK",
+      "STREAMS",
+      "a",
+      "b",
+      ">",
+      "0",
+    ],
+  )
+  assert(!xreadGroupAnyCmd(ref("c"), [a], 0, -1, false).readOnly, "XREADGROUP writes")
+  let r = sArr([sArr([sBulk("a"), sArr([sEntry("1-0", ["k", "v"])])]), sArr([sBulk("b"), sArr([])])])
+  let got = asReads(r, "XREADGROUP") catch e {
+    panic("asReads: ${e.message()}")
+  }
+  assert(
+    len(got) == 2 && got[0].key == "a" && len(got[0].entries) == 1 && len(got[1].entries) == 0,
+    "per stream",
+  )
+}
+
+test "XINFO STREAM FULL sends COUNT and decodes groups, pending lists and consumers" {
+  assertArgs(
+    xinfoStreamFullCmd("s", 10).args,
+    ["XINFO", "STREAM", "s", "FULL", "COUNT", "10"],
+  )
+  assertArgs(xinfoStreamFullCmd("s", 0).args, ["XINFO", "STREAM", "s", "FULL", "COUNT", "0"])
+  let consumer = sArr(
+    [
+      sBulk("name"), sBulk("w1"),
+      sBulk("seen-time"), Reply.Int(1700),
+      sBulk("active-time"), Reply.Int(-1),
+      sBulk("pel-count"), Reply.Int(1),
+      sBulk("pending"), sArr([sArr([sBulk("1-1"), Reply.Int(1600), Reply.Int(2)])]),
+    ],
+  )
+  let group = sArr(
+    [
+      sBulk("name"), sBulk("g"),
+      sBulk("last-delivered-id"), sBulk("1-1"),
+      sBulk("entries-read"), Reply.Int(1),
+      sBulk("lag"), Reply.Int(0),
+      sBulk("pel-count"), Reply.Int(1),
+      sBulk("pending"), sArr([sArr([sBulk("1-1"), sBulk("w1"), Reply.Int(1600), Reply.Int(2)])]),
+      sBulk("consumers"), sArr([consumer]),
+    ],
+  )
+  let r = sArr(
+    [
+      sBulk("length"), Reply.Int(1),
+      sBulk("last-generated-id"), sBulk("1-1"),
+      sBulk("entries-added"), Reply.Int(1),
+      sBulk("entries"), sArr([sEntry("1-1", ["a", "1"])]),
+      sBulk("groups"), sArr([group]),
+    ],
+  )
+  let got = asStreamInfoFull(r) catch e {
+    panic("decode: ${e.message()}")
+  }
+  assert(got.length == 1 && got.lastGeneratedId == "1-1" && got.entriesAdded == 1, "counters")
+  assert(len(got.entries) == 1 && unwrap(got.entries[0].get("a")) == "1", "entries")
+  let g = got.groups[0]
+  assert(g.name == "g" && g.lastDeliveredId == "1-1" && g.pelCount == 1, "group")
+  assert(unwrap(g.entriesRead) == 1 && unwrap(g.lag) == 0, "entriesRead and lag")
+  assert(
+    g.pending[0].id == "1-1" && g.pending[0].consumer == "w1",
+    "group pending names its holder",
+  )
+  assert(g.pending[0].deliveredAt == 1600 && g.pending[0].deliveries == 2, "group pending numbers")
+  let c = g.consumers[0]
+  assert(c.name == "w1" && c.seenAt == 1700 && c.pelCount == 1, "consumer")
+  assert(isNone(c.activeAt), "active-time -1 is None")
+  assert(
+    c.pending[0].consumer == "w1" && c.pending[0].deliveries == 2,
+    "consumer pending takes its name",
+  )
+  let none = asStreamInfoFull(sArr([sBulk("length"), Reply.Int(0)])) catch e {
+    panic("empty: ${e.message()}")
+  }
+  assert(len(none.entries) == 0 && len(none.groups) == 0, "missing lists are empty")
+}
+
+test "a pinned runner refuses a blocking read before any I/O" {
+  let pinned = Runner{ client = Option.None, conn = Option.None, timeoutNs = 0 }
+  let refused = false
+  let _ = streamRun<[]Entry>(
+    pinned,
+    xreadCmd([Cursor{ key = "s", from = StreamId.Latest }], 0, 1),
+    1,
+  ) catch e {
+    refused = isInvalid(e)
+    []Entry(0)
+  }
+  assert(refused, "a block on a pinned runner is Invalid")
+}
+
+test "StreamBatch queues the group commands, with the same argv as Group" {
+  let batch = Batch()
+  let g = StreamBatch{ batch = batch, key = "s" }.group("g")
+  let _ = g.create(StreamId.Zero, false)
+  let _ = g.destroy()
+  let _ = g.setId(StreamId.Latest)
+  let _ = g.createConsumer("c")
+  let _ = g.delConsumer("c")
+  let _ = g.ack("1-0", "2-0")
+  let _ = g.ackDelete(["1-0"], RefMode.Drop)
+  let _ = g.pending()
+  let _ = g.pendingList(10, StreamId.First, StreamId.Last, "c", 2 * Second)
+  let _ = g.claim("c", 3 * Second, ["1-0"], true)
+  let _ = g.claimIds("c", 3 * Second, ["1-0"])
+  let _ = g.autoClaim("c", 4 * Second, StreamId.Zero, 7)
+  let _ = g.consumers()
+  let want = [
+    ["XGROUP", "CREATE", "s", "g", "0"],
+    ["XGROUP", "DESTROY", "s", "g"],
+    ["XGROUP", "SETID", "s", "g", "$"],
+    ["XGROUP", "CREATECONSUMER", "s", "g", "c"],
+    ["XGROUP", "DELCONSUMER", "s", "g", "c"],
+    ["XACK", "s", "g", "1-0", "2-0"],
+    ["XACKDEL", "s", "g", "DELREF", "IDS", "1", "1-0"],
+    ["XPENDING", "s", "g"],
+    ["XPENDING", "s", "g", "IDLE", "2000", "-", "+", "10", "c"],
+    ["XCLAIM", "s", "g", "c", "3000", "1-0", "FORCE"],
+    ["XCLAIM", "s", "g", "c", "3000", "1-0", "JUSTID"],
+    ["XAUTOCLAIM", "s", "g", "c", "4000", "0", "COUNT", "7"],
+    ["XINFO", "CONSUMERS", "s", "g"],
+  ]
+  assert(len(batch.queued) == len(want), "queued ${len(batch.queued)} commands")
+  let i = 0
+  while (i < len(want)) {
+    assertArgs(batch.queued[i], want[i])
+    i = i + 1
+  }
 }
