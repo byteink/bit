@@ -389,6 +389,7 @@ irTrial() {
 # with the packing is #7637 (a file that needs both is named for the rune call, the one rewrite
 # that is not a width).
 explainIrLag() {
+  [ "$(canon_ir_ids "$1")" = "$(canon_ir_ids "$2")" ] && return 1
   irWalkAwk
   irTrial "$1" "$2" 1 0 0 half && return 0
   irTrial "$1" "$2" 1 1 0 narrow 0 && return 0

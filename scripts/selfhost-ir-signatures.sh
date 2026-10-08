@@ -251,8 +251,8 @@
 #
 # --- Declared signatures (against the 0.40.0 oracle) ---
 #
-# Both retire at the next stage0 repin, which is the first oracle cut from a tree that carries
-# #7558 and #7562. The walks live in scripts/ir-signatures-walk.sh, sourced below.
+# These retire at the next stage0 repin, which is the first oracle cut from a tree that carries
+# #7558, #7562, #7574 and #7637. The walks live in scripts/ir-signatures-walk.sh, sourced below.
 #
 # 7558-synth-json-alias-column-shift (`types`). #7558 (54c0b8420) binds std/json's `Json` and
 # `JsonEntry` under the reserved aliases `__Json`/`__JsonEntry` in the code a `@json` class
@@ -277,6 +277,24 @@
 # 3 corpus files, on both arms: convert_widen_alias.bit, run_narrow_slice_store_widen.bit and
 # run_packed_i16_slice.bit.
 #
+# 7574-packed-narrow-slices (`ir`, `iropt`). #7574 (8eb73dbbf) extends #7562's packing to every
+# narrow prim: []i8/[]bool at 1 byte, []i32/[]u32/[]f32 at 4. The same shapes as 7562 (elem_size
+# constant, `index_get` reads, narrow stores without the word-widening `convert`, ptrOf scaling,
+# the append fast path) plus the f32 element store, which was `bitcast u32` into `rt_call
+# slice_set` and is now an inline `index_set` from the float register: unchecked (a literal's
+# fill, one `field_get s[0]` per slice and block) or behind the slice_len guard and panic block.
+# The trial that names it enables the halfword and the narrow widths together; the f32 store has
+# a trial per form. A file with any other difference stays unexplained: the optimizer-driven
+# differences of the post-opt arm (a load the oracle CSE'd that the tree re-loads) are NOT in it.
+#
+# 7637-string-from-rune-range (`ir`, `iropt`). #7637 (c8381c0c2) makes `string(rs[lo:hi])` on a
+# `[]rune` one `rt_call string_from_rune_range(rs, lo, hi)`; the oracle emitted
+# `string_from_byte_range` with the same arguments. The rewrite fires only when the first operand
+# is a `[]i32` (or the untyped nil), so a `[]u8` receiver is never touched. A file that needs this
+# together with the packing is named 7637 (the one rewrite that is not a width).
+#
+# All three retire at the next stage0 repin (#6533).
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does.
@@ -299,7 +317,7 @@ explainMismatch() {
 # scripts/ir-signatures-walk.sh.
 declaredSignatureNames() {
   local types="7558-synth-json-alias-column-shift"
-  local ir="7562-packed-halfword-slices"
+  local ir="7562-packed-halfword-slices 7574-packed-narrow-slices 7637-string-from-rune-range"
   case "${1:-}" in
     types) printf '%s\n' $types ;;
     ir|iropt) printf '%s\n' $ir ;;
