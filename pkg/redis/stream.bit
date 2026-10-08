@@ -1,17 +1,657 @@
-// pkg/redis/stream.bit — `r.stream(key)`: the stream handle. Epic
-// #6013, #6028: SCAFFOLD ONLY, no commands wired yet (`XADD, XREAD, XRANGE, consumer groups`, a
-// follow-up ticket) — this file exists so later family tickets touch only
-// their own file, never `client.bit`. `cmd.bit`'s header is the template:
-// one `Cmd<T>` factory per command, called from a method here.
-export class Stream {
-  client: Client,
-  key: string,
+// pkg/redis/stream.bit - `r.stream(key)`: an append-only log of entries, the
+// commands that do not need a consumer group (`XADD` through `XREAD`).
+// Epic #6013, #6028, #6035. Follows `cmd.bit`'s HOW-TO header and
+// `list.bit`'s shape: one `Cmd<T>` factory per command, an immediate method
+// on `Stream`, a queued method on `StreamBatch`. Consumer groups are
+// `streamgroup.bit` (`Group`, `Consumer`), `XINFO` is `streaminfo.bit`.
+//
+// `Stream` HOLDS `client: Client`, NOT `runner: Runner`, for the reason
+// `list.bit`'s header gives: `client.bit`'s `stream` accessor builds
+// `Stream{ client = this, key = key }` and a family ticket may not edit that
+// shared file. `tx.read.stream(key)` does not exist yet.
+//
+// ENTRIES ARE ORDERED. A stream entry is an id plus field/value pairs, and
+// the server keeps the pairs in the order they were added, so `Entry.fields`
+// is a `[]Field`, not a map: order survives a round trip, and a field name
+// may repeat. `Entry.get(name)` is the lookup for the common case.
+//
+// POSITIONS ARE `StreamId`, NEVER A MAGIC STRING. `*`, `$`, `>`, `-`, `+`, `0`
+// and `(id` each mean something only to some commands; `StreamId` names them
+// and `StreamId.At(id)` is an explicit id. A position that a command does
+// not accept is refused by the server, not hidden by the client.
+//
+// TRIMMING IS ONE TYPE. `MAXLEN` and `MINID` are exclusive on the wire, so
+// they are the two payload variants of `Trim` and "both" cannot be written.
+// `approx` (default true) sends `~`, which lets the server trim whole
+// internal nodes: cheap, and the stream may keep a few entries more than
+// asked. `limit` (only with `approx`) caps the entries one trim removes.
+//
+// `add` RETURNS THE NEW ID, `addIfExists` AN `Option` (`NOMKSTREAM`): the
+// return type differs, so they are two methods, like `list.bit`'s `push` and
+// `pushIfExists`.
+//
+// BLOCKING READS (`read`, `readAny`, and `Consumer.read`). `block` is
+// nanoseconds, a negative value (the default) does not block, `0` waits
+// forever, and a timeout is an empty result, never an error. The server takes
+// whole milliseconds; a positive block under 1ms is sent as 1ms, because `0`
+// would mean forever. A blocking call dials its own connection (`runBlocking`
+// in `cmd.bit`, `list.bit`'s header says why) and its read deadline is
+// `block + commandTimeout`. `StreamBatch` has no blocking methods.
+
+// One field of an entry: a name and its value.
+export class Field { export name: string, export value: string }
+
+// `Field{ name = name, value = value }`, short enough to build a list inline:
+// `stream.add([field("kind", "publish"), field("article", "41")])`.
+export fn field(name: string, value: string): Field {
+  return Field{ name = name, value = value }
 }
 
-// The queued view `Pipeline.stream`/`Tx.stream` both return — `cmd.bit`'s
-// `Batch` is the ONE client-side queue the two executors share, so this
-// is the ONLY queued view Stream needs (`cmd.bit`'s header, point 2).
+// One stream entry: its id (`1700000000000-0`) and fields in server order.
+export class Entry {
+  export id: string
+  export fields: []Field
+
+  // The value of the first field called `name`, or `None`.
+  export get(name: string): Option<string> {
+    let i = 0
+    while (i < len(this.fields)) {
+      if (this.fields[i].name == name) {
+        return Option.Some(this.fields[i].value)
+      }
+      i = i + 1
+    }
+    return Option.None
+  }
+}
+
+// What one stream of a multi-stream read answered: its key and new entries.
+export class KeyedEntries { export key: string, export entries: []Entry }
+
+// Where `readAny` starts reading another stream.
+export class Cursor { export key: string, export from: StreamId }
+
+// A position in a stream. Each variant is the word the server expects in
+// that place, `text()` is that word.
+export enum StreamId {
+  Auto
+  Latest
+  Undelivered
+  First
+  Last
+  Zero
+  At(string)
+  After(string)
+
+  export text(): string {
+    match (this) {
+      Auto => return "*"
+      Latest => return "$"
+      Undelivered => return ">"
+      First => return "-"
+      Last => return "+"
+      Zero => return "0"
+      At(id) => return id
+      After(id) => return "(${id}"
+    }
+  }
+}
+
+// How `add` and `trim` cap a stream. `Off` leaves it alone, `MaxLen(n)`
+// keeps about the newest `n` entries, `MinId(id)` drops entries older than
+// `id`.
+export enum Trim {
+  Off,
+  MaxLen(int),
+  MinId(string),
+}
+
+// `add`/`trim`'s three trimming knobs as one value, so the command builders
+// stay under the lint parameter limit.
+class Capping {
+  trim: Trim,
+  approx: bool,
+  limit: int,
+}
+
+// What `delete` and `Group.ackDelete` do with the entry's references in
+// consumer groups (Redis 8.2+): `Keep` leaves them in each group's pending
+// list, `Drop` removes them everywhere, `AckedOnly` deletes the entry only
+// once every group has acknowledged it.
+export enum RefMode {
+  Keep,
+  Drop,
+  AckedOnly,
+}
+
+// The per-id answer of `delete` and `Group.ackDelete`.
+export enum DelStatus {
+  NotFound,
+  Deleted,
+  Retained,
+}
+
+export class Stream {
+  client: Client
+  key: string
+
+  // `XADD`: appends one entry and returns its id. `id` is `StreamId.Auto`
+  // (the server picks) or `StreamId.At("1700000000000-5")`. Creates the
+  // stream if it is missing.
+  export add(
+    fields: []Field,
+    id: StreamId = StreamId.Auto,
+    trim: Trim = Trim.Off,
+    approx: bool = true,
+    limit: int = 0,
+  ): string!RedisError {
+    checkTrim(Capping{ trim = trim, approx = approx, limit = limit })?
+    return this.client.runCmd(
+      xaddCmd(this.key, fields, id, Capping{ trim = trim, approx = approx, limit = limit }),
+    )?
+  }
+  // `XADD .. NOMKSTREAM`: appends only when the stream already exists;
+  // `None` when it does not, and nothing is created.
+  export addIfExists(
+    fields: []Field,
+    id: StreamId = StreamId.Auto,
+    trim: Trim = Trim.Off,
+    approx: bool = true,
+    limit: int = 0,
+  ): Option<string>!RedisError {
+    checkTrim(Capping{ trim = trim, approx = approx, limit = limit })?
+    return this.client.runCmd(
+      xaddOptCmd(this.key, fields, id, Capping{ trim = trim, approx = approx, limit = limit }),
+    )?
+  }
+  export len(): i64!RedisError { return this.client.runCmd(xlenCmd(this.key))? }
+  // `XRANGE`: entries from `start` to `end`, both inclusive (`StreamId.After(id)`
+  // makes one exclusive). `count` 0 means all.
+  export range(
+    start: StreamId = StreamId.First,
+    end: StreamId = StreamId.Last,
+    count: int = 0,
+  ): []Entry!RedisError {
+    return this.client.runCmd(xrangeCmd("XRANGE", this.key, start, end, count))?
+  }
+  // `XREVRANGE`: the same range newest first. The order of arguments is the
+  // server's: the high end comes first.
+  export revRange(
+    end: StreamId = StreamId.Last,
+    start: StreamId = StreamId.First,
+    count: int = 0,
+  ): []Entry!RedisError {
+    return this.client.runCmd(xrangeCmd("XREVRANGE", this.key, end, start, count))?
+  }
+  // `XDEL`: the number of entries removed. Ids that are not there count 0.
+  export del(...ids: string): i64!RedisError { return this.client.runCmd(xdelCmd(this.key, ids))? }
+  // `XDELEX` (Redis 8.2+): `del` with a say in what happens to group references.
+  export delete(ids: []string, refs: RefMode = RefMode.Keep): []DelStatus!RedisError {
+    return this.client.runCmd(xdelexCmd(this.key, ids, refs))?
+  }
+  // `XTRIM`: the number of entries removed. `Trim.Off` is refused.
+  export trim(by: Trim, approx: bool = true, limit: int = 0): i64!RedisError {
+    checkTrimming(Capping{ trim = by, approx = approx, limit = limit })?
+    return this.client.runCmd(
+      xtrimCmd(this.key, Capping{ trim = by, approx = approx, limit = limit }),
+    )?
+  }
+  // `XREAD` on this stream: entries after `from` (`StreamId.Latest` for only
+  // what arrives from now on, which needs a `block`). See the header for `block`.
+  export read(from: StreamId = StreamId.Zero, count: int = 0, block: int = -1): []Entry!RedisError {
+    return streamRun(
+      this.client,
+      xreadCmd([Cursor{ key = this.key, from = from }], count, block),
+      block,
+    )?
+  }
+  // `XREAD` over this stream and `others`: one `KeyedEntries` per stream that had entries.
+  export readAny(
+    from: StreamId,
+    others: []Cursor,
+    count: int = 0,
+    block: int = -1,
+  ): []KeyedEntries!RedisError {
+    let all = append([Cursor{ key = this.key, from = from }], ...others)
+    return streamRun(this.client, xreadAnyCmd(all, count, block), block)?
+  }
+  export group(name: string): Group {
+    return Group{ client = this.client, key = this.key, name = name }
+  }
+  // `XINFO STREAM`.
+  export info(): StreamInfo!RedisError { return this.client.runCmd(xinfoStreamCmd(this.key))? }
+  // `XINFO GROUPS`.
+  export groups(): []GroupInfo!RedisError { return this.client.runCmd(xinfoGroupsCmd(this.key))? }
+}
+
+// The queued view `Pipeline.stream`/`Tx.stream` both return - `cmd.bit`'s
+// `Batch` is the ONE client-side queue the two executors share. No blocking
+// reads and no consumer groups: this file's header says why for the first,
+// `streamgroup.bit` is immediate-only.
 export class StreamBatch {
-  batch: Batch,
+  batch: Batch
+  key: string
+
+  export add(
+    fields: []Field,
+    id: StreamId = StreamId.Auto,
+    trim: Trim = Trim.Off,
+    approx: bool = true,
+    limit: int = 0,
+  ): Future<string> {
+    checkTrim(Capping{ trim = trim, approx = approx, limit = limit }) catch e {
+      return failedFuture<string>(e)
+    }
+    return this.batch.queue(
+      xaddCmd(this.key, fields, id, Capping{ trim = trim, approx = approx, limit = limit }),
+    )
+  }
+  export len(): Future<i64> { return this.batch.queue(xlenCmd(this.key)) }
+  export range(
+    start: StreamId = StreamId.First,
+    end: StreamId = StreamId.Last,
+    count: int = 0,
+  ): Future<[]Entry> {
+    return this.batch.queue(xrangeCmd("XRANGE", this.key, start, end, count))
+  }
+  export revRange(
+    end: StreamId = StreamId.Last,
+    start: StreamId = StreamId.First,
+    count: int = 0,
+  ): Future<[]Entry> {
+    return this.batch.queue(xrangeCmd("XREVRANGE", this.key, end, start, count))
+  }
+  export del(...ids: string): Future<i64> { return this.batch.queue(xdelCmd(this.key, ids)) }
+  export trim(by: Trim, approx: bool = true, limit: int = 0): Future<i64> {
+    checkTrimming(Capping{ trim = by, approx = approx, limit = limit }) catch e {
+      return failedFuture<i64>(e)
+    }
+    return this.batch.queue(xtrimCmd(this.key, Capping{ trim = by, approx = approx, limit = limit }))
+  }
+  // `XACK` for `group`; the group handle itself is immediate-only.
+  export ack(group: string, ...ids: string): Future<i64> {
+    return this.batch.queue(xackCmd(this.key, group, ids))
+  }
+}
+
+// `XADD`/`XTRIM` refuse a bad trim before anything is sent: `LIMIT` needs `~`
+// (the server's rule), and a negative threshold is meaningless.
+fn checkTrim(capping: Capping): ()!RedisError {
+  if (capping.limit < 0) {
+    fail RedisError.Invalid("limit must be >= 0, got ${capping.limit}")
+  }
+  if (capping.limit > 0 && !capping.approx) {
+    fail RedisError.Invalid("limit needs approx = true")
+  }
+  match (capping.trim) {
+    MaxLen(n) => {
+      if (n < 0) {
+        fail RedisError.Invalid("maxLen must be >= 0, got ${n}")
+      }
+    }
+    _ => return
+  }
+}
+
+fn checkTrimming(capping: Capping): ()!RedisError {
+  match (capping.trim) {
+    Off => fail RedisError.Invalid("trim needs Trim.MaxLen or Trim.MinId")
+    _ => return checkTrim(capping)?
+  }
+}
+
+// `MAXLEN|MINID [~] threshold [LIMIT n]`, or nothing for `Trim.Off`.
+fn trimArgs(capping: Capping): []string {
+  let out = []string(0)
+  match (capping.trim) {
+    Off => return out
+    MaxLen(_) => out = ["MAXLEN"]
+    MinId(_) => out = ["MINID"]
+  }
+  if (capping.approx) {
+    out = append(out, "~")
+  }
+  out = append(out, trimThreshold(capping.trim))
+  if (capping.limit > 0) {
+    out = append(out, "LIMIT", "${capping.limit}")
+  }
+  return out
+}
+
+fn trimThreshold(trim: Trim): string {
+  match (trim) {
+    MaxLen(n) => return "${n}"
+    MinId(id) => return id
+    Off => return ""
+  }
+}
+
+fn xaddArgs(
   key: string,
+  fields: []Field,
+  id: StreamId,
+  capping: Capping,
+  noMkStream: bool,
+): []string {
+  let out = ["XADD", key]
+  if (noMkStream) {
+    out = append(out, "NOMKSTREAM")
+  }
+  out = append(out, ...trimArgs(capping))
+  out = append(out, id.text())
+  let i = 0
+  while (i < len(fields)) {
+    out = append(out, fields[i].name, fields[i].value)
+    i = i + 1
+  }
+  return out
+}
+
+fn xaddCmd(key: string, fields: []Field, id: StreamId, capping: Capping): Cmd<string> {
+  return Cmd<string>{
+    args = xaddArgs(key, fields, id, capping, false),
+    decode = (r) => asXaddId(r),
+    readOnly = false,
+  }
+}
+
+fn xaddOptCmd(key: string, fields: []Field, id: StreamId, capping: Capping): Cmd<Option<string>> {
+  return Cmd<Option<string>>{
+    args = xaddArgs(key, fields, id, capping, true),
+    decode = (r) => asOptString(r, "XADD"),
+    readOnly = false,
+  }
+}
+
+// `XADD` without `NOMKSTREAM` always answers an id.
+fn asXaddId(r: Reply): string!RedisError {
+  let id = asOptString(r, "XADD")?
+  match (id) {
+    Some(s) => return s
+    None => fail RedisError.Unexpected("XADD", "Null")
+  }
+}
+
+fn xlenCmd(key: string): Cmd<i64> {
+  return Cmd<i64>{ args = ["XLEN", key], decode = (r) => asInt(r, "XLEN"), readOnly = true }
+}
+
+fn xrangeCmd(
+  cmd: string,
+  key: string,
+  first: StreamId,
+  second: StreamId,
+  count: int,
+): Cmd<[]Entry> {
+  let args = [cmd, key, first.text(), second.text()]
+  if (count > 0) {
+    args = append(args, "COUNT", "${count}")
+  }
+  return Cmd<[]Entry>{ args = args, decode = (r) => asStreamEntries(r, cmd), readOnly = true }
+}
+
+fn xdelCmd(key: string, ids: []string): Cmd<i64> {
+  return Cmd<i64>{
+    args = append(["XDEL", key], ...ids),
+    decode = (r) => asInt(r, "XDEL"),
+    readOnly = false,
+  }
+}
+
+fn refWord(refs: RefMode): string {
+  match (refs) {
+    Keep => return "KEEPREF"
+    Drop => return "DELREF"
+    AckedOnly => return "ACKED"
+  }
+}
+
+// `<head> [KEEPREF|DELREF|ACKED] IDS n id...`, the tail `XDELEX` and
+// `XACKDEL` share.
+fn idsArgs(head: []string, refs: RefMode, ids: []string): []string {
+  let out = []string(0)
+  out = append(out, ...head)
+  out = append(out, refWord(refs), "IDS", "${len(ids)}")
+  return append(out, ...ids)
+}
+
+fn xdelexCmd(key: string, ids: []string, refs: RefMode): Cmd<[]DelStatus> {
+  return Cmd<[]DelStatus>{
+    args = idsArgs(["XDELEX", key], refs, ids),
+    decode = (r) => asDelStatuses(r, "XDELEX"),
+    readOnly = false,
+  }
+}
+
+fn asDelStatuses(r: Reply, cmd: string): []DelStatus!RedisError {
+  match (r) {
+    Array(items) => return delStatusesFromList(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn delStatusesFromList(list: []Reply, cmd: string): []DelStatus!RedisError {
+  let out = []DelStatus(0)
+  let i = 0
+  while (i < len(list)) {
+    let n = asInt(list[i], cmd)?
+    out = append(out, delStatusOf(n))
+    i = i + 1
+  }
+  return out
+}
+
+fn delStatusOf(n: i64): DelStatus {
+  if (n == 1) {
+    return DelStatus.Deleted
+  }
+  if (n == 2) {
+    return DelStatus.Retained
+  }
+  return DelStatus.NotFound
+}
+
+fn xtrimCmd(key: string, capping: Capping): Cmd<i64> {
+  return Cmd<i64>{
+    args = append(["XTRIM", key], ...trimArgs(capping)),
+    decode = (r) => asInt(r, "XTRIM"),
+    readOnly = false,
+  }
+}
+
+// `BLOCK ms` as the server wants it: whole milliseconds, `0` forever, and a
+// positive sub-millisecond block rounded up to 1 so it never becomes forever.
+fn blockMillis(ns: int): string {
+  if (ns <= 0) {
+    return "0"
+  }
+  let ms = ns / Millisecond
+  if (ms == 0) {
+    ms = 1
+  }
+  return "${ms}"
+}
+
+// `[COUNT n] [BLOCK ms]` shared by `XREAD` and `XREADGROUP`.
+fn readOptions(count: int, block: int): []string {
+  let out = []string(0)
+  if (count > 0) {
+    out = append(out, "COUNT", "${count}")
+  }
+  if (block >= 0) {
+    out = append(out, "BLOCK", blockMillis(block))
+  }
+  return out
+}
+
+// `STREAMS key... id...`.
+fn streamsArgs(cursors: []Cursor): []string {
+  let out = ["STREAMS"]
+  let i = 0
+  while (i < len(cursors)) {
+    out = append(out, cursors[i].key)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(cursors)) {
+    out = append(out, cursors[i].from.text())
+    i = i + 1
+  }
+  return out
+}
+
+fn xreadArgs(cursors: []Cursor, count: int, block: int): []string {
+  return append(append(["XREAD"], ...readOptions(count, block)), ...streamsArgs(cursors))
+}
+
+fn xreadCmd(cursors: []Cursor, count: int, block: int): Cmd<[]Entry> {
+  return Cmd<[]Entry>{
+    args = xreadArgs(cursors, count, block),
+    decode = (r) => asFirstRead(r, "XREAD"),
+    readOnly = true,
+  }
+}
+
+fn xreadAnyCmd(cursors: []Cursor, count: int, block: int): Cmd<[]KeyedEntries> {
+  return Cmd<[]KeyedEntries>{
+    args = xreadArgs(cursors, count, block),
+    decode = (r) => asReads(r, "XREAD"),
+    readOnly = true,
+  }
+}
+
+fn xackCmd(key: string, group: string, ids: []string): Cmd<i64> {
+  return Cmd<i64>{
+    args = append(["XACK", key, group], ...ids),
+    decode = (r) => asInt(r, "XACK"),
+    readOnly = false,
+  }
+}
+
+// A blocking read runs on its own connection (`runBlocking`); a plain one
+// goes through the pool like any command.
+fn streamRun<T>(client: Client, cmd: Cmd<T>, block: int): T!RedisError {
+  if (block < 0) {
+    return client.runCmd(cmd)?
+  }
+  return runBlocking(client, cmd, block)?
+}
+
+// ---- reply decoders ----
+
+fn asStreamEntries(r: Reply, cmd: string): []Entry!RedisError {
+  match (r) {
+    Null => return []Entry(0)
+    Array(items) => return entriesFromList(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn entriesFromList(list: []Reply, cmd: string): []Entry!RedisError {
+  let out = []Entry(len(list))
+  let i = 0
+  while (i < len(list)) {
+    out[i] = asEntry(list[i], cmd)?
+    i = i + 1
+  }
+  return out
+}
+
+// `[id, [field, value, ...]]`. A pending entry whose data was deleted is
+// `[id, nil]` (`XREADGROUP` with a history id, `XCLAIM`): no fields.
+fn asEntry(r: Reply, cmd: string): Entry!RedisError {
+  match (r) {
+    Array(items) => return entryFromPair(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn entryFromPair(list: []Reply, cmd: string): Entry!RedisError {
+  if (len(list) != 2) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let id = replyToString(list[0], cmd)?
+  let fields = asFields(list[1], cmd)?
+  return Entry{ id = id, fields = fields }
+}
+
+fn asFields(r: Reply, cmd: string): []Field!RedisError {
+  match (r) {
+    Null => return []Field(0)
+    Array(items) => return fieldsFromFlat(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn fieldsFromFlat(list: []Reply, cmd: string): []Field!RedisError {
+  if (len(list) % 2 != 0) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let out = []Field(len(list) / 2)
+  let i = 0
+  while (i < len(list)) {
+    let name = replyToString(list[i], cmd)?
+    let value = replyToString(list[i + 1], cmd)?
+    out[i / 2] = Field{ name = name, value = value }
+    i = i + 2
+  }
+  return out
+}
+
+// `XREAD`/`XREADGROUP`: RESP3 answers a map of key to entries, RESP2 an array
+// of `[key, entries]`, and a block that timed out is a null in both.
+fn asReads(r: Reply, cmd: string): []KeyedEntries!RedisError {
+  match (r) {
+    Null => return []KeyedEntries(0)
+    Map(pairs) => return readsFromMap(pairs, cmd)?
+    Array(items) => return readsFromArray(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn readsFromMap(pairs: []MapEntry, cmd: string): []KeyedEntries!RedisError {
+  let out = []KeyedEntries(len(pairs))
+  let i = 0
+  while (i < len(pairs)) {
+    let key = replyToString(pairs[i].key, cmd)?
+    let entries = asStreamEntries(pairs[i].value, cmd)?
+    out[i] = KeyedEntries{ key = key, entries = entries }
+    i = i + 1
+  }
+  return out
+}
+
+fn readsFromArray(list: []Reply, cmd: string): []KeyedEntries!RedisError {
+  let out = []KeyedEntries(len(list))
+  let i = 0
+  while (i < len(list)) {
+    out[i] = keyedFromPair(list[i], cmd)?
+    i = i + 1
+  }
+  return out
+}
+
+fn keyedFromPair(r: Reply, cmd: string): KeyedEntries!RedisError {
+  match (r) {
+    Array(items) => return keyedFromList(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn keyedFromList(list: []Reply, cmd: string): KeyedEntries!RedisError {
+  if (len(list) != 2) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let key = replyToString(list[0], cmd)?
+  let entries = asStreamEntries(list[1], cmd)?
+  return KeyedEntries{ key = key, entries = entries }
+}
+
+// A single-stream read: the first (only) stream's entries, none on a timeout.
+fn asFirstRead(r: Reply, cmd: string): []Entry!RedisError {
+  let reads = asReads(r, cmd)?
+  if (len(reads) == 0) {
+    return []Entry(0)
+  }
+  return reads[0].entries
 }

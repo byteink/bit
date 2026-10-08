@@ -1,0 +1,376 @@
+// pkg/redis/stream.test.bit - `stream.bit`, `streamgroup.bit` and
+// `streaminfo.bit`'s wire arguments and reply decoders, tested without a
+// server: plain arguments and `Reply` values. `assertArgs` is
+// `list.test.bit`s and `sBulk`/`sArr` `script.test.bit`s (same module). `stream.live.test.bit` runs the same
+// commands against a real server.
+
+fn sEntry(id: string, kv: []string): Reply {
+  let flat = []Reply(0)
+  for s of kv {
+    flat = append(flat, sBulk(s))
+  }
+  return sArr([sBulk(id), sArr(flat)])
+}
+
+fn capping(t: Trim, approx: bool, limit: int): Capping {
+  return Capping{ trim = t, approx = approx, limit = limit }
+}
+
+fn ref(consumer: string): groupRef {
+  return groupRef{ key = "s", group = "g", consumer = consumer }
+}
+
+fn isInvalid(e: RedisError): bool {
+  match (e) {
+    Invalid(_) => return true
+    _ => return false
+  }
+}
+
+test "StreamId names every position the server understands" {
+  assert(StreamId.Auto.text() == "*", "Auto")
+  assert(StreamId.Latest.text() == "$", "Latest")
+  assert(StreamId.Undelivered.text() == ">", "Undelivered")
+  assert(StreamId.First.text() == "-", "First")
+  assert(StreamId.Last.text() == "+", "Last")
+  assert(StreamId.Zero.text() == "0", "Zero")
+  assert(StreamId.At("5-1").text() == "5-1", "At")
+  assert(StreamId.After("5-1").text() == "(5-1", "After")
+}
+
+test "XADD sends NOMKSTREAM, then the trim, then the id, then the fields in order" {
+  assertArgs(
+    xaddCmd("s", [field("a", "1"), field("b", "2")], StreamId.Auto, capping(Trim.Off, true, 0)).args,
+    ["XADD", "s", "*", "a", "1", "b", "2"],
+  )
+  assertArgs(
+    xaddOptCmd("s", [field("a", "1")], StreamId.At("7-0"), capping(Trim.Off, true, 0)).args,
+    ["XADD", "s", "NOMKSTREAM", "7-0", "a", "1"],
+  )
+  assertArgs(
+    xaddCmd("s", [field("a", "1")], StreamId.Auto, capping(Trim.MaxLen(100), true, 10)).args,
+    ["XADD", "s", "MAXLEN", "~", "100", "LIMIT", "10", "*", "a", "1"],
+  )
+  assertArgs(
+    xaddCmd("s", [field("a", "1")], StreamId.Auto, capping(Trim.MinId("5-0"), false, 0)).args,
+    ["XADD", "s", "MINID", "5-0", "*", "a", "1"],
+  )
+}
+
+test "XTRIM and the trim checks" {
+  assertArgs(xtrimCmd("s", capping(Trim.MaxLen(5), false, 0)).args, ["XTRIM", "s", "MAXLEN", "5"])
+  assertArgs(
+    xtrimCmd("s", capping(Trim.MinId("1-0"), true, 0)).args,
+    ["XTRIM", "s", "MINID", "~", "1-0"],
+  )
+  let off = false
+  checkTrimming(capping(Trim.Off, true, 0)) catch e {
+    off = isInvalid(e)
+  }
+  assert(off, "Trim.Off is refused by trim")
+  let limit = false
+  checkTrim(capping(Trim.MaxLen(5), false, 3)) catch e {
+    limit = isInvalid(e)
+  }
+  assert(limit, "LIMIT without approx is refused")
+  let neg = false
+  checkTrim(capping(Trim.MaxLen(-1), true, 0)) catch e {
+    neg = isInvalid(e)
+  }
+  assert(neg, "a negative maxLen is refused")
+  checkTrim(capping(Trim.Off, true, 0)) catch e {
+    panic("Trim.Off on add is fine: ${e.message()}")
+  }
+}
+
+test "range commands: XREVRANGE puts the high end first, COUNT only when positive" {
+  assertArgs(
+    xrangeCmd("XRANGE", "s", StreamId.First, StreamId.Last, 0).args,
+    ["XRANGE", "s", "-", "+"],
+  )
+  assertArgs(
+    xrangeCmd("XREVRANGE", "s", StreamId.After("9-0"), StreamId.At("1-0"), 3).args,
+    ["XREVRANGE", "s", "(9-0", "1-0", "COUNT", "3"],
+  )
+  assertArgs(xlenCmd("s").args, ["XLEN", "s"])
+  assertArgs(xdelCmd("s", ["1-0", "2-0"]).args, ["XDEL", "s", "1-0", "2-0"])
+}
+
+test "XREAD lays out COUNT, BLOCK, then every key and then every id" {
+  let a = Cursor{ key = "a", from = StreamId.Zero }
+  let b = Cursor{ key = "b", from = StreamId.Latest }
+  assertArgs(xreadCmd([a], 0, -1).args, ["XREAD", "STREAMS", "a", "0"])
+  assertArgs(
+    xreadAnyCmd([a, b], 5, 2 * Second).args,
+    ["XREAD", "COUNT", "5", "BLOCK", "2000", "STREAMS", "a", "b", "0", "$"],
+  )
+  assertArgs(xreadCmd([a], 0, 0).args, ["XREAD", "BLOCK", "0", "STREAMS", "a", "0"])
+}
+
+test "blockMillis never turns a wait into forever" {
+  assert(blockMillis(0) == "0", "0 is forever")
+  assert(blockMillis(1500 * Millisecond) == "1500", "1500ms")
+  assert(blockMillis(7) == "1", "7ns is 1ms, not 0")
+}
+
+test "XREADGROUP names the group and consumer, NOACK goes before STREAMS" {
+  assertArgs(
+    xreadGroupCmd(ref("c"), StreamId.Undelivered, 10, 500 * Millisecond, true).args,
+    ["XREADGROUP", "GROUP", "g", "c", "COUNT", "10", "BLOCK", "500", "NOACK", "STREAMS", "s", ">"],
+  )
+  assertArgs(
+    xreadGroupCmd(ref("c"), StreamId.Zero, 0, -1, false).args,
+    ["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", "0"],
+  )
+}
+
+test "XGROUP and XACK wire forms" {
+  assertArgs(
+    xgroupCreateCmd("s", "g", StreamId.Latest, true).args,
+    ["XGROUP", "CREATE", "s", "g", "$", "MKSTREAM"],
+  )
+  assertArgs(
+    xgroupCreateCmd("s", "g", StreamId.Zero, false).args,
+    ["XGROUP", "CREATE", "s", "g", "0"],
+  )
+  assertArgs(
+    xgroupSetIdCmd("s", "g", StreamId.At("3-0")).args,
+    ["XGROUP", "SETID", "s", "g", "3-0"],
+  )
+  assertArgs(xgroupBoolCmd("DESTROY", "s", "g", "").args, ["XGROUP", "DESTROY", "s", "g"])
+  assertArgs(
+    xgroupBoolCmd("CREATECONSUMER", "s", "g", "c").args,
+    ["XGROUP", "CREATECONSUMER", "s", "g", "c"],
+  )
+  assertArgs(xgroupDelConsumerCmd("s", "g", "c").args, ["XGROUP", "DELCONSUMER", "s", "g", "c"])
+  assertArgs(xackCmd("s", "g", ["1-0", "2-0"]).args, ["XACK", "s", "g", "1-0", "2-0"])
+}
+
+test "XPENDING, XCLAIM and XAUTOCLAIM convert nanoseconds to milliseconds" {
+  assertArgs(xpendingSummaryCmd("s", "g").args, ["XPENDING", "s", "g"])
+  assertArgs(
+    xpendingListCmd(ref("c"), 10, StreamId.First, StreamId.Last, 2 * Second).args,
+    ["XPENDING", "s", "g", "IDLE", "2000", "-", "+", "10", "c"],
+  )
+  assertArgs(
+    xpendingListCmd(ref(""), 10, StreamId.First, StreamId.Last, 0).args,
+    ["XPENDING", "s", "g", "-", "+", "10"],
+  )
+  assertArgs(
+    xclaimCmd(ref("c"), 3 * Second, ["1-0"], true).args,
+    ["XCLAIM", "s", "g", "c", "3000", "1-0", "FORCE"],
+  )
+  assertArgs(
+    xclaimIdsCmd(ref("c"), Second, ["1-0"], false).args,
+    ["XCLAIM", "s", "g", "c", "1000", "1-0", "JUSTID"],
+  )
+  assertArgs(
+    xautoClaimCmd(ref("c"), Second, StreamId.Zero, 50).args,
+    ["XAUTOCLAIM", "s", "g", "c", "1000", "0", "COUNT", "50"],
+  )
+}
+
+test "XDELEX and XACKDEL name the reference mode and count the ids" {
+  assertArgs(
+    xdelexCmd("s", ["1-0", "2-0"], RefMode.AckedOnly).args,
+    ["XDELEX", "s", "ACKED", "IDS", "2", "1-0", "2-0"],
+  )
+  assertArgs(
+    xackdelCmd("s", "g", ["1-0"], RefMode.Drop).args,
+    ["XACKDEL", "s", "g", "DELREF", "IDS", "1", "1-0"],
+  )
+  let got = asDelStatuses(sArr([Reply.Int(-1), Reply.Int(1), Reply.Int(2)]), "XDELEX") catch e {
+    panic("statuses: ${e.message()}")
+  }
+  assert(len(got) == 3, "three statuses")
+  assert(
+    got[0] == DelStatus.NotFound && got[1] == DelStatus.Deleted && got[2] == DelStatus.Retained,
+    "mapping",
+  )
+}
+
+test "the retry policy: reads retry, group reads, claims and acks never do" {
+  assert(xlenCmd("s").readOnly, "XLEN is a read")
+  assert(xrangeCmd("XRANGE", "s", StreamId.First, StreamId.Last, 0).readOnly, "XRANGE is a read")
+  assert(xpendingSummaryCmd("s", "g").readOnly, "XPENDING is a read")
+  assert(
+    !xreadGroupCmd(ref("c"), StreamId.Undelivered, 0, -1, false).readOnly,
+    "XREADGROUP changes the pending list",
+  )
+  assert(!xackCmd("s", "g", ["1-0"]).readOnly, "XACK writes")
+  assert(!xautoClaimCmd(ref("c"), 1, StreamId.Zero, 1).readOnly, "XAUTOCLAIM writes")
+  assert(
+    !xaddCmd("s", []Field(0), StreamId.Auto, capping(Trim.Off, true, 0)).readOnly,
+    "XADD writes",
+  )
+}
+
+test "asStreamEntries keeps field order and a repeated field name" {
+  let r = sArr([sEntry("1-0", ["a", "1", "b", "2", "a", "3"]), sEntry("2-0", [])])
+  let got = asStreamEntries(r, "XRANGE") catch e {
+    panic("entries: ${e.message()}")
+  }
+  assert(len(got) == 2, "two entries")
+  assert(got[0].id == "1-0" && len(got[0].fields) == 3, "first entry")
+  assert(got[0].fields[1].name == "b" && got[0].fields[2].value == "3", "order kept")
+  assert(unwrap(got[0].get("a")) == "1", "get returns the first match")
+  assert(isNone(got[0].get("zz")), "get misses")
+  assert(len(got[1].fields) == 0, "an entry with no fields")
+}
+
+test "an entry whose data was deleted decodes with no fields" {
+  let r = sArr([sArr([sBulk("1-0"), Reply.Null])])
+  let got = asStreamEntries(r, "XREADGROUP") catch e {
+    panic("deleted: ${e.message()}")
+  }
+  assert(len(got) == 1 && got[0].id == "1-0" && len(got[0].fields) == 0, "deleted entry")
+}
+
+test "asStreamEntries refuses an odd field list and a wrong shape" {
+  let odd = false
+  let _ = asStreamEntries(sArr([sEntry("1-0", ["a"])]), "XRANGE") catch _ {
+    odd = true
+    []Entry(0)
+  }
+  assert(odd, "odd field list")
+  let wrong = false
+  let _ = asStreamEntries(Reply.Int(1), "XRANGE") catch _ {
+    wrong = true
+    []Entry(0)
+  }
+  assert(wrong, "an integer is not entries")
+}
+
+test "asReads reads RESP3 maps, RESP2 arrays and a timeout null" {
+  let es = sArr([sEntry("1-0", ["a", "1"])])
+  let r3 = asReads(Reply.Map([MapEntry{ key = sBulk("s"), value = es }]), "XREAD") catch e {
+    panic("map: ${e.message()}")
+  }
+  assert(len(r3) == 1 && r3[0].key == "s" && len(r3[0].entries) == 1, "RESP3 map")
+  let r2 = asReads(sArr([sArr([sBulk("s"), es])]), "XREAD") catch e {
+    panic("array: ${e.message()}")
+  }
+  assert(len(r2) == 1 && r2[0].entries[0].id == "1-0", "RESP2 array")
+  let none = asReads(Reply.Null, "XREAD") catch e {
+    panic("null: ${e.message()}")
+  }
+  assert(len(none) == 0, "null is a timeout")
+  let first = asFirstRead(Reply.Array(Option.None), "XREAD") catch e {
+    panic("null array: ${e.message()}")
+  }
+  assert(len(first) == 0, "RESP2 null array is a timeout")
+}
+
+test "asXaddId needs an id, asOptString on NOMKSTREAM may be None" {
+  let id = asXaddId(sBulk("5-0")) catch e {
+    panic("id: ${e.message()}")
+  }
+  assert(id == "5-0", "id")
+  let failed = false
+  let _ = asXaddId(Reply.Null) catch _ {
+    failed = true
+    ""
+  }
+  assert(failed, "XADD without NOMKSTREAM never answers null")
+}
+
+test "asAutoClaimed reads the three-element form and the pre-7.0 two-element one" {
+  let three = asAutoClaimed(
+    sArr([sBulk("0-0"), sArr([sEntry("1-0", ["a", "1"])]), sArr([sBulk("9-0")])]),
+  ) catch e {
+    panic("three: ${e.message()}")
+  }
+  assert(three.next == "0-0" && len(three.entries) == 1 && three.deleted[0] == "9-0", "three")
+  let two = asAutoClaimed(sArr([sBulk("4-0"), sArr([]Reply(0))])) catch e {
+    panic("two: ${e.message()}")
+  }
+  assert(two.next == "4-0" && len(two.entries) == 0 && len(two.deleted) == 0, "two")
+}
+
+test "asPendingSummary reads counts per consumer and the empty form" {
+  let r = sArr(
+    [
+      Reply.Int(3),
+      sBulk("1-0"),
+      sBulk("3-0"),
+      sArr([sArr([sBulk("c1"), sBulk("2")]), sArr([sBulk("c2"), sBulk("1")])]),
+    ],
+  )
+  let got = asPendingSummary(r) catch e {
+    panic("summary: ${e.message()}")
+  }
+  assert(got.count == 3 && unwrap(got.minId) == "1-0" && unwrap(got.maxId) == "3-0", "bounds")
+  assert(
+    len(got.consumers) == 2 && got.consumers[1].consumer == "c2" && got.consumers[0].count == 2,
+    "consumers",
+  )
+  let empty = asPendingSummary(sArr([Reply.Int(0), Reply.Null, Reply.Null, Reply.Null])) catch e {
+    panic("empty: ${e.message()}")
+  }
+  assert(empty.count == 0 && isNone(empty.minId) && len(empty.consumers) == 0, "empty")
+}
+
+test "asPendingList reads id, consumer, idle and deliveries" {
+  let r = sArr([sArr([sBulk("1-0"), sBulk("c1"), Reply.Int(1500), Reply.Int(2)])])
+  let got = asPendingList(r) catch e {
+    panic("list: ${e.message()}")
+  }
+  assert(len(got) == 1 && got[0].id == "1-0" && got[0].consumer == "c1", "ids")
+  assert(got[0].idle == 1500 * Millisecond && got[0].deliveries == 2, "idle and deliveries")
+}
+
+test "XINFO decodes a RESP3 map and a RESP2 flat array alike" {
+  let flat = sArr(
+    [
+      sBulk("length"), Reply.Int(2),
+      sBulk("last-generated-id"), sBulk("2-0"),
+      sBulk("groups"), Reply.Int(1),
+      sBulk("first-entry"), sEntry("1-0", ["a", "1"]),
+      sBulk("last-entry"), Reply.Null,
+      sBulk("future-field"), Reply.Int(9),
+    ],
+  )
+  let got = asStreamInfo(flat) catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(got.length == 2 && got.lastGeneratedId == "2-0" && got.groups == 1, "scalars")
+  assert(isSome(got.firstEntry) && unwrap(got.firstEntry).id == "1-0", "first entry")
+  assert(isNone(got.lastEntry) && got.entriesAdded == 0, "absent and nil fields")
+  let m = Reply.Map(
+    [
+      MapEntry{ key = sBulk("name"), value = sBulk("g") },
+      MapEntry{ key = sBulk("consumers"), value = Reply.Int(2) },
+      MapEntry{ key = sBulk("pending"), value = Reply.Int(4) },
+      MapEntry{ key = sBulk("last-delivered-id"), value = sBulk("7-0") },
+      MapEntry{ key = sBulk("entries-read"), value = Reply.Null },
+      MapEntry{ key = sBulk("lag"), value = Reply.Int(3) },
+    ],
+  )
+  let groups = asGroupInfos(sArr([m])) catch e {
+    panic("groups: ${e.message()}")
+  }
+  assert(groups[0].name == "g" && groups[0].pending == 4 && groups[0].consumers == 2, "group")
+  assert(isNone(groups[0].entriesRead) && unwrap(groups[0].lag) == 3, "lag and entriesRead")
+}
+
+test "XINFO CONSUMERS converts idle and inactive to nanoseconds" {
+  let m = Reply.Map(
+    [
+      MapEntry{ key = sBulk("name"), value = sBulk("c1") },
+      MapEntry{ key = sBulk("pending"), value = Reply.Int(1) },
+      MapEntry{ key = sBulk("idle"), value = Reply.Int(250) },
+      MapEntry{ key = sBulk("inactive"), value = Reply.Int(300) },
+    ],
+  )
+  let got = asConsumerInfos(sArr([m])) catch e {
+    panic("consumers: ${e.message()}")
+  }
+  assert(got[0].name == "c1" && got[0].idle == 250 * Millisecond, "idle")
+  assert(unwrap(got[0].inactive) == 300 * Millisecond, "inactive")
+}
+
+test "BUSYGROUP is the one error ensure swallows" {
+  assert(isBusyGroup(RedisError.Server("BUSYGROUP", "Consumer Group name already exists")), "busy")
+  assert(!isBusyGroup(RedisError.Server("ERR", "x")), "other server error")
+  assert(!isBusyGroup(RedisError.Timeout), "timeout")
+}
