@@ -1,0 +1,206 @@
+// Self-host Stage 3: interval SPLITTING for the linear-scan allocator (#7635,
+// epic #7310), split out of compiler/regalloc.bit at the 800-line limit.
+// Sibling .bit file, same module: see regalloc.bit for the allocator overview.
+//
+// Before this, an evicted interval went to its stack slot for its WHOLE life,
+// so a value read early and evicted late paid a reload at every read, the
+// early ones included, to free a register it was holding anyway. Now the
+// eviction splits it at a block start `at` at or before the scan frontier: it
+// keeps its register on [start, at) and lives in its slot on [at, end]
+// (Wimmer & Franz 2010's split-at-a-block-boundary, in its simplest form).
+//
+// A split point is always a BLOCK START, so inside any block a value has one
+// location and only a CFG edge can change it. `splitEdgeMoves` names the move
+// each edge owes, and both backends append it to the edge's parallel move
+// (blockArgMoves, xBlockArgMoves), so the jump-chain bypass and the branch
+// shape see it exactly as they see a parameter move.
+//
+// SOUNDNESS of handing the register to nobody before `at`: every other
+// interval is placed exactly as before. The evicted one held its register on
+// [start, frontier) in the scan, so nothing else was given that register
+// there, and `at <= frontier`. The slot is a FRESH one (`assignSpill` with
+// reuse=false), so the edge store before `at` overwrites no other value.
+//
+// SCOPE (#7635): only Int, non-reference, non-heap-derived, non-remat values
+// split. A reference's stack maps and #5847's slot clears still name one
+// location for a whole life (#7636), which is why `assertNoRefSplit` exists.
+
+// The split of one interval: its register before `at`, `tail` from `at` on.
+// `start`/`end` are its (alias-widened) interval, the positions an edge move
+// may be owed at.
+class SplitPiece {
+  vreg: int,
+  start: int,
+  at: int,
+  end: int,
+  tail: RegLoc,
+}
+
+// One resolution move: `vreg` sits in `src` at an edge's source and must be
+// in `dst` at its target.
+class SplitMove {
+  vreg: int,
+  src: RegLoc,
+  dst: RegLoc,
+}
+
+// #7634: the one read of `locations` outside this module. `pos` is the
+// instruction position emitted or checked.
+fn locAt(res: RegAllocResult, v: int, pos: int): RegLoc {
+  if (v < len(res.splitOf) && res.splitOf[v] >= 0 && pos >= res.splits[res.splitOf[v]].at) {
+    return res.splits[res.splitOf[v]].tail
+  }
+  return res.locations[v]
+}
+
+// A read with no instruction position (frame sizing, whole-function scans,
+// allocator tests). For a split value it is the location before the split,
+// which is the register a callee-saved scan must see as used; the tail's slot
+// is counted by `numSpillSlots`.
+fn locWhole(res: RegAllocResult, v: int): RegLoc {
+  return res.locations[v]
+}
+
+// Overwrites `v`'s location; fixtures only.
+fn setLoc(res: RegAllocResult, v: int, loc: RegLoc) {
+  res.locations[v] = loc
+}
+
+fn splittable(iv: LiveInterval): bool {
+  return iv.regClass == RegClass.Int && !iv.isRef && !iv.heapDerived && !iv.remat && !iv.folded
+}
+
+// The latest block start in (iv.start, frontier], or -1.
+fn latestBlockStart(iv: LiveInterval, frontier: int, edges: []CfgEdge): int {
+  let at = -1
+  for e of edges {
+    if (e.dstStart > iv.start && e.dstStart <= frontier && e.dstStart > at) {
+      at = e.dstStart
+    }
+  }
+  return at
+}
+
+// Where to split `iv`, evicted at `frontier`, or -1 to spill it whole.
+//
+// Refused when splitting could cost more than the whole-life spill, which
+// pays one store at the definition and one reload per read. It must save at
+// least two reads before `at`, and it is not defined in the entry block: there
+// the prologue would zero the tail slot the entry block no longer writes
+// (`entryWrittenSlots`), and x86-64 reads a spilled parameter from its
+// argument register for free right after the binding (`xArgFwd`). A back edge
+// crossing `at` inside the interval would reload on every lap, and more than
+// one forward crossing edge would store more than once. With at most one
+// store and no back-edge reload, the split is no worse, and every read before
+// `at` stops reloading. A forward crossing edge never repeats inside a loop
+// without a back edge that crosses too, so the bound holds per run.
+fn splitPoint(iv: LiveInterval, frontier: int, edges: []CfgEdge): int {
+  if (!splittable(iv)) {
+    return -1
+  }
+  let at = latestBlockStart(iv, frontier, edges)
+  if (at < 0 || iv.use2 < 0 || iv.use2 >= at || inEntryBlock(iv, edges)) {
+    return -1
+  }
+  if (crossingStores(iv, at, edges) < 0) {
+    return -1
+  }
+  return at
+}
+
+// Whether `iv` is defined before the first block any edge enters.
+fn inEntryBlock(iv: LiveInterval, edges: []CfgEdge): bool {
+  for e of edges {
+    if (e.dstStart <= iv.start) {
+      return false
+    }
+  }
+  return true
+}
+
+// The edges inside `iv` that cross `at` forward, each owing one store; -1
+// when a back edge crosses it or more than one forward edge does.
+fn crossingStores(iv: LiveInterval, at: int, edges: []CfgEdge): int {
+  let stores = 0
+  for e of edges {
+    if (!spans(iv.start, iv.end, e.srcLast, e.dstStart) || e.srcLast < at == (e.dstStart < at)) {
+      continue
+    }
+    if (e.srcLast >= at || stores == 1) {
+      return -1
+    }
+    stores = stores + 1
+  }
+  return stores
+}
+
+fn spans(start: int, end: int, from: int, to: int): bool {
+  return from >= start && from <= end && to >= start && to <= end
+}
+
+// The split state `allocateCoalesced` threads through its scan: the result's
+// `locations`, the CFG edges, and the pieces split so far.
+class Splitter {
+  locations: []RegLoc,
+  edges: []CfgEdge,
+  pieces: []SplitPiece,
+}
+
+// Places `iv`, evicted from `reg` at `frontier` into `slot`: split when
+// `splitPoint` allows, else on the stack for its whole life. The assert is
+// #7636's fence: a reference never reaches a split.
+fn placeEvicted(sp: Splitter, iv: LiveInterval, reg: int, slot: int, frontier: int) {
+  let at = splitPoint(iv, frontier, sp.edges)
+  if (at < 0) {
+    sp.locations[iv.vreg] = RegLoc{ isSpill = true, index = slot }
+    return
+  }
+  assert(!iv.isRef && slot >= 0 && at > iv.start && at <= iv.end)
+  sp.locations[iv.vreg] = RegLoc{ isSpill = false, index = reg }
+  let tail = RegLoc{ isSpill = true, index = slot }
+  sp.pieces = append(
+    sp.pieces,
+    SplitPiece{ vreg = iv.vreg, start = iv.start, at = at, end = iv.end, tail = tail },
+  )
+}
+
+// Per vreg, the index of its SplitPiece or -1. An alias takes its root's,
+// exactly as it takes its root's location (`propagateAliasLocations`).
+fn splitIndex(n: int, splits: []SplitPiece, roots: []int): []int {
+  let out = []int(0)
+  let v = 0
+  while (v < n) {
+    out = append(out, -1)
+    v = v + 1
+  }
+  let k = 0
+  while (k < len(splits)) {
+    out[splits[k].vreg] = k
+    k = k + 1
+  }
+  v = 0
+  while (v < n && len(roots) > 0) {
+    if (roots[v] != v) {
+      out[v] = out[roots[v]]
+    }
+    v = v + 1
+  }
+  return out
+}
+
+// The moves a CFG edge from position `from` (its source's last instruction)
+// to `to` (its target's first) owes split values. A value whose interval does
+// not contain both ends is not live across the edge and owes nothing.
+fn splitEdgeMoves(res: RegAllocResult, from: int, to: int): []SplitMove {
+  let out = []SplitMove(0)
+  for p of res.splits {
+    if (!spans(p.start, p.end, from, to) || from < p.at == (to < p.at)) {
+      continue
+    }
+    out = append(
+      out,
+      SplitMove{ vreg = p.vreg, src = locAt(res, p.vreg, from), dst = locAt(res, p.vreg, to) },
+    )
+  }
+  return out
+}
