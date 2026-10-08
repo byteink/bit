@@ -327,6 +327,11 @@ const h2connPreface: string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 // Dial: run the client side of the preface (magic + SETTINGS) over `t` and start
 // the connection. The returned `Conn` is ready for `roundTrip`.
 //
+// `abort` is a channel a caller sends one value on to end the wait for the peer's
+// opening SETTINGS early (#7662): the transport is shut down as for a timeout
+// and this fails with `Aborted` (abort.bit). Capacity 1, so the sender never
+// blocks.
+//
 // `deadlineNs` bounds the wait for the peer's opening SETTINGS — an absolute
 // monotonic nanosecond deadline (`std/time`'s `monotonic()` plus a budget,
 // the same convention `std/net`/`std/tls` use), or 0 for no bound. Pass the
@@ -334,10 +339,15 @@ const h2connPreface: string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 // nonzero deadline over an unbounded transport can make setup fail here
 // while the transport itself waits out its own unrelated, unbounded read
 // (#3019).
-export fn connect(t: Transport, cfg: Config, deadlineNs: int): Conn! {
+export fn connect(
+  t: Transport,
+  cfg: Config,
+  deadlineNs: int,
+  abort: Option<chan<int>> = Option.None,
+): Conn! {
   t.write([]byte(h2connPreface))?
   let r = h2connNewFrameReader(t)
-  return h2connStart(t, cfg, true, r, deadlineNs)?
+  return h2connStart(t, cfg, true, r, h2connBoundOf(deadlineNs, abort))?
 }
 
 // Answer: read and validate the client preface over `t`, then start the
@@ -349,7 +359,7 @@ export fn accept(t: Transport, cfg: Config, deadlineNs: int): Conn! {
   if (!h2connBytesEqual(magic, []byte(h2connPreface))) {
     fail newError("http2: malformed client connection preface")
   }
-  return h2connStart(t, cfg, false, r, deadlineNs)?
+  return h2connStart(t, cfg, false, r, h2connBoundOf(deadlineNs, Option.None))?
 }
 
 // Common startup: send our SETTINGS, allocate the channels, build the loop-owned
@@ -359,8 +369,9 @@ fn h2connStart(
   cfg: Config,
   isClient: bool,
   r: h2connFrameReader,
-  deadlineNs: int,
+  bound: h2connBound,
 ): Conn! {
+  let deadlineNs = bound.deadlineNs
   t.write(encodeSettings(h2connOurSettings(cfg))?)?
 
   let inCh = chan<h2connEvent>(64)
@@ -415,7 +426,7 @@ fn h2connStart(
   // window and frame-size limits are known before the first request is sent.
   // Bounded by `deadlineNs` and by the teardown path, not a bare receive —
   // see `h2connAwaitReady` (#3019).
-  let peerStreams = h2connAwaitReady(t, readyCh, readerDoneCh, writerDoneCh, deadlineNs)?
+  let peerStreams = h2connAwaitReady(t, readyCh, readerDoneCh, writerDoneCh, bound)?
   return Conn{
     isClient = isClient,
     cmdCh = cmdCh,
@@ -432,7 +443,9 @@ fn h2connStart(
 // plus one for its opening SETTINGS, which this returns without the one;
 // 0 for a teardown before that — the transport's EOF, or a connection error
 // this side raised, both in events.bit) or until `deadlineNs` elapses first
-// (0 = no bound). A channel receive has no timer of its own, unlike a socket
+// (0 = no bound) or until `bound.wake` receives a value (outcome 3,
+// `Aborted`; a connection nothing aborts gets a channel that never fires).
+// A channel receive has no timer of its own, unlike a socket
 // read, so one is armed here explicitly for exactly this wait: a green thread
 // that sleeps for the remaining budget then signals `timeoutCh`, raced against
 // `readyCh` with `select`.
@@ -468,8 +481,9 @@ fn h2connAwaitReady(
   readyCh: chan<int>,
   readerDoneCh: chan<int>,
   writerDoneCh: chan<int>,
-  deadlineNs: int,
+  bound: h2connBound,
 ): int! {
+  let deadlineNs = bound.deadlineNs
   let timeoutCh = chan<int>(1)
   if (deadlineNs != 0) {
     spawn h2connArmDeadline(deadlineNs, timeoutCh)
@@ -485,6 +499,8 @@ fn h2connAwaitReady(
       }
     case _ = <- timeoutCh:
       outcome = 2
+    case _ = <- bound.wake:
+      outcome = 3
   }
   // `readyCh` delivering 0 (outcome 1) is ambiguous: it fires both for a
   // genuine early close and for the deadline's own consequence (the reader's
@@ -507,6 +523,9 @@ fn h2connAwaitReady(
   <- writerDoneCh
   if (outcome == 2) {
     fail newError("http2: timed out waiting for peer SETTINGS")
+  }
+  if (outcome == 3) {
+    fail Aborted{}
   }
   fail newError("http2: connection closed before peer SETTINGS")
 }

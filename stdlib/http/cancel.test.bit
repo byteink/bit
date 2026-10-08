@@ -403,6 +403,8 @@ class rawH2 {
   rstCode: AtomicI64,
   // Every RST_STREAM the client sent; a reply to the late DATA would be a second.
   rstCount: AtomicI64,
+  // Completes the handshake and reads, but never sends SETTINGS (#7662).
+  mute: bool,
 }
 
 class rawBuf { data: []byte }
@@ -513,7 +515,23 @@ fn rawOnFrame(conn: TlsConn, o: rawH2, f: Frame) {
   rawSend(conn, rawData(1, rawHalf, true))
 }
 
+// Reads until the client closes, answering nothing.
+fn rawMute(conn: TlsConn) {
+  while (true) {
+    let more = conn.read(16384) catch _ {
+      return
+    }
+    if (len(more) == 0) {
+      return
+    }
+  }
+}
+
 fn rawServe(conn: TlsConn, o: rawH2) {
+  if (o.mute) {
+    rawMute(conn)
+    return
+  }
   let rb = rawBuf{ data = []byte(0) }
   rawSend(conn, rawSettings(false))
   // The 24-byte client preface precedes the first frame.
@@ -546,12 +564,16 @@ fn rawAccept(o: rawH2) {
 }
 
 fn startRawH2(): rawH2! {
+  return startRawH2Mode(false)?
+}
+
+fn startRawH2Mode(mute: bool): rawH2! {
   let cfg = tls5916ServerConfig()?
   cfg.alpn = ["h2", "http/1.1"]
   let l = tlsListen("127.0.0.1", 0, cfg)?
   let o = rawH2{
     l = l, port = l.port()?, accepts = AtomicI64(0), heads = AtomicI64(0), rstStream = AtomicI64(0),
-    rstCode = AtomicI64(0), rstCount = AtomicI64(0),
+    rstCode = AtomicI64(0), rstCount = AtomicI64(0), mute = mute,
   }
   spawn rawAccept(o)
   return o
@@ -575,6 +597,14 @@ fn rawWait(a: AtomicI64, want: int, what: string) {
 
 fn rawSendTok(c: Client, url: string, tok: Cancel, out: chan<error>) {
   c.send(ClientRequest{ url = url, cancel = Option.Some(tok) }) catch e {
+    out <- e
+    return
+  }
+  out <- newError("the request under the token succeeded")
+}
+
+fn rawSendReq(c: Client, req: ClientRequest, out: chan<error>) {
+  c.send(req) catch e {
     out <- e
     return
   }
@@ -619,4 +649,26 @@ test "cancel over h2 resets one stream with CANCEL and the other stream finishes
   assert(<- again == "200 ${2 * rawHalf}", "a request after the cancel failed")
   assert(o.accepts.load() == 1, "accepts = ${o.accepts.load()}: the connection was not kept")
   assert(o.rstCount.load() == 1, "the client sent ${o.rstCount.load()} RST_STREAM frames, not 1")
+}
+
+test "cancel while the h2 connection waits for the server's opening SETTINGS fails within the bound" {
+  let o = startRawH2Mode(true) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = rawClient()
+  let url = "https://127.0.0.1:${o.port}/x"
+  let tok = Cancel()
+  let out = chan<error>(1)
+  let req = ClientRequest{ url = url, cancel = Option.Some(tok), timeoutMs = 5000 }
+  spawn rawSendReq(c, req, out)
+  rawWait(o.accepts, 1, "origin accepted the connection")
+  let at = AtomicI64(monotonic().ns)
+  sleep(cancelDelayMs * 1000000)
+  at.store(monotonic().ns)
+  tok.cancel()
+  let e = <- out
+  assertWithin(at, "h2 cancel before SETTINGS")
+  assertCancelled(e, "h2 cancel before SETTINGS")
+  assert(o.heads.load() == 0, "a request reached the origin")
 }
