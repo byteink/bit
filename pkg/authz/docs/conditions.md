@@ -383,6 +383,112 @@ A condition that still holds a `Param` when it is evaluated is an
 first. `validate` accepts a placeholder (its value is not known until the
 request) and still checks the field it compares.
 
+## Stored conditions as JSON
+
+An admin screen posts a policy as JSON, so the condition arrives as text, not
+as `eq(...)` calls. `condFromJson` reads it into the same `Cond`, in the
+syntax CASL users already know: an object's keys are fields, all of which
+must hold; a plain value means equal; an operator object holds `$eq`, `$ne`,
+`$in`, `$lt`, `$lte`, `$gt` and `$gte`; `$and`, `$or` and `$not` combine. A
+string `"$user.team"` is the placeholder of the previous section. Here is
+"editors may touch their own team's drafts and reviews":
+
+```bit
+import { Authz, Cond, Subject, Truth, bind, condFromJson, evalCond } from "authz"
+import { Tabled } from "orm"
+import { jsonParse } from "std/json"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+  team: string
+  status: string
+  views: i64
+}
+
+class User {
+  export id: string,
+  export roles: []string,
+  export team: string,
+}
+
+fn main(): ()! {
+  let authz = Authz<Action>()?
+  authz.resource<Article>()?
+  let article = unwrap(authz.resourceByName("Article"))
+
+  let doc = jsonParse("{ \"team\": \"$user.team\", \"status\": { \"$in\": [\"draft\", \"review\"] } }")?
+  let stored: Cond = condFromJson(article, doc)?
+
+  let mira = User{ id = "mira", roles = ["editor"], team = "sport" }
+  let (bound, _) = bind(stored, Option<Subject>.Some(mira))
+  let mine = Article{ id = 1, team = "sport", status = "draft", views = 40 }
+  let theirs = Article{ id = 2, team = "news", status = "draft", views = 90 }
+  println("her draft: ${evalCond(bound, mine)? == Truth.True}")
+  println("news draft: ${evalCond(bound, theirs)? == Truth.True}")
+}
+```
+
+This prints `her draft: true` and `news draft: false`. `condFromJson` takes the
+resource it is for, which is what makes it safe to run on whatever an admin
+types: every mistake is an `InvalidPolicy` that says where it is, and nothing
+a document contains can make it panic:
+
+```bit
+import { Authz, condFromJson } from "authz"
+import { Tabled } from "orm"
+import { jsonParse } from "std/json"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+  authorId: string
+  views: i64
+  published: bool
+}
+
+fn show(authz: Authz<Action>, text: string): ()! {
+  let article = unwrap(authz.resourceByName("Article"))
+  let _ = condFromJson(article, jsonParse(text)?, "statements[0].when") catch e {
+    println(e.message())
+    return
+  }
+}
+
+fn main(): ()! {
+  let authz = Authz<Action>()?
+  authz.resource<Article>()?
+  show(authz, "{ \"authorID\": \"sara\" }")?
+  show(authz, "{ \"views\": { \"$gte\": \"many\" } }")?
+  show(authz, "{ \"published\": { \"$gt\": true } }")?
+  show(authz, "{ \"views\": { \"$between\": [1, 9] } }")?
+}
+```
+
+The third argument is where the caller found the document, so the path reads
+from the policy's own JSON; it defaults to `when`. The four lines are:
+
+```text
+invalid policy: statements[0].when.authorID: Article has no field "authorID" (closest: "authorId")
+invalid policy: statements[0].when.views.$gte: field views is i64, the value is text
+invalid policy: statements[0].when.published.$gt: field published is bool, which cannot be ordered
+invalid policy: statements[0].when.views.$between: unknown operator "$between" (operators: $eq, $ne, $in, $lt, $lte, $gt, $gte, $related)
+```
+
+A value must fit the field's type, an `$in` needs a non-empty array, an
+enum field (`@enumVariants`) takes one of its variant names and cannot be
+ordered, and `"$$user.team"` is the literal text `$user.team`, as everywhere
+else. `{ "folder": { "$related": "editor" } }` is the relationship test of the
+relationships chapter. Two limits protect the server from admin input: objects
+nested deeper than 16 levels and more than 256 nodes (every key and every array
+element, `$in` values included) are refused. `null` is refused too, since a
+comparison with NULL is never true; and an empty operator object is an error
+rather than an always-true condition.
+
 ## Filtering a list
 
 "May sara update THIS article" is one row. Inkwell's "my articles" page asks
