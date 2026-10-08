@@ -352,9 +352,11 @@ connection stays pooled.
 
 A request with a token is HTTP/1.1 only, as a streamed one is: it never joins
 the shared HTTP/2 connection (closing that would cancel other requests), never
-upgrades to HTTP/3, and an `https+h3://` URL, or a redirect to one, fails. A
-`Client.send` that waits for a free connection under `maxConnsPerHost` is not
-woken by `cancel()`; it stays bound by `timeoutMs`.
+upgrades to HTTP/3, and an `https+h3://` URL, or a redirect to one, fails.
+
+A `send` that waits for a free connection because the host is at
+`maxConnsPerHost` is woken by `cancel()` too: it fails with `Cancelled`, `sent`
+false, before it dials.
 
 ### A client that reuses connections
 
@@ -442,8 +444,8 @@ for each. `maxConnsPerHost` (default 0, no limit) caps the connections open at
 once to one host, idle ones included. With `maxConnsPerHost = 8`, the ninth
 concurrent `get` to a host waits until a request finishes and its connection
 is parked or closed, then runs on it. The wait ends at the request's own
-timeout (`getTimeout`, `requestTimeout`); a request with no timeout waits as
-long as it takes. A request that times out in the queue fails with `http:
+timeout (`getTimeout`, `requestTimeout`) or at its `Cancel`; a request with
+neither waits as long as it takes. A request that times out in the queue fails with `http:
 timed out waiting for a free connection (PoolLimits.maxConnsPerHost = 8
 connections to http://host:80 already open)`, so the cap is named, not guessed
 at. The cap is per host and per `Client`: another host has its own eight.
