@@ -1,0 +1,453 @@
+// pkg/redis/stream.live.test.bit - `r.stream(key)` against a real server.
+// `liveUrl`/`liveClient` are `client.live.test.bit`'s own, `delKey` is
+// `zset.live.test.bit`'s (same module, no import); every test is skipped, and
+// says so, when `REDIS_TEST_URL` is unset. `./make test-package-redis-live`
+// (`_tests_/bit/redislive.bit`) supplies it against `redis:8.10.2` in a
+// throwaway Docker container.
+
+// `n` events "kind=publish article=<i>" with ids `1-1` .. `1-<n>`; returns the ids.
+fn streamFill(s: Stream, n: int): []string {
+  let ids = []string(0)
+  let i = 1
+  while (i <= n) {
+    let id = s.add([field("kind", "publish"), field("article", "${i}")], StreamId.At("1-${i}")) catch e {
+      panic("add ${i}: ${e.message()}")
+    }
+    ids = append(ids, id)
+    i = i + 1
+  }
+  return ids
+}
+
+fn streamIds(es: []Entry): string {
+  let out = ""
+  for e of es {
+    out = "${out}${e.id} "
+  }
+  return out
+}
+
+fn streamCount(got: i64, want: i64, what: string) {
+  assert(got == want, "${what}: expected ${want}, got ${got}")
+}
+
+fn streamRead(c: Consumer, count: int): []Entry {
+  return c.read(count) catch e {
+    panic("read: ${e.message()}")
+  }
+}
+
+// `add` after `delayNs`, run on its own green thread by the blocking test.
+fn streamDelayedAdd(admin: Client, key: string, delayNs: int) {
+  sleep(delayNs)
+  admin.stream(key).add([field("kind", "late")]) catch e {
+    panic("delayed add: ${e.message()}")
+  }
+}
+
+test "live: add, len, range, revRange, read and del round-trip an event log" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let key = "bit:live:stream:log"
+  delKey(c, key)
+  let s = c.stream(key)
+
+  let ids = streamFill(s, 5)
+  assert(ids[0] == "1-1" && ids[4] == "1-5", "explicit ids come back: ${ids[0]}")
+  let auto = s.add([field("kind", "auto")], StreamId.Auto) catch e {
+    panic("auto add: ${e.message()}")
+  }
+  assert(auto != "", "an automatic id")
+  let size = s.len() catch e {
+    panic("len: ${e.message()}")
+  }
+  streamCount(size, 6, "len")
+
+  let mid = s.range(StreamId.At("1-2"), StreamId.At("1-4")) catch e {
+    panic("range: ${e.message()}")
+  }
+  assert(streamIds(mid) == "1-2 1-3 1-4 ", "range is inclusive: ${streamIds(mid)}")
+  assert(unwrap(mid[0].get("article")) == "2" && unwrap(mid[0].get("kind")) == "publish", "fields")
+  assert(mid[0].fields[0].name == "kind" && mid[0].fields[1].name == "article", "field order kept")
+  let after = s.range(StreamId.After("1-4"), StreamId.At("1-5")) catch e {
+    panic("range after: ${e.message()}")
+  }
+  assert(streamIds(after) == "1-5 ", "exclusive start: ${streamIds(after)}")
+  let newest = s.revRange(count = 2) catch e {
+    panic("revRange: ${e.message()}")
+  }
+  assert(len(newest) == 2 && newest[0].id == auto && newest[1].id == "1-5", "revRange newest first")
+
+  let all = s.read() catch e {
+    panic("read: ${e.message()}")
+  }
+  assert(len(all) == 6, "read from the start returns every entry, got ${len(all)}")
+  let tail = s.read(StreamId.At("1-4"), 1) catch e {
+    panic("read count: ${e.message()}")
+  }
+  assert(streamIds(tail) == "1-5 ", "read after an id, count 1: ${streamIds(tail)}")
+
+  let removed = s.del("1-1", "9-9") catch e {
+    panic("del: ${e.message()}")
+  }
+  streamCount(removed, 1, "del counts only ids that existed")
+
+  let missing = c.stream("bit:live:stream:nostream")
+  delKey(c, "bit:live:stream:nostream")
+  let none = missing.addIfExists([field("a", "1")]) catch e {
+    panic("addIfExists: ${e.message()}")
+  }
+  assert(isNone(none), "addIfExists on a missing stream creates nothing")
+  let there = s.addIfExists([field("a", "1")]) catch e {
+    panic("addIfExists existing: ${e.message()}")
+  }
+  assert(isSome(there), "addIfExists on an existing stream appends")
+  c.close()
+}
+
+test "live: readAny reads two streams, a block that elapses is empty, a block that is met returns" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let admin = liveClient(u)
+  let a = "bit:live:stream:any:a"
+  let b = "bit:live:stream:any:b"
+  delKey(c, a)
+  delKey(c, b)
+  let sa = c.stream(a)
+  let _ = streamFill(sa, 2)
+  let _ = streamFill(c.stream(b), 3)
+
+  let got = sa.readAny(StreamId.Zero, [Cursor{ key = b, from = StreamId.At("1-1") }]) catch e {
+    panic("readAny: ${e.message()}")
+  }
+  assert(len(got) == 2, "two streams answered, got ${len(got)}")
+  let total = 0
+  for k of got {
+    total = total + len(k.entries)
+  }
+  assert(total == 4, "2 from a and 2 after 1-1 from b, got ${total}")
+
+  let started = monotonic().ns
+  let empty = sa.read(StreamId.Latest, 0, 300 * Millisecond) catch e {
+    panic("block timeout: ${e.message()}")
+  }
+  let waited = monotonic().ns - started
+  assert(len(empty) == 0, "a timeout is no entries")
+  assert(waited >= 250 * Millisecond && waited < 3 * Second, "waited ${waited}ns")
+
+  spawn streamDelayedAdd(admin, a, 200 * Millisecond)
+  let met = sa.read(StreamId.Latest, 0, 5 * Second) catch e {
+    panic("block met: ${e.message()}")
+  }
+  assert(
+    len(met) == 1 && unwrap(met[0].get("kind")) == "late",
+    "the spawned add satisfies the block",
+  )
+  c.close()
+  admin.close()
+}
+
+test "live: a group splits work between two consumers, ack empties the pending list" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let key = "bit:live:stream:split"
+  delKey(c, key)
+  let s = c.stream(key)
+  let _ = streamFill(s, 6)
+
+  let g = s.group("workers")
+  let made = g.ensure(StreamId.Zero) catch e {
+    panic("ensure: ${e.message()}")
+  }
+  assert(made, "ensure creates the group")
+  let again = g.ensure(StreamId.Zero) catch e {
+    panic("ensure twice: ${e.message()}")
+  }
+  assert(!again, "ensure on an existing group is a no-op, not BUSYGROUP")
+
+  let w1 = g.consumer("w1")
+  let w2 = g.consumer("w2")
+  let first = streamRead(w1, 2)
+  let second = streamRead(w2, 2)
+  let third = streamRead(w1, 10)
+  assert(len(first) == 2 && len(second) == 2 && len(third) == 2, "2/2/2 split")
+  assert(first[0].id == "1-1" && second[0].id == "1-3" && third[0].id == "1-5", "no entry twice")
+  let drained = streamRead(w2, 10)
+  assert(len(drained) == 0, "nothing undelivered is left")
+
+  let sum = g.pending() catch e {
+    panic("pending: ${e.message()}")
+  }
+  streamCount(sum.count, 6, "pending count")
+  assert(unwrap(sum.minId) == "1-1" && unwrap(sum.maxId) == "1-6", "pending bounds")
+  assert(len(sum.consumers) == 2, "two consumers hold entries")
+  let mine = w1.pending() catch e {
+    panic("consumer pending: ${e.message()}")
+  }
+  assert(len(mine) == 4 && mine[0].consumer == "w1" && mine[0].deliveries == 1, "w1 holds 4")
+
+  let acked = w1.ack(first[0].id, first[1].id) catch e {
+    panic("ack: ${e.message()}")
+  }
+  streamCount(acked, 2, "consumer ack")
+  let gacked = g.ack(second[0].id, "9-9") catch e {
+    panic("group ack: ${e.message()}")
+  }
+  streamCount(gacked, 1, "group ack counts only pending ids")
+
+  let hist = w2.read(0, -1, StreamId.Zero) catch e {
+    panic("history: ${e.message()}")
+  }
+  assert(len(hist) == 1 && hist[0].id == "1-4", "a history read returns w2's own unacked entry")
+  let rest = g.pending() catch e {
+    panic("pending after: ${e.message()}")
+  }
+  streamCount(rest.count, 3, "pending after acks")
+
+  g.setId(StreamId.Zero) catch e {
+    panic("setId: ${e.message()}")
+  }
+  let redo = streamRead(w1, 100)
+  assert(len(redo) == 6, "setId back to 0 redelivers the whole stream, got ${len(redo)}")
+  let gone = g.destroy() catch e {
+    panic("destroy: ${e.message()}")
+  }
+  assert(gone, "destroy")
+  c.close()
+}
+
+test "live: a dead consumer's entries are claimed with claimStale, claim and claimIds" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let key = "bit:live:stream:dead"
+  delKey(c, key)
+  let s = c.stream(key)
+  let _ = streamFill(s, 5)
+  let g = s.group("workers")
+  g.create(StreamId.Zero) catch e {
+    panic("create: ${e.message()}")
+  }
+  let dead = g.consumer("dead")
+  let live = g.consumer("live")
+  let taken = streamRead(dead, 5)
+  assert(len(taken) == 5, "the doomed consumer takes everything")
+
+  let early = live.claimStale(10 * Second) catch e {
+    panic("claimStale early: ${e.message()}")
+  }
+  assert(len(early.entries) == 0, "nothing has been idle for 10s yet")
+
+  sleep(150 * Millisecond)
+  let got = live.claimStale(100 * Millisecond, 2) catch e {
+    panic("claimStale: ${e.message()}")
+  }
+  assert(len(got.entries) == 2 && got.entries[0].id == "1-1", "the first page is 2 entries")
+  assert(got.next == "1-3", "next points at the unscanned remainder: ${got.next}")
+  let more = live.claimStale(100 * Millisecond, 100, StreamId.At(got.next)) catch e {
+    panic("claimStale page 2: ${e.message()}")
+  }
+  assert(len(more.entries) == 3 && more.next == "0-0", "page 2 finishes the scan")
+
+  let held = live.pending() catch e {
+    panic("pending: ${e.message()}")
+  }
+  assert(
+    len(held) == 5 && held[0].deliveries == 2,
+    "claimed entries moved to live, deliveries bumped",
+  )
+  let left = g.pending() catch e {
+    panic("group pending: ${e.message()}")
+  }
+  assert(len(left.consumers) == 1 && left.consumers[0].consumer == "live", "dead holds nothing now")
+
+  sleep(150 * Millisecond)
+  let ids = g.claimIds("dead", 100 * Millisecond, ["1-1", "1-2"]) catch e {
+    panic("claimIds: ${e.message()}")
+  }
+  assert(len(ids) == 2, "claimIds returns ids")
+  let back = g.claim("live", 0, ["1-1"]) catch e {
+    panic("claim: ${e.message()}")
+  }
+  assert(len(back) == 1 && unwrap(back[0].get("article")) == "1", "claim returns the entry")
+  let recent = g.pendingList(10, minIdle = 10 * Second) catch e {
+    panic("pendingList idle: ${e.message()}")
+  }
+  assert(len(recent) == 0, "nothing idle for 10s")
+  let ranged = g.pendingList(2, StreamId.At("1-2"), StreamId.Last) catch e {
+    panic("pendingList: ${e.message()}")
+  }
+  assert(len(ranged) == 2 && ranged[0].id == "1-2", "pendingList respects start and count")
+
+  let pend = g.delConsumer("dead") catch e {
+    panic("delConsumer: ${e.message()}")
+  }
+  streamCount(pend, 1, "dead still held 1-2 after the claim of 1-1 back")
+  let fresh = g.createConsumer("fresh") catch e {
+    panic("createConsumer: ${e.message()}")
+  }
+  assert(fresh, "createConsumer")
+  c.close()
+}
+
+test "live: trim, MAXLEN, MINID, delete and ackDelete" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let key = "bit:live:stream:trim"
+  delKey(c, key)
+  let s = c.stream(key)
+  let _ = streamFill(s, 10)
+
+  let cut = s.trim(Trim.MaxLen(7), false) catch e {
+    panic("trim maxlen: ${e.message()}")
+  }
+  streamCount(cut, 3, "exact MAXLEN removes 3")
+  let by = s.trim(Trim.MinId("1-6"), false) catch e {
+    panic("trim minid: ${e.message()}")
+  }
+  streamCount(by, 2, "MINID 1-6 removes 1-4 and 1-5")
+  let approx = s.trim(Trim.MaxLen(100)) catch e {
+    panic("trim approx: ${e.message()}")
+  }
+  streamCount(approx, 0, "approximate trim under the cap removes nothing")
+  let added = s.add([field("a", "1")], StreamId.At("2-0"), Trim.MaxLen(3), false) catch e {
+    panic("add with trim: ${e.message()}")
+  }
+  assert(added == "2-0", "add with an exact trim")
+  let size = s.len() catch e {
+    panic("len: ${e.message()}")
+  }
+  streamCount(size, 3, "add trimmed the stream to 3")
+
+  let g = s.group("g")
+  g.create(StreamId.Zero) catch e {
+    panic("create: ${e.message()}")
+  }
+  let w = g.consumer("w")
+  let es = streamRead(w, 10)
+  let gone = s.delete([es[0].id, "9-9"], RefMode.Keep) catch e {
+    panic("delete: ${e.message()}")
+  }
+  assert(gone[0] == DelStatus.Deleted && gone[1] == DelStatus.NotFound, "delete statuses")
+  let acked = g.ackDelete([es[1].id], RefMode.AckedOnly) catch e {
+    panic("ackDelete: ${e.message()}")
+  }
+  assert(acked[0] == DelStatus.Deleted, "ackDelete acks and deletes")
+  let bad = false
+  let _ = s.trim(Trim.Off) catch _ {
+    bad = true
+    0
+  }
+  assert(bad, "Trim.Off is refused before anything is sent")
+  c.close()
+}
+
+test "live: info, groups and consumers describe the stream" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let key = "bit:live:stream:info"
+  delKey(c, key)
+  let s = c.stream(key)
+  let _ = streamFill(s, 3)
+  let g = s.group("workers")
+  g.create(StreamId.Zero) catch e {
+    panic("create: ${e.message()}")
+  }
+  let w = g.consumer("w1")
+  let got = streamRead(w, 2)
+  assert(len(got) == 2, "two delivered")
+
+  let info = s.info() catch e {
+    panic("info: ${e.message()}")
+  }
+  streamCount(info.length, 3, "info.length")
+  streamCount(info.groups, 1, "info.groups")
+  assert(info.lastGeneratedId == "1-3", "lastGeneratedId ${info.lastGeneratedId}")
+  assert(
+    unwrap(info.firstEntry).id == "1-1" && unwrap(info.lastEntry).id == "1-3",
+    "first and last entry",
+  )
+  streamCount(info.entriesAdded, 3, "entriesAdded")
+
+  let gs = s.groups() catch e {
+    panic("groups: ${e.message()}")
+  }
+  assert(len(gs) == 1 && gs[0].name == "workers", "one group")
+  streamCount(gs[0].consumers, 1, "group consumers")
+  streamCount(gs[0].pending, 2, "group pending")
+  assert(gs[0].lastDeliveredId == "1-2", "lastDeliveredId ${gs[0].lastDeliveredId}")
+  streamCount(unwrap(gs[0].lag), 1, "lag")
+
+  let cs = g.consumers() catch e {
+    panic("consumers: ${e.message()}")
+  }
+  assert(len(cs) == 1 && cs[0].name == "w1" && cs[0].pending == 2, "consumer w1 holds 2")
+  assert(cs[0].idle >= 0 && cs[0].idle < 30 * Second, "idle is a sane duration")
+
+  let empty = c.stream("bit:live:stream:info:empty")
+  delKey(c, "bit:live:stream:info:empty")
+  empty.group("g").create(StreamId.Latest) catch e {
+    panic("mkstream: ${e.message()}")
+  }
+  let einfo = empty.info() catch e {
+    panic("empty info: ${e.message()}")
+  }
+  assert(einfo.length == 0 && isNone(einfo.firstEntry), "an empty stream has no first entry")
+  c.close()
+}
+
+test "live: a Pipeline queues stream commands and a missing group is a server error" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let key = "bit:live:stream:pipe"
+  delKey(c, key)
+  let p = c.pipeline()
+  let a = p.stream(key).add([field("n", "1")], StreamId.At("1-1"))
+  let b = p.stream(key).add([field("n", "2")], StreamId.At("1-2"))
+  let n = p.stream(key).len()
+  let r = p.stream(key).range()
+  p.exec() catch e {
+    panic("exec: ${e.message()}")
+  }
+  let ida = a.get() catch e {
+    panic("future a: ${e.message()}")
+  }
+  let idb = b.get() catch e {
+    panic("future b: ${e.message()}")
+  }
+  let nn = n.get() catch e {
+    panic("future len: ${e.message()}")
+  }
+  let rr = r.get() catch e {
+    panic("future range: ${e.message()}")
+  }
+  assert(ida == "1-1" && idb == "1-2" && nn == 2 && len(rr) == 2, "queued results")
+
+  let failed = false
+  let _ = c.stream(key).group("nope").consumer("x").read() catch _ {
+    failed = true
+    []Entry(0)
+  }
+  assert(failed, "XREADGROUP on a group that does not exist fails NOGROUP")
+  c.close()
+}
