@@ -1,0 +1,451 @@
+// pkg/authz/condjson.bit — a stored policy's `when` part, read from JSON into
+// a `Cond`. The syntax is CASL's (MongoQuery), so an admin who knows it can
+// write a condition without learning ours:
+//
+//   { "team": "$user.team", "status": { "$in": ["review", "draft"] },
+//     "$or": [ { "views": { "$gte": 10, "$lt": 100 } }, { "folder": { "$related": "editor" } } ] }
+//
+//  - an object's keys are field names, AND-ed; `{}` is always true;
+//  - a plain value is equality; an operator object holds `$eq $ne $in $lt
+//    $lte $gt $gte`, AND-ed (`$in` takes an array);
+//  - `$and` and `$or` take an array of objects, `$not` one object;
+//  - a string `"$user.<path>"` is the asking user's attribute (`Operand.Param`,
+//    condparam.bit), `"$$..."` is the literal text with one `$` dropped;
+//  - `{ "folder": { "$related": "editor" } }` is `Cond.Related` (condrelated.bit).
+//
+// EVERY MISTAKE IS AN InvalidPolicy THAT NAMES WHERE. `condFromJson` checks the
+// document against the resource it is for: the field must be one of its
+// columns (the message offers the closest name), the JSON value must fit the
+// column's type, an ordering needs an orderable column and an enum column
+// (`@enumVariants`) takes one of its variant names. The path in the message
+// reads `statements[0].when.$or[1].status`: the caller passes the prefix it
+// found the document under, `when` by default.
+//
+// BOUNDED. The document is admin input, so the walk is: objects nested deeper
+// than 16 and more than 256 nodes are refused. A node is every key of a
+// condition or operator object and every element of an array, `$in`'s values
+// included; the root costs nothing. No input can make it panic: a shape it
+// does not know is a refusal.
+//
+// NULL. `null` is refused for every field: comparing with NULL is never true
+// (`validate` refuses `Value.Null` for the same reason), so a stored `{ "tag":
+// null }` would silently never match. Numbers keep their kind: `3` is an
+// integer operand, `3.5` a float one, and a float column takes both.
+//
+// This file checks the document against the resource's columns only. That the
+// relation a `$related` names is declared is `Authz.validate`'s check, as for
+// a condition built in code.
+
+import { JsonEntry, jsonIsNull } from "std/json"
+
+const maxJsonDepth: int = 16
+const maxJsonNodes: int = 256
+const operatorNames: string = "$eq, $ne, $in, $lt, $lte, $gt, $gte, $related"
+
+// What one decode is working on: the resource, its row columns and the nodes
+// seen so far (the budget is shared by the whole document).
+class JsonWalk {
+  res: ResourceInfo,
+  cols: []FieldDesc,
+  nodes: int,
+}
+
+fn jsonBad(path: string, why: string): InvalidPolicy {
+  return InvalidPolicy{ detail = "${path}: ${why}" }
+}
+
+fn subPath(path: string, key: string): string {
+  return "${path}.${key}"
+}
+
+fn itemPath(path: string, i: int): string {
+  return "${path}[${i}]"
+}
+
+// What a JSON value is, for "got ..." in a message.
+fn jsonKind(j: Json): string {
+  return match (j) {
+    JsonNull => "null"
+    JsonBool(_) => "a bool"
+    JsonInt(_) => "an integer"
+    JsonFloat(_) => "a float"
+    JsonString(_) => "a string"
+    JsonArray(_) => "an array"
+    JsonObject(_) => "an object"
+  }
+}
+
+// Spends one node of the budget.
+fn charge(w: JsonWalk, path: string): ()! {
+  w.nodes = w.nodes + 1
+  if (w.nodes > maxJsonNodes) {
+    fail jsonBad(path, "more than ${maxJsonNodes} nodes in one condition")
+  }
+}
+
+fn min3(a: int, b: int, c: int): int {
+  let m = a
+  if (b < m) {
+    m = b
+  }
+  if (c < m) {
+    m = c
+  }
+  return m
+}
+
+// Edit distance between `a` and `b`, over two rows.
+fn editDistance(a: string, b: string): int {
+  let prev = []int(0)
+  let j = 0
+  while (j <= len(b)) {
+    prev = append(prev, j)
+    j = j + 1
+  }
+  let i = 0
+  while (i < len(a)) {
+    let cur = [i + 1]
+    j = 0
+    while (j < len(b)) {
+      let sub = prev[j]
+      if (a[i] != b[j]) {
+        sub = sub + 1
+      }
+      cur = append(cur, min3(prev[j + 1] + 1, cur[j] + 1, sub))
+      j = j + 1
+    }
+    prev = cur
+    i = i + 1
+  }
+  return prev[len(b)]
+}
+
+// The name in `cols` nearest to `field` within a few edits, or None.
+fn closestName(cols: []FieldDesc, field: string): Option<string> {
+  let best = Option<string>.None
+  let bestAt = 3
+  for c of cols {
+    let d = editDistance(c.name, field)
+    if (d < bestAt) {
+      best = Option<string>.Some(c.name)
+      bestAt = d
+    }
+  }
+  return best
+}
+
+fn noFieldError(res: ResourceInfo, cols: []FieldDesc, field: string, path: string): InvalidPolicy {
+  let near = closestName(cols, field)
+  let hint = "fields: ${fieldList(cols)}"
+  if (isSome(near)) {
+    hint = "closest: \"${unwrap(near)}\""
+  }
+  return jsonBad(path, "${res.name} has no field \"${field}\" (${hint})")
+}
+
+// The row column `field` names, or the refusal that says why it is none.
+fn columnFor(w: JsonWalk, field: string, path: string): FieldDesc! {
+  let col = columnOf(w.cols, field)
+  if (isSome(col)) {
+    return unwrap(col)
+  }
+  if (isSome(columnOf(w.res.columns, field))) {
+    fail jsonBad(
+      path,
+      "${field} is not a plain column; a relation takes { \"$related\": \"<relation>\" }",
+    )
+  }
+  fail noFieldError(w.res, w.cols, field, path)
+}
+
+fn variantsOf(f: FieldDesc): []string {
+  for a of f.attrs {
+    if (a.name == "enumVariants") {
+      return a.args
+    }
+  }
+  return []string(0)
+}
+
+fn isEnumField(f: FieldDesc): bool {
+  return hasAttr(f, "enumVariants")
+}
+
+fn isOptionType(typeName: string): bool {
+  let t = stripSpaces(typeName)
+  return unwrapOption(t) != t
+}
+
+fn nullRefusal(f: FieldDesc, path: string): InvalidPolicy {
+  if (isOptionType(f.typeName)) {
+    return jsonBad(path, "field ${f.name}: comparing with null is never true")
+  }
+  return jsonBad(path, "field ${f.name} is ${f.typeName} and cannot be null")
+}
+
+fn isVariant(variants: []string, s: string): bool {
+  for v of variants {
+    if (v == s) {
+      return true
+    }
+  }
+  return false
+}
+
+// An enum column takes only its variants.
+fn checkVariant(f: FieldDesc, v: Value, path: string): ()! {
+  if (!isEnumField(f)) {
+    return
+  }
+  match (v) {
+    Text(s) => {
+      let variants = variantsOf(f)
+      if (!isVariant(variants, s)) {
+        fail jsonBad(
+          path,
+          "field ${f.name}: \"${s}\" is not a variant (variants: ${join(variants, ", ")})",
+        )
+      }
+    }
+    _ => {}
+  }
+}
+
+// The literal `v` must be something the column holds.
+fn checkFits(f: FieldDesc, v: Value, path: string): ()! {
+  let k = unwrap(columnKind(f.typeName))
+  if (!sameKind(k, unwrap(operandKind(v)))) {
+    fail jsonBad(path, "field ${f.name} is ${f.typeName}, the value is ${kindName(v)}")
+  }
+  checkVariant(f, v, path)?
+}
+
+// A JSON scalar as the `Value` it states, None for null, an array or an object.
+fn scalarValue(j: Json): Option<Value> {
+  return match (j) {
+    JsonBool(b) => Option<Value>.Some(Value.Bool(b))
+    JsonInt(i) => Option<Value>.Some(Value.Int(i))
+    JsonFloat(x) => Option<Value>.Some(Value.Float(x))
+    JsonString(s) => Option<Value>.Some(Value.Text(s))
+    _ => Option<Value>.None
+  }
+}
+
+// The operand a scalar value stands for: text goes through `operandOf`, so a
+// placeholder and the `$$` escape read as they do everywhere else.
+fn operandFor(f: FieldDesc, j: Json, path: string): Operand! {
+  if (jsonIsNull(j)) {
+    fail nullRefusal(f, path)
+  }
+  let v = scalarValue(j)
+  if (!isSome(v)) {
+    fail jsonBad(path, "field ${f.name}: expected a value, got ${jsonKind(j)}")
+  }
+  let o = Operand.Lit(unwrap(v))
+  match (unwrap(v)) {
+    Text(s) => { o = operandOf(s) }
+    _ => {}
+  }
+  match (o) {
+    Param(p) => {
+      if (p == "") {
+        fail jsonBad(path, "the placeholder \"$user.\" names no attribute")
+      }
+    }
+    Lit(lit) => checkFits(f, lit, path)?
+  }
+  return o
+}
+
+fn orderRefusal(f: FieldDesc, path: string): InvalidPolicy {
+  if (isEnumField(f)) {
+    return jsonBad(path, "field ${f.name} is an enum, which cannot be ordered")
+  }
+  return jsonBad(path, "field ${f.name} is ${f.typeName}, which cannot be ordered")
+}
+
+fn operatorOf(key: string): Option<Op> {
+  if (key == "$eq") {
+    return Option<Op>.Some(Op.Eq)
+  }
+  if (key == "$ne") {
+    return Option<Op>.Some(Op.Ne)
+  }
+  if (key == "$in") {
+    return Option<Op>.Some(Op.In)
+  }
+  if (key == "$lt") {
+    return Option<Op>.Some(Op.Lt)
+  }
+  if (key == "$lte") {
+    return Option<Op>.Some(Op.Lte)
+  }
+  if (key == "$gt") {
+    return Option<Op>.Some(Op.Gt)
+  }
+  if (key == "$gte") {
+    return Option<Op>.Some(Op.Gte)
+  }
+  return Option<Op>.None
+}
+
+// `$in`: one or more values, each fitting the column.
+fn inCond(w: JsonWalk, f: FieldDesc, value: Json, path: string): Cond! {
+  let items = []Json(0)
+  match (value) {
+    JsonArray(js) => { items = js }
+    _ => fail jsonBad(path, "$in needs an array, got ${jsonKind(value)}")
+  }
+  if (len(items) == 0) {
+    fail jsonBad(path, "$in needs at least one value")
+  }
+  let operands = []Operand(0)
+  let i = 0
+  for item of items {
+    charge(w, itemPath(path, i))?
+    operands = append(operands, operandFor(f, item, itemPath(path, i))?)
+    i = i + 1
+  }
+  return Cond.Cmp(f.name, Op.In, operands)
+}
+
+// One `{ "<op>": value }` entry of an operator object.
+fn operatorCond(w: JsonWalk, f: FieldDesc, e: JsonEntry, path: string): Cond! {
+  let op = operatorOf(e.key)
+  if (!isSome(op)) {
+    fail jsonBad(path, "unknown operator \"${e.key}\" (operators: ${operatorNames})")
+  }
+  if (unwrap(op) == Op.In) {
+    return inCond(w, f, e.value, path)?
+  }
+  if (isOrdering(unwrap(op)) && (!orderable(unwrap(columnKind(f.typeName))) || isEnumField(f))) {
+    fail orderRefusal(f, path)
+  }
+  return Cond.Cmp(f.name, unwrap(op), [operandFor(f, e.value, path)?])
+}
+
+// `{ "$gte": 18, "$lt": 65 }`: every operator must hold.
+fn operatorsCond(w: JsonWalk, f: FieldDesc, entries: []JsonEntry, path: string): Cond! {
+  if (len(entries) == 0) {
+    fail jsonBad(
+      path,
+      "an operator object needs at least one operator (operators: ${operatorNames})",
+    )
+  }
+  let parts = []Cond(0)
+  for e of entries {
+    let p = subPath(path, e.key)
+    charge(w, p)?
+    parts = append(parts, operatorCond(w, f, e, p)?)
+  }
+  return and(parts)
+}
+
+fn hasKey(entries: []JsonEntry, key: string): bool {
+  for e of entries {
+    if (e.key == key) {
+      return true
+    }
+  }
+  return false
+}
+
+// `{ "folder": { "$related": "editor" } }`. `resolveRelated` finds the column
+// the relation field points through; its refusal is re-pathed here.
+fn relatedCond(w: JsonWalk, field: string, entries: []JsonEntry, path: string): Cond! {
+  let p = subPath(path, "$related")
+  if (len(entries) != 1) {
+    fail jsonBad(p, "$related is the whole value of a field, it takes no other operator")
+  }
+  charge(w, p)?
+  let relation = ""
+  match (entries[0].value) {
+    JsonString(s) => { relation = s }
+    _ => fail jsonBad(p, "$related needs a relation name, got ${jsonKind(entries[0].value)}")
+  }
+  if (relation == "") {
+    fail jsonBad(p, "$related needs a relation name")
+  }
+  if (!isSome(columnOf(w.res.columns, field))) {
+    fail noFieldError(w.res, w.res.columns, field, path)
+  }
+  return resolveRelated(w.res.columns, w.res.name, field, relation) catch e {
+    fail jsonBad(p, e.message())
+  }
+}
+
+// One `"field": value` entry of a condition object.
+fn fieldCond(w: JsonWalk, field: string, value: Json, path: string): Cond! {
+  match (value) {
+    JsonObject(entries) => {
+      if (hasKey(entries, "$related")) {
+        return relatedCond(w, field, entries, path)?
+      }
+      return operatorsCond(w, columnFor(w, field, path)?, entries, path)?
+    }
+    JsonArray(_) => fail jsonBad(path, "field ${field}: use { \"$in\": [...] } for a list")
+    _ => {}
+  }
+  let f = columnFor(w, field, path)?
+  return Cond.Cmp(f.name, Op.Eq, [operandFor(f, value, path)?])
+}
+
+// `$and` and `$or`: an array of condition objects.
+fn combineCond(w: JsonWalk, value: Json, path: string, depth: int, isAnd: bool): Cond! {
+  let items = []Json(0)
+  match (value) {
+    JsonArray(js) => { items = js }
+    _ => fail jsonBad(path, "expected an array of objects, got ${jsonKind(value)}")
+  }
+  let kids = []Cond(0)
+  let i = 0
+  for item of items {
+    charge(w, itemPath(path, i))?
+    kids = append(kids, objectCond(w, item, itemPath(path, i), depth + 1)?)
+    i = i + 1
+  }
+  if (isAnd) {
+    return and(kids)
+  }
+  return or(kids)
+}
+
+// One entry of a condition object: a combinator or a field.
+fn entryCond(w: JsonWalk, e: JsonEntry, path: string, depth: int): Cond! {
+  let p = subPath(path, e.key)
+  if (e.key == "$and" || e.key == "$or") {
+    return combineCond(w, e.value, p, depth, e.key == "$and")?
+  }
+  if (e.key == "$not") {
+    return not(objectCond(w, e.value, p, depth + 1)?)
+  }
+  if (hasPrefix(e.key, "$")) {
+    fail jsonBad(p, "unknown operator \"${e.key}\" (conditions: $and, $or, $not)")
+  }
+  return fieldCond(w, e.key, e.value, p)?
+}
+
+// A condition object: every entry must hold.
+fn objectCond(w: JsonWalk, j: Json, path: string, depth: int): Cond! {
+  if (depth > maxJsonDepth) {
+    fail jsonBad(path, "nested deeper than ${maxJsonDepth} levels")
+  }
+  let entries = []JsonEntry(0)
+  match (j) {
+    JsonObject(es) => { entries = es }
+    _ => fail jsonBad(path, "expected an object, got ${jsonKind(j)}")
+  }
+  let parts = []Cond(0)
+  for e of entries {
+    charge(w, subPath(path, e.key))?
+    parts = append(parts, entryCond(w, e, path, depth)?)
+  }
+  return and(parts)
+}
+
+// The condition the JSON document `j` states for resource `res`. `path` is
+// where the caller found `j`, and prefixes the path of every refusal.
+export fn condFromJson(res: ResourceInfo, j: Json, path: string = "when"): Cond! {
+  let w = JsonWalk{ res = res, cols = rowColumns(res.columns), nodes = 0 }
+  return objectCond(w, j, path, 1)?
+}
