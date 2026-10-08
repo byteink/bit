@@ -305,10 +305,36 @@
 explainMismatch() {
   case "$3" in
     types) explainLagTypes "$1" "$2"; return ;;
-    ir|iropt) explainIrLag "$1" "$2"; return ;;
+    ir|iropt)
+      explainIrLag "$1" "$2" && return 0
+      irLagPinned "$3" "${4:-}" && explainIrLagPin "$1" "$2"
+      return ;;
   esac
   return 1
 }
+
+# --- Per-file lag pins (#7671) ---
+#
+# 7574-f32-store-schedule-lag (`iropt` only). #7574 stores an f32 element inline, so the optimizer
+# of the working tree moves those stores relative to the guards of the reads that follow and shares
+# one slice_len between them; the pinned stage0 sees an opaque `rt_call slice_set` there and cannot.
+# golden (run_float32_interp, run_float_slice_elems, run_packed_narrow_slices) proves the output
+# right. A pin is `kind|file|reason`; it explains its file only when, with every line tied to an
+# []f32 slice deleted from both dumps (explainIrLagPin), the rest is identical, and a pinned file
+# that no longer needs the pin (it matches, or a declared signature explains it) fails the run as
+# STALE-PIN in selfhost-diffdump.sh. Removable at the stage0 repin (#6533). This is the one
+# per-file list the family has; #1883 deleted the last one, so an entry here needs a reason a
+# reader can check.
+irLagPins() {
+  printf '%s\n' \
+    'iropt|_tests_/cases/run_float32_interp.bit|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin' \
+    'iropt|_tests_/cases/run_float_slice_elems.bit|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin' \
+    'iropt|_tests_/cases/run_packed_narrow_slices.bit|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin'
+}
+# irLagPinned <kind> <file> -- 0 when the (kind, file) pair is pinned.
+irLagPinned() { irLagPins | awk -F'|' -v k="$1" -v f="${2:-}" '$1 == k && $2 == f { found = 1 } END { exit !found }'; }
+# irLagPinFiles <kind> -- the pinned files of that arm, one per line.
+irLagPinFiles() { irLagPins | awk -F'|' -v k="$1" '$1 == k { print $2 }'; }
 
 # declaredSignatureNames [ir|iropt|ast|fmt|types|diags] -- every name explainMismatch
 # CAN print for the given dump kind, one per line (#5509, extended by #5510).
@@ -322,10 +348,12 @@ explainMismatch() {
 declaredSignatureNames() {
   local types="7558-synth-json-alias-column-shift"
   local ir="7562-packed-halfword-slices 7574-packed-narrow-slices 7637-string-from-rune-range"
+  local lag="7574-f32-store-schedule-lag"
   case "${1:-}" in
     types) printf '%s\n' $types ;;
-    ir|iropt) printf '%s\n' $ir ;;
-    "") printf '%s\n' $types $ir ;;
+    ir) printf '%s\n' $ir ;;
+    iropt) printf '%s\n' $ir $lag ;;
+    "") printf '%s\n' $types $ir $lag ;;
   esac
   return 0
 }

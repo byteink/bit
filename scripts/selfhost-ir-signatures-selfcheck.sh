@@ -271,6 +271,48 @@ ${f32_chk/icmp_ult bool %2, %3/icmp_ult bool %3, %3}
 }" ir)" "ir: an f32 store whose guard tests another index"
 
 
+  # 7574-f32-store-schedule-lag: a per-file pin (irLagPins) for the optimizer moving the inline f32
+  # store past the next call. Accepted only for a pinned file on the iropt arm, and only when what is
+  # left after deleting every line tied to an []f32 slice is identical on both sides.
+  lag_o='bb0(%0: []f32, %1: f32, %9: i64):
+  %2 = const_int i64 0
+  %3 = bitcast u32 %1
+  %4 = const_int i64 8
+  %5 = rt_call slice_set(%0, %2, %3, %4) void
+  %6 = rt_call string_from_int(%9) string
+  ret'
+  lag_t='bb0(%0: []f32, %1: f32, %9: i64):
+  %2 = const_int i64 0
+  %6 = rt_call string_from_int(%9) string
+  %3 = slice_len %0
+  %4 = icmp_ult bool %2, %3
+  br %4, bb1(), bb2()
+bb2():
+  %5 = const_string "index out of range"
+  %7 = rt_call panic(%5) void
+  unreachable
+bb1():
+  %10 = field_get %0[0] i64
+  %11 = field_get %0[16] i64
+  %12 = add i64 %11, %2
+  index_set %10[%12] = %1
+  ret'
+  lag_pin=_tests_/cases/run_float32_interp.bit
+  lag_want="7574-f32-store-schedule-lag"
+  lag() { explainMismatch "func g() void {
+$1
+}" "func g() void {
+$2
+}" "$3" "$4"; }
+  expect "$lag_want" "$(lag "$lag_o" "$lag_t" iropt "$lag_pin")" "iropt: a pinned file, the store scheduled past a call"
+  expect "" "$(lag "$lag_o" "$lag_t" iropt _tests_/cases/run_float32_interp_other.bit)" "iropt: the same diff in an unpinned file"
+  expect "" "$(lag "$lag_o" "$lag_t" ir "$lag_pin")" "ir: the pin is for the iropt arm only"
+  expect "" "$(lag "$lag_o" "${lag_t/string_from_int/string_from_uint}" iropt "$lag_pin")" "iropt: a pinned file whose diff also changes an unrelated call"
+  expect "" "$(lag "$lag_o" "$(printf '%s\n' "$lag_t" | sed '/string_from_int/d')" iropt "$lag_pin")" "iropt: a pinned file whose diff also drops an unrelated line"
+  expect "" "$(lag "$lag_o" "$(printf '%s\n' "$lag_t" | sed 's/^  %6 = rt_call string_from_int(%9) string$/  %6 = rt_call string_from_int(%1) string/')" iropt "$lag_pin")" "iropt: a pinned file whose unrelated call takes another operand"
+  expect "$lag_want" "$(lag "$lag_o" "$lag_t" iropt _tests_/cases/run_float_slice_elems.bit)" "iropt: the second pinned file"
+  expect "$lag_want" "$(lag "$lag_o" "$lag_t" iropt _tests_/cases/run_packed_narrow_slices.bit)" "iropt: the third pinned file"
+
   # 7637-string-from-rune-range: string(rs[lo:hi]) on a []rune.
   rr_o='func f(%0: []i32, %1: i64, %2: i64) string {
 bb0(%0: []i32, %1: i64, %2: i64):
@@ -299,8 +341,8 @@ bb0(%0: []i32, %1: i64, %2: i64):
   # one line, so `print "…"` no longer always starts the line) -- safe
   # against a false match inside `printf` because that is followed by `f`
   # then a SINGLE quote, never `print` immediately followed by a `"`.
-  want=$(grep -hoE 'print "[0-9]+-[a-z-]+"' "${ROOT}/scripts/selfhost-ir-signatures.sh" "${ROOT}/scripts/ir-signatures-walk.sh" |
-    grep -oE '"[0-9]+-[a-z-]+"' | tr -d '"' | LC_ALL=C sort -u)
+  want=$(grep -hoE 'print "[0-9]+-[a-z0-9-]+"' "${ROOT}/scripts/selfhost-ir-signatures.sh" "${ROOT}/scripts/ir-signatures-walk.sh" |
+    grep -oE '"[0-9]+-[a-z0-9-]+"' | tr -d '"' | LC_ALL=C sort -u)
   if [ "$got" != "$want" ]; then
     echo "FAIL: declaredSignatureNames() is out of sync with explainMismatch's print statements"
     echo "  declaredSignatureNames(): $(printf '%s' "$got" | tr '\n' ' ')"

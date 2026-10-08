@@ -282,11 +282,11 @@ function tmplAt(i,   a, b, c, h, d, e, v, f, s, j, r, n, t, l, x, et, w, ix) {
   s = x; sub(/^[^,]*, /, "", s); sub(/\(\)$/, "", s)
   if (L[i + 4] != f "():") { return 0 }
   d = dst(L[i + 5])
-  if (L[i + 5] != "  " d " = field_get " h "[0] i64") { return 0 }
+  if (L[i + 5] != "  " d " = field_get " h "[0] i64" && L[i + 5] != "  " d " = f32buf " h) { return 0 }
   e = dst(L[i + 6])
   sh = 0
   ix = "[{add i64 " e ", " a "}]"
-  if (L[i + 6] != "  " e " = field_get " h "[16] i64") {
+  if (L[i + 6] != "  " e " = field_get " h "[16] i64" && L[i + 6] != "  " e " = f32off " h) {
     sh = 1
     ix = "[" a "]"
   }
@@ -414,6 +414,73 @@ function flush(   i, m, c, d, S, idx, v, q, r, inner, pfx) {
 /^func /{ flush(); print; next }
 { L[++n0] = $0 }
 END { flush() }'
+  IR_LAG_AWK='# The per-file lag pin check (#7671), both sides, after IR_F32_AWK. It deletes every line tied to an
+# []f32 slice, and nothing else, and erases the ordinals: the f32 stores and loads, the slice_len /
+# icmp_ult / br guard on such a slice with its panic block, the buffer and offset field_gets, the f32
+# element reads and the f32 constants. The two texts that remain must be equal, so any other line
+# that differs, moves or disappears, or takes another operand, keeps the file unexplained (the
+# ordinals left are renumbered by first appearance, so an operand is compared by identity). A slice is an []f32 one when a
+# surviving f32_store/f32_load names it.
+function dst(l) { sub(/^  /, "", l); sub(/ = .*$/, "", l); return l }
+function opd(x,   p) { split(x, p, /[\[ ,)]/); return p[1] }
+function slOf(l,   t) {
+  t = l
+  if (sub(/^  f32_store /, "", t) || sub(/^  \$[0-9]+ = f32_load /, "", t)) { sub(/\[.*$/, "", t); return t }
+  return ""
+}
+function mapTok(s, re, pre,   out, tok) {
+  out = ""
+  while (match(s, re)) {
+    tok = substr(s, RSTART, RLENGTH)
+    if (!(tok in M)) { M[tok] = pre (cnt[pre]++) }
+    out = out substr(s, 1, RSTART - 1) M[tok]
+    s = substr(s, RSTART + RLENGTH)
+  }
+  return out s
+}
+function flush(   i, S, x, b, ok, bad, t, n, inpan, keep, a1, a2, c) {
+  for (i = 1; i <= n0; i++) { S = slOf(L[i]); if (S != "") { F[S] = 1 } }
+  for (i = 1; i <= n0; i++) {
+    keep[i] = 1
+    t = L[i]
+    if (slOf(t) != "") { keep[i] = 0; continue }
+    if (t ~ /^  \$[0-9]+ = field_get \$[0-9]+\[(0|16)\] i64$/) {
+      x = dst(t); S = t; sub(/^.* = field_get /, "", S); sub(/\[.*$/, "", S)
+      if (S in F) { keep[i] = 0; if (t ~ /\[0\] i64$/) { BUFD[x] = 1 } }
+    } else if (t ~ /^  \$[0-9]+ = slice_len \$[0-9]+$/) {
+      S = t; sub(/^.* = slice_len /, "", S)
+      if (S in F) { keep[i] = 0; LEN[dst(t)] = 1 }
+    } else if (t ~ /^  \$[0-9]+ = icmp_ult bool /) {
+      a1 = t; sub(/^.* = icmp_ult bool /, "", a1); c = index(a1, ", "); a2 = substr(a1, c + 2); a1 = substr(a1, 1, c - 1)
+      if ((a1 in LEN) || (a2 in LEN)) { keep[i] = 0; CMP[dst(t)] = 1 }
+    } else if (t ~ /^  br \$[0-9]+, bb[0-9]+\(\), bb[0-9]+\(\)$/) {
+      x = t; sub(/^  br /, "", x); b = x; sub(/,.*$/, "", b)
+      if (b in CMP) {
+        sub(/^[^,]*, /, "", x); ok = x; sub(/\(\), .*$/, "", ok); bad = x; sub(/^[^,]*, /, "", bad); sub(/\(\)$/, "", bad)
+        keep[i] = 0; DROPL[ok] = 1; DROPL[bad] = 1; PAN[bad] = 1
+      }
+    } else if (t ~ /^  \$[0-9]+ = index_get \$[0-9]+\[.*\] f32$/ || t ~ /^  \$[0-9]+ = field_get \$[0-9]+\[0\] f32$/) {
+      x = t; sub(/^.* = (index_get|field_get) /, "", x); sub(/\[.*$/, "", x)
+      if (x in BUFD) { keep[i] = 0 }
+    } else if (t ~ /^  \$[0-9]+ = const_float f32 /) { keep[i] = 0 }
+  }
+  inpan = 0
+  for (i = 1; i <= n0; i++) {
+    t = L[i]
+    if (t ~ /^bb[0-9]+\(\):$/) {
+      x = t; sub(/\(\):$/, "", x)
+      inpan = ((x in PAN) ? 1 : 0)
+      if (x in DROPL) { continue }
+    } else if (inpan && (t ~ /^  \$[0-9]+ = rt_call panic\(\{const_string "index out of range"\}\) void$/ || t == "  unreachable")) { continue }
+    else { inpan = 0 }
+    if (!keep[i]) { continue }
+    print mapTok(mapTok(t, "\\$[0-9]+", "$"), "bb[0-9]+", "bb")
+  }
+  n0 = 0; delete L; delete F; delete BUFD; delete LEN; delete CMP; delete DROPL; delete PAN; delete keep; delete M; delete cnt
+}
+/^func /{ flush(); print; next }
+{ L[++n0] = $0 }
+END { flush() }'
   IR_RENUM_AWK='# Stage 3, both sides: `$k` and `bbN` renumbered to first-appearance order, per function.
 function mapTok(s, re, pre,   out, tok) {
   out = ""
@@ -480,6 +547,19 @@ irTrial() {
   # shellcheck disable=SC2086
   t=$(canon_ir_ids "$2" | LC_ALL=C awk $f -v side=tree "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk $f "${IR_PW_AWK}${IR_FOLD_AWK}" | LC_ALL=C awk "${IR_F32_AWK}" | LC_ALL=C awk "${IR_RENUM_AWK}") || return 1
   printf '%s\n@@@BIT2@@@\n%s\n' "${o}" "${t}" | LC_ALL=C awk -v which="$6" "${IR_CMP_AWK}"
+}
+
+# explainIrLagPin <oracle_text> <bit2_text> -- the per-file lag pin (#7671, selfhost-ir-signatures.sh
+# irLagPins): prints the signature when, with every line tied to an []f32 slice deleted from both
+# normalized dumps, what is left is identical. The caller has already checked the file is pinned.
+explainIrLagPin() {
+  local o t f="-v half=1 -v narrow=1 -v rune=0"
+  irWalkAwk
+  # shellcheck disable=SC2086
+  o=$(canon_ir_ids "$1" | LC_ALL=C awk $f -v side=oracle "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk "${IR_F32_AWK}" | LC_ALL=C awk "${IR_LAG_AWK}") || return 1
+  # shellcheck disable=SC2086
+  t=$(canon_ir_ids "$2" | LC_ALL=C awk $f -v side=tree "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk $f "${IR_PW_AWK}${IR_FOLD_AWK}" | LC_ALL=C awk "${IR_F32_AWK}" | LC_ALL=C awk "${IR_LAG_AWK}") || return 1
+  [ -n "${o}" ] && [ "${o}" = "${t}" ] && awk 'BEGIN { print "7574-f32-store-schedule-lag" }'
 }
 
 # explainIrLag <oracle_text> <bit2_text> -- prints the signature name and returns 0 when the two
