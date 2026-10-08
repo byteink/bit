@@ -1,0 +1,417 @@
+// stdlib/http/cancel.bit — cancel an in-flight request (#6602).
+//
+// One token type, `Cancel`. Put it on `ClientRequest.cancel`, hand the same
+// token to another task, and `cancel()` from there makes the request fail
+// within one scheduler turn instead of waiting for the server:
+//
+//   let stop = Cancel()
+//   spawn watchdog(stop)                      // calls stop.cancel() later
+//   let res = client.send(ClientRequest{ url = url, cancel = Option.Some(stop) })
+//
+// Industry shape: Go's `context.WithCancel`, .NET's `CancellationToken`,
+// fetch's `AbortSignal`. A token is one-shot and idempotent; any number of
+// requests may share it, and `cancel()` stops all of them. A token that is
+// cancelled before `send` fails the request at once, before anything is
+// dialed.
+//
+// What stops, and how:
+//
+//   * connect         the dial runs on its own task and the request waits on it
+//                     and on the token; a dial that finishes after the cancel
+//                     closes its own socket;
+//   * TLS handshake   the TCP connection is registered with the token for the
+//                     whole handshake; `cancel()` shuts it and the handshake
+//                     read fails;
+//   * response head   the request's connection is registered from the first
+//                     byte written; `cancel()` shuts it, which wakes the read
+//                     that is parked on it (`byteStream.forceClose`);
+//   * response body   the same registration lives as long as the `BodyReader`
+//                     is open; the pending `read` fails.
+//
+// Every one of them fails with `Cancelled`, found with `isCancelled(e)`: a
+// request fails with a `RequestError` (`sent` says whether the server may have
+// the request) whose `cause` is the `Cancelled`, a `BodyReader.read` fails with
+// the bare `Cancelled`. A connection a cancel touched is shut and is never
+// returned to the idle pool.
+//
+// A request with a token is HTTP/1.1 only, as a streamed one is: ALPN offers
+// `http/1.1`, it never joins the shared HTTP/2 connection (closing that would
+// cancel other requests), it never upgrades to HTTP/3 and an `https+h3://` URL
+// is refused.
+//
+// `Mutex`, `byteStream`, `netStream`, `tlsStream`, `Conn`, `TlsConfig`,
+// `Client`, `ClientRequest`, `Response`, `Url`, `RequestError`, `dialConn`,
+// `http1Only`, `openStream`, `followed`, `requestTimeoutTls`, `settle`,
+// `mergeHeaders`, `serializeHeaders`, `textBody`, `parseUrl`, `unsentError`
+// and `newError` are siblings or module-wide imports (SPEC §19).
+import { client as tlsClient } from "std/tls"
+
+// The error a cancelled request fails with. `op` is "send" (connect,
+// handshake, request and response head) or "read" (one `BodyReader.read`).
+export class Cancelled {
+  export op: string
+
+  export message(): string {
+    return "http: ${this.op} cancelled"
+  }
+}
+
+// Whether `e` is a cancellation: a bare `Cancelled`, or a `RequestError` whose
+// `cause` is one.
+export fn isCancelled(e: error): bool {
+  let (_, bare) = e.(Cancelled)
+  if (bare) {
+    return true
+  }
+  let (r, wrapped) = e.(RequestError)
+  if (!wrapped) {
+    return false
+  }
+  let (_, inner) = r.cause.(Cancelled)
+  return inner
+}
+
+// A connection a request has open, which `cancel()` shuts; `hit` says it did.
+class liveConn {
+  id: int,
+  stream: byteStream,
+  hit: bool,
+}
+
+// A request waiting for a dial, woken by `cancel()`.
+class dialWait {
+  id: int,
+  wake: chan<int>,
+}
+
+// The cancellation token. Create it with `Cancel()`, give it to the requests
+// with `ClientRequest.cancel`, call `cancel()` from any task.
+export class Cancel {
+  mu: Mutex
+  fired: bool
+  next: int
+  live: []liveConn
+  waits: []dialWait
+
+  init() {
+    this.mu = Mutex()
+    this.fired = false
+    this.next = 1
+    this.live = []liveConn(0)
+    this.waits = []dialWait(0)
+  }
+
+  // Cancels every request holding this token, and every later one. Safe from
+  // any task, any number of times; the second and later calls do nothing. Does
+  // not block: the connections are shut, not drained.
+  export cancel() {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (this.fired) {
+      return
+    }
+    this.fired = true
+    // Under the lock, so a request that is leaving (`release`) has finished
+    // before its stream is shut, and one that has left is never touched.
+    for l of this.live {
+      l.hit = true
+      l.stream.forceClose()
+    }
+    for w of this.waits {
+      w.wake <- 1
+    }
+  }
+
+  // Whether `cancel()` has been called.
+  export cancelled(): bool {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.fired
+  }
+
+  // Registers `s` so `cancel()` shuts it; fails with `Cancelled` when the token
+  // is already cancelled (the caller then shuts `s`). Returns the id for
+  // `leave`.
+  watch(s: byteStream): int! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (this.fired) {
+      fail Cancelled{ op = "send" }
+    }
+    let id = this.next
+    this.next = id + 1
+    this.live = append(this.live, liveConn{ id = id, stream = s, hit = false })
+    return id
+  }
+
+  // Unregisters `id`; whether `cancel()` shut that stream while it was
+  // registered. After this returns `cancel()` can no longer touch the stream.
+  leave(id: int): bool {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let keep = []liveConn(0)
+    let hit = false
+    for l of this.live {
+      if (l.id == id) {
+        hit = l.hit
+      } else {
+        keep = append(keep, l)
+      }
+    }
+    this.live = keep
+    return hit
+  }
+
+  // Whether `cancel()` has shut the stream registered as `id`.
+  isHit(id: int): bool {
+    this.mu.lock()
+    defer this.mu.unlock()
+    for l of this.live {
+      if (l.id == id) {
+        return l.hit
+      }
+    }
+    return false
+  }
+
+  // Has `wake` receive one value when the token is cancelled (at once when it
+  // already is); `wake` needs room for it. Returns the id for `unwait`.
+  wait(wake: chan<int>): int {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let id = this.next
+    this.next = id + 1
+    if (this.fired) {
+      wake <- 1
+      return id
+    }
+    this.waits = append(this.waits, dialWait{ id = id, wake = wake })
+    return id
+  }
+
+  // Stops waiting for `id`.
+  unwait(id: int) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let keep = []dialWait(0)
+    for w of this.waits {
+      if (w.id != id) {
+        keep = append(keep, w)
+      }
+    }
+    this.waits = keep
+  }
+}
+
+// One request's registration of its current connection with its token, if it
+// has a token. `id` is 0 when nothing is registered. A class so the reader that
+// outlives `send` keeps the registration the dial made.
+class connWatch {
+  cancel: Option<Cancel>
+  id: int
+  // Whether the registration ended with the connection shut by `cancel()`.
+  hitSeen: bool
+
+  // Registers `s`, failing with `Cancelled` when the token is already cancelled.
+  attach(s: byteStream): ()! {
+    match (this.cancel) {
+      Some(tok) => { this.id = tok.watch(s)? }
+      None => {}
+    }
+  }
+
+  // Whether `cancel()` has shut the registered connection.
+  hit(): bool {
+    match (this.cancel) {
+      Some(tok) => {
+        if (this.id == 0) {
+          return this.hitSeen
+        }
+        return tok.isHit(this.id)
+      }
+      None => { return false }
+    }
+  }
+
+  // Unregisters; whether `cancel()` shut the connection. Idempotent. The caller
+  // shuts or parks the connection only after this.
+  release(): bool {
+    if (this.id == 0) {
+      return this.hitSeen
+    }
+    match (this.cancel) {
+      Some(tok) => { this.hitSeen = tok.leave(this.id) }
+      None => {}
+    }
+    this.id = 0
+    return this.hitSeen
+  }
+}
+
+// A watch for a request whose extras carry `cancel` (none registered yet).
+fn watchOf(cancel: Option<Cancel>): connWatch {
+  return connWatch{ cancel = cancel, id = 0, hitSeen = false }
+}
+
+// `e` as the failure of a request whose token was cancelled: a `RequestError`
+// with the `Cancelled` as cause, `sent` kept. `e` itself when the token is not
+// cancelled.
+fn cancelOr(tok: Cancel, e: error): error {
+  if (!tok.cancelled()) {
+    return e
+  }
+  let (r, ok) = e.(RequestError)
+  if (ok) {
+    return RequestError{ sent = r.sent, cause = Cancelled{ op = "send" } }
+  }
+  return RequestError{ sent = false, cause = Cancelled{ op = "send" } }
+}
+
+// What a dial task hands back: the connection, or why there is none.
+class dialOut {
+  conn: Option<Conn>,
+  msg: string,
+}
+
+// One dial running on its own task, and the hand-over of its result. `abandon`
+// and `finish` race; whichever comes second closes a connection the first left
+// without an owner.
+class dialJob {
+  mu: Mutex
+  out: chan<dialOut>
+  sent: bool
+  abandoned: bool
+
+  finish(o: dialOut) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (this.abandoned) {
+      closeDialed(o)
+      return
+    }
+    this.sent = true
+    this.out <- o
+  }
+
+  abandon() {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.abandoned = true
+    if (this.sent) {
+      closeDialed(<- this.out)
+    }
+  }
+}
+
+fn closeDialed(o: dialOut) {
+  match (o.conn) {
+    Some(c) => { c.close() }
+    None => {}
+  }
+}
+
+fn dialTask(job: dialJob, u: Url, deadline: int) {
+  let c = dialConn(u, deadline) catch e {
+    job.finish(dialOut{ conn = Option.None, msg = e.message() })
+    return
+  }
+  job.finish(dialOut{ conn = Option.Some(c), msg = "" })
+}
+
+// A TCP connection to `u`'s origin, bounded by `deadline` (0 = none) and by
+// `tok`: the dial runs on its own task so a cancel does not wait for the
+// kernel's connect. A dial that completes after the cancel is closed by its own
+// task.
+fn dialRaced(u: Url, tok: Cancel, deadline: int): Conn! {
+  let job = dialJob{ mu = Mutex(), out = chan<dialOut>(1), sent = false, abandoned = false }
+  let wake = chan<int>(1)
+  let id = tok.wait(wake)
+  spawn dialTask(job, u, deadline)
+  let cancelled = false
+  let got = dialOut{ conn = Option.None, msg = "" }
+  select {
+    case o = <- job.out:
+      got = o
+    case _ = <- wake:
+      cancelled = true
+  }
+  tok.unwait(id)
+  if (cancelled) {
+    job.abandon()
+    fail Cancelled{ op = "send" }
+  }
+  match (got.conn) {
+    Some(c) => { return c }
+    None => { fail newError(got.msg) }
+  }
+}
+
+// A connection to `u`'s origin for a request under `tok`, over TLS (HTTP/1.1
+// only) for https. The TCP connection is registered with the token for the
+// whole handshake, so a cancel there shuts it and the handshake fails.
+fn dialCancellable(u: Url, cfg: TlsConfig, tok: Cancel, deadline: int): byteStream! {
+  let conn = dialRaced(u, tok, deadline)?
+  if (!u.https) {
+    return netStream{ conn = conn }
+  }
+  let w = watchOf(Option.Some(tok))
+  w.attach(netStream{ conn = conn }) catch e {
+    conn.close()
+    fail e
+  }
+  let tc = tlsClient(conn, u.host, cfg) catch e {
+    w.release()
+    fail cancelOr(tok, e)
+  }
+  if (w.release()) {
+    tc.close()
+    fail Cancelled{ op = "send" }
+  }
+  return tlsStream{ conn = tc }
+}
+
+// `Client.send(req)` for a request carrying `tok` (client.bit): the same
+// request, HTTP/1.1 only and registered with the token on every connection it
+// uses. Streamed or buffered; a buffered one follows redirects as
+// `Client.request` does, each hop under the token.
+fn sendWithCancel(c: Client, req: ClientRequest, tok: Cancel, stream: bool): Response! {
+  if (tok.cancelled()) {
+    fail unsentError(Cancelled{ op = "send" })
+  }
+  let u = parseUrl(req.url)?
+  if (u.h3) {
+    fail newError("send: https+h3:// cannot be cancelled")
+  }
+  let extras = c.extrasWith(serializeHeaders(mergeHeaders(c.headers, req.headers))?)
+  // Fresh and empty: an Alt-Svc a response advertises must not send a later hop
+  // over HTTP/3, which the token cannot reach.
+  extras.h3Ports = map<string, int>()
+  extras.cancel = Option.Some(tok)
+  if (stream) {
+    let res = openStream(req.method, u, textBody(req.body), extras, req.timeoutMs) catch e {
+      fail cancelOr(tok, e)
+    }
+    res.url = req.url
+    return res
+  }
+  let res = sendBuffered(req, extras) catch e {
+    fail cancelOr(tok, e)
+  }
+  return res
+}
+
+// The buffered half of `sendWithCancel`.
+fn sendBuffered(req: ClientRequest, extras: RequestExtras): Response! {
+  if (req.timeoutMs > 0) {
+    return requestTimeoutTls(req.method, req.url, textBody(req.body), req.timeoutMs, extras)?
+  }
+  return followed(req.method, req.url, textBody(req.body), extras)?
+}
+
+// A redirect hop of a request under a token may not leave HTTP/1.1: `next` over
+// HTTP/3 is refused (`planHop`, redirect.bit).
+fn refuseCancelledH3(next: Url, extras: RequestExtras): ()! {
+  if (next.h3 && isSome(extras.cancel)) {
+    fail newError("redirect to ${urlString(next)}: a cancellable request is HTTP/1.1 only")
+  }
+}

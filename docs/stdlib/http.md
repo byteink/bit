@@ -264,6 +264,98 @@ fn head(c: Client, url: string, n: int): string! {
 }
 ```
 
+### Cancelling a request
+
+A timeout answers "the server took too long". Sometimes the reason to stop is
+yours: the reader closed the tab, the export a page asked for is no longer
+wanted, a sibling upload failed and its other parts are now wasted work.
+`Cancel` is the token for that, the same shape as Go's `context.WithCancel`,
+.NET's `CancellationToken` and fetch's `AbortSignal`. Put one on
+`ClientRequest.cancel`, hand the same token to another task, and `cancel()`
+from there fails the request at once, in whichever phase it is waiting:
+
+```bit
+import { Client, ClientRequest, Cancel, isCancelled } from "std/http"
+import { sleep } from "std/time"
+
+// Calls `stop.cancel()` after `ms` milliseconds.
+fn stopAfter(stop: Cancel, ms: int) {
+  sleep(ms * 1000000)
+  stop.cancel()
+}
+
+// The text of Inkwell's export at `url`, or "" when it was cancelled first.
+fn fetchExport(c: Client, url: string, stop: Cancel): string! {
+  let res = c.send(ClientRequest{ url = url, cancel = Option.Some(stop) }) catch e {
+    if (isCancelled(e)) {
+      return ""
+    }
+    fail e
+  }
+  return res.body
+}
+
+fn main() {
+  let stop = Cancel()
+  spawn stopAfter(stop, 5000)
+  let text = fetchExport(Client(), "http://127.0.0.1:8080/export", stop) catch _ {
+    return
+  }
+  println("${len(text)} bytes")
+}
+```
+
+The request fails within one scheduler turn of the `cancel()` call, not after
+the server's next byte: while the connection is being made, during the TLS
+handshake, while the response head is awaited, and in the middle of a body. A
+buffered `send` fails with a `RequestError` whose `cause` is a `Cancelled`
+(`sent` says whether the server may have the request), and a streamed one is
+the same until the head has arrived. After that, the pending `BodyReader.read`
+fails with the bare `Cancelled`, whose `op` is `"read"`:
+
+```bit
+import { Client, ClientRequest, Cancel, Cancelled } from "std/http"
+
+// How many bytes of `url`'s body arrived before `stop` was cancelled.
+fn countUntilStopped(c: Client, url: string, stop: Cancel): int! {
+  let res = c.send(ClientRequest{ url = url, cancel = Option.Some(stop) }, stream = true)?
+  let body = unwrap(res.reader)
+  defer body.close()
+  let total = 0
+  while (!stop.cancelled()) {
+    let piece = body.read(65536) catch e {
+      let (ce, ok) = e.(Cancelled)
+      if (ok && ce.op == "read") {
+        return total
+      }
+      fail e
+    }
+    if (len(piece) == 0) {
+      return total
+    }
+    total = total + len(piece)
+  }
+  return total
+}
+```
+
+`isCancelled(e)` is true for both shapes, so one check covers a request and
+its reader. A cancelled body never reads as a complete, shorter one: a
+read-to-close response cut by the cancel fails too. The connection a cancel
+touched is shut and never returns to the client's pool.
+
+A token is one-shot and `cancel()` is safe to call again and from any task. One
+token can be on any number of requests (an upload's parts, say) and stops all
+of them. A token cancelled before `send` fails the request before anything is
+dialed, with `sent` false. A request that already finished is unaffected: its
+connection stays pooled.
+
+A request with a token is HTTP/1.1 only, as a streamed one is: it never joins
+the shared HTTP/2 connection (closing that would cancel other requests), never
+upgrades to HTTP/3, and an `https+h3://` URL, or a redirect to one, fails. A
+`Client.send` that waits for a free connection under `maxConnsPerHost` is not
+woken by `cancel()`; it stays bound by `timeoutMs`.
+
 ### A client that reuses connections
 
 The package-level functions above share one connection pool for the whole
@@ -602,6 +694,8 @@ starting from exactly the handler shown above.
 | a response over the body-size budget (32 MiB default) | the call fails before the bytes are read |
 | a `BodyReader` neither read to the end nor closed | its connection and its `maxConnsPerHost` slot stay held - `close()` it |
 | a `BodyReader` closed after a partial read | its connection is shut, never reused |
+| `Cancel.cancel()` on a request in flight | it fails with `Cancelled` and its connection is shut, never pooled |
+| a request with a `Cancel` | HTTP/1.1 only: no shared h2 connection, no HTTP/3 |
 | a redirect to another host, port or scheme | `Authorization`, `Cookie`, `Proxy-Authorization` and `WWW-Authenticate` are dropped, defaults included |
 | a redirect from `https` to `http` | the call fails - opt in with `RedirectAllow.Downgrade` |
 | a `307` or `308` with a body to another origin | the call fails - opt in with `RedirectAllow.ReplayBody` |
@@ -806,9 +900,11 @@ As `Client.request`, bounded by one deadline.
 
 A request for `Client.send`: `method` (`"GET"` by default), `url`, `headers`
 (`[]Header`, layered onto the client's own as `Client.requestWith` does),
-`body` (`""` by default) and `timeoutMs` (`0`, no bound, by default): the bound
+`body` (`""` by default), `timeoutMs` (`0`, no bound, by default): the bound
 in milliseconds on the connect, the response head and each body `read` of a
-streamed response.
+streamed response, and `cancel` (`Option<Cancel>`, none by default): the token
+that stops the request from another task. See [Cancelling a
+request](#cancelling-a-request).
 
 ### `RequestError`
 
@@ -831,6 +927,36 @@ the bound.
 ### `TimeoutError.message(): string`
 
 `"http: send timed out after 500 ms"` or `"http: read timed out after 500 ms"`.
+
+### `Cancel`
+
+The cancellation token, made with `Cancel()`. Set it on `ClientRequest.cancel`
+and call `cancel()` from any task to fail every request that holds it. One-shot:
+a cancelled token stays cancelled.
+
+### `Cancel.cancel()`
+
+Cancels every request holding the token, whatever phase it is in, and every
+later one. Shuts their connections, which never return to a pool. Safe from any
+task and idempotent; does not block.
+
+### `Cancel.cancelled(): bool`
+
+Whether `cancel()` has been called.
+
+### `Cancelled`
+
+The error a cancelled request fails with, as the `cause` of a `RequestError` for
+`Client.send` and bare for `BodyReader.read`: `op` is `"send"` (connect,
+handshake, request, head) or `"read"` (one `BodyReader.read`).
+
+### `Cancelled.message(): string`
+
+`"http: send cancelled"` or `"http: read cancelled"`.
+
+### `isCancelled(e: error): bool`
+
+Whether `e` is a `Cancelled`, bare or the `cause` of a `RequestError`.
 
 ### `Client.send(req: ClientRequest, stream: bool = false): Response!`
 

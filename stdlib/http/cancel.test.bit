@@ -1,0 +1,321 @@
+// stdlib/http/cancel.test.bit — `Cancel` (cancel.bit, #6602): a cancel from
+// another task fails an in-flight request within 100 ms, in every phase a
+// request waits in, with `Cancelled`, and no connection it touched is parked.
+//
+// Same module as cancel.bit and bodyreaderpool.test.bit (SPEC §19): `Client`,
+// `ClientRequest`, `RequestError`, `kaStart`/`kaStartTls`/`kaPlanOf`/`kaFixed`/
+// `kaUrl`/`kaOrigin`, `readerOf`, `tls5916ClientConfig`, `AtomicI64`,
+// `monotonic`, `sleep`, `repeat` and `indexOf` are bound module-wide, so nothing
+// is imported but the load scale.
+//
+// The bound is 100 ms from the `cancel()` call to the failure, scaled by the
+// host's load like every other timing gate (`scaledBudgetMs`,
+// _tests_/bit/loadscale/loadscale.bit): at or under one run-queue entry per
+// core the scale is 1 and the bound is exactly 100 ms; on a loaded host the
+// scheduler may hold the woken task off a CPU, which is not what these tests own.
+import { loadProbe, scaledBudgetMs } from "../../_tests_/bit/loadscale"
+
+// Wait this long before cancelling, so the request is parked in its phase.
+const cancelDelayMs: int = 50
+
+fn boundMs(): int {
+  return scaledBudgetMs(100, loadProbe())
+}
+
+// Cancels `tok` after `delayMs`, recording the instant it did.
+fn cancelLater(tok: Cancel, delayMs: int, at: AtomicI64) {
+  sleep(delayMs * 1000000)
+  at.store(monotonic().ns)
+  tok.cancel()
+}
+
+fn startCancel(tok: Cancel): AtomicI64 {
+  let at = AtomicI64(0)
+  spawn cancelLater(tok, cancelDelayMs, at)
+  return at
+}
+
+// The ms from the cancel call to now, asserted within the bound.
+fn assertWithin(at: AtomicI64, what: string) {
+  let ms = (monotonic().ns - at.load()) / 1000000
+  let bound = boundMs()
+  assert(at.load() != 0, "${what}: failed before the cancel was called")
+  assert(ms <= bound, "${what}: failed ${ms} ms after the cancel, bound ${bound} ms")
+}
+
+fn silentPlan(): kaPlan {
+  let plan = kaFixed("never")
+  plan.silent = true
+  return plan
+}
+
+fn stallPlan(head: string): kaPlan {
+  let plan = kaPlanOf(head, repeat("s", 100))
+  plan.part = 10
+  return plan
+}
+
+fn assertCancelled(e: error, what: string) {
+  assert(isCancelled(e), "${what}: failed with '${e.message()}', not Cancelled")
+}
+
+test "a token cancelled before send fails the request at once and dials nothing" {
+  let o = kaStart(silentPlan()) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let tok = Cancel()
+  tok.cancel()
+  tok.cancel()
+  assert(tok.cancelled(), "cancelled() is false after cancel()")
+  let c = Client()
+  c.send(ClientRequest{ url = kaUrl(o), cancel = Option.Some(tok) }) catch e {
+    o.stop()
+    assertCancelled(e, "send")
+    let (re, ok) = e.(RequestError)
+    assert(ok && !re.sent, "a request cancelled before send must be unsent")
+    assert(o.accepts.load() == 0, "accepts = ${o.accepts.load()}")
+    return
+  }
+  o.stop()
+  assert(false, "a cancelled token let the request through")
+}
+
+test "cancel while waiting for the response head fails the send within the bound" {
+  let o = kaStart(silentPlan()) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let tok = Cancel()
+  let at = startCancel(tok)
+  c.send(ClientRequest{ url = kaUrl(o), cancel = Option.Some(tok) }, stream = true) catch e {
+    assertWithin(at, "streamed head")
+    o.stop()
+    assertCancelled(e, "streamed head")
+    assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)}")
+    return
+  }
+  o.stop()
+  assert(false, "a silent server answered")
+}
+
+test "cancel while the buffered send waits for the response head fails within the bound" {
+  let o = kaStart(silentPlan()) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let tok = Cancel()
+  let at = startCancel(tok)
+  c.send(ClientRequest{ url = kaUrl(o), cancel = Option.Some(tok) }) catch e {
+    assertWithin(at, "buffered head")
+    o.stop()
+    assertCancelled(e, "buffered head")
+    let (re, ok) = e.(RequestError)
+    assert(ok && re.sent, "the silent server had the request, so it was sent")
+    assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)}")
+    return
+  }
+  o.stop()
+  assert(false, "a silent server answered")
+}
+
+test "cancel during the TLS handshake fails the send within the bound" {
+  // A server that accepts the TCP connection and never speaks TLS.
+  let o = kaStart(silentPlan()) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client(tls = tls5916ClientConfig())
+  let tok = Cancel()
+  let at = startCancel(tok)
+  let url = "https://127.0.0.1:${o.port}/obj"
+  c.send(ClientRequest{ url = url, cancel = Option.Some(tok) }, stream = true) catch e {
+    assertWithin(at, "TLS handshake")
+    o.stop()
+    assertCancelled(e, "TLS handshake")
+    let (re, ok) = e.(RequestError)
+    assert(ok && !re.sent, "nothing was sent before the handshake finished")
+    assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)}")
+    return
+  }
+  o.stop()
+  assert(false, "a server that never speaks TLS completed a handshake")
+}
+
+test "cancel during connect fails the send within the bound" {
+  // 10.255.255.1 is a private address nothing answers: the SYN goes unanswered.
+  // A network that refuses it at once never reaches the connect phase; that
+  // run proves nothing about it, so it is not counted as a pass or a failure.
+  let c = Client()
+  let tok = Cancel()
+  let at = startCancel(tok)
+  let t0 = monotonic().ns
+  c.send(ClientRequest{ url = "http://10.255.255.1:81/x", cancel = Option.Some(tok) }) catch e {
+    if (at.load() == 0) {
+      return
+    }
+    assertWithin(at, "connect")
+    assertCancelled(e, "connect")
+    let (re, ok) = e.(RequestError)
+    assert(ok && !re.sent, "nothing was sent before the connect finished")
+    assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)}")
+    assert((monotonic().ns - t0) / 1000000 < 5000, "connect was not interrupted")
+    return
+  }
+  assert(false, "a connect to an unroutable address succeeded")
+}
+
+test "cancel mid-body fails the pending read with Cancelled within the bound" {
+  let o = kaStart(stallPlan("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let tok = Cancel()
+  let res = c.send(ClientRequest{ url = kaUrl(o), cancel = Option.Some(tok) }, stream = true) catch e {
+    o.stop()
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    o.stop()
+    assert(false, "${e.message()}")
+    return
+  }
+  let first = r.read(64) catch e {
+    o.stop()
+    assert(false, "first read: ${e.message()}")
+    return
+  }
+  assert(len(first) == 10, "first read returned ${len(first)} bytes")
+  let at = startCancel(tok)
+  r.read(64) catch e {
+    assertWithin(at, "mid-body read")
+    o.stop()
+    let (ce, ok) = e.(Cancelled)
+    assert(ok, "the read failed with '${e.message()}', not Cancelled")
+    assert(ce.op == "read", "op = '${ce.op}'")
+    assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)}")
+    r.read(1) catch e2 {
+      assert(indexOf(e2.message(), "earlier read failed") >= 0, "message = '${e2.message()}'")
+      return
+    }
+    assert(false, "a read after the cancel succeeded")
+    return
+  }
+  o.stop()
+  assert(false, "a stalled body read returned")
+}
+
+test "cancel mid-body of a read-to-close response is a failure, never a short body" {
+  let o = kaStart(stallPlan("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let tok = Cancel()
+  let res = c.send(ClientRequest{ url = kaUrl(o), cancel = Option.Some(tok) }, stream = true) catch e {
+    o.stop()
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    o.stop()
+    assert(false, "${e.message()}")
+    return
+  }
+  let first = r.read(64) catch e {
+    o.stop()
+    assert(false, "first read: ${e.message()}")
+    return
+  }
+  assert(len(first) == 10, "first read returned ${len(first)} bytes")
+  let at = startCancel(tok)
+  r.read(64) catch e {
+    assertWithin(at, "read-to-close body")
+    o.stop()
+    assertCancelled(e, "read-to-close body")
+    return
+  }
+  o.stop()
+  assert(false, "the cancel of a read-to-close body read as a clean end")
+}
+
+test "cancel mid-body of a buffered send fails it, never returns the partial body" {
+  let o = kaStart(stallPlan("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let tok = Cancel()
+  let at = startCancel(tok)
+  c.send(ClientRequest{ url = kaUrl(o), cancel = Option.Some(tok) }) catch e {
+    assertWithin(at, "buffered body")
+    o.stop()
+    assertCancelled(e, "buffered body")
+    assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)}")
+    return
+  }
+  o.stop()
+  assert(false, "a cancelled buffered send returned a response")
+}
+
+test "one token cancels every request that holds it, and a later request fails at once" {
+  let o = kaStart(silentPlan()) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let tok = Cancel()
+  let done = chan<int>(2)
+  spawn sendUntilCancelled(c, kaUrl(o), tok, done)
+  spawn sendUntilCancelled(c, kaUrl(o), tok, done)
+  sleep(cancelDelayMs * 1000000)
+  let at = AtomicI64(monotonic().ns)
+  tok.cancel()
+  let a = <- done
+  let b = <- done
+  assertWithin(at, "two requests")
+  assert(a == 1 && b == 1, "results ${a} ${b}: both requests must fail with Cancelled")
+  assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)}")
+  c.send(ClientRequest{ url = kaUrl(o), cancel = Option.Some(tok) }) catch e {
+    o.stop()
+    assertCancelled(e, "after")
+    return
+  }
+  o.stop()
+  assert(false, "a request with a cancelled token succeeded")
+}
+
+fn sendUntilCancelled(c: Client, url: string, tok: Cancel, done: chan<int>) {
+  c.send(ClientRequest{ url = url, cancel = Option.Some(tok) }, stream = true) catch e {
+    if (isCancelled(e)) {
+      done <- 1
+      return
+    }
+  }
+  done <- 0
+}
+
+test "a request that finishes before the cancel keeps its connection pooled" {
+  let o = kaStart(kaFixed("hello")) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let tok = Cancel()
+  let res = c.send(ClientRequest{ url = kaUrl(o), cancel = Option.Some(tok) }) catch e {
+    o.stop()
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  tok.cancel()
+  o.stop()
+  assert(res.status == 200 && res.body == "hello", "status ${res.status} body '${res.body}'")
+  assert(
+    len(c.pool.idle) == 1,
+    "idle = ${len(c.pool.idle)}: a finished request parks its connection",
+  )
+}
