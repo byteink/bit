@@ -95,7 +95,7 @@ bb2():
   expect "7562-packed-halfword-slices" "$(explainMismatch "$ir_o" "$ir_b" ir)" "ir: scaled read becomes index_get"
   expect "7562-packed-halfword-slices" "$(explainMismatch "$ir_o" "$ir_b" iropt)" "iropt: scaled read becomes index_get"
   expect "" "$(explainMismatch "$ir_o" "${ir_b/string_from_int/string_from_uint}" ir)" "ir: an unrelated call changed"
-  expect "" "$(explainMismatch "${ir_o//u16/u32}" "${ir_b//u16/u32}" ir)" "ir: a u32 slice is not packed"
+  expect "" "$(explainMismatch "${ir_o//u16/u64}" "${ir_b//u16/u64}" ir)" "ir: a u64 slice is a word and never packed"
   expect "" "$(explainMismatch "$ir_o" "$(printf '%s\n' "$ir_b" | sed 's/index_get %6\[%8\]/index_get %6[%1]/')" ir)" "ir: the packed read takes another index"
   expect "" "$(explainMismatch "$ir_o" "$ir_o" ir)" "ir: a tree that kept the word stride is not explained by the packing"
   ir_new_o='bb0():
@@ -128,13 +128,203 @@ $ir_new_b
 ${ir_new_o//i16/i32}
 }" "func g() void {
 ${ir_new_b//i16/i32}
-}" ir)" "ir: an i32 slice keeps elem_size 8"
+}" ir)" "ir: an i32 slice packed at the halfword 2"
   ir_new_4=$(printf '%s\n' "$ir_new_b" | sed 's/%2 = const_int i64 2/%2 = const_int i64 4/')
   expect "" "$(explainMismatch "func g() void {
 $ir_new_o
 }" "func g() void {
 $ir_new_4
 }" ir)" "ir: elem_size is neither 8 nor the packed 2"
+
+  # 7574-packed-narrow-slices: the same shapes for i8/bool (1 byte) and i32/u32/f32 (4 bytes).
+  ir_o32="${ir_o//u16/u32}"
+  ir_b32="${ir_b//u16/u32}"
+  expect "7574-packed-narrow-slices" "$(explainMismatch "$ir_o32" "$ir_b32" ir)" "ir: a u32 scaled read becomes index_get"
+  expect "7574-packed-narrow-slices" "$(explainMismatch "$ir_o32" "$ir_b32" iropt)" "iropt: a u32 scaled read becomes index_get"
+  expect "7574-packed-narrow-slices" "$(explainMismatch "${ir_o//u16/f32}" "${ir_b//u16/f32}" ir)" "ir: an f32 scaled read becomes index_get"
+  expect "7574-packed-narrow-slices" "$(explainMismatch "${ir_o//u16/bool}" "${ir_b//u16/bool}" ir)" "ir: a bool scaled read becomes index_get"
+  expect "" "$(explainMismatch "$ir_o32" "$ir_o32" ir)" "ir: a u32 read that kept the word stride is not explained"
+  expect "" "$(explainMismatch "$ir_o32" "$(printf '%s\n' "$ir_b32" | sed 's/index_get %6\[%8\]/index_get %6[%1]/')" ir)" "ir: a packed u32 read takes another index"
+  ir_wrong_stride=$(printf '%s\n' "$ir_o32" | sed 's/{const_int i64 3}/{const_int i64 2}/; s/%9 = const_int i64 3/%9 = const_int i64 2/')
+  expect "" "$(explainMismatch "$ir_o32" "$ir_wrong_stride" ir)" "ir: a read re-strided to a shift of 2 stays unexplained"
+  ir_new_i32_4=$(printf '%s\n' "${ir_new_b//i16/i32}" | sed 's/%2 = const_int i64 2/%2 = const_int i64 4/')
+  expect "7574-packed-narrow-slices" "$(explainMismatch "func g() void {
+${ir_new_o//i16/i32}
+}" "func g() void {
+$ir_new_i32_4
+}" ir)" "ir: an i32 slice at elem_size 4, the narrow store"
+  expect "" "$(explainMismatch "func g() void {
+${ir_new_o//i16/i32}
+}" "func g() void {
+${ir_new_b//i16/i32}
+}" ir)" "ir: an i32 slice at elem_size 2 is a wrong stride"
+  ir_new_i8=$(printf '%s\n' "${ir_new_b//i16/i8}" | sed 's/%2 = const_int i64 2/%2 = const_int i64 1/')
+  expect "7574-packed-narrow-slices" "$(explainMismatch "func g() void {
+${ir_new_o//i16/i8}
+}" "func g() void {
+$ir_new_i8
+}" ir)" "ir: an i8 slice at elem_size 1"
+  expect "" "$(explainMismatch "func g() void {
+${ir_new_o//i16/i8}
+}" "func g() void {
+${ir_new_b//i16/i8}
+}" ir)" "ir: an i8 slice at elem_size 2 is a wrong stride"
+
+  # 7574, the f32 element store: slice_set through bitcast becomes the inline store.
+  f32_o='bb0(%0: []f32, %1: f32):
+  %2 = const_int i64 0
+  %3 = bitcast u32 %1
+  %4 = const_int i64 8
+  %5 = rt_call slice_set(%0, %2, %3, %4) void
+  ret'
+  f32_fill='bb0(%0: []f32, %1: f32):
+  %2 = const_int i64 0
+  %3 = field_get %0[0] i64
+  index_set %3[%2] = %1
+  ret'
+  f32_chk='bb0(%0: []f32, %1: f32):
+  %2 = const_int i64 0
+  %3 = slice_len %0
+  %4 = icmp_ult bool %2, %3
+  br %4, bb1(), bb2()
+bb2():
+  %5 = const_string "index out of range"
+  %6 = rt_call panic(%5) void
+  unreachable
+bb1():
+  %7 = field_get %0[0] i64
+  %8 = field_get %0[16] i64
+  %9 = add i64 %8, %2
+  index_set %7[%9] = %1
+  ret'
+  f32_other=$(printf '%s\n' "$f32_fill" | sed 's/index_set %3\[%2\]/index_set %3[%1]/')
+  expect "7574-packed-narrow-slices" "$(explainMismatch "func g() void {
+$f32_o
+}" "func g() void {
+$f32_fill
+}" ir)" "ir: an f32 literal store inline"
+  expect "7574-packed-narrow-slices" "$(explainMismatch "func g() void {
+$f32_o
+}" "func g() void {
+$f32_chk
+}" ir)" "ir: an f32 checked store inline"
+  expect "" "$(explainMismatch "func g() void {
+$f32_o
+}" "func g() void {
+$f32_other
+}" ir)" "ir: an f32 store at another index"
+  expect "" "$(explainMismatch "func g() void {
+$f32_o
+}" "func g() void {
+$f32_o
+}" ir)" "ir: a tree that kept the f32 slice_set is not explained by the inline store"
+
+  # 7574, the f32 element read: slice_get through bitcast, or the tree's guarded index_get. Both
+  # sides are canonicalized, so a tree that still reads through slice_get (at elem_size 4) agrees too.
+  f32_ld_o='bb0(%0: []f32):
+  %1 = const_int i64 0
+  %2 = const_int i64 8
+  %3 = rt_call slice_get(%0, %1, %2) u32
+  %4 = bitcast f32 %3
+  %5 = rt_call string_from_float(%4) string
+  ret'
+  f32_ld_chk='bb0(%0: []f32):
+  %1 = const_int i64 0
+  %2 = slice_len %0
+  %3 = icmp_ult bool %1, %2
+  br %3, bb1(), bb2()
+bb2():
+  %4 = const_string "index out of range"
+  %5 = rt_call panic(%4) void
+  unreachable
+bb1():
+  %6 = field_get %0[0] i64
+  %7 = field_get %0[16] i64
+  %8 = add i64 %7, %1
+  %9 = index_get %6[%8] f32
+  %10 = rt_call string_from_float(%9) string
+  ret'
+  expect "7574-packed-narrow-slices" "$(explainMismatch "func g() void {
+$f32_ld_o
+}" "func g() void {
+$f32_ld_chk
+}" ir)" "ir: an f32 guarded read inline"
+  expect "7574-packed-narrow-slices" "$(explainMismatch "func g() void {
+$f32_ld_o
+}" "func g() void {
+${f32_ld_o/i64 8/i64 4}
+}" ir)" "ir: an f32 read through slice_get at the packed elem_size 4"
+  expect "" "$(explainMismatch "func g() void {
+$f32_ld_o
+}" "func g() void {
+${f32_ld_o/i64 8/i64 2}
+}" ir)" "ir: an f32 read at elem_size 2 is a wrong stride"
+  expect "" "$(explainMismatch "func g() void {
+$f32_ld_o
+}" "func g() void {
+${f32_ld_chk/icmp_ult bool %1, %2/icmp_ult bool %2, %2}
+}" ir)" "ir: an f32 read whose guard tests another index"
+  expect "" "$(explainMismatch "func g() void {
+$f32_o
+}" "func g() void {
+${f32_chk/icmp_ult bool %2, %3/icmp_ult bool %3, %3}
+}" ir)" "ir: an f32 store whose guard tests another index"
+
+
+  # 7574-f32-store-schedule-lag: a per-file pin (irLagPins) for the optimizer moving the inline f32
+  # store past the next call. Accepted only for a pinned file on the iropt arm, and only when what is
+  # left after deleting every line tied to an []f32 slice is identical on both sides.
+  lag_o='bb0(%0: []f32, %1: f32, %9: i64):
+  %2 = const_int i64 0
+  %3 = bitcast u32 %1
+  %4 = const_int i64 8
+  %5 = rt_call slice_set(%0, %2, %3, %4) void
+  %6 = rt_call string_from_int(%9) string
+  ret'
+  lag_t='bb0(%0: []f32, %1: f32, %9: i64):
+  %2 = const_int i64 0
+  %6 = rt_call string_from_int(%9) string
+  %3 = slice_len %0
+  %4 = icmp_ult bool %2, %3
+  br %4, bb1(), bb2()
+bb2():
+  %5 = const_string "index out of range"
+  %7 = rt_call panic(%5) void
+  unreachable
+bb1():
+  %10 = field_get %0[0] i64
+  %11 = field_get %0[16] i64
+  %12 = add i64 %11, %2
+  index_set %10[%12] = %1
+  ret'
+  lag_pin=_tests_/cases/run_float32_interp.bit
+  lag_want="7574-f32-store-schedule-lag"
+  lag() { explainMismatch "func g() void {
+$1
+}" "func g() void {
+$2
+}" "$3" "$4"; }
+  expect "$lag_want" "$(lag "$lag_o" "$lag_t" iropt "$lag_pin")" "iropt: a pinned file, the store scheduled past a call"
+  expect "" "$(lag "$lag_o" "$lag_t" iropt _tests_/cases/run_float32_interp_other.bit)" "iropt: the same diff in an unpinned file"
+  expect "" "$(lag "$lag_o" "$lag_t" ir "$lag_pin")" "ir: the pin is for the iropt arm only"
+  expect "" "$(lag "$lag_o" "${lag_t/string_from_int/string_from_uint}" iropt "$lag_pin")" "iropt: a pinned file whose diff also changes an unrelated call"
+  expect "" "$(lag "$lag_o" "$(printf '%s\n' "$lag_t" | sed '/string_from_int/d')" iropt "$lag_pin")" "iropt: a pinned file whose diff also drops an unrelated line"
+  expect "" "$(lag "$lag_o" "$(printf '%s\n' "$lag_t" | sed 's/^  %6 = rt_call string_from_int(%9) string$/  %6 = rt_call string_from_int(%1) string/')" iropt "$lag_pin")" "iropt: a pinned file whose unrelated call takes another operand"
+  expect "$lag_want" "$(lag "$lag_o" "$lag_t" iropt _tests_/cases/run_float_slice_elems.bit)" "iropt: the second pinned file"
+  expect "$lag_want" "$(lag "$lag_o" "$lag_t" iropt _tests_/cases/run_packed_narrow_slices.bit)" "iropt: the third pinned file"
+
+  # 7637-string-from-rune-range: string(rs[lo:hi]) on a []rune.
+  rr_o='func f(%0: []i32, %1: i64, %2: i64) string {
+bb0(%0: []i32, %1: i64, %2: i64):
+  %3 = rt_call string_from_byte_range(%0, %1, %2) string
+  ret %3
+}'
+  rr_b="${rr_o//string_from_byte_range/string_from_rune_range}"
+  expect "7637-string-from-rune-range" "$(explainMismatch "$rr_o" "$rr_b" ir)" "ir: a []rune range call"
+  expect "7637-string-from-rune-range" "$(explainMismatch "$rr_o" "$rr_b" iropt)" "iropt: a []rune range call"
+  expect "" "$(explainMismatch "${rr_o//i32/u8}" "${rr_b//i32/u8}" ir)" "ir: a []u8 receiver keeps string_from_byte_range"
+  expect "" "$(explainMismatch "$rr_o" "$rr_o" ir)" "ir: a []rune call that stayed a byte range is not explained"
+  expect "" "$(explainMismatch "$rr_o" "${rr_b/\(%0, %1, %2\)/(%0, %2, %1)}" ir)" "ir: a range call with swapped bounds"
 
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
@@ -151,8 +341,8 @@ $ir_new_4
   # one line, so `print "…"` no longer always starts the line) -- safe
   # against a false match inside `printf` because that is followed by `f`
   # then a SINGLE quote, never `print` immediately followed by a `"`.
-  want=$(grep -hoE 'print "[0-9]+-[a-z-]+"' "${ROOT}/scripts/selfhost-ir-signatures.sh" "${ROOT}/scripts/ir-signatures-walk.sh" |
-    grep -oE '"[0-9]+-[a-z-]+"' | tr -d '"' | LC_ALL=C sort -u)
+  want=$(grep -hoE 'print "[0-9]+-[a-z0-9-]+"' "${ROOT}/scripts/selfhost-ir-signatures.sh" "${ROOT}/scripts/ir-signatures-walk.sh" |
+    grep -oE '"[0-9]+-[a-z0-9-]+"' | tr -d '"' | LC_ALL=C sort -u)
   if [ "$got" != "$want" ]; then
     echo "FAIL: declaredSignatureNames() is out of sync with explainMismatch's print statements"
     echo "  declaredSignatureNames(): $(printf '%s' "$got" | tr '\n' ' ')"

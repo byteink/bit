@@ -251,8 +251,8 @@
 #
 # --- Declared signatures (against the 0.40.0 oracle) ---
 #
-# Both retire at the next stage0 repin, which is the first oracle cut from a tree that carries
-# #7558 and #7562. The walks live in scripts/ir-signatures-walk.sh, sourced below.
+# These retire at the next stage0 repin, which is the first oracle cut from a tree that carries
+# #7558, #7562, #7574 and #7637. The walks live in scripts/ir-signatures-walk.sh, sourced below.
 #
 # 7558-synth-json-alias-column-shift (`types`). #7558 (54c0b8420) binds std/json's `Json` and
 # `JsonEntry` under the reserved aliases `__Json`/`__JsonEntry` in the code a `@json` class
@@ -277,16 +277,64 @@
 # 3 corpus files, on both arms: convert_widen_alias.bit, run_narrow_slice_store_widen.bit and
 # run_packed_i16_slice.bit.
 #
+# 7574-packed-narrow-slices (`ir`, `iropt`). #7574 (8eb73dbbf) extends #7562's packing to every
+# narrow prim: []i8/[]bool at 1 byte, []i32/[]u32/[]f32 at 4. The same shapes as 7562 (elem_size
+# constant, `index_get` reads, narrow stores without the word-widening `convert`, ptrOf scaling,
+# the append fast path) plus the f32 element store, which was `bitcast u32` into `rt_call
+# slice_set` and is now an inline `index_set` from the float register, and the read-back of a whole
+# f32 lvalue, which is still `rt_call slice_get` plus `bitcast f32` in places and a slice_len-guarded
+# `index_get` in others. Every spelling of an f32 element store or read, in BOTH dumps, is collapsed to
+# the pseudo-ops `f32_store s[i] = v` and `f32_load s[i] f32` (the guard, its panic block and the two
+# field_get reads go with the guarded spelling; a guard that does not match exactly stays and keeps the
+# file unexplained). The trial that names it enables the halfword and the narrow widths together. The
+# optimizer-driven differences of the post-opt arm are NOT in it: run_float32_interp,
+# run_float_slice_elems and run_packed_narrow_slices differ there by where the inline stores sit
+# relative to the following reads' guards, and stdlib/crypto/bigint.bit by a load the oracle CSE'd.
+#
+# 7637-string-from-rune-range (`ir`, `iropt`). #7637 (c8381c0c2) makes `string(rs[lo:hi])` on a
+# `[]rune` one `rt_call string_from_rune_range(rs, lo, hi)`; the oracle emitted
+# `string_from_byte_range` with the same arguments. The rewrite fires only when the first operand
+# is a `[]i32` (or the untyped nil), so a `[]u8` receiver is never touched. A file that needs this
+# together with the packing is named 7637 (the one rewrite that is not a width).
+#
+# All three retire at the next stage0 repin (#6533).
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does.
 explainMismatch() {
   case "$3" in
     types) explainLagTypes "$1" "$2"; return ;;
-    ir|iropt) explainIrLag "$1" "$2"; return ;;
+    ir|iropt)
+      explainIrLag "$1" "$2" && return 0
+      irLagPinned "$3" "${4:-}" && explainIrLagPin "$1" "$2"
+      return ;;
   esac
   return 1
 }
+
+# --- Per-file lag pins (#7671) ---
+#
+# 7574-f32-store-schedule-lag (`iropt` only). #7574 stores an f32 element inline, so the optimizer
+# of the working tree moves those stores relative to the guards of the reads that follow and shares
+# one slice_len between them; the pinned stage0 sees an opaque `rt_call slice_set` there and cannot.
+# golden (run_float32_interp, run_float_slice_elems, run_packed_narrow_slices) proves the output
+# right. A pin is `kind|file|reason`; it explains its file only when, with every line tied to an
+# []f32 slice deleted from both dumps (explainIrLagPin), the rest is identical, and a pinned file
+# that no longer needs the pin (it matches, or a declared signature explains it) fails the run as
+# STALE-PIN in selfhost-diffdump.sh. Removable at the stage0 repin (#6533). This is the one
+# per-file list the family has; #1883 deleted the last one, so an entry here needs a reason a
+# reader can check.
+irLagPins() {
+  printf '%s\n' \
+    'iropt|_tests_/cases/run_float32_interp.bit|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin' \
+    'iropt|_tests_/cases/run_float_slice_elems.bit|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin' \
+    'iropt|_tests_/cases/run_packed_narrow_slices.bit|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin'
+}
+# irLagPinned <kind> <file> -- 0 when the (kind, file) pair is pinned.
+irLagPinned() { irLagPins | awk -F'|' -v k="$1" -v f="${2:-}" '$1 == k && $2 == f { found = 1 } END { exit !found }'; }
+# irLagPinFiles <kind> -- the pinned files of that arm, one per line.
+irLagPinFiles() { irLagPins | awk -F'|' -v k="$1" '$1 == k { print $2 }'; }
 
 # declaredSignatureNames [ir|iropt|ast|fmt|types|diags] -- every name explainMismatch
 # CAN print for the given dump kind, one per line (#5509, extended by #5510).
@@ -299,11 +347,13 @@ explainMismatch() {
 # scripts/ir-signatures-walk.sh.
 declaredSignatureNames() {
   local types="7558-synth-json-alias-column-shift"
-  local ir="7562-packed-halfword-slices"
+  local ir="7562-packed-halfword-slices 7574-packed-narrow-slices 7637-string-from-rune-range"
+  local lag="7574-f32-store-schedule-lag"
   case "${1:-}" in
     types) printf '%s\n' $types ;;
-    ir|iropt) printf '%s\n' $ir ;;
-    "") printf '%s\n' $types $ir ;;
+    ir) printf '%s\n' $ir ;;
+    iropt) printf '%s\n' $ir $lag ;;
+    "") printf '%s\n' $types $ir $lag ;;
   esac
   return 0
 }
