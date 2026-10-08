@@ -157,11 +157,23 @@ export class Conn {
   // the setting would mean either returning a body this call truncated or
   // buffering up to `maxBodyBytes` behind the setting's back. `roundTripStream`
   // below is what such a client calls (#4728).
-  export roundTrip(req: Request, deadlineNs: int = 0): Response! {
+  //
+  // `abort` is a channel a caller sends one value on to cancel just this request
+  // from another green thread (#7639): the stream is reset with RST_STREAM
+  // (CANCEL), the body bytes it had buffered give their connection credit back,
+  // and this fails with `Aborted` while the connection and its other streams run
+  // on. Capacity 1, so the sender never blocks. A request already answered in
+  // full is not affected, and one aborted twice is aborted once.
+  export roundTrip(
+    req: Request,
+    deadlineNs: int = 0,
+    abort: Option<chan<int>> = Option.None,
+  ): Response! {
     if (this.streamBodies) {
       fail newError("http2: Config.streamBodies is set — call roundTripStream instead")
     }
-    let msg = h2connOpenRoundTrip(this.cmdCh, req, this.boundOf(deadlineNs))?
+    let ab = h2connNewAbort(this.cmdCh, abort)
+    let msg = h2connOpenRoundTrip(this.cmdCh, req, this.boundOf(deadlineNs), ab)?
     if (!msg.hasBody) {
       return msg.response
     }
@@ -169,7 +181,7 @@ export class Conn {
     // the receive windows follow on the client side, as the handler thread is on
     // the server side — see `h2connDrainBody` (streams.bit).
     let res = msg.response
-    res.body = h2connDrainBody(Stream{ cmdCh = this.cmdCh, id = msg.streamId })?
+    res.body = h2connDrainAbortable(this.cmdCh, msg.streamId, ab)?
     return res
   }
 
@@ -194,7 +206,8 @@ export class Conn {
   // green threads — but exactly one thread reads one stream, which is the thread
   // this handed the `Stream` to.
   export roundTripStream(req: Request, deadlineNs: int = 0): (Response, Stream)! {
-    let msg = h2connOpenRoundTrip(this.cmdCh, req, this.boundOf(deadlineNs))?
+    let ab = h2connNewAbort(this.cmdCh, Option.None)
+    let msg = h2connOpenRoundTrip(this.cmdCh, req, this.boundOf(deadlineNs), ab)?
     return (msg.response, Stream{ cmdCh = this.cmdCh, id = msg.streamId })
   }
 
@@ -372,6 +385,7 @@ fn h2connStart(
     nextStreamId = h2connFirstId(isClient),
     lastPeerStreamId = 0,
     openBodies = 0,
+    aborted = map<int, bool>(),
     connSendWindow = 65535,
     connRecvWindow = 65535,
     peerInitialWindow = 65535,
@@ -509,38 +523,6 @@ fn h2connArmDeadline(deadlineNs: int, timeoutCh: chan<int>) {
     sleep(remaining)
   }
   timeoutCh <- 1
-}
-
-// Block until `replyCh` delivers a stream's outcome, or `deadlineNs` elapses
-// first (0 = no bound) — the same race `h2connAwaitReady` runs for the
-// SETTINGS wait, and needed for the identical reason: a channel receive has
-// no timer of its own, and no deadline on the transport's own reads can
-// reach it.
-//
-// This closes a real gap, not a hypothetical one: `h2connLoop`'s
-// `while (st.running)` (loop.bit) stops as soon as `h2connTerminate`
-// (events.bit) flips `st.running` — on an inbound `eof` or on a connection
-// error this side raised (#4606) — WITHOUT draining anything still queued in
-// `cmdCh`, so a `h2cmdOpen` that reaches `cmdCh` around the same moment that
-// termination runs can lose the race and sit there forever: the loop thread
-// has already returned, nothing will ever read it, and nothing will ever
-// send on the `replyCh` `roundTrip` is waiting on (#3036). Draining `cmdCh`
-// in the `eof` branch would not fully close this — a command sent AFTER the
-// loop has already left its `select` cannot be drained by a handler that
-// thread will never run again — so `roundTrip` bounds its own wait instead,
-// exactly as `h2connAwaitReady` already does for the symmetric case one step
-// earlier in the connection's lifecycle.
-fn h2connAwaitReply(replyCh: chan<h2connMsg>, deadlineNs: int): h2connMsg! {
-  let timeoutCh = chan<int>(1)
-  if (deadlineNs != 0) {
-    spawn h2connArmDeadline(deadlineNs, timeoutCh)
-  }
-  select {
-    case msg = <- replyCh:
-      return msg
-    case _ = <- timeoutCh:
-      fail newError("http2: timed out waiting for response")
-  }
 }
 
 // The first stream id this endpoint allocates: clients use odd ids from 1, and a

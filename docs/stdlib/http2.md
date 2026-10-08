@@ -651,7 +651,7 @@ a malformed client preface.
 A live HTTP/2 connection. Safe to use from many green threads at once; every
 operation is a method that talks to its own background threads.
 
-### `Conn.roundTrip(req: Request, deadlineNs: int = 0): Response!`
+### `Conn.roundTrip(req: Request, deadlineNs: int = 0, abort: Option<chan<int>> = Option.None): Response!`
 
 Sends `req` on a fresh stream and blocks for the full response. Fails if the
 stream is reset, the connection is closing, or `Config.streamBodies` is set
@@ -660,6 +660,19 @@ stream is reset, the connection is closing, or `Config.streamBodies` is set
 `deadlineNs` is an absolute `monotonic` deadline for this one request, so
 requests with different deadlines can share a connection. `0`, the default, falls
 back to the deadline `connect` or `accept` received, where `0` means no bound.
+
+`abort` is a channel of capacity 1 that another green thread sends one value on to
+cancel just this request, in any phase: waiting for the headers or for the body.
+The stream is reset with `RST_STREAM` carrying `errorCancel`, the connection
+credit of the body bytes it had buffered goes back to the peer, frames the peer
+had already sent for it are ignored, and the call fails with `Aborted`. The
+connection and every other stream on it keep running.
+
+### `Aborted`
+
+The error `Conn.roundTrip` fails with after its `abort` channel received a value.
+`message()` reads `http2: request aborted`. Unlike any other `roundTrip` failure it
+says nothing about the connection, which stays usable.
 
 ### `Conn.roundTripStream(req: Request, deadlineNs: int = 0): (Response, Stream)!`
 

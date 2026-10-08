@@ -63,12 +63,13 @@ class h2Entry {
   torn: bool
 
   // Takes a stream slot, waiting while the connection is at its cap, but not
-  // past `deadlineNs` (0 = no bound).
-  acquire(deadlineNs: int): ()! {
+  // past `deadlineNs` (0 = no bound); a value on `wake` ends the wait with
+  // `Cancelled`.
+  acquire(deadlineNs: int, wake: chan<int>): ()! {
     acquireToken(
       this.slots,
       deadlineNs,
-      chan<int>(1),
+      wake,
       "http2: timed out waiting for a free slot",
       "${this.streamCap} streams in flight",
     )?
@@ -207,8 +208,9 @@ class h2Pool {
   }
 
   // Joins the single-flight for `key`, waiting for the dial in progress but
-  // not past `deadlineNs`. `leave` must follow a success.
-  enter(key: string, now: int, deadlineNs: int): h2Origin! {
+  // not past `deadlineNs`, and not past a value on `wake` (`Cancelled`).
+  // `leave` must follow a success.
+  enter(key: string, now: int, deadlineNs: int, wake: chan<int>): h2Origin! {
     this.mu.lock()
     let o = this.originLocked(key, now)
     o.dialing = o.dialing + 1
@@ -216,7 +218,7 @@ class h2Pool {
     acquireToken(
       o.dialTok,
       deadlineNs,
-      chan<int>(1),
+      wake,
       "http2: timed out waiting for a free slot",
       "another dial to ${key} in progress",
     ) catch e {
@@ -443,7 +445,10 @@ fn dialOrigin(key: string, u: Url, extras: RequestExtras): Dialed! {
 // before this one left a shared connection to use instead.
 fn dialSerial(key: string, u: Url, extras: RequestExtras): Dialed! {
   let hp = extras.pool.h2
-  let o = hp.enter(key, monotonic().ns, extras.deadline)?
+  let wake = chan<int>(1)
+  let wid = cancelWait(extras.cancel, wake)
+  defer cancelUnwait(extras.cancel, wid)
+  let o = hp.enter(key, monotonic().ns, extras.deadline, wake)?
   let d = dialHeld(key, u, extras) catch e {
     hp.leave(o)
     fail e
@@ -459,6 +464,16 @@ fn dialHeld(key: string, u: Url, extras: RequestExtras): Dialed! {
   }
 }
 
+// A TLS connection to `u`'s origin, bounded by `extras.deadline` and, for a
+// request with a `Cancel`, by it (`dialTlsCancellable`, cancel.bit): the dial and
+// the handshake fail with `Cancelled` instead of running to the end.
+fn dialOriginTls(u: Url, cfg: TlsConfig, extras: RequestExtras): TlsConn! {
+  match (extras.cancel) {
+    Some(tok) => { return dialTlsCancellable(u, cfg, tok, extras.deadline)? }
+    None => { return dialTlsConn(u, cfg, extras.deadline)? }
+  }
+}
+
 // One TLS dial to `u`: an HTTP/1.1 connection handed back as it is, an h2 one
 // opened (`h2glueOpen`, h2.bit) and made the origin's shared connection.
 fn dialTlsOrigin(key: string, u: Url, extras: RequestExtras): Dialed! {
@@ -466,7 +481,7 @@ fn dialTlsOrigin(key: string, u: Url, extras: RequestExtras): Dialed! {
   if (len(cfg.alpn) == 0) {
     cfg.alpn = ["h2", "http/1.1"]
   }
-  let tc = dialTlsConn(u, cfg, extras.deadline)?
+  let tc = dialOriginTls(u, cfg, extras)?
   let hp = extras.pool.h2
   if (tc.alpnProtocol() != "h2") {
     hp.noteH1(key, monotonic().ns)
@@ -483,6 +498,10 @@ fn runH2(e: h2Entry, method: string, u: Url, body: Body, extras: RequestExtras):
   let hp = extras.pool.h2
   let res = h2clientExchange(e, method, u, body, extras) catch err {
     hp.release(e, monotonic().ns)
+    let (_, wrapped) = err.(RequestError)
+    if (wrapped) {
+      fail err
+    }
     fail sentError(err)
   }
   hp.release(e, monotonic().ns)
