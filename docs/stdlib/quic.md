@@ -157,6 +157,22 @@ An established QUIC connection. Safe to use from many green threads at once.
 The peer's address, fixed for the life of the connection, or `""` if
 unknown.
 
+### `dialQuicTlsUntil(host: string, port: int, serverName: string, config: TlsConfig, wake: chan<int>): Conn!`
+
+`dialQuicTls`, but a value on `wake` (capacity 1) ends the wait for the handshake with `Woken` and closes the connection being set up.
+
+### `streamReadUntil(s: Stream, wake: chan<int>): StreamChunk!`
+
+`Stream.read`, but a value on `wake` ends the wait with `Woken`.
+
+### `streamFinishUntil(s: Stream, wake: chan<int>): ()!`
+
+`Stream.finish`, but a value on `wake` ends the wait for the acknowledgements with `Woken`; the FIN stays queued and `Stream.reset` abandons it.
+
+### `Woken`
+
+What the three functions above fail with when their `wake` channel received a value first.
+
 ### `Conn.openStream(): Stream!`
 
 Opens a new bidirectional stream from this side.

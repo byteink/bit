@@ -1,0 +1,98 @@
+// Bit standard library — http3 module, aborting a client request from another
+// green thread: `H3Conn.request`'s `abort` argument and the bounded dial (#7640).
+// Same flat `std/http3` module and namespace as `h3.bit`.
+
+// What `H3Conn.request` and `h3DialTlsBounded` fail with when their abort
+// channel received a value. A request that was aborted had its stream reset and
+// stopped with H3_REQUEST_CANCELLED (RFC 9114 §4.1.1) and only that stream: the
+// QUIC connection and every other stream on it run on, so a caller sharing the
+// `H3Conn` keeps using it. A dial that was aborted closed the connection it was
+// setting up.
+export class H3Aborted {
+  export message(): string {
+    return "http3: request aborted"
+  }
+}
+
+// What ends the wait of a dial: the absolute monotonic `deadlineNs` (0 = no
+// bound, see `h3DialDeadline`) or a value on `wake` (capacity 1, so the sender
+// never blocks).
+export class H3Bound {
+  export deadlineNs: int,
+  export wake: chan<int>,
+}
+
+// The channel an exchange races against: `abort` when the caller gave one, else
+// a fresh one nothing ever sends on.
+fn h3wakeOf(abort: Option<chan<int>>): chan<int> {
+  match (abort) {
+    Some(c) => { return c }
+    None => { return chan<int>(1) }
+  }
+}
+
+// Resets the send side of request stream `s` and asks the peer to stop sending
+// on it, both with `code`. Best-effort and fire-and-forget: a stream whose FIN
+// already went out has nothing left to reset, and the stop request alone ends
+// the response.
+fn h3abortStream(s: Stream, code: int) {
+  s.reset(code) catch _ {}
+  s.stopSending(code) catch _ {}
+}
+
+// `e` as the error of an exchange on `s`: when `e` is a wake, the stream is
+// aborted with H3_REQUEST_CANCELLED and the error is `H3Aborted`; any other
+// error is returned as it is.
+fn h3interrupted(s: Stream, e: error): error {
+  let (_, woken) = e.(Woken)
+  if (!woken) {
+    return e
+  }
+  h3abortStream(s, h3ErrRequestCancelled)
+  return H3Aborted{}
+}
+
+// Finish the send half of `s` and read the whole response off it, both ending
+// early on `wake`.
+fn h3finishAndRead(s: Stream, wake: chan<int>): []byte! {
+  streamFinishUntil(s, wake)?
+  let first = streamReadUntil(s, wake)?
+  return h3readRest(s, first, wake)?
+}
+
+// The response bytes of request stream `s` once its request was written; fails
+// with `H3Aborted` (the stream aborted) when `wake` receives a value first.
+fn h3exchangeStream(s: Stream, wake: chan<int>): []byte! {
+  let buf = h3finishAndRead(s, wake) catch e {
+    fail h3interrupted(s, e)
+  }
+  return buf
+}
+
+// As `h3DialTls`, bounded by `bound` (`H3Bound`): the wait for the QUIC
+// handshake ends on a wake with `H3Aborted`, and `bound.deadlineNs`, when set,
+// lowers the connection's idle timeout exactly as `h3DialDeadline` describes.
+export fn h3DialTlsBounded(
+  host: string,
+  port: int,
+  serverName: string,
+  config: TlsConfig,
+  bound: H3Bound,
+): H3Conn! {
+  let conn = dialQuicTlsUntil(host, port, serverName, config, bound.wake) catch e {
+    let (_, woken) = e.(Woken)
+    if (woken) {
+      fail H3Aborted{}
+    }
+    fail e
+  }
+  if (bound.deadlineNs != 0) {
+    let remaining = bound.deadlineNs - monotonic().ns
+    if (remaining <= 0) {
+      conn.close()
+      fail newError("h3: dial ${host}:${port} timed out")
+    }
+    conn.setIdleTimeout(remaining)
+  }
+  return h3newConn(conn, true)?
+}

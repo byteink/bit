@@ -165,79 +165,86 @@ fn h3glueAnswer(req: H3Request, peer: string, handler: (Request) => Response): H
   return h3glueResponseOut(handler(r))
 }
 
-// Run one request/response over HTTP/3: dial QUIC at `u.host:u.port` with the
-// caller's `config` (from `getTls`/`requestTls`/a `Client`'s own TLS config —
-// #6235, the same `TlsConfig` the https leg already carries), send the
-// request on a fresh stream, read the response, and close the connection (one
-// request per connection, as elsewhere in this module). `block` is extra
-// request headers, already validated and serialized by `serializeHeaders`
+// Run one request/response over HTTP/3: dial QUIC at `u.host:u.port` with
+// `extras.config` (from `getTls`/`requestTls`/a `Client`'s own TLS config —
+// #6235, the same `TlsConfig` the https leg already carries), send the request on
+// a fresh stream, read the response, and close the connection (one request per
+// connection, as elsewhere in this module). `extras.block` is extra request
+// headers, already validated and serialized by `serializeHeaders`
 // (reqheader.bit, #2290) — "" for none.
-fn h3Exchange(u: Url, method: string, body: Body, block: string, config: TlsConfig): Response! {
-  let conn = h3DialTls(u.host, u.port, u.host, config) catch e {
-    fail unsentError(e)
-  }
-  let res = conn.request(h3glueRequestOf(method, u, body, block)) catch e {
-    conn.close()
-    fail sentError(e)
-  }
-  conn.close()
-  return h3glueResponse(res)
-}
-
-// As `h3Exchange`, bounded by `deadlineNs` — an absolute monotonic
-// nanosecond deadline resolved ONCE before dial, matching the shape
-// `requestTimeoutTls` (client.bit) already uses for `dialDeadline`/
-// `tlsDialDeadline` on the http/https path (#2995/#3004).
 //
-// Unlike that path, this deadline does not bound every read/write
+// `extras.deadline`, when not 0, is an absolute monotonic nanosecond deadline
+// resolved ONCE before dial, matching the shape `requestTimeoutTls` (client.bit)
+// uses for `dialDeadline`/`tlsDialDeadline` on the http/https path
+// (#2995/#3004). Unlike that path, it does not bound every read/write
 // individually: std/net's is a real syscall-level deadline
 // (`bit_rt_net_read_deadline_w`); QUIC is not built on a `std/net` `Conn` at
-// all and has no per-operation deadline primitive in this runtime. Instead
-// it rides `h3DialTlsDeadline`'s lowered CONNECTION idle timeout (RFC 9000
-// §10.1) rather than adding a second, parallel timer: a peer that accepts
-// the handshake and then never answers stops producing any transport
-// traffic at all (this exchange's own HEADERS/FIN is the last thing that
-// gets a transport ACK), so the idle timer elapses close to `deadlineNs` and
-// tears the connection down, releasing `request()`.
+// all and has no per-operation deadline primitive in this runtime. Instead it
+// rides `h3DialTlsBounded`'s lowered CONNECTION idle timeout (RFC 9000 §10.1)
+// rather than adding a second, parallel timer: a peer that accepts the
+// handshake and then never answers stops producing any transport traffic at all
+// (this exchange's own HEADERS/FIN is the last thing that gets a transport
+// ACK), so the idle timer elapses close to the deadline and tears the
+// connection down, releasing `request()`.
 //
-// This IS a real, documented gap relative to the http/https path: QUIC's
-// idle timer resets on ANY received datagram, not on request progress
-// specifically (RFC 9000 §10.1 is a "peer is gone" detector, not a
-// wall-clock ceiling), so a peer that keeps the connection alive with
-// transport-level traffic while never answering at the application layer
-// could in principle outlast `deadlineNs`. Closing it needs a true
-// wall-clock check independent of `st.lastRecv`, which is out of this
-// ticket's scope (see `h3DialTlsDeadline`'s doc for the matching handshake-side
-// gap). `h3Exchange` is one request per connection (this file's header), so
-// tearing the connection down on timeout can never strand a sibling request
-// the way it would on a server- or pool-side multiplexed connection.
-// `extras` (client.bit's `RequestExtras`) carries `config` and `block` —
-// taken as one value rather than two more parameters, E0202's ceiling is 5.
-fn h3ExchangeDeadline(
-  u: Url,
-  method: string,
-  body: Body,
-  deadlineNs: int,
-  extras: RequestExtras,
-): Response! {
-  let conn = h3DialTlsDeadline(u.host, u.port, u.host, extras.config, deadlineNs) catch e {
-    fail unsentError(h3DeadlineRelabel(e, deadlineNs))
+// This IS a real, documented gap relative to the http/https path: QUIC's idle
+// timer resets on ANY received datagram, not on request progress specifically
+// (RFC 9000 §10.1 is a "peer is gone" detector, not a wall-clock ceiling), so a
+// peer that keeps the connection alive with transport-level traffic while never
+// answering at the application layer could in principle outlast the deadline.
+// Closing it needs a true wall-clock check independent of `st.lastRecv`, which
+// is out of scope (see `h3DialTlsDeadline`'s doc for the matching handshake-side
+// gap). Tearing the connection down on timeout can never strand a sibling
+// request because this exchange owns its connection.
+//
+// A request with a `Cancel` (cancel.bit, #7640) is woken by `cancel()` for the
+// QUIC handshake and for the request itself (`h3clientExchange`): it fails with
+// `Cancelled`.
+fn h3Exchange(u: Url, method: string, body: Body, extras: RequestExtras): Response! {
+  let wake = chan<int>(1)
+  let wid = cancelWait(extras.cancel, wake)
+  defer cancelUnwait(extras.cancel, wid)
+  let bound = H3Bound{ deadlineNs = extras.deadline, wake = wake }
+  let conn = h3DialTlsBounded(u.host, u.port, u.host, extras.config, bound) catch e {
+    fail unsentError(h3Failure(e, extras.deadline))
   }
-  let res = conn.request(h3glueRequestOf(method, u, body, extras.block)) catch e {
+  let req = h3glueRequestOf(method, u, body, extras.block)
+  let res = h3clientExchange(conn, req, extras.deadline, wake) catch e {
     conn.close()
-    fail sentError(h3DeadlineRelabel(e, deadlineNs))
+    fail e
   }
   conn.close()
+  return res
+}
+
+// One request on the established `conn`, which is left open whatever happens: a
+// value on `wake` aborts just this request's stream (`H3Conn.request`'s `abort`)
+// and fails it with `Cancelled`, while the connection and any other request on it
+// run on. Cancelled before a stream is opened, nothing is sent.
+fn h3clientExchange(conn: H3Conn, req: H3Request, deadlineNs: int, wake: chan<int>): Response! {
+  select {
+    case _ = <- wake:
+      fail unsentError(Cancelled{ op = "send" })
+    default:
+  }
+  let res = conn.request(req, Option.Some(wake)) catch e {
+    fail sentError(h3Failure(e, deadlineNs))
+  }
   return h3glueResponse(res)
 }
 
-// Relabel `e` as a timeout only when `deadlineNs` had genuinely already
+// `e`, an h3 failure, as this module reports it: `Cancelled` for an aborted
+// request or dial, a timeout when `deadlineNs` (0 = none) had genuinely already
 // elapsed by the time of failure, so a real handshake or protocol error that
-// happens to land before the deadline is never misreported as one — the
-// same distinction std/net's `-2` read/write sentinel draws at the syscall
-// level, approximated here since QUIC has no equivalent signal to read.
-fn h3DeadlineRelabel(e: error, deadlineNs: int): error {
-  if (monotonic().ns >= deadlineNs) {
+// happens to land before the deadline is never misreported as one — the same
+// distinction std/net's `-2` read/write sentinel draws at the syscall level,
+// approximated here since QUIC has no equivalent signal to read.
+fn h3Failure(e: error, deadlineNs: int): error {
+  let (_, aborted) = e.(H3Aborted)
+  if (aborted) {
+    return Cancelled{ op = "send" }
+  }
+  if (deadlineNs != 0 && monotonic().ns >= deadlineNs) {
     return newError("h3: request timed out (${e.message()})")
   }
   return e
