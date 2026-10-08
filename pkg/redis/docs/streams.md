@@ -469,7 +469,7 @@ refused with `RedisError.Invalid`: the connection is held for the whole
 `WATCH` to `EXEC` window and cannot wait.
 
 ```bit
-import { open, field, RedisError } from "redis"
+import { open, field, Future, RedisError } from "redis"
 
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
