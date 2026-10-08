@@ -527,8 +527,8 @@ so the collector never walks it and sweeps referents the program still
 holds — see the fabricated-header bug at `runtime/root/slices.bit:443-451`
 (`_tests_/cases/run_empty_slice_null_header.bit`). Packing is scoped by
 `is_ref`, not by element identity: any `is_ref == false` buffer may pack to its
-element's own byte stride (`elem_size`, §9) — `1` for `[]u8` (a non-ref,
-1-byte element, `elem_size = 1`), `2` for `[]i16`/`[]u16` (#7562), or a class `T`'s own body size
+element's own byte stride (`elem_size`, §9) — the scalar's own width for a
+narrow prim (`1`, `2` or `4`, listed below), or a class `T`'s own body size
 (`elem_size = layout.size`) when EVERY field of `T` is a non-reference scalar
 (`ptr_offsets` empty), or `16` for a `decimal` (#6570). `elem_size` is a per-call-site
 compile-time constant, never runtime state, and travels as an explicit
@@ -545,9 +545,9 @@ neither is ever called with `elem_size > 8` for a packed buffer — the
 compiler lowers a wide-element field read/write to a direct load/store at the
 field's own offset instead, and the runtime FATALs if a stride it cannot
 represent through either function ever reaches it, rather than silently
-returning or storing a truncated word. `i16`/`u16` pack at 2 bytes (#7562);
-for 1/2/4 the runtime moves exactly those bytes, `get` zero-extended. Packing
-`i8`/`i32`/`u32`/`bool`/`f32` waits on the FFI callers that marshal at 8.
+returning or storing a truncated word. Every scalar narrower than a word
+packs at its own width: `i8`/`u8`/`bool` at 1, `i16`/`u16` at 2 (#7562),
+`i32`/`u32`/`f32` at 4 (#7574); the runtime moves exactly those bytes, `get` zero-extended.
 
 Channels (§11) and native maps (§15, `runtime/root/maps.bit`'s `allocBuf`
 callers) do **not** pack and stay word-per-element regardless of element type:
@@ -2957,7 +2957,7 @@ defined exactly once).
 | `bit_rt_string_from_byte_range` | `(h: *const SliceHeader, lo: usize, hi: usize) -> *const RtBytes` (§2, `string(b[lo:hi])` in one call, #6558: a fresh string holding bytes `lo..hi` of `b`'s view, with no intermediate slice header. Bounds and panic are `bit_rt_slice_slice`'s exactly — a null `h` admits only `[0:0]`, otherwise `0 <= lo <= hi <= cap`, else "slice bounds out of range" — and the caller has already evaluated `b`, `lo`, `hi` in reslice order) |
 | `bit_rt_string_from_rune` | `(r: i32) -> *const RtBytes` (§2, `string(r)`, #7101: the UTF-8 encoding of `r` in one exactly-sized string. Only the low 32 bits of the register are read, so the caller's sign- or zero-extension is immaterial; a negative value, a surrogate U+D800..U+DFFF or a value above U+10FFFF encodes U+FFFD) |
 | `bit_rt_string_from_runes` | `(h: *const SliceHeader) -> *const RtBytes` (§2, `string(rs)` for a `[]rune`, #7101: each element encoded as `bit_rt_string_from_rune` does, in one exactly-sized string; a null `h` is `""`) |
-| `bit_rt_runes_from_string` | `(s: *const RtBytes) -> *SliceHeader` (§2, `[]rune(s)`, #7101: a fresh `[]i32`, one 8-byte word per element, `len == cap ==` the code point count. An invalid byte sequence is U+FFFD and consumes one byte, `std/strings`' `decodeRune` rule) |
+| `bit_rt_runes_from_string` | `(s: *const RtBytes) -> *SliceHeader` (§2, `[]rune(s)`, #7101: a fresh `[]i32`, packed at 4 bytes per element (#7574), `len == cap ==` the code point count. An invalid byte sequence is U+FFFD and consumes one byte, `std/strings`' `decodeRune` rule) |
 | `bit_rt_string_from_int`   | `(v: i64) -> *const RtBytes` (§2, the signed prims i8..i64) |
 | `bit_rt_string_from_uint`  | `(v: u64) -> *const RtBytes` (§2, the unsigned prims u8..u64, zero-extended by the caller) |
 | `bit_rt_string_from_float` | `(v: f64) -> *const RtBytes` (§2)                  |
@@ -4973,12 +4973,12 @@ bit_rt_sha256_hw_blocks(state, data, blocks)   // fold `blocks` 64-byte blocks i
 
 `state`/`data` are raw addresses (`int`); `blocks` a `u64` count. `state`
 points at a PACKED 32-byte buffer — 8 running `u32` words (a..h), native
-(little-endian on ARM64) byte order per word — updated in place. This is
-deliberately NOT the layout a Bit `[]u32` slice's own `ptrOf` addresses
-(SPEC §11.8: one 8-byte word per element, only `[]u8`/`[]byte` is
-byte-packed), so a caller holding `stdlib/crypto/sha256.bit`'s own
-`state: []u32` field must marshal into/out of a packed `[]byte(32)` around
-each call. `data` points at `64*blocks` PACKED bytes of message, read
+(little-endian on ARM64) byte order per word — updated in place. That is
+the layout a Bit `[]u32` slice's own `ptrOf` addresses (SPEC §11.8: a
+`[]u32` packs at 4 bytes per element, #7574), so
+`stdlib/crypto/sha256.bit`'s `absorb` passes `ptrOf(state)` of its
+`state: []u32` directly, with no marshalling around the
+call. `data` points at `64*blocks` PACKED bytes of message, read
 big-endian per FIPS 180-4's own convention.
 `bit_rt_sha256_hw_blocks` implements the same recurrence
 `stdlib/crypto/sha256.bit`'s software `compress` does, once per 64-byte block,
