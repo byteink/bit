@@ -10,22 +10,33 @@
 # that is rewritten, and only along the exact shapes #7562 changed, so a tree that still leaves a
 # halfword slice word-strided, or differs anywhere else, stays unexplained.
 irWalkAwk() {
+  IR_PW_AWK='# The element widths a trial may treat as packed: half is #7562 (2), narrow is #7574 (1 for i8/bool, 4
+# for i32/u32/f32). A type outside the trial set is width 0, so its sites are never rewritten.
+function pw(t) {
+  if (half == 1 && (t == "i16" || t == "u16")) { return 2 }
+  if (narrow == 1 && (t == "i8" || t == "bool")) { return 1 }
+  if (narrow == 1 && (t == "i32" || t == "u32" || t == "f32")) { return 4 }
+  return 0
+}
+'
   IR_STAGE1_AWK='# Stage 1: one dump, one side. Pure ops (const, shl, add, sub, mul, convert) are never printed as
 # lines: each use prints the whole expression in braces, so where an operand was defined never
 # matters. Every other def is named by its ordinal in the function, `$k`. Side oracle then rewrites
 # the word-strided halfword (i16/u16) slice shapes into the packed ones the tree emits; side tree
 # is only inlined, never rewritten, so a tree that failed to pack a site stays different.
-BEGIN { LB = "\173"; RB = "\175"; CI3 = LB "const_int i64 3" RB; CI8 = LB "const_int i64 8" RB; CI2 = LB "const_int i64 2" RB }
-function rwPtr(e,   n) {
-  if (e !~ /^convert \*(i16|u16) / || index(e, " " LB "add i64 ") == 0 || index(e, ", " LB "mul i64 ") == 0) { return e }
+BEGIN { LB = "\173"; RB = "\175"; CI3 = LB "const_int i64 3" RB; CI8 = LB "const_int i64 8" RB }
+function rwPtr(e,   n, t, w) {
+  if (e !~ /^convert \*[a-z0-9]+ / || index(e, " " LB "add i64 ") == 0 || index(e, ", " LB "mul i64 ") == 0) { return e }
+  t = e; sub(/^convert \*/, "", t); sub(/ .*$/, "", t)
+  w = pw(t)
   n = length(e) - length(CI8 RB RB)
-  if (substr(e, n + 1) != CI8 RB RB) { return e }
-  return substr(e, 1, n) CI2 RB RB
+  if (w == 0 || substr(e, n + 1) != CI8 RB RB) { return e }
+  return substr(e, 1, n) LB "const_int i64 " w RB RB RB
 }
-function isHalf(t) { return t == "i16" || t == "u16" }
-function isHalfSlice(t) { return t == "[]i16" || t == "[]u16" }
+function isHalf(t) { return pw(t) > 0 }
+function isHalfSlice(t) { return t ~ /^\[\][a-z0-9]+$/ && pw(substr(t, 3)) > 0 }
 function lastTok(s,   n, p) { n = split(s, p, " "); return p[n] }
-function resTy(e,   n, p) { n = split(e, p, " "); return (p[2] ~ /^(i8|i16|i32|i64|u8|u16|u32|u64|bool|f32|f64|int)$/) ? p[2] : p[n] }
+function resTy(e,   n, p) { n = split(e, p, " "); if (p[1] == "const_bool") { return "bool" }; return (p[2] ~ /^(i8|i16|i32|i64|u8|u16|u32|u64|bool|f32|f64|int)$/) ? p[2] : p[n] }
 function ex(s,   out, id) {
   out = ""
   while (match(s, /%[0-9]+/)) {
@@ -60,10 +71,10 @@ function sliceOfBuf(b,   d, p) {
 }
 function rwLoad(rest,   t, addr, c, b, i, r, m, k) {
   t = lastTok(rest)
-  if (side != "oracle" || !isHalf(t) || rest !~ /^field_get .*\[0\] (i16|u16)$/) { return rest }
+  if (side != "oracle" || !isHalf(t) || rest !~ /^field_get .*\[0\] [a-z0-9]+$/) { return rest }
   addr = rest
   sub(/^field_get /, "", addr)
-  sub(/\[0\] (i16|u16)$/, "", addr)
+  sub(/\[0\] [a-z0-9]+$/, "", addr)
   if (addr ~ /^\{add i64 .*, \{shl i64 .*, \{const_int i64 3\}\}\}$/) {
     r = substr(addr, 10, length(addr) - 10)
     c = topComma(r)
@@ -86,6 +97,9 @@ function rwLoad(rest,   t, addr, c, b, i, r, m, k) {
   if (addr ~ /^\$[0-9]+$/ && isHalfSlice(sliceOfBuf(addr))) { return "index_get " addr "[{const_int i64 0}] " t }
   return rest
 }
+# A hoisted buffer pointer (a block parameter of the optimized dump) has no field_get to name its
+# slice, so the narrow value type of the stored operand is the only evidence there.
+function isParam(b) { return (b in OT) && !(b in Def) }
 function rwStore(line,   buf, v, et, pre, x) {
   if (side != "oracle") { return line }
   pre = line
@@ -97,7 +111,7 @@ function rwStore(line,   buf, v, et, pre, x) {
   pre = substr(line, 1, length(line) - length(v))
   et = sliceOfBuf(buf)
   et = isHalfSlice(et) ? substr(et, 3) : ""
-  if (et != "" && v ~ /^[\173]convert [iu]64 / && isHalf(typeOf(substr(v, 14, length(v) - 14)))) { return pre substr(v, 14, length(v) - 14) }
+  if ((et != "" || isParam(buf)) && v ~ /^[\173]convert [iu]64 / && isHalf(typeOf(substr(v, 14, length(v) - 14)))) { return pre substr(v, 14, length(v) - 14) }
   if (et != "" && v ~ /^\{const_int [iu]64 -?[0-9]+\}$/) {
     x = v
     sub(/^[\173]const_int [iu]64 /, "", x)
@@ -105,7 +119,15 @@ function rwStore(line,   buf, v, et, pre, x) {
   }
   return line
 }
-function rwCall(rest, id,   name, args, t, st, c, last, pre) {
+function rwRunes(rest,   args, r1) {
+  if (side != "oracle" || rune != 1 || rest !~ /^rt_call string_from_byte_range\(/) { return rest }
+  args = substr(rest, length("rt_call string_from_byte_range(") + 1)
+  r1 = substr(args, 1, index(args, ",") - 1)
+  if (OT[r1] != "[]i32" && Def[r1] != "const_nil") { return rest }
+  return "rt_call string_from_rune_range(" args
+}
+function rwCall(rest, id,   name, args, t, st, c, pre, w) {
+  rest = rwRunes(rest)
   if (side != "oracle" || rest !~ /^rt_call slice_[a-z_]*\(/) { return rest }
   name = rest
   sub(/^rt_call /, "", name)
@@ -116,16 +138,71 @@ function rwCall(rest, id,   name, args, t, st, c, last, pre) {
   c = split(args, AP, ", ")
   st = isHalfSlice(t) ? t : (c > 0 ? OT[AP[1]] : "")
   if (!isHalfSlice(st) || AP[c] != "{const_int i64 8}") { return rest }
+  w = pw(substr(st, 3))
   pre = substr(rest, 1, length(rest) - length(t) - 1)
-  sub(/\{const_int i64 8\}\)$/, "{const_int i64 2})", pre)
-  if (name == "slice_get" && t == "i16") {
-    S2[id] = LB "convert i16 " NEXTORD RB
+  sub(/\{const_int i64 8\}\)$/, "{const_int i64 " w "})", pre)
+  if (name == "slice_get" && (t == "i16" || t == "i8" || t == "i32")) {
+    S2[id] = LB "convert " t " " NEXTORD RB
     return pre " i64"
   }
   return pre " " t
 }
-/^func /{ delete E; delete N; delete OT; delete Def; delete S2; k = 0; print; next }
+function flushHeld() { if (HELD != "") { print HELD; HELD = "" } }
+# #7574 stores an f32 element inline from a float register; the oracle widened it through
+# `bitcast u32` into `rt_call slice_set`. The bitcast line is held until the next def: when that def
+# is the slice_set consuming it, both become the tree store (one `field_get s[0]` per slice and
+# block, then `index_set buf[i] = v`); any other next line prints the held bitcast untouched.
+# The checked form: the call becomes the slice_len / icmp_ult / br guard, the panic block and the
+# inline store (panic block first, as the lowering prints it), with block names no real one uses.
+function chkStore(S, ix,   a, b, ok, bad) {
+  a = "$" (k++); b = "$" (k++)
+  ok = "bb8" (NB++) "01"; bad = "bb8" (NB++) "01"
+  print "  " a " = slice_len " S
+  print "  " b " = icmp_ult bool " ix ", " a
+  print "  br " b ", " ok "(), " bad "()"
+  print bad "():"
+  print "  $" (k++) " = rt_call panic(" LB "const_string \"index out of range\"" RB ") void"
+  print "  unreachable"
+  print ok "():"
+  print "  $" k " = field_get " S "[0] i64"
+  print "  $" (k + 1) " = field_get " S "[16] i64"
+  print "  index_set $" k "[" LB "add i64 $" (k + 1) ", " ix RB "] = " HELDV
+  k += 2
+  return 1
+}
+function f32Fill(e, id,   v, args, c, S) {
+  if (side != "oracle" || narrow != 1) { return 0 }
+  if (e ~ /^bitcast u32 / && typeOf(substr(e, 13)) == "f32") {
+    flushHeld()
+    HELDV = substr(e, 13)
+    HELDID = "$" k
+    N[id] = "$" (k++)
+    OT[N[id]] = "u32"
+    HELD = "  " N[id] " = " e
+    return 1
+  }
+  if (HELD == "" || e !~ /^rt_call slice_set\(/ || lastTok(e) != "void") { return 0 }
+  args = substr(e, length("rt_call slice_set(") + 1)
+  sub(/\) void$/, "", args)
+  c = split(args, AP, ", ")
+  if (c != 4 || AP[3] != HELDID || AP[4] != "{const_int i64 8}" || OT[AP[1]] != "[]f32") { return 0 }
+  S = AP[1]
+  k--
+  HELD = ""
+  if (f32c == 1) { return chkStore(S, AP[2]) }
+  if (!(S in FB)) {
+    FB[S] = "$" (k++)
+    OT[FB[S]] = "i64"
+    Def[FB[S]] = "field_get " S "[0] i64"
+    print "  " FB[S] " = " Def[FB[S]]
+  }
+  print "  index_set " FB[S] "[" AP[2] "] = " HELDV
+  return 1
+}
+/^func /{ flushHeld(); delete E; delete N; delete OT; delete Def; delete S2; delete FB; k = 0; print; next }
 /^bb[0-9]+\(/ {
+  flushHeld()
+  delete FB
   line = $0
   s = line
   while (match(s, /%[0-9]+: /)) {
@@ -152,6 +229,8 @@ function rwCall(rest, id,   name, args, t, st, c, last, pre) {
   }
   NEXTORD = "$" k
   e = ex(line)
+  if (f32Fill(e, id)) { next }
+  flushHeld()
   e = rwLoad(rwCall(e, id))
   N[id] = "$" (k++)
   OT[N[id]] = resTy(e)
@@ -159,8 +238,9 @@ function rwCall(rest, id,   name, args, t, st, c, last, pre) {
   print "  " N[id] " = " e
   next
 }
-/^  index_set / { print "  " rwStore(ex(substr($0, 3))); next }
-{ print ex($0) }'
+/^  index_set / { flushHeld(); print "  " rwStore(ex(substr($0, 3))); next }
+{ flushHeld(); print ex($0) }
+END { flushHeld() }'
   IR_FOLD_AWK='# Stage 2, tree side only: folds the append fast path that #7562 made eligible for []i16/[]u16
 # (optappend.bit: elem_size equals the element width) back into the one slice_append call the
 # oracle keeps. The template is matched line for line; a near miss folds nothing and so differs.
@@ -175,7 +255,7 @@ function repTok(s, from, to,   out, post, i) {
   return out s
 }
 function dst(l) { sub(/^  /, "", l); sub(/ = .*$/, "", l); return l }
-function tmplAt(i,   a, b, c, h, d, e, v, f, s, j, r, n, t, l, x) {
+function tmplAt(i,   a, b, c, h, d, e, v, f, s, j, r, n, t, l, x, et, w, ix) {
   l = L[i]
   if (l !~ /^  \$[0-9]+ = slice_len \$[0-9]+$/) { return 0 }
   a = dst(l); h = l; sub(/^.* = slice_len /, "", h)
@@ -189,23 +269,31 @@ function tmplAt(i,   a, b, c, h, d, e, v, f, s, j, r, n, t, l, x) {
   f = x; sub(/\(\), .*$/, "", f)
   s = x; sub(/^[^,]*, /, "", s); sub(/\(\)$/, "", s)
   if (L[i + 4] != f "():") { return 0 }
-  d = dst(L[i + 5]); e = dst(L[i + 6])
+  d = dst(L[i + 5])
   if (L[i + 5] != "  " d " = field_get " h "[0] i64") { return 0 }
-  if (L[i + 6] != "  " e " = field_get " h "[16] i64") { return 0 }
-  v = L[i + 7]
-  if (index(v, "  index_set " d "[{add i64 " e ", " a "}] = ") != 1) { return 0 }
-  v = substr(v, length("  index_set " d "[{add i64 " e ", " a "}] = ") + 1)
-  if (L[i + 8] != "  field_set " h "[8] = {add i64 " a ", {const_int i64 1}}") { return 0 }
-  j = L[i + 9]
+  e = dst(L[i + 6])
+  sh = 0
+  ix = "[{add i64 " e ", " a "}]"
+  if (L[i + 6] != "  " e " = field_get " h "[16] i64") {
+    sh = 1
+    ix = "[" a "]"
+  }
+  v = L[i + 7 - sh]
+  if (index(v, "  index_set " d ix " = ") != 1) { return 0 }
+  v = substr(v, length("  index_set " d ix " = ") + 1)
+  if (L[i + 8 - sh] != "  field_set " h "[8] = {add i64 " a ", {const_int i64 1}}") { return 0 }
+  j = L[i + 9 - sh]
   if (j !~ /^  jump bb[0-9]+\(\$[0-9]+\)$/) { return 0 }
-  if (L[i + 10] != s "():") { return 0 }
-  t = L[i + 11]
+  if (L[i + 10 - sh] != s "():") { return 0 }
+  t = L[i + 11 - sh]
   r = dst(t)
-  if (t != "  " r " = rt_call slice_append(" h ", " v ", {const_int i64 0}, {const_int i64 2}) []i16" && t != "  " r " = rt_call slice_append(" h ", " v ", {const_int i64 0}, {const_int i64 2}) []u16") { return 0 }
+  et = t; sub(/^.* \[\]/, "", et)
+  w = pw(et)
+  if (w == 0 || t != "  " r " = rt_call slice_append(" h ", " v ", {const_int i64 0}, {const_int i64 " w "}) []" et) { return 0 }
   sub(/^  jump /, "", j); sub(/\(.*$/, "", j)
-  if (L[i + 9] != "  jump " j "(" h ")" || L[i + 12] != "  jump " j "(" r ")") { return 0 }
-  n = L[i + 13]
-  if (index(n, j "(") != 1 || n !~ /^bb[0-9]+\(\$[0-9]+: \[\]((i|u)16)\):$/) { return 0 }
+  if (L[i + 9 - sh] != "  jump " j "(" h ")" || L[i + 12 - sh] != "  jump " j "(" r ")") { return 0 }
+  n = L[i + 13 - sh]
+  if (index(n, j "(") != 1 || n !~ /^bb[0-9]+\(\$[0-9]+: \[\][a-z0-9]+\):$/) { return 0 }
   sub(/^[^(]*\(/, "", n); sub(/:.*$/, "", n)
   NN = n; RR = r; OUT1 = t
   return 1
@@ -215,8 +303,8 @@ function flush(   i, k, o, n) {
   for (i = 1; i <= n0; i++) {
     if (tmplAt(i)) {
       print OUT1
-      for (k = i + 14; k <= n0; k++) { L[k] = repTok(L[k], NN, RR) }
-      i = i + 13
+      for (k = i + 14 - sh; k <= n0; k++) { L[k] = repTok(L[k], NN, RR) }
+      i = i + 13 - sh
       continue
     }
     print L[i]
@@ -247,7 +335,9 @@ END {
   for (i = 1; i <= na; i++) {
     if (A[i] != B[i]) { exit 1 }
   }
-  print "7562-packed-halfword-slices"
+  if (which == "half") { print "7562-packed-halfword-slices" }
+  else if (which == "narrow") { print "7574-packed-narrow-slices" }
+  else { print "7637-string-from-rune-range" }
 }'
   IR_TYPES_AWK='# The types row: the oracle dump, a line @@@BIT2@@@, then the tree dump. Rows are `line:col: name:
 # type`. #7558 spells the synthesized import alias `__Json`, which lengthens the synthesized text, so
@@ -281,14 +371,32 @@ END {
 }'
 }
 
+# irTrial <oracle_text> <bit2_text> <half> <narrow> <rune> <name> [f32c] -- one normalization with the given
+# rewrite classes enabled; prints the signature when the two dumps then agree byte for byte.
+irTrial() {
+  local o t f="-v half=$3 -v narrow=$4 -v rune=$5 -v f32c=${7:-0}"
+  # shellcheck disable=SC2086
+  o=$(canon_ir_ids "$1" | LC_ALL=C awk $f -v side=oracle "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk "${IR_RENUM_AWK}") || return 1
+  # shellcheck disable=SC2086
+  t=$(canon_ir_ids "$2" | LC_ALL=C awk $f -v side=tree "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk $f "${IR_PW_AWK}${IR_FOLD_AWK}" | LC_ALL=C awk "${IR_RENUM_AWK}") || return 1
+  printf '%s\n@@@BIT2@@@\n%s\n' "${o}" "${t}" | LC_ALL=C awk -v which="$6" "${IR_CMP_AWK}"
+}
+
 # explainIrLag <oracle_text> <bit2_text> -- prints the signature name and returns 0 when the two
-# dumps agree after normalization, prints nothing and returns 1 otherwise.
+# dumps agree after normalization, prints nothing and returns 1 otherwise. The trials run from the
+# narrowest rewrite set to the widest and the first that agrees names the file: halfword alone is
+# #7562, halfword plus the 1 and 4 byte widths is #7574, the []rune range call alone or together
+# with the packing is #7637 (a file that needs both is named for the rune call, the one rewrite
+# that is not a width).
 explainIrLag() {
-  local o t
   irWalkAwk
-  o=$(canon_ir_ids "$1" | LC_ALL=C awk -v side=oracle "${IR_STAGE1_AWK}" | LC_ALL=C awk "${IR_RENUM_AWK}") || return 1
-  t=$(canon_ir_ids "$2" | LC_ALL=C awk -v side=tree "${IR_STAGE1_AWK}" | LC_ALL=C awk "${IR_FOLD_AWK}" | LC_ALL=C awk "${IR_RENUM_AWK}") || return 1
-  printf '%s\n@@@BIT2@@@\n%s\n' "${o}" "${t}" | LC_ALL=C awk "${IR_CMP_AWK}"
+  irTrial "$1" "$2" 1 0 0 half && return 0
+  irTrial "$1" "$2" 1 1 0 narrow 0 && return 0
+  irTrial "$1" "$2" 1 1 0 narrow 1 && return 0
+  irTrial "$1" "$2" 0 0 1 rune && return 0
+  irTrial "$1" "$2" 1 1 1 rune 0 && return 0
+  irTrial "$1" "$2" 1 1 1 rune 1 && return 0
+  return 1
 }
 
 # explainLagTypes <oracle_text> <bit2_text> -- the `types` row, same contract as explainIrLag.
