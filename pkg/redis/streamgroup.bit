@@ -1,0 +1,438 @@
+// pkg/redis/streamgroup.bit - consumer groups on a stream: `r.stream(k)
+// .group("g")` and `.consumer("c")`. Epic #6013, #6035. `stream.bit`'s
+// header covers entries, `StreamId`, blocking and why the handles hold a
+// `client: Client`; this file adds the group commands (`XGROUP`, `XREADGROUP`,
+// `XACK`, `XPENDING`, `XCLAIM`, `XAUTOCLAIM`, `XACKDEL`).
+//
+// THE DELIVERY MODEL IN ONE PARAGRAPH. A group remembers the last id it
+// handed out. `Consumer.read` asks for entries nobody in the group has been
+// given (`StreamId.Undelivered`, `>`); each one goes to exactly one consumer
+// and sits in the group's pending list until it is acknowledged. A consumer
+// that dies leaves its entries pending; `claimStale` hands entries idle longer
+// than `minIdle` to a live consumer. Asking `read(from = StreamId.Zero)`
+// re-reads the consumer's OWN pending entries instead (an entry deleted from
+// the stream since comes back with no fields).
+//
+// DURATIONS ARE NANOSECONDS, like every timeout in this package; the server
+// counts milliseconds, and `idle` in the replies is converted back.
+
+// What `XAUTOCLAIM` returned: the entries now owned by the claiming consumer,
+// `next` (the id to pass as `start` for the following page, `0-0` when the
+// scan finished) and `deleted`, ids that were pending but no longer exist in
+// the stream and were dropped from the pending list.
+export class AutoClaimed {
+  export next: string,
+  export entries: []Entry,
+  export deleted: []string,
+}
+
+// `XPENDING` without a range: how many entries are pending, the smallest and
+// largest id among them (`None` when nothing is pending) and the count per
+// consumer.
+export class PendingSummary {
+  export count: i64,
+  export minId: Option<string>,
+  export maxId: Option<string>,
+  export consumers: []PendingCount,
+}
+
+export class PendingCount { export consumer: string, export count: i64 }
+
+// One pending entry: who holds it, how long ago it was last delivered (`idle`,
+// nanoseconds) and how many times it has been delivered.
+export class PendingEntry {
+  export id: string,
+  export consumer: string,
+  export idle: int,
+  export deliveries: i64,
+}
+
+export class Group {
+  client: Client
+  key: string
+  name: string
+
+  // `XGROUP CREATE`: `from` is `StreamId.Latest` (only entries added from now
+  // on) or `StreamId.Zero` (the whole stream). `mkStream` creates the stream
+  // when it is missing. Fails `RedisError.Server("BUSYGROUP", ..)` when the
+  // group exists; `ensure` is the call that tolerates it.
+  export create(from: StreamId = StreamId.Latest, mkStream: bool = true): ()!RedisError {
+    return this.client.runCmd(xgroupCreateCmd(this.key, this.name, from, mkStream))?
+  }
+  // `create` that is happy when the group is already there: true when this
+  // call made it. Safe to run at every worker start.
+  export ensure(from: StreamId = StreamId.Latest): bool!RedisError {
+    this.create(from) catch e {
+      if (isBusyGroup(e)) {
+        return false
+      }
+      fail e
+    }
+    return true
+  }
+  // `XGROUP DESTROY`: false when there was no such group.
+  export destroy(): bool!RedisError {
+    return this.client.runCmd(xgroupBoolCmd("DESTROY", this.key, this.name, ""))?
+  }
+  // `XGROUP SETID`: moves the group's last-delivered position.
+  export setId(to: StreamId): ()!RedisError {
+    return this.client.runCmd(xgroupSetIdCmd(this.key, this.name, to))?
+  }
+  // `XGROUP CREATECONSUMER`: false when the consumer existed. A consumer is
+  // also created by its first read.
+  export createConsumer(name: string): bool!RedisError {
+    return this.client.runCmd(xgroupBoolCmd("CREATECONSUMER", this.key, this.name, name))?
+  }
+  // `XGROUP DELCONSUMER`: how many pending entries the consumer still held
+  // (they are dropped from the pending list, so claim them first).
+  export delConsumer(name: string): i64!RedisError {
+    return this.client.runCmd(xgroupDelConsumerCmd(this.key, this.name, name))?
+  }
+  who(consumer: string): groupRef {
+    return groupRef{ key = this.key, group = this.name, consumer = consumer }
+  }
+  export consumer(name: string): Consumer {
+    return Consumer{ client = this.client, key = this.key, group = this.name, name = name }
+  }
+  // `XACK`: how many of `ids` were pending and are now acknowledged.
+  export ack(...ids: string): i64!RedisError {
+    return this.client.runCmd(xackCmd(this.key, this.name, ids))?
+  }
+  // `XACKDEL` (Redis 8.2+): acknowledge and delete in one step.
+  export ackDelete(ids: []string, refs: RefMode = RefMode.Keep): []DelStatus!RedisError {
+    return this.client.runCmd(xackdelCmd(this.key, this.name, ids, refs))?
+  }
+  // `XPENDING key group`.
+  export pending(): PendingSummary!RedisError {
+    return this.client.runCmd(xpendingSummaryCmd(this.key, this.name))?
+  }
+  // `XPENDING key group start end count [consumer]`: up to `count` pending
+  // entries in id order. `consumer` "" means every consumer; `minIdle` > 0
+  // keeps only entries idle that long.
+  export pendingList(
+    count: int,
+    start: StreamId = StreamId.First,
+    end: StreamId = StreamId.Last,
+    consumer: string = "",
+    minIdle: int = 0,
+  ): []PendingEntry!RedisError {
+    return this.client.runCmd(
+      xpendingListCmd(this.who(consumer), count, start, end, minIdle),
+    )?
+  }
+  // `XCLAIM`: gives `consumer` the pending `ids` that have been idle at least
+  // `minIdle`. `force` also creates the pending record of an id nobody holds.
+  export claim(
+    consumer: string,
+    minIdle: int,
+    ids: []string,
+    force: bool = false,
+  ): []Entry!RedisError {
+    return this.client.runCmd(xclaimCmd(this.who(consumer), minIdle, ids, force))?
+  }
+  // `XCLAIM .. JUSTID`: the claimed ids only, the delivery count is not bumped.
+  export claimIds(
+    consumer: string,
+    minIdle: int,
+    ids: []string,
+    force: bool = false,
+  ): []string!RedisError {
+    return this.client.runCmd(xclaimIdsCmd(this.who(consumer), minIdle, ids, force))?
+  }
+  // `XAUTOCLAIM`: scans pending entries from `start` and gives `consumer` up
+  // to `count` of those idle at least `minIdle`.
+  export autoClaim(
+    consumer: string,
+    minIdle: int,
+    start: StreamId = StreamId.Zero,
+    count: int = 100,
+  ): AutoClaimed!RedisError {
+    return this.client.runCmd(xautoClaimCmd(this.who(consumer), minIdle, start, count))?
+  }
+  // `XINFO CONSUMERS`.
+  export consumers(): []ConsumerInfo!RedisError {
+    return this.client.runCmd(xinfoConsumersCmd(this.key, this.name))?
+  }
+}
+
+// One consumer of one group: the handle a worker loop holds.
+export class Consumer {
+  client: Client
+  key: string
+  group: string
+  name: string
+
+  who(): groupRef { return groupRef{ key = this.key, group = this.group, consumer = this.name } }
+  // `XREADGROUP`: new entries for this consumer (`from` = `StreamId.Undelivered`),
+  // or its own unacknowledged ones (`StreamId.Zero` or `StreamId.At(id)`).
+  // `count` 0 is all available, `block` as in `Stream.read`. `noAck` skips the
+  // pending list, for entries you can afford to lose.
+  export read(
+    count: int = 0,
+    block: int = -1,
+    from: StreamId = StreamId.Undelivered,
+    noAck: bool = false,
+  ): []Entry!RedisError {
+    let cmd = xreadGroupCmd(this.who(), from, count, block, noAck)
+    return streamRun(this.client, cmd, block)?
+  }
+  export ack(...ids: string): i64!RedisError {
+    return this.client.runCmd(xackCmd(this.key, this.group, ids))?
+  }
+  // This consumer's pending entries, oldest first, at most `count`.
+  export pending(count: int = 100): []PendingEntry!RedisError {
+    let cmd = xpendingListCmd(this.who(), count, StreamId.First, StreamId.Last, 0)
+    return this.client.runCmd(cmd)?
+  }
+  // `XAUTOCLAIM` into this consumer: takes over entries other consumers
+  // left pending for `minIdle`. Pass `AutoClaimed.next` as `start` for the
+  // next page.
+  export claimStale(
+    minIdle: int,
+    count: int = 100,
+    start: StreamId = StreamId.Zero,
+  ): AutoClaimed!RedisError {
+    return this.client.runCmd(xautoClaimCmd(this.who(), minIdle, start, count))?
+  }
+}
+
+fn isBusyGroup(e: RedisError): bool {
+  match (e) {
+    Server(code, _) => return code == "BUSYGROUP"
+    _ => return false
+  }
+}
+
+fn idleMillis(ns: int): string {
+  return "${ns / Millisecond}"
+}
+
+fn xgroupCreateCmd(key: string, group: string, from: StreamId, mkStream: bool): Cmd<()> {
+  let args = ["XGROUP", "CREATE", key, group, from.text()]
+  if (mkStream) {
+    args = append(args, "MKSTREAM")
+  }
+  return Cmd<()>{ args = args, decode = (r) => asOk(r, "XGROUP"), readOnly = false }
+}
+
+fn xgroupSetIdCmd(key: string, group: string, to: StreamId): Cmd<()> {
+  return Cmd<()>{
+    args = ["XGROUP", "SETID", key, group, to.text()],
+    decode = (r) => asOk(r, "XGROUP"),
+    readOnly = false,
+  }
+}
+
+// `DESTROY key group` and `CREATECONSUMER key group consumer`, both answering 0/1.
+fn xgroupBoolCmd(sub: string, key: string, group: string, consumer: string): Cmd<bool> {
+  let args = ["XGROUP", sub, key, group]
+  if (consumer != "") {
+    args = append(args, consumer)
+  }
+  return Cmd<bool>{ args = args, decode = (r) => asBool(r, "XGROUP"), readOnly = false }
+}
+
+fn xgroupDelConsumerCmd(key: string, group: string, consumer: string): Cmd<i64> {
+  return Cmd<i64>{
+    args = ["XGROUP", "DELCONSUMER", key, group, consumer],
+    decode = (r) => asInt(r, "XGROUP"),
+    readOnly = false,
+  }
+}
+
+fn xackdelCmd(key: string, group: string, ids: []string, refs: RefMode): Cmd<[]DelStatus> {
+  return Cmd<[]DelStatus>{
+    args = idsArgs(["XACKDEL", key, group], refs, ids),
+    decode = (r) => asDelStatuses(r, "XACKDEL"),
+    readOnly = false,
+  }
+}
+
+// Which group member a command acts for; `consumer` is "" where the command
+// is about the whole group. One value instead of three parameters, which also
+// keeps the builders under the lint parameter limit.
+class groupRef {
+  key: string,
+  group: string,
+  consumer: string,
+}
+
+fn xreadGroupCmd(who: groupRef, from: StreamId, count: int, block: int, noAck: bool): Cmd<[]Entry> {
+  let args = ["XREADGROUP", "GROUP", who.group, who.consumer]
+  args = append(args, ...readOptions(count, block))
+  if (noAck) {
+    args = append(args, "NOACK")
+  }
+  args = append(args, ...streamsArgs([Cursor{ key = who.key, from = from }]))
+  return Cmd<[]Entry>{ args = args, decode = (r) => asFirstRead(r, "XREADGROUP"), readOnly = false }
+}
+
+fn xpendingSummaryCmd(key: string, group: string): Cmd<PendingSummary> {
+  return Cmd<PendingSummary>{
+    args = ["XPENDING", key, group],
+    decode = (r) => asPendingSummary(r),
+    readOnly = true,
+  }
+}
+
+fn xpendingListCmd(
+  who: groupRef,
+  count: int,
+  start: StreamId,
+  end: StreamId,
+  minIdle: int,
+): Cmd<[]PendingEntry> {
+  let args = ["XPENDING", who.key, who.group]
+  if (minIdle > 0) {
+    args = append(args, "IDLE", idleMillis(minIdle))
+  }
+  args = append(args, start.text(), end.text(), "${count}")
+  if (who.consumer != "") {
+    args = append(args, who.consumer)
+  }
+  return Cmd<[]PendingEntry>{
+    args = args,
+    decode = (r) => asPendingList(r),
+    readOnly = true,
+  }
+}
+
+fn xclaimArgs(who: groupRef, minIdle: int, ids: []string, force: bool): []string {
+  let args = ["XCLAIM", who.key, who.group, who.consumer, idleMillis(minIdle)]
+  args = append(args, ...ids)
+  if (force) {
+    args = append(args, "FORCE")
+  }
+  return args
+}
+
+fn xclaimCmd(who: groupRef, minIdle: int, ids: []string, force: bool): Cmd<[]Entry> {
+  return Cmd<[]Entry>{
+    args = xclaimArgs(who, minIdle, ids, force),
+    decode = (r) => asStreamEntries(r, "XCLAIM"),
+    readOnly = false,
+  }
+}
+
+fn xclaimIdsCmd(who: groupRef, minIdle: int, ids: []string, force: bool): Cmd<[]string> {
+  let args = xclaimArgs(who, minIdle, ids, force)
+  args = append(args, "JUSTID")
+  return Cmd<[]string>{ args = args, decode = (r) => asStrings(r, "XCLAIM"), readOnly = false }
+}
+
+fn xautoClaimCmd(who: groupRef, minIdle: int, start: StreamId, count: int): Cmd<AutoClaimed> {
+  let args = ["XAUTOCLAIM", who.key, who.group, who.consumer, idleMillis(minIdle), start.text()]
+  if (count > 0) {
+    args = append(args, "COUNT", "${count}")
+  }
+  return Cmd<AutoClaimed>{ args = args, decode = (r) => asAutoClaimed(r), readOnly = false }
+}
+
+fn asAutoClaimed(r: Reply): AutoClaimed!RedisError {
+  match (r) {
+    Array(items) => return autoClaimedFromList(unwrapOr(items, []Reply(0)))?
+    _ => fail RedisError.Unexpected("XAUTOCLAIM", shapeName(r))
+  }
+}
+
+fn autoClaimedFromList(list: []Reply): AutoClaimed!RedisError {
+  if (len(list) < 2 || len(list) > 3) {
+    fail RedisError.Unexpected("XAUTOCLAIM", "Array")
+  }
+  let next = replyToString(list[0], "XAUTOCLAIM")?
+  let entries = asStreamEntries(list[1], "XAUTOCLAIM")?
+  let deleted = []string(0)
+  if (len(list) == 3) {
+    deleted = asStrings(list[2], "XAUTOCLAIM")?
+  }
+  return AutoClaimed{ next = next, entries = entries, deleted = deleted }
+}
+
+// `[count, min-id|nil, max-id|nil, [[consumer, "n"], ...]|nil]`.
+fn asPendingSummary(r: Reply): PendingSummary!RedisError {
+  match (r) {
+    Array(items) => return pendingSummaryFromList(unwrapOr(items, []Reply(0)))?
+    _ => fail RedisError.Unexpected("XPENDING", shapeName(r))
+  }
+}
+
+fn pendingSummaryFromList(list: []Reply): PendingSummary!RedisError {
+  if (len(list) != 4) {
+    fail RedisError.Unexpected("XPENDING", "Array")
+  }
+  let count = asInt(list[0], "XPENDING")?
+  let minId = asOptString(list[1], "XPENDING")?
+  let maxId = asOptString(list[2], "XPENDING")?
+  let consumers = pendingCounts(list[3])?
+  return PendingSummary{ count = count, minId = minId, maxId = maxId, consumers = consumers }
+}
+
+fn pendingCounts(r: Reply): []PendingCount!RedisError {
+  match (r) {
+    Null => return []PendingCount(0)
+    Array(items) => return pendingCountsFromList(unwrapOr(items, []Reply(0)))?
+    _ => fail RedisError.Unexpected("XPENDING", shapeName(r))
+  }
+}
+
+fn pendingCountsFromList(list: []Reply): []PendingCount!RedisError {
+  let out = []PendingCount(len(list))
+  let i = 0
+  while (i < len(list)) {
+    out[i] = pendingCountOf(list[i])?
+    i = i + 1
+  }
+  return out
+}
+
+fn pendingCountOf(r: Reply): PendingCount!RedisError {
+  let pair = asStrings(r, "XPENDING")?
+  if (len(pair) != 2) {
+    fail RedisError.Unexpected("XPENDING", "Array")
+  }
+  let n = parseInt(pair[1]) catch _ {
+    fail RedisError.Unexpected("XPENDING", "Bulk")
+  }
+  return PendingCount{ consumer = pair[0], count = n }
+}
+
+// `[[id, consumer, idle-ms, deliveries], ...]`.
+fn asPendingList(r: Reply): []PendingEntry!RedisError {
+  match (r) {
+    Array(items) => return pendingListFromList(unwrapOr(items, []Reply(0)))?
+    _ => fail RedisError.Unexpected("XPENDING", shapeName(r))
+  }
+}
+
+fn pendingListFromList(list: []Reply): []PendingEntry!RedisError {
+  let out = []PendingEntry(len(list))
+  let i = 0
+  while (i < len(list)) {
+    out[i] = pendingEntryOf(list[i])?
+    i = i + 1
+  }
+  return out
+}
+
+fn pendingEntryOf(r: Reply): PendingEntry!RedisError {
+  match (r) {
+    Array(items) => return pendingEntryFromList(unwrapOr(items, []Reply(0)))?
+    _ => fail RedisError.Unexpected("XPENDING", shapeName(r))
+  }
+}
+
+fn pendingEntryFromList(list: []Reply): PendingEntry!RedisError {
+  if (len(list) != 4) {
+    fail RedisError.Unexpected("XPENDING", "Array")
+  }
+  let id = replyToString(list[0], "XPENDING")?
+  let consumer = replyToString(list[1], "XPENDING")?
+  let idleMs = asInt(list[2], "XPENDING")?
+  let deliveries = asInt(list[3], "XPENDING")?
+  return PendingEntry{
+    id = id,
+    consumer = consumer,
+    idle = idleMs * Millisecond,
+    deliveries = deliveries,
+  }
+}
