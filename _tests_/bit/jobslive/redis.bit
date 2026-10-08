@@ -10,7 +10,7 @@
 // `_tests_/bit/jobslive.bit` generates, and resolves "jobs" and "redis"
 // through that project's `bit.lock`.
 
-import { Client, open as redisOpen, asInt as redisInt, asOptString, asStrings } from "redis"
+import { Client, open as redisOpen, asInt as redisInt, asOptString, asStrings, asDouble } from "redis"
 import {
   RedisStore, RedisLocker, ClaimedJob, Options, PermanentFailure, open as queueOpen,
 } from "jobs"
@@ -175,17 +175,74 @@ fn expectOneJob(store: RedisStore, label: string) {
   }
 }
 
-// One claim that must find nothing BEFORE `due` (the caller's clock). True when
-// it found nothing. A job it did claim is a failure only if the clock read
-// AFTER the call is still short of `due`; past `due` the job was legitimately
-// due, the claim proved nothing, the job is completed and the answer is false
-// (#7452: a stalled `sleep` outruns any fixed window).
-fn claimNothingBefore(store: RedisStore, due: int, label: string): bool {
+// The server's clock, `TIME`, in ns.
+fn serverNow(l: RedisLocker): int {
+  return l.serverNowNs() catch e {
+    panic("serverNowNs: ${e.message()}")
+  }
+}
+
+// The availability the store wrote for the soonest job in the ready set, on the
+// SERVER's clock: the score of its first member (the hour-ahead job sits
+// behind it). Read back so the proof never has to guess what the store stored.
+fn storedDue(c: Client, store: RedisStore): f64 {
+  let ids = asStrings(
+    c.command(["ZRANGE", store.readyKey, "0", "0"]) catch e {
+      panic("ZRANGE: ${e.message()}")
+    },
+    "ZRANGE",
+  ) catch e {
+    panic("ZRANGE decode: ${e.message()}")
+  }
+  if (len(ids) != 1) {
+    panic("LIVE PROOF FAILED: the ready set was empty after the delayed enqueue")
+  }
+  return asDouble(
+    c.command(["ZSCORE", store.readyKey, ids[0]]) catch e {
+      panic("ZSCORE: ${e.message()}")
+    },
+    "ZSCORE",
+  ) catch e {
+    panic("ZSCORE decode: ${e.message()}")
+  }
+}
+
+// Scores are doubles, 256 ns apart at today's epoch: a microsecond of slack.
+const scoreSlackNs: int = 1000
+
+// The stored availability of a job enqueued `delay` ahead is a DELAY on the
+// server's clock: no earlier than `before + delay - callerElapsed` (`before`
+// is the server's TIME read before the call, `callerElapsed` how long the call
+// took by the caller's own clock, which bounds the time the caller spent
+// between reading its `now` and sending it) and no later than `after + delay`
+// (`after` is TIME read once the call returned). A store that wrote the
+// caller's clock instead lands outside this range as soon as the two clocks
+// differ by more than one round trip.
+fn expectStoredDelay(dueServer: f64, before: int, after: int, delay: int, callerElapsed: int) {
+  let lo = f64(before + delay - callerElapsed - scoreSlackNs)
+  let hi = f64(after + delay + scoreSlackNs)
+  if (dueServer < lo || dueServer > hi) {
+    let off = (int(dueServer) - (after + delay)) / 1000000
+    panic("LIVE PROOF FAILED: a ${delay / Millisecond} ms delay was stored ${off} ms from the server's clock (server TIME before ${before}, after ${after}, caller call took ${callerElapsed / 1000000} ms, stored ${int(dueServer)})")
+  }
+}
+
+// One claim that must find nothing BEFORE `dueServer`, the availability the
+// store wrote, which is on the SERVER's clock. True when it found nothing. A
+// job it did claim is a failure only if the server's clock read AFTER the call
+// is still short of `dueServer` (the claim ran at or before that read, so it
+// ran early); at or past it the job was legitimately due, the claim proved
+// nothing, the job is completed and the answer is false (#7452: a stalled
+// `sleep`, or a host clock stepped forward as the x86 docker host's is every
+// ~32 s by timesyncd (#7673), outruns any fixed window). Nothing here reads the
+// caller's clock, so a caller stall cannot fail it.
+fn claimNothingBefore(l: RedisLocker, store: RedisStore, dueServer: f64, label: string): bool {
   match (claimOnce(store, label)) {
     None => return true
     Some(job) => {
-      if (now().ns < due) {
-        panic("LIVE PROOF FAILED: ${label}: job ${job.id} was claimable ${(due - now().ns) / Millisecond} ms early")
+      let at = serverNow(l)
+      if (f64(at) < dueServer) {
+        panic("LIVE PROOF FAILED: ${label}: job ${job.id} was claimable ${(int(dueServer) - at) / 1000000} ms early on the server's clock")
       }
       store.complete(job.id) catch e {
         panic("complete: ${e.message()}")
@@ -198,11 +255,16 @@ fn claimNothingBefore(store: RedisStore, due: int, label: string): bool {
 // A job `delay` ahead is not claimable before the delay is up and is after it.
 // False when the machine was too slow to prove the first half (see
 // `claimNothingBefore`).
-fn attemptDelay(store: RedisStore, delay: int): bool {
-  let due = now().ns + delay
-  enqueueAt(store, due)
+fn attemptDelay(c: Client, store: RedisStore, l: RedisLocker, delay: int): bool {
+  let sent = now().ns
+  let before = serverNow(l)
+  enqueueAt(store, sent + delay)
+  let took = now().ns - sent
+  let after = serverNow(l)
+  let dueServer = storedDue(c, store)
+  expectStoredDelay(dueServer, before, after, delay, took)
   sleep(delay * 3 / 7)
-  if (!claimNothingBefore(store, due, "before its delay")) {
+  if (!claimNothingBefore(l, store, dueServer, "before its delay")) {
     return false
   }
   sleep(delay)
@@ -211,21 +273,19 @@ fn attemptDelay(store: RedisStore, delay: int): bool {
 }
 
 // A delay is a delay on the SERVER's clock: a job 700 ms ahead by the caller's
-// clock is not claimable after 300 ms and is after a second, whatever the
-// caller's clock and the server's disagree by (printed, not asserted: it is a
-// property of the machines). The delay is retried doubled, at most four times,
-// when the caller was outrun. A job an hour ahead never is, and one an hour
-// behind always is.
+// clock is stored as that far ahead of the server's TIME (whatever the two
+// clocks disagree by: printed, not asserted, it is a property of the machines),
+// is not claimable before the server's clock reaches it and is after. The
+// delay is retried doubled, at most four times, when the caller was outrun. A
+// job an hour ahead never is claimable, and one an hour behind always is.
 fn proveDelayIsADuration(c: Client, store: RedisStore, locker: RedisLocker) {
-  let server = locker.serverNowNs() catch e {
-    panic("serverNowNs: ${e.message()}")
-  }
+  let server = serverNow(locker)
   print("REDIS_SKEW server_minus_caller_ms=${(server - now().ns) / 1000000}\n")
   let hour = 3600 * 1000 * 1000000
   enqueueAt(store, now().ns + hour)
   let delay = 700 * Millisecond
   let tries = 0
-  while (!attemptDelay(store, delay)) {
+  while (!attemptDelay(c, store, locker, delay)) {
     tries = tries + 1
     if (tries > 4) {
       panic("LIVE PROOF FAILED: a ${delay / Millisecond} ms delay was outrun by this machine on every attempt")
