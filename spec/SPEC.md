@@ -2856,6 +2856,11 @@ syscall(nr, a0, a1, a2, a3, a4, a5)
   pointer. A slice of a scalar narrower than 8 bytes is **packed** at the
   element's own width (`i8`/`u8`/`bool` 1, `i16`/`u16` 2, `i32`/`u32`/`f32` 4),
   and every other element type is stored one 8-byte word per element.
+  `ptrOf` accepts a slice of any non-reference scalar element - an integer,
+  `bool`, `f32` or `f64` - and yields a `*T` over that buffer at its packed
+  stride, so `ptrOf(xs)` of a `[]f32` is a native `float*` for C. A slice of
+  references (`string`, a class, an interface, a nested slice) is **E0053**:
+  its words are headers the collector traces, not a buffer a callee can read.
 
 The compiler emits the kernel trap inline - never a call to a runtime symbol -
 using each platform's kernel ABI, which is **not** its C ABI:
