@@ -85,6 +85,21 @@ func other$c1() {}'
   g=$(canon_ir_ids '  %38 = call @size$t37(%26)  i64')
   assert_eq "non-\$t tokens and whitespace are untouched" "$g" '  %38 = call @size$c0(%26)  i64'
 
+  # A non-UTF-8 byte in a const_string must not truncate the dump (#6716): both
+  # sides keep all 4 lines and a difference after the byte still shows. Forced
+  # to a UTF-8 locale, where awk without LC_ALL=C stops at the byte.
+  bad=$(printf '  %%1 = const_string "\300A"')
+  h=$(LC_ALL=en_US.UTF-8 canon_ir_ids "func f\$t1() {
+${bad}
+  ret \$t1 x
+}")
+  i=$(LC_ALL=en_US.UTF-8 canon_ir_ids "func f\$t2() {
+${bad}
+  ret \$t2 y
+}")
+  [ "$h" = "$i" ] && { echo "FAIL: a difference after a non-UTF-8 byte was truncated away"; fail=1; }
+  assert_eq "non-UTF-8 byte keeps every line" "$(printf '%s\n' "$h" | wc -l | tr -d ' ')" 4
+
   if [ "$fail" -eq 0 ]; then
     echo "selfhost-ir-canon.sh: self-check passed"
   fi

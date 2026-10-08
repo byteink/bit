@@ -57,7 +57,8 @@
 # Exit codes (matching x64gate.sh / selfhost-diffsafepoints.sh / 3977211):
 #   0  every file compared, no false positive
 #   1  real failure: a FALSEPOS (bit rejects code the oracle accepts)
-#   2  could not decide: a file timed out and was never compared. Not a pass.
+#   2  could not decide: a file timed out and was never compared, or a DIFF did
+#      not reproduce on fresh captures (UNSTABLE, #6357). Not a pass.
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffcheck.sh
 set -u
@@ -103,29 +104,19 @@ export BIT_STDLIB
 # artifact does not. TIMEOUT_S overrides for a slower host.
 TIMEOUT_S=${TIMEOUT_S:-20}
 
-# Alarm-guarded run; captures diagnostics (stderr) and discards stdout.
-# The exit status is LOAD-BEARING and must be read by every caller: it returns
-# 142 (128+SIGALRM) iff the run timed out TWICE. Retry-once-on-stall is
-# scripts/alarmrun.sh's alarmrun_retry (#3408); no persistent artifact to clean
-# between attempts here, so its outfile arg is "".
-run() {
-  local out rc side
-  local TIMEOUT="$TIMEOUT_S"
-  [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
-  out=$(ALARMRUN_KEEP_STDERR=1 alarmrun_retry "$side" "" "$@" 2>&1 >/dev/null)
-  rc=$?
-  printf '%s' "$out"
-  return "$rc"
-}
-
-# run_cap <side> <capture> <cmd...> -- like run() above, but writes stderr to
-# a FILE instead of returning it via `$(...)`, so the caller can background
+# The compared payload never leaves its capture FILE (#6357, same shape as
+# #6355): it used to be read into a variable and `printf`ed into the caller's
+# `$(...)`, and a signal landing on that write (alarmrun's SIGALRM machinery,
+# under fleet load) truncated one side's payload. Sides are compared with `cmp`
+# and searched with `grep` on the files themselves.
+#
+# run_cap <side> <capture> <cmd...> -- alarm-guarded run: writes stderr (the
+# diagnostics) to a FILE and discards stdout, so the caller can background
 # it: a shell variable assigned inside `$(...)` run in `&` never reaches the
 # parent shell, but a file written before the child exits, read after `wait`
 # returns, does (#3783). Mirrors alarmrun_retry's own retry-once-on-stall
 # shape rather than calling it directly, because alarmrun_retry_cap merges
-# stdout into the capture and this differential discards stdout (see run()
-# above) -- so <capture> is truncated before EACH attempt here, same as
+# stdout into the capture and this differential discards stdout -- so <capture> is truncated before EACH attempt here, same as
 # alarmrun_cap does for its own merged capture and for the same reason
 # (#3478): a stalled first attempt's partial bytes must never survive into a
 # retry's compared payload.
@@ -145,6 +136,20 @@ run_cap() {
   return "$rc"
 }
 
+# runpair <file> -- both sides of one file CONCURRENTLY into $seedcap/$b2cap;
+# the exit statuses land in $src and $brc. ORACLE and BIT2 are independent per
+# file -- compared only after both return -- so they need not run back-to-back
+# (#3783). Each is still independently alarm-guarded, so a hung ORACLE still
+# cannot wedge the whole gate: it only stalls this one file's own iteration.
+runpair() {
+  run_cap ORACLE "$seedcap" "$ORACLE" check "$1" &
+  oraclepid=$!
+  run_cap BIT2 "$b2cap" "$BIT2" check "$1" &
+  bit2pid=$!
+  wait "$oraclepid"; src=$?
+  wait "$bit2pid"; brc=$?
+}
+
 # FALSE POSITIVES DECLARED AGAINST THE PINNED ORACLE. One line per file:
 # `<path> <error code> #<ticket>`. A file listed here that the oracle accepts
 # and bit2 rejects WITH EXACTLY THAT CODE is a deliberate new check-time
@@ -159,24 +164,13 @@ declaredCode() {
   printf '%s\n' "$FALSEPOS_DECLARED" | awk -v f="$1" '$1 == f { print $2 }'
 }
 
-match=0 missing=0 falsepos=0 diff=0 timeout=0 explained=0 firstfp="" firstdiff="" firsthang="" hitdeclared=""
+match=0 missing=0 falsepos=0 diff=0 timeout=0 explained=0 unstable=0 firstfp="" firstdiff="" firsthang="" firstunstable="" hitdeclared=""
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 seedcap="$work/seed.out"
 b2cap="$work/b2.out"
 for f in $(find stdlib examples _tests_/cases _tests_/imports -name '*.bit' | sort); do
-  # ORACLE and BIT2 are independent per file -- compared only after both
-  # return -- so run them CONCURRENTLY rather than back-to-back (#3783).
-  # Each is still independently alarm-guarded, so a hung ORACLE still cannot
-  # wedge the whole gate: it only stalls this one file's own iteration.
-  run_cap ORACLE "$seedcap" "$ORACLE" check "$f" &
-  oraclepid=$!
-  run_cap BIT2 "$b2cap" "$BIT2" check "$f" &
-  bit2pid=$!
-  wait "$oraclepid"; src=$?
-  wait "$bit2pid"; brc=$?
-  seed=$(cat "$seedcap")
-  b2=$(cat "$b2cap")
+  runpair "$f"
   if [ "$src" -eq 142 ] || [ "$brc" -eq 142 ]; then
     # Undecided: this file was never compared. Counted on its own, and
     # deliberately NOT folded into MISSING or FALSEPOS — those are tracked,
@@ -224,15 +218,24 @@ for f in $(find stdlib examples _tests_/cases _tests_/imports -name '*.bit' | so
   if [ "$src" -eq 0 ] && [ "$brc" -eq 0 ]; then
     match=$((match + 1))
   elif [ "$src" -ne 0 ] && [ "$brc" -ne 0 ]; then
-    if [ "$seed" = "$b2" ]; then
+    if cmp -s "$seedcap" "$b2cap"; then
       match=$((match + 1))
     else
-      diff=$((diff + 1))
-      [ -z "$firstdiff" ] && firstdiff="$f"
+      # A DIFF only counts if it REPRODUCES on fresh captures: a re-run that
+      # agrees, changes verdict or stalls decided nothing (#6357, as #6355).
+      runpair "$f"
+      if [ "$src" -ne 0 ] && [ "$src" -ne 142 ] && [ "$brc" -ne 0 ] && [ "$brc" -ne 142 ] &&
+         ! cmp -s "$seedcap" "$b2cap"; then
+        diff=$((diff + 1))
+        [ -z "$firstdiff" ] && firstdiff="$f"
+      else
+        unstable=$((unstable + 1))
+        [ -z "$firstunstable" ] && firstunstable="$f"
+      fi
     fi
   elif [ "$src" -eq 0 ] && [ "$brc" -ne 0 ]; then
     code=$(declaredCode "$f")
-    if [ -n "$code" ] && printf '%s' "$b2" | grep -q "^error\[$code\]"; then
+    if [ -n "$code" ] && grep -q "^error\[$code\]" "$b2cap"; then
       explained=$((explained + 1))
       hitdeclared="$hitdeclared $f"
       continue
@@ -243,7 +246,7 @@ for f in $(find stdlib examples _tests_/cases _tests_/imports -name '*.bit' | so
     missing=$((missing + 1))
   fi
 done
-echo "check differential: MATCH=$match MISSING=$missing FALSEPOS=$falsepos DIFF=$diff EXPLAINED=$explained TIMEOUT=$timeout"
+echo "check differential: MATCH=$match MISSING=$missing FALSEPOS=$falsepos DIFF=$diff EXPLAINED=$explained TIMEOUT=$timeout UNSTABLE=$unstable"
 for d in $(printf '%s\n' "$FALSEPOS_DECLARED" | awk 'NF { print $1 }'); do
   case " $hitdeclared " in
   *" $d "*) echo "  $d -> explained by declared false positive ($(printf '%s\n' "$FALSEPOS_DECLARED" | awk -v f="$d" '$1 == f { print $2, $3 }'))" ;;
@@ -255,7 +258,8 @@ for d in $(printf '%s\n' "$FALSEPOS_DECLARED" | awk 'NF { print $1 }'); do
 done
 if [ -n "$firstfp" ]; then
   echo "=== FIRST FALSE POSITIVE (bit2 rejects code the seed accepts): $firstfp"
-  run "$BIT2" check "$firstfp" | head -8
+  run_cap BIT2 "$b2cap" "$BIT2" check "$firstfp"
+  head -8 "$b2cap"
 fi
 if [ -n "$firstdiff" ]; then
   echo "=== first differing text: $firstdiff"
@@ -263,10 +267,18 @@ if [ -n "$firstdiff" ]; then
   # drift, or the evidence printed here describes a comparison that was never
   # made — which is why the normalization that used to sit on this line came out
   # with the one in the loop (#1920), not separately.
-  diff <(run "$ORACLE" check "$firstdiff") \
-       <(run "$BIT2" check "$firstdiff") | head -14
+  runpair "$firstdiff"
+  diff "$seedcap" "$b2cap" | head -14
 fi
 # Only a false positive is a build-breaking regression; MISSING shrinks as emit
 # sites land, and DIFF is dominated by cascades from unported root sites.
 [ "$timeout" -gt 0 ] && echo "first timeout: $firsthang"
+# An unstable DIFF is not a pass and not a divergence (exit 2); a FALSEPOS still
+# wins, exactly as diffexit ranks a failure over an undecided.
+if [ "$unstable" -gt 0 ]; then
+  echo "first unstable: $firstunstable"
+  echo "UNDECIDED: $unstable file(s) differed once, then agreed (or stalled) on an immediate re-run."
+  echo "           Not a pass, and not a divergence: the capture or the host was interrupted (#6357)."
+  [ "$falsepos" -gt 0 ] || exit 2
+fi
 diffexit "check" -f "$falsepos" -t "file(s)=$timeout"
