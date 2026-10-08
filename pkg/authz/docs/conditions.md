@@ -176,8 +176,9 @@ invalid policy: no field authorID (fields: id, authorId, views)
 invalid policy: field views is i64, the value is text
 ```
 
-`validate` also refuses a comparison with `Value.Null` (it is never true), an
-ordering (`lt`, `gt`) over a bool or bytes column, an `oneOf` with no values,
+`validate` also refuses a comparison with `Value.Null` (it is never true; the
+next chapter has the way to ask about NULL), a null test on a field that cannot
+be NULL, an ordering (`lt`, `gt`) over a bool or bytes column, an `oneOf` with no values,
 and a resource that is not registered. A condition on `all` may not name a
 field, since the resources `all` covers do not share one.
 
@@ -244,6 +245,13 @@ same rule is `NOT COALESCE(cond, false)`.
 `oneOf` is a chain of `or`ed equalities, so `oneOf("views", [Null, 40])` is
 true for 40 and unknown for anything else, as `x IN (NULL, 40)` is.
 
+To ask about NULL itself, use `eqNull` and `neNull`, SQL's `IS NULL` and
+`IS NOT NULL`. They are never unknown: `eqNull("editorNote")` is true for the
+article above and `neNull("editorNote")` is false. A rule such as "only
+articles without an editor's note" is `eqNull("editorNote")`, and `validate`
+accepts it on an `Option` field only, since on any other the answer never
+changes.
+
 ## Where this differs from CASL
 
 CASL conditions are Mongo-style objects and a missing field simply does not
@@ -252,7 +260,8 @@ separated: a field the class does not have is an error (`InvalidPolicy`,
 at startup through `validate`, and on the first check if it slipped past), and
 a field that exists but is NULL is unknown. `$in` over a list is `oneOf`;
 `$ne`, `$lt`, `$lte`, `$gt`, `$gte`, `$and`, `$or` and `$not` are `ne`, `lt`,
-`lte`, `gt`, `gte`, `and`, `or` and `not`.
+`lte`, `gt`, `gte`, `and`, `or` and `not`. `{ field: null }` is `eqNull` and
+`{ field: { $ne: null } }` is `neNull`.
 
 Evaluation checks every child of an `and` and `or` and every value of an
 `oneOf` even after the answer is settled, so a typo fails on the first row
@@ -485,9 +494,52 @@ ordered, and `"$$user.team"` is the literal text `$user.team`, as everywhere
 else. `{ "folder": { "$related": "editor" } }` is the relationship test of the
 relationships chapter. Two limits protect the server from admin input: objects
 nested deeper than 16 levels and more than 256 nodes (every key and every array
-element, `$in` values included) are refused. `null` is refused too, since a
-comparison with NULL is never true; and an empty operator object is an error
-rather than an always-true condition.
+element, `$in` values included) are refused. An empty operator object is an
+error rather than an always-true condition.
+
+### Null in a stored condition
+
+As in MongoDB and CASL, `{ "deletedAt": null }` matches a row whose
+`deletedAt` is NULL and `{ "deletedAt": { "$ne": null } }` one where it is set.
+They decode to `eqNull` and `neNull`, so the same policy answers a single check
+and compiles to `IS NULL` / `IS NOT NULL` for a list. "Readers see only
+articles that are not deleted":
+
+```bit
+import { Authz, Cond, Truth, condFromJson, evalCond } from "authz"
+import { Tabled } from "orm"
+import { jsonParse } from "std/json"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+  title: string
+  deletedAt: Option<string>
+}
+
+fn main(): ()! {
+  let authz = Authz<Action>()?
+  authz.resource<Article>()?
+  let article = unwrap(authz.resourceByName("Article"))
+
+  let live: Cond = condFromJson(article, jsonParse("{ \"deletedAt\": null }")?)?
+  let gone: Cond = condFromJson(article, jsonParse("{ \"deletedAt\": { \"$ne\": null } }")?)?
+
+  let kept = Article{ id = 1, title = "Kept" }
+  let removed = Article{ id = 2, title = "Removed", deletedAt = Option<string>.Some("2026-10-01") }
+  println("kept is live: ${evalCond(live, kept)? == Truth.True}")
+  println("removed is live: ${evalCond(live, removed)? == Truth.True}")
+  println("removed is gone: ${evalCond(gone, removed)? == Truth.True}")
+}
+```
+
+This prints `kept is live: true`, `removed is live: false` and `removed is gone:
+true`. Only an `Option` field can be NULL, so `null` on any other field is an
+`InvalidPolicy` (`field title is string and cannot be null`), and so is `null`
+under `$lt`, `$lte`, `$gt`, `$gte` or inside an `$in` list, where it could
+never match.
 
 ## Filtering a list
 
@@ -757,7 +809,8 @@ condition when one can say it: a rule as data is also a filter.
   `bool`, `string`, `[]byte`) and an `Option` of one. A relation field
   (`@belongsTo`, `@hasMany`) cannot, and neither can a field of another type.
 - `Value.Null` is never a useful operand: `validate` refuses it, and
-  evaluated directly it makes the comparison unknown.
+  evaluated directly it makes the comparison unknown. Use `eqNull` and
+  `neNull` to test for NULL.
 - Text compares byte by byte here. A database with a case-insensitive
   collation orders text differently; keep authorization comparisons on
   columns that use a binary collation.
