@@ -1,0 +1,204 @@
+// stdlib/quic/pto.test.bit — the PTO is armed per packet-number space and fires
+// for the earliest deadline (#7725, RFC 9002 §6.2.1 and A.8 GetPtoTimeAndSpace),
+// and a client keeps one armed before the handshake is confirmed even with
+// nothing in flight (§6.2.2.1). It used to be armed for the last ack-eliciting
+// packet of any space and probed the highest space that still had packets, so an
+// unacknowledged Handshake packet waited behind a later 1-RTT one.
+//
+// Every test drives one connection state directly with a fixed history, so the
+// space that was probed and the probe count are exact. `quicconnNewState`,
+// `quicconnMaybePto`, `quicconnProcessAck`, `clientInitialKeys` are module
+// siblings.
+
+const ptoMs: int = 1000000
+
+// A state whose three spaces can all seal, pointed at `peer`. Confirmed (the
+// application space is armed) unless a test says otherwise.
+fn ptoState(peer: UdpSocket, isClient: bool): quicconnState {
+  let port = peer.port() catch _ {
+    return quicconnNewState(isClient, peer, false, "127.0.0.1", 1, []byte(0), []byte(0))
+  }
+  // Real-length ids: the Initial padding floor assumes them.
+  let dcid = quicconnMakeCid()
+  let st = quicconnNewState(isClient, peer, false, "127.0.0.1", port, quicconnMakeCid(), dcid)
+  st.havePeer = true
+  let keys = clientInitialKeys(dcid)
+  st.iLevel.ksend = keys
+  st.iLevel.haveSend = true
+  st.hLevel.ksend = keys
+  st.hLevel.haveSend = true
+  st.aLevel.ksend = keys
+  st.aLevel.haveSend = true
+  st.established = true
+  st.handshakeComplete = true
+  return st
+}
+
+// One ack-eliciting packet in flight in `lvl`, last sent `agoNs` ago.
+fn ptoInFlight(st: quicconnState, lvl: quicconnLevel, agoNs: int) {
+  let now = monotonic().ns
+  let sp = quicconnSent{
+    pn = len(lvl.sent),
+    timeSent = now - agoNs,
+    size = 100,
+    ackEliciting = true,
+    frames = []Frame(0),
+  }
+  lvl.sent = append(lvl.sent, sp)
+  lvl.nextPn = len(lvl.sent)
+  lvl.timeLastAckEliciting = now - agoNs
+  st.bytesInFlight = st.bytesInFlight + sp.size
+}
+
+fn ptoBind(): UdpSocket {
+  return udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind: ${e.message()}")
+    return UdpSocket{}
+  }
+}
+
+fn ptoFire(st: quicconnState) {
+  quicconnMaybePto(st) catch e {
+    assert(false, "quicconnMaybePto: ${e.message()}")
+  }
+}
+
+fn ptoDatagramLen(peer: UdpSocket): int {
+  let d = peer.recv(2048) catch e {
+    assert(false, "probe datagram: ${e.message()}")
+    return 0
+  }
+  return len(d.data)
+}
+
+test "an unacked Handshake packet whose PTO is earlier gets the probe, not the later 1-RTT packet" {
+  let peer = ptoBind()
+  let st = ptoState(peer, true)
+  let dur = quicconnPtoDuration(st)
+  ptoInFlight(st, st.hLevel, dur + 50 * ptoMs)
+  ptoInFlight(st, st.aLevel, 0)
+  ptoFire(st)
+  assert(st.ptoCount == 1, "ptoCount after the Handshake PTO: ${st.ptoCount}")
+  assert(
+    len(st.hLevel.sent) == 3,
+    "Handshake packets: ${len(st.hLevel.sent)}, want 1 old + 2 probes",
+  )
+  assert(
+    len(st.aLevel.sent) == 1,
+    "1-RTT packets: ${len(st.aLevel.sent)}, want the 1 old, no probe",
+  )
+  assert(len(st.iLevel.sent) == 0, "Initial packets: ${len(st.iLevel.sent)}")
+}
+
+test "no probe before the earliest space's deadline" {
+  let peer = ptoBind()
+  let st = ptoState(peer, true)
+  let dur = quicconnPtoDuration(st)
+  ptoInFlight(st, st.iLevel, dur / 2)
+  ptoInFlight(st, st.hLevel, dur / 2)
+  ptoInFlight(st, st.aLevel, dur / 2)
+  ptoFire(st)
+  assert(st.ptoCount == 0, "ptoCount before any deadline: ${st.ptoCount}")
+  assert(len(st.hLevel.sent) == 1, "Handshake packets: ${len(st.hLevel.sent)}")
+}
+
+test "the earliest of Initial and Handshake wins" {
+  let peer = ptoBind()
+  let st = ptoState(peer, true)
+  let dur = quicconnPtoDuration(st)
+  ptoInFlight(st, st.iLevel, dur + 200 * ptoMs)
+  ptoInFlight(st, st.hLevel, dur + 100 * ptoMs)
+  ptoFire(st)
+  assert(len(st.iLevel.sent) == 3, "Initial packets: ${len(st.iLevel.sent)}, want 1 old + 2 probes")
+  assert(len(st.hLevel.sent) == 1, "Handshake packets: ${len(st.hLevel.sent)}, want the 1 old")
+}
+
+test "the 1-RTT space is not armed before the handshake is confirmed" {
+  let peer = ptoBind()
+  let st = ptoState(peer, true)
+  st.handshakeComplete = false
+  let dur = quicconnPtoDuration(st)
+  ptoInFlight(st, st.aLevel, 10 * dur)
+  ptoFire(st)
+  assert(st.ptoCount == 0, "ptoCount with only 1-RTT in flight, unconfirmed: ${st.ptoCount}")
+  assert(len(st.aLevel.sent) == 1, "1-RTT packets: ${len(st.aLevel.sent)}, want the 1 old")
+  st.handshakeComplete = true
+  ptoFire(st)
+  assert(st.ptoCount == 1, "ptoCount once confirmed: ${st.ptoCount}")
+  assert(len(st.aLevel.sent) == 3, "1-RTT packets: ${len(st.aLevel.sent)}, want 1 old + 2 probes")
+}
+
+test "a client with nothing in flight and no Handshake keys probes with padded Initials" {
+  let peer = ptoBind()
+  let st = ptoState(peer, true)
+  st.handshakeComplete = false
+  st.hLevel.haveSend = false
+  st.lastRecv = monotonic().ns - 10 * quicconnPtoDuration(st)
+  ptoFire(st)
+  assert(st.ptoCount == 1, "ptoCount after the anti-deadlock PTO: ${st.ptoCount}")
+  assert(len(st.iLevel.sent) == 2, "Initial probes: ${len(st.iLevel.sent)}, want 2")
+  assert(ptoDatagramLen(peer) >= 1200, "first Initial probe datagram under 1200 bytes")
+  assert(ptoDatagramLen(peer) >= 1200, "second Initial probe datagram under 1200 bytes")
+}
+
+test "a client with nothing in flight and Handshake keys probes in the Handshake space" {
+  let peer = ptoBind()
+  let st = ptoState(peer, true)
+  st.handshakeComplete = false
+  st.lastRecv = monotonic().ns - 10 * quicconnPtoDuration(st)
+  ptoFire(st)
+  assert(len(st.hLevel.sent) == 2, "Handshake probes: ${len(st.hLevel.sent)}, want 2")
+  assert(len(st.iLevel.sent) == 0, "Initial packets: ${len(st.iLevel.sent)}")
+}
+
+test "the anti-deadlock PTO waits for its deadline and stops once the server validated the client" {
+  let peer = ptoBind()
+  let st = ptoState(peer, true)
+  st.handshakeComplete = false
+  st.lastRecv = monotonic().ns
+  ptoFire(st)
+  assert(st.ptoCount == 0, "fired before the deadline: ${st.ptoCount}")
+  st.lastRecv = monotonic().ns - 10 * quicconnPtoDuration(st)
+  st.hLevel.largestAcked = 0
+  ptoFire(st)
+  assert(st.ptoCount == 0, "fired after a Handshake ACK validated the client: ${st.ptoCount}")
+  st.hLevel.largestAcked = -1
+  st.handshakeComplete = true
+  ptoFire(st)
+  assert(st.ptoCount == 0, "fired after the handshake was confirmed: ${st.ptoCount}")
+}
+
+test "a server with nothing in flight arms no PTO" {
+  let peer = ptoBind()
+  let st = ptoState(peer, false)
+  st.handshakeComplete = false
+  st.lastRecv = monotonic().ns - 10 * quicconnPtoDuration(st)
+  ptoFire(st)
+  assert(st.ptoCount == 0, "a server fired the anti-deadlock PTO: ${st.ptoCount}")
+}
+
+fn ptoAck(largest: int): AckFrame {
+  return AckFrame{
+    largest = u64(largest),
+    delay = 0,
+    firstRange = 0,
+    ranges = []AckRange(0),
+    ecn = false,
+    ect0 = 0,
+    ect1 = 0,
+    ce = 0,
+  }
+}
+
+test "an ACK resets the backoff only once the server has validated the client" {
+  let peer = ptoBind()
+  let st = ptoState(peer, true)
+  st.handshakeComplete = false
+  st.ptoCount = 3
+  ptoInFlight(st, st.iLevel, 0)
+  quicconnProcessAck(st, quicconnLvlInitial, ptoAck(0))
+  assert(st.ptoCount == 3, "an Initial ACK reset the backoff: ${st.ptoCount}")
+  ptoInFlight(st, st.hLevel, 0)
+  quicconnProcessAck(st, quicconnLvlHandshake, ptoAck(0))
+  assert(st.ptoCount == 0, "a Handshake ACK kept the backoff: ${st.ptoCount}")
+}

@@ -51,7 +51,7 @@ fn quicconnProcessAck(st: quicconnState, levelIdx: int, a: AckFrame) {
     quicconnUpdateRtt(st, now - largestAckedTime)
   }
   if (ackedAny) {
-    st.ptoCount = 0
+    quicconnResetPtoCount(st)
     quicconnDetectLoss(st, levelIdx)
     quicconnCheckDelivered(st)
   }
@@ -228,13 +228,14 @@ fn quicconnDetectLoss(st: quicconnState, levelIdx: int) {
   }
 }
 
-// The base PTO duration (RFC 9002 §6.2.1), floored so a coarse tick and green-
+// The base PTO duration (RFC 9002 §6.2.1) before backoff and before the
+// application-space `max_ack_delay` term, floored so a coarse tick and green-
 // thread jitter cannot make it fire before a genuine ACK would arrive.
 fn quicconnPtoDuration(st: quicconnState): int {
   if (!st.haveRtt) {
     return quicconnInitialPto
   }
-  let pto = st.srtt + quicconnMax(4 * st.rttvar, quicconnGranularity) + st.maxAckDelay
+  let pto = st.srtt + quicconnMax(4 * st.rttvar, quicconnGranularity)
   if (pto < quicconnMinPto) {
     pto = quicconnMinPto
   }
@@ -244,56 +245,121 @@ fn quicconnPtoDuration(st: quicconnState): int {
 // Probe datagrams sent per PTO (RFC 9002 §6.2.4 allows one or two).
 const quicconnProbeCount: int = 2
 
-// Fire the probe timeout if the PTO has elapsed since the last ack-eliciting
-// packet with data still in flight (RFC 9002 §6.2): send two probe datagrams.
-// This is what recovers a lost tail, and what gets a control frame out when
-// every packet after it was lost too.
-fn quicconnMaybePto(st: quicconnState): ()! {
-  if (st.bytesInFlight == 0) {
-    return
+// RFC 9002 A.8 `PeerCompletedAddressValidation`: a server always has; a client
+// has once it has had a Handshake packet acknowledged or the handshake is
+// confirmed (`handshakeComplete` is the server's receipt of the client Finished
+// and the client's receipt of HANDSHAKE_DONE, RFC 9001 §4.1.2).
+fn quicconnPeerValidated(st: quicconnState): bool {
+  return !st.isClient || st.hLevel.largestAcked >= 0 || st.handshakeComplete
+}
+
+// RFC 9002 A.7: an ACK resets the PTO backoff, except for a client not yet sure
+// the server validated its address (§6.2.1).
+fn quicconnResetPtoCount(st: quicconnState) {
+  if (quicconnPeerValidated(st)) {
+    st.ptoCount = 0
   }
-  let last = quicconnMax(
-    st.iLevel.timeLastAckEliciting,
-    quicconnMax(st.hLevel.timeLastAckEliciting, st.aLevel.timeLastAckEliciting),
-  )
-  if (last == 0) {
-    return
+}
+
+// The PTO deadline of packet-number space `idx` (RFC 9002 A.8): the time of its
+// last ack-eliciting packet plus the backed-off duration, or 0 when the space has
+// nothing in flight. The application space adds `max_ack_delay` (also backed
+// off) and is not armed at all until the handshake is confirmed.
+fn quicconnSpacePto(st: quicconnState, idx: int): int {
+  let lvl = quicconnLvl(st, idx)
+  if (len(lvl.sent) == 0) {
+    return 0
   }
   let backoff = 1 << st.ptoCount
-  let deadline = last + quicconnPtoDuration(st) * backoff
-  if (monotonic().ns < deadline) {
+  let duration = quicconnPtoDuration(st) * backoff
+  if (idx == quicconnLvlApp) {
+    if (!st.handshakeComplete) {
+      return 0
+    }
+    duration = duration + st.maxAckDelay * backoff
+  }
+  return lvl.timeLastAckEliciting + duration
+}
+
+// Whether any packet-number space has an ack-eliciting packet in flight.
+fn quicconnAnyInFlight(st: quicconnState): bool {
+  return len(st.iLevel.sent) > 0 || len(st.hLevel.sent) > 0 || len(st.aLevel.sent) > 0
+}
+
+// RFC 9002 §6.2.2.1 / A.8: a client with nothing in flight that is not sure the
+// server has validated its address keeps a PTO armed, in the Handshake space if
+// it holds Handshake keys and the Initial space otherwise, so a lost server
+// flight cannot deadlock the handshake. Returns that space once its deadline,
+// measured from the last datagram received (the event that last re-armed the
+// timer), has passed; -1 otherwise.
+fn quicconnAntiDeadlockSpace(st: quicconnState, now: int): int {
+  if (quicconnPeerValidated(st)) {
+    return -1
+  }
+  if (now < st.lastRecv + quicconnPtoDuration(st) * (1 << st.ptoCount)) {
+    return -1
+  }
+  if (st.hLevel.haveSend) {
+    return quicconnLvlHandshake
+  }
+  return quicconnLvlInitial
+}
+
+// RFC 9002 A.8 `GetPtoTimeAndSpace`: the space with the earliest PTO deadline
+// (ties go to the earlier space), or -1 when the earliest has not passed yet or
+// no timer is armed.
+fn quicconnPtoSpace(st: quicconnState, now: int): int {
+  if (!quicconnAnyInFlight(st)) {
+    return quicconnAntiDeadlockSpace(st, now)
+  }
+  let space = -1
+  let earliest = 0
+  let idx = quicconnLvlInitial
+  while (idx <= quicconnLvlApp) {
+    let t = quicconnSpacePto(st, idx)
+    if (t != 0 && (space < 0 || t < earliest)) {
+      space = idx
+      earliest = t
+    }
+    idx = idx + 1
+  }
+  if (space < 0 || now < earliest) {
+    return -1
+  }
+  return space
+}
+
+// Whether a time-threshold loss timer is armed in any space. RFC 9002 §6.2
+// (`SetLossDetectionTimer`): it takes priority, and the PTO is not armed while
+// it is; `quicconnDetectLoss` runs on every tick and settles it.
+fn quicconnLossTimerArmed(st: quicconnState): bool {
+  return st.iLevel.lossTime != 0 || st.hLevel.lossTime != 0 || st.aLevel.lossTime != 0
+}
+
+// Fire the probe timeout when the earliest per-space PTO has elapsed (RFC 9002
+// §6.2): send two probe datagrams in that space. This is what recovers a lost
+// tail, and what gets a control frame out when every packet after it was lost
+// too.
+fn quicconnMaybePto(st: quicconnState): ()! {
+  if (quicconnLossTimerArmed(st)) {
+    return
+  }
+  let space = quicconnPtoSpace(st, monotonic().ns)
+  if (space < 0) {
     return
   }
   st.ptoCount = st.ptoCount + 1
   if (st.ptoCount > 8) {
     st.ptoCount = 8
   }
-  quicconnSendProbes(st)?
+  quicconnSendProbes(st, space)?
 }
 
-// The highest level that still has an unacknowledged packet, or -1.
-fn quicconnProbeLevel(st: quicconnState): int {
-  if (len(st.aLevel.sent) > 0) {
-    return quicconnLvlApp
-  }
-  if (len(st.hLevel.sent) > 0) {
-    return quicconnLvlHandshake
-  }
-  if (len(st.iLevel.sent) > 0) {
-    return quicconnLvlInitial
-  }
-  return -1
-}
-
-// Send `quicconnProbeCount` probe datagrams at the probe level (RFC 9002
-// §6.2.4: one or two, each ack-eliciting). Each is flushed on its own so the two
-// are separate datagrams, and neither waits for congestion window: pending
-// frames are not window-gated, and a probe may exceed the window (§7).
-fn quicconnSendProbes(st: quicconnState): ()! {
-  let idx = quicconnProbeLevel(st)
-  if (idx < 0) {
-    return
-  }
+// Send `quicconnProbeCount` probe datagrams in space `idx` (RFC 9002 §6.2.4:
+// one or two, each ack-eliciting). Each is flushed on its own so the two are
+// separate datagrams, and neither waits for congestion window: pending frames
+// are not window-gated, and a probe may exceed the window (§7).
+fn quicconnSendProbes(st: quicconnState, idx: int): ()! {
   let lvl = quicconnLvl(st, idx)
   let from = 0
   let k = 0
