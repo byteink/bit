@@ -311,7 +311,145 @@ $2
   expect "" "$(lag "$lag_o" "$(printf '%s\n' "$lag_t" | sed '/string_from_int/d')" iropt "$lag_pin")" "iropt: a pinned file whose diff also drops an unrelated line"
   expect "" "$(lag "$lag_o" "$(printf '%s\n' "$lag_t" | sed 's/^  %6 = rt_call string_from_int(%9) string$/  %6 = rt_call string_from_int(%1) string/')" iropt "$lag_pin")" "iropt: a pinned file whose unrelated call takes another operand"
   expect "$lag_want" "$(lag "$lag_o" "$lag_t" iropt _tests_/cases/run_float_slice_elems.bit)" "iropt: the second pinned file"
-  expect "$lag_want" "$(lag "$lag_o" "$lag_t" iropt _tests_/cases/run_packed_narrow_slices.bit)" "iropt: the third pinned file"
+
+  # 7674-forwarded-index-get: the oracle loads a scalar element again where optcse.bit forwards the
+  # first load (single-predecessor forward chain, no barrier between, same base, index and type).
+  cse_pre='func f(%0: []u8, %1: i64, %9: i64) bool {
+bb0(%0: []u8, %1: i64, %9: i64):
+  %2 = field_get %0[0] i64
+  %3 = index_get %2[%1] u8
+  %5 = icmp_ult bool %3, %9
+  jump bb1()
+bb1():'
+  cse_o="$cse_pre
+  %4 = index_get %2[%1] u8
+  %6 = icmp_ult bool %4, %9
+  %7 = icmp_eq bool %5, %6
+  ret %7
+}"
+  cse_b="$cse_pre
+  %7 = icmp_eq bool %5, %5
+  ret %7
+}"
+  expect "7674-forwarded-index-get" "$(explainMismatch "$cse_o" "$cse_b" iropt)" "iropt: a repeated element load forwarded, and the compare it made equal"
+  expect "" "$(explainMismatch "$cse_o" "$cse_b" ir)" "ir: the pre-opt dump has no CSE, so the forward explains nothing"
+  expect "" "$(explainMismatch "$cse_o" "$cse_o" iropt)" "iropt: a tree that kept both loads is not explained"
+  cse_kept_cmp="$cse_pre
+  %6 = icmp_ult bool %3, %9
+  %7 = icmp_eq bool %5, %6
+  ret %7
+}"
+  expect "" "$(explainMismatch "$cse_o" "$cse_kept_cmp" iropt)" "iropt: the load forwarded but the compare it made equal kept"
+  cse_barrier_b=$(printf '%s\n' "$cse_b" | sed 's/^bb1():$/bb1():\nBARRIER/')
+  for barrier in '  %8 = call @g() void' '  %8 = rt_call string_from_int(%9) string' '  index_set %2[%1] = %9' '  field_set %0[8] = %9' \
+    '  %8 = gc_alloc size=8 ptrs=[] T' '  %8 = atomic_load %2 u8' '  %8 = sdiv i64 %9, %1' '  %8 = keep_alive %0'; do
+    cse_ob=${cse_o/bb1():/bb1():
+$barrier}
+    expect "" "$(explainMismatch "$cse_ob" "${cse_barrier_b/BARRIER/$barrier}" iropt)" "iropt: a barrier (${barrier# }) between two loads keeps the second"
+  done
+  cse_x() { # <sed expr on the oracle's second load> -- the tree drops nothing the walk would not
+    explainMismatch "$(printf '%s\n' "$cse_o" | sed "$1")" "$cse_b" iropt
+  }
+  expect "" "$(cse_x 's/^  %4 = index_get %2\[%1\] u8$/  %4 = index_get %2[%9] u8/')" "iropt: a load of another index is not dropped"
+  expect "" "$(cse_x 's/^  %4 = index_get %2\[%1\] u8$/  %4 = index_get %2[%1] i8/')" "iropt: a load of another type is not dropped"
+  expect "" "$(cse_x 's/^  %4 = index_get %2\[%1\] u8$/  %4 = index_get %0[%1] u8/')" "iropt: a load of another base is not dropped"
+  cse_join_o='func f(%0: []u8, %1: i64, %9: i64) bool {
+bb0(%0: []u8, %1: i64, %9: i64):
+  %2 = field_get %0[0] i64
+  %3 = index_get %2[%1] u8
+  br %9, bb1(), bb2()
+bb2():
+  jump bb1()
+bb1():
+  %4 = index_get %2[%1] u8
+  %7 = icmp_eq bool %3, %4
+  ret %7
+}'
+  cse_join_b="${cse_join_o/  %4 = index_get %2[%1] u8
+  %7 = icmp_eq bool %3, %4/  %7 = icmp_eq bool %3, %3}"
+  expect "" "$(explainMismatch "$cse_join_o" "$cse_join_b" iropt)" "iropt: a block with two predecessors starts from an empty table"
+  # An edge to a block with a LOWER id is a back edge (it carries the safepoint poll): no table crosses it.
+  cse_back_o='func f(%0: []u8, %1: i64) bool {
+bb0(%0: []u8, %1: i64):
+  %2 = field_get %0[0] i64
+  jump bb2()
+bb2():
+  %3 = index_get %2[%1] u8
+  jump bb1()
+bb1():
+  %4 = index_get %2[%1] u8
+  %7 = icmp_eq bool %3, %4
+  ret %7
+}'
+  cse_back_b='func f(%0: []u8, %1: i64) bool {
+bb0(%0: []u8, %1: i64):
+  %2 = field_get %0[0] i64
+  jump bb2()
+bb2():
+  %3 = index_get %2[%1] u8
+  jump bb1()
+bb1():
+  %7 = icmp_eq bool %3, %3
+  ret %7
+}'
+  expect "" "$(explainMismatch "$cse_back_o" "$cse_back_b" iropt)" "iropt: an edge to a lower block id carries no table"
+  # The same drop on top of the packing: the oracle reads a u32 element through the scaled address.
+  cse_pk_o='func f(%0: []u32, %1: i64) bool {
+bb0(%0: []u32, %1: i64):
+  %2 = field_get %0[0] i64
+  %3 = const_int i64 3
+  %4 = shl i64 %1, %3
+  %5 = add i64 %2, %4
+  %6 = field_get %5[0] u32
+  jump bb1()
+bb1():
+  %7 = field_get %5[0] u32
+  %8 = icmp_eq bool %6, %7
+  ret %8
+}'
+  cse_pk_b='func f(%0: []u32, %1: i64) bool {
+bb0(%0: []u32, %1: i64):
+  %2 = field_get %0[0] i64
+  %3 = index_get %2[%1] u32
+  jump bb1()
+bb1():
+  %4 = icmp_eq bool %3, %3
+  ret %4
+}'
+  expect "7674-forwarded-index-get" "$(explainMismatch "$cse_pk_o" "$cse_pk_b" iropt)" "iropt: the forward composes with the narrow packing"
+  expect "" "$(explainMismatch "$cse_pk_o" "$cse_pk_b" ir)" "ir: the packing alone does not explain the forward"
+  expect "" "$(explainMismatch "$cse_pk_o" "$(printf '%s\n' "$cse_pk_b" | sed 's/index_get %2\[%1\] u32/index_get %2[%2] u32/')" iropt)" "iropt: the forwarded packed read takes another index"
+
+  # 7574, an f32 store into a slice the tree knows starts at offset 0: no f32off read, the guard is on the index.
+  f32_zero_o='bb0(%0: []f32, %1: f32):
+  %2 = const_int i64 0
+  %3 = bitcast u32 %1
+  %4 = const_int i64 8
+  %5 = rt_call slice_set(%0, %2, %3, %4) void
+  ret'
+  f32_zero_t='bb0(%0: []f32, %1: f32):
+  %2 = const_int i64 0
+  %3 = slice_len %0
+  %4 = icmp_ult bool %2, %3
+  br %4, bb1(), bb2()
+bb2():
+  %5 = const_string "index out of range"
+  %6 = rt_call panic(%5) void
+  unreachable
+bb1():
+  %7 = field_get %0[0] i64
+  index_set %7[%2] = %1
+  ret'
+  expect "7574-packed-narrow-slices" "$(explainMismatch "func g() void {
+$f32_zero_o
+}" "func g() void {
+$f32_zero_t
+}" ir)" "ir: an f32 store with no offset read, guarded"
+  expect "" "$(explainMismatch "func g() void {
+$f32_zero_o
+}" "func g() void {
+${f32_zero_t/icmp_ult bool %2, %3/icmp_ult bool %3, %3}
+}" ir)" "ir: an f32 store with no offset read whose guard tests another index"
 
   # 7637-string-from-rune-range: string(rs[lo:hi]) on a []rune.
   rr_o='func f(%0: []i32, %1: i64, %2: i64) string {
