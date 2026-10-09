@@ -118,11 +118,17 @@ through `H3Listener.accept()`.
 
 ## Sharp edges
 
-**This connection's dynamic table has zero capacity.** Every field line is a
-literal or a static-table reference, so no request ever blocks waiting on the
-QPACK encoder stream - but it also means the encoder/decoder table-mutation API
-below (`Encoder.insertLiteral` and friends) is exercised only if you drive it
-yourself; `H3Conn` never grows the table on its own.
+**Our encoder never grows the table; the peer's may.** `H3Conn` advertises a
+4096-byte dynamic table and no blocked streams. Everything it writes is a literal
+or a static-table reference, so the encoder/decoder table-mutation API below
+(`Encoder.insertLiteral` and friends) is exercised only if you drive it yourself.
+The peer's QPACK encoder and decoder streams are read for the life of the
+connection, so their bytes never hold QUIC connection credit: its inserts go into
+the connection's `Decoder` and each is answered with an Insert Count Increment
+(no blocked streams means the peer references an entry only after that), and its
+acknowledgements go into the `Encoder`. The peer ending either stream closes the
+connection with `H3_CLOSED_CRITICAL_STREAM`; a malformed instruction closes it with
+`QPACK_ENCODER_STREAM_ERROR` or `QPACK_DECODER_STREAM_ERROR`.
 
 **Read `H3Conn.peerIp()` once per connection, not once per request.** HTTP/3
 multiplexes many requests over one connection, and the address is a property of
@@ -259,8 +265,8 @@ The current dynamic-table capacity in bytes.
 ## HTTP/3 core
 
 The request/response layer, built on the QPACK compressor above and `std/quic`.
-This connection's dynamic table has zero capacity, so every field line is a
-literal or a static-table reference; see [Sharp edges](#sharp-edges).
+Its own field lines are literals or static-table references; the peer's may
+use the dynamic table; see [Sharp edges](#sharp-edges).
 
 ### `H3Request`
 

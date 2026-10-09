@@ -1,0 +1,263 @@
+// Bit standard library — http3 module, the peer's QPACK streams (RFC 9204 §4.2,
+// §4.3, §4.4, #7753). Same flat `std/http3` module and namespace as `h3.bit`.
+//
+// QUIC grants connection flow-control credit only as the application reads
+// (`std/quic` flow.bit, #7709), so a QPACK stream left unread holds its bytes
+// against the connection window for the connection's life, and the instructions
+// on it are never applied. One reader per peer stream takes EVERY byte until the
+// connection ends:
+//
+//   * the peer's encoder stream feeds our `Decoder` (inserts, duplicates, table
+//     capacity) and each chunk that inserted something is answered with an Insert
+//     Count Increment on our decoder stream, which is what lets a peer whose
+//     `SETTINGS_QPACK_BLOCKED_STREAMS` is 0 reference those entries at all;
+//   * the peer's decoder stream feeds our `Encoder` (Section Acknowledgment,
+//     Stream Cancellation, Insert Count Increment).
+//
+// An instruction split across two chunks waits in `pending`; the wait is bounded,
+// and an instruction that would outgrow the bound is a stream error. Either
+// stream ending is H3_CLOSED_CRITICAL_STREAM (§4.2); a malformed instruction is
+// QPACK_ENCODER_STREAM_ERROR or QPACK_DECODER_STREAM_ERROR (§6).
+
+// The QPACK error codes (RFC 9204 §6).
+const h3ErrQpackDecompression: int = 0x0200
+const h3ErrQpackEncoderStream: int = 0x0201
+const h3ErrQpackDecoderStream: int = 0x0202
+
+// The dynamic-table capacity we advertise (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`)
+// and the most the peer's encoder may set. It is also the `Decoder` limit.
+const h3QpackTableCapacity: int = 4096
+
+// The most bytes of one unfinished instruction a reader holds. An encoder-stream
+// instruction carries at most `h3QpackTableCapacity` decoded bytes (a larger entry
+// is rejected) and Huffman expands a byte to at most 30 bits, so 4 * 4096 plus the
+// two length prefixes bounds a valid one. A decoder-stream instruction is one
+// prefix integer of at most 9 bytes.
+const h3QpackMaxEncoderPending: int = 16448
+const h3QpackMaxDecoderPending: int = 16
+
+// What `h3qpackApply` returns: the bytes of whole instructions it applied and the
+// error code that closes the connection, 0 for none.
+class h3QpackFed {
+  used: int,
+  code: int,
+}
+
+// One reader's state: the front of an instruction cut short by the end of the
+// last chunk, and which of the peer's two streams it reads.
+class h3QpackIn {
+  pending: []byte,
+  encoderStream: bool,
+}
+
+// The field section for `fields` on request stream `sid`, encoded under `encMu`
+// against the encoder's current insert count.
+fn h3encodeSection(c: H3Conn, sid: int, fields: []HeaderField): []byte {
+  c.encMu.lock()
+  let section = c.enc.encodeFieldSection(sid, c.enc.insertCount(), fields)
+  c.encMu.unlock()
+  return section
+}
+
+// Decodes the field section `payload` of stream `sid`, and acknowledges it on our
+// decoder stream when it referenced the dynamic table (§4.4.1; a section of
+// Required Insert Count 0 is never acknowledged). A section that does not decode
+// closes the connection with QPACK_DECOMPRESSION_FAILED (§2.2.3): the dynamic
+// table can no longer be trusted to match the peer's.
+fn h3decodeSection(c: H3Conn, sid: int, payload: []byte): []HeaderField! {
+  c.decMu.lock()
+  let sec = qpackDecodeSection(c.dec, payload) catch e {
+    c.decMu.unlock()
+    c.conn.closeWithCode(h3ErrQpackDecompression)
+    fail e
+  }
+  c.decMu.unlock()
+  if (sec.ric > 0) {
+    h3sendAck(c, sid, sec.ric)?
+  }
+  return sec.fields
+}
+
+// Writes `bytes` to our decoder stream. The caller holds `decOutMu`, which is
+// released here, so the order of the writes is the order the state changed in.
+fn h3writeDecoder(c: H3Conn, bytes: []byte): ()! {
+  c.qpackDec.write(bytes) catch e {
+    c.decOutMu.unlock()
+    fail e
+  }
+  c.decOutMu.unlock()
+}
+
+// Sends a Section Acknowledgment for `sid`, whose section needed insert count
+// `ric`; the peer's Known Received Count is then at least `ric` (§4.4.1).
+fn h3sendAck(c: H3Conn, sid: int, ric: int): ()! {
+  c.decOutMu.lock()
+  if (ric > c.qpackKnown) {
+    c.qpackKnown = ric
+  }
+  h3writeDecoder(c, c.dec.sectionAck(sid))?
+}
+
+// Tells the peer's encoder that request stream `sid` was abandoned before its
+// field section was decoded, so the entries that section may have pinned can be
+// evicted: a Stream Cancellation (§4.4.2). Nothing is sent while the peer has
+// inserted nothing (`qpackKnown` is 0), and a failed write is the connection
+// ending, which cancels everything anyway.
+fn h3cancelStream(c: H3Conn, sid: int) {
+  c.decOutMu.lock()
+  if (c.qpackKnown == 0) {
+    c.decOutMu.unlock()
+    return
+  }
+  h3writeDecoder(c, c.dec.streamCancel(sid)) catch _ {
+    return
+  }
+}
+
+// Tells the peer's encoder how many insertions we hold beyond what it knows: an
+// Insert Count Increment (§4.4.3) for the difference, or nothing when there is none.
+fn h3sendIncrement(c: H3Conn): ()! {
+  c.decOutMu.lock()
+  c.decMu.lock()
+  let total = c.dec.insertCount()
+  c.decMu.unlock()
+  let n = total - c.qpackKnown
+  if (n <= 0) {
+    c.decOutMu.unlock()
+    return
+  }
+  c.qpackKnown = total
+  h3writeDecoder(c, c.dec.insertCountIncrement(n))?
+}
+
+// Applies the whole instructions at the front of `buf` to the stream's state under
+// that state's lock; a malformed one carries its stream's error code.
+fn h3qpackApply(c: H3Conn, encoderStream: bool, buf: []byte): h3QpackFed {
+  if (encoderStream) {
+    c.decMu.lock()
+    let used = qpackDecoderFeed(c.dec, buf) catch _ {
+      c.decMu.unlock()
+      return h3QpackFed{ used = 0, code = h3ErrQpackEncoderStream }
+    }
+    c.decMu.unlock()
+    return h3QpackFed{ used = used, code = 0 }
+  }
+  c.encMu.lock()
+  let used = qpackEncoderFeed(c.enc, buf) catch _ {
+    c.encMu.unlock()
+    return h3QpackFed{ used = 0, code = h3ErrQpackDecoderStream }
+  }
+  c.encMu.unlock()
+  return h3QpackFed{ used = used, code = 0 }
+}
+
+// Feeds the next stream bytes `data` to the reader `st`. Returns 0, or the error
+// code the connection must be closed with. Bytes left over from an instruction
+// cut short wait in `st.pending`, up to the stream's bound.
+fn h3qpackFeed(c: H3Conn, st: h3QpackIn, data: []byte): int {
+  let buf = data
+  if (len(st.pending) > 0) {
+    buf = qpackAppendBytes(qpackAppendBytes([]byte(0), st.pending), data)
+  }
+  let fed = h3qpackApply(c, st.encoderStream, buf)
+  if (fed.code != 0) {
+    return fed.code
+  }
+  st.pending = buf[fed.used:len(buf)]
+  if (st.encoderStream && len(st.pending) > h3QpackMaxEncoderPending) {
+    return h3ErrQpackEncoderStream
+  }
+  if (!st.encoderStream && len(st.pending) > h3QpackMaxDecoderPending) {
+    return h3ErrQpackDecoderStream
+  }
+  return 0
+}
+
+// Counts `n` more bytes read off the peer's encoder or decoder stream.
+fn h3qpackCount(c: H3Conn, encoderStream: bool, n: int) {
+  if (encoderStream) {
+    c.qpackEncRead = c.qpackEncRead + n
+    return
+  }
+  c.qpackDecRead = c.qpackDecRead + n
+}
+
+// The error code `chunk` closes the connection with, or 0: the instructions in
+// `data` (the chunk's bytes past the stream-type byte, if it is the first) that
+// are malformed, or the peer finishing or resetting its stream, which is
+// H3_CLOSED_CRITICAL_STREAM whatever it sent before (§4.2).
+fn h3qpackVerdict(c: H3Conn, st: h3QpackIn, chunk: StreamChunk, data: []byte): int {
+  h3qpackCount(c, st.encoderStream, len(chunk.data))
+  let code = h3qpackFeed(c, st, data)
+  if (code == 0 && (chunk.fin || chunk.reset)) {
+    return h3ErrClosedCritical
+  }
+  return code
+}
+
+// Reads the peer's QPACK stream `s`, whose first chunk (the stream-type byte and
+// whatever followed it) is `first`, until the connection ends. A verdict other
+// than 0 closes the connection (§4.2, §6) and ends the reader; so does a failed
+// write of the Insert Count Increment. A read that fails means the connection
+// already ended, which is the only other way out of the loop.
+fn h3qpackRun(c: H3Conn, s: Stream, first: StreamChunk, encoderStream: bool) {
+  let st = h3QpackIn{ pending = []byte(0), encoderStream = encoderStream }
+  let chunk = first
+  let data = h3tail(chunk.data)
+  while (true) {
+    let code = h3qpackVerdict(c, st, chunk, data)
+    if (code == 0 && encoderStream) {
+      h3sendIncrement(c) catch _ {
+        return
+      }
+    }
+    if (code != 0) {
+      c.conn.closeWithCode(code)
+      return
+    }
+    chunk = s.read() catch _ {
+      return
+    }
+    data = chunk.data
+  }
+}
+
+// Whether `s` is the first QPACK stream of its kind the peer opened on `c`; a
+// second one closes the connection with H3_STREAM_CREATION_ERROR (§4.2).
+fn h3claimQpack(c: H3Conn, encoderStream: bool): bool {
+  let seen = c.qpackDecSeen
+  if (encoderStream) {
+    seen = c.qpackEncSeen
+  }
+  if (seen) {
+    c.conn.closeWithCode(h3ErrStreamCreation)
+    return false
+  }
+  if (encoderStream) {
+    c.qpackEncSeen = true
+  } else {
+    c.qpackDecSeen = true
+  }
+  return true
+}
+
+// Starts the reader for the peer's uni stream `s` (first chunk `first`, not empty)
+// when its type byte names the control stream or a QPACK stream; false for any
+// other stream, which the caller owns.
+fn h3peerUni(c: H3Conn, s: Stream, first: StreamChunk): bool {
+  let t = int(first.data[0])
+  if (t == h3StreamControl) {
+    if (h3claimControl(c)) {
+      spawn h3controlRun(c, s, first)
+    }
+    return true
+  }
+  if (t != h3StreamQpackEncoder && t != h3StreamQpackDecoder) {
+    return false
+  }
+  let encoderStream = t == h3StreamQpackEncoder
+  if (h3claimQpack(c, encoderStream)) {
+    spawn h3qpackRun(c, s, first, encoderStream)
+  }
+  return true
+}
