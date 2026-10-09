@@ -4569,17 +4569,25 @@ valid flag per worker indexed by the calling task's `wkId`, and `std/net` read
 it back with two more calls, `bit_rt_net_udp_sender_port` then
 `bit_rt_net_udp_sender_host`. A single shared slot (before #3272) was clobbered
 by two tasks on two OS threads; the per-worker slot fixed that and argued the
-two reads were safe because "nothing parks between them". That held for a park
-and not for the other ways a task changes worker: a task preempted at a
-safepoint, or moved by the scheduler, between `recv` and the sender reads read
-another worker's slot, or an invalid one, and the caller saw a datagram from
-`0.0.0.0:0` (a QUIC server replying to it failed with `udp send to 0.0.0.0:0
-failed` and ended the connection under load). Adjacency of two calls is a
+read-backs were safe because "nothing parks between them". A park is not the
+only scheduling point: every loop back edge polls, and a poll yields when the
+worker's preempt flag is up (`schedMaybeYieldForPreempt`), after which the task
+may resume on another worker. Under load a QUIC server saw a datagram from
+`0.0.0.0:0` (a reply to it failed with `udp send to 0.0.0.0:0 failed` and ended
+the connection). The window PROVEN is in the engine: `netRecvFromLoop`
+(`runtime/net/{linux,darwin}/udp.bit`) had the kernel write the sender into the
+per-worker `saBytes()` slot and a copy loop (a back edge is a poll site) re-derive
+the slot to copy it out; a `schedYield()` inserted right after the
+kernel write made `stdlib/net/udpsender.test.bit` report 2 to 10
+wrong senders in 4 of 5 runs, and the same insertion into the fixed tree 0 in
+10 of 10. Whether the field failure came through that loop or through the
+slot read-back is not established; both are gone. Adjacency of two calls is a
 property of one instruction stream, not a guarantee about the storage between
 them; storage the caller passes in has no such window. The slots, their
 accessors (`udpSenderSlot`, `udpValidAt`, `udpSenderWordAt`, `udpSenderAddr`,
 `copySockAddrWords`), `formatQuad` and the three primitives are deleted on every
-provider.
+provider, and `netRecvFrom` on Linux and Darwin writes the sockaddr straight into
+the caller's `peer` (its `salen` is a managed local).
 
 ```
 bit_rt_net_udp_bind(host, port)         -> fd    // datagram socket; port 0 = kernel picks. -1 on error
@@ -5122,8 +5130,8 @@ per-worker storage, not a single shared word (§5.1):**
   here, one slot per worker indexed by `wkId`. Deleted by #7746: the sender now
   travels in a buffer the caller passes to `bit_rt_net_udp_recv_from_w`, so no
   runtime cell is read back by a later call. (A per-worker slot read back by
-  adjacency is sound only while the task stays on that worker; a preempted or
-  migrated task read a stranger's sender.)
+  adjacency is sound only while nothing between the write and the read yields;
+  a loop back-edge poll can, and the task then read a stranger's sender.)
 - `runtime/sched/sched.bit`: `Worker.tls` — re-derived on every read from the
   running task's own stack pointer (`sched.bit:15`'s `schedCurrentTask`),
   never cached across a call boundary, specifically because a parked task can
