@@ -296,7 +296,8 @@ fn main(): ()! {
 ```
 
 Use `tx.read` only for reads. A write such as `tx.read.sset(key).add(...)`
-would run immediately, outside the transaction's `MULTI`/`EXEC`.
+would run immediately, outside the transaction's `MULTI`/`EXEC`, so it fails
+with `RedisError.Invalid`; queue it with `tx.sset(key)`.
 
 ## Sharp edges
 
