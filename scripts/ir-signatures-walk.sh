@@ -629,6 +629,7 @@ END {
   for (i = 1; i <= na; i++) {
     if (rowPos(A[i]) && restOf(A[i]) ~ /^__json_/) { synth[lineOf(A[i])] = 1 }
     else if (rowPos(A[i]) && restOf(A[i]) ~ /^__row: / && !synth[lineOf(A[i])]) { synth[lineOf(A[i])] = 2 }
+    else if (rowPos(A[i]) && eof > 0 && lineOf(A[i]) > eof) { synth[lineOf(A[i])] = 3 }
   }
   for (i = 1; i <= na; i++) {
     if (!rowPos(A[i]) || !rowPos(B[i])) {
@@ -637,7 +638,9 @@ END {
     }
     ln = lineOf(A[i])
     d = colOf(B[i]) - colOf(A[i])
-    if (ln != lineOf(B[i]) || restOf(A[i]) != restOf(B[i]) || d < last[ln]) { exit 1 }
+    if (ln != lineOf(B[i]) || restOf(A[i]) != restOf(B[i])) { exit 1 }
+    if (synth[ln] == 3) { if (d != 0) { moved++ } ; continue }
+    if (d < last[ln]) { exit 1 }
     if (d > 0 && !synth[ln]) { exit 1 }
     last[ln] = d
     if (d > 0) { moved++; if (synth[ln] == 1) { json = 1 } }
@@ -737,8 +740,11 @@ explainIrLag() {
   return 1
 }
 
-# explainLagTypes <oracle_text> <bit2_text> -- the `types` row, same contract as explainIrLag.
+# explainLagTypes <oracle_text> <bit2_text> [file] -- the `types` row, same contract as explainIrLag.
+# The file's line count marks rows past its end as synthesized text (0 when unknown: no such rows).
 explainLagTypes() {
+  local eof=0
+  if [ -n "${3:-}" ] && [ -f "$3" ]; then eof=$(wc -l < "$3" | tr -d ' '); fi
   irWalkAwk
-  printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2" | LC_ALL=C awk "${IR_TYPES_AWK}"
+  printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2" | LC_ALL=C awk -v eof="$eof" "${IR_TYPES_AWK}"
 }

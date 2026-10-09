@@ -268,7 +268,9 @@
 # @table class's synthesized code imports (`Rows`, `Value`, `FieldDesc`, ...) under a reserved `__`
 # alias, the same lengthening #7558 did for @json, so the same column-only rule applies on a source
 # line that carries the synthesized `__row` local. 15 corpus files (the @table/relation cases).
-# A file whose moved rows sit on a `__json_` line reads as 7558.
+# A file whose moved rows sit on a `__json_` line reads as 7558. A row on a line past the source
+# file's last line sits in wholly synthesized text (the std/sql row mapper #7564 also rewrote), so
+# there its column may move either way; line, name, type and row order must still agree.
 #
 # 7562-packed-halfword-slices (`ir`, `iropt`). #7562 (05bb7c255, a64ce6f04) packs []i16/[]u16 at
 # 2 bytes per element: the elem_size constant of slice_new/slice_append/slice_get is 2 instead of
@@ -343,7 +345,7 @@
 # and returns 0, or prints nothing and returns 1 if none does.
 explainMismatch() {
   case "$3" in
-    types) explainLagTypes "$1" "$2"; return ;;
+    types) explainLagTypes "$1" "$2" "${4:-}"; return ;;
     ir|iropt)
       explainIrLag "$1" "$2" "$3" && return 0
       irLagPinned "$3" "${4:-}" && explainIrLagPin "$1" "$2"
