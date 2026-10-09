@@ -37,7 +37,15 @@ function isHalf(t) { return pw(t) > 0 }
 function isHalfSlice(t) { return t ~ /^\[\][a-z0-9]+$/ && pw(substr(t, 3)) > 0 }
 function lastTok(s,   n, p) { n = split(s, p, " "); return p[n] }
 function resTy(e,   n, p) { n = split(e, p, " "); if (p[1] == "const_bool") { return "bool" }; return (p[2] ~ /^(i8|i16|i32|i64|u8|u16|u32|u64|bool|f32|f64|int)$/) ? p[2] : p[n] }
-function ex(s,   out, id) {
+# A `ptrs=[%16]` list holds byte OFFSETS spelled like value ids (irdump.bit dumpValList), so it is
+# never mapped: with the ids mapped, two dumps whose value ids differ (an extra block parameter, #7737)
+# would read the same offset as different values.
+function ex(s,   out, id, p, q) {
+  p = index(s, "ptrs=[")
+  if (p > 0) {
+    q = index(substr(s, p), "]")
+    return ex(substr(s, 1, p - 1)) substr(s, p, q) ex(substr(s, p + q))
+  }
   out = ""
   while (match(s, /%[0-9]+/)) {
     id = substr(s, RSTART, RLENGTH)
@@ -611,6 +619,7 @@ END {
   if (which == "half") { print "7562-packed-halfword-slices" }
   else if (which == "narrow") { print "7574-packed-narrow-slices" }
   else if (which == "cse") { print "7674-forwarded-index-get" }
+  else if (which == "forof") { print "7737-forof-len-once" }
   else { print "7637-string-from-rune-range" }
 }'
   IR_TYPES_AWK='# The types row: the oracle dump, a line @@@BIT2@@@, then the tree dump. Rows are `line:col: name:
@@ -725,6 +734,8 @@ explainOmittedFunctions() {
 # with the packing is #7637 (a file that needs both is named for the rune call, the one rewrite
 # that is not a width). On the iropt arm only, the trials with stage 1b follow, alone or on top of the
 # packing: #7674 (the pre-opt dump has no CSE, so there is nothing for it to explain on the ir arm).
+# Last come the trials on the dumps with the #7737 hoisted loop bound put back (explainForOfLen,
+# scripts/ir-signatures-forof.sh), on both arms, so a file another signature explains keeps its name.
 explainIrLag() {
   [ "$(canon_ir_ids "$1")" = "$(canon_ir_ids "$2")" ] && return 1
   irWalkAwk
@@ -733,11 +744,12 @@ explainIrLag() {
   irTrial "$1" "$2" 0 0 1 rune && return 0
   irTrial "$1" "$2" 1 1 1 rune && return 0
   explainOmittedFunctions "$1" "$2" && return 0
-  [ "$3" = iropt ] || return 1
-  irTrial "$1" "$2" 0 0 0 cse 1 && return 0
-  irTrial "$1" "$2" 1 1 0 cse 1 && return 0
-  irTrial "$1" "$2" 1 1 1 rune 1 && return 0
-  return 1
+  if [ "$3" = iropt ]; then
+    irTrial "$1" "$2" 0 0 0 cse 1 && return 0
+    irTrial "$1" "$2" 1 1 0 cse 1 && return 0
+    irTrial "$1" "$2" 1 1 1 rune 1 && return 0
+  fi
+  explainForOfLen "$1" "$2" "$3"
 }
 
 # explainLagTypes <oracle_text> <bit2_text> [file] -- the `types` row, same contract as explainIrLag.

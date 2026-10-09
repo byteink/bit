@@ -338,7 +338,20 @@
 # differs, or a tree function the oracle never calls, keeps the file unexplained. 1 corpus file, on both
 # arms: _tests_/cases/run_tuple_assign_targets.bit (swaps, order).
 #
-# All five retire at the next stage0 repin (#6533).
+# 7737-forof-len-once (`ir`, `iropt`). #7737 makes `for x of xs`, `for i in xs` and `for (i, x) in xs`
+# over a slice read the length once (SPEC 13.1, "The bound of a slice or array loop is read once"):
+# lowerForOf and lowerForInSetupLoop emit `%v = slice_len %xs` in the block that jumps into the loop and
+# thread it through every block of the loop as one more block parameter, and the header compares the
+# cursor against that parameter. The pinned stage0 emitted `slice_len %xs` in the header, every
+# iteration. irForOfUnhoist (scripts/ir-signatures-forof.sh) rewrites the TREE dump only, and only a
+# loop of exactly that shape: a `slice_len` immediately before the jump into a header whose first line
+# is `icmp_slt bool <cursor>, <that value's parameter>`, the value and the parameters it reaches (every
+# edge of the function, greatest fixpoint) used nowhere else. Those are deleted and `slice_len` of the
+# ranged slice goes back into the header; the trials of the other signatures then run on the result, so
+# a file that also needs the packing or the forwarded loads is named for this one. Anything else that
+# differs, in the loop or outside it, keeps the file unexplained. Files: see the run output.
+#
+# All six retire at the next stage0 repin (#6533).
 #
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
@@ -387,7 +400,7 @@ irLagPinFiles() { irLagPins | awk -F'|' -v k="$1" '$1 == k { print $2 }'; }
 # scripts/ir-signatures-walk.sh.
 declaredSignatureNames() {
   local types="7558-synth-json-alias-column-shift 7564-synth-table-alias-column-shift"
-  local ir="7562-packed-halfword-slices 7574-packed-narrow-slices 7637-string-from-rune-range 6681-multi-assign-oracle-omits-function"
+  local ir="7562-packed-halfword-slices 7574-packed-narrow-slices 7637-string-from-rune-range 6681-multi-assign-oracle-omits-function 7737-forof-len-once"
   local lag="7574-f32-store-schedule-lag 7674-forwarded-index-get"
   case "${1:-}" in
     types) printf '%s\n' $types ;;
@@ -404,3 +417,5 @@ declaredSignatureNames() {
 . "$(dirname -- "${BASH_SOURCE[0]}")/selfhost-ir-canon.sh"
 # shellcheck source=scripts/ir-signatures-walk.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-walk.sh"
+# shellcheck source=scripts/ir-signatures-forof.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-forof.sh"
