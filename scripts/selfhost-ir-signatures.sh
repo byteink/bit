@@ -278,20 +278,140 @@
 # state before #6533; scripts/ir-signatures-walk.sh and
 # scripts/ir-signatures-forof.sh are deleted.
 #
-# NO SIGNATURE IS DECLARED. `explainMismatch` below is the empty table every
-# caller still consults, so the next lowering change that outruns the oracle
-# adds its entry there instead of re-plumbing the callers. The input protocol
-# is the text the awk body of the previous revision read: the oracle's dump,
-# a line `@@@BIT2@@@`, then the tree's dump, with the kind and the corpus file
-# as `-v` variables. A new entry must satisfy the rules in the header: an
-# exact identity, derived from FULL dumps (the oracle's from
-# `sh scripts/stage0.sh`, the tree's from `bit-out/bin/bit`), never an excerpt.
+# --- Declared signatures (against the 0.41.0 oracle) ---
 #
+# Retires at the next stage0 repin, the first oracle cut from a tree that carries #7745.
+#
+# 7745-loop-defer-stack (`ir`, `iropt`). #7745 (lowerdefer.bit) lowers a function with a `defer`
+# inside a loop onto a per-frame stack of thunks: every execution of a defer builds
+# `make_closure @defer$thunk$N` (a function that unpacks the captured receiver/arguments and makes the
+# deferred call) and appends it to a `[]fn() void`, and every exit pops the stack. The pinned stage0 kept
+# one flag and one set of slots per defer statement and replayed each at every exit. The two shapes share
+# nothing a rewrite could map line to line, so the identity is on the function level, in three parts.
+# `explainLoopDeferStack` prints the signature and returns 0 only when ALL hold:
+#   1. A tree function is STACK-MODE when its body holds a `make_closure @defer$thunk$N`. There is at
+#      least one, every `defer$thunk$N` function of the tree is made by some stack-mode function, every
+#      thunk a stack-mode function makes exists, and the oracle has a function of the same name for each
+#      stack-mode function.
+#   2. Every other function is byte-equal. Both dumps lose the stack-mode functions; the tree also loses
+#      the thunks, and a `closure$N` or `trampoline$N` name (they share the thunks' id space, so every
+#      one after a thunk moved up by the thunks before it) is renumbered back by that count.
+#   3. For each stack-mode function every callee (`call @f`, `rt_call f`, `call_iface`) of the oracle
+#      function is a callee of the tree function or of a thunk it makes, so no deferred call was dropped.
+#      The tree may hold more: the oracle replays a defer only at an exit it can reach, and a loop with
+#      no exit has none. The stack's own `rt_call slice_append`/`slice_get` are not callees here.
+# What it does not check is the body of a stack-mode function beyond that callee set; the golden case
+# _tests_/cases/run_defer_each_loop_iteration.bit proves its behaviour. Files: see the run output.
+#
+# explainLoopDeferStack <oracle_text> <bit2_text> -- see the 7745 entry above.
+irLoopDeferAwk() {
+  IR_LOOPDEFER_AWK='
+function fname(s,   n) { n = s; sub(/^func /, "", n); sub(/\(.*$/, "", n); return n }
+function isThunk(n) { return n ~ /^defer\$thunk\$[0-9]+$/ }
+function thunkId(n,   i) { i = n; sub(/^defer\$thunk\$/, "", i); return i + 0 }
+# The callee tokens of one function text, as " tok " items appended to the set string s.
+function callees(text, s,   a, n, i, l, t) {
+  n = split(text, a, "\n")
+  for (i = 1; i <= n; i++) {
+    l = a[i]; t = ""
+    if (match(l, /= call @[^(]+\(/)) { t = substr(l, RSTART + 2, RLENGTH - 3) }
+    else if (match(l, /= rt_call [^(]+\(/)) { t = substr(l, RSTART + 2, RLENGTH - 3) }
+    else if (l ~ /= call_iface /) { t = "call_iface" }
+    if (t != "" && t != "rt_call slice_append" && t != "rt_call slice_get" && index(s, " " t " ") == 0) { s = s " " t " " }
+  }
+  return s
+}
+# Whether every item of the set string x is in the set string y.
+function subsetSet(x, y,   a, n, i) {
+  n = split(x, a, "  ")
+  for (i = 1; i <= n; i++) {
+    gsub(/^ +| +$/, "", a[i])
+    if (a[i] != "" && index(y, " " a[i] " ") == 0) { return 0 }
+  }
+  return 1
+}
+# Renumbers every closure$N / trampoline$N of a line down by the thunks with a smaller id.
+function renumber(line,   out, tok, id, k, c) {
+  out = ""
+  while (match(line, /(closure|trampoline)\$[0-9]+/)) {
+    tok = substr(line, RSTART, RLENGTH)
+    id = tok; sub(/^[a-z]+\$/, "", id); id = id + 0
+    c = 0
+    for (k = 1; k <= nth; k++) { if (TID[k] < id) { c++ } }
+    sub(/\$[0-9]+$/, "", tok)
+    out = out substr(line, 1, RSTART - 1) tok "$" (id - c)
+    line = substr(line, RSTART + RLENGTH)
+  }
+  return out line
+}
+$0 == "@@@BIT2@@@" { side = 1; cur = ""; next }
+{
+  if ($0 ~ /^func /) {
+    cur = fname($0)
+    if (side == 0) { on++; ON[on] = cur; OT[cur] = "" } else { tn++; TN[tn] = cur; TT[cur] = "" }
+  }
+  if (cur != "") { if (side == 0) { OT[cur] = OT[cur] $0 "\n" } else { TT[cur] = TT[cur] $0 "\n" } }
+}
+END {
+  nth = 0; ns = 0
+  for (i = 1; i <= tn; i++) {
+    f = TN[i]
+    if (isThunk(f)) { nth++; TID[nth] = thunkId(f); TNAME[nth] = f; continue }
+    if (index(TT[f], "make_closure @defer$thunk$") > 0) { ns++; SN[ns] = f; ISS[f] = 1 }
+  }
+  if (ns == 0) { exit 1 }
+  # 1. thunks and stack-mode functions pair up, and the oracle has every stack-mode function.
+  for (i = 1; i <= ns; i++) {
+    f = SN[i]
+    if (!(f in OT)) { exit 1 }
+    m = split(TT[f], L, "\n"); need = ""
+    for (j = 1; j <= m; j++) {
+      if (match(L[j], /make_closure @defer\$thunk\$[0-9]+/)) {
+        t = substr(L[j], RSTART + 14, RLENGTH - 14)
+        if (!(t in TT)) { exit 1 }
+        MADE[t] = 1; need = need " " t
+      }
+    }
+    NEED[f] = need
+  }
+  for (i = 1; i <= nth; i++) { if (!(TNAME[i] in MADE)) { exit 1 } }
+  # 3. the callee sets.
+  for (i = 1; i <= ns; i++) {
+    f = SN[i]
+    ts = callees(TT[f], ""); m = split(NEED[f], P, " ")
+    for (j = 1; j <= m; j++) { ts = callees(TT[P[j]], ts) }
+    os = callees(OT[f], "")
+    if (!subsetSet(os, ts)) { exit 1 }
+  }
+  # 2. everything else is byte-equal.
+  ot = ""; tt = ""
+  for (i = 1; i <= on; i++) { if (!(ON[i] in ISS)) { ot = ot OT[ON[i]] } }
+  for (i = 1; i <= tn; i++) {
+    f = TN[i]
+    if ((f in ISS) || isThunk(f)) { continue }
+    m = split(TT[f], L, "\n")
+    for (j = 1; j < m; j++) { tt = tt renumber(L[j]) "\n" }
+  }
+  # A dump ends at its last function; the one the tree loses may have been followed by that blank line.
+  sub(/\n+$/, "", ot); sub(/\n+$/, "", tt)
+  if (ot != tt) { exit 1 }
+  print "7745-loop-defer-stack"
+}'
+}
+
+explainLoopDeferStack() {
+  irLoopDeferAwk
+  printf '%s\n@@@BIT2@@@\n%s\n' "$(canon_ir_ids "$1")" "$(canon_ir_ids "$2")" | LC_ALL=C awk "${IR_LOOPDEFER_AWK}"
+}
+
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
-# and returns 0, or prints nothing and returns 1 if none does. No signature is
-# registered, so it returns 1 for every kind.
+# and returns 0, or prints nothing and returns 1 if none does. Only 7745-loop-defer-stack is
+# registered, on the `ir` and `iropt` kinds.
 explainMismatch() {
+  case "$3" in
+    ir|iropt) explainLoopDeferStack "$1" "$2"; return ;;
+  esac
   return 1
 }
 
@@ -302,8 +422,14 @@ explainMismatch() {
 # function does not list can never be checked for going dead, and one it lists
 # that explainMismatch no longer prints would make that check fail on every
 # run. Kept in sync by hand, and selfhost-ir-signatures-selfcheck.sh asserts
-# the list matches the `print "..."` statements in this file. None are
-# declared, so it prints nothing for every kind.
+# the list matches the `print "..."` statements in this file. Declared for
+# `ir` and `iropt` only.
 declaredSignatureNames() {
+  case "${1:-}" in
+    ir|iropt|"") printf '%s\n' 7745-loop-defer-stack ;;
+  esac
   return 0
 }
+
+# shellcheck source=scripts/selfhost-ir-canon.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/selfhost-ir-canon.sh"
