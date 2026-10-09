@@ -1,0 +1,198 @@
+// stdlib/net/udpsender.test.bit — `UdpSocket.recv` names the sender of the
+// datagram it returned, not of another task's (#7746).
+//
+// Eight receivers and eight senders share one process. Every sender sends, in
+// each of twenty rounds, one datagram to every receiver, and the payload is that
+// sender's own port as text. A receiver checks the `Datagram` it got against
+// what was sent in it, so a sender read from anywhere but the datagram's own
+// `recvfrom` (the per-worker last-sender slot `recv` used to read back after the
+// receive, which another task, or this task on another worker, could overwrite)
+// shows up as a payload that disagrees with `Datagram.port`/`host`.
+//
+// The test counts and asserts; it does not retry. The count is the evidence:
+// `wrong` must be 0 out of `got`, and `got` must be nearly all of what was sent
+// (loopback UDP into an idle receiver does not lose datagrams at this rate; the
+// 90% floor only keeps a kernel drop from failing a test about sender identity).
+import { AtomicI64 } from "std/sync"
+import { sleep } from "std/time"
+
+const udpsPeers: int = 8
+const udpsRounds: int = 20
+// Bound on the waits below: 2000 polls of 5 ms.
+const udpsDrainTries: int = 2000
+const udpsPollNs: int = 5000000
+
+class udpsRig {
+  recvs: []UdpSocket,
+  wrong: AtomicI64,
+  got: AtomicI64,
+  finished: AtomicI64,
+}
+
+fn udpsReceive(r: udpsRig, sock: UdpSocket) {
+  while (true) {
+    let d = sock.recv(64) catch _ {
+      break
+    }
+    if (d.data == "END") {
+      break
+    }
+    r.got.add(1)
+    if (d.data != "${d.port}" || d.host != "127.0.0.1") {
+      r.wrong.add(1)
+    }
+  }
+  r.finished.add(1)
+}
+
+fn udpsSend(r: udpsRig, done: chan<int>) {
+  let s = udpBind("127.0.0.1", 0) catch _ {
+    done <- 0
+    return
+  }
+  let port = s.port() catch _ {
+    done <- 0
+    return
+  }
+  let round = 0
+  while (round < udpsRounds) {
+    let k = 0
+    while (k < udpsPeers) {
+      let to = r.recvs[k].port() catch _ {
+        done <- 0
+        return
+      }
+      s.send("127.0.0.1", to, "${port}") catch _ {
+        done <- 0
+        return
+      }
+      k = k + 1
+    }
+    round = round + 1
+  }
+  s.close()
+  done <- 1
+}
+
+// Tell every receiver that has not finished to stop, again and again until all
+// have: an `END` can itself be dropped by a full socket buffer, and a receiver
+// that never sees one would park forever.
+fn udpsStop(r: udpsRig, closer: UdpSocket): bool {
+  let tries = 0
+  while (tries < udpsDrainTries) {
+    if (r.finished.load() == udpsPeers) {
+      return true
+    }
+    let k = 0
+    while (k < udpsPeers) {
+      let to = r.recvs[k].port() catch _ {
+        0
+      }
+      closer.send("127.0.0.1", to, "END") catch _ {}
+      k = k + 1
+    }
+    sleep(udpsPollNs)
+    tries = tries + 1
+  }
+  return false
+}
+
+test "recv names the sender of the datagram it returned (8x8x20: 8 receivers, 8 senders, 20 rounds)" {
+  let r = udpsRig{
+    recvs = []UdpSocket(0),
+    wrong = AtomicI64(0),
+    got = AtomicI64(0),
+    finished = AtomicI64(0),
+  }
+  let k = 0
+  while (k < udpsPeers) {
+    let s = udpBind("127.0.0.1", 0) catch e {
+      assert(false, "udpBind: ${e.message()}")
+      return
+    }
+    r.recvs = append(r.recvs, s)
+    k = k + 1
+  }
+  let sdone = chan<int>(udpsPeers)
+  k = 0
+  while (k < udpsPeers) {
+    spawn udpsReceive(r, r.recvs[k])
+    spawn udpsSend(r, sdone)
+    k = k + 1
+  }
+  k = 0
+  while (k < udpsPeers) {
+    let ok = <- sdone
+    assert(ok == 1, "a sender failed")
+    k = k + 1
+  }
+  let sent = udpsPeers * udpsPeers * udpsRounds
+  // Let the receivers drain what is queued before the first END overtakes it.
+  let waited = 0
+  while (r.got.load() < sent && waited < udpsDrainTries) {
+    sleep(udpsPollNs)
+    waited = waited + 1
+  }
+  let closer = udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind: ${e.message()}")
+    return
+  }
+  let stopped = udpsStop(r, closer)
+  println("udpsender: sent=${sent} got=${r.got.load()} wrong=${r.wrong.load()}")
+  assert(stopped, "a receiver never saw END")
+  assert(
+    r.wrong.load() == 0,
+    "wrong = ${r.wrong.load()} of ${r.got.load()} datagrams named another sender",
+  )
+  assert(r.got.load() * 10 >= sent * 9, "got ${r.got.load()} of ${sent} datagrams")
+}
+
+test "recv returns a zero-length datagram with its sender, and fails on a closed socket" {
+  let a = udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind a: ${e.message()}")
+    return
+  }
+  let b = udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind b: ${e.message()}")
+    return
+  }
+  let ap = a.port() catch e {
+    assert(false, "port a: ${e.message()}")
+    return
+  }
+  let bp = b.port() catch e {
+    assert(false, "port b: ${e.message()}")
+    return
+  }
+  a.send("127.0.0.1", bp, "") catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let d = b.recv(16) catch e {
+    assert(false, "recv: ${e.message()}")
+    return
+  }
+  assert(len(d.data) == 0, "payload ${len(d.data)} bytes, want 0")
+  assert(d.host == "127.0.0.1", "host ${d.host}")
+  assert(d.port == ap, "port ${d.port}, want ${ap}")
+  // A datagram longer than `max` is cut to `max` and still names its sender.
+  a.send("127.0.0.1", bp, "0123456789") catch e {
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let cut = b.recv(4) catch e {
+    assert(false, "recv: ${e.message()}")
+    return
+  }
+  assert(cut.data == "0123", "cut ${cut.data}")
+  assert(cut.port == ap, "cut port ${cut.port}, want ${ap}")
+  b.close()
+  let failed = b.recv(16) catch _ {
+    Datagram{ data = "failed", host = "", port = 0 }
+  }
+  assert(failed.data == "failed", "recv on a closed socket returned ${failed.data}")
+  let zero = a.recv(0) catch _ {
+    Datagram{ data = "failed", host = "", port = 0 }
+  }
+  assert(zero.data == "failed", "recv(0) returned ${zero.data}")
+}

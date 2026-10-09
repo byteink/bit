@@ -1958,10 +1958,11 @@ word, one worker's result is whatever the other happened to leave there. This
 was read into the adjacency contract by every site that cited it as a safety
 argument for a *shared* buffer; adjacency was never that.
 
-**Two fixes** proved the distinction above the hard way: one to
-`udpSenderBuf`/`udpSenderValid` (`runtime/net/{darwin,linux}/netabi.bit`) —
-the root cause of a shared-buffer race open six months across three wrong
-hypotheses before this was found — and one to `saBuf`/`saBuf2`/`optBuf`/
+**Two fixes** proved the distinction above the hard way: one to the UDP
+last-sender slot (a per-worker `udpSenderBuf`/`udpSenderValid`, since deleted
+altogether by #7746 in favour of a caller-owned buffer — see §20's UDP
+paragraph) — the root cause of a shared-buffer race open six months across
+three wrong hypotheses before this was found — and one to `saBuf`/`saBuf2`/`optBuf`/
 `lenBuf`/`ipBuf` (`runtime/net/{darwin,linux}/sock.bit`, mutation-tested both
 directions), whose pre-fix fingerprint was `gotport == the other socket's
 port` — an outright swap. A
@@ -1981,16 +1982,15 @@ actually exercised. §22 audits every remaining module-level cell in
   M:N scheduler migrating the task to a different worker between the two
   calls.
 - If the value is scoped to the calling **worker** instead — a buffer built
-  once per OS thread rather than per task, as `udpSenderBuf` and the
-  sockaddr scratch buffers are — use **per-worker slots** indexed by `wkId`,
+  once per OS thread rather than per task, as the sockaddr scratch buffers
+  are — use **per-worker slots** indexed by `wkId`,
   double-bounded against both `schedMaxWorkers` and the array's own literal
   capacity (`let a: [N]i64` needs a literal `N`), plus one fallback slot for a
   caller with no current task.
 - If the span can **park**, decide the slot **after** the park returns, not
-  before it starts — `netAbiUdpRecv` (the sockaddr scratch-buffer fix) writes the raw result into
-  throwaway per-call scratch and only asks for its worker slot once
-  `netRecvFrom` has actually returned, because the task can resume on a
-  different worker mid-call.
+  before it starts — the task can resume on a different worker mid-call. A
+  value the CALLER needs back after the call is not a slot at all: pass the
+  caller's own buffer in (`bit_rt_net_udp_recv_from_w`, #7746).
 - Filling a buffer once outside a retry loop that can park is unsound under
   per-worker slots even though it was harmless under one shared buffer — a
   migrated task's next read lands on a different, unfilled slot (the sockaddr
@@ -3057,9 +3057,7 @@ defined exactly once).
 | `bit_rt_net_lookup_txt_w` | `(inWords: usize, hostLen: i64, nsLen: i64, port: i64, outWords: usize) -> i64` (§20, #6882: the TXT records of a host, written into the caller's own `outWords` buffer (65537 bytes) as entries of a two-byte big-endian length then that many bytes, one per TXT RR with its character-strings concatenated in order. `in` holds a 16-byte budget header (#6350: the per-attempt window in milliseconds, then the attempt count, each a little-endian 64-bit word; it rides in the buffer because the entry is at the five-parameter ceiling), then the host (`hostLen` bytes), then, when `nsLen > 0`, one nameserver's IPv4 or IPv6 text (at most 64 bytes) that is asked on `port`; `nsLen == 0` asks every nameserver in `/etc/resolv.conf` on port 53. A budget outside 1..1000000 for either word returns `-1`. Returns the bytes written (`0`: no TXT record, NXDOMAIN included), `-1` timeout or server failure, `-2` malformed reply, `-3` unsupported (Windows, which has no TXT lookup). A reply with TC set is repeated over TCP (IPv4 nameservers only) inside the same per-server budget as `bit_rt_net_resolve_w`. Both buffers cross as packed `[]byte` backings the caller holds live with `keepAlive`) |
 | `bit_rt_net_udp_bind` | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_udp_send` | `(fd: i64, host: *const RtBytes, port: i64, data: *const RtBytes) -> i64` (§20) |
-| `bit_rt_net_udp_recv` | `(fd: i64, max: i64) -> *const RtBytes` (§20)          |
-| `bit_rt_net_udp_sender_host` | `() -> *const RtBytes` (§20)                    |
-| `bit_rt_net_udp_sender_port` | `() -> i64` (§20)                               |
+| `bit_rt_net_udp_recv_from_w` | `(fd: i64, outWords: usize, cap: i64, peerWords: usize) -> i64` (§20, #7746: the next datagram into the caller's own packed `outWords` buffer (up to `cap` bytes) and the sender's raw 16-byte `sockaddr_in` into the caller's own `peerWords` buffer, in ONE call, as recvfrom(2) does; the runtime keeps no last-sender state. The caller keeps both buffers live across the call with `keepAlive`. Byte count (`0` for a zero-length datagram, which has a valid sender), `-1` on error. A plain `extern fn` in `stdlib/net/net.bit`; it replaced the `netUdpRecv`, `netUdpSenderHost` and `netUdpSenderPort` compiler primitives and their three `bit_rt_net_udp_*` entries) |
 | `bit_rt_net_resolve_w` | `(hostWords: usize, hostLen: i64, timeoutMs: i64, attempts: i64, outWords: usize) -> i64` (§20, #6350: the first A record of the host as a dotted quad written into the caller's own `outWords` buffer (at least 16 bytes), its byte count returned; `-1` once every nameserver has failed or an argument is refused (a host of 0 or over 255 bytes, a null buffer, `timeoutMs` or `attempts` outside 1..1000000). `timeoutMs` is the receive window of ONE try and `attempts` how many passes are made over the nameserver list (A, B, A, B: resolv.conf(5)'s meaning, so a dead first server costs one window before the second is asked; the window is fixed, no retrans back-off): `std/net` owns both (resolv.conf's `options timeout:N attempts:N`, defaults 5000 and 2) and the runtime keeps no default of its own. A plain `extern fn` in `stdlib/net/net.bit`, which replaced the `netResolve` compiler primitive and its `bit_rt_net_resolve` entry: a primitive's arity is baked into the compiler that emits the call, so widening it would have needed a stage0 repin (`tools/build/abiarity.bit`); an `extern` takes its arity from the source it is compiled against. Both buffers cross as packed `[]byte` backings the caller holds live with `keepAlive`) |
 | `bit_rt_net_dns_servers_w` | `() -> i64` (§20, #7480: how many nameservers `bit_rt_net_resolve_w` walks that no `/etc/resolv.conf` line names, so `std/net`'s `resolveBudgetMs` budgets the servers the resolver asks. `0` on Linux and Darwin, whose list is that file, which `std/net` counts itself. On Windows the number of DNS servers, IPv4 and IPv6, that the adapters that are up carry (`GetAdaptersAddresses`, deduplicated, at most 16), from the SAME discovery the resolve walks, `0` when there is none. A plain `extern fn` in `stdlib/net/net.bit`) |
 | `bit_rt_random_bytes` | `(len: i64) -> *const RtBytes` (§21)                   |
@@ -4524,11 +4522,10 @@ IPv4-mapped, `::ffff:a.b.c.d` (ten zero bytes, `ff ff`, the four octets), so a
 the one rendering rule in `std/net` (`stdlib/net/ipaddr.bit`: mapped prints as
 the dotted quad, anything else per RFC 5952) gives one client one string.
 
-It is raw bytes rather than formatted, unlike `bit_rt_net_udp_sender_host`
-below, so that all three wrappers stay `@nosplit`: formatting means allocating
-a managed octet scratch and a string, which costs four entries in
-`_tests_/bit/pollfree`'s REVIEWED exception list (§5's hazard of a raw GC
-address held across a poll). `std/net`'s `Conn.peerIp()` renders them instead,
+It is raw bytes rather than formatted so that all three wrappers stay
+`@nosplit`: formatting means allocating a managed octet scratch and a string,
+which costs entries in `_tests_/bit/pollfree`'s REVIEWED exception list (§5's
+hazard of a raw GC address held across a poll). `std/net`'s `Conn.peerIp()` renders them instead,
 where string work is free. `outWords` crosses as a packed `[]byte` backing the
 caller holds live with `keepAlive`, and is written before the wrapper returns.
 
@@ -4556,38 +4553,46 @@ in any case: `make selfhost` compiles the whole stdlib with the PINNED stage0,
 and `compiler/pmfetch.bit` pulls `std/http` -> `std/net` into that build, so a
 freshly added predeclared name is `E0040: undefined name` there.
 
-**UDP** (connectionless). `recv` records the sender in per-OS module state,
-**one `[4]i64` sockaddr and one valid flag PER WORKER** —
-`udpSenderBuf`/`udpSenderValid` (`runtime/net/linux/netabi.bit:407-408`;
-`runtime/net/darwin/netabi.bit:396-397`), indexed by the calling task's own
-worker id (`wkId`, §9's `runtime/sched/worker.bit`) via `udpSenderSlot()`,
-double-bounded against `schedMaxWorkers` and the file's own array capacity —
-read back by the two accessors with no intervening park. This is neither a
-threadlocal nor the §13 per-task scratch slot: the provider's own header
-says so outright ("THE LAST SENDER IS PER-WORKER SCRATCH, NOT A
-THREADLOCAL", `runtime/net/linux/netabi.bit:355`).
+**UDP** (connectionless). `bit_rt_net_udp_recv_from_w(fd, outWords, cap,
+peerWords)` is recvfrom(2): ONE call returns the datagram and its sender, both
+written into buffers the CALLER owns — the datagram into `outWords` (up to `cap`
+bytes, a packed `[]byte` backing), the sender's raw `sockaddr_in` into
+`peerWords` (16 bytes, the port big-endian at byte 2, the four octets at byte 4,
+on Linux, Darwin and Windows alike; only the family byte differs). The runtime
+keeps NO "last sender" state, and `std/net`'s `UdpSocket.recv` decodes the
+address from its own buffer. A zero-length datagram returns `0` with a valid
+sender; a failed receive returns `-1`, which is how it is told from one.
 
-**This used to be a single SHARED slot for the whole process** — sound,
-the header used to claim, "only because v1 pins the scheduler to one worker
-(§5/§9)". That was false as soon as the scheduler could boot more than one worker: two
-green threads on two OS threads racing `recv` clobbered the shared flag —
-one succeeds and sets it, the other (a different worker) zeroes it, the
-first reads back "no sender" — and one such clobber on a listener socket
-wedged it permanently (`stdlib/quic/listener.bit`'s `catch _ { return }`).
-Per-worker slots fix the concurrent-task case; they remain
-sound under a single task's own migration between the two calls too,
-because `netRecvFrom`'s park is the only park in `udp_recv`, and the slot is
-chosen only AFTER that park returns — see the provider's own header comment
-for the full argument. A failed `recv` returns `""` with `sender_port` `-1`,
-which is how it is told from a legitimate zero-length datagram (whose
-sender port is `0..65535`).
+**This replaced a per-worker "last sender" slot (#7746).** `recv` used to record
+the sender in `udpSenderBuf`/`udpSenderValid`, one `[4]i64` sockaddr and one
+valid flag per worker indexed by the calling task's `wkId`, and `std/net` read
+it back with two more calls, `bit_rt_net_udp_sender_port` then
+`bit_rt_net_udp_sender_host`. A single shared slot (before #3272) was clobbered
+by two tasks on two OS threads; the per-worker slot fixed that and argued the
+read-backs were safe because "nothing parks between them". A park is not the
+only scheduling point: every loop back edge polls, and a poll yields when the
+worker's preempt flag is up (`schedMaybeYieldForPreempt`), after which the task
+may resume on another worker. Under load a QUIC server saw a datagram from
+`0.0.0.0:0` (a reply to it failed with `udp send to 0.0.0.0:0 failed` and ended
+the connection). The window PROVEN is in the engine: `netRecvFromLoop`
+(`runtime/net/{linux,darwin}/udp.bit`) had the kernel write the sender into the
+per-worker `saBytes()` slot and a copy loop (a back edge is a poll site) re-derive
+the slot to copy it out; a `schedYield()` inserted right after the
+kernel write made `stdlib/net/udpsender.test.bit` report 2 to 10
+wrong senders in 4 of 5 runs, and the same insertion into the fixed tree 0 in
+10 of 10. Whether the field failure came through that loop or through the
+slot read-back is not established; both are gone. Adjacency of two calls is a
+property of one instruction stream, not a guarantee about the storage between
+them; storage the caller passes in has no such window. The slots, their
+accessors (`udpSenderSlot`, `udpValidAt`, `udpSenderWordAt`, `udpSenderAddr`,
+`copySockAddrWords`), `formatQuad` and the three primitives are deleted on every
+provider, and `netRecvFrom` on Linux and Darwin writes the sockaddr straight into
+the caller's `peer` (its `salen` is a managed local).
 
 ```
 bit_rt_net_udp_bind(host, port)         -> fd    // datagram socket; port 0 = kernel picks. -1 on error
 bit_rt_net_udp_send(fd, host, port, s)  -> n     // one datagram (all-or-nothing). -1 on error
-bit_rt_net_udp_recv(fd, max)            -> str   // next datagram; parks. records the sender
-bit_rt_net_udp_sender_host()            -> str   // last recv's sender ip, or "" on error
-bit_rt_net_udp_sender_port()            -> port  // last recv's sender port, or -1 on error
+bit_rt_net_udp_recv_from_w(fd, out, cap, peer) -> n // next datagram into out, sender sockaddr into peer; parks. -1 on error
 ```
 
 **DNS.** `resolve` returns the first A record for `host` as a dotted quad, or `""`
@@ -5121,31 +5126,12 @@ different OS thread — a per-OS-thread slot could not:**
 matching read can cross a scheduling point — a green task migrates workers
 only at an explicit yield/park, never mid-expression — AND each slot really is
 per-worker storage, not a single shared word (§5.1):**
-- `runtime/net/{linux,darwin}/netabi.bit`: `udpSenderBuf`/`udpSenderValid`
-  (`linux/netabi.bit:407-408`; `darwin/netabi.bit:396-397`) — per-OS, not
-  `root.bit`, and NOT a `threadlocal` (Mach-O refuses one, §11.11).
-
-  **This bullet used to describe a SINGLE shared slot for the whole
-  process**, claimed sound "only because v1 pins the scheduler to one worker
-  (§5/§9)". That claim was false as soon as more than one worker could boot:
-  two tasks on two OS threads racing `udp_recv` clobbered the one
-  shared flag, and a permanently wedged UDP listener was traced to exactly
-  that. Fixed by giving each WORKER its own `[4]i64`/valid-flag slot, indexed
-  by the calling task's own worker id (`wkId`, `runtime/sched/worker.bit`)
-  via `udpSenderSlot()`, double-bounded against `schedMaxWorkers` and the
-  array's own literal capacity (the same shape `runtime/sched/preempt.bit`
-  uses for `startTick`/`requested`). It belongs in this category **now**, post-fix,
-  because there are genuinely `schedMaxWorkers` separate words, not one.
-
-  `udp_recv` contains a real park (`netRecvFrom`, on the same engine
-  `netAbiRead` uses), so the task CAN resume on a different worker mid-call.
-  The slot is therefore chosen only AFTER that park returns, from the worker
-  id current at that point, and the raw `recvfrom` output is held in a
-  throwaway per-call scratch until then — see the provider's own header
-  comment (`linux/netabi.bit:355` / `darwin/netabi.bit:343`) for the full
-  argument. From the point the slot is chosen to `udp_sender_host`/`_port`'s
-  read, adjacency holds: nothing parks in between, so the two see the same
-  slot — and that slot is this task's worker's own, not shared with any other.
+- `runtime/net/{linux,darwin}/netabi.bit`: `udpSenderBuf`/`udpSenderValid` WERE
+  here, one slot per worker indexed by `wkId`. Deleted by #7746: the sender now
+  travels in a buffer the caller passes to `bit_rt_net_udp_recv_from_w`, so no
+  runtime cell is read back by a later call. (A per-worker slot read back by
+  adjacency is sound only while nothing between the write and the read yields;
+  a loop back-edge poll can, and the task then read a stranger's sender.)
 - `runtime/sched/sched.bit`: `Worker.tls` — re-derived on every read from the
   running task's own stack pointer (`sched.bit:15`'s `schedCurrentTask`),
   never cached across a call boundary, specifically because a parked task can
