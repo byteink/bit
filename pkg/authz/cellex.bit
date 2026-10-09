@@ -4,35 +4,41 @@
 // else is refused when the policy is saved). CEL is the Common Expression
 // Language, defined in the language definition of github.com/google/cel-spec.
 //
-// What is lexed: string literals, decimal integers, floats, `true` / `false`
+// What is lexed: string and bytes literals (CEL's full syntax: either quote,
+// triple-quoted, `r` raw, `b` bytes and every escape the language definition
+// lists), decimal integers, floats, `true` / `false`
 // / `null`, identifiers, the operators `== != < <= > >= && || ! in`,
 // parentheses, list brackets, `,` and `.`, and `//` comments to the end of
 // the line. The arithmetic operators `+ - * / %`, the ternary `? :` and the
 // braces of a map literal are lexed too, as `Op` tokens, so the parser (cel.bit)
 // can refuse each by name; the lexer itself never judges them. Everything else
 // is an error that names its byte offset: `cel: unexpected character '#' at
-// byte 14`. That includes hexadecimal and `u`-suffixed integers, raw strings,
-// triple-quoted strings and bytes literals; the last four say "not supported"
-// rather than "unexpected".
+// byte 14`. That includes hexadecimal and `u`-suffixed integers, which say
+// "not supported" rather than "unexpected". An integer literal after a `-`
+// may be 9223372036854775808, the int64 minimum, as CEL's `-?` literal
+// allows; anywhere else it is out of range.
 //
 // The input is an admin's text, so the lexer is bounded before it is clever:
 // at most 4096 bytes and 512 tokens, each an InvalidPolicy. It is one pass
 // over the bytes and never panics: every read goes through `byteAt`, which
 // yields 0 past the end, and every slice is cut between two positions the scan
 // has already checked. A string literal with no escape is a slice of the
-// source; only one with an escape is rebuilt, through a `Builder`.
+// source; only one with an escape is rebuilt, through a `Builder`. A code
+// point that is a surrogate or above U+10FFFF is refused at its backslash.
 //
 // Offsets are byte offsets into `src`, `[start, end)`. The error offset is
 // the first byte that is wrong, or for a literal that never closes, the byte
 // that opened it.
 
-import { Builder, isValidUtf8, parseInt } from "std/strings"
+import { Builder, contains, isValidUtf8, parseInt } from "std/strings"
 
-// One CEL token. `in` is the operator `Op("in")`; `true`, `false` and `null`
+// One CEL token. `Bytes` holds the octets of a `b"..."` literal, which need
+// not be UTF-8. `in` is the operator `Op("in")`; `true`, `false` and `null`
 // are `Bool` and `Null`, never identifiers.
 export enum CelTok {
   Ident(string),
   Str(string),
+  Bytes(string),
   Int(i64),
   Float(f64),
   Bool(bool),
@@ -108,61 +114,123 @@ fn showByte(src: string, at: int): string {
   return "\\x" + hexDigits[v / 16:v / 16 + 1] + hexDigits[v % 16:v % 16 + 1]
 }
 
+// The one-character escapes of the language definition: `escFrom[i]` after a
+// backslash stands for the byte `escTo[i]` (bell, backspace, form feed, line
+// feed, carriage return, tab, vertical tab, then the punctuation marks).
+const escFrom: string = "abfnrtv\\'\"?`"
+const escTo: string = "\x07\x08\x0c\n\r\t\x0b\\'\"?`"
+
 // The byte a one-character escape (`\n`) stands for, -1 when `c` is not one.
 fn escByte(c: u8): int {
-  if (c == 'n') {
-    return 10
-  }
-  if (c == 't') {
-    return 9
-  }
-  if (c == '\\' || c == '\'' || c == '"') {
-    return int(c)
+  let i = 0
+  while (i < len(escFrom)) {
+    if (escFrom[i] == c) {
+      return int(escTo[i])
+    }
+    i = i + 1
   }
   return -1
 }
 
-// The UTF-8 bytes of `cp`, at most U+FFFF and no surrogate (a `\uXXXX` is
-// four hex digits). There is no rune-to-string conversion yet (SPEC §12.9).
+// The UTF-8 bytes of `cp`, a code point up to U+10FFFF that is no surrogate.
+// There is no rune-to-string conversion yet (SPEC §12.9).
 fn appendUtf8(b: Builder, cp: int) {
   if (cp < 0x80) {
     b.writeByte(u8(cp))
   } else if (cp < 0x800) {
     b.writeByte(u8(0xC0 | (cp >> 6)))
     b.writeByte(u8(0x80 | (cp & 0x3F)))
-  } else {
+  } else if (cp < 0x10000) {
     b.writeByte(u8(0xE0 | (cp >> 12)))
+    b.writeByte(u8(0x80 | ((cp >> 6) & 0x3F)))
+    b.writeByte(u8(0x80 | (cp & 0x3F)))
+  } else {
+    b.writeByte(u8(0xF0 | (cp >> 18)))
+    b.writeByte(u8(0x80 | ((cp >> 12) & 0x3F)))
     b.writeByte(u8(0x80 | ((cp >> 6) & 0x3F)))
     b.writeByte(u8(0x80 | (cp & 0x3F)))
   }
 }
 
-// `\uXXXX` at `src[i:i+6]` appended to `b` as UTF-8; the index after it. A
-// surrogate is not a code point, so it is refused.
-fn decodeU(b: Builder, src: string, i: int): int! {
+// The value of the `n` hex digits at `src[from:]`, -1 when one is not a digit.
+fn hexRun(src: string, from: int, n: int): int {
   let cp = 0
   let k = 0
-  while (k < 4) {
-    let h = hexVal(byteAt(src, i + 2 + k))
+  while (k < n) {
+    let h = hexVal(byteAt(src, from + k))
     if (h < 0) {
-      fail celErr("invalid \\u escape", i)
+      return -1
     }
     cp = cp * 16 + h
     k = k + 1
   }
-  if (cp >= 0xD800 && cp <= 0xDFFF) {
-    fail celErr("invalid unicode code point in \\u escape", i)
+  return cp
+}
+
+// The value of the octal escape digits at `src[from:]`: three digits from
+// 000 to 377. -1 for anything else.
+fn octRun(src: string, from: int): int {
+  let d0 = int(byteAt(src, from)) - int('0')
+  let d1 = int(byteAt(src, from + 1)) - int('0')
+  let d2 = int(byteAt(src, from + 2)) - int('0')
+  if (d0 < 0 || d0 > 3 || d1 < 0 || d1 > 7 || d2 < 0 || d2 > 7) {
+    return -1
+  }
+  return d0 * 64 + d1 * 8 + d2
+}
+
+// `\uXXXX` or `\UXXXXXXXX` (`n` digits) at `src[i:]` appended to `b` as UTF-8;
+// the index after it. A surrogate or a value above U+10FFFF is not a code
+// point, so it is refused. `\U` is for strings only.
+fn decodeUni(b: Builder, src: string, i: int, n: int, bytes: bool): int! {
+  let kind = src[i + 1:i + 2]
+  if (n == 8 && bytes) {
+    fail celErr("\\U escape is not valid in a bytes literal", i)
+  }
+  let cp = hexRun(src, i + 2, n)
+  if (cp < 0) {
+    fail celErr("invalid \\${kind} escape", i)
+  }
+  if ((cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) {
+    fail celErr("invalid unicode code point in \\${kind} escape", i)
   }
   appendUtf8(b, cp)
-  return i + 6
+  return i + 2 + n
+}
+
+// `\xHH` or `\ooo` at `src[i:]`: the code point U+00HH in a string, the octet
+// in a bytes literal; the index after it.
+fn decodeNum(b: Builder, src: string, i: int, bytes: bool): int! {
+  let isOct = isDigit(src[i + 1])
+  let v = hexRun(src, i + 2, 2)
+  let what = "\\x"
+  if (isOct) {
+    v = octRun(src, i + 1)
+    what = "octal"
+  }
+  if (v < 0) {
+    fail celErr("invalid ${what} escape", i)
+  }
+  if (bytes) {
+    b.writeByte(u8(v))
+  } else {
+    appendUtf8(b, v)
+  }
+  return i + 4
 }
 
 // The escape starting at the backslash `src[i]`, appended to `b`; the index
 // after it.
-fn decodeEsc(b: Builder, src: string, i: int): int! {
+fn decodeEsc(b: Builder, src: string, i: int, bytes: bool): int! {
   let c = byteAt(src, i + 1)
   if (c == 'u') {
-    return decodeU(b, src, i)?
+    return decodeUni(b, src, i, 4, bytes)?
+  }
+  if (c == 'U') {
+    return decodeUni(b, src, i, 8, bytes)?
+  }
+  if ((c | 0x20) == 'x' || isDigit(c)) {
+    return decodeNum(b, src, i, bytes)?
   }
   let v = escByte(c)
   if (v < 0) {
@@ -173,14 +241,14 @@ fn decodeEsc(b: Builder, src: string, i: int): int! {
 }
 
 // The text of a literal body `src[from:to]` that holds at least one escape.
-fn decodeStr(src: string, from: int, to: int): string! {
+fn decodeStr(src: string, from: int, to: int, bytes: bool): string! {
   let b = Builder()
   let seg = from
   let i = from
   while (i < to) {
     if (src[i] == '\\') {
       b.write(src[seg:i])
-      i = decodeEsc(b, src, i)?
+      i = decodeEsc(b, src, i, bytes)?
       seg = i
     } else {
       i = i + 1
@@ -188,6 +256,36 @@ fn decodeStr(src: string, from: int, to: int): string! {
   }
   b.write(src[seg:to])
   return b.toString()
+}
+
+// Whether the literal body closes at `src[i]`: the quote `q`, or three of them
+// in a triple-quoted literal.
+fn closesAt(src: string, i: int, q: u8, triple: bool): bool {
+  if (byteAt(src, i) != q) {
+    return false
+  }
+  return !triple || (byteAt(src, i + 1) == q && byteAt(src, i + 2) == q)
+}
+
+// The index where the literal body starting at `from` closes, -1 when it never
+// does. A quoted literal ends at a line break; a raw one keeps its backslashes,
+// so a backslash does not hide the quote after it.
+fn scanBody(src: string, from: int, q: u8, triple: bool, raw: bool): int {
+  let i = from
+  while (i < len(src)) {
+    let c = src[i]
+    if (closesAt(src, i, q, triple)) {
+      return i
+    }
+    if (c == '\\' && !raw) {
+      i = i + 2
+    } else if (!triple && (c == '\n' || c == '\r')) {
+      return -1
+    } else {
+      i = i + 1
+    }
+  }
+  return -1
 }
 
 // The operator the two bytes `c d` start with when `d` is `=`.
@@ -271,6 +369,27 @@ fn isStringPrefix(src: string, start: int, end: int): bool {
     return x == 'b' || x == 'r'
   }
   return n == 2 && isPrefixPair(src[start], src[start + 1])
+}
+
+// Whether the prefix `src[start:end]` holds the letter `l` (lower case), in
+// either case: `r` for raw, `b` for bytes.
+fn prefixHas(src: string, start: int, end: int, l: u8): bool {
+  let i = start
+  while (i < end) {
+    if ((src[i] | 0x20) == l) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The digits of the int64 minimum without its sign.
+const minIntDigits: string = "9223372036854775808"
+
+// The int64 minimum, which has no positive twin and so no literal in Bit.
+export fn celMinInt(): i64 {
+  return -9223372036854775807 - 1
 }
 
 // The index after the digits that start at `i`.
@@ -362,7 +481,8 @@ class CelLexer {
     }
     let q = byteAt(this.src, i)
     if ((q == '"' || q == '\'') && isStringPrefix(this.src, start, i)) {
-      fail celErr("bytes and raw string literals are not supported", start)
+      this.str(start, i, prefixHas(this.src, start, i, 'r'), prefixHas(this.src, start, i, 'b'))?
+      return
     }
     this.push(wordTok(this.src[start:i]), start, i)?
   }
@@ -397,38 +517,58 @@ class CelLexer {
       this.push(CelTok.Float(f), start, end)?
       return
     }
+    this.push(CelTok.Int(this.intValue(text, start)?), start, end)?
+  }
+
+  // Whether the last token is a `-`, which makes the int64 minimum's digits a
+  // literal.
+  afterMinus(): bool {
+    if (len(this.toks) == 0) {
+      return false
+    }
+    return match (this.toks[len(this.toks) - 1].tok) {
+      Op(o) => o == "-"
+      _ => false
+    }
+  }
+
+  // The value of the decimal integer `text` that starts at `start`.
+  intValue(text: string, start: int): i64! {
+    if (text == minIntDigits && this.afterMinus()) {
+      return celMinInt()
+    }
     let v = parseInt(text) catch _ {
       fail celErr("integer out of range", start)
     }
-    this.push(CelTok.Int(i64(v)), start, end)?
+    return i64(v)
   }
 
-  str(): ()! {
-    let start = this.pos
-    let q = this.src[start]
-    if (byteAt(this.src, start + 1) == q && byteAt(this.src, start + 2) == q) {
-      fail celErr("triple-quoted strings are not supported", start)
+  // The literal that starts at `start`, its opening quote at `qpos` (after any
+  // `r` / `b` prefix).
+  str(start: int, qpos: int, raw: bool, bytes: bool): ()! {
+    let q = this.src[qpos]
+    let triple = byteAt(this.src, qpos + 1) == q && byteAt(this.src, qpos + 2) == q
+    let quotes = 1
+    if (triple) {
+      quotes = 3
     }
-    let i = start + 1
-    let hasEsc = false
-    while (i < len(this.src) && this.src[i] != q && this.src[i] != '\n' && this.src[i] != '\r') {
-      if (this.src[i] == '\\') {
-        hasEsc = true
-        i = i + 1
-      }
-      i = i + 1
-    }
-    if (byteAt(this.src, i) != q) {
+    let from = qpos + quotes
+    let to = scanBody(this.src, from, q, triple, raw)
+    if (to < 0) {
       fail celErr("unterminated string", start)
     }
-    let value = this.src[start + 1:i]
-    if (hasEsc) {
-      value = decodeStr(this.src, start + 1, i)?
+    let value = this.src[from:to]
+    if (!raw && contains(value, "\\")) {
+      value = decodeStr(this.src, from, to, bytes)?
+    }
+    if (bytes) {
+      this.push(CelTok.Bytes(value), start, to + quotes)?
+      return
     }
     if (!isValidUtf8(value)) {
       fail celErr("invalid UTF-8 in string", start)
     }
-    this.push(CelTok.Str(value), start, i + 1)?
+    this.push(CelTok.Str(value), start, to + quotes)?
   }
 
   // Pushes the one-byte bracket, comma or dot `c` at `p`; false when `c` is
@@ -480,7 +620,7 @@ class CelLexer {
     } else if (isDigit(c) || (c == '.' && isDigit(byteAt(this.src, this.pos + 1)))) {
       this.number()?
     } else if (c == '"' || c == '\'') {
-      this.str()?
+      this.str(this.pos, this.pos, false, false)?
     } else {
       this.symbol()?
     }
