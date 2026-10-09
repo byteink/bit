@@ -124,12 +124,11 @@ import { loadByte, storeByte } from "../../gc"
 // "../../net" by this module's sibling sock.bit (imports are module-scoped), so
 // re-importing them here is an E0042 redeclaration — only the name sock.bit
 // does NOT bring in is imported. `emptyStr`, `u8At`, `scratchWords`,
-// `strData`, `strSizeOf`, `strFromPacked` and the UDP last-sender slot
-// accessors are core (../netabi.bit, #2552) too, module-scoped the same way.
+// `strData`, `strSizeOf` and `strFromPacked` are core (../netabi.bit, #2552)
+// too, module-scoped the same way.
 import {
   netNextNameserver, emptyStr, u8At, scratchWords, strData, strSizeOf,
-  strFromPacked, netDnsArgsOk, udpSenderSlot, udpValidAt, udpSenderWordAt,
-  copySockAddrWords,
+  strFromPacked, netDnsArgsOk,
 } from "../../net"
 
 // ---------------------------------------------------------------------------
@@ -370,19 +369,15 @@ export @symbol("bit_rt_net_close_w") @nosplit fn netAbiCloseW(fd: int) {
 // UDP (ABI.md §20)
 // ---------------------------------------------------------------------------
 //
-// THE LAST-SENDER STATE AND ITS SLOT ACCESSORS (`udpSenderSlot`, `udpValidAt`,
-// `udpSenderWordAt`, `copySockAddrWords`) ARE CORE NOW (../netabi.bit, #2552)
-// — they are pure per-worker scratch bookkeeping with no OS call. What stays
-// here is `netAbiUdpBind`/`Send`/`Recv`, because each calls the OS-specific
-// socket engine (`netBindUdp`, `netSendTo`, `netRecvFrom`).
-//
-// WHY PER-WORKER (not one shared slot, #3272): a second task on a second OS
-// thread racing `netAbiUdpRecv` would otherwise clobber the first task's
-// just-recorded sender. `netAbiUdpRecv` below writes the raw `recvfrom`
-// result into a throwaway per-call scratch (`peer`), and only once
-// `netRecvFrom` returns — the task's own worker id can change across that
-// park — does it ask `udpSenderSlot()` for the CURRENT worker's slot and copy
-// into it. See ../netabi.bit's header for the rest of the argument.
+// SEND AND RECEIVE ARE EACH ONE RUNTIME CALL (#7746). `netAbiUdpRecvFromW`
+// returns the datagram AND the sender's sockaddr in buffers the CALLER owns,
+// the way recvfrom(2) does. The runtime keeps no "last sender" state: a slot
+// read back by a second call afterwards (the per-worker `udpSenderBuf` this
+// replaced, #3272/#2552) is only the right slot while the task stays on one
+// worker, and a task preempted or migrated between `netUdpRecv` and
+// `netUdpSenderPort` read another worker's sender, or none (0.0.0.0:0).
+// What stays here is `netAbiUdpBind`/`Send`/`RecvFromW`, because each calls the
+// OS-specific socket engine (`netBindUdp`, `netSendTo`, `netRecvFrom`).
 
 // `bit_rt_net_udp_bind`: a datagram socket bound to `host:port`, or -1.
 export @symbol("bit_rt_net_udp_bind") @nosplit fn netAbiUdpBind(host: int, port: int): int {
@@ -406,42 +401,32 @@ export @symbol("bit_rt_net_udp_send") fn netAbiUdpSend(
   return netSendTo(fd, strData(host), strSizeOf(host), port, strData(data), strSizeOf(data))
 }
 
-// `bit_rt_net_udp_recv`: up to `max` bytes of the next datagram on `fd`, parking
-// until one arrives. Records the sender, in THIS TASK'S OWN worker's slot, for
-// `udp_sender_host`/`_port` — see the header comment above for why the slot is
-// decided only after `netRecvFrom` returns. On error returns empty and marks
-// that slot invalid; a zero-length datagram returns empty with a valid sender
-// (UDP has no end-of-stream).
-export @symbol("bit_rt_net_udp_recv") fn netAbiUdpRecv(fd: int, max: int): int {
-  if (max <= 0) {
-    return emptyStr()
+// `bit_rt_net_udp_recv_from_w` (#7746): the next datagram on `fd`, parking until
+// one arrives, written into the caller's own packed `outWords` buffer (`bufCap`
+// bytes) with the sender's raw `sockaddr_in` written into the caller's own
+// `peerWords` buffer (at least `netSockAddrLen()` = 16 bytes). Returns the byte
+// count, or -1 on error (a closed fd, a null or empty buffer, an I/O failure);
+// a ZERO-LENGTH DATAGRAM returns 0 with a valid sender, UDP having no
+// end-of-stream. `std/net`'s `UdpSocket.recv` decodes the address.
+//
+// Raw bytes in the caller's storage rather than a `string` and a slot: an
+// `extern fn` cannot return a string (SPEC §11.7), and nothing the runtime
+// holds between this call and the caller's read can be another task's.
+// Both buffers are packed `[]byte` backings the caller holds live across the
+// call with `keepAlive`, rooted by the calling Bit frame through the park
+// (the argument `netAbiReadBytesW` makes); this frame holds no raw address of
+// its own.
+export @symbol("bit_rt_net_udp_recv_from_w") fn netAbiUdpRecvFromW(
+  fd: int,
+  outWords: int,
+  bufCap: int,
+  peerWords: int,
+): int {
+  if (bufCap <= 0 || outWords == 0 || peerWords == 0) {
+    return 0 - 1
   }
-  // MANAGED scratch (#1668), both of them: `scratch` (the datagram) and `peer`
-  // (the raw sockaddr `netRecvFrom` fills) must be managed locals rather than
-  // raw addresses, because `netRecvFrom` parks on the same engine as
-  // `netAbiRead`. `peer` is deliberately NOT slot-indexed yet — see the header
-  // comment on why the slot can only be decided after the park is over.
-  let scratch = []i64(scratchWords(max))
-  let peer = []i64(4)
-  let n = netRecvFrom(fd, u8At(int(ptrOf(scratch))), max, u8At(int(ptrOf(peer))))
-
-  let slot = udpSenderSlot()
-  if (n < 0) {
-    if (slot >= 0) {
-      *udpValidAt(slot) = 0
-    }
-    return emptyStr()
-  }
-  if (slot >= 0) {
-    copySockAddrWords(ptrOf(peer), udpSenderWordAt(slot))
-    *udpValidAt(slot) = 1
-  }
-  return strFromPacked(int(ptrOf(scratch)), n)
+  return netRecvFrom(fd, u8At(outWords), bufCap, u8At(peerWords))
 }
-
-// `bit_rt_net_udp_sender_host`/`_port` (the last recv's sender, read back on
-// THIS task's own worker slot) are core now too (../netabi.bit, #2552) — pure
-// accessors over the per-worker state above, no OS call.
 
 // ---------------------------------------------------------------------------
 // DNS (ABI.md §20)
