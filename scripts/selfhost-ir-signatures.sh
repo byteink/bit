@@ -352,7 +352,8 @@
 # file that needs nothing else is named for this one. The `iropt` arm, where the optimizer has already
 # turned the compare into a hoisted header parameter, also merges trivial and dead block parameters
 # (scripts/ir-signatures-forof.sh irDedupAwk) and drops header word loads nothing reads, on both
-# sides, and may move the hoisted `slice_len` back into the header (irLenToHeader). Anything else that
+# sides, may move the hoisted `slice_len` back into the header (irLenToHeader), and merges repeated
+# header word loads of one block (irMergeLoads). Anything else that
 # differs, in the loop or outside it, keeps the file unexplained. Files: see the run output.
 #
 # All six retire at the next stage0 repin (#6533).
@@ -365,7 +366,11 @@ explainMismatch() {
     types) explainLagTypes "$1" "$2" "${4:-}"; return ;;
     ir|iropt)
       explainIrLag "$1" "$2" "$3" && return 0
-      irLagPinned "$3" "${4:-}" && { explainIrLagPin "$1" "$2" || explainIrLagPinForOf "$1" "$2"; }
+      irLagPinned "$3" "${4:-}" || return 1
+      case "$(irLagPinSig "$3" "$4")" in
+        7737-forof-len-once) explainGuardPin "$1" "$2" ;;
+        *) explainIrLagPin "$1" "$2" || explainIrLagPinForOf "$1" "$2" ;;
+      esac
       return ;;
   esac
   return 1
@@ -377,21 +382,34 @@ explainMismatch() {
 # of the working tree moves those stores relative to the guards of the reads that follow and shares
 # one slice_len between them; the pinned stage0 sees an opaque `rt_call slice_set` there and cannot.
 # golden (run_float32_interp, run_float_slice_elems) proves the output
-# right. A pin is `kind|file|reason`; it explains its file only when, with every line tied to an
+# right. A pin is `kind|file|signature|reason`; it explains its file only when, with every line tied to an
 # []f32 slice deleted from both dumps (explainIrLagPin), the rest is identical, and a pinned file
-# that no longer needs the pin (it matches, or a declared signature explains it) fails the run as
+# that no longer needs the pin (it matches, or another signature explains it) fails the run as
 # STALE-PIN in selfhost-diffdump.sh. Removable at the stage0 repin (#6533). This is the one
 # per-file list the family has; #1883 deleted the last one, so an entry here needs a reason a
 # reader can check.
+#
+# 7737-forof-len-once (`iropt` only, one file: stdlib/compress/crc32.bit). With the loop bound read once, the tree's bounds-check
+# elimination (optbce.bit) proves the guard of `xs[i]` in `for i in xs` from the loop test: it reads
+# the same length the test does. The oracle's two reads were different values and it kept the guard.
+# The pin explains its file only when (explainGuardPin, scripts/ir-signatures-forof.sh) no function of
+# the tree holds more out-of-range panic blocks than the oracle's and one holds fewer, and with the
+# loop-tested guards removed from both dumps (irGuardOff: an `icmp_ult` of the index and the length an
+# `icmp_slt` in the same function tests, read by one `br` to a panic block of exactly the out-of-range
+# panic that nothing else enters) the two are equal, so nothing else differs. The pin shares the
+# signature's name, so a signature that comes to explain the file does not mark the pin stale.
 irLagPins() {
   printf '%s\n' \
-    'iropt|_tests_/cases/run_float32_interp.bit|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin' \
-    'iropt|_tests_/cases/run_float_slice_elems.bit|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin'
+    'iropt|_tests_/cases/run_float32_interp.bit|7574-f32-store-schedule-lag|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin' \
+    'iropt|_tests_/cases/run_float_slice_elems.bit|7574-f32-store-schedule-lag|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin' \
+    'iropt|stdlib/compress/crc32.bit|7737-forof-len-once|#7737 bounds guard of `xs[i]` in `for i in xs` dropped by BCE, until the #6533 repin'
 }
 # irLagPinned <kind> <file> -- 0 when the (kind, file) pair is pinned.
 irLagPinned() { irLagPins | awk -F'|' -v k="$1" -v f="${2:-}" '$1 == k && $2 == f { found = 1 } END { exit !found }'; }
 # irLagPinFiles <kind> -- the pinned files of that arm, one per line.
 irLagPinFiles() { irLagPins | awk -F'|' -v k="$1" '$1 == k { print $2 }'; }
+# irLagPinSig <kind> <file> -- the signature name a pinned file is explained under.
+irLagPinSig() { irLagPins | awk -F'|' -v k="$1" -v f="${2:-}" '$1 == k && $2 == f { print $3 }'; }
 
 # declaredSignatureNames [ir|iropt|ast|fmt|types|diags] -- every name explainMismatch
 # CAN print for the given dump kind, one per line (#5509, extended by #5510).

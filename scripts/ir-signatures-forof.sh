@@ -342,6 +342,47 @@ function flush(   i, r, v, s, tok, ch) {
 END { flush() }'
 }
 
+# irMergeLoads <dump> -- within one block, a `slice_len` or `field_get` that repeats an earlier one's
+# operand, offset and type, with nothing between them that can write memory, is deleted and its uses read
+# the earlier. Two hoists of one header word into the same preheader are the same value; the pinned
+# stage0 left both where the tree's hoist (licmParamAlias, licmDupOf) keeps one. Only the pure ops that
+# cannot write (header word loads, constants, arithmetic, compares, converts, `index_get`) keep the table;
+# any other op, a call or a store, empties it.
+irMergeLoads() {
+  printf '%s\n' "$1" | LC_ALL=C awk '
+function rn(s,   out, id) {
+  out = ""
+  while (match(s, /%[0-9]+/)) {
+    id = substr(s, RSTART, RLENGTH)
+    out = out substr(s, 1, RSTART - 1) ((id in REN) ? REN[id] : id)
+    s = substr(s, RSTART + RLENGTH)
+  }
+  return out s
+}
+function safeOp(o) { return o ~ /^(slice_len|field_get|index_get|const_[a-z]+|add|sub|mul|shl|lshr|ashr|band|bor|bxor|convert|bitcast|icmp_[a-z]+|global_addr)$/ }
+function flush(   i, l, o, id, key, rhs) {
+  delete TAB; delete REN
+  for (i = 1; i <= n0; i++) {
+    l = rn(L[i])
+    if (l ~ /^bb[0-9]+\(/ || l ~ /^  (jump|br|ret|unreachable)( |$)/) { delete TAB; OUT[i] = l; continue }
+    if (match(l, /^  %[0-9]+ = [a-z_0-9]+ /)) {
+      split(l, W, " "); id = W[1]; o = W[3]
+      if (o == "slice_len" || o == "field_get") {
+        rhs = substr(l, index(l, " = ") + 3)
+        if (rhs in TAB) { REN[id] = TAB[rhs]; merged++; OUT[i] = ""; DEL[i] = 1; continue }
+        TAB[rhs] = id
+      } else if (!safeOp(o)) { delete TAB }
+    } else { delete TAB }
+    OUT[i] = l
+  }
+  for (i = 1; i <= n0; i++) { if (!DEL[i]) { print rn(OUT[i]) } }
+  n0 = 0; delete L; delete OUT; delete DEL
+}
+/^func / { flush(); print; next }
+{ L[++n0] = $0 }
+END { flush() }'
+}
+
 # irLenToHeader <dump> -- for a dump the parameter cleanup above has already run over: the optimizer
 # threads the hoisted length into the loop header as a plain dominating value, so the compare in the
 # header reads a `slice_len` that sits in the block before the loop. When the first line of a block is
@@ -404,7 +445,12 @@ explainForOfLen() {
     t=$(irDropDeadLoads "$(irParamDedup "$2")")
     forOfTrials "${o}" "${t}" "$3" && return 0
     u=$(irLenToHeader "${t}") && forOfTrials "${o}" "${u}" "$3" && return 0
-    return 1
+    # A file with several loops can keep the load in the preheader in one function and in the header in
+    # another, on either side: put every such load in the header, on both sides.
+    u=$(irLenToHeader "${t}") || u=${t}
+    forOfTrials "$(irLenToHeader "${o}" || true)" "${u}" "$3" && return 0
+    forOfTrials "$(irDropDeadLoads "$(irMergeLoads "$(irLenToHeader "${o}" || true)")")" "$(irDropDeadLoads "$(irMergeLoads "${u}")")" "$3"
+    return
   fi
   t=$(irForOfUnhoist "$2") || return 1
   forOfTrials "${o}" "${t}" "$3"
@@ -440,4 +486,91 @@ explainIrLagPinForOf() {
   t=$(irDropDeadLoads "$(irParamDedup "${u}")")
   [ "${t}" = "$2" ] && return 1
   explainIrLagPin "${o}" "${t}"
+}
+
+# irGuardOff <dump> -- the dump without the bounds guards the loop test makes redundant.
+# A guard is exactly `%c = icmp_ult bool %i, %l` and the one `br %c, bbT(), bbP()` that reads it (%c has no other use) where bbP is a panic block of
+# exactly `const_string "index out of range"`, `rt_call panic(<it>) void`, `unreachable` that nothing
+# else enters, and some `icmp_slt bool %i, %l'` in the same function tests the same index against the
+# same length (the same value, or `slice_len` of the same value). Each guard becomes `jump bbT()` and
+# its panic block goes. Exits 1 when none matched, so a function with an unrelated guard is untouched.
+irGuardOff() {
+  printf '%s\n' "$1" | LC_ALL=C awk '
+function key(v) { return (v in SL) ? "sl:" SL[v] : v }
+function flush(   i, j, b, m, c, t, p, ix, ln, mid, pid, u) {
+  delete SL; delete HK; delete BI; delete INC; delete DROP; delete REPL; delete GONE; delete BR; delete NU
+  for (i = 1; i <= n0; i++) {
+    if (match(L[i], /^  %[0-9]+ = slice_len %[0-9]+$/)) { split(L[i], W, " "); SL[W[1]] = W[4] }
+    if (L[i] ~ /^bb[0-9]+\(/) { b = L[i]; sub(/\(.*$/, "", b); BI[b] = i }
+    u = L[i]; gsub(/ptrs=\[[^]]*\]/, "", u)
+    while (match(u, /%[0-9]+/)) { NU[substr(u, RSTART, RLENGTH)]++; u = substr(u, RSTART + RLENGTH) }
+    if (match(L[i], /^  br %[0-9]+, /)) { split(L[i], W, " "); m = W[2]; sub(/,$/, "", m); BR[m] = i }
+    if (L[i] ~ /^  (jump|br) /) { t = L[i]; while (match(t, /bb[0-9]+\(/)) { INC[substr(t, RSTART, RLENGTH - 1)]++; t = substr(t, RSTART + RLENGTH) } }
+  }
+  for (i = 1; i <= n0; i++) {
+    if (match(L[i], /^  %[0-9]+ = icmp_slt bool %[0-9]+, %[0-9]+$/)) { split(L[i], W, " "); ix = W[5]; sub(/,$/, "", ix); HK[key(ix), key(W[6])] = 1 }
+  }
+  for (i = 1; i <= n0; i++) {
+    if (!match(L[i], /^  %[0-9]+ = icmp_ult bool %[0-9]+, %[0-9]+$/)) { continue }
+    split(L[i], W, " "); c = W[1]; ix = W[5]; sub(/,$/, "", ix); ln = W[6]
+    mid = key(ix) SUBSEP key(ln)
+    if (!(mid in HK)) { continue }
+    j = BR[c]
+    if (!j || NU[c] != 2 || !match(L[j], "^  br " c ", bb[0-9]+\\(\\), bb[0-9]+\\(\\)$")) { continue }
+    split(L[j], W, " "); t = W[3]; sub(/,$/, "", t); sub(/\(\)/, "", t); p = W[4]; sub(/\(\)$/, "", p)
+    if (INC[p] != 1 || !(p in BI)) { continue }
+    b = BI[p]
+    if (L[b] != p "():" || L[b + 1] !~ /^  %[0-9]+ = const_string "index out of range"$/ || L[b + 3] != "  unreachable") { continue }
+    split(L[b + 1], W, " "); mid = W[1]
+    if (L[b + 2] !~ ("^  %[0-9]+ = rt_call panic\\(" mid "\\) void$")) { continue }
+    DROP[i] = 1; REPL[j] = "  jump " t "()"; GONE[b] = 1; GONE[b + 1] = 1; GONE[b + 2] = 1; GONE[b + 3] = 1; removed++
+  }
+  for (i = 1; i <= n0; i++) {
+    if ((i in DROP) || (i in GONE)) { continue }
+    print (i in REPL) ? REPL[i] : L[i]
+  }
+  n0 = 0; delete L
+}
+/^func / { flush(); print; next }
+{ L[++n0] = $0 }
+END { flush(); if (removed == 0) { exit 1 } }'
+}
+
+# irGuardCounts <dump> -- `function count` per function: how many out-of-range panic blocks it holds.
+irGuardCounts() {
+  printf '%s\n' "$1" | LC_ALL=C awk '/^func / { f = $2; sub(/\(.*$/, "", f); C[f] += 0 } /= const_string "index out of range"$/ { C[f]++ } END { for (f in C) print f, C[f] }' | LC_ALL=C sort
+}
+
+# guardsDropped <oracle_text> <tree_text> -- 0 when no function of the tree holds more out-of-range panic
+# blocks than the oracle's and at least one holds fewer: the tree only lost guards, and did lose some.
+guardsDropped() {
+  join -a 1 -a 2 -e MISSING -o 0,1.2,2.2 <(irGuardCounts "$1") <(irGuardCounts "$2") |
+    LC_ALL=C awk '{ if ($3 == "MISSING" || $2 == "MISSING" || $3 + 0 > $2 + 0) { bad = 1 } if ($3 + 0 < $2 + 0) { fewer = 1 } } END { exit (bad || !fewer) }'
+}
+
+# explainGuardPin <oracle_text> <bit2_text> -- the file pins for 7737-forof-len-once (irLagPins): prints
+# the signature and returns 0 when (a) the tree holds fewer out-of-range panic blocks than the oracle in
+# some function and more in none (guardsDropped), and (b) with every loop-tested bounds guard removed from
+# BOTH dumps (irGuardOff) and the rewrites explainForOfLen runs, the two dumps are equal. So the tree lost
+# guards of the loop-tested kind and nothing else differs; a vanished guard of any other index or length,
+# a guard the tree gained, or any other difference leaves the file unexplained. The caller has already
+# checked the file is pinned.
+explainGuardPin() {
+  local o u t
+  o=$(irParamDedup "$1")
+  u=$(irForOfUnhoist "$2") && irGuardPair "${o}" "$(irParamDedup "${u}")" && return 0
+  t=$(irParamDedup "$2")
+  irGuardPair "${o}" "${t}" && return 0
+  # A file with several loops can keep the length load in the preheader in one function and in the
+  # header in another, on either side: put every such load in the header, on both sides.
+  irGuardPair "$(irLenToHeader "${o}" || true)" "$(irLenToHeader "${t}" || true)"
+}
+
+# irGuardPair <oracle> <tree> -- explainGuardPin's two conditions over one rewritten pair.
+irGuardPair() {
+  local o t
+  guardsDropped "$1" "$2" || return 1
+  o=$(irDropDeadLoads "$(irGuardOff "$1" || true)")
+  t=$(irDropDeadLoads "$(irGuardOff "$2" || true)")
+  irTrial "${o}" "${t}" 0 0 0 forof
 }
