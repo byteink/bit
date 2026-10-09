@@ -1,0 +1,231 @@
+// stdlib/quic/discard.test.bit — an endpoint that drops a packet-number space's
+// keys drops the space with them (#7729, RFC 9001 §4.9 and RFC 9002 §6.4).
+//
+// Without it the Initial and Handshake packets a peer never acknowledges (it
+// dropped those keys too) stayed in `sent` and `bytesInFlight` for ever and held
+// the earliest per-space PTO (#7725) in a space nothing could answer in. The
+// client drops Initial on its first Handshake packet, the server on its first
+// processed Handshake packet, and both drop Handshake when the handshake is
+// confirmed (the client on HANDSHAKE_DONE, the server on the client Finished).
+//
+// Every test drives one connection state directly. `quicconnNewState`,
+// `quicconnFlush`, `quicconnDiscardSpace`, `quicconnSpacePto`, `clientInitialKeys`
+// are module siblings.
+
+const dscMs: int = 1000000
+
+// A state whose three spaces can seal and open with one key set, pointed at `peer`.
+fn dscState(peer: UdpSocket, isClient: bool): quicconnState {
+  let port = peer.port() catch _ {
+    return quicconnNewState(isClient, peer, false, "127.0.0.1", 1, []byte(0), []byte(0))
+  }
+  let dcid = quicconnMakeCid()
+  let st = quicconnNewState(isClient, peer, false, "127.0.0.1", port, quicconnMakeCid(), dcid)
+  st.havePeer = true
+  let keys = clientInitialKeys(dcid)
+  for lvl of [st.iLevel, st.hLevel, st.aLevel] {
+    lvl.ksend = keys
+    lvl.krecv = keys
+    lvl.haveSend = true
+    lvl.haveRecv = true
+  }
+  st.established = true
+  return st
+}
+
+// One ack-eliciting packet of `size` bytes in flight in `lvl`, last sent `agoNs` ago.
+fn dscInFlight(st: quicconnState, lvl: quicconnLevel, size: int, agoNs: int) {
+  let now = monotonic().ns
+  lvl.sent = append(
+    lvl.sent, quicconnSent{
+      pn = len(lvl.sent),
+      timeSent = now - agoNs,
+      size = size,
+      ackEliciting = true,
+      frames = []Frame(0),
+    },
+  )
+  lvl.nextPn = len(lvl.sent)
+  lvl.timeLastAckEliciting = now - agoNs
+  st.bytesInFlight = st.bytesInFlight + size
+}
+
+fn dscBind(): UdpSocket {
+  return udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind: ${e.message()}")
+    return UdpSocket{}
+  }
+}
+
+fn dscFlush(st: quicconnState) {
+  quicconnFlush(st) catch e {
+    assert(false, "quicconnFlush: ${e.message()}")
+  }
+}
+
+fn dscFire(st: quicconnState) {
+  quicconnMaybePto(st) catch e {
+    assert(false, "quicconnMaybePto: ${e.message()}")
+  }
+}
+
+test "a client's first Handshake packet ends the Initial space and its PTO" {
+  let peer = dscBind()
+  let st = dscState(peer, true)
+  let dur = quicconnPtoDuration(st)
+  dscInFlight(st, st.iLevel, 1200, 2 * dur)
+  st.iLevel.lossTime = monotonic().ns + 50 * dscMs
+  st.ptoCount = 3
+  assert(quicconnSpacePto(st, quicconnLvlInitial) != 0, "control: the Initial space arms a PTO")
+  quicconnQueueCrypto(st, quicconnLvlHandshake, []byte(40))
+  dscFlush(st)
+  assert(len(st.hLevel.sent) == 1, "Handshake packets: ${len(st.hLevel.sent)}, want the first one")
+  assert(len(st.iLevel.sent) == 0, "Initial packets still in flight: ${len(st.iLevel.sent)}")
+  assert(st.iLevel.lossTime == 0, "Initial loss timer still armed: ${st.iLevel.lossTime}")
+  assert(quicconnSpacePto(st, quicconnLvlInitial) == 0, "the Initial space still arms a PTO")
+  assert(
+    st.bytesInFlight == st.hLevel.sent[0].size,
+    "bytesInFlight ${st.bytesInFlight}, want only the Handshake packet's ${st.hLevel.sent[0].size}",
+  )
+  assert(st.ptoCount == 0, "ptoCount ${st.ptoCount}, want 0")
+  assert(st.iLevel.discarded && !st.iLevel.haveSend && !st.iLevel.haveRecv, "Initial keys kept")
+  assert(!st.hLevel.discarded, "the Handshake space went with it")
+  peer.close()
+}
+
+test "an Initial ACK beside the client's first Handshake packet still goes out" {
+  let peer = dscBind()
+  let st = dscState(peer, true)
+  st.iLevel.recvRanges = [quicconnRange{ lo = 0, hi = 0 }]
+  st.iLevel.ackPending = true
+  quicconnQueueCrypto(st, quicconnLvlHandshake, []byte(40))
+  dscFlush(st)
+  assert(st.iLevel.nextPn == 1, "the Initial ACK was not sent: nextPn ${st.iLevel.nextPn}")
+  assert(st.iLevel.discarded, "Initial not discarded")
+  peer.close()
+}
+
+test "a client keeps Initial until it sends a Handshake packet" {
+  let peer = dscBind()
+  let st = dscState(peer, true)
+  dscInFlight(st, st.iLevel, 1200, 0)
+  quicconnQueueCrypto(st, quicconnLvlInitial, []byte(40))
+  dscFlush(st)
+  assert(!st.iLevel.discarded, "Initial discarded by an Initial-only flush")
+  assert(len(st.iLevel.sent) == 2, "Initial packets: ${len(st.iLevel.sent)}")
+  peer.close()
+}
+
+test "HANDSHAKE_DONE ends the client's Handshake space and its PTO" {
+  let peer = dscBind()
+  let st = dscState(peer, true)
+  let dur = quicconnPtoDuration(st)
+  dscInFlight(st, st.hLevel, 300, 2 * dur)
+  dscInFlight(st, st.aLevel, 500, 0)
+  st.hLevel.lossTime = monotonic().ns + 50 * dscMs
+  st.ptoCount = 2
+  quicconnHandleFrame(st, quicconnLvlApp, Frame.HandshakeDone) catch e {
+    assert(false, "HANDSHAKE_DONE: ${e.message()}")
+  }
+  assert(st.handshakeComplete, "handshake not confirmed")
+  assert(len(st.hLevel.sent) == 0, "Handshake packets still in flight: ${len(st.hLevel.sent)}")
+  assert(st.hLevel.lossTime == 0, "Handshake loss timer still armed")
+  assert(quicconnSpacePto(st, quicconnLvlHandshake) == 0, "the Handshake space still arms a PTO")
+  assert(st.bytesInFlight == 500, "bytesInFlight ${st.bytesInFlight}, want the 1-RTT packet's 500")
+  assert(st.ptoCount == 0, "ptoCount ${st.ptoCount}, want 0")
+  assert(st.hLevel.discarded && !st.hLevel.haveRecv, "Handshake keys kept")
+  assert(len(st.aLevel.sent) == 1, "the 1-RTT packet went with it")
+  peer.close()
+}
+
+test "a dead space no longer holds the PTO from the 1-RTT space" {
+  let peer = dscBind()
+  let st = dscState(peer, true)
+  st.handshakeComplete = true
+  let dur = quicconnPtoDuration(st)
+  dscInFlight(st, st.hLevel, 300, 20 * dur)
+  dscInFlight(st, st.aLevel, 500, 2 * dur)
+  assert(
+    quicconnPtoSpace(st, monotonic().ns) == quicconnLvlHandshake,
+    "control: Handshake PTO is earliest",
+  )
+  quicconnDiscardSpace(st, quicconnLvlHandshake)
+  assert(quicconnPtoSpace(st, monotonic().ns) == quicconnLvlApp, "1-RTT still starved")
+  dscFire(st)
+  assert(len(st.aLevel.sent) == 3, "1-RTT packets: ${len(st.aLevel.sent)}, want 1 old + 2 probes")
+  peer.close()
+}
+
+test "discarding a space twice leaves the second call a no-op" {
+  let peer = dscBind()
+  let st = dscState(peer, false)
+  dscInFlight(st, st.iLevel, 700, 0)
+  quicconnDiscardSpace(st, quicconnLvlInitial)
+  st.ptoCount = 2
+  dscInFlight(st, st.aLevel, 400, 0)
+  quicconnDiscardSpace(st, quicconnLvlInitial)
+  assert(st.ptoCount == 2, "the second discard reset ptoCount: ${st.ptoCount}")
+  assert(st.bytesInFlight == 400, "bytesInFlight ${st.bytesInFlight}, want 400")
+  peer.close()
+}
+
+test "a server does not re-derive Initial keys from a late Initial packet" {
+  let peer = dscBind()
+  let st = dscState(peer, false)
+  assert(!quicconnNeedsServerInitKeys(st, quicconnLvlInitial), "control: keys are installed")
+  quicconnDiscardSpace(st, quicconnLvlInitial)
+  assert(
+    !quicconnNeedsServerInitKeys(st, quicconnLvlInitial),
+    "a discarded Initial space asks for keys",
+  )
+  peer.close()
+}
+
+test "a server's first processed Handshake packet ends its Initial space" {
+  let sender = dscBind()
+  let peer = dscBind()
+  let srv = dscState(peer, false)
+  let cli = dscState(sender, true)
+  cli.hLevel.ksend = srv.hLevel.krecv
+  dscInFlight(srv, srv.iLevel, 1200, 0)
+  srv.ptoCount = 1
+  let frames = [Frame.Ping, Frame.Padding(40)]
+  let length = quicconnPnLen + quicconnFramesLen(frames) + quicconnAeadTag
+  let header = quicconnEncodeHsHeader(srv.version, srv.scid, cli.scid, length, 0)
+  let pkt = quicconnSealPacket(cli, cli.hLevel, frames, header) catch e {
+    assert(false, "seal: ${e.message()}")
+    return
+  }
+  quicconnRecvDatagram(srv, pkt) catch e {
+    assert(false, "recv: ${e.message()}")
+  }
+  assert(srv.hLevel.largestRecvPn == 0, "the Handshake packet was not processed")
+  assert(srv.iLevel.discarded, "Initial not discarded")
+  assert(len(srv.iLevel.sent) == 0, "Initial packets still in flight: ${len(srv.iLevel.sent)}")
+  assert(srv.bytesInFlight == 0, "bytesInFlight ${srv.bytesInFlight}")
+  assert(srv.ptoCount == 0, "ptoCount ${srv.ptoCount}")
+  assert(!srv.hLevel.discarded, "Handshake went with it")
+  sender.close()
+  peer.close()
+}
+
+test "a Handshake packet that fails to decrypt does not end a server's Initial space" {
+  let sender = dscBind()
+  let peer = dscBind()
+  let srv = dscState(peer, false)
+  let cli = dscState(sender, true)
+  dscInFlight(srv, srv.iLevel, 1200, 0)
+  srv.hLevel.krecv = clientInitialKeys(quicconnMakeCid())
+  let frames = [Frame.Ping, Frame.Padding(40)]
+  let length = quicconnPnLen + quicconnFramesLen(frames) + quicconnAeadTag
+  let header = quicconnEncodeHsHeader(srv.version, srv.scid, cli.scid, length, 0)
+  let pkt = quicconnSealPacket(cli, cli.hLevel, frames, header) catch e {
+    assert(false, "seal: ${e.message()}")
+    return
+  }
+  quicconnRecvDatagram(srv, pkt) catch _ {}
+  assert(!srv.iLevel.discarded, "an unauthenticated packet discarded the Initial space")
+  assert(len(srv.iLevel.sent) == 1, "Initial packets: ${len(srv.iLevel.sent)}")
+  sender.close()
+  peer.close()
+}
