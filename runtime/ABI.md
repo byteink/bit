@@ -4202,7 +4202,7 @@ instead of making the clock quietly slower.
 caller-saved GPR declared clobbered, the `taskInvoke` shape, admitted in
 `@nosplit` code by SPEC §10.3.1's `asm` rule: it neither allocates nor reaches a
 safepoint. The vDSO's C ABI preserves a superset of the registers Bit's callers
-rely on (x64 SysV keeps rbx, rbp, r12..r15; Bit keeps rbx, r13..r15. AAPCS64
+rely on (x64 SysV keeps rbx, rbp, r12..r15, and so does Bit. AAPCS64
 keeps x19..x28 and the low halves of v8..v15, which is exactly Bit's set), so the
 call destroys only registers every Bit call already treats as dead. Every Bit
 prologue leaves rsp 16-byte aligned at the `call` (read back from the
