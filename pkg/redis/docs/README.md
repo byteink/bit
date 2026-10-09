@@ -8,6 +8,8 @@
 | [Streams](streams.md) | `r.stream(key)`: an event log, consumer groups, claiming a dead worker's entries, `XINFO` |
 | [Hashes](hashes.md) | `r.hash(key)`: fields, counters, `scan`, field expiry |
 | [Sets](sets.md) | `r.sset(key)`: members, set algebra, `scan`, reads inside a transaction |
+| [Sorted sets](sorted-sets.md) | `r.zset(key)`: leaderboards, ranges by rank, score or name, blocking pops, combining boards |
+| [Locations, unique counts and bitmaps](geo-hll-bitmaps.md) | `r.geo(key)`, `r.hll(key)`, `r.bitmap(key)`: nearby search, HyperLogLog counts, `BITOP`, `BITFIELD` |
 | [Strings and keys](strings-and-keys.md) | `set`/`get` options, `r.str(key)`, `r.keys()`: TTLs, `TYPE`, `RENAME`, `SCAN` |
 | [Scripting](scripting.md) | `Script`: EVALSHA with automatic load, `Fn` and `Functions`, scripts in pipelines, read-only scripts |
 | [RESP2](resp.md) | The wire protocol: `Reply`, nil vs. empty, errors, what is not implemented |
