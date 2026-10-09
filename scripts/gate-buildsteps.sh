@@ -350,8 +350,9 @@ case "${BUCKET}" in
     # test-tree-archive (#7751): a compiler/** diff changes the code the tree
     # emits for runtime/**, which no other step links (every gate uses the
     # stage0-built libbitrt.a); #7750 shipped an aarch64-linux startup SIGBUS
-    # through a green gate for that reason.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword test-no-warnings test-call-shapes test-fmt-prec-matrix test-hashseed test-tree-archive)
+    # through a green gate for that reason. test-tree-archive-x64 (#7752) is the
+    # same check for x86_64-linux on the real x86 host.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword test-no-warnings test-call-shapes test-fmt-prec-matrix test-hashseed test-tree-archive test-tree-archive-x64)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
@@ -438,7 +439,7 @@ case "${BUCKET}" in
     # #5606 comment: runtime/** can break how a published package resolves
     # just as much as compiler/** can, and #5597 wired it only into `pkg`.
     # Measured `./make test-package-tags` 0m24s on this branch's own tip.
-    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention test-gc-decimalstress test-fmt-citations test-taskwords-sizing test-no-warnings test-tree-archive)
+    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention test-gc-decimalstress test-fmt-citations test-taskwords-sizing test-no-warnings test-tree-archive test-tree-archive-x64)
     ;;
   testcases)
     # test-fuzz mutates the real _tests_/cases corpus (BIT_FUZZ_CASES=
