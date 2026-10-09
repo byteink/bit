@@ -138,12 +138,23 @@ fn quicconnAccumulateLost(sp: quicconnSent, st: quicconnState, lvl: quicconnLeve
   if (sp.ackEliciting) {
     st.bytesInFlight = st.bytesInFlight - sp.size
   }
+  let _ = quicconnRequeueFrames(sp, st, lvl)
+  return len(sp.frames)
+}
+
+// Put the frames of sent packet `sp` that still need delivering back on
+// `lvl.pending` (RFC 9000 §13.3: STREAM, RESET_STREAM, CRYPTO, the MAX_* and
+// *_BLOCKED frames go out again in a new packet), and return how many went.
+// Shared by loss detection and the PTO probes.
+fn quicconnRequeueFrames(sp: quicconnSent, st: quicconnState, lvl: quicconnLevel): int {
+  let n = 0
   for f of sp.frames {
     if (quicconnShouldRetransmit(st, f)) {
       lvl.pending = append(lvl.pending, f)
+      n = n + 1
     }
   }
-  return len(sp.frames)
+  return n
 }
 
 // Whether a lost or probed frame `f` goes back on the queue: retransmittable,
@@ -230,10 +241,14 @@ fn quicconnPtoDuration(st: quicconnState): int {
   return pto
 }
 
+// Probe datagrams sent per PTO (RFC 9002 §6.2.4 allows one or two).
+const quicconnProbeCount: int = 2
+
 // Fire the probe timeout if the PTO has elapsed since the last ack-eliciting
-// packet with data still in flight (RFC 9002 §6.2). Retransmits the oldest
-// unacked packet's frames — this is what recovers a lost tail.
-fn quicconnMaybePto(st: quicconnState) {
+// packet with data still in flight (RFC 9002 §6.2): send two probe datagrams.
+// This is what recovers a lost tail, and what gets a control frame out when
+// every packet after it was lost too.
+fn quicconnMaybePto(st: quicconnState): ()! {
   if (st.bytesInFlight == 0) {
     return
   }
@@ -253,30 +268,59 @@ fn quicconnMaybePto(st: quicconnState) {
   if (st.ptoCount > 8) {
     st.ptoCount = 8
   }
-  quicconnSendProbe(st)
+  quicconnSendProbes(st)?
 }
 
-// Re-queue the oldest unacknowledged packet's frames on the highest level that
-// still has one, forcing a retransmission on the next flush.
-fn quicconnSendProbe(st: quicconnState) {
-  let idx = -1
+// The highest level that still has an unacknowledged packet, or -1.
+fn quicconnProbeLevel(st: quicconnState): int {
   if (len(st.aLevel.sent) > 0) {
-    idx = quicconnLvlApp
-  } else if (len(st.hLevel.sent) > 0) {
-    idx = quicconnLvlHandshake
-  } else if (len(st.iLevel.sent) > 0) {
-    idx = quicconnLvlInitial
+    return quicconnLvlApp
   }
+  if (len(st.hLevel.sent) > 0) {
+    return quicconnLvlHandshake
+  }
+  if (len(st.iLevel.sent) > 0) {
+    return quicconnLvlInitial
+  }
+  return -1
+}
+
+// Send `quicconnProbeCount` probe datagrams at the probe level (RFC 9002
+// §6.2.4: one or two, each ack-eliciting). Each is flushed on its own so the two
+// are separate datagrams, and neither waits for congestion window: pending
+// frames are not window-gated, and a probe may exceed the window (§7).
+fn quicconnSendProbes(st: quicconnState): ()! {
+  let idx = quicconnProbeLevel(st)
   if (idx < 0) {
     return
   }
   let lvl = quicconnLvl(st, idx)
-  let sp = lvl.sent[0]
-  for f of sp.frames {
-    if (quicconnShouldRetransmit(st, f)) {
-      lvl.pending = append(lvl.pending, f)
+  let from = 0
+  let k = 0
+  while (k < quicconnProbeCount) {
+    from = quicconnQueueProbe(st, lvl, from)
+    quicconnFlush(st)?
+    k = k + 1
+  }
+}
+
+// Queue the content of one probe: the frames of the oldest unacknowledged packet
+// at or after index `from` of `lvl.sent` that still has any worth delivering
+// (a packet whose only frames are STREAM data of a reset stream has none, and
+// must not stand in the way of the RESET_STREAM behind it). Returns the index
+// after that packet. When nothing is left, queues a PING so the probe is still
+// ack-eliciting and returns `len(lvl.sent)`.
+fn quicconnQueueProbe(st: quicconnState, lvl: quicconnLevel, from: int): int {
+  let i = from
+  while (i < len(lvl.sent)) {
+    let n = quicconnRequeueFrames(lvl.sent[i], st, lvl)
+    i = i + 1
+    if (n > 0) {
+      return i
     }
   }
+  lvl.pending = append(lvl.pending, Frame.Ping)
+  return i
 }
 
 // Reply to any finished stream whose send buffer is fully acknowledged, so the
