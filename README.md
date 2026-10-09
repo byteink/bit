@@ -78,24 +78,24 @@ twelve small programs. Reproduce with `bench/run.sh`; sources live in
 `bench/cases/`.
 
 <!-- BENCH:START -->
-Bit is faster than Go on 3 of 12 benchmarks, about the same on 0 and slower on 9 (up to 2.1x slower); against C it is faster on 0, about the same on 1 and slower on 11 (up to 9.5x slower).
+Bit is faster than Go on 3 of 12 benchmarks, about the same on 0 and slower on 9 (up to 2.1x slower); against C it is faster on 0, about the same on 2 and slower on 10 (up to 8.8x slower).
 
 | Benchmark | What it tests | vs Go | vs C |
 |---|---|--:|--:|
 | strings | building and slicing strings | 1.8x faster | 2.0x slower |
-| map | hash map with number keys | 1.3x faster | 2.0x slower |
+| map | hash map with number keys | 1.4x faster | 2.1x slower |
 | sort | sorting numbers and strings | 1.3x faster | about the same |
 | fib | function calls | 1.1x slower | 1.6x slower |
 | mandelbrot | floating point math | 1.3x slower | 1.3x slower |
-| allocflat | many objects in one buffer | 1.3x slower | 9.5x slower |
+| allocflat | many objects in one buffer | 1.4x slower | 8.8x slower |
+| allocpar | heap objects on 8 threads | 1.4x slower | about the same |
 | matrix | matrix multiplication | 1.4x slower | 3.5x slower |
 | collatz | integer loops and branches | 1.5x slower | 2.2x slower |
 | alloc | many small heap objects | 1.6x slower | 1.4x slower |
-| allocpar | heap objects on 8 threads | 1.7x slower | 1.2x slower |
-| strmap | hash map with string keys | 1.8x slower | 4.5x slower |
-| json | JSON parse and walk | 2.1x slower | 3.3x slower |
+| strmap | hash map with string keys | 1.8x slower | 4.4x slower |
+| json | JSON parse and walk | 2.1x slower | 3.2x slower |
 
-Memory: Bit uses less than Go on 9 of 12 benchmarks. A typical run takes 9.5 MB in Bit, 13.3 MB in Go and 5.8 MB in C.
+Memory: Bit uses less than Go on 9 of 12 benchmarks. A typical run takes 9.5 MB in Bit, 13.4 MB in Go and 5.9 MB in C.
 
 Program size: about 381 KB in Bit, 2.3 MB in Go and 33 KB in C.
 
