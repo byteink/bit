@@ -32,7 +32,7 @@ fn main(): ()! {
 }
 ```
 
-`r.geo(key)`, `r.hll(key)` and `r.bitmap(key)` are cheap values, `{client,
+`r.geo(key)`, `r.hll(key)` and `r.bitmap(key)` are cheap values, `{runner,
 key}`: call them again any time you need the same key.
 
 ## Writers near you
@@ -501,6 +501,49 @@ fn main(): ()! {
   return
 }
 ```
+
+## Inside a transaction
+
+A check-in reads first and writes after: place a writer only if they are not
+on the map yet, and count them once. `tx.read.geo(key)`, `tx.read.hll(key)`
+and `tx.read.bitmap(key)` are the same `Geo`, `Hll` and `Bitmap` handles as
+`r.geo(key)`, bound to the transaction's own connection, so their reads run
+now and see the keys the transaction `WATCH`es. The reads are `pos`, `dist`,
+`hash` and `search` on a geo key, `count` on a HyperLogLog, and `get`, `count`,
+`pos` and `bitfieldRo` on a bitmap. The writes you decide on go through
+`tx.geo(key)`, `tx.hll(key)` and `tx.bitmap(key)`, which queue them for
+`EXEC`. If another client changes a watched key first, the transaction retries
+and the body runs again with fresh reads.
+
+```bit
+import { open, place, Future } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let places = "inkwell:writers"
+  let active = "inkwell:active:2026-10-09"
+  let readers = "inkwell:readers:article:41"
+  let checked = r.transaction<Future<bool>>([places, active, readers], (tx) => {
+    let placed = tx.read.geo(places).pos("ana")?
+    let counted = tx.read.hll(readers).count()?
+    if (isNone(placed[0])) {
+      tx.geo(places).add([place("ana", 13.405, 52.52)])
+    }
+    tx.hll(readers).add("user:7")
+    println("${counted} readers before this check-in")
+    return tx.bitmap(active).set(7, true)
+  })?
+  println("already active today: ${checked.get()?}")
+  r.close()
+  return
+}
+```
+
+`tx.read` is for reads only. A write such as `tx.read.geo(places).add(...)`,
+`tx.read.hll(readers).merge(...)` or `tx.read.bitmap(active).set(7, true)`
+would run immediately, outside the transaction's `MULTI`/`EXEC`, so it fails
+with `RedisError.Invalid`; queue it on `tx.geo(...)`, `tx.hll(...)` or
+`tx.bitmap(...)` instead.
 
 ## Sharp edges
 
