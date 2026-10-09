@@ -48,7 +48,7 @@ in force instead of findings.
 | `max-params` | 5 | The call site has stopped being readable; group the arguments into a class. |
 | `max-nesting` | 4 | This is almost always a missing early return. |
 | `max-complexity` | 10 | Too many independent paths through one function to reason about (cyclomatic complexity). |
-| `defer-in-loop` | - | A `defer` lexically inside a `while`/`for` runs at function exit, not loop exit - it holds whatever it acquired for the rest of the function. |
+| `defer-in-loop` | - | A `defer` lexically inside a `while`/`for` runs at function exit, not loop exit: each iteration schedules its own call, and every one holds what it acquired until the function returns. |
 | `unused-import` | - | An import nothing in the file reads. |
 | `unused-local` | - | A `let`/`const` nothing reads - almost always a leftover from a refactor. |
 | `unreachable-code` | - | A statement after one that always exits the block (`return`/`fail`/`break`/`continue`/`panic`). |
