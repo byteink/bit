@@ -1,0 +1,311 @@
+// stdlib/quic/probe.test.bit — what a PTO probe carries (#7710, RFC 9002 §6.2.4,
+// RFC 9000 §13.3). The probe timer used to re-queue only the frames of the
+// OLDEST unacknowledged packet; when that packet carried STREAM data of a stream
+// since reset it queued nothing, so after a burst of dropped datagrams the
+// client's RESET_STREAM (in a later packet) never left, and every further PTO
+// fired just as empty.
+//
+// Two tests. The first drives one connection state directly with a fixed
+// history, so the probe's frames and count are exact. The second puts the real
+// client and a real server behind a UDP relay that drops every client datagram
+// after the 20th until the reset has been sent into the void, then forwards, and
+// checks the reset reaches the server within a few PTO periods.
+//
+// `quicconnNewState`, `quicconnMaybePto`, `clientInitialKeys`,
+// `serverInitialKeys`, `dialQuicTls`, `acceptQuic` are module siblings;
+// `quicRefusalCertPem`/`quicRefusalKeyPem` (listener.test.bit) and
+// `quicAcceptClientConfig` (accept.test.bit) supply the identity and client TLS.
+import { Millisecond } from "std/time"
+import { AtomicI64 } from "std/sync"
+
+const qpStreamId: int = 0
+const qpAppCode: int = 77
+
+fn qpSent(pn: int, frames: []Frame): quicconnSent {
+  return quicconnSent{ pn = pn, timeSent = 1, size = 1200, ackEliciting = true, frames = frames }
+}
+
+fn qpStreamFrame(off: int): Frame {
+  return Frame.Stream(
+    StreamFrame{
+      id = u64(qpStreamId),
+      offset = u64(off),
+      data = []byte(10),
+      hasOffset = true,
+      hasLength = true,
+      fin = false,
+    },
+  )
+}
+
+// A client state whose 1-RTT level can seal, pointed at `peer`, with a PTO that
+// has long expired: packet 0 carries STREAM data of stream 0, packet 1 the
+// RESET_STREAM that abandoned it, both unacknowledged.
+fn qpState(peer: UdpSocket): quicconnState {
+  let port = peer.port() catch _ {
+    return quicconnNewState(true, peer, false, "127.0.0.1", 1, []byte(0), []byte(0))
+  }
+  let dcid = [byte(1), byte(2), byte(3), byte(4)]
+  let st = quicconnNewState(true, peer, false, "127.0.0.1", port, dcid, dcid)
+  st.aLevel.ksend = clientInitialKeys(dcid)
+  st.aLevel.haveSend = true
+  st.established = true
+  let s = quicconnNewStream(st, qpStreamId, false)
+  s.sendLen = 20
+  s.sendOff = 20
+  st.streams[qpStreamId] = s
+  st.present[qpStreamId] = 1
+  quicconnAbortSend(st, qpStreamId, qpAppCode)
+  let reset = st.aLevel.pending[0]
+  st.aLevel.pending = []Frame(0)
+  st.aLevel.sent = [qpSent(0, [qpStreamFrame(0)]), qpSent(1, [reset])]
+  st.aLevel.nextPn = 2
+  st.aLevel.timeLastAckEliciting = monotonic().ns - 10 * quicconnInitialPto
+  st.bytesInFlight = 2400
+  return st
+}
+
+fn qpCountResets(frames: []Frame): int {
+  let n = 0
+  for f of frames {
+    match (f) {
+      ResetStream(id, code, _) => {
+        if (int(id) == qpStreamId && int(code) == qpAppCode) {
+          n = n + 1
+        }
+      }
+      _ => {}
+    }
+  }
+  return n
+}
+
+fn qpCountStreams(frames: []Frame): int {
+  let n = 0
+  for f of frames {
+    if (quicconnFrameStreamId(f) == qpStreamId) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+fn qpBind(): UdpSocket {
+  return udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind: ${e.message()}")
+    return UdpSocket{}
+  }
+}
+
+test "a PTO sends two ack-eliciting probes and the first carries the pending RESET_STREAM" {
+  let peer = qpBind()
+  let st = qpState(peer)
+  quicconnMaybePto(st) catch e {
+    assert(false, "quicconnMaybePto: ${e.message()}")
+    return
+  }
+  assert(st.ptoCount == 1, "ptoCount after one PTO: ${st.ptoCount}")
+  let sent = st.aLevel.sent
+  assert(len(sent) == 4, "packets in flight after the PTO: ${len(sent)}, want the 2 old + 2 probes")
+  assert(sent[2].ackEliciting && sent[3].ackEliciting, "a probe was not ack-eliciting")
+  assert(qpCountResets(sent[2].frames) == 1, "first probe did not carry the RESET_STREAM")
+  assert(qpCountStreams(sent[2].frames) == 0, "first probe resent STREAM data of a reset stream")
+  assert(qpCountStreams(sent[3].frames) == 0, "second probe resent STREAM data of a reset stream")
+  let a = peer.recv(2048) catch e {
+    assert(false, "first probe datagram: ${e.message()}")
+    return
+  }
+  let b = peer.recv(2048) catch e {
+    assert(false, "second probe datagram: ${e.message()}")
+    return
+  }
+  assert(len(a.data) > 0 && len(b.data) > 0, "empty probe datagram")
+}
+
+test "a PTO with only the STREAM data of a reset stream in flight probes with PING" {
+  let peer = qpBind()
+  let st = qpState(peer)
+  st.aLevel.sent = [st.aLevel.sent[0]]
+  quicconnMaybePto(st) catch e {
+    assert(false, "quicconnMaybePto: ${e.message()}")
+    return
+  }
+  // Only a reset stream's STREAM frame is in flight: nothing left to retransmit,
+  // so each probe is a PING (RFC 9002 §6.2.4: a probe is always ack-eliciting).
+  let sent = st.aLevel.sent
+  assert(
+    len(sent) == 3,
+    "packets in flight after the PTO: ${len(sent)}, want 1 old + 2 PING probes",
+  )
+  assert(sent[1].ackEliciting && sent[2].ackEliciting, "a PING probe was not ack-eliciting")
+  assert(st.ptoCount == 1, "ptoCount after one PTO: ${st.ptoCount}")
+}
+
+// -- the relay --------------------------------------------------------------
+
+const qpDgramMax: int = 2048
+const qpDropFrom: int = 20
+const qpForever: int = 1099511627776
+
+class qpRelay {
+  front: UdpSocket,
+  back: UdpSocket,
+  port: int,
+  originPort: int,
+  clientPort: AtomicI64,
+  // Client datagrams seen; those numbered above `qpDropFrom` and up to `dropTo`
+  // are dropped, and how many were.
+  seen: AtomicI64,
+  dropTo: AtomicI64,
+  dropped: AtomicI64,
+}
+
+fn qpRelayUp(r: qpRelay) {
+  let guard = 0
+  while (guard < 1000000) {
+    guard = guard + 1
+    let d = r.front.recv(qpDgramMax) catch _ {
+      return
+    }
+    r.clientPort.store(d.port)
+    let n = r.seen.add(1)
+    if (n > qpDropFrom && n <= r.dropTo.load()) {
+      r.dropped.add(1)
+      continue
+    }
+    r.back.send("127.0.0.1", r.originPort, d.data) catch _ {
+      return
+    }
+  }
+}
+
+fn qpRelayDown(r: qpRelay) {
+  let guard = 0
+  while (guard < 1000000) {
+    guard = guard + 1
+    let d = r.back.recv(qpDgramMax) catch _ {
+      return
+    }
+    r.front.send("127.0.0.1", int(r.clientPort.load()), d.data) catch _ {
+      return
+    }
+  }
+}
+
+fn qpRelayStart(originPort: int): qpRelay! {
+  let front = udpBind("127.0.0.1", 0)?
+  let back = udpBind("127.0.0.1", 0)?
+  let r = qpRelay{
+    front = front,
+    back = back,
+    port = front.port()?,
+    originPort = originPort,
+    clientPort = AtomicI64(0),
+    seen = AtomicI64(0),
+    dropTo = AtomicI64(qpForever),
+    dropped = AtomicI64(0),
+  }
+  spawn qpRelayUp(r)
+  spawn qpRelayDown(r)
+  return r
+}
+
+// The origin: reads stream 0 to its end and reports the reset code, or -1 for a
+// clean end, or -2 when the connection died first.
+fn qpOrigin(sock: UdpSocket, ended: chan<int>) {
+  let conn = acceptQuic(sock, quicRefusalCertPem(), quicRefusalKeyPem()) catch _ {
+    ended <- -3
+    return
+  }
+  let s = conn.acceptStream() catch _ {
+    ended <- -2
+    return
+  }
+  let guard = 0
+  while (guard < 100000) {
+    guard = guard + 1
+    let c = s.read() catch _ {
+      ended <- -2
+      return
+    }
+    if (c.reset) {
+      ended <- c.resetCode
+      return
+    }
+    if (c.fin) {
+      ended <- -1
+      return
+    }
+  }
+}
+
+// Polls until `r.dropped` reaches `n`; false after `ms`.
+fn qpWaitDropped(r: qpRelay, n: int, ms: int): bool {
+  let waited = 0
+  while (waited < ms) {
+    if (r.dropped.load() >= n) {
+      return true
+    }
+    sleep(Millisecond)
+    waited = waited + 1
+  }
+  return r.dropped.load() >= n
+}
+
+fn qpTimeout(ms: int, ch: chan<bool>) {
+  sleep(ms * Millisecond)
+  ch <- true
+}
+
+test "a client whose datagrams were dropped sends its RESET_STREAM within a few PTO periods" {
+  let origin = qpBind()
+  let originPort = origin.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let ended = chan<int>(1)
+  spawn qpOrigin(origin, ended)
+  let relay = qpRelayStart(originPort) catch e {
+    assert(false, "relay: ${e.message()}")
+    return
+  }
+  let conn = dialQuicTls("127.0.0.1", relay.port, "localhost", quicAcceptClientConfig()) catch e {
+    assert(false, "dialQuicTls: ${e.message()}")
+    return
+  }
+  let s = conn.openStream() catch e {
+    assert(false, "openStream: ${e.message()}")
+    return
+  }
+  s.write([]byte(30000)) catch e {
+    assert(false, "write: ${e.message()}")
+    return
+  }
+  // The client keeps sending until its window fills, all of it into the void.
+  assert(
+    qpWaitDropped(relay, 3, 5000),
+    "client sent only ${relay.dropped.load()} datagrams past the 20th",
+  )
+  let before = relay.dropped.load()
+  s.reset(qpAppCode) catch e {
+    assert(false, "reset: ${e.message()}")
+    return
+  }
+  // The reset's own datagram is dropped too; only then does the path heal.
+  assert(qpWaitDropped(relay, before + 1, 5000), "the reset never left the client")
+  relay.dropTo.store(relay.seen.load())
+  let t0 = monotonic().ns
+  let late = chan<bool>(1)
+  spawn qpTimeout(1500, late)
+  select {
+    case code = <- ended:
+      let ms = (monotonic().ns - t0) / 1000000
+      assert(code == qpAppCode, "origin saw ${code}, want reset code ${qpAppCode}")
+      assert(ms < 1500, "reset arrived ${ms} ms after the path healed")
+    case _ = <- late:
+      assert(false, "RESET_STREAM did not reach the origin within 1500 ms of the path healing")
+  }
+  conn.close()
+  relay.front.close()
+  relay.back.close()
+}
