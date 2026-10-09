@@ -351,11 +351,23 @@ fn edgeClearSlots(clears: []SlotClear, src: int, dst: int): []int {
 // written after the zero); nothing reads the zero, so it is as sound as
 // handing the register to the next interval. A split value counts as
 // holding every register it uses over its whole life, which only withholds a
-// clear. The clear runs at most once per register between occupants (a later
-// call in the same block sees it clean) and never in a loop body, the rule the
-// slot clears above follow: a value defined in the iteration is rewritten by
-// the next one, and one that dies in the loop is cleared before the first call
-// after the loop.
+// clear. The clear runs at most once per register between occupants and never
+// in a loop body, the rule the slot clears above follow: a value defined in the
+// iteration is rewritten by the next one, and one that dies in the loop is
+// cleared before the first call after the loop.
+//
+// #7733: "at most once between occupants" holds across blocks, not only
+// inside one. A register is CLEAN at a point when, on every path to it, a
+// clear point that needed it ran after the last occupancy touching it: it is
+// zero there, so a later clear is dropped. `cleanOnEntry` carries that as a
+// forward must-dataflow over the CFG edges (clean on entry to a block iff
+// clean at the end of every predecessor; the entry block and a block no edge
+// enters start dirty). An occupancy touching a range kills the fact for its
+// register: every write to an allocatable register is inside one of its
+// occupancies, edge moves included (a param's interval covers its block's
+// first position), and the scratch registers are never allocatable. A clear
+// point counts as having run even when the backend emits nothing for it (a
+// register its frame never saves holds the caller's word all along).
 //
 // #7732: a register dirty BEFORE a loop is the one case that rule leaves
 // exposed: it stays dirty for every call in the loop, and no iteration
@@ -437,16 +449,6 @@ fn inLoopBody(edges: []CfgEdge, p: int): bool {
   return false
 }
 
-// A block starts in (lo, hi].
-fn blockStartIn(starts: []int, lo: int, hi: int): bool {
-  for s of starts {
-    if (s > lo && s <= hi) {
-      return true
-    }
-  }
-  return false
-}
-
 // Ascending copy of `ps` (insertion sort; a function's calls are few).
 fn sortedPositions(ps: []int): []int {
   let out = []int(0)
@@ -490,41 +492,126 @@ fn viewAt(spans: []RegSpan, p: int, nregs: int): RegView {
   return v
 }
 
-// What `computeRegClears` carries between calls: the occupancies, the block
-// starts, and per register the span index (+1) and position of the last clear.
+// What `computeRegClears` reads at every clear point: the occupancies, the
+// int file's callee-saved mask and size, and per position the registers a
+// clear point there needs zero (`clearMaskAt`, before #7733's dedupe).
 class ClearState {
   spans: []RegSpan,
-  starts: []int,
   calleeSaved: int,
   nregs: int,
-  lastKey: []int,
-  lastPos: []int,
+  need: []int,
 }
 
-// Whether the register whose latest ended span is `key` must be zeroed at `p`.
-fn needsClear(st: ClearState, v: RegView, r: int, p: int): bool {
+// Whether the register whose latest ended span is `v.last[r]` must be zero at
+// a clear point: callee-saved, free there, and last held a heap word.
+fn needsClear(st: ClearState, v: RegView, r: int): bool {
   let key = v.last[r]
-  if (((st.calleeSaved >> r) & 1) == 0 || v.covered[r] || key < 0 || !st.spans[key].heap) {
-    return false
-  }
-  // A clear since this occupant, in the same block, still stands.
-  return !(st.lastKey[r] == key + 1 && !blockStartIn(st.starts, st.lastPos[r], p))
+  return ((st.calleeSaved >> r) & 1) == 1 && !v.covered[r] && key >= 0 && st.spans[key].heap
 }
 
-// The mask of registers to zero before the call at `p`.
+// The mask of registers that must be zero before the instruction at `p`.
 fn clearMaskAt(st: ClearState, p: int): int {
   let v = viewAt(st.spans, p, st.nregs)
   let mask = 0
   let r = 0
   while (r < st.nregs) {
-    if (needsClear(st, v, r, p)) {
+    if (needsClear(st, v, r)) {
       mask = mask | (1 << r)
-      st.lastKey[r] = v.last[r] + 1
-      st.lastPos[r] = p
     }
     r = r + 1
   }
   return mask
+}
+
+// #7733: the registers an occupancy touches somewhere in [a, b): one that
+// starts there writes it, one that covers `a` may have been written on the way
+// in. `b` past every position reads to the end of the function.
+fn touchedIn(spans: []RegSpan, a: int, b: int): int {
+  let m = 0
+  for s of spans {
+    if (s.lo < b && s.hi >= a) {
+      m = m | (1 << s.reg)
+    }
+  }
+  return m
+}
+
+// One past block `b`'s last position, or past every position when it runs to
+// the end of the function.
+fn blockEnd(lasts: []int, b: int): int {
+  if (lasts[b] < 0) {
+    return 1 << 62
+  }
+  return lasts[b] + 1
+}
+
+// #7733: walks the clear points in [lo, end) from `clean`, the registers zero
+// on entry, and returns those still zero at `end`. Each point owes what it
+// needs and is not already clean; its mask lands in `out` unless `out` is
+// empty (`cleanOnEntry` walks only for the answer).
+fn walkClears(st: ClearState, lo: int, end: int, clean: int, out: []int): int {
+  let need = st.need
+  let c = clean
+  let pos = lo
+  let p = lo
+  while (p < end && p < len(need)) {
+    if (need[p] != 0) {
+      c = c & ~touchedIn(st.spans, pos, p)
+      if (len(out) > 0) {
+        out[p] = need[p] & ~c
+      }
+      c = c | need[p]
+      pos = p
+    }
+    p = p + 1
+  }
+  return c & ~touchedIn(st.spans, pos, end)
+}
+
+// #7733: per block, the registers clean on entry on every path (see the
+// header). The greatest fixed point from "all clean" for every block an edge
+// enters, the entry block excepted; a pass that changes anything clears at
+// least one bit, so it ends within `blocks x registers` passes. A block's exit
+// is `gen | (entry & ~kill)`: `walkClears` from nothing, and every register
+// an occupancy touches in it.
+fn cleanOnEntry(st: ClearState, edges: []CfgEdge, starts: []int, lasts: []int): []int {
+  let n = len(starts)
+  let gen = []int(n)
+  let kill = []int(n)
+  let entry = []int(n)
+  let b = 0
+  while (b < n) {
+    if (starts[b] >= 0) {
+      gen[b] = walkClears(st, starts[b], blockEnd(lasts, b), 0, []int(0))
+      kill[b] = touchedIn(st.spans, starts[b], blockEnd(lasts, b))
+    }
+    b = b + 1
+  }
+  for e of edges {
+    if (e.dst != 0) {
+      entry[e.dst] = (1 << st.nregs) - 1
+    }
+  }
+  let passes = 0
+  while (meetEdges(edges, gen, kill, entry)) {
+    passes = passes + 1
+    assert(passes <= n * st.nregs, "#7733: register-clean dataflow did not settle")
+  }
+  return entry
+}
+
+// One forward pass: every target keeps only what each source leaves clean.
+// True if any block changed.
+fn meetEdges(edges: []CfgEdge, gen: []int, kill: []int, entry: []int): bool {
+  let changed = false
+  for e of edges {
+    let met = entry[e.dst] & (gen[e.src] | (entry[e.src] & ~kill[e.src]))
+    if (met != entry[e.dst]) {
+      entry[e.dst] = met
+      changed = true
+    }
+  }
+  return changed
 }
 
 // The last position of the loop headed by `header` (its furthest back edge's
@@ -580,7 +667,8 @@ fn holdsPos(ps: []int, p: int): bool {
 // to zero before the instruction there; empty when none needs one. Indexed by
 // instruction position, length `last position + 1`, over the calls that can
 // reach the collector (`points.calleeSafepoints`) outside every loop body and
-// the loop entries `loopEntryPositions` names, for the int `file`.
+// the loop entries `loopEntryPositions` names, for the int `file`, less what
+// is already clean there (#7733).
 fn computeRegClears(
   scan: []LiveInterval, alias: []bool, sp: Splitter, points: AllocPoints, file: RegFile,
 ): []int {
@@ -597,21 +685,56 @@ fn computeRegClears(
       splitIndex(len(scan), sp.pieces, []int(0)),
       sp.pieces,
     ),
-    starts = blockStarts(edges), calleeSaved = file.calleeSaved, nregs = file.count,
-    lastKey = []int(file.count), lastPos = []int(file.count),
+    calleeSaved = file.calleeSaved, nregs = file.count, need = []int(0),
   }
   let ordered = calls
   for p of loopEntryPositions(edges, calls) {
     ordered = append(ordered, p)
   }
   ordered = sortedPositions(ordered)
-  let out = []int(ordered[len(ordered) - 1] + 1)
+  let need = []int(ordered[len(ordered) - 1] + 1)
   for p of ordered {
     if (!inLoopBody(edges, p)) {
-      out[p] = clearMaskAt(st, p)
+      need[p] = clearMaskAt(st, p)
     }
   }
+  st.need = need
+  let starts = blockStarts(edges)
+  let lasts = blockLasts(edges, starts)
+  let out = []int(len(need))
+  emitClears(st, starts, lasts, cleanOnEntry(st, edges, starts, lasts), out)
   return out
+}
+
+// `blockLast` of every block an edge names, -1 for the rest.
+fn blockLasts(edges: []CfgEdge, starts: []int): []int {
+  let out = []int(len(starts))
+  let b = 0
+  while (b < len(starts)) {
+    out[b] = -1
+    if (starts[b] >= 0) {
+      out[b] = blockLast(edges, starts, b)
+    }
+    b = b + 1
+  }
+  return out
+}
+
+// #7733: fills `out` block by block, each from what is clean on its entry. A
+// run of positions no block an edge names holds (the whole function when it
+// has no edges, or code no edge reaches) starts from nothing.
+fn emitClears(st: ClearState, starts: []int, lasts: []int, entry: []int, out: []int) {
+  let cursor = 0
+  let b = 0
+  while (b < len(starts)) {
+    if (starts[b] >= 0) {
+      let _ = walkClears(st, cursor, starts[b], 0, out)
+      let _ = walkClears(st, starts[b], blockEnd(lasts, b), entry[b], out)
+      cursor = blockEnd(lasts, b)
+    }
+    b = b + 1
+  }
+  let _ = walkClears(st, cursor, len(st.need), 0, out)
 }
 
 // The mask `RegAllocResult.regClears` holds for position `p`, 0 past its end.
