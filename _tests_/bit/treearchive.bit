@@ -26,41 +26,82 @@
 // bin/bit) and the same gate passes: it then builds the archive with stage0,
 // which is what every other gate links against.
 //
-// NOT COVERED: x86_64-linux. Its image runs on the x86 host over ssh, behind
-// that host's benchlock and with the program staged by tar; that path is
-// dockerlive.bit's BIT_LIVE_DOCKER_HOST mode, which this single-image harness
-// does not drive. Filed separately.
+// X86_64-LINUX (#7752). `./make test-tree-archive-x64` is the same three steps for
+// x86_64-linux, run in bit-linux-gate-amd64:latest on the real x86 host that
+// scripts/x64host.sh resolves (BIT_X64_HOST and friends; BIT_LIVE_DOCKER_HOST
+// forces the ssh alias). The run is dockerlive.bit's remote mode: the host's
+// /tmp/benchlock directory lock is held for the run, the program's directory
+// is staged by tar, and the program's stdout and rc come back through
+// `dockerOutput`. The lock, the staged copy and the container are removed on
+// every exit path, so the host is left clean. NO HOST ANSWERING FAILS the gate,
+// like no Docker does; BIT_LIVE_OPTIONAL=1 is the one explicit skip.
 //
-// ENV (`./make test-tree-archive` sets all three, tools/build/gatestable3.bit):
+// ENV (`./make test-tree-archive[-x64]` sets all four, tools/build/gatestable3.bit):
 //   BIT_REPO    repo root (required)
 //   BIT_BIN     the compiler under test (default BIT_REPO/bit-out/bin/bit)
 //   BIT_STDLIB  stdlib to link hello.bit against
+//   BIT_TREEARCHIVE_TARGET  aarch64-linux | x86_64-linux
 import { output } from "std/process"
 import { env, envOr, exit } from "std/os"
 import { mkdir, writeFile } from "std/fs"
 import { contains, trimSpace } from "std/strings"
 import { uuidV4, format as uuidFormat } from "std/uuid"
-import { dockerRunTimeoutMs, failureText, requireDocker, releaseDocker } from "./dockerlive"
+import {
+  dockerOutput,
+  dockerRunTimeoutMs,
+  failureText,
+  giveUp,
+  releaseDocker,
+  remoteHostEnv,
+  requireDocker,
+  useRemoteHost,
+} from "./dockerlive"
 
-const target: string = "aarch64-linux"
-const image: string = "bit-linux-gate:latest"
+const x64Target: string = "x86_64-linux"
+const hostTimeoutMs: int = 60000
 const wantLine: string = "smoke ok"
 const archiveTimeoutMs: int = 300000
 const buildTimeoutMs: int = 120000
 const hello: string = "fn main() {\n  print(\"smoke ok\\n\")\n}\n"
 
+// One run: the compiler and stdlib under test, the target and its image, and
+// the scratch directory holding l1.a, hello.bit and run/hello. `run/` holds only
+// the program because a remote run stages the whole mount.
+class Job { bin: string, stdlib: string, target: string, image: string, scratch: string }
+
+fn archiveOf(j: Job): string {
+  return "${j.scratch}/l1.a"
+}
+
+fn runDirOf(j: Job): string {
+  return "${j.scratch}/run"
+}
+
+// The docker binary (or remote shim) in use, so every exit path can release a
+// remote run's lock, staged copy and containers. "" before it exists.
+let dockerBin: string = ""
+
 fn requiredEnv(name: string): string {
   let v = env(name)
   if (len(v) == 0) {
-    eprint("treearchive: ${name} is not set — run this through `./make test-tree-archive`\n")
+    eprint("treearchive: ${name} is not set — run this through `./make test-tree-archive` or `test-tree-archive-x64`\n")
     exit(2)
   }
   return v
 }
 
-// Prints the failure, keeps `scratch` for a hand re-run, and exits 1.
+fn imageFor(target: string): string {
+  if (target == x64Target) {
+    return "bit-linux-gate-amd64:latest"
+  }
+  return "bit-linux-gate:latest"
+}
+
+// Prints the failure, keeps `scratch` for a hand re-run, releases a remote run
+// and exits 1.
 fn fail1(scratch: string, msg: string) {
   eprint("treearchive: FAIL: ${msg}\n  scratch kept for a hand re-run: ${scratch}\n")
+  releaseDocker(dockerBin)
   exit(1)
 }
 
@@ -76,92 +117,130 @@ fn removeScratch(scratch: string) {
   }
 }
 
-fn buildArchive(repo: string, bin: string, archive: string): string {
+fn buildArchive(repo: string, j: Job): string {
+  let archive = archiveOf(j)
   let r = output(
     "/usr/bin/env",
-    ["BIT=${bin}", "/bin/bash", "${repo}/scripts/g2archive.sh", target, archive],
+    ["BIT=${j.bin}", "/bin/bash", "${repo}/scripts/g2archive.sh", j.target, archive],
     archiveTimeoutMs,
   )
   if (r.exitCode == 0) {
     return ""
   }
-  return "scripts/g2archive.sh ${target} with ${bin} exited ${r.exitCode} building ${archive}: ${failureText(
+  return "scripts/g2archive.sh ${j.target} with ${j.bin} exited ${r.exitCode} building ${archive}: ${failureText(
     r,
     archiveTimeoutMs,
   )}"
 }
 
-fn linkProgram(bin: string, stdlib: string, archive: string, src: string, prog: string): string {
+fn linkProgram(j: Job): string {
+  let archive = archiveOf(j)
+  let src = "${j.scratch}/hello.bit"
   let r = output(
     "/usr/bin/env",
     [
-      "BIT_STDLIB=${stdlib}",
+      "BIT_STDLIB=${j.stdlib}",
       "BIT_LIBBITRT=${archive}",
-      bin,
+      j.bin,
       "build",
       src,
       "--target",
-      target,
+      j.target,
       "-o",
-      prog,
+      "${runDirOf(j)}/hello",
     ],
     buildTimeoutMs,
   )
   if (r.exitCode == 0) {
     return ""
   }
-  return "${bin} build ${src} --target ${target} against ${archive} exited ${r.exitCode}: ${failureText(
+  return "${j.bin} build ${src} --target ${j.target} against ${archive} exited ${r.exitCode}: ${failureText(
     r,
     buildTimeoutMs,
   )}"
 }
 
 // "" when the program printed the line and exited 0 inside the image, else why not.
-fn runInImage(docker: string, scratch: string, archive: string): string {
-  let r = output(
+fn runInImage(docker: string, j: Job): string {
+  let archive = archiveOf(j)
+  let r = dockerOutput(
     docker,
-    ["run", "--rm", "-v", "${scratch}:/w", image, "/w/hello"],
+    ["run", "--rm", "-v", "${runDirOf(j)}:/w", j.image, "/w/hello"],
     dockerRunTimeoutMs,
-  )
+  ) catch e {
+    return "docker run of hello (linked against ${archive}) in ${j.image} did not start: ${e.message()}"
+  }
   if (r.exitCode == 0 && trimSpace(r.stdout) == wantLine) {
     return ""
   }
-  return "hello-world linked against the tree-built archive ${archive} exited rc=${r.exitCode} in ${image} (want rc=0 and \"${wantLine}\"); stdout=\"${trimSpace(r.stdout)}\" stderr=\"${failureText(
+  return "program ${runDirOf(j)}/hello linked against the tree-built archive ${archive} exited rc=${r.exitCode} in ${j.image} (want rc=0 and \"${wantLine}\"); stdout=\"${trimSpace(r.stdout)}\" stderr=\"${failureText(
     r,
     dockerRunTimeoutMs,
   )}\""
 }
 
+// The docker to run on: the local daemon for aarch64-linux; for x86_64-linux
+// the ssh host scripts/x64host.sh resolves (BIT_LIVE_DOCKER_HOST wins), run
+// through dockerlive.bit's remote mode. Exits 1 (0 under BIT_LIVE_OPTIONAL=1)
+// when no host answers.
+fn dockerFor(repo: string, target: string): string {
+  if (target == x64Target && env(remoteHostEnv) == "") {
+    let r = output("/bin/bash", ["${repo}/scripts/x64host.sh"], hostTimeoutMs)
+    let host = trimSpace(r.stdout)
+    if (r.exitCode != 0 || host == "") {
+      giveUp(
+        "treearchive",
+        "scripts/x64host.sh found no x86-64 host: ${failureText(r, hostTimeoutMs)}",
+        0,
+      )
+    }
+    useRemoteHost(host) catch e {
+      giveUp("treearchive", "scripts/x64host.sh printed an unusable host: ${e.message()}", 0)
+    }
+  }
+  return requireDocker("treearchive")
+}
+
 fn main() {
   let repo = requiredEnv("BIT_REPO")
-  let stdlib = requiredEnv("BIT_STDLIB")
-  let bin = envOr("BIT_BIN", "${repo}/bit-out/bin/bit")
-  let docker = requireDocker("treearchive")
-
-  let scratch = envOr("TMPDIR", "/tmp") + "/bit-treearchive-${uuidFormat(uuidV4())}"
-  mkdir(scratch) catch e {
-    eprint("treearchive: cannot create scratch directory ${scratch}: ${e.message()}\n")
+  let target = requiredEnv("BIT_TREEARCHIVE_TARGET")
+  if (target != x64Target && target != "aarch64-linux") {
+    eprint("treearchive: BIT_TREEARCHIVE_TARGET=${target} is not aarch64-linux or ${x64Target}\n")
     exit(2)
   }
-  let archive = "${scratch}/l1.a"
-  let src = "${scratch}/hello.bit"
-  writeFile(src, hello) catch e {
-    fail1(scratch, "cannot write ${src}: ${e.message()}")
+  let docker = dockerFor(repo, target)
+  dockerBin = docker
+  let scratch = envOr("TMPDIR", "/tmp") + "/bit-treearchive-${uuidFormat(uuidV4())}"
+  let j = Job{
+    bin = envOr("BIT_BIN", "${repo}/bit-out/bin/bit"),
+    stdlib = requiredEnv("BIT_STDLIB"),
+    target = target,
+    image = imageFor(target),
+    scratch = scratch,
+  }
+  mkdir(scratch) catch e {
+    eprint("treearchive: cannot create scratch directory ${scratch}: ${e.message()}\n")
+    releaseDocker(docker)
+    exit(2)
+  }
+  mkdir(runDirOf(j)) catch e {
+    fail1(scratch, "cannot create ${runDirOf(j)}: ${e.message()}")
+  }
+  writeFile("${scratch}/hello.bit", hello) catch e {
+    fail1(scratch, "cannot write ${scratch}/hello.bit: ${e.message()}")
   }
 
-  let why = buildArchive(repo, bin, archive)
-  if (why != "") {
-    fail1(scratch, why)
+  let why = buildArchive(repo, j)
+  if (why == "") {
+    why = linkProgram(j)
   }
-  why = linkProgram(bin, stdlib, archive, src, "${scratch}/hello")
-  if (why != "") {
-    fail1(scratch, why)
+  if (why == "") {
+    why = runInImage(docker, j)
+    releaseDocker(docker)
   }
-  why = runInImage(docker, scratch, archive)
-  releaseDocker(docker)
   if (why != "") {
     fail1(scratch, why)
   }
   removeScratch(scratch)
-  print("treearchive: ok — ${target} hello linked against the tree-built archive printed \"${wantLine}\", rc=0, in ${image}\n")
+  print("treearchive: ok — ${target} hello linked against the tree-built archive printed \"${wantLine}\", rc=0, in ${j.image}\n")
 }
