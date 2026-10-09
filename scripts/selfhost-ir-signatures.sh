@@ -249,167 +249,51 @@
 # scripts/ir-signatures-walk.sh and scripts/safepoint-signatures.sh are
 # deleted.
 #
-# --- Declared signatures (against the 0.40.0 oracle) ---
+# Every signature declared against the 0.40.0 oracle was retired by the stage0
+# 0.41.0 repin (#6533), declared by #7558, #7562, #7564, #7574, #7637, #7671,
+# #7674, #7700, #6681 and #7737: 7562-packed-halfword-slices,
+# 7574-packed-narrow-slices, 7637-string-from-rune-range,
+# 6681-multi-assign-oracle-omits-function and 7737-forof-len-once (`ir`,
+# `iropt`), 7574-f32-store-schedule-lag and 7674-forwarded-index-get (`iropt`),
+# 7558-synth-json-alias-column-shift and 7564-synth-table-alias-column-shift
+# (`types`), the three per-file lag pins of irLagPins (run_float32_interp,
+# run_float_slice_elems, stdlib/compress/crc32.bit) with the STALE-PIN check of
+# selfhost-diffdump.sh, and the ORACLE_LAG list of selfhost-diffexamples.sh.
+# 0.41.0 carries #7562, #7574 (so the pinned compiler strides narrow slices the
+# way the tree does), #7637, #7674, #6681, #7558, #7564 and #7737, so it is the
+# first oracle that agrees with the tree on every corpus file they explained.
+# Confirmed against the 0.41.0 pin (this tree at the #6533 repin, aarch64-macos,
+# the only host this repin was run on): selfhost-diffir.sh reports MATCH=1162
+# MISMATCH=0 EXPLAINED=0 and names the five `ir` signatures as RETIRED;
+# selfhost-diffiropt.sh reports MATCH=1162 MISMATCH=0 EXPLAINED=0, names all
+# seven `ir`/`iropt` signatures as RETIRED and the three pinned files as
+# STALE-PIN; selfhost-difftypes.sh reports MATCH=1793 MISMATCH=0 EXPLAINED=0 and
+# names the two `types` signatures as RETIRED; selfhost-diffcheck.sh MATCH=1793
+# FALSEPOS=0 DIFF=0, selfhost-diffsafepoints.sh MATCH=1134 MISMATCH=0
+# EXPLAINED=0 and selfhost-diffexamples.sh PASS=48 DIFF=0 REFUSED=0 LAG=0. Their
+# derivations (`irWalkAwk` and its stage 1, fold, renumber, f32, CSE and types
+# programs, `irTrial`, `explainIrLagPin`, `explainOmittedFunctions`,
+# `explainLagTypes`, and the #7737 `irForOfAwk`, `irDedupAwk`, `irMergeLoads`,
+# `irLenToHeader`, `irGuardOff`) are preserved in git history at this file's
+# state before #6533; scripts/ir-signatures-walk.sh and
+# scripts/ir-signatures-forof.sh are deleted.
 #
-# These retire at the next stage0 repin, which is the first oracle cut from a tree that carries
-# #7558, #7562, #7574 and #7637. The walks live in scripts/ir-signatures-walk.sh, sourced below.
-#
-# 7558-synth-json-alias-column-shift (`types`). #7558 (54c0b8420) binds std/json's `Json` and
-# `JsonEntry` under the reserved aliases `__Json`/`__JsonEntry` in the code a `@json` class
-# synthesizes, so the synthesized text is longer and every row the dump places on that source line
-# after the insertion moves right. The oracle and the tree must have the same row count and agree
-# on every row's line, name and type; the column may only grow, must never shrink back along the
-# line, and may move only on a source line that carries a synthesized `__json_` row. 23 corpus
-# files: the 19 under _tests_/cases/ and the four jsonattr/jsonschema* mains under
-# _tests_/imports/ (the rows `cols` and `__row` of run_table_persisted_flag.bit move because they
-# sit on the same synthesized line, after the insertion).
-#
-# 7564-synth-table-alias-column-shift (`types`). #7564 part 1 (d845bc5c5) binds every name an
-# @table class's synthesized code imports (`Rows`, `Value`, `FieldDesc`, ...) under a reserved `__`
-# alias, the same lengthening #7558 did for @json, so the same column-only rule applies on a source
-# line that carries the synthesized `__row` local. 15 corpus files (the @table/relation cases).
-# A file whose moved rows sit on a `__json_` line reads as 7558. A row on a line past the source
-# file's last line sits in wholly synthesized text (the std/sql row mapper #7564 also rewrote), so
-# there its column may move either way; line, name, type and row order must still agree.
-#
-# 7562-packed-halfword-slices (`ir`, `iropt`). #7562 (05bb7c255, a64ce6f04) packs []i16/[]u16 at
-# 2 bytes per element: the elem_size constant of slice_new/slice_append/slice_get is 2 instead of
-# 8, an element read is `index_get buf[i]` instead of `field_get (buf + (i << 3))[0]`, a store
-# writes the narrow value instead of its word-widened `convert`, ptrOf scales by 2, a signed
-# `rt_call slice_get` returns i64 and a `convert i16` narrows it, and optappend.bit's append fast
-# path (elem_size equals the element width) now expands for these slices. Both dumps are normalized
-# (scripts/ir-signatures-walk.sh), the oracle one rewritten along exactly those shapes and the
-# tree one with the append fast path folded back, and the texts must then agree byte for byte.
-# The rewrites fire on i16/u16 only, so an i32/u32/i8/bool slice that changed, a tree that left a
-# halfword site word-strided, or any other difference anywhere in the file stays a REGRESSION.
-# 3 corpus files, on both arms: convert_widen_alias.bit, run_narrow_slice_store_widen.bit and
-# run_packed_i16_slice.bit.
-#
-# 7574-packed-narrow-slices (`ir`, `iropt`). #7574 (8eb73dbbf) extends #7562's packing to every
-# narrow prim: []i8/[]bool at 1 byte, []i32/[]u32/[]f32 at 4. The same shapes as 7562 (elem_size
-# constant, `index_get` reads, narrow stores without the word-widening `convert`, ptrOf scaling,
-# the append fast path) plus the f32 element store, which was `bitcast u32` into `rt_call
-# slice_set` and is now an inline `index_set` from the float register, and the read-back of a whole
-# f32 lvalue, which is still `rt_call slice_get` plus `bitcast f32` in places and a slice_len-guarded
-# `index_get` in others. Every spelling of an f32 element store or read, in BOTH dumps, is collapsed to
-# the pseudo-ops `f32_store s[i] = v` and `f32_load s[i] f32` (the guard, its panic block and the two
-# field_get reads go with the guarded spelling; a guard that does not match exactly stays and keeps the
-# file unexplained). The trial that names it enables the halfword and the narrow widths together. The
-# optimizer-driven differences of the post-opt arm are NOT in it: run_float32_interp and
-# run_float_slice_elems differ there by where the inline stores sit relative to the following reads'
-# guards. A store into a slice the tree knows to start at offset 0 (a fresh literal) has no offset read:
-# its guard and buffer read are collapsed the same way. stdlib/crypto/bigint.bit differed by a load the
-# oracle CSE'd until #7674 made the tree forward it; it is explained by this signature alone.
-#
-# 7637-string-from-rune-range (`ir`, `iropt`). #7637 (c8381c0c2) makes `string(rs[lo:hi])` on a
-# `[]rune` one `rt_call string_from_rune_range(rs, lo, hi)`; the oracle emitted
-# `string_from_byte_range` with the same arguments. The rewrite fires only when the first operand
-# is a `[]i32` (or the untyped nil), so a `[]u8` receiver is never touched. A file that needs this
-# together with the packing is named 7637 (the one rewrite that is not a width).
-#
-# 7674-forwarded-index-get (`iropt` only). #7674 (aa32c9bf3) puts the `index_get` of a non-reference
-# scalar into optcse.bit's load chain (cseStep, AvailArena.elem, cseScalarType); the pinned stage0
-# forwarded only the word-strided `field_get` read it replaced, so it loads such an element twice
-# where the tree loads it once. The oracle dump is rewritten by IR_CSE_AWK (scripts/ir-signatures-walk.sh)
-# along the rule optcse.bit applies: a block with exactly one predecessor, reached by a forward edge,
-# starts from that predecessor's exit table, any other block from an empty one; a later `index_get`
-# with the same base, index and prim type as an entry is dropped and its uses renamed to the earlier
-# id; every op in isSideEffecting except index_get and the terminators (a call, a store, an
-# allocation, a division, an atomic, asm, a syscall, the attention poll, keepAlive) empties the table,
-# and so does any op the walk does not know. A compare or a bitwise, shift or float op that the rename
-# made equal to an earlier one is dropped too (optcse.bit's pure chain, which no barrier clears), but
-# only when it was renamed. The tree dump is never touched, so a tree that kept a load, or a load the
-# walk would not drop, stays unexplained; the normalized texts must then agree byte for byte. It
-# composes with the packing: the stage runs after the halfword/narrow rewrites. 18 corpus files:
-# json_cst_create_intermediate, jsonc_parse_{comments,json5_rejected,trailing_comma,
-# two_trailing_commas}, run_append_spread, run_inliner_loop_return, run_tuple_narrow_{boxed,exploded}_
-# convert under _tests_/cases/, examples/strslice and examples/syncmutex, and stdlib/{hash/xxhash64,
-# time/extend,http2/hpack,json/lex,decimal/decimal,crypto/sha512,crypto/field25519}.
-#
-# 6681-multi-assign-oracle-omits-function (`ir`, `iropt`). #6681 (e2852f5d0) lowers a multi-target
-# assignment with index and field targets (`a[i], a[j] = a[j], a[i]`). The pinned stage0 refuses it with
-# E0092 ("cannot lower a multi-target assignment this lowerer does not yet handle"), but only
-# `bit build` reports that: `check` and `--dump-diags` are silent and exit 0, and `--dump-ir` /
-# `--dump-ir-pre` print the rest of the file, exit 0 and write nothing to stderr, so the function holding
-# the assignment is simply absent while its callers still call it. The same shape as the retired
-# 7387-self-result-oracle-omits-function (5e92190a7). Identity: every tree function the oracle dump lacks
-# and still calls is removed from the tree dump, there is at least one, and the two dumps are then
-# byte-equal (explainOmittedFunctions, scripts/ir-signatures-walk.sh). A function both emitted that
-# differs, or a tree function the oracle never calls, keeps the file unexplained. 1 corpus file, on both
-# arms: _tests_/cases/run_tuple_assign_targets.bit (swaps, order).
-#
-# 7737-forof-len-once (`ir`, `iropt`). #7737 makes `for x of xs`, `for i in xs` and `for (i, x) in xs`
-# over a slice read the length once (SPEC 13.1, "The bound of a slice or array loop is read once"):
-# lowerForOf and lowerForInSetupLoop emit `%v = slice_len %xs` in the block that jumps into the loop and
-# thread it through every block of the loop as one more block parameter, and the header compares the
-# cursor against that parameter. The pinned stage0 emitted `slice_len %xs` in the header, every
-# iteration. irForOfUnhoist (scripts/ir-signatures-forof.sh) rewrites the TREE dump only, and only a
-# loop of exactly that shape: a `slice_len` immediately before the jump into a header whose first line
-# is `icmp_slt bool <cursor>, <that value's parameter>`, the value and the parameters it reaches (every
-# edge of the function, greatest fixpoint) used nowhere else. Those are deleted and `slice_len` of the
-# ranged slice goes back into the header; the trials of the other signatures then run on the result, so
-# a file that also needs the packing, the rune call or the forwarded loads keeps that name and only a
-# file that needs nothing else is named for this one. The `iropt` arm, where the optimizer has already
-# turned the compare into a hoisted header parameter, also merges trivial and dead block parameters
-# (scripts/ir-signatures-forof.sh irDedupAwk) and drops header word loads nothing reads, on both
-# sides, may move the hoisted `slice_len` back into the header (irLenToHeader), and merges repeated
-# header word loads of one block (irMergeLoads). Anything else that
-# differs, in the loop or outside it, keeps the file unexplained. Files: see the run output.
-#
-# All six retire at the next stage0 repin (#6533).
+# NO SIGNATURE IS DECLARED. `explainMismatch` below is the empty table every
+# caller still consults, so the next lowering change that outruns the oracle
+# adds its entry there instead of re-plumbing the callers. The input protocol
+# is the text the awk body of the previous revision read: the oracle's dump,
+# a line `@@@BIT2@@@`, then the tree's dump, with the kind and the corpus file
+# as `-v` variables. A new entry must satisfy the rules in the header: an
+# exact identity, derived from FULL dumps (the oracle's from
+# `sh scripts/stage0.sh`, the tree's from `bit-out/bin/bit`), never an excerpt.
 #
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
-# and returns 0, or prints nothing and returns 1 if none does.
+# and returns 0, or prints nothing and returns 1 if none does. No signature is
+# registered, so it returns 1 for every kind.
 explainMismatch() {
-  case "$3" in
-    types) explainLagTypes "$1" "$2" "${4:-}"; return ;;
-    ir|iropt)
-      explainIrLag "$1" "$2" "$3" && return 0
-      irLagPinned "$3" "${4:-}" || return 1
-      case "$(irLagPinSig "$3" "$4")" in
-        7737-forof-len-once) explainGuardPin "$1" "$2" ;;
-        *) explainIrLagPin "$1" "$2" || explainIrLagPinForOf "$1" "$2" ;;
-      esac
-      return ;;
-  esac
   return 1
 }
-
-# --- Per-file lag pins (#7671) ---
-#
-# 7574-f32-store-schedule-lag (`iropt` only). #7574 stores an f32 element inline, so the optimizer
-# of the working tree moves those stores relative to the guards of the reads that follow and shares
-# one slice_len between them; the pinned stage0 sees an opaque `rt_call slice_set` there and cannot.
-# golden (run_float32_interp, run_float_slice_elems) proves the output
-# right. A pin is `kind|file|signature|reason`; it explains its file only when, with every line tied to an
-# []f32 slice deleted from both dumps (explainIrLagPin), the rest is identical, and a pinned file
-# that no longer needs the pin (it matches, or another signature explains it) fails the run as
-# STALE-PIN in selfhost-diffdump.sh. Removable at the stage0 repin (#6533). This is the one
-# per-file list the family has; #1883 deleted the last one, so an entry here needs a reason a
-# reader can check.
-#
-# 7737-forof-len-once (`iropt` only, one file: stdlib/compress/crc32.bit). With the loop bound read once, the tree's bounds-check
-# elimination (optbce.bit) proves the guard of `xs[i]` in `for i in xs` from the loop test: it reads
-# the same length the test does. The oracle's two reads were different values and it kept the guard.
-# The pin explains its file only when (explainGuardPin, scripts/ir-signatures-forof.sh) no function of
-# the tree holds more out-of-range panic blocks than the oracle's and one holds fewer, and with the
-# loop-tested guards removed from both dumps (irGuardOff: an `icmp_ult` of the index and the length an
-# `icmp_slt` in the same function tests, read by one `br` to a panic block of exactly the out-of-range
-# panic that nothing else enters) the two are equal, so nothing else differs. The pin shares the
-# signature's name, so a signature that comes to explain the file does not mark the pin stale.
-irLagPins() {
-  printf '%s\n' \
-    'iropt|_tests_/cases/run_float32_interp.bit|7574-f32-store-schedule-lag|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin' \
-    'iropt|_tests_/cases/run_float_slice_elems.bit|7574-f32-store-schedule-lag|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin' \
-    'iropt|stdlib/compress/crc32.bit|7737-forof-len-once|#7737 bounds guard of `xs[i]` in `for i in xs` dropped by BCE, until the #6533 repin'
-}
-# irLagPinned <kind> <file> -- 0 when the (kind, file) pair is pinned.
-irLagPinned() { irLagPins | awk -F'|' -v k="$1" -v f="${2:-}" '$1 == k && $2 == f { found = 1 } END { exit !found }'; }
-# irLagPinFiles <kind> -- the pinned files of that arm, one per line.
-irLagPinFiles() { irLagPins | awk -F'|' -v k="$1" '$1 == k { print $2 }'; }
-# irLagPinSig <kind> <file> -- the signature name a pinned file is explained under.
-irLagPinSig() { irLagPins | awk -F'|' -v k="$1" -v f="${2:-}" '$1 == k && $2 == f { print $3 }'; }
 
 # declaredSignatureNames [ir|iropt|ast|fmt|types|diags] -- every name explainMismatch
 # CAN print for the given dump kind, one per line (#5509, extended by #5510).
@@ -418,26 +302,8 @@ irLagPinSig() { irLagPins | awk -F'|' -v k="$1" -v f="${2:-}" '$1 == k && $2 == 
 # function does not list can never be checked for going dead, and one it lists
 # that explainMismatch no longer prints would make that check fail on every
 # run. Kept in sync by hand, and selfhost-ir-signatures-selfcheck.sh asserts
-# the list matches the `print "..."` statements in this file and in
-# scripts/ir-signatures-walk.sh.
+# the list matches the `print "..."` statements in this file. None are
+# declared, so it prints nothing for every kind.
 declaredSignatureNames() {
-  local types="7558-synth-json-alias-column-shift 7564-synth-table-alias-column-shift"
-  local ir="7562-packed-halfword-slices 7574-packed-narrow-slices 7637-string-from-rune-range 6681-multi-assign-oracle-omits-function 7737-forof-len-once"
-  local lag="7574-f32-store-schedule-lag 7674-forwarded-index-get"
-  case "${1:-}" in
-    types) printf '%s\n' $types ;;
-    ir) printf '%s\n' $ir ;;
-    iropt) printf '%s\n' $ir $lag ;;
-    "") printf '%s\n' $types $ir $lag ;;
-  esac
   return 0
 }
-
-# The walks and the canonicalizer they use (scripts/selfhost-ir-canon.sh). Sourced after the
-# functions above are defined; nothing here runs until explainMismatch is called.
-# shellcheck source=scripts/selfhost-ir-canon.sh
-. "$(dirname -- "${BASH_SOURCE[0]}")/selfhost-ir-canon.sh"
-# shellcheck source=scripts/ir-signatures-walk.sh
-. "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-walk.sh"
-# shellcheck source=scripts/ir-signatures-forof.sh
-. "$(dirname -- "${BASH_SOURCE[0]}")/ir-signatures-forof.sh"

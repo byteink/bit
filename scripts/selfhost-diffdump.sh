@@ -627,17 +627,6 @@ run_ir() {
     fi
   done < <(declaredSignatureNames "$NAME")
 
-  # A per-file lag pin (irLagPins, #7671) that is not explained by its own signature this run is
-  # stale: the file matches again, or a declared signature explains it, or it vanished.
-  stale="" stalecount=0
-  while IFS= read -r pinned; do
-    [ -n "$pinned" ] || continue
-    if ! grep -q -F "${pinned}${sep}explained by declared signature '$(irLagPinSig "$NAME" "$pinned")'" "$work/explained" 2>/dev/null; then
-      stale="$stale $pinned"
-      stalecount=$((stalecount + 1))
-    fi
-  done < <(irLagPinFiles "$NAME")
-
   echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch EXPLAINED=$explained NO-VERDICT=$timeouts ORACLE-TIMEOUT=$oracletimeouts ORACLE-CRASH=$oraclecrashes ORACLE-PANIC=$oraclepanics SKIP($SKIPLABEL)=$skip"
 
   # A RUN THAT COMPARED NOTHING IS NOT A PASS (#1881). Two ways to get here having
@@ -747,13 +736,7 @@ run_ir() {
     for s in $retired; do echo "  retired: $s"; done
   fi
 
-  if [ "$stalecount" -gt 0 ]; then
-    echo
-    echo "STALE-PIN: $stalecount pinned file(s) no longer diverge only by the pinned lag; delete them from irLagPins in scripts/selfhost-ir-signatures.sh:"
-    for s in $stale; do echo "  stale-pin: $s"; done
-  fi
-
-  if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && [ "$oracletimeouts" -eq 0 ] && [ "$retiredcount" -eq 0 ] && [ "$stalecount" -eq 0 ]; then
+  if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && [ "$oracletimeouts" -eq 0 ] && [ "$retiredcount" -eq 0 ]; then
     echo
     if [ "$explained" -gt 0 ]; then
       echo "$PREFIX: every file's $VERB IR matches the pinned stage0's, or is explained by a declared transform signature ($explained explained)."
@@ -761,7 +744,7 @@ run_ir() {
       echo "$PREFIX: every file's $VERB IR is identical to the pinned stage0's."
     fi
   fi
-  diffexit "$LABEL" -f "$mismatch" "$retiredcount" "$stalecount" -t "file(s)=$timeouts" "oracle file(s)=$oracletimeouts"
+  diffexit "$LABEL" -f "$mismatch" "$retiredcount" -t "file(s)=$timeouts" "oracle file(s)=$oracletimeouts"
 }
 
 case "$KIND" in
