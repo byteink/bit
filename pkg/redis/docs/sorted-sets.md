@@ -303,6 +303,47 @@ fn main(): ()! {
 }
 ```
 
+### Reading the board inside a transaction
+
+A bonus round pays only the players still outside the top three, and it must
+decide on the board as it is at that moment. `tx.read.zset(key)` is the same
+`Zset` as `r.zset(key)`, bound to the transaction's own connection, so its
+reads run now and see the keys the transaction `WATCH`es. The reads are
+`score`, `scores`, `rank`, `card`, `countByScore`, `countByLex`, `top`,
+`bottom`, `byScore`, `byLex`, `union`, `inter`, `diff`, `randMember`,
+`randMembers` and `scan`. The writes you decide on go through
+`tx.zset(key)`, which queues them for `EXEC`. If another client changes a
+watched key first, the transaction retries and the body runs again with fresh
+reads.
+
+```bit
+import { open, Future } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let key = "game:board"
+  let paid = r.transaction<Future<f64>>([key], (tx) => {
+    let leaders = tx.read.zset(key).top(3)?
+    let bonus = 100.0
+    for entry of leaders {
+      if (entry.member == "linus") {
+        bonus = 0.0
+      }
+    }
+    return tx.zset(key).incrBy("linus", bonus)
+  })?
+  println("linus now has ${paid.get()?}")
+  r.close()
+  return
+}
+```
+
+`tx.read` is for reads only. A write such as `tx.read.zset(key).add(...)` or
+`tx.read.zset(key).incrBy(...)` would run immediately, outside the
+transaction's `MULTI`/`EXEC`, so it fails with `RedisError.Invalid`; queue it
+on `tx.zset(key)` instead. A blocking pop (`blockPopMin` and its kin) fails
+the same way, because the pinned connection cannot wait.
+
 ## Sharp edges
 
 A missing key behaves like an empty sorted set for every read (`card`

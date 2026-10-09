@@ -602,3 +602,150 @@ test "live: scan iterates every member exactly once, scores intact" {
   assert(total == 6.0, "scan scores should sum to 6.0, got ${total}")
   c.close()
 }
+
+fn seedBoard(c: Client, key: string) {
+  delKey(c, key)
+  c.zset(key).addMany(
+    Scored{ member = "ada", score = 10.0 },
+    Scored{ member = "bob", score = 20.0 },
+    Scored{ member = "cy", score = 30.0 },
+  ) catch e {
+    panic("addMany ${key}: ${e.message()}")
+  }
+}
+
+test "live: tx.read.zset reads score, rank, card, counts and ranges before the queued write runs" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let key = "bit:live:zset:txread"
+  let lex = "bit:live:zset:txread:lex"
+  seedBoard(c, key)
+  delKey(c, lex)
+  c.zset(lex).addMany(
+    Scored{ member = "a", score = 0.0 },
+    Scored{ member = "b", score = 0.0 },
+    Scored{ member = "c", score = 0.0 },
+  ) catch e {
+    panic("addMany lex: ${e.message()}")
+  }
+  let out = c.transaction<Future<i64>>([key, lex], (tx) => {
+    tx.zset(lex).add("d", 0.0)
+    let queued = tx.zset(key).add("dee", 40.0)
+    let z = tx.read.zset(key)
+    let dee = z.score("dee")?
+    let bob = z.score("bob")?
+    assert(isNone(dee) && unwrap(bob) == 20.0, "score runs now: dee is not added until EXEC")
+    let both = z.scores("ada", "dee")?
+    assert(unwrap(both[0]) == 10.0 && isNone(both[1]), "scores runs now")
+    let placed = z.rank("cy", false)?
+    assert(
+      unwrap(placed).0 == 0 && unwrap(placed).1 == 30.0,
+      "rank runs now: dee does not outrank cy yet",
+    )
+    let card = z.card()?
+    assert(card == 3, "card = ${card}, not 4")
+    let byScoreCount = z.countByScore(Bound<f64>.Unbounded, Bound<f64>.Unbounded)?
+    assert(byScoreCount == 3, "countByScore = ${byScoreCount}")
+    let byLexCount = tx.read.zset(lex).countByLex(Bound<string>.Unbounded, Bound<string>.Unbounded)?
+    assert(byLexCount == 3, "countByLex = ${byLexCount}, not 4")
+    let top = z.top(10)?
+    assert(len(top) == 3 && top[0].member == "cy", "top sees three members, cy first")
+    let bottom = z.bottom(10)?
+    assert(len(bottom) == 3 && bottom[0].member == "ada", "bottom sees three members, ada first")
+    let range = z.byScore(Bound<f64>.Inclusive(15.0), Bound<f64>.Unbounded, noLimit())?
+    assert(len(range) == 2, "byScore sees bob and cy, got ${len(range)}")
+    let words = tx.read.zset(lex).byLex(
+      Bound<string>.Inclusive("a"),
+      Bound<string>.Unbounded,
+      noLimit(),
+    )?
+    assert(len(words) == 3, "byLex sees a, b, c, not d, got ${len(words)}")
+    return queued
+  }) catch e {
+    panic("transaction: ${e.message()}")
+  }
+  let added = out.get() catch e {
+    panic("future: ${e.message()}")
+  }
+  assert(added == 1, "the queued add committed, got ${added}")
+  let after = c.zset(key).card() catch e {
+    panic("card after: ${e.message()}")
+  }
+  assert(after == 4, "dee landed at EXEC, card = ${after}")
+  delKey(c, key)
+  delKey(c, lex)
+  c.close()
+}
+
+test "live: tx.read.zset reads union, inter, diff, randMember and scan before the queued write runs, and refuses a write" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let key = "bit:live:zset:txread:sets"
+  let other = "bit:live:zset:txread:other"
+  seedBoard(c, key)
+  delKey(c, other)
+  c.zset(other).addMany(
+    Scored{ member = "ada", score = 1.0 },
+    Scored{ member = "zed", score = 5.0 },
+  ) catch e {
+    panic("addMany other: ${e.message()}")
+  }
+  let out = c.transaction<Future<i64>>([key], (tx) => {
+    let queued = tx.zset(key).add("dee", 40.0)
+    let z = tx.read.zset(key)
+    let union = z.union([other], []f64(0), Aggregate.Sum)?
+    assert(len(union) == 4, "union = ${len(union)} members: ada, bob, cy, zed, not dee")
+    let inter = z.inter([other], []f64(0), Aggregate.Sum)?
+    assert(
+      len(inter) == 1 && inter[0].member == "ada" && inter[0].score == 11.0,
+      "inter = ada at 11",
+    )
+    let diff = z.diff([other])?
+    assert(len(diff) == 2, "diff = bob and cy, got ${len(diff)}")
+    let one = z.randMember()?
+    assert(unwrap(one) != "dee", "randMember draws from the three members present")
+    let many = z.randMembers(10)?
+    assert(len(many) == 3, "randMembers(10) = ${len(many)}, not 4")
+    let it = z.scan()
+    let seen = 0
+    let next = it.next()?
+    while (isSome(next)) {
+      assert(unwrap(next).member != "dee", "scan yielded dee before EXEC")
+      seen = seen + 1
+      next = it.next()?
+    }
+    assert(seen == 3, "scan yields the three members present, got ${seen}")
+    let refused = false
+    let _ = z.add("eve", 1.0) catch _ {
+      refused = true
+      0
+    }
+    assert(refused, "a write through tx.read is refused")
+    let refusedPop = false
+    let _ = z.blockPopMin(1000000) catch _ {
+      refusedPop = true
+      Option.None
+    }
+    assert(refusedPop, "a blocking pop through tx.read is refused")
+    return queued
+  }) catch e {
+    panic("transaction: ${e.message()}")
+  }
+  let added = out.get() catch e {
+    panic("future: ${e.message()}")
+  }
+  assert(added == 1, "the queued add committed, got ${added}")
+  let after = c.zset(key).score("eve") catch e {
+    panic("score after: ${e.message()}")
+  }
+  assert(isNone(after), "eve never landed")
+  delKey(c, key)
+  delKey(c, other)
+  c.close()
+}
