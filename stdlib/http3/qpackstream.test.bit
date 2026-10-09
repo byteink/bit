@@ -1,0 +1,467 @@
+// stdlib/http3/qpackstream.test.bit — the peer's QPACK encoder and decoder
+// streams are read for the connection's life (qpackstream.bit, #7753; RFC 9204
+// §4.2, §4.3, §4.4).
+//
+// The instruction tests drive `qpackDecoderFeed` and `qpackEncoderFeed` directly:
+// split deliveries, an instruction cut short, and each instruction that closes the
+// connection. The loopback tests run a real client and server `H3Conn` over QUIC:
+// the client writes more insert instructions on its QPACK encoder stream than the
+// connection window (32768, `quicconnFlowWindow`), then a request whose field
+// section references the last inserts. The server's `qpackEncRead` counts every
+// byte it took, and the request only decodes because the inserts were applied. The
+// client plays a peer encoder with a plain `Encoder`, reading the server's decoder
+// stream to learn what it holds, as `SETTINGS_QPACK_BLOCKED_STREAMS` = 0 demands.
+//
+// `h3cPem`, `h3cLeafHex`, `h3cKeyHex`, `h3cClientConfig` and `h3cWait`
+// (control.test.bit) are siblings; the imports there are this module's.
+
+// The bytes of `n` insert-with-literal-name instructions from `gen`, each with a
+// value of `pad` bytes.
+fn h3qInserts(gen: Encoder, from: int, n: int, pad: int): []byte {
+  let out = []byte(0)
+  let value = string([]byte(pad))
+  let i = 0
+  while (i < n) {
+    let ins = gen.insertLiteral("x-fill-${from + i}", value) catch _ {
+      return out
+    }
+    out = qpackAppendBytes(out, ins)
+    i = i + 1
+  }
+  return out
+}
+
+// Feeds `wire` to the decoder `d` one byte at a time, carrying an unfinished
+// instruction to the next call as `h3qpackFeed` does. Returns the bytes left over.
+fn h3qByByte(d: Decoder, wire: []byte): int {
+  let pending = []byte(0)
+  let i = 0
+  while (i < len(wire)) {
+    let buf = qpackAppendBytes(qpackAppendBytes([]byte(0), pending), wire[i:i + 1])
+    let used = qpackDecoderFeed(d, buf) catch _ {
+      return -1
+    }
+    pending = buf[used:len(buf)]
+    i = i + 1
+  }
+  return len(pending)
+}
+
+test "encoder-stream instructions delivered a byte at a time build the same table" {
+  let gen = Encoder(4096, true)
+  let wire = gen.setCapacity(4096)
+  wire = qpackAppendBytes(wire, h3qInserts(gen, 0, 20, 90))
+  let whole = Decoder(4096)
+  let used = qpackDecoderFeed(whole, wire) catch e {
+    assert(false, "whole: ${e.message()}")
+    return
+  }
+  assert(used == len(wire), "whole feed used ${used} of ${len(wire)}")
+  let split = Decoder(4096)
+  assert(h3qByByte(split, wire) == 0, "nothing left over")
+  assert(split.insertCount() == gen.insertCount(), "inserts ${split.insertCount()}")
+  assert(split.insertCount() == whole.insertCount(), "same count as a whole feed")
+  assert(split.tableSize() == whole.tableSize(), "same size as a whole feed")
+  assert(split.tableCount() == whole.tableCount(), "same entries as a whole feed")
+}
+
+test "an instruction cut short is left alone until the rest arrives" {
+  let gen = Encoder(4096, false)
+  let setCap = gen.setCapacity(4096)
+  let ins = gen.insertLiteral("x-name", "some value") catch _ {
+    assert(false, "insert")
+    return
+  }
+  let d = Decoder(4096)
+  assert(h3qFeeds(d, setCap), "capacity applied")
+  let cut = ins[0:len(ins) - 3]
+  let used = qpackDecoderFeed(d, cut) catch _ {
+    assert(false, "a short instruction is not an error")
+    return
+  }
+  assert(used == 0, "used ${used} of a cut instruction")
+  assert(d.insertCount() == 0, "table untouched")
+  let all = qpackDecoderFeed(d, ins) catch _ {
+    assert(false, "whole instruction")
+    return
+  }
+  assert(all == len(ins) && d.insertCount() == 1, "applied once complete")
+}
+
+test "malformed encoder-stream instructions fail" {
+  let over = Encoder(8192, false).setCapacity(8192)
+  assert(!h3qFeeds(Decoder(4096), over), "a capacity over the advertised limit")
+  let d = Decoder(4096)
+  assert(h3qFeeds(d, []byte{ 0x20 | 31, 0xe1, 0x1f }), "setCapacity 4096 is fine")
+  assert(!h3qFeeds(d, []byte{ 0x00 }), "Duplicate of an entry that is not there")
+  assert(
+    !h3qFeeds(d, []byte{ 0xbf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00 }),
+    "over-long index",
+  )
+}
+
+// Whether `qpackDecoderFeed` accepts `wire` on `d`.
+fn h3qFeeds(d: Decoder, wire: []byte): bool {
+  qpackDecoderFeed(d, wire) catch _ {
+    return false
+  }
+  return true
+}
+
+test "decoder-stream instructions retire sections and move the known count" {
+  let e = Encoder(4096, false)
+  e.setCapacity(4096)
+  e.insertLiteral("a", "1") catch _ {
+    return
+  }
+  e.insertLiteral("b", "2") catch _ {
+    return
+  }
+  let fields = []HeaderField{ HeaderField{ name = "b", value = "2", sensitive = false } }
+  e.encodeFieldSection(4, e.insertCount(), fields)
+  e.encodeFieldSection(8, e.insertCount(), fields)
+  assert(len(e.outstanding) == 2, "two sections reference the table")
+  e.encodeFieldSection(
+    12,
+    e.insertCount(),
+    []HeaderField{ HeaderField{ name = ":method", value = "GET", sensitive = false } },
+  )
+  assert(len(e.outstanding) == 2, "a section with Required Insert Count 0 is not outstanding")
+  let d = Decoder(4096)
+  let wire = qpackAppendBytes(d.sectionAck(4), d.streamCancel(8))
+  wire = qpackAppendBytes(wire, d.streamCancel(99))
+  let applied = qpackEncoderFeed(e, wire) catch _ {
+    assert(false, "decoder-stream instructions")
+    return
+  }
+  assert(applied == len(wire), "all applied")
+  assert(len(e.outstanding) == 0, "acknowledged and cancelled")
+  assert(e.knownReceivedCount() == 2, "known ${e.knownReceivedCount()}")
+}
+
+test "malformed decoder-stream instructions fail" {
+  let e = Encoder(4096, false)
+  e.setCapacity(4096)
+  e.insertLiteral("a", "1") catch _ {
+    return
+  }
+  let d = Decoder(4096)
+  assert(!h3qAcks(e, d.sectionAck(4)), "acknowledging a stream with no section")
+  assert(!h3qAcks(e, d.insertCountIncrement(0)), "an increment of zero")
+  assert(!h3qAcks(e, d.insertCountIncrement(2)), "an increment past the inserts")
+  assert(h3qAcks(e, d.insertCountIncrement(1)), "an increment of the one insert")
+  assert(e.knownReceivedCount() == 1, "known")
+  // A section cut short at its integer continuation is left for more bytes.
+  let cut = qpackEncoderFeed(e, []byte{ 0x80 | 0x7f }) catch _ {
+    assert(false, "a cut Section Acknowledgment is not an error")
+    return
+  }
+  assert(cut == 0, "a cut Section Acknowledgment waits: ${cut}")
+}
+
+// Whether `qpackEncoderFeed` accepts `wire` on `e`.
+fn h3qAcks(e: Encoder, wire: []byte): bool {
+  qpackEncoderFeed(e, wire) catch _ {
+    return false
+  }
+  return true
+}
+
+test "the Required Insert Count wraps by the advertised capacity, not the current one" {
+  let gen = Encoder(4096, false)
+  let d = Decoder(4096)
+  let wire = gen.setCapacity(1024)
+  wire = qpackAppendBytes(wire, h3qInserts(gen, 0, 100, 10))
+  assert(h3qFeeds(d, wire), "inserts")
+  assert(d.insertCount() == 100 && d.capacity() == 1024, "table at capacity 1024")
+  // An encoder wrapping against the advertised 4096 bytes (128 entries), referencing
+  // the newest entry relative to Base 100.
+  let section = qpackEncodePrefix(100, 100, qpackMaxEntries(4096))
+  section = qpackAppendBytes(section, []byte{ 0x80 })
+  let fields = d.decodeFieldSection(section) catch e {
+    assert(false, "decode: ${e.message()}")
+    return
+  }
+  assert(len(fields) == 1 && fields[0].name == "x-fill-99", "newest entry: ${len(fields)}")
+}
+
+// A loopback pair: the server `H3Conn` (sent on `out`) and the client.
+fn h3qServe(sock: UdpSocket, out: chan<H3Conn>, got: chan<string>) {
+  let srv = h3Accept(sock, h3cPem("CERTIFICATE", h3cLeafHex), h3cPem("PRIVATE KEY", h3cKeyHex)) catch _ {
+    return
+  }
+  out <- srv
+  let sr = srv.accept() catch e {
+    got <- "accept: ${e.message()}"
+    return
+  }
+  let line = sr.req.path
+  for h of sr.req.headers {
+    line = line + " " + h.name + "=" + h.value
+  }
+  got <- line
+}
+
+// Ends the read of a stream that never delivers: sends on `wake` after ten seconds.
+fn h3qWatchdog(wake: chan<int>) {
+  sleep(10000 * Millisecond)
+  wake <- 0
+}
+
+// Reads the server's decoder stream `s` into `gen` until `done()` holds.
+fn h3qDrain(s: Stream, gen: Encoder, done: () => bool): bool {
+  let wake = chan<int>(1)
+  spawn h3qWatchdog(wake)
+  let pending = []byte(0)
+  let guard = 0
+  while (!done() && guard < 1000) {
+    guard = guard + 1
+    let chunk = streamReadUntil(s, wake) catch _ {
+      return false
+    }
+    let buf = qpackAppendBytes(qpackAppendBytes([]byte(0), pending), chunk.data)
+    let used = qpackEncoderFeed(gen, buf) catch _ {
+      return false
+    }
+    pending = buf[used:len(buf)]
+  }
+  return done()
+}
+
+// The server's decoder stream, found among the streams it opened on `cl`, with the
+// instruction bytes that came with its type byte applied to `gen`.
+fn h3qFindDecoder(cl: H3Conn, gen: Encoder): Stream! {
+  let i = 0
+  while (i < 3) {
+    i = i + 1
+    let s = cl.conn.acceptStream()?
+    let first = h3readFirst(s)?
+    if (len(first.data) > 0 && int(first.data[0]) == h3StreamQpackDecoder) {
+      qpackEncoderFeed(gen, h3tail(first.data))?
+      return s
+    }
+  }
+  fail newError("the server opened no decoder stream")
+}
+
+test "inserts past the connection window are read and a request referencing them decodes" {
+  let sock = udpBind("127.0.0.1", 0) catch _ {
+    assert(false, "udpBind")
+    return
+  }
+  let port = sock.port() catch _ {
+    assert(false, "port")
+    return
+  }
+  let out = chan<H3Conn>(1)
+  let got = chan<string>(1)
+  spawn h3qServe(sock, out, got)
+  let cl = h3DialTls("127.0.0.1", port, "localhost", h3cClientConfig()) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  let srv = <- out
+  let gen = Encoder(4096, false)
+  let sent = 1
+  let wire = gen.setCapacity(4096)
+  cl.qpackEnc.write(wire) catch _ {
+    assert(false, "write capacity")
+    return
+  }
+  sent = sent + len(wire)
+  let i = 0
+  while (sent < 40000) {
+    let batch = h3qInserts(gen, i, 8, 110)
+    i = i + 8
+    cl.qpackEnc.write(batch) catch _ {
+      assert(false, "write inserts")
+      return
+    }
+    sent = sent + len(batch)
+  }
+  let last = gen.insertLiteral("x-last-a", "va") catch _ {
+    return
+  }
+  let last2 = gen.insertLiteral("x-last-b", "vb") catch _ {
+    return
+  }
+  cl.qpackEnc.write(qpackAppendBytes(qpackAppendBytes([]byte(0), last), last2)) catch _ {
+    assert(false, "write last")
+    return
+  }
+  sent = sent + len(last) + len(last2)
+  assert(sent > 32768, "wrote ${sent} bytes on the encoder stream")
+  let ds = h3qFindDecoder(cl, gen) catch e {
+    assert(false, "decoder stream: ${e.message()}")
+    return
+  }
+  assert(
+    h3qDrain(ds, gen, () => gen.knownReceivedCount() == gen.insertCount()),
+    "inserts announced",
+  )
+  let s = cl.conn.openStream() catch _ {
+    assert(false, "open")
+    return
+  }
+  let fields = []HeaderField{
+    HeaderField{ name = ":method", value = "GET", sensitive = false },
+    HeaderField{ name = ":scheme", value = "https", sensitive = false },
+    HeaderField{ name = ":authority", value = "localhost", sensitive = false },
+    HeaderField{ name = ":path", value = "/dyn", sensitive = false },
+    HeaderField{ name = "x-last-a", value = "va", sensitive = false },
+    HeaderField{ name = "x-last-b", value = "vb", sensitive = false },
+  }
+  let section = gen.encodeFieldSection(s.id(), gen.insertCount(), fields)
+  assert(len(gen.outstanding) == 1, "the section references the table")
+  s.write(h3frame(h3FrameHeaders, section)) catch _ {
+    assert(false, "write request")
+    return
+  }
+  s.finish() catch _ {
+    assert(false, "finish request")
+    return
+  }
+  let line = <- got
+  assert(line == "/dyn x-last-a=va x-last-b=vb", "request: ${line}")
+  assert(srv.qpackEncRead == sent, "server read ${srv.qpackEncRead} of ${sent} encoder bytes")
+  assert(srv.dec.insertCount() == gen.insertCount(), "server inserts ${srv.dec.insertCount()}")
+  assert(h3qDrain(ds, gen, () => len(gen.outstanding) == 0), "the section was acknowledged")
+  println("encoder-stream bytes sent=${sent} read=${srv.qpackEncRead} window=32768")
+  cl.close()
+}
+
+// A server `H3Conn` that does nothing but sit on its connection, for tests that
+// call the reader's functions on it directly.
+fn h3qHold(sock: UdpSocket, out: chan<H3Conn>, hold: chan<int>) {
+  let srv = h3Accept(sock, h3cPem("CERTIFICATE", h3cLeafHex), h3cPem("PRIVATE KEY", h3cKeyHex)) catch _ {
+    return
+  }
+  out <- srv
+  <- hold
+}
+
+fn h3qPair(out: chan<H3Conn>, hold: chan<int>): H3Conn! {
+  let sock = udpBind("127.0.0.1", 0)?
+  let port = sock.port()?
+  spawn h3qHold(sock, out, hold)
+  return h3DialTls("127.0.0.1", port, "localhost", h3cClientConfig())?
+}
+
+fn h3qChunk(data: []byte, fin: bool): StreamChunk {
+  return StreamChunk{ data = data, fin = fin, reset = false, resetCode = 0 }
+}
+
+test "each way a QPACK stream goes wrong has its own error code" {
+  let out = chan<H3Conn>(1)
+  let hold = chan<int>(1)
+  let cl = h3qPair(out, hold) catch e {
+    assert(false, "pair: ${e.message()}")
+    return
+  }
+  let srv = <- out
+  let enc = h3QpackIn{ pending = []byte(0), encoderStream = true }
+  let ok = Encoder(4096, false).setCapacity(4096)
+  assert(h3qpackVerdict(srv, enc, h3qChunk(ok, false), ok) == 0, "a valid instruction")
+  assert(srv.dec.capacity() == 4096, "applied to the connection's decoder")
+  let bad = Encoder(8192, false).setCapacity(8192)
+  assert(
+    h3qpackVerdict(srv, enc, h3qChunk(bad, false), bad) == h3ErrQpackEncoderStream,
+    "capacity over the advertised limit",
+  )
+  assert(
+    h3qpackVerdict(srv, enc, h3qChunk([]byte(0), true), []byte(0)) == h3ErrClosedCritical,
+    "the encoder stream finished",
+  )
+  let dec = h3QpackIn{ pending = []byte(0), encoderStream = false }
+  let ack = Decoder(4096).sectionAck(4)
+  assert(
+    h3qpackVerdict(srv, dec, h3qChunk(ack, false), ack) == h3ErrQpackDecoderStream,
+    "an acknowledgment of a stream with no section",
+  )
+  assert(
+    h3qpackVerdict(srv, dec, h3qChunk([]byte(0), true), []byte(0)) == h3ErrClosedCritical,
+    "the decoder stream finished",
+  )
+  // An instruction that never finishes cannot be buffered without bound.
+  let flood = h3QpackIn{ pending = []byte(0), encoderStream = true }
+  let head = []byte{ 0x40 | 0x1f, 0xff, 0xff, 0x7f }
+  assert(h3qpackFeed(srv, flood, head) == 0, "a long name is awaited")
+  assert(
+    h3qpackFeed(srv, flood, []byte(h3QpackMaxEncoderPending)) == h3ErrQpackEncoderStream,
+    "bounded buffering",
+  )
+  assert(
+    len(flood.pending) <= h3QpackMaxEncoderPending + len(head),
+    "pending ${len(flood.pending)}",
+  )
+  hold <- 0
+  cl.close()
+}
+
+test "the peer finishing its QPACK encoder stream closes the connection" {
+  let out = chan<H3Conn>(1)
+  let hold = chan<int>(1)
+  let cl = h3qPair(out, hold) catch e {
+    assert(false, "pair: ${e.message()}")
+    return
+  }
+  let srv = <- out
+  srv.watchPeer()
+  cl.qpackEnc.finish() catch _ {
+    assert(false, "finish")
+    return
+  }
+  assert(
+    h3cWait(() => srv.gone),
+    "server connection closed after the peer's FIN on its encoder stream",
+  )
+  hold <- 0
+  cl.close()
+}
+
+test "a malformed encoder-stream instruction closes the connection" {
+  let out = chan<H3Conn>(1)
+  let hold = chan<int>(1)
+  let cl = h3qPair(out, hold) catch e {
+    assert(false, "pair: ${e.message()}")
+    return
+  }
+  let srv = <- out
+  srv.watchPeer()
+  cl.qpackEnc.write(Encoder(8192, false).setCapacity(8192)) catch _ {
+    assert(false, "write")
+    return
+  }
+  assert(h3cWait(() => srv.gone), "server connection closed after a capacity over its limit")
+  hold <- 0
+  cl.close()
+}
+
+test "an abandoned request stream is cancelled on the decoder stream once the peer has inserted" {
+  let out = chan<H3Conn>(1)
+  let hold = chan<int>(1)
+  let cl = h3qPair(out, hold) catch e {
+    assert(false, "pair: ${e.message()}")
+    return
+  }
+  let srv = <- out
+  let gen = Encoder(4096, false)
+  let ds = h3qFindDecoder(cl, gen) catch e {
+    assert(false, "decoder stream: ${e.message()}")
+    return
+  }
+  h3cancelStream(srv, 8)
+  assert(srv.qpackKnown == 0, "nothing to cancel before the peer inserts")
+  srv.qpackKnown = 3
+  h3cancelStream(srv, 8)
+  let wake = chan<int>(1)
+  spawn h3qWatchdog(wake)
+  let chunk = streamReadUntil(ds, wake) catch _ {
+    assert(false, "no Stream Cancellation arrived")
+    return
+  }
+  let want = Decoder(4096).streamCancel(8)
+  assert(len(chunk.data) == len(want) && chunk.data[0] == want[0], "got ${len(chunk.data)} bytes")
+  hold <- 0
+  cl.close()
+}

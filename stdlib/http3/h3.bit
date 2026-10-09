@@ -13,9 +13,10 @@
 //     tells a uni stream from a request stream by that leading type byte.
 //
 //   * **SETTINGS.** Both peers send a SETTINGS frame first thing on their control
-//     stream (RFC 9114 §7.2.4). We advertise a zero-capacity QPACK dynamic table
-//     (`SETTINGS_QPACK_MAX_TABLE_CAPACITY` = 0, `SETTINGS_QPACK_BLOCKED_STREAMS`
-//     = 0); a client additionally sends MAX_PUSH_ID = 0 to forbid server push.
+//     stream (RFC 9114 §7.2.4). We advertise a QPACK dynamic table of
+//     `h3QpackTableCapacity` bytes and no blocked streams
+//     (`SETTINGS_QPACK_BLOCKED_STREAMS` = 0); a client additionally sends
+//     MAX_PUSH_ID = 0 to forbid server push.
 //
 //   * **Frames.** Every HTTP/3 frame is a type varint, a length varint, then that
 //     many payload bytes (RFC 9114 §7.1): DATA=0x0, HEADERS=0x1, SETTINGS=0x4,
@@ -30,13 +31,11 @@
 //   * **QPACK over QUIC.** The encoder's table-mutation instructions go out on the
 //     qpack-encoder uni stream and the decoder's acknowledgements on the
 //     qpack-decoder uni stream; the peer feeds them back into its `Decoder` /
-//     `Encoder`. This core uses a *zero-capacity* dynamic table, so every field
-//     line is literal (or a static-table reference) and the Required Insert Count
-//     is always 0: the QPACK streams then carry only their type byte, no
-//     instruction ever blocks, and no section acknowledgement is required
-//     (RFC 9204 §2.2.1). The plumbing (open the streams, emit the type prefix,
-//     apply the peer's encoder stream, emit an ack when the capacity is nonzero)
-//     is in place so the same code is correct once a capacity is negotiated.
+//     `Encoder`. This core's own encoder inserts nothing, so every field line it
+//     writes is literal (or a static-table reference) and its Required Insert
+//     Count is 0; its decoder takes the peer's inserts from a reader on the peer's
+//     encoder stream, and answers each with an Insert Count Increment and each
+//     section that used one with a Section Acknowledgment (`qpackstream.bit`, #7753).
 //
 // It is one flat module with `qpack.bit`, so it calls that file's helpers
 // (`qpackAppendBytes`, the `Encoder`/`Decoder`/`HeaderField` types) directly and
@@ -49,6 +48,7 @@ import {
   StreamChunk, encodeVarint, streamReadUntil, streamFinishUntil, Woken,
 } from "std/quic"
 import { UdpSocket } from "std/net"
+import { Mutex } from "std/sync"
 import { monotonic } from "std/time"
 import { TlsConfig } from "std/tls"
 
@@ -119,6 +119,21 @@ export class H3Conn {
   control: Stream
   qpackEnc: Stream
   qpackDec: Stream
+  // `dec` and `enc` are used by the request threads and by the readers of the
+  // peer's two QPACK streams at once (`qpackstream.bit`); `decMu` and `encMu`
+  // guard each. `decOutMu` orders the bytes written to `qpackDec` and guards
+  // `qpackKnown`, the insert count the peer's encoder has been told we hold.
+  decMu: Mutex
+  encMu: Mutex
+  decOutMu: Mutex
+  qpackKnown: int
+  // Whether the peer opened its QPACK encoder / decoder stream yet (RFC 9204
+  // §4.2: a second of either is H3_STREAM_CREATION_ERROR), and how many bytes of
+  // each `h3qpackRun` has read — every one returned to QUIC as connection credit.
+  qpackEncSeen: bool
+  qpackDecSeen: bool
+  qpackEncRead: int
+  qpackDecRead: int
   // The highest client-initiated request stream id `accept` has handed to a
   // caller so far, or -1 before the first one. The cutoff `goAway` sends is
   // derived from this — see `goAway`'s doc comment.
@@ -187,13 +202,16 @@ export class H3Conn {
       fail H3Unsent{ cause = e }
     }
     let sid = s.id()
-    let section = this.enc.encodeFieldSection(sid, this.enc.insertCount(), h3requestFields(req))
+    let section = h3encodeSection(this, sid, h3requestFields(req))
     let out = h3frame(h3FrameHeaders, section)
     if (len(req.body) > 0) {
       out = qpackAppendBytes(out, h3frame(h3FrameData, req.body))
     }
     s.write(out)?
-    let buf = h3exchangeStream(s, wake)?
+    let buf = h3exchangeStream(s, wake) catch e {
+      h3cancelStream(this, sid)
+      fail e
+    }
     return h3parseResponse(this, sid, buf)?
   }
 
@@ -215,8 +233,9 @@ export class H3Conn {
 
   // Accept the next request. Peer-initiated streams are classified by their leading
   // byte: a control stream (0x00), qpack-encoder stream (0x02) and qpack-decoder
-  // stream (0x03) are consumed into the QPACK state and skipped; the first stream
-  // that is none of these is a request stream (its HEADERS frame type, 0x01).
+  // stream (0x03) each get a reader that runs for the connection's life
+  // (`h3peerUni`) and are skipped here; the first stream that is none of these is
+  // a request stream (its HEADERS frame type, 0x01).
   // A request stream at or above a cutoff this connection has already sent in a
   // GOAWAY (`goAway`) is refused (`h3refuse`, RFC 9114 §5.2/§4.1.1) instead of
   // being read and returned — the scan continues past it. Otherwise it is read
@@ -228,19 +247,11 @@ export class H3Conn {
       let s = this.conn.acceptStream()?
       let first = h3readFirst(s)?
       if (len(first.data) > 0) {
-        let t = int(first.data[0])
-        if (t == h3StreamControl) {
-          if (h3claimControl(this)) {
-            spawn h3controlRun(this, s, first)
-          }
-        } else if (t == h3StreamQpackEncoder) {
-          this.dec.applyEncoderStream(h3tail(first.data))?
-        } else if (t == h3StreamQpackDecoder) {
-          this.enc.applyDecoderStream(h3tail(first.data))?
-        } else {
+        if (!h3peerUni(this, s, first)) {
           let sid = s.id()
           if (this.goawaySent && sid >= this.goawayId) {
             h3refuse(s)
+            h3cancelStream(this, sid)
             continue
           }
           if (sid > this.highWater) {
@@ -259,7 +270,7 @@ export class H3Conn {
   // the `:status` field section, then a DATA frame for the body if any, then FIN.
   export respond(sr: H3ServerRequest, resp: H3Response): ()! {
     let sid = sr.stream.id()
-    let section = this.enc.encodeFieldSection(sid, this.enc.insertCount(), h3responseFields(resp))
+    let section = h3encodeSection(this, sid, h3responseFields(resp))
     let out = h3frame(h3FrameHeaders, section)
     if (len(resp.body) > 0) {
       out = qpackAppendBytes(out, h3frame(h3FrameData, resp.body))
@@ -381,12 +392,13 @@ fn h3parseFrames(data: []byte): []h3Frame! {
   return out
 }
 
-// The SETTINGS payload we advertise: a zero-capacity QPACK dynamic table and no
-// blocked streams (RFC 9204 §5). Both are 0, so no dynamic-table state is ever
-// exchanged and no field section can block.
+// The SETTINGS payload we advertise: a QPACK dynamic table of up to
+// `h3QpackTableCapacity` bytes and no blocked streams (RFC 9204 §5). With no
+// blocked streams the peer's encoder references only entries we have announced
+// (Insert Count Increment), so no field section can block.
 fn h3settingsPayload(): []byte {
   let out = encodeVarint(u64(h3SettingQpackMaxTableCapacity))
-  out = qpackAppendBytes(out, encodeVarint(u64(0)))
+  out = qpackAppendBytes(out, encodeVarint(u64(h3QpackTableCapacity)))
   out = qpackAppendBytes(out, encodeVarint(u64(h3SettingQpackBlockedStreams)))
   out = qpackAppendBytes(out, encodeVarint(u64(0)))
   return out
@@ -496,17 +508,6 @@ fn h3parseStatus(s: string): int {
   return v
 }
 
-// Emit a Section Acknowledgment on our qpack-decoder stream for `streamId`, but
-// only when the dynamic table has a nonzero capacity: a section that referenced no
-// dynamic entry (Required Insert Count 0) is never acknowledged (RFC 9204 §4.4.1),
-// and this core runs a zero-capacity table, so in practice no ack is sent. The
-// call keeps the acknowledgement plumbing correct once a capacity is negotiated.
-fn h3maybeAck(c: H3Conn, streamId: int): ()! {
-  if (c.dec.capacity() > 0) {
-    c.qpackDec.write(c.dec.sectionAck(streamId))?
-  }
-}
-
 // Decode the frames of a fully-read request stream into an `H3Request`: the first
 // HEADERS frame's field section supplies the pseudo- and regular headers, DATA
 // frames concatenate into the body, and any other frame type is ignored.
@@ -522,8 +523,7 @@ fn h3parseRequest(c: H3Conn, sid: int, buf: []byte): H3Request! {
   for f of frames {
     if (int(f.ftype) == h3FrameHeaders && !sawHeaders) {
       sawHeaders = true
-      let fields = c.dec.decodeFieldSection(f.payload)?
-      h3maybeAck(c, sid)?
+      let fields = h3decodeSection(c, sid, f.payload)?
       for hf of fields {
         if (hf.name == ":method") {
           method = hf.value
@@ -561,8 +561,7 @@ fn h3parseResponse(c: H3Conn, sid: int, buf: []byte): H3Response! {
   for f of frames {
     if (int(f.ftype) == h3FrameHeaders && !sawHeaders) {
       sawHeaders = true
-      let fields = c.dec.decodeFieldSection(f.payload)?
-      h3maybeAck(c, sid)?
+      let fields = h3decodeSection(c, sid, f.payload)?
       for hf of fields {
         if (hf.name == ":status") {
           status = h3parseStatus(hf.value)
@@ -594,10 +593,18 @@ fn h3newConn(conn: Conn, isClient: bool): H3Conn! {
   return H3Conn{
     conn = conn,
     enc = Encoder(0, true),
-    dec = Decoder(0),
+    dec = Decoder(h3QpackTableCapacity),
     control = control,
     qpackEnc = qpackEnc,
     qpackDec = qpackDec,
+    decMu = Mutex(),
+    encMu = Mutex(),
+    decOutMu = Mutex(),
+    qpackKnown = 0,
+    qpackEncSeen = false,
+    qpackDecSeen = false,
+    qpackEncRead = 0,
+    qpackDecRead = 0,
     highWater = -1,
     goawaySent = false,
     goawayId = -1,
