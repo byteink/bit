@@ -1,17 +1,512 @@
-// pkg/redis/geo.bit — `r.geo(key)`: the geospatial handle. Epic
-// #6013, #6028: SCAFFOLD ONLY, no commands wired yet (`GEOADD, GEOSEARCH, GEODIST`, a
-// follow-up ticket) — this file exists so later family tickets touch only
-// their own file, never `client.bit`. `cmd.bit`'s header is the template:
-// one `Cmd<T>` factory per command, called from a method here.
-export class Geo {
-  client: Client,
-  key: string,
+// pkg/redis/geo.bit - `r.geo(key)`: the geospatial commands, `GEOADD`,
+// `GEOPOS`, `GEODIST`, `GEOHASH`, `GEOSEARCH` and `GEOSEARCHSTORE`. Epic
+// #6013, #6028, #6036. Follows `cmd.bit`'s HOW-TO header and `counter.bit`'s
+// shape: one `Cmd<T>` factory per command, an immediate method on `Geo`, a
+// queued one on `GeoBatch`.
+//
+// `Geo` HOLDS `client: Client`, NOT `runner: Runner`, as `zset.bit` does and
+// for the same reason: `runner` needs `client.bit`'s `geo()` accessor and a
+// `TxRead.geo` on `tx.bit` to change, and this ticket touches only the geo
+// family's files. `Client.runCmd` does for a pool-backed handle what
+// `Runner.runCmd` would; only `tx.read.geo(key)` is missing. Reported on #6036.
+//
+// A GEO KEY IS A SORTED SET. `GEOADD` stores each member with its 52-bit
+// geohash as the score, so `r.zset(key)` reads the same data and `DEL` and
+// `TYPE` see a `zset`. `GEOSEARCHSTORE` writes the same shape to its target.
+//
+// ONE METHOD PER COMMAND, TYPED OPTIONS. `add` takes `GeoAddOptions` (NX, XX,
+// CH), `search` takes `GeoFrom` (a member or a point), `GeoBy` (a radius or a
+// box) and `GeoSearchOptions` (order, COUNT [ANY], WITHCOORD/WITHDIST/
+// WITHHASH); `searchStore` takes `GeoStoreOptions` (order, COUNT [ANY],
+// STOREDIST). Each reads the same word the server does, so a reader with the
+// command reference open can follow it.
+//
+// COORDINATES ARE CHECKED BEFORE ANYTHING IS SENT. The server refuses a
+// longitude outside -180..180 or a latitude outside +-85.05112878 (the Web
+// Mercator limit its geohash covers), so `checkPoint` fails
+// `RedisError.Invalid` with the value and the range; a NaN fails the same way.
+// Whatever else the server rejects (NX with XX, a negative radius) still
+// reaches the caller as the server's own `RedisError`.
+//
+// `GeoHit` CARRIES ONLY WHAT WAS ASKED FOR: `dist`, `hash` and `at` are `None`
+// unless `WITHDIST`, `WITHHASH` or `WITHCOORD` was on. `dist` is in the unit
+// the search area named. The server lists the extras in a fixed order (dist,
+// hash, coordinates) whatever order the options were given in; `asGeoHits`
+// reads them that way.
+
+// A longitude and latitude in degrees (WGS84).
+export class Point { export lon: f64, export lat: f64 }
+
+// One `GEOADD` entry: a member name and where it is.
+export class GeoMember { export member: string, export at: Point }
+
+// `GeoMember` without the class literal: `place("ana", 13.4, 52.5)`.
+export fn place(member: string, lon: f64, lat: f64): GeoMember {
+  return GeoMember{ member = member, at = Point{ lon = lon, lat = lat } }
 }
 
-// The queued view `Pipeline.geo`/`Tx.geo` both return — `cmd.bit`'s
-// `Batch` is the ONE client-side queue the two executors share, so this
-// is the ONLY queued view Geo needs (`cmd.bit`'s header, point 2).
+// A distance unit; `text()` is the word the server expects.
+export enum GeoUnit {
+  Meters
+  Kilometers
+  Feet
+  Miles
+
+  export text(): string {
+    match (this) {
+      Meters => return "m"
+      Kilometers => return "km"
+      Feet => return "ft"
+      Miles => return "mi"
+    }
+  }
+}
+
+// `GEOADD`'s flags: `nx` adds only new members, `xx` updates only existing
+// ones, `ch` makes the reply count changed members (updated ones too), not
+// just new ones.
+export class GeoAddOptions {
+  export nx: bool = false,
+  export xx: bool = false,
+  export ch: bool = false,
+}
+
+// Where a search is centred: on an existing member (`FROMMEMBER`) or on a
+// point (`FROMLONLAT`).
+export enum GeoFrom {
+  Member(string),
+  At(Point),
+}
+
+// The shape of a search area: a circle of `radius` or a `width` by `height`
+// rectangle, in `unit`.
+export enum GeoBy {
+  Radius(f64, GeoUnit),
+  Box(f64, f64, GeoUnit),
+}
+
+// Result order by distance from the centre: `Nearest` is `ASC`, `Farthest` is
+// `DESC`, `Unsorted` leaves it to the server.
+export enum GeoOrder {
+  Unsorted,
+  Nearest,
+  Farthest,
+}
+
+// `GEOSEARCH`'s knobs. `count` 0 means all; `any` (needs a `count`) stops at
+// the first `count` matches instead of finding the nearest.
+export class GeoSearchOptions {
+  export order: GeoOrder = GeoOrder.Unsorted,
+  export count: int = 0,
+  export any: bool = false,
+  export withCoord: bool = false,
+  export withDist: bool = false,
+  export withHash: bool = false,
+}
+
+// `GEOSEARCHSTORE`'s knobs; `storeDist` stores each member's distance as its
+// score instead of its geohash.
+export class GeoStoreOptions {
+  export order: GeoOrder = GeoOrder.Unsorted,
+  export count: int = 0,
+  export any: bool = false,
+  export storeDist: bool = false,
+}
+
+// One search result. `dist`, `hash` and `at` are `Some` only when the search
+// asked for them (this file's header).
+export class GeoHit {
+  export member: string,
+  export dist: Option<f64>,
+  export hash: Option<i64>,
+  export at: Option<Point>,
+}
+
+const maxLat: f64 = 85.05112878
+
+export class Geo {
+  client: Client
+  key: string
+
+  // `GEOADD`: places the members; returns how many were new (with `ch`, how
+  // many changed). A member already there is moved.
+  export add(members: []GeoMember, opts: GeoAddOptions = GeoAddOptions{}): i64!RedisError {
+    checkMembers(members)?
+    return this.client.runCmd(geoAddCmd(this.key, members, opts))?
+  }
+  // `GEOPOS`: where each member is, `None` for one that is not there.
+  export pos(...members: string): []Option<Point>!RedisError {
+    return this.client.runCmd(geoPosCmd(this.key, members))?
+  }
+  // `GEODIST`: the distance between two members in `unit`, `None` when either
+  // is missing.
+  export dist(a: string, b: string, unit: GeoUnit = GeoUnit.Meters): Option<f64>!RedisError {
+    return this.client.runCmd(geoDistCmd(this.key, a, b, unit))?
+  }
+  // `GEOHASH`: each member's standard 11 character geohash, `None` for a
+  // missing member.
+  export hash(...members: string): []Option<string>!RedisError {
+    return this.client.runCmd(geoHashCmd(this.key, members))?
+  }
+  // `GEOSEARCH`: the members inside the area.
+  export search(
+    from: GeoFrom,
+    by: GeoBy,
+    opts: GeoSearchOptions = GeoSearchOptions{},
+  ): []GeoHit!RedisError {
+    checkSearch(from, opts.count, opts.any)?
+    return this.client.runCmd(geoSearchCmd(this.key, from, by, opts))?
+  }
+  // `GEOSEARCHSTORE`: the same search, written to `dest` as a geo key;
+  // returns how many members were stored.
+  export searchStore(
+    dest: string,
+    from: GeoFrom,
+    by: GeoBy,
+    opts: GeoStoreOptions = GeoStoreOptions{},
+  ): i64!RedisError {
+    checkSearch(from, opts.count, opts.any)?
+    return this.client.runCmd(geoSearchStoreCmd(dest, this.key, from, by, opts))?
+  }
+}
+
+// The queued view `Pipeline.geo`/`Tx.geo` both return.
 export class GeoBatch {
-  batch: Batch,
-  key: string,
+  batch: Batch
+  key: string
+
+  export add(members: []GeoMember, opts: GeoAddOptions = GeoAddOptions{}): Future<i64> {
+    checkMembers(members) catch e {
+      return failedFuture<i64>(e)
+    }
+    return this.batch.queue(geoAddCmd(this.key, members, opts))
+  }
+  export pos(...members: string): Future<[]Option<Point>> {
+    return this.batch.queue(geoPosCmd(this.key, members))
+  }
+  export dist(a: string, b: string, unit: GeoUnit = GeoUnit.Meters): Future<Option<f64>> {
+    return this.batch.queue(geoDistCmd(this.key, a, b, unit))
+  }
+  export hash(...members: string): Future<[]Option<string>> {
+    return this.batch.queue(geoHashCmd(this.key, members))
+  }
+  export search(
+    from: GeoFrom,
+    by: GeoBy,
+    opts: GeoSearchOptions = GeoSearchOptions{},
+  ): Future<[]GeoHit> {
+    checkSearch(from, opts.count, opts.any) catch e {
+      return failedFuture<[]GeoHit>(e)
+    }
+    return this.batch.queue(geoSearchCmd(this.key, from, by, opts))
+  }
+  export searchStore(
+    dest: string,
+    from: GeoFrom,
+    by: GeoBy,
+    opts: GeoStoreOptions = GeoStoreOptions{},
+  ): Future<i64> {
+    checkSearch(from, opts.count, opts.any) catch e {
+      return failedFuture<i64>(e)
+    }
+    return this.batch.queue(geoSearchStoreCmd(dest, this.key, from, by, opts))
+  }
+}
+
+// Which of `WITHDIST`/`WITHHASH`/`WITHCOORD` a search asked for, so the
+// decoder knows how many extras follow each member and in which slot.
+class geoWith { dist: bool, hash: bool, coord: bool }
+
+fn checkPoint(p: Point): ()!RedisError {
+  if (!(p.lon >= -180.0 && p.lon <= 180.0)) {
+    fail RedisError.Invalid("longitude must be in -180..180, got ${p.lon}")
+  }
+  if (!(p.lat >= 0.0 - maxLat && p.lat <= maxLat)) {
+    fail RedisError.Invalid("latitude must be in -85.05112878..85.05112878, got ${p.lat}")
+  }
+}
+
+fn checkMembers(members: []GeoMember): ()!RedisError {
+  if (len(members) == 0) {
+    fail RedisError.Invalid("add needs at least one member")
+  }
+  let i = 0
+  while (i < len(members)) {
+    checkPoint(members[i].at)?
+    i = i + 1
+  }
+}
+
+// A search refuses a centre off the map, a negative `count`, and `any`
+// without a `count` (the server's own rule) before anything is sent.
+fn checkSearch(from: GeoFrom, count: int, any: bool): ()!RedisError {
+  if (count < 0) {
+    fail RedisError.Invalid("count must be >= 0, got ${count}")
+  }
+  if (any && count == 0) {
+    fail RedisError.Invalid("any needs a count")
+  }
+  match (from) {
+    At(p) => return checkPoint(p)?
+    Member(_) => return
+  }
+}
+
+fn geoAddArgs(key: string, members: []GeoMember, opts: GeoAddOptions): []string {
+  let out = ["GEOADD", key]
+  if (opts.nx) {
+    out = append(out, "NX")
+  }
+  if (opts.xx) {
+    out = append(out, "XX")
+  }
+  if (opts.ch) {
+    out = append(out, "CH")
+  }
+  let i = 0
+  while (i < len(members)) {
+    out = append(out, "${members[i].at.lon}", "${members[i].at.lat}", members[i].member)
+    i = i + 1
+  }
+  return out
+}
+
+fn geoAddCmd(key: string, members: []GeoMember, opts: GeoAddOptions): Cmd<i64> {
+  return Cmd<i64>{
+    args = geoAddArgs(key, members, opts),
+    decode = (r) => asInt(r, "GEOADD"),
+    readOnly = false,
+  }
+}
+
+fn geoPosCmd(key: string, members: []string): Cmd<[]Option<Point>> {
+  return Cmd<[]Option<Point>>{
+    args = append(["GEOPOS", key], ...members),
+    decode = (r) => asGeoPoints(r, "GEOPOS"),
+    readOnly = true,
+  }
+}
+
+fn geoDistCmd(key: string, a: string, b: string, unit: GeoUnit): Cmd<Option<f64>> {
+  return Cmd<Option<f64>>{
+    args = ["GEODIST", key, a, b, unit.text()],
+    decode = (r) => asGeoDist(r, "GEODIST"),
+    readOnly = true,
+  }
+}
+
+fn geoHashCmd(key: string, members: []string): Cmd<[]Option<string>> {
+  return Cmd<[]Option<string>>{
+    args = append(["GEOHASH", key], ...members),
+    decode = (r) => asGeoHashes(r, "GEOHASH"),
+    readOnly = true,
+  }
+}
+
+fn geoFromArgs(from: GeoFrom): []string {
+  match (from) {
+    Member(m) => return ["FROMMEMBER", m]
+    At(p) => return ["FROMLONLAT", "${p.lon}", "${p.lat}"]
+  }
+}
+
+fn geoByArgs(by: GeoBy): []string {
+  match (by) {
+    Radius(r, u) => return ["BYRADIUS", "${r}", u.text()]
+    Box(w, h, u) => return ["BYBOX", "${w}", "${h}", u.text()]
+  }
+}
+
+// `ASC|DESC`, then `COUNT n [ANY]`: the tail `GEOSEARCH` and
+// `GEOSEARCHSTORE` share.
+fn geoLimitArgs(order: GeoOrder, count: int, any: bool): []string {
+  let out = []string(0)
+  match (order) {
+    Nearest => out = ["ASC"]
+    Farthest => out = ["DESC"]
+    Unsorted => out = []string(0)
+  }
+  if (count > 0) {
+    out = append(out, "COUNT", "${count}")
+  }
+  if (any) {
+    out = append(out, "ANY")
+  }
+  return out
+}
+
+fn geoShapeArgs(head: []string, from: GeoFrom, by: GeoBy): []string {
+  return extendArgs(extendArgs(head, geoFromArgs(from)), geoByArgs(by))
+}
+
+fn geoSearchArgs(key: string, from: GeoFrom, by: GeoBy, opts: GeoSearchOptions): []string {
+  let out = geoShapeArgs(["GEOSEARCH", key], from, by)
+  out = append(out, ...geoLimitArgs(opts.order, opts.count, opts.any))
+  if (opts.withCoord) {
+    out = append(out, "WITHCOORD")
+  }
+  if (opts.withDist) {
+    out = append(out, "WITHDIST")
+  }
+  if (opts.withHash) {
+    out = append(out, "WITHHASH")
+  }
+  return out
+}
+
+fn geoSearchCmd(key: string, from: GeoFrom, by: GeoBy, opts: GeoSearchOptions): Cmd<[]GeoHit> {
+  let want = geoWith{ dist = opts.withDist, hash = opts.withHash, coord = opts.withCoord }
+  return Cmd<[]GeoHit>{
+    args = geoSearchArgs(key, from, by, opts),
+    decode = (r) => asGeoHits(r, want, "GEOSEARCH"),
+    readOnly = true,
+  }
+}
+
+fn geoSearchStoreCmd(
+  dest: string,
+  src: string,
+  from: GeoFrom,
+  by: GeoBy,
+  opts: GeoStoreOptions,
+): Cmd<i64> {
+  let out = geoShapeArgs(["GEOSEARCHSTORE", dest, src], from, by)
+  out = append(out, ...geoLimitArgs(opts.order, opts.count, opts.any))
+  if (opts.storeDist) {
+    out = append(out, "STOREDIST")
+  }
+  return Cmd<i64>{ args = out, decode = (r) => asInt(r, "GEOSEARCHSTORE"), readOnly = false }
+}
+
+// `[lon, lat]`, or nothing for a member that is not there: a RESP3 null, or
+// RESP2's null array.
+fn asGeoPoint(r: Reply, cmd: string): Option<Point>!RedisError {
+  match (r) {
+    Null => return Option.None
+    Array(items) => return geoPointFromOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn geoPointFromOpt(items: Option<[]Reply>, cmd: string): Option<Point>!RedisError {
+  if (isNone(items)) {
+    return Option.None
+  }
+  let list = unwrap(items)
+  if (len(list) != 2) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let lon = asDouble(list[0], cmd)?
+  let lat = asDouble(list[1], cmd)?
+  return Option.Some(Point{ lon = lon, lat = lat })
+}
+
+fn asGeoPoints(r: Reply, cmd: string): []Option<Point>!RedisError {
+  match (r) {
+    Array(items) => return geoPointsFromList(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn geoPointsFromList(list: []Reply, cmd: string): []Option<Point>!RedisError {
+  let out = []Option<Point>(0)
+  let i = 0
+  while (i < len(list)) {
+    out = append(out, asGeoPoint(list[i], cmd)?)
+    i = i + 1
+  }
+  return out
+}
+
+// `GEODIST`: a double (RESP3) or a decimal bulk string (RESP2), null when a
+// member is missing.
+fn asGeoDist(r: Reply, cmd: string): Option<f64>!RedisError {
+  match (r) {
+    Null => return Option.None
+    Bulk(v) => {
+      if (isNone(v)) {
+        return Option.None
+      }
+      return Option.Some(asDouble(r, cmd)?)
+    }
+    _ => return Option.Some(asDouble(r, cmd)?)
+  }
+}
+
+fn asGeoHashes(r: Reply, cmd: string): []Option<string>!RedisError {
+  match (r) {
+    Array(items) => return geoHashesFromList(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn geoHashesFromList(list: []Reply, cmd: string): []Option<string>!RedisError {
+  let out = []Option<string>(0)
+  let i = 0
+  while (i < len(list)) {
+    out = append(out, asOptString(list[i], cmd)?)
+    i = i + 1
+  }
+  return out
+}
+
+fn asGeoHits(r: Reply, want: geoWith, cmd: string): []GeoHit!RedisError {
+  match (r) {
+    Array(items) => return geoHitsFromList(unwrapOr(items, []Reply(0)), want, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn geoHitsFromList(list: []Reply, want: geoWith, cmd: string): []GeoHit!RedisError {
+  let out = []GeoHit(0)
+  let i = 0
+  while (i < len(list)) {
+    out = append(out, asGeoHit(list[i], want, cmd)?)
+    i = i + 1
+  }
+  return out
+}
+
+// A bare member name when no `WITH*` option was on, else
+// `[member, dist?, hash?, [lon, lat]?]`.
+fn asGeoHit(r: Reply, want: geoWith, cmd: string): GeoHit!RedisError {
+  let bare = GeoHit{ member = "", dist = Option.None, hash = Option.None, at = Option.None }
+  if (!want.dist && !want.hash && !want.coord) {
+    bare.member = replyToString(r, cmd)?
+    return bare
+  }
+  match (r) {
+    Array(items) => return geoHitFromList(bare, unwrapOr(items, []Reply(0)), want, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn geoHitFromList(hit: GeoHit, list: []Reply, want: geoWith, cmd: string): GeoHit!RedisError {
+  let extras = 0
+  if (want.dist) {
+    extras = extras + 1
+  }
+  if (want.hash) {
+    extras = extras + 1
+  }
+  if (want.coord) {
+    extras = extras + 1
+  }
+  if (len(list) != 1 + extras) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  hit.member = replyToString(list[0], cmd)?
+  let i = 1
+  if (want.dist) {
+    hit.dist = Option.Some(asDouble(list[i], cmd)?)
+    i = i + 1
+  }
+  if (want.hash) {
+    hit.hash = Option.Some(asInt(list[i], cmd)?)
+    i = i + 1
+  }
+  if (want.coord) {
+    hit.at = asGeoPoint(list[i], cmd)?
+  }
+  return hit
 }
