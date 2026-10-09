@@ -122,21 +122,11 @@ EXPECTED_REFUSED=${EXPECTED_REFUSED:-0}
 # the example counts as LAG only when the oracle's output differs AND bit2's equals that derived
 # text exactly. bit2 printing anything else is still a DIFF, and the oracle agreeing again is a
 # stale pin that fails the run, so the entry is deleted at the repin that fixes the oracle (#6533).
-#   hashing  #7574 packs []u32 at 4 bytes; stdlib/crypto/sha256.bit hands ptrOf(state) to the
-#            hardware routine as a packed []u32, which the pinned stage0 still strides at 8, so its
-#            digests end in SHA-256's initial H4..H7.
-ORACLE_LAG="hashing"
-lag_expected() {
-  case "$1" in
-    hashing)
-      local m="the quick brown fox" k="shared-secret" d h
-      d=$(printf %s "$m" | shasum -a 256) || return 1
-      h=$(printf %s "$m" | openssl dgst -sha256 -hmac "$k") || return 1
-      printf 'sha256=%s\nhmac=%s\n' "${d%% *}" "${h##* }"
-      ;;
-    *) return 1 ;;
-  esac
-}
+# The list is empty: the one entry (hashing, #7574) was fixed at the cause by making std/crypto's
+# sha256 correct under both []u32 strides (#7713), which turned its pin STALE.
+ORACLE_LAG=""
+# lag_expected <example> -- print the output a pinned example MUST produce; fails for an unpinned one.
+lag_expected() { return 1; }
 # lag_pinned <example> -- 0 when the example is on the ORACLE_LAG list.
 lag_pinned() { case " $ORACLE_LAG " in *" $1 "*) return 0 ;; esac; return 1; }
 # Network-dependent examples: they talk to the outside world, so their output is
