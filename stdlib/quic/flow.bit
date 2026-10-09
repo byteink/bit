@@ -1,0 +1,177 @@
+// Bit standard library — quic module, receive flow-control credit that follows the
+// application's reads (RFC 9000 §4.1, §4.2; #7709).
+//
+// MAX_STREAM_DATA and MAX_DATA used to go out as bytes entered a stream's
+// `recvCh`, so a receiver that never read still told the peer to keep sending and
+// the queue was the only bound (4096 chunks per stream). Credit is now granted for
+// bytes the application TOOK: `Stream.read` / `streamReadUntil` count what they
+// return (`streamNoteRead`) and tell the loop in batches over `quicconnReadTx`;
+// the loop folds those notes in (`quicconnFoldReads`, called at the top of
+// `quicconnFlush`), moves the windows, and queues the updates once consumption has
+// crossed half a window, the batching §4.2 recommends. What the peer may have in
+// flight and unread is therefore the advertised window, never a channel capacity,
+// and a peer that sends past it is a FLOW_CONTROL_ERROR (§4.1).
+//
+// The chunk queue is bounded too: a window of one-byte STREAM frames is far more
+// chunks than `recvCh` holds, and a loop parked on a full channel serves nobody.
+// The loop keeps `chunksOut` (chunks queued minus chunks reported read) under
+// `quicconnRecvChunkCap`; contiguous bytes that do not fit wait in the stream's
+// assembler and go out as one larger chunk when a read note frees room.
+//
+// Same flat `std/quic` module and namespace as `conn.bit`.
+
+// Chunks one stream's `recvCh` holds. One slot is reserved for the single FIN or
+// reset chunk a stream ever gets, so the loop never blocks sending it.
+const quicconnRecvChunkCap: int = 256
+
+// A reader reports after this many bytes or chunks (and at FIN/reset). Both stay
+// far under a half window / the chunk cap, so the loop's view of the window and
+// the queue lags the truth by less than the headroom it keeps.
+const quicconnReadBatchBytes: int = 4096
+const quicconnReadBatchChunks: int = 16
+
+// Notes the reader-to-loop channel holds; a full channel parks the reader until
+// the loop's next `quicconnFoldReads`.
+const quicconnReadQueue: int = 64
+
+// RFC 9000 §20.1 transport error code: the peer sent more than the stream or
+// connection credit this endpoint granted (§4.1).
+const quicconnErrFlowControl: int = 0x03
+
+// What a reader tells the loop: `bytes` and `chunks` it took off stream `id`, or
+// (`discard`) that it will take nothing more from it.
+class quicconnRead { id: int, bytes: int, chunks: int, discard: bool }
+
+// The reader-to-loop path every `Stream` of a connection shares: the notes, and
+// the loop's tick channel to wake it so credit is not held back until the next tick.
+class quicconnReadTx { readCh: chan<quicconnRead>, wakeCh: chan<int> }
+
+// One `Stream`'s reads not yet reported. Touched only by the thread reading it.
+class quicconnReadAcct { bytes: int, chunks: int }
+
+fn quicconnNewReadTx(wakeCh: chan<int>): quicconnReadTx {
+  return quicconnReadTx{ readCh = chan<quicconnRead>(quicconnReadQueue), wakeCh = wakeCh }
+}
+
+// ---------------------------------------------------------------------------
+// Reader side (the application's thread)
+// ---------------------------------------------------------------------------
+
+// The `Stream` handle `Conn.openStream` / `acceptStream` return for reply `r`.
+fn quicconnNewStreamHandle(c: Conn, r: quicconnOpenReply): Stream {
+  return Stream{
+    streamId = r.id,
+    cmdCh = c.cmdCh,
+    recvCh = r.recvCh,
+    doneCh = c.doneCh,
+    tx = c.tx,
+    acct = quicconnReadAcct{ bytes = 0, chunks = 0 },
+  }
+}
+
+// Count a chunk `Stream.read` / `streamReadUntil` is about to return, and report
+// the batch once it is big enough or the stream has ended.
+fn streamNoteRead(s: Stream, c: StreamChunk) {
+  let a = s.acct
+  a.bytes = a.bytes + len(c.data)
+  a.chunks = a.chunks + 1
+  if (!c.fin && a.bytes < quicconnReadBatchBytes && a.chunks < quicconnReadBatchChunks) {
+    return
+  }
+  let n = quicconnRead{ id = s.streamId, bytes = a.bytes, chunks = a.chunks, discard = false }
+  a.bytes = 0
+  a.chunks = 0
+  streamSendRead(s, n)
+}
+
+// Hand `n` to the loop and wake it. Races `doneCh` so a reader never parks on a
+// loop that has exited; the wake is non-blocking because a tick already queued
+// will fold the note just the same.
+fn streamSendRead(s: Stream, n: quicconnRead) {
+  select {
+    case s.tx.readCh <- n:
+      {}
+    case _ = <- s.doneCh:
+      return
+  }
+  select {
+    case s.tx.wakeCh <- 0:
+      {}
+    default:
+      {}
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Loop side
+// ---------------------------------------------------------------------------
+
+// Fold every pending read note into the connection state, at most one queue's
+// worth per call (producers can refill it; the next flush takes the rest).
+fn quicconnFoldReads(st: quicconnState) {
+  let i = 0
+  while (i < quicconnReadQueue) {
+    i = i + 1
+    select {
+      case n = <- st.flowTx.readCh:
+        quicconnOnRead(st, n)
+      default:
+        return
+    }
+  }
+}
+
+fn quicconnOnRead(st: quicconnState, n: quicconnRead) {
+  if (st.present[n.id] == 0) {
+    return
+  }
+  let str = st.streams[n.id]
+  if (str.discard) {
+    return
+  }
+  if (n.discard) {
+    str.discard = true
+    quicconnConsume(st, str, str.recvDelivered - str.recvConsumed)
+  } else {
+    str.chunksOut = quicconnMax(str.chunksOut - n.chunks, 0)
+    quicconnConsume(st, str, n.bytes)
+  }
+  quicconnDeliverStream(st, str)
+}
+
+// `n` more bytes of `str` are out of this endpoint's buffers (read, or dropped
+// because the application abandoned the stream): move the credit.
+fn quicconnConsume(st: quicconnState, str: quicconnStream, n: int) {
+  str.recvConsumed = str.recvConsumed + n
+  st.dataConsumed = st.dataConsumed + n
+  quicconnMaybeExtendWindows(st, str)
+}
+
+// Keep the advertised windows a full `quicconnFlowWindow` ahead of what has been
+// consumed, queuing MAX_DATA / MAX_STREAM_DATA when they cross the midpoint. A
+// stream whose final size is known needs no more stream credit (§4.2).
+fn quicconnMaybeExtendWindows(st: quicconnState, str: quicconnStream) {
+  if (str.recvFinalSize < 0 && str.localMaxStreamData - str.recvConsumed < quicconnFlowWindow / 2) {
+    str.localMaxStreamData = str.recvConsumed + quicconnFlowWindow
+    str.needMaxStreamData = true
+  }
+  if (st.localMaxData - st.dataConsumed < quicconnFlowWindow / 2) {
+    st.localMaxData = st.dataConsumed + quicconnFlowWindow
+    st.needMaxData = true
+  }
+}
+
+// Account a peer's highest offset on `str` against the credit granted (RFC 9000
+// §4.1, §4.5). False after closing the connection with FLOW_CONTROL_ERROR when
+// `end` passes the stream's limit or the bytes sent on all streams pass the
+// connection's.
+fn quicconnAdmit(st: quicconnState, str: quicconnStream, end: int): bool {
+  let grew = quicconnMax(end - str.recvHighest, 0)
+  if (end > str.localMaxStreamData || st.dataRecv + grew > st.localMaxData) {
+    quicconnCloseWithError(st, quicconnErrFlowControl)
+    return false
+  }
+  str.recvHighest = str.recvHighest + grew
+  st.dataRecv = st.dataRecv + grew
+  return true
+}

@@ -256,8 +256,8 @@ fn quicconnDecodePn(largest: int, truncated: int, pnLen: int): int {
 //     never arrive for a challenge we actually issued.
 //   * `DataBlocked`/`StreamDataBlocked` (RFC 9000 §19.9/§19.12, receive
 //     direction) — advisory only. This endpoint already proactively re-extends
-//     both windows as consumption crosses the midpoint
-//     (`quicconnMaybeExtendWindows`), so hearing that the peer is blocked would
+//     both windows as the application's reads cross the midpoint
+//     (`quicconnMaybeExtendWindows`, flow.bit), so hearing that the peer is blocked would
 //     at best make an already-scheduled MAX_DATA/MAX_STREAM_DATA update fire
 //     sooner; it cannot change what update gets sent. The send-side signal
 //     (telling the peer WE are blocked) is implemented, in
@@ -288,7 +288,7 @@ fn quicconnHandleFrame(st: quicconnState, levelIdx: int, f: Frame): ()! {
     Padding(_) => {}
     Ping => {}
     Ack(a) => { quicconnProcessAck(st, levelIdx, a) }
-    ResetStream(id, code, _) => { quicconnOnResetStream(st, int(id), int(code)) }
+    ResetStream(id, code, size) => { quicconnOnResetStream(st, int(id), int(code), int(size)) }
     StopSending(id, code) => { quicconnAbortSend(st, int(id), int(code)) }
     Crypto(offset, cdata) => { quicconnLvl(st, levelIdx).crecv.insert(offset, cdata)? }
     NewToken(_) => {}
@@ -437,15 +437,26 @@ fn quicconnOpenPeerStream(st: quicconnState, id: int) {
 // (#3232) — a peer that resets a stream before ever sending data on it is valid
 // QUIC (RFC 9000 §2.1) and used to drop that RESET_STREAM on the floor instead
 // of surfacing it.
-fn quicconnOnResetStream(st: quicconnState, id: int, code: int) {
+//
+// `size` is the stream's final size (RFC 9000 §4.5): it counts against the flow
+// control limits like data, and the part of it that never reached `recvCh` will
+// never be read, so its connection credit is returned here instead of leaking.
+fn quicconnOnResetStream(st: quicconnState, id: int, code: int, size: int) {
   match (quicconnEnsureStream(st, id)) {
     None => {}
     Some(str) => {
-      if (!str.finDelivered) {
-        str.finDelivered = true
-        str.recvCh <- StreamChunk{ data = []byte(0), fin = true, reset = true, resetCode = code }
-        quicconnReturnCredit(st, str)
+      if (str.finDelivered || !quicconnAdmit(st, str, size)) {
+        return
       }
+      str.finDelivered = true
+      str.recvFinalSize = size
+      quicconnConsume(st, str, quicconnMax(size - str.recvDelivered, 0))
+      str.recvDelivered = quicconnMax(size, str.recvDelivered)
+      quicconnPushChunk(
+        str,
+        StreamChunk{ data = []byte(0), fin = true, reset = true, resetCode = code },
+      )
+      quicconnReturnCredit(st, str)
     }
   }
 }
@@ -474,6 +485,9 @@ fn quicconnOnStream(st: quicconnState, s: StreamFrame): ()! {
   match (quicconnEnsureStream(st, id)) {
     None => { return }
     Some(str) => {
+      if (!quicconnAdmit(st, str, int(s.offset) + len(s.data))) {
+        return
+      }
       str.recvAsm.insert(s.offset, s.data)?
       if (s.fin) {
         str.recvFinalSize = int(s.offset) + len(s.data)
@@ -483,43 +497,54 @@ fn quicconnOnStream(st: quicconnState, s: StreamFrame): ()! {
   }
 }
 
-// Hand any newly contiguous received bytes to the application and advance the
-// receive flow-control window (auto-tuning, RFC 9000 §4.1). When the FIN arrives
-// after the last data was already delivered (an empty STREAM frame at the final
-// offset, or a FIN reordered ahead of nothing), emit a trailing empty
-// `fin = true` chunk so the reader still sees the end of stream.
+// Hand any newly contiguous received bytes to the application. Flow-control
+// credit is NOT granted here: it follows the application's reads (flow.bit,
+// RFC 9000 §4.1). When `recvCh` already holds `quicconnRecvChunkCap - 1` chunks
+// the bytes stay in the assembler and go out as one larger chunk once a read note
+// frees room, so a peer cannot park the loop on a full channel. A stream the
+// application abandoned (`discard`) queues no data, and its bytes count as read.
+// When the FIN arrives after the last data was already delivered (an empty STREAM
+// frame at the final offset, or a FIN reordered ahead of nothing), emit a trailing
+// empty `fin = true` chunk so the reader still sees the end of stream.
 fn quicconnDeliverStream(st: quicconnState, str: quicconnStream) {
   let contig = str.recvAsm.contiguousLen()
-  if (contig > str.recvDelivered) {
-    let all = str.recvAsm.contiguous()
-    let chunk = quicconnCopyRange(all, str.recvDelivered, contig)
-    let n = contig - str.recvDelivered
-    let isFin = str.recvFinalSize >= 0 && contig == str.recvFinalSize
-    str.recvDelivered = contig
-    st.dataConsumed = st.dataConsumed + n
-    str.recvCh <- StreamChunk{ data = chunk, fin = isFin, reset = false, resetCode = 0 }
-    if (isFin) {
-      str.finDelivered = true
-    }
-    quicconnMaybeExtendWindows(st, str)
+  if (contig > str.recvDelivered && (str.discard || str.chunksOut < quicconnRecvChunkCap - 1)) {
+    quicconnDeliverRun(st, str, contig)
   }
   if (!str.finDelivered && str.recvFinalSize >= 0 && str.recvDelivered >= str.recvFinalSize) {
     str.finDelivered = true
-    str.recvCh <- StreamChunk{ data = []byte(0), fin = true, reset = false, resetCode = 0 }
+    quicconnPushChunk(
+      str,
+      StreamChunk{ data = []byte(0), fin = true, reset = false, resetCode = 0 },
+    )
   }
   quicconnReturnCredit(st, str)
 }
 
-// Keep the advertised windows a full `quicconnFlowWindow` ahead of what has been
-// consumed, queuing MAX_DATA / MAX_STREAM_DATA when they cross the midpoint.
-fn quicconnMaybeExtendWindows(st: quicconnState, str: quicconnStream) {
-  if (str.localMaxStreamData - str.recvDelivered < quicconnFlowWindow / 2) {
-    str.localMaxStreamData = str.recvDelivered + quicconnFlowWindow
-    str.needMaxStreamData = true
+// Deliver the contiguous bytes `[str.recvDelivered, contig)` of `str` as one chunk,
+// or, for an abandoned stream, count them as read and queue only its FIN.
+fn quicconnDeliverRun(st: quicconnState, str: quicconnStream, contig: int) {
+  let from = str.recvDelivered
+  let isFin = str.recvFinalSize >= 0 && contig == str.recvFinalSize
+  str.recvDelivered = contig
+  if (str.discard) {
+    quicconnConsume(st, str, contig - from)
   }
-  if (st.localMaxData - st.dataConsumed < quicconnFlowWindow / 2) {
-    st.localMaxData = st.dataConsumed + quicconnFlowWindow
-    st.needMaxData = true
+  if (!str.discard || isFin) {
+    let data = []byte(0)
+    if (!str.discard) {
+      data = quicconnCopyRange(str.recvAsm.contiguous(), from, contig)
+    }
+    quicconnPushChunk(str, StreamChunk{ data = data, fin = isFin, reset = false, resetCode = 0 })
+  }
+  if (isFin) {
+    str.finDelivered = true
   }
 }
 
+// Queue `c` for the reader. The caller keeps `chunksOut` under the channel's
+// capacity (data stops one short of it; the FIN or reset chunk takes the last slot).
+fn quicconnPushChunk(str: quicconnStream, c: StreamChunk) {
+  str.recvCh <- c
+  str.chunksOut = str.chunksOut + 1
+}
