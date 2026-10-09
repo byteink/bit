@@ -1,17 +1,278 @@
-// pkg/redis/json.bit — `r.json(key)`: the RedisJSON handle. Epic
-// #6013, #6028: SCAFFOLD ONLY, no commands wired yet (`JSON.SET, JSON.GET, JSON.DEL`, a
-// follow-up ticket) — this file exists so later family tickets touch only
-// their own file, never `client.bit`. `cmd.bit`'s header is the template:
-// one `Cmd<T>` factory per command, called from a method here.
+// pkg/redis/json.bit - `r.json(key)`: the RedisJSON commands, `JSON.SET`,
+// `JSON.GET`, `JSON.MGET`, `JSON.MSET`, `JSON.MERGE`, `JSON.DEL`,
+// `JSON.CLEAR`, `JSON.TYPE`, `JSON.NUMINCRBY`, `JSON.NUMMULTBY`,
+// `JSON.STRAPPEND`, `JSON.STRLEN`, the `JSON.ARR*` family, `JSON.OBJKEYS`,
+// `JSON.OBJLEN` and `JSON.TOGGLE`. Epic #6013, #6028, #6037. Follows
+// `cmd.bit`'s HOW-TO header: one `Cmd<T>` factory per command (`jsoncmd.bit`),
+// an immediate method on `Json`, a queued one on `JsonBatch`.
+//
+// A JSON KEY IS A DOCUMENT, NOT A STRING. `TYPE` says `ReJSON-RL`, `GET` on it
+// is WRONGTYPE, and one command can reach inside it by path. Redis 8 ships
+// the module built in.
+//
+// A CLASS GOES IN AND COMES OUT OF `@json`. `set` takes a `JsonValue` tree
+// (std/json's `Json`), which a `@json` class makes with its own `toJson()`;
+// `get<T>` reads the document straight into `T` with `jsonDecode<T>`, so a
+// nested class, an array of classes, an `Option` field or an enum round-trip
+// exactly as `std/json` defines. A document that does not fit `T` fails
+// `RedisError.Unexpected` with the decoder's own field path. Decoding goes
+// through `jsonParse` + `jsonDecode<T>` rather than `jsonDecodeText<T>`:
+// the text entry point is specialised by rewriting its own call site and
+// cannot be written from a generic body (`pkg/orm/jsoncol.bit` on #4563).
+//
+// WHY A TREE, NOT A `T: Jsonable` PARAMETER. The same method sets a class
+// (`u.toJson()`), a number (`JsonValue.JsonInt(3)`) or a string at a path,
+// and a bare `i64` has no `toJson`. One parameter type covers all of them.
+//
+// ONE METHOD PER COMMAND, EXCEPT WHERE THE ANSWER'S TYPE DIFFERS. `JSON.GET`
+// has three readings with three result types, which no option can switch
+// between: `get<T>()` the document (`Option<T>`, `None` for a missing key),
+// `getAt<T>(path)` every match of one path (`[]T`), and `getPaths(...paths)`
+// several paths at once (`[]JsonMatch`, trees). `JSON.SET`'s `NX`, `XX` and
+// `FPHA` are `JsonSetOptions`.
+//
+// PATHS ARE JSONPATH (`$`, `$.name`, `$.tags[0]`, `$..id`) and default to the
+// root. Every path method answers one entry per match, in document order: a
+// path that matches nothing answers an empty slice, and where a match is not
+// the kind of value the command works on (`arrLen` on a string) its entry is
+// `None`. A legacy path (`.name`) answers a different shape and fails
+// `RedisError.Unexpected` (`jsoncmd.bit`'s header).
+//
+// THE SERVER'S OWN ERRORS REACH THE CALLER. A key that does not exist is
+// `RedisError.Server` for `arrLen`, `strLen`, `objKeys`, `toggle` and
+// `clear`, and an empty answer for `get`, `typeOf` and `del`; `set` at a
+// non-root path on a missing key is the server's "new objects must be
+// created at the root".
+//
+// `Json` STILL HOLDS `client: Client`, as the scaffold did. The newer
+// families hold a `runner: Runner` so `tx.read.<family>(key)` can reach them;
+// that move edits `client.bit` (`Client.json`) and `tx.bit` (`Tx.read`),
+// which this ticket did not touch, so `run` below is the one place to change
+// when it lands (#6109).
+
 export class Json {
-  client: Client,
-  key: string,
+  client: Client
+  key: string
+
+  run<T>(cmd: Cmd<T>): T!RedisError {
+    return poolRunner(this.client).runCmd(cmd)?
+  }
+
+  // `JSON.SET`: puts `value` at `path` (the root by default). True when it
+  // was set, false when `opts.nx`/`opts.xx` said no or the path cannot be
+  // created because a parent is missing.
+  export set(
+    value: JsonValue,
+    path: string = "$",
+    opts: JsonSetOptions = JsonSetOptions{},
+  ): bool!RedisError {
+    return this.run(jsonSetCmd(this.key, path, value, opts))?
+  }
+  // `JSON.MSET`: sets this key's `value` at `path` and every entry of
+  // `others` in one atomic command. Each key may be new only at the root.
+  export mset(value: JsonValue, path: string, ...others: JsonTarget): ()!RedisError {
+    return this.run(jsonMsetCmd(JsonTarget{ key = this.key, path = path, value = value }, others))?
+  }
+  // `JSON.MERGE`: merges `value` into what `path` holds. An object key set to
+  // `null` is deleted, any other key is added or replaced, and an array is
+  // replaced whole.
+  export merge(value: JsonValue, path: string = "$"): ()!RedisError {
+    return this.run(jsonMergeCmd(this.key, path, value))?
+  }
+  // `JSON.GET` of the root: the document as a `T`, a class carrying `@json`;
+  // `None` when the key does not exist.
+  export get<T>(): Option<T>!RedisError {
+    return this.run(jsonGetCmd<T>(this.key))?
+  }
+  // `JSON.GET` of one JSONPath: every match as a `T`, in document order.
+  export getAt<T>(path: string): []T!RedisError {
+    return this.run(jsonGetAtCmd<T>(this.key, path))?
+  }
+  // `JSON.GET` of several paths: one `JsonMatch` per path asked, in the order
+  // asked, holding the trees that path matched.
+  export getPaths(...paths: string): []JsonMatch!RedisError {
+    return this.run(jsonGetPathsCmd(this.key, paths))?
+  }
+  // `JSON.MGET`: the first match of `path` in this key and in each of
+  // `others`, as a `T`; `None` for a missing key or a path with no match.
+  export mget<T>(others: []string, path: string = "$"): []Option<T>!RedisError {
+    return this.run(jsonMgetCmd<T>(append([this.key], ...others), path))?
+  }
+  // `JSON.DEL`: removes every match of `path`; returns how many. Deleting
+  // the root, or the last value of the root container, deletes the key.
+  export del(path: string = "$"): i64!RedisError {
+    return this.run(jsonCountCmd("JSON.DEL", this.key, path))?
+  }
+  // `JSON.CLEAR`: empties arrays and objects and zeroes numbers at `path`;
+  // returns how many values it changed.
+  export clear(path: string = "$"): i64!RedisError {
+    return this.run(jsonCountCmd("JSON.CLEAR", this.key, path))?
+  }
+  // `JSON.TYPE`: the type name of each match: `object`, `array`, `string`,
+  // `integer`, `number`, `boolean` or `null`. Empty for a missing key.
+  export typeOf(path: string = "$"): []string!RedisError {
+    return this.run(jsonTypeCmd(this.key, path))?
+  }
+  // `JSON.NUMINCRBY`: adds `by` to each number at `path`; the new numbers.
+  // Integers beyond 2^53 lose precision in the `f64` answer.
+  export numIncrBy(by: f64, path: string = "$"): []Option<f64>!RedisError {
+    checkNumber(by)?
+    return this.run(jsonNumCmd("JSON.NUMINCRBY", this.key, path, by))?
+  }
+  // `JSON.NUMMULTBY`: multiplies each number at `path` by `by`; the new numbers.
+  export numMultBy(by: f64, path: string = "$"): []Option<f64>!RedisError {
+    checkNumber(by)?
+    return this.run(jsonNumCmd("JSON.NUMMULTBY", this.key, path, by))?
+  }
+  // `JSON.STRAPPEND`: appends `text` to each string at `path`; the new lengths.
+  export strAppend(text: string, path: string = "$"): []Option<i64>!RedisError {
+    return this.run(jsonStrAppendCmd(this.key, path, text))?
+  }
+  // `JSON.STRLEN`: the length of each string at `path`.
+  export strLen(path: string = "$"): []Option<i64>!RedisError {
+    return this.run(jsonLenCmd("JSON.STRLEN", this.key, path))?
+  }
+  // `JSON.ARRAPPEND`: appends `values` to each array at `path`; the new lengths.
+  export arrAppend(path: string, ...values: JsonValue): []Option<i64>!RedisError {
+    return this.run(jsonArrAppendCmd(this.key, path, values))?
+  }
+  // `JSON.ARRINSERT`: inserts `values` before `index` (negative counts from
+  // the end) in each array at `path`; the new lengths.
+  export arrInsert(path: string, index: int, ...values: JsonValue): []Option<i64>!RedisError {
+    return this.run(jsonArrInsertCmd(this.key, path, index, values))?
+  }
+  // `JSON.ARRLEN`: the length of each array at `path`.
+  export arrLen(path: string = "$"): []Option<i64>!RedisError {
+    return this.run(jsonLenCmd("JSON.ARRLEN", this.key, path))?
+  }
+  // `JSON.ARRPOP`: removes and returns the element at `index` (the last by
+  // default) of each array at `path`; `None` for an empty array.
+  export arrPop(path: string = "$", index: int = -1): []Option<JsonValue>!RedisError {
+    return this.run(jsonArrPopCmd(this.key, path, index))?
+  }
+  // `JSON.ARRTRIM`: keeps `start..stop` (inclusive, negative counts from the
+  // end) of each array at `path`; the new lengths.
+  export arrTrim(path: string, start: int, stop: int): []Option<i64>!RedisError {
+    return this.run(jsonArrTrimCmd(this.key, path, start, stop))?
+  }
+  // `JSON.ARRINDEX`: the position of the first element equal to `value` in
+  // each array at `path`, -1 when there is none. `start` and `stop` bound the
+  // search; a `stop` of 0 reads to the end.
+  export arrIndex(
+    path: string,
+    value: JsonValue,
+    start: int = 0,
+    stop: int = 0,
+  ): []Option<i64>!RedisError {
+    return this.run(jsonArrIndexCmd(this.key, path, value, start, stop))?
+  }
+  // `JSON.OBJKEYS`: the key names of each object at `path`.
+  export objKeys(path: string = "$"): []Option<[]string>!RedisError {
+    return this.run(jsonObjKeysCmd(this.key, path))?
+  }
+  // `JSON.OBJLEN`: the number of keys of each object at `path`.
+  export objLen(path: string = "$"): []Option<i64>!RedisError {
+    return this.run(jsonLenCmd("JSON.OBJLEN", this.key, path))?
+  }
+  // `JSON.TOGGLE`: flips each boolean at `path`; the new values.
+  export toggle(path: string = "$"): []Option<bool>!RedisError {
+    return this.run(jsonToggleCmd(this.key, path))?
+  }
 }
 
-// The queued view `Pipeline.json`/`Tx.json` both return — `cmd.bit`'s
-// `Batch` is the ONE client-side queue the two executors share, so this
-// is the ONLY queued view Json needs (`cmd.bit`'s header, point 2).
+// A number the server can add or multiply by: it refuses NaN and infinity
+// with a syntax error, so they are refused here, before anything is sent.
+fn checkNumber(by: f64): ()!RedisError {
+  if (by != by || by > 1.7976931348623157e308 || by < -1.7976931348623157e308) {
+    fail RedisError.Invalid("json: ${by} is not a finite number")
+  }
+  return
+}
+
+// The queued view `Pipeline.json`/`Tx.json` both return (`cmd.bit`'s header,
+// point 2): the same commands, each a `Future`.
 export class JsonBatch {
-  batch: Batch,
-  key: string,
+  batch: Batch
+  key: string
+
+  export set(
+    value: JsonValue,
+    path: string = "$",
+    opts: JsonSetOptions = JsonSetOptions{},
+  ): Future<bool> {
+    return this.batch.queue(jsonSetCmd(this.key, path, value, opts))
+  }
+  export mset(value: JsonValue, path: string, ...others: JsonTarget): Future<()> {
+    return this.batch.queue(
+      jsonMsetCmd(JsonTarget{ key = this.key, path = path, value = value }, others),
+    )
+  }
+  export merge(value: JsonValue, path: string = "$"): Future<()> {
+    return this.batch.queue(jsonMergeCmd(this.key, path, value))
+  }
+  export get<T>(): Future<Option<T>> {
+    return this.batch.queue(jsonGetCmd<T>(this.key))
+  }
+  export getAt<T>(path: string): Future<[]T> {
+    return this.batch.queue(jsonGetAtCmd<T>(this.key, path))
+  }
+  export getPaths(...paths: string): Future<[]JsonMatch> {
+    return this.batch.queue(jsonGetPathsCmd(this.key, paths))
+  }
+  export mget<T>(others: []string, path: string = "$"): Future<[]Option<T>> {
+    return this.batch.queue(jsonMgetCmd<T>(append([this.key], ...others), path))
+  }
+  export del(path: string = "$"): Future<i64> {
+    return this.batch.queue(jsonCountCmd("JSON.DEL", this.key, path))
+  }
+  export clear(path: string = "$"): Future<i64> {
+    return this.batch.queue(jsonCountCmd("JSON.CLEAR", this.key, path))
+  }
+  export typeOf(path: string = "$"): Future<[]string> {
+    return this.batch.queue(jsonTypeCmd(this.key, path))
+  }
+  export numIncrBy(by: f64, path: string = "$"): Future<[]Option<f64>> {
+    return this.batch.queue(jsonNumCmd("JSON.NUMINCRBY", this.key, path, by))
+  }
+  export numMultBy(by: f64, path: string = "$"): Future<[]Option<f64>> {
+    return this.batch.queue(jsonNumCmd("JSON.NUMMULTBY", this.key, path, by))
+  }
+  export strAppend(text: string, path: string = "$"): Future<[]Option<i64>> {
+    return this.batch.queue(jsonStrAppendCmd(this.key, path, text))
+  }
+  export strLen(path: string = "$"): Future<[]Option<i64>> {
+    return this.batch.queue(jsonLenCmd("JSON.STRLEN", this.key, path))
+  }
+  export arrAppend(path: string, ...values: JsonValue): Future<[]Option<i64>> {
+    return this.batch.queue(jsonArrAppendCmd(this.key, path, values))
+  }
+  export arrInsert(path: string, index: int, ...values: JsonValue): Future<[]Option<i64>> {
+    return this.batch.queue(jsonArrInsertCmd(this.key, path, index, values))
+  }
+  export arrLen(path: string = "$"): Future<[]Option<i64>> {
+    return this.batch.queue(jsonLenCmd("JSON.ARRLEN", this.key, path))
+  }
+  export arrPop(path: string = "$", index: int = -1): Future<[]Option<JsonValue>> {
+    return this.batch.queue(jsonArrPopCmd(this.key, path, index))
+  }
+  export arrTrim(path: string, start: int, stop: int): Future<[]Option<i64>> {
+    return this.batch.queue(jsonArrTrimCmd(this.key, path, start, stop))
+  }
+  export arrIndex(
+    path: string,
+    value: JsonValue,
+    start: int = 0,
+    stop: int = 0,
+  ): Future<[]Option<i64>> {
+    return this.batch.queue(jsonArrIndexCmd(this.key, path, value, start, stop))
+  }
+  export objKeys(path: string = "$"): Future<[]Option<[]string>> {
+    return this.batch.queue(jsonObjKeysCmd(this.key, path))
+  }
+  export objLen(path: string = "$"): Future<[]Option<i64>> {
+    return this.batch.queue(jsonLenCmd("JSON.OBJLEN", this.key, path))
+  }
+  export toggle(path: string = "$"): Future<[]Option<bool>> {
+    return this.batch.queue(jsonToggleCmd(this.key, path))
+  }
 }

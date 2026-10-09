@@ -1,0 +1,508 @@
+// pkg/redis/jsoncmd.bit - the wire half of `json.bit`: one `Cmd<T>` factory
+// per RedisJSON command and the decoders for their replies. Epic #6013,
+// #6028, #6037. `json.bit` holds the handle, its queued view and the option
+// types; this file holds what they call. A pure split of one family, the way
+// `zsetcmd.bit` is `zset.bit`'s.
+//
+// `Json as JsonValue`: this package already has a `Json` (the `r.json(key)`
+// handle), so std/json's value type is imported under another name, and
+// `JsonValue` is what every signature in the family means by "a JSON tree".
+// The import is per MODULE (SPEC §17.1): `json.bit`, `json.test.bit` and
+// `json.live.test.bit` use these names without importing them again.
+//
+// EVERY PATH IS A JSONPATH. A path starting with `$` answers with one entry
+// per match, an array whatever the number of matches; a legacy path (`.name`)
+// answers with the first match alone, a different shape. The decoders read
+// the JSONPath shape only: a legacy path fails `RedisError.Unexpected` naming
+// the command and the shape that came back, never a half-decoded answer.
+//
+// BOTH WIRE PROTOCOLS ARE READ. RESP3 (the default) answers `JSON.TYPE` with
+// the matches wrapped in one more array, and `JSON.NUMINCRBY` with native
+// integers and doubles; RESP2 answers `JSON.TYPE` flat and `JSON.NUMINCRBY`
+// with a bulk string holding a JSON array. `jsonTypes` and `jsonNumbers`
+// accept either, so `json.test.bit` can check both without a second server.
+
+import {
+  Json as JsonValue,
+  JsonEntry,
+  jsonAsArray,
+  jsonAsNumber,
+  jsonAsObject,
+  jsonDecode,
+  jsonEncode,
+  jsonParse,
+} from "std/json"
+
+const jsonRoot: string = "$"
+
+// The tree for `text`, or `RedisError.Unexpected` naming `cmd` when the
+// server sent something that is not JSON.
+fn jsonTree(text: string, cmd: string): JsonValue!RedisError {
+  return jsonParse(text) catch e {
+    fail RedisError.Unexpected(cmd, "reply is not JSON: ${e.message()}")
+  }
+}
+
+// The matches a JSONPath answer lists: `text` is a JSON array.
+fn jsonMatches(text: string, cmd: string): []JsonValue!RedisError {
+  let tree = jsonTree(text, cmd)?
+  match (jsonAsArray(tree)) {
+    Some(items) => return items
+    None => fail RedisError.Unexpected(
+      cmd,
+      "expected an array of matches, got a single value (a legacy path?)",
+    )
+  }
+}
+
+// `tree` as a `T`; a document that does not fit `T` is the caller's data
+// disagreeing with its class, reported with the decoder's own field path.
+fn jsonInto<T>(tree: JsonValue, cmd: string): T!RedisError {
+  return jsonDecode<T>(tree) catch e {
+    fail RedisError.Unexpected(cmd, "cannot decode into the requested class: ${e.message()}")
+  }
+}
+
+// ---- JSON.SET / JSON.MSET / JSON.MERGE --------------------------------------
+
+// `FPHA`: the floating point type the server stores a homogeneous number
+// array in. `Auto` leaves the choice to the server.
+export enum JsonFloatType {
+  Auto
+  Fp16
+  Bf16
+  Fp32
+  Fp64
+
+  export text(): string {
+    match (this) {
+      Auto => return ""
+      Fp16 => return "FP16"
+      Bf16 => return "BF16"
+      Fp32 => return "FP32"
+      Fp64 => return "FP64"
+    }
+  }
+}
+
+// `JSON.SET`'s switches: `nx` sets only where the path has no match, `xx`
+// only where it has one (never both), `fpha` pins the type of number arrays.
+export class JsonSetOptions {
+  export nx: bool = false,
+  export xx: bool = false,
+  export fpha: JsonFloatType = JsonFloatType.Auto,
+}
+
+// One `JSON.MSET` entry after the first: the key, the path in it and the
+// value to put there.
+export class JsonTarget {
+  export key: string,
+  export path: string,
+  export value: JsonValue,
+}
+
+fn jsonSetArgs(key: string, path: string, value: JsonValue, opts: JsonSetOptions): []string {
+  let args = ["JSON.SET", key, path, jsonEncode(value)]
+  if (opts.nx) {
+    args = append(args, "NX")
+  }
+  if (opts.xx) {
+    args = append(args, "XX")
+  }
+  if (opts.fpha != JsonFloatType.Auto) {
+    args = append(args, "FPHA", opts.fpha.text())
+  }
+  return args
+}
+
+// `OK` is true; a null reply (an `NX`/`XX` that did not apply, or a path that
+// cannot be created) is false.
+fn jsonSetCmd(key: string, path: string, value: JsonValue, opts: JsonSetOptions): Cmd<bool> {
+  return Cmd<bool>{
+    args = jsonSetArgs(key, path, value, opts),
+    decode = (r) => asSet(r),
+    readOnly = false,
+  }
+}
+
+fn asSet(r: Reply): bool!RedisError {
+  match (r) {
+    Simple(_) => return true
+    Null => return false
+    _ => fail RedisError.Unexpected("JSON.SET", shapeName(r))
+  }
+}
+
+fn jsonMsetCmd(first: JsonTarget, others: []JsonTarget): Cmd<()> {
+  let args = ["JSON.MSET", first.key, first.path, jsonEncode(first.value)]
+  for t of others {
+    args = append(args, t.key, t.path, jsonEncode(t.value))
+  }
+  return Cmd<()>{ args = args, decode = (r) => asOk(r, "JSON.MSET"), readOnly = false }
+}
+
+fn jsonMergeCmd(key: string, path: string, value: JsonValue): Cmd<()> {
+  return Cmd<()>{
+    args = ["JSON.MERGE", key, path, jsonEncode(value)],
+    decode = (r) => asOk(r, "JSON.MERGE"),
+    readOnly = false,
+  }
+}
+
+// ---- JSON.GET / JSON.MGET ---------------------------------------------------
+
+// The matches of `path`, as the trees the server stores.
+export class JsonMatch {
+  export path: string,
+  export values: []JsonValue,
+}
+
+fn jsonGetCmd<T>(key: string): Cmd<Option<T>> {
+  return Cmd<Option<T>>{
+    args = ["JSON.GET", key, jsonRoot],
+    decode = (r) => asFirstMatch<T>(r, "JSON.GET"),
+    readOnly = true,
+  }
+}
+
+// The first match in a `[...]` bulk reply, or `None` for a missing key or an
+// empty match list.
+fn asFirstMatch<T>(r: Reply, cmd: string): Option<T>!RedisError {
+  let text = asOptString(r, cmd)?
+  match (text) {
+    None => return Option.None
+    Some(s) => {
+      let items = jsonMatches(s, cmd)?
+      if (len(items) == 0) {
+        return Option.None
+      }
+      return Option.Some(jsonInto<T>(items[0], cmd)?)
+    }
+  }
+}
+
+fn jsonGetAtCmd<T>(key: string, path: string): Cmd<[]T> {
+  return Cmd<[]T>{
+    args = ["JSON.GET", key, path],
+    decode = (r) => asEveryMatch<T>(r),
+    readOnly = true,
+  }
+}
+
+fn asEveryMatch<T>(r: Reply): []T!RedisError {
+  let out = []T(0)
+  let text = asOptString(r, "JSON.GET")?
+  match (text) {
+    None => return out
+    Some(s) => {
+      for tree of jsonMatches(s, "JSON.GET")? {
+        out = append(out, jsonInto<T>(tree, "JSON.GET")?)
+      }
+      return out
+    }
+  }
+}
+
+fn jsonGetPathsCmd(key: string, paths: []string): Cmd<[]JsonMatch> {
+  return Cmd<[]JsonMatch>{
+    args = append(["JSON.GET", key], ...paths),
+    decode = (r) => asPathMatches(r, paths),
+    readOnly = true,
+  }
+}
+
+// With two or more paths the server answers one object keyed by path; with
+// one path it answers that path's array. Both come back in the order the
+// paths were asked, a path with no entry holding no values.
+fn asPathMatches(r: Reply, paths: []string): []JsonMatch!RedisError {
+  let out = []JsonMatch(0)
+  let text = asOptString(r, "JSON.GET")?
+  match (text) {
+    None => return out
+    Some(s) => {
+      if (len(paths) == 1) {
+        return [JsonMatch{ path = paths[0], values = jsonMatches(s, "JSON.GET")? }]
+      }
+      let entries = jsonObjectEntries(s, "JSON.GET")?
+      for p of paths {
+        out = append(out, JsonMatch{ path = p, values = entryMatches(entries, p)? })
+      }
+      return out
+    }
+  }
+}
+
+fn jsonObjectEntries(text: string, cmd: string): []JsonEntry!RedisError {
+  let tree = jsonTree(text, cmd)?
+  match (jsonAsObject(tree)) {
+    Some(entries) => return entries
+    None => fail RedisError.Unexpected(cmd, "expected an object keyed by path")
+  }
+}
+
+fn entryMatches(entries: []JsonEntry, path: string): []JsonValue!RedisError {
+  for e of entries {
+    if (e.key == path) {
+      match (jsonAsArray(e.value)) {
+        Some(items) => return items
+        None => fail RedisError.Unexpected("JSON.GET", "the entry for '${path}' is not an array")
+      }
+    }
+  }
+  return []JsonValue(0)
+}
+
+fn jsonMgetCmd<T>(keys: []string, path: string): Cmd<[]Option<T>> {
+  return Cmd<[]Option<T>>{
+    args = append(append(["JSON.MGET"], ...keys), path),
+    decode = (r) => asEachKey<T>(r),
+    readOnly = true,
+  }
+}
+
+// One entry per key: the first match of the path in that key, `None` for a
+// missing key or a path with no match.
+fn asEachKey<T>(r: Reply): []Option<T>!RedisError {
+  let out = []Option<T>(0)
+  for item of replyItems(r, "JSON.MGET")? {
+    out = append(out, asFirstMatch<T>(item, "JSON.MGET")?)
+  }
+  return out
+}
+
+// ---- keyless-reply helpers --------------------------------------------------
+
+// The elements of an array reply; a null array has none.
+fn replyItems(r: Reply, cmd: string): []Reply!RedisError {
+  match (r) {
+    Array(items) => return unwrapOr(items, []Reply(0))
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn isNull(r: Reply): bool {
+  match (r) {
+    Null => return true
+    Bulk(v) => return isNone(v)
+    _ => return false
+  }
+}
+
+// ---- per-match integer, boolean, string and number answers ------------------
+
+fn jsonLenCmd(name: string, key: string, path: string): Cmd<[]Option<i64>> {
+  return Cmd<[]Option<i64>>{
+    args = [name, key, path],
+    decode = (r) => asOptInts(r, name),
+    readOnly = true,
+  }
+}
+
+// One entry per match: the integer, or `None` where the match is not the kind
+// of value the command works on.
+fn asOptInts(r: Reply, cmd: string): []Option<i64>!RedisError {
+  let out = []Option<i64>(0)
+  for item of replyItems(r, cmd)? {
+    if (isNull(item)) {
+      out = append(out, Option.None)
+    } else {
+      out = append(out, Option.Some(asInt(item, cmd)?))
+    }
+  }
+  return out
+}
+
+fn jsonToggleCmd(key: string, path: string): Cmd<[]Option<bool>> {
+  return Cmd<[]Option<bool>>{
+    args = ["JSON.TOGGLE", key, path],
+    decode = (r) => asOptBools(r),
+    readOnly = false,
+  }
+}
+
+fn asOptBools(r: Reply): []Option<bool>!RedisError {
+  let out = []Option<bool>(0)
+  for item of replyItems(r, "JSON.TOGGLE")? {
+    if (isNull(item)) {
+      out = append(out, Option.None)
+    } else {
+      out = append(out, Option.Some(asBool(item, "JSON.TOGGLE")?))
+    }
+  }
+  return out
+}
+
+fn jsonTypeCmd(key: string, path: string): Cmd<[]string> {
+  return Cmd<[]string>{
+    args = ["JSON.TYPE", key, path],
+    decode = (r) => jsonTypes(r),
+    readOnly = true,
+  }
+}
+
+// RESP3 wraps the matches' type names in one more array (`[["object"]]`),
+// RESP2 lists them flat (`["object"]`); a missing key answers `[nil]`. All
+// three read as the list of type names, empty when there is none.
+fn jsonTypes(r: Reply): []string!RedisError {
+  let items = replyItems(r, "JSON.TYPE")?
+  if (len(items) == 0 || isNull(items[0])) {
+    return []string(0)
+  }
+  match (items[0]) {
+    Array(_) => return asStrings(items[0], "JSON.TYPE")?
+    _ => return asStrings(r, "JSON.TYPE")?
+  }
+}
+
+fn jsonObjKeysCmd(key: string, path: string): Cmd<[]Option<[]string>> {
+  return Cmd<[]Option<[]string>>{
+    args = ["JSON.OBJKEYS", key, path],
+    decode = (r) => asKeyLists(r),
+    readOnly = true,
+  }
+}
+
+fn asKeyLists(r: Reply): []Option<[]string>!RedisError {
+  let out = []Option<[]string>(0)
+  for item of replyItems(r, "JSON.OBJKEYS")? {
+    if (isNull(item)) {
+      out = append(out, Option.None)
+    } else {
+      out = append(out, Option.Some(asStrings(item, "JSON.OBJKEYS")?))
+    }
+  }
+  return out
+}
+
+fn jsonStrAppendCmd(key: string, path: string, text: string): Cmd<[]Option<i64>> {
+  return Cmd<[]Option<i64>>{
+    args = ["JSON.STRAPPEND", key, path, jsonEncode(JsonValue.JsonString(text))],
+    decode = (r) => asOptInts(r, "JSON.STRAPPEND"),
+    readOnly = false,
+  }
+}
+
+// `JSON.NUMINCRBY` and `JSON.NUMMULTBY`: one entry per match, the new number
+// or `None` where the match is not a number.
+fn jsonNumCmd(name: string, key: string, path: string, by: f64): Cmd<[]Option<f64>> {
+  return Cmd<[]Option<f64>>{
+    args = [name, key, path, "${by}"],
+    decode = (r) => jsonNumbers(r, name),
+    readOnly = false,
+  }
+}
+
+fn jsonNumbers(r: Reply, cmd: string): []Option<f64>!RedisError {
+  match (r) {
+    Bulk(_) => return numbersFromText(unwrapOr(asOptString(r, cmd)?, "[]"), cmd)?
+    _ => return numbersFromItems(replyItems(r, cmd)?, cmd)?
+  }
+}
+
+fn numbersFromText(text: string, cmd: string): []Option<f64>!RedisError {
+  let out = []Option<f64>(0)
+  for tree of jsonMatches(text, cmd)? {
+    out = append(out, jsonAsNumber(tree))
+  }
+  return out
+}
+
+fn numbersFromItems(items: []Reply, cmd: string): []Option<f64>!RedisError {
+  let out = []Option<f64>(0)
+  for item of items {
+    match (item) {
+      Int(n) => out = append(out, Option.Some(f64(n)))
+      Null => out = append(out, Option.None)
+      _ => out = append(out, Option.Some(asDouble(item, cmd)?))
+    }
+  }
+  return out
+}
+
+// ---- arrays -----------------------------------------------------------------
+
+fn jsonArrAppendCmd(key: string, path: string, values: []JsonValue): Cmd<[]Option<i64>> {
+  return Cmd<[]Option<i64>>{
+    args = append(["JSON.ARRAPPEND", key, path], ...encodeAll(values)),
+    decode = (r) => asOptInts(r, "JSON.ARRAPPEND"),
+    readOnly = false,
+  }
+}
+
+fn jsonArrInsertCmd(
+  key: string,
+  path: string,
+  index: int,
+  values: []JsonValue,
+): Cmd<[]Option<i64>> {
+  return Cmd<[]Option<i64>>{
+    args = append(["JSON.ARRINSERT", key, path, "${index}"], ...encodeAll(values)),
+    decode = (r) => asOptInts(r, "JSON.ARRINSERT"),
+    readOnly = false,
+  }
+}
+
+fn encodeAll(values: []JsonValue): []string {
+  let out = []string(0)
+  for v of values {
+    out = append(out, jsonEncode(v))
+  }
+  return out
+}
+
+// `stop` 0 reads to the end, the server's own default; both ends are sent
+// whenever either is set so the pair is never ambiguous.
+fn jsonArrIndexCmd(
+  key: string,
+  path: string,
+  value: JsonValue,
+  start: int,
+  stop: int,
+): Cmd<[]Option<i64>> {
+  let args = ["JSON.ARRINDEX", key, path, jsonEncode(value)]
+  if (start != 0 || stop != 0) {
+    args = append(args, "${start}", "${stop}")
+  }
+  return Cmd<[]Option<i64>>{
+    args = args,
+    decode = (r) => asOptInts(r, "JSON.ARRINDEX"),
+    readOnly = true,
+  }
+}
+
+fn jsonArrPopCmd(key: string, path: string, index: int): Cmd<[]Option<JsonValue>> {
+  return Cmd<[]Option<JsonValue>>{
+    args = ["JSON.ARRPOP", key, path, "${index}"],
+    decode = (r) => jsonPopped(r),
+    readOnly = false,
+  }
+}
+
+// Each popped element is JSON text; an empty array or a non-array match
+// pops nothing.
+fn jsonPopped(r: Reply): []Option<JsonValue>!RedisError {
+  let out = []Option<JsonValue>(0)
+  for item of replyItems(r, "JSON.ARRPOP")? {
+    let text = asOptString(item, "JSON.ARRPOP")?
+    match (text) {
+      Some(s) => out = append(out, Option.Some(jsonTree(s, "JSON.ARRPOP")?))
+      None => out = append(out, Option.None)
+    }
+  }
+  return out
+}
+
+fn jsonArrTrimCmd(key: string, path: string, start: int, stop: int): Cmd<[]Option<i64>> {
+  return Cmd<[]Option<i64>>{
+    args = ["JSON.ARRTRIM", key, path, "${start}", "${stop}"],
+    decode = (r) => asOptInts(r, "JSON.ARRTRIM"),
+    readOnly = false,
+  }
+}
+
+// ---- JSON.DEL / JSON.CLEAR --------------------------------------------------
+
+// `JSON.DEL` and `JSON.CLEAR` answer how many values they removed or reset.
+fn jsonCountCmd(name: string, key: string, path: string): Cmd<i64> {
+  return Cmd<i64>{ args = [name, key, path], decode = (r) => asInt(r, name), readOnly = false }
+}
