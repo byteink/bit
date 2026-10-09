@@ -115,20 +115,6 @@ alarm_run() {
 }
 # The pin. Override only to explore locally; the committed value is the gate.
 EXPECTED_REFUSED=${EXPECTED_REFUSED:-0}
-# Oracle-lag pins (#7671). An example whose output the PINNED stage0 gets WRONG, because the stage0
-# compiles the working tree's stdlib at a layout it does not yet have, is not a miscompile of the
-# new compiler. It is pinned by name with the output it MUST print, derived here by a tool that
-# shares no code with Bit, so the pin is a claim the new compiler is right and not an exemption:
-# the example counts as LAG only when the oracle's output differs AND bit2's equals that derived
-# text exactly. bit2 printing anything else is still a DIFF, and the oracle agreeing again is a
-# stale pin that fails the run, so the entry is deleted at the repin that fixes the oracle (#6533).
-# The list is empty: the one entry (hashing, #7574) was fixed at the cause by making std/crypto's
-# sha256 correct under both []u32 strides (#7713), which turned its pin STALE.
-ORACLE_LAG=""
-# lag_expected <example> -- print the output a pinned example MUST produce; fails for an unpinned one.
-lag_expected() { return 1; }
-# lag_pinned <example> -- 0 when the example is on the ORACLE_LAG list.
-lag_pinned() { case " $ORACLE_LAG " in *" $1 "*) return 0 ;; esac; return 1; }
 # Network-dependent examples: they talk to the outside world, so their output is
 # not a function of the compiler alone.
 SKIP="h3fetch httpserver httpsserver http2server tlsclient"
@@ -160,7 +146,7 @@ export BIT_LIBBITRT="$PWD/$HOST_RT"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-pass=0 diff=0 refused=0 oraclefail=0 skipped=0 timedout=0 lagged=0 stalepin=0
+pass=0 diff=0 refused=0 oraclefail=0 skipped=0 timedout=0
 for d in examples/*/; do
   n=$(basename "$d")
   case " $SKIP " in *" $n "*) skipped=$((skipped + 1)); continue;; esac
@@ -210,16 +196,6 @@ for d in examples/*/; do
     continue
   fi
 
-  if lag_pinned "$n" && [ "$se" = "$b2" ] && cmp -s "$TMP/o_oracle_$n" "$TMP/o_b2_$n"; then
-    echo "STALE-PIN $n: the oracle agrees with bit2 now; delete it from ORACLE_LAG"
-    stalepin=$((stalepin + 1))
-    continue
-  fi
-  if lag_pinned "$n" && [ "$se" = 0 ] && [ "$b2" = 0 ] && lag_expected "$n" >"$TMP/want_$n" && cmp -s "$TMP/want_$n" "$TMP/o_b2_$n"; then
-    echo "LAG       $n (oracle output differs, bit2 equals the independently derived output; pinned until #6533)"
-    lagged=$((lagged + 1))
-    continue
-  fi
   if [ "$se" != "$b2" ] || ! cmp -s "$TMP/o_oracle_$n" "$TMP/o_b2_$n"; then
     echo "DIFF      $n (exit oracle=$se bit2=$b2)"
     command diff "$TMP/o_oracle_$n" "$TMP/o_b2_$n" | head -6
@@ -229,7 +205,7 @@ for d in examples/*/; do
   pass=$((pass + 1))
 done
 
-echo "example differential: PASS=$pass DIFF=$diff TIMEOUT=$timedout REFUSED=$refused (pinned $EXPECTED_REFUSED) ORACLE-FAIL=$oraclefail LAG=$lagged STALE-PIN=$stalepin SKIP(network)=$skipped"
+echo "example differential: PASS=$pass DIFF=$diff TIMEOUT=$timedout REFUSED=$refused (pinned $EXPECTED_REFUSED) ORACLE-FAIL=$oraclefail SKIP(network)=$skipped"
 # A REFUSED example is an honest "not ported yet" only while it matches the pin.
 refusedmismatch=0
 if [ "$refused" -gt "$EXPECTED_REFUSED" ]; then
@@ -244,4 +220,4 @@ fi
 # A DIFF is a miscompile; an ORACLE-FAIL means the oracle itself did not build;
 # a REFUSED drift off the pin is a regression either direction. All three
 # always win over a concurrent TIMEOUT, which decided nothing.
-diffexit "examples" -f "$diff" "$oraclefail" "$refusedmismatch" "$stalepin" -t "example(s)=$timedout"
+diffexit "examples" -f "$diff" "$oraclefail" "$refusedmismatch" -t "example(s)=$timedout"
