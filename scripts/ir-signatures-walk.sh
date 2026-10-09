@@ -253,6 +253,108 @@ function f32Fill(e, id,   v, args, c, S) {
 /^  index_set / { flushHeld(); print "  " rwStore(ex(substr($0, 3))); next }
 { flushHeld(); print ex($0) }
 END { flushHeld() }'
+  IR_CSE_AWK='# Stage 1b, oracle side only (#7674): drops each element load the working tree optcse.bit forwards and
+# the pinned stage0 never did. optcse.bit (cseStep, cseInheritHead, opClobbersLoads) keeps one table of
+# loads per block: a block with exactly ONE predecessor, reached by a FORWARD edge (lower block id and
+# earlier in emission order), starts from that predecessor exit table, anything else from an empty one.
+# An `index_get` of a non-reference scalar (cseScalarType: a prim integer, float or bool) is keyed on its
+# base, its index and its type; when the table holds the key the load is forwarded to the earlier one,
+# otherwise it is recorded. Any op in isSideEffecting other than index_get and the terminators empties
+# the table: calls, stores, allocations, closures, divisions, atomics, asm, syscall, the attention poll,
+# keepAlive, call words. Pure ops are printed inline by stage 1, so two operand expressions are the same
+# key exactly when their text agrees once the dropped ids are renamed to the kept ones. The test
+# for a barrier is a whitelist of the ops that are not one, so an op this file does not know empties the
+# table and the file stays unexplained. Nothing is dropped unless the table, rebuilt from the dump text,
+# holds the key; the tree side is never touched, so a tree that kept a load stays different.
+function safeOp(o) { return o ~ /^(index_get|field_get|slice_len|bitcast|convert|const_[a-z]+|icmp_[a-z]+|fcmp_[a-z]+|add|sub|mul|shl|ashr|lshr|band|bor|bxor|bnot|neg|fneg|fadd|fsub|fmul|fdiv|fsqrt|ffloor|fceil|ftrunc|fround|smulhi|umulhi|func_addr|global_addr|stack_maps_addr)$/ }
+function scalarTy(t) { return t ~ /^(i8|i16|i32|i64|u8|u16|u32|u64|bool|f32|f64|int)$/ }
+function rn(s,   out, id) {
+  out = ""
+  while (match(s, /\$[0-9]+/)) {
+    id = substr(s, RSTART, RLENGTH)
+    out = out substr(s, 1, RSTART - 1) (id in REN ? REN[id] : id)
+    s = substr(s, RSTART + RLENGTH)
+  }
+  return out s
+}
+function lookup(st, key,   p, v) {
+  p = index(st, "\001" key "\002")
+  if (p == 0) { return "" }
+  v = substr(st, p + length(key) + 2)
+  sub(/\001.*$/, "", v)
+  return v
+}
+function edges(   i, s, t, cur) {
+  for (i = 1; i <= n0; i++) {
+    if (L[i] ~ /^bb[0-9]+\(/) { cur = L[i]; sub(/\(.*$/, "", cur); nb++; BN[nb] = cur; BPOS[cur] = nb; continue }
+    if (cur == "" || L[i] !~ /^  (jump|br) /) { continue }
+    s = L[i]
+    while (match(s, /bb[0-9]+\(/)) {
+      t = substr(s, RSTART, RLENGTH - 1)
+      PC[t]++
+      PRED[t] = cur
+      s = substr(s, RSTART + RLENGTH)
+    }
+  }
+}
+function entry(b, tab,   p) {
+  p = PRED[b]
+  if (PC[b] != 1 || substr(p, 3) + 0 >= substr(b, 3) + 0 || BPOS[p] >= BPOS[b]) { return "" }
+  return tab[p]
+}
+# A pure binary op printed as a def (compares, bitwise, shifts, float arithmetic) is a second chain
+# optcse.bit never clears. It is dropped only when renaming an operand to a kept load made it the
+# same key as an earlier one (that line, or the earlier one, was renamed), so a duplicate the oracle
+# itself left in place is not touched.
+function pureStep(l, changed,   key, hit) {
+  key = substr(l, index(l, " = ") + 3)
+  hit = lookup(PT, key)
+  if (hit != "") {
+    if (changed || (hit in TOUCHED)) { REN[W[1]] = hit; DEL[CUR] = 1 }
+    return
+  }
+  if (changed) { TOUCHED[W[1]] = 1 }
+  PT = PT "\001" key "\002" W[1]
+}
+function step(i,   l, o, rest, t, key, hit) {
+  l = rn(L[i])
+  if (l !~ /^  \$[0-9]+ = /) { return (l ~ /^  (jump|br|ret|unreachable)( |$)/) ? 1 : 0 }
+  split(l, W, " ")
+  o = W[3]
+  if (o ~ /^(icmp_[a-z]+|fcmp_[a-z]+|band|bor|bxor|ashr|lshr|fadd|fsub|fmul|fdiv|smulhi|umulhi)$/) { CUR = i; pureStep(l, l != L[i]) }
+  if (o != "index_get") { return safeOp(o) }
+  rest = substr(l, index(l, " = ") + 3 + length("index_get "))
+  t = rest; sub(/^.* /, "", t)
+  if (!scalarTy(t) || rest !~ /\] [a-z0-9]+$/) { return 1 }
+  key = rest
+  hit = lookup(ST, key)
+  if (hit != "") { REN[W[1]] = hit; DEL[i] = 1; return 1 }
+  ST = ST "\001" key "\002" W[1]
+  return 1
+}
+function flush(   i, b) {
+  edges()
+  b = ""
+  for (i = 1; i <= n0; i++) {
+    if (L[i] ~ /^bb[0-9]+\(/) {
+      if (b != "") { EXIT[b] = ST; PEXIT[b] = PT }
+      b = L[i]; sub(/\(.*$/, "", b)
+      ST = entry(b, EXIT)
+      PT = entry(b, PEXIT)
+      continue
+    }
+    if (b == "") { continue }
+    if (!step(i)) { ST = "" }
+  }
+  for (i = 1; i <= n0; i++) {
+    if (DEL[i]) { continue }
+    print (L[i] ~ /^bb[0-9]+\(/) ? L[i] : rn(L[i])
+  }
+  n0 = 0; nb = 0; delete L; delete REN; delete DEL; delete PC; delete PRED; delete BN; delete BPOS; delete EXIT; delete PEXIT; delete TOUCHED
+}
+/^func /{ flush(); print; next }
+{ L[++n0] = $0 }
+END { flush() }'
   IR_FOLD_AWK='# Stage 2, tree side only: folds the append fast path that #7562 made eligible for []i16/[]u16
 # (optappend.bit: elem_size equals the element width) back into the one slice_append call the
 # oracle keeps. The template is matched line for line; a near miss folds nothing and so differs.
@@ -331,7 +433,9 @@ END { flush() }'
 # f32buf is the pseudo-op; when its index is `{add i64 <f32off of the same slice>, i}` and the nine
 # lines before it are exactly the slice_len / icmp_ult / br guard with its panic block for that slice
 # and index, that guard goes too. A guard that does not match, or whose values are used elsewhere,
-# stays in the text and so keeps the file unexplained.
+# stays in the text and so keeps the file unexplained. A store into a slice whose offset the tree
+# knows to be zero (a fresh literal) has no f32off read: the seven guard lines and the f32buf read
+# before it go the same way, when the guard tests the index the store writes.
 function dst(l) { sub(/^  /, "", l); sub(/ = .*$/, "", l); return l }
 function usedOutside(tok, lo, hi,   j, s, i, c) {
   for (j = 1; j <= n0; j++) {
@@ -397,6 +501,8 @@ function flush(   i, m, c, d, S, idx, v, q, r, inner, pfx) {
         for (m = i - 9; m < i; m++) { DEL[m] = 1 }
         idx = inner
       }
+    } else if (guardAt(i - 8, S, idx) && L[i - 1] == "  " c " = f32buf " S) {
+      for (m = i - 8; m < i - 1; m++) { DEL[m] = 1 }
     }
     L[i] = "  f32_store " S "[" idx "] = " v
   }
@@ -504,6 +610,7 @@ END {
   }
   if (which == "half") { print "7562-packed-halfword-slices" }
   else if (which == "narrow") { print "7574-packed-narrow-slices" }
+  else if (which == "cse") { print "7674-forwarded-index-get" }
   else { print "7637-string-from-rune-range" }
 }'
   IR_TYPES_AWK='# The types row: the oracle dump, a line @@@BIT2@@@, then the tree dump. Rows are `line:col: name:
@@ -538,12 +645,23 @@ END {
 }'
 }
 
-# irTrial <oracle_text> <bit2_text> <half> <narrow> <rune> <name> -- one normalization with the given
-# rewrite classes enabled; prints the signature when the two dumps then agree byte for byte.
+# irOracleStage1 <oracle_text> <awk flags> <cse: 0|1> -- the oracle dump after stage 1, and after stage
+# 1b (IR_CSE_AWK, #7674) when cse is 1. Shared by irTrial and explainIrLagPin so the stage cannot differ.
+irOracleStage1() {
+  # shellcheck disable=SC2086
+  if [ "$3" = 1 ]; then
+    canon_ir_ids "$1" | LC_ALL=C awk $2 -v side=oracle "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk "${IR_CSE_AWK}"
+  else
+    canon_ir_ids "$1" | LC_ALL=C awk $2 -v side=oracle "${IR_PW_AWK}${IR_STAGE1_AWK}"
+  fi
+}
+
+# irTrial <oracle_text> <bit2_text> <half> <narrow> <rune> <name> [cse] -- one normalization with the
+# given rewrite classes enabled (cse: also forward the element loads of #7674 on the oracle side);
+# prints the signature when the two dumps then agree byte for byte.
 irTrial() {
   local o t f="-v half=$3 -v narrow=$4 -v rune=$5"
-  # shellcheck disable=SC2086
-  o=$(canon_ir_ids "$1" | LC_ALL=C awk $f -v side=oracle "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk "${IR_F32_AWK}" | LC_ALL=C awk "${IR_RENUM_AWK}") || return 1
+  o=$(irOracleStage1 "$1" "$f" "${7:-0}" | LC_ALL=C awk "${IR_F32_AWK}" | LC_ALL=C awk "${IR_RENUM_AWK}") || return 1
   # shellcheck disable=SC2086
   t=$(canon_ir_ids "$2" | LC_ALL=C awk $f -v side=tree "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk $f "${IR_PW_AWK}${IR_FOLD_AWK}" | LC_ALL=C awk "${IR_F32_AWK}" | LC_ALL=C awk "${IR_RENUM_AWK}") || return 1
   printf '%s\n@@@BIT2@@@\n%s\n' "${o}" "${t}" | LC_ALL=C awk -v which="$6" "${IR_CMP_AWK}"
@@ -556,7 +674,7 @@ explainIrLagPin() {
   local o t f="-v half=1 -v narrow=1 -v rune=0"
   irWalkAwk
   # shellcheck disable=SC2086
-  o=$(canon_ir_ids "$1" | LC_ALL=C awk $f -v side=oracle "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk "${IR_F32_AWK}" | LC_ALL=C awk "${IR_LAG_AWK}") || return 1
+  o=$(irOracleStage1 "$1" "$f" 1 | LC_ALL=C awk "${IR_F32_AWK}" | LC_ALL=C awk "${IR_LAG_AWK}") || return 1
   # shellcheck disable=SC2086
   t=$(canon_ir_ids "$2" | LC_ALL=C awk $f -v side=tree "${IR_PW_AWK}${IR_STAGE1_AWK}" | LC_ALL=C awk $f "${IR_PW_AWK}${IR_FOLD_AWK}" | LC_ALL=C awk "${IR_F32_AWK}" | LC_ALL=C awk "${IR_LAG_AWK}") || return 1
   [ -n "${o}" ] && [ "${o}" = "${t}" ] && awk 'BEGIN { print "7574-f32-store-schedule-lag" }'
@@ -567,7 +685,8 @@ explainIrLagPin() {
 # narrowest rewrite set to the widest and the first that agrees names the file: halfword alone is
 # #7562, halfword plus the 1 and 4 byte widths is #7574, the []rune range call alone or together
 # with the packing is #7637 (a file that needs both is named for the rune call, the one rewrite
-# that is not a width).
+# that is not a width). On the iropt arm only, the trials with stage 1b follow, alone or on top of the
+# packing: #7674 (the pre-opt dump has no CSE, so there is nothing for it to explain on the ir arm).
 explainIrLag() {
   [ "$(canon_ir_ids "$1")" = "$(canon_ir_ids "$2")" ] && return 1
   irWalkAwk
@@ -575,6 +694,10 @@ explainIrLag() {
   irTrial "$1" "$2" 1 1 0 narrow && return 0
   irTrial "$1" "$2" 0 0 1 rune && return 0
   irTrial "$1" "$2" 1 1 1 rune && return 0
+  [ "$3" = iropt ] || return 1
+  irTrial "$1" "$2" 0 0 0 cse 1 && return 0
+  irTrial "$1" "$2" 1 1 0 cse 1 && return 0
+  irTrial "$1" "$2" 1 1 1 rune 1 && return 0
   return 1
 }
 

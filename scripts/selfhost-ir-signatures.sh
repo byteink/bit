@@ -287,9 +287,11 @@
 # the pseudo-ops `f32_store s[i] = v` and `f32_load s[i] f32` (the guard, its panic block and the two
 # field_get reads go with the guarded spelling; a guard that does not match exactly stays and keeps the
 # file unexplained). The trial that names it enables the halfword and the narrow widths together. The
-# optimizer-driven differences of the post-opt arm are NOT in it: run_float32_interp,
-# run_float_slice_elems and run_packed_narrow_slices differ there by where the inline stores sit
-# relative to the following reads' guards, and stdlib/crypto/bigint.bit by a load the oracle CSE'd.
+# optimizer-driven differences of the post-opt arm are NOT in it: run_float32_interp and
+# run_float_slice_elems differ there by where the inline stores sit relative to the following reads'
+# guards. A store into a slice the tree knows to start at offset 0 (a fresh literal) has no offset read:
+# its guard and buffer read are collapsed the same way. stdlib/crypto/bigint.bit differed by a load the
+# oracle CSE'd until #7674 made the tree forward it; it is explained by this signature alone.
 #
 # 7637-string-from-rune-range (`ir`, `iropt`). #7637 (c8381c0c2) makes `string(rs[lo:hi])` on a
 # `[]rune` one `rt_call string_from_rune_range(rs, lo, hi)`; the oracle emitted
@@ -297,7 +299,26 @@
 # is a `[]i32` (or the untyped nil), so a `[]u8` receiver is never touched. A file that needs this
 # together with the packing is named 7637 (the one rewrite that is not a width).
 #
-# All three retire at the next stage0 repin (#6533).
+# 7674-forwarded-index-get (`iropt` only). #7674 (aa32c9bf3) puts the `index_get` of a non-reference
+# scalar into optcse.bit's load chain (cseStep, AvailArena.elem, cseScalarType); the pinned stage0
+# forwarded only the word-strided `field_get` read it replaced, so it loads such an element twice
+# where the tree loads it once. The oracle dump is rewritten by IR_CSE_AWK (scripts/ir-signatures-walk.sh)
+# along the rule optcse.bit applies: a block with exactly one predecessor, reached by a forward edge,
+# starts from that predecessor's exit table, any other block from an empty one; a later `index_get`
+# with the same base, index and prim type as an entry is dropped and its uses renamed to the earlier
+# id; every op in isSideEffecting except index_get and the terminators (a call, a store, an
+# allocation, a division, an atomic, asm, a syscall, the attention poll, keepAlive) empties the table,
+# and so does any op the walk does not know. A compare or a bitwise, shift or float op that the rename
+# made equal to an earlier one is dropped too (optcse.bit's pure chain, which no barrier clears), but
+# only when it was renamed. The tree dump is never touched, so a tree that kept a load, or a load the
+# walk would not drop, stays unexplained; the normalized texts must then agree byte for byte. It
+# composes with the packing: the stage runs after the halfword/narrow rewrites. 18 corpus files:
+# json_cst_create_intermediate, jsonc_parse_{comments,json5_rejected,trailing_comma,
+# two_trailing_commas}, run_append_spread, run_inliner_loop_return, run_tuple_narrow_{boxed,exploded}_
+# convert under _tests_/cases/, examples/strslice and examples/syncmutex, and stdlib/{hash/xxhash64,
+# time/extend,http2/hpack,json/lex,decimal/decimal,crypto/sha512,crypto/field25519}.
+#
+# All four retire at the next stage0 repin (#6533).
 #
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
@@ -306,7 +327,7 @@ explainMismatch() {
   case "$3" in
     types) explainLagTypes "$1" "$2"; return ;;
     ir|iropt)
-      explainIrLag "$1" "$2" && return 0
+      explainIrLag "$1" "$2" "$3" && return 0
       irLagPinned "$3" "${4:-}" && explainIrLagPin "$1" "$2"
       return ;;
   esac
@@ -318,7 +339,7 @@ explainMismatch() {
 # 7574-f32-store-schedule-lag (`iropt` only). #7574 stores an f32 element inline, so the optimizer
 # of the working tree moves those stores relative to the guards of the reads that follow and shares
 # one slice_len between them; the pinned stage0 sees an opaque `rt_call slice_set` there and cannot.
-# golden (run_float32_interp, run_float_slice_elems, run_packed_narrow_slices) proves the output
+# golden (run_float32_interp, run_float_slice_elems) proves the output
 # right. A pin is `kind|file|reason`; it explains its file only when, with every line tied to an
 # []f32 slice deleted from both dumps (explainIrLagPin), the rest is identical, and a pinned file
 # that no longer needs the pin (it matches, or a declared signature explains it) fails the run as
@@ -328,8 +349,7 @@ explainMismatch() {
 irLagPins() {
   printf '%s\n' \
     'iropt|_tests_/cases/run_float32_interp.bit|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin' \
-    'iropt|_tests_/cases/run_float_slice_elems.bit|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin' \
-    'iropt|_tests_/cases/run_packed_narrow_slices.bit|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin'
+    'iropt|_tests_/cases/run_float_slice_elems.bit|#7574 inline f32 store scheduled by the optimizer, until the #6533 repin'
 }
 # irLagPinned <kind> <file> -- 0 when the (kind, file) pair is pinned.
 irLagPinned() { irLagPins | awk -F'|' -v k="$1" -v f="${2:-}" '$1 == k && $2 == f { found = 1 } END { exit !found }'; }
@@ -348,7 +368,7 @@ irLagPinFiles() { irLagPins | awk -F'|' -v k="$1" '$1 == k { print $2 }'; }
 declaredSignatureNames() {
   local types="7558-synth-json-alias-column-shift"
   local ir="7562-packed-halfword-slices 7574-packed-narrow-slices 7637-string-from-rune-range"
-  local lag="7574-f32-store-schedule-lag"
+  local lag="7574-f32-store-schedule-lag 7674-forwarded-index-get"
   case "${1:-}" in
     types) printf '%s\n' $types ;;
     ir) printf '%s\n' $ir ;;
