@@ -332,3 +332,224 @@ fn edgeClearSlots(clears: []SlotClear, src: int, dst: int): []int {
   }
   return out
 }
+
+// #7716: zeroing a DEAD heap-word CALLEE-SAVED register before a call.
+//
+// Same hazard as the slots above, other storage. A callee that uses a
+// callee-saved register saves the caller's value in its prologue, and
+// `stwScanStackRange` reads that save conservatively. A register whose
+// interval ended keeps its last word until the next interval assigned to it
+// writes it, which can be after any number of calls, so a dead reference left
+// there roots its object for as long as a callee that saves the register is
+// on the stack. Which object leaks is register-assignment luck: #7706 and
+// #7708 each moved a retained 58-byte string in `bench/cases/json`.
+//
+// So before a call that can reach the collector, every callee-saved register
+// that holds no value at that point and whose latest occupant was a
+// `isRef || heapDerived` interval is zeroed. "Holds no value" is "no interval
+// assigned it is live into the call" (a result the call itself defines is
+// written after the zero); nothing reads the zero, so it is as sound as
+// handing the register to the next interval. A split value counts as
+// holding every register it uses over its whole life, which only withholds a
+// clear. The clear runs at most once per register between occupants (a later
+// call in the same block sees it clean) and never in a loop body, the rule the
+// slot clears above follow: a value defined in the iteration is rewritten by
+// the next one, and one that dies in the loop is cleared before the first call
+// after the loop.
+//
+// The emitter zeroes the registers of `mask` before the instruction at
+// position `p`, only those its frame saves (an interval the emitter folded
+// away owns a register the prologue never saved, and zeroing that one would
+// clobber the caller's value).
+
+// One register occupancy: `reg` (int file position) holds a value on [lo, hi].
+class RegSpan {
+  reg: int,
+  lo: int,
+  hi: int,
+  heap: bool,
+}
+
+// Every register occupancy of a non-alias, non-folded Int interval. A split
+// interval contributes one span per register it ever uses, over its whole life.
+fn regSpans(
+  scan: []LiveInterval, locations: []RegLoc, alias: []bool, splitOf: []int,
+  splits: []SplitPiece,
+): []RegSpan {
+  let out = []RegSpan(0)
+  let i = 0
+  while (i < len(scan)) {
+    let iv = scan[i]
+    if (!alias[i] && !iv.filler && !iv.folded && iv.regClass == RegClass.Int) {
+      out = appendSpans(out, iv, locations[iv.vreg], splitOf[iv.vreg], splits)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn appendSpans(
+  out: []RegSpan, iv: LiveInterval, head: RegLoc, split: int, splits: []SplitPiece,
+): []RegSpan {
+  let heap = iv.isRef || iv.heapDerived
+  if (split < 0) {
+    if (head.isSpill) {
+      return out
+    }
+    out = append(out, RegSpan{ reg = head.index, lo = iv.start, hi = iv.end, heap = heap })
+    return out
+  }
+  let p = splits[split]
+  if (!head.isSpill) {
+    out = append(out, RegSpan{ reg = head.index, lo = iv.start, hi = iv.end, heap = false })
+  }
+  if (!p.tail.isSpill) {
+    out = append(out, RegSpan{ reg = p.tail.index, lo = iv.start, hi = iv.end, heap = false })
+  }
+  if (p.at2 >= 0) {
+    out = append(out, RegSpan{ reg = p.backReg, lo = iv.start, hi = iv.end, heap = false })
+  }
+  return out
+}
+
+// `p` lies in the body of some loop: a back edge's header start to its source's
+// last position.
+fn inLoopBody(edges: []CfgEdge, p: int): bool {
+  for e of edges {
+    if (e.dst <= e.src && e.dstStart <= p && p <= e.srcLast) {
+      return true
+    }
+  }
+  return false
+}
+
+// A block starts in (lo, hi].
+fn blockStartIn(starts: []int, lo: int, hi: int): bool {
+  for s of starts {
+    if (s > lo && s <= hi) {
+      return true
+    }
+  }
+  return false
+}
+
+// Ascending copy of `ps` (insertion sort; a function's calls are few).
+fn sortedPositions(ps: []int): []int {
+  let out = []int(0)
+  for p of ps {
+    out = append(out, p)
+    let k = len(out) - 1
+    while (k > 0 && out[k - 1] > out[k]) {
+      let t = out[k]
+      out[k] = out[k - 1]
+      out[k - 1] = t
+      k = k - 1
+    }
+  }
+  return out
+}
+
+// What the call at `p` sees per register: the span holding it (`covered`), or
+// else the index of the latest span that ended before `p`.
+class RegView {
+  covered: []bool,
+  last: []int,
+}
+
+fn viewAt(spans: []RegSpan, p: int, nregs: int): RegView {
+  let v = RegView{ covered = []bool(nregs), last = []int(nregs) }
+  let r = 0
+  while (r < nregs) {
+    v.last[r] = -1
+    r = r + 1
+  }
+  let k = 0
+  while (k < len(spans)) {
+    let s = spans[k]
+    if (s.lo < p && p <= s.hi) {
+      v.covered[s.reg] = true
+    } else if (s.hi < p && (v.last[s.reg] < 0 || s.lo > spans[v.last[s.reg]].lo)) {
+      v.last[s.reg] = k
+    }
+    k = k + 1
+  }
+  return v
+}
+
+// What `computeRegClears` carries between calls: the occupancies, the block
+// starts, and per register the span index (+1) and position of the last clear.
+class ClearState {
+  spans: []RegSpan,
+  starts: []int,
+  calleeSaved: int,
+  nregs: int,
+  lastKey: []int,
+  lastPos: []int,
+}
+
+// Whether the register whose latest ended span is `key` must be zeroed at `p`.
+fn needsClear(st: ClearState, v: RegView, r: int, p: int): bool {
+  let key = v.last[r]
+  if (((st.calleeSaved >> r) & 1) == 0 || v.covered[r] || key < 0 || !st.spans[key].heap) {
+    return false
+  }
+  // A clear since this occupant, in the same block, still stands.
+  return !(st.lastKey[r] == key + 1 && !blockStartIn(st.starts, st.lastPos[r], p))
+}
+
+// The mask of registers to zero before the call at `p`.
+fn clearMaskAt(st: ClearState, p: int): int {
+  let v = viewAt(st.spans, p, st.nregs)
+  let mask = 0
+  let r = 0
+  while (r < st.nregs) {
+    if (needsClear(st, v, r, p)) {
+      mask = mask | (1 << r)
+      st.lastKey[r] = v.last[r] + 1
+      st.lastPos[r] = p
+    }
+    r = r + 1
+  }
+  return mask
+}
+
+// Per position, a mask over int-file positions of the callee-saved registers
+// to zero before the call there; empty when no call needs one. Indexed by
+// instruction position, length `max call position + 1`, over the calls that
+// can reach the collector (`points.calleeSafepoints`) and the int `file`.
+fn computeRegClears(
+  scan: []LiveInterval, alias: []bool, sp: Splitter, points: AllocPoints, file: RegFile,
+): []int {
+  let calls = points.calleeSafepoints
+  let edges = sp.edges
+  if (len(calls) == 0 || file.calleeSaved == 0) {
+    return []int(0)
+  }
+  let st = ClearState{
+    spans = regSpans(
+      scan,
+      sp.locations,
+      alias,
+      splitIndex(len(scan), sp.pieces, []int(0)),
+      sp.pieces,
+    ),
+    starts = blockStarts(edges), calleeSaved = file.calleeSaved, nregs = file.count,
+    lastKey = []int(file.count), lastPos = []int(file.count),
+  }
+  let ordered = sortedPositions(calls)
+  let out = []int(ordered[len(ordered) - 1] + 1)
+  for p of ordered {
+    if (!inLoopBody(edges, p)) {
+      out[p] = clearMaskAt(st, p)
+    }
+  }
+  return out
+}
+
+// The mask `RegAllocResult.regClears` holds for position `p`, 0 past its end.
+fn regClearsAt(res: RegAllocResult, p: int): int {
+  if (p < 0 || p >= len(res.regClears)) {
+    return 0
+  }
+  return res.regClears[p]
+}
