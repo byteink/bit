@@ -174,6 +174,10 @@ unknown.
 
 What the three functions above fail with when their `wake` channel received a value first.
 
+### `Woken.message`
+
+The fixed text `quic: wait woken`. A woken wait is the caller's own doing and not a fault of the connection, so test for it with `e.(Woken)` and treat any other error as a real failure; the text is for logs.
+
 ### `Conn.openStream(): Stream!`
 
 Opens a new bidirectional stream from this side.

@@ -316,6 +316,75 @@ test "testpanic_pop_on_empty" {
 }
 ```
 
+## Deadlines on a loaded machine
+
+A test that asserts "this finished within 100 ms" is true on an idle laptop and
+false on a build box running six compilers: the scheduler holds the woken task
+off a CPU, and nothing in your code changed. Raising the number for everyone
+hides real slowdowns; leaving it fixed makes the test flaky exactly when the
+machine is busiest.
+
+`loadProbe` reads the one-minute load average and the core count, and
+`scaledBudgetMs` multiplies your bound by the result. At or under one
+run-queue entry per core the scale is 1, so the bound is exactly the number you
+wrote; on a busy host it grows in whole steps, never past `loadScaleCap`. Put
+this in `reply.test.bit`:
+
+<!-- doctest: test-file -->
+```bit
+import { ok, loadProbe, scaledBudgetMs } from "std/testing"
+import { monotonic, sleep } from "std/time"
+
+test "a 5 ms nap ends within its bound" {
+  let bound = scaledBudgetMs(50, loadProbe())
+  let start = monotonic().ns
+  sleep(5000000)
+  let ms = (monotonic().ns - start) / 1000000
+  ok(ms <= bound, "napped ${ms} ms, bound ${bound} ms")
+}
+```
+
+Call `loadProbe()` once per assertion, as above, when the test waits long enough
+for the load to change; call it once and keep the `LoadProbe` when a gate wants
+the same scale for several budgets and a line saying what it saw
+(`probe.text`).
+
+The probe runs `/bin/sh` for `uptime`, `getconf` and `awk`. If any of them is
+missing, prints something unreadable or times out after five seconds, the scale
+is 1: a broken probe falls back to your fixed bound and can never lengthen a
+wait past a real hang.
+
+### `loadProbe(): LoadProbe`
+
+One sample of the host load. Never fails: a probe that cannot read the load
+returns `scale` 1 and `text` `"unknown"`.
+
+### `LoadProbe`
+
+The result of `loadProbe`: `scale`, the whole multiplier to apply (1 to
+`loadScaleCap`), and `text`, the one-minute load average it was computed from,
+as `uptime` printed it.
+
+### `LoadProbe.scale`
+
+The multiplier: the load average over the core count, rounded up, at least 1 and
+at most `loadScaleCap`.
+
+### `LoadProbe.text`
+
+The load average the scale came from, as text, for a log line. `"unknown"` when
+the probe fell back.
+
+### `scaledBudgetMs(baseMs: int, probe: LoadProbe): int`
+
+`baseMs` times `probe.scale`: the bound a timing assertion should use. At most
+`baseMs * loadScaleCap`, so it stays a bounded wait.
+
+### `loadScaleCap`
+
+The largest scale, 8. A host so loaded that it would ask for more still gets
+8 times your bound and no more.
+
 ## Running a subset of tests: `--run <pattern>`
 
 `bit test <file.bit|dir> --run <pattern>` runs only the discovered tests
