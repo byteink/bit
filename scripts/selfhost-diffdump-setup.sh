@@ -87,4 +87,11 @@ diffdump_setup() {
   # GENERIC_EXPLODE, DCE_PARAMS and DCE_METHODS since the 0.33.0 repin (#6245).
   # So are CONST_STRING_FOLD, MAP_PRESENCE and STRBOX_JOIN since the 0.35.0
   # repin (#6527).
+
+  # #6416: the `if` branch-chain lowering (#5926, `ifBranchChainEnabled` in
+  # compiler/lowercondchain.bit) defaults ON in this tree since the 0.41.0
+  # repin; that ORACLE carries the code but still defaults it off. Both sides
+  # inherit this environment, so force "1" to compare ON against ON. Delete
+  # with the flag, one release after the flip.
+  export BIT_IF_BRANCHCHAIN=1
 }

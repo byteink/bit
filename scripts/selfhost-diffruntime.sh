@@ -38,6 +38,12 @@ BIT2=bit-out/bin/bit
 # which #6191 confirmed is an ancestor of v0.32.0 before flipping the default.
 # #6245 deleted both flags once the pinned oracle carried the defaults too, so
 # no override is needed here any more.
+#
+# #6416: same reasoning as selfhost-diffdump-setup.sh's identical export --
+# the 0.41.0 ORACLE carries the `if` branch-chain lowering (#5926) but still
+# defaults it off, the tree defaults it on, and both invocations share this
+# environment. Delete with the flag, one release after the flip.
+export BIT_IF_BRANCHCHAIN=1
 # The alarm is a HANG guard, not a performance budget (#2070). 20s sat below the
 # corpus's slowest file measured on the IR differentials (25.20s on this tree,
 # 21.86s on the oracle), so a busy box turned a clean run red with no divergence
