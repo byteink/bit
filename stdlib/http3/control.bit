@@ -1,0 +1,265 @@
+// Bit standard library — http3 module, the peer's control stream (RFC 9114
+// §6.2.1, #7736). Same flat `std/http3` module and namespace as `h3.bit`.
+//
+// QUIC grants connection flow-control credit only as the application reads
+// (`std/quic` flow.bit, #7709), so a control stream left partly unread holds its
+// bytes against the connection window for the connection's life. The reader here
+// therefore takes EVERY byte the peer sends on its control stream until the
+// connection ends: SETTINGS and GOAWAY are processed, MAX_PUSH_ID and CANCEL_PUSH
+// are accepted (this core never pushes), and every other frame, unknown and
+// reserved types included, is skipped without being buffered (§7.2.8, §9). The
+// peer closing the stream is H3_CLOSED_CRITICAL_STREAM (§6.2.1).
+
+// HTTP/3 error codes the control stream can raise (RFC 9114 §8.1).
+const h3ErrStreamCreation: int = 0x0103
+const h3ErrClosedCritical: int = 0x0104
+const h3ErrFrameUnexpected: int = 0x0105
+const h3ErrFrame: int = 0x0106
+const h3ErrExcessiveLoad: int = 0x0107
+const h3ErrSettings: int = 0x0109
+const h3ErrMissingSettings: int = 0x010a
+
+// The largest SETTINGS frame the reader buffers; a bigger one is the peer
+// exceeding an implementation limit (H3_EXCESSIVE_LOAD, §7.2.4.2).
+const h3ControlMaxSettings: int = 16384
+
+// What `h3controlStep` returns besides an error code.
+const h3stepMore: int = -1
+const h3stepDone: int = 0
+
+// How the reader treats a frame type arriving on the control stream.
+const h3kindSkip: int = 0
+const h3kindParsed: int = 1
+const h3kindForbidden: int = 2
+
+// The frame types below 10 that never belong on a control stream, one bit each:
+// DATA 0, HEADERS 1, PRIORITY 2, PUSH_PROMISE 5, PING 6, WINDOW_UPDATE 8 and
+// CONTINUATION 9 (RFC 9114 §7.2, §11.2.1).
+const h3controlForbidden: int = 0x367
+
+// The reader's state for one peer control stream. `buf` holds the bytes of the
+// frame being assembled (header, or payload of a parsed kind); `skip` counts the
+// payload bytes of a skipped frame still to come, so a huge unknown frame costs
+// no memory.
+class h3Control {
+  buf: []byte,
+  skip: int,
+  settings: bool,
+  goaway: bool,
+  isClient: bool,
+}
+
+fn h3newControl(isClient: bool): h3Control {
+  return h3Control{
+    buf = []byte(0),
+    skip = 0,
+    settings = false,
+    goaway = false,
+    isClient = isClient,
+  }
+}
+
+// The treatment of frame type `ft` on a control stream (RFC 9114 §7.2): DATA,
+// HEADERS, PUSH_PROMISE and the HTTP/2 types HTTP/3 reserved (PRIORITY, PING,
+// WINDOW_UPDATE, CONTINUATION) are forbidden here; SETTINGS, GOAWAY and
+// MAX_PUSH_ID are parsed; everything else is skipped.
+fn h3controlKind(ft: int): int {
+  if (ft == h3FrameSettings || ft == h3FrameGoaway || ft == h3FrameMaxPushId) {
+    return h3kindParsed
+  }
+  if (ft < 10 && ((h3controlForbidden >> ft) & 1) == 1) {
+    return h3kindForbidden
+  }
+  return h3kindSkip
+}
+
+// Whether `payload` is exactly one varint, as GOAWAY and MAX_PUSH_ID carry.
+fn h3singleVarint(payload: []byte): bool {
+  let r = h3Reader{ data = payload, pos = 0 }
+  h3readVarint(r) catch _ {
+    return false
+  }
+  return r.pos == len(payload)
+}
+
+// Validates a SETTINGS payload (RFC 9114 §7.2.4): a sequence of identifier/value
+// varint pairs with no identifier repeated. Returns 0 or the error code.
+fn h3checkSettings(payload: []byte): int {
+  let r = h3Reader{ data = payload, pos = 0 }
+  let seen = []u64(0)
+  while (r.pos < len(payload)) {
+    let id = h3readVarint(r) catch _ {
+      return h3ErrFrame
+    }
+    h3readVarint(r) catch _ {
+      return h3ErrFrame
+    }
+    for p of seen {
+      if (p == id) {
+        return h3ErrSettings
+      }
+    }
+    seen = append(seen, id)
+  }
+  return 0
+}
+
+// Applies one complete SETTINGS, GOAWAY or MAX_PUSH_ID frame. Returns 0 or the
+// error code that closes the connection.
+fn h3controlFrame(st: h3Control, ft: int, payload: []byte): int {
+  if (ft == h3FrameSettings) {
+    if (st.settings) {
+      return h3ErrFrameUnexpected
+    }
+    st.settings = true
+    return h3checkSettings(payload)
+  }
+  if (!h3singleVarint(payload)) {
+    return h3ErrFrame
+  }
+  if (ft == h3FrameGoaway) {
+    st.goaway = true
+    return 0
+  }
+  if (st.isClient) {
+    return h3ErrFrameUnexpected
+  }
+  return 0
+}
+
+// Discards up to `st.skip` bytes of a skipped frame's payload from `st.buf`.
+fn h3controlSkip(st: h3Control): int {
+  let n = st.skip
+  if (len(st.buf) < n) {
+    n = len(st.buf)
+  }
+  st.buf = st.buf[n:len(st.buf)]
+  st.skip = st.skip - n
+  return h3stepDone
+}
+
+// The error code for a SETTINGS, GOAWAY or MAX_PUSH_ID frame whose declared
+// payload length is `n`, or 0: SETTINGS past `h3ControlMaxSettings` is
+// H3_EXCESSIVE_LOAD, a GOAWAY or MAX_PUSH_ID longer than one varint H3_FRAME_ERROR.
+fn h3controlSize(ft: int, n: int): int {
+  if (n < 0 || (ft == h3FrameSettings && n > h3ControlMaxSettings)) {
+    return h3ErrExcessiveLoad
+  }
+  if (ft != h3FrameSettings && n > 8) {
+    return h3ErrFrame
+  }
+  return 0
+}
+
+// Takes the frame of type `ft` and payload length `n` whose header `r` has just
+// read from `st.buf`: buffers and applies a parsed kind once its payload is all
+// here, or starts skipping any other. `h3stepMore` while the payload is short.
+fn h3controlTake(st: h3Control, r: h3Reader, ft: int, n: int): int {
+  if (h3controlKind(ft) == h3kindSkip) {
+    st.buf = st.buf[r.pos:len(st.buf)]
+    st.skip = n
+    return h3stepDone
+  }
+  let bad = h3controlSize(ft, n)
+  if (bad != 0) {
+    return bad
+  }
+  if (r.pos + n > len(st.buf)) {
+    return h3stepMore
+  }
+  let payload = st.buf[r.pos:r.pos + n]
+  st.buf = st.buf[r.pos + n:len(st.buf)]
+  let code = h3controlFrame(st, ft, payload)
+  if (code != 0) {
+    return code
+  }
+  return h3stepDone
+}
+
+// Consumes up to one frame, or part of a skipped frame's payload, from `st.buf`.
+// Returns `h3stepMore` when `st.buf` needs more bytes first, `h3stepDone` after
+// consuming at least one byte, or an error code.
+fn h3controlStep(st: h3Control): int {
+  if (len(st.buf) == 0) {
+    return h3stepMore
+  }
+  if (st.skip > 0) {
+    return h3controlSkip(st)
+  }
+  let r = h3Reader{ data = st.buf, pos = 0 }
+  let ftype = h3readVarint(r) catch _ {
+    return h3stepMore
+  }
+  let length = h3readVarint(r) catch _ {
+    return h3stepMore
+  }
+  let ft = int(ftype)
+  if (!st.settings && ft != h3FrameSettings) {
+    return h3ErrMissingSettings
+  }
+  if (h3controlKind(ft) == h3kindForbidden) {
+    return h3ErrFrameUnexpected
+  }
+  return h3controlTake(st, r, ft, int(length))
+}
+
+// Feeds the next control-stream bytes to the reader. Returns 0, or the HTTP/3
+// error code the connection must be closed with. Each completed step consumes at
+// least one byte, so `len(st.buf) + 1` steps bound the loop.
+fn h3controlFeed(st: h3Control, data: []byte): int {
+  st.buf = qpackAppendBytes(st.buf, data)
+  let limit = len(st.buf) + 1
+  let n = 0
+  while (n < limit) {
+    n = n + 1
+    let code = h3controlStep(st)
+    if (code == h3stepMore) {
+      return 0
+    }
+    if (code != h3stepDone) {
+      return code
+    }
+  }
+  return 0
+}
+
+// Whether `s` is the first control stream the peer opened on `c`; a second one
+// closes the connection with H3_STREAM_CREATION_ERROR (§6.2.1).
+fn h3claimControl(c: H3Conn): bool {
+  if (c.controlSeen) {
+    c.conn.closeWithCode(h3ErrStreamCreation)
+    return false
+  }
+  c.controlSeen = true
+  return true
+}
+
+// Reads the peer's control stream `s`, whose first chunk (the stream-type byte
+// and whatever followed it) is `first`, until the connection ends. Sets
+// `peerGoaway` on a GOAWAY and counts every byte read in `controlRead`. A framing
+// error, or the peer finishing or resetting the stream, closes the connection
+// (§6.2.1, §8) and ends the reader. A read that fails means the connection
+// already ended, which is the only other way out of the loop.
+fn h3controlRun(c: H3Conn, s: Stream, first: StreamChunk) {
+  let st = h3newControl(c.isClient)
+  let chunk = first
+  let data = h3tail(chunk.data)
+  while (true) {
+    c.controlRead = c.controlRead + len(chunk.data)
+    let code = h3controlFeed(st, data)
+    if (st.goaway) {
+      c.peerGoaway = true
+    }
+    if (code == 0 && (chunk.fin || chunk.reset)) {
+      code = h3ErrClosedCritical
+    }
+    if (code != 0) {
+      c.conn.closeWithCode(code)
+      return
+    }
+    chunk = s.read() catch _ {
+      return
+    }
+    data = chunk.data
+  }
+}
