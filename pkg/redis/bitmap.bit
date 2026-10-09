@@ -1,17 +1,426 @@
-// pkg/redis/bitmap.bit — `r.bitmap(key)`: the bitmap handle. Epic
-// #6013, #6028: SCAFFOLD ONLY, no commands wired yet (`SETBIT, GETBIT, BITCOUNT, BITFIELD`, a
-// follow-up ticket) — this file exists so later family tickets touch only
-// their own file, never `client.bit`. `cmd.bit`'s header is the template:
-// one `Cmd<T>` factory per command, called from a method here.
-export class Bitmap {
-  client: Client,
-  key: string,
+// pkg/redis/bitmap.bit - `r.bitmap(key)`: bit-level commands on a string,
+// `SETBIT`, `GETBIT`, `BITCOUNT`, `BITPOS`, `BITOP`, `BITFIELD` and
+// `BITFIELD_RO`. Epic #6013, #6028, #6036. Follows `cmd.bit`'s HOW-TO header
+// and `counter.bit`'s shape: one `Cmd<T>` factory per command, an immediate
+// method on `Bitmap`, a queued one on `BitmapBatch`.
+//
+// `Bitmap` HOLDS `client: Client`, NOT `runner: Runner`, as `zset.bit` does:
+// `runner` needs `client.bit`'s `bitmap()` accessor and a `TxRead.bitmap` on
+// `tx.bit` to change, outside this ticket's files (#6036).
+//
+// BITS ARE NUMBERED FROM THE LEFT: bit 0 is the most significant bit of byte
+// 0, so `set(7, true)` makes the string "\x01" and `set(0, true)` "\x80".
+// An offset is 0 to 2^32-1 (a 512 MB string); `checkOffset` refuses anything
+// else before it is sent. Writing past the end grows the string with zeros.
+//
+// A RANGE IS A VALUE, NOT THREE ARGUMENTS. `BitRange.All` sends nothing,
+// `Bytes(start, end)` and `Bits(start, end)` name the unit (end inclusive,
+// negative counts from the end), `From(start)` is `BITPOS`'s start-only form.
+// `BITPOS` keeps `All` and `From` apart from `Bytes(start, -1)` on purpose:
+// asking for the first CLEAR bit of a string of all ones answers one past
+// the end (the string length in bits) when no end was given, and -1 when an
+// end was. `count` has no start-only form and refuses `From`.
+//
+// `bitop` TAKES ALL EIGHT OPERATORS the 8.2+ server accepts: the classic
+// `And`, `Or`, `Xor`, `Not`, and `Diff` (bits in the first source and in none
+// of the others), `Diff1` (bits in some other source and not in the first),
+// `AndOr` (bits in the first and in at least one other) and `One` (bits in
+// exactly one source). The handle's key is the DESTINATION; sources come as
+// arguments. A server older than 8.2 answers an error for the last four.
+//
+// `BITFIELD` is built, not called with strings: `bitfield()` starts a
+// `BitFieldOps`, each of `get`, `set`, `incrBy` and `overflow` returns the
+// longer builder (it never changes the one it was called on), and
+// `bitmap.bitfield(ops)` sends it. The reply is one `Option<i64>` per `get`/
+// `set`/`incrBy`, in order: `set` answers the OLD value, and `None` marks an
+// `incrBy` that `BitOverflow.Fail` refused. A bad type or offset is held in
+// the builder and refused as `RedisError.Invalid` when it is sent, so a chain
+// reads straight through without a `?` per link.
+
+// Which part of the string `count` or `pos` looks at. `end` is inclusive and
+// both ends may be negative (counted from the end).
+export enum BitRange {
+  All,
+  From(i64),
+  Bytes(i64, i64),
+  Bits(i64, i64),
 }
 
-// The queued view `Pipeline.bitmap`/`Tx.bitmap` both return — `cmd.bit`'s
-// `Batch` is the ONE client-side queue the two executors share, so this
-// is the ONLY queued view Bitmap needs (`cmd.bit`'s header, point 2).
+// `BITOP`'s operator; `text()` is the word the server expects.
+export enum BitOp {
+  And
+  Or
+  Xor
+  Not
+  Diff
+  Diff1
+  AndOr
+  One
+
+  export text(): string {
+    match (this) {
+      And => return "AND"
+      Or => return "OR"
+      Xor => return "XOR"
+      Not => return "NOT"
+      Diff => return "DIFF"
+      Diff1 => return "DIFF1"
+      AndOr => return "ANDOR"
+      One => return "ONE"
+    }
+  }
+}
+
+// A `BITFIELD` integer type: `Unsigned(1..63)` or `Signed(1..64)` bits wide.
+// `text()` is the server's spelling, `u8` or `i16`.
+export enum BitType {
+  Unsigned(int)
+  Signed(int)
+
+  export text(): string {
+    match (this) {
+      Unsigned(n) => return "u${n}"
+      Signed(n) => return "i${n}"
+    }
+  }
+}
+
+// Where a `BITFIELD` value sits: `Bit(n)` is bit number `n`, `Slot(n)` is the
+// `n`th value of the operation's own width (`#n`), so `Slot(2)` of `u8` is
+// bits 16 to 23.
+export enum BitAt {
+  Bit(i64)
+  Slot(i64)
+
+  export text(): string {
+    match (this) {
+      Bit(n) => return "${n}"
+      Slot(n) => return "#${n}"
+    }
+  }
+}
+
+// What `incrBy` and `set` do when the value does not fit its type: `Wrap`
+// wraps around (the default), `Sat` stops at the limit, `Fail` leaves the
+// value alone and answers `None`.
+export enum BitOverflow {
+  Wrap
+  Sat
+  Fail
+
+  export text(): string {
+    match (this) {
+      Wrap => return "WRAP"
+      Sat => return "SAT"
+      Fail => return "FAIL"
+    }
+  }
+}
+
+// A `BITFIELD` command under construction: `bitfield()` is the empty one.
+export class BitFieldOps {
+  args: []string
+  readsOnly: bool
+  problem: string
+
+  // `GET type offset`: reads a value.
+  export get(t: BitType, at: BitAt): BitFieldOps {
+    return bitFieldStep(this, ["GET", t.text(), at.text()], t, at, true)
+  }
+  // `SET type offset value`: writes a value; the reply is the old one.
+  export set(t: BitType, at: BitAt, value: i64): BitFieldOps {
+    return bitFieldStep(this, ["SET", t.text(), at.text(), "${value}"], t, at, false)
+  }
+  // `INCRBY type offset delta`: adds to a value (delta may be negative); the
+  // reply is the new one.
+  export incrBy(t: BitType, at: BitAt, delta: i64): BitFieldOps {
+    return bitFieldStep(this, ["INCRBY", t.text(), at.text(), "${delta}"], t, at, false)
+  }
+  // `OVERFLOW mode`: how the `set`s and `incrBy`s AFTER this call handle a
+  // value that does not fit.
+  export overflow(mode: BitOverflow): BitFieldOps {
+    let words = extendArgs(this.args, ["OVERFLOW", mode.text()])
+    return BitFieldOps{ args = words, readsOnly = false, problem = this.problem }
+  }
+}
+
+// The empty `BITFIELD` builder.
+export fn bitfield(): BitFieldOps {
+  return BitFieldOps{ args = []string(0), readsOnly = true, problem = "" }
+}
+
+export class Bitmap {
+  client: Client
+  key: string
+
+  // `SETBIT`: sets bit `offset` to `on`; returns what it was before.
+  export set(offset: i64, on: bool): bool!RedisError {
+    checkOffset(offset)?
+    return this.client.runCmd(setBitCmd(this.key, offset, on))?
+  }
+  // `GETBIT`: false for a bit past the end of the string or a missing key.
+  export get(offset: i64): bool!RedisError {
+    checkOffset(offset)?
+    return this.client.runCmd(getBitCmd(this.key, offset))?
+  }
+  // `BITCOUNT`: how many bits are set in `range`.
+  export count(range: BitRange = BitRange.All): i64!RedisError {
+    checkCountRange(range)?
+    return this.client.runCmd(bitCountCmd(this.key, range))?
+  }
+  // `BITPOS`: the position of the first bit equal to `bit` in `range`, or -1
+  // when there is none (this file's header has the one exception).
+  export pos(bit: bool, range: BitRange = BitRange.All): i64!RedisError {
+    return this.client.runCmd(bitPosCmd(this.key, bit, range))?
+  }
+  // `BITOP`: stores `operator` applied to `sources` in this key; returns the
+  // length of the stored string in bytes.
+  export op(operator: BitOp, ...sources: string): i64!RedisError {
+    return this.client.runCmd(bitOpCmd(this.key, operator, sources))?
+  }
+  // `BITFIELD`: runs the built operations, one `Option<i64>` each.
+  export bitfield(ops: BitFieldOps): []Option<i64>!RedisError {
+    checkOps(ops, false)?
+    return this.client.runCmd(bitFieldCmd("BITFIELD", this.key, ops))?
+  }
+  // `BITFIELD_RO`: the same for operations that only `get`; refuses a `set`,
+  // `incrBy` or `overflow` before sending. Safe on a read replica.
+  export bitfieldRo(ops: BitFieldOps): []Option<i64>!RedisError {
+    checkOps(ops, true)?
+    return this.client.runCmd(bitFieldCmd("BITFIELD_RO", this.key, ops))?
+  }
+}
+
+// The queued view `Pipeline.bitmap`/`Tx.bitmap` both return.
 export class BitmapBatch {
-  batch: Batch,
-  key: string,
+  batch: Batch
+  key: string
+
+  export set(offset: i64, on: bool): Future<bool> {
+    checkOffset(offset) catch e {
+      return failedFuture<bool>(e)
+    }
+    return this.batch.queue(setBitCmd(this.key, offset, on))
+  }
+  export get(offset: i64): Future<bool> {
+    checkOffset(offset) catch e {
+      return failedFuture<bool>(e)
+    }
+    return this.batch.queue(getBitCmd(this.key, offset))
+  }
+  export count(range: BitRange = BitRange.All): Future<i64> {
+    checkCountRange(range) catch e {
+      return failedFuture<i64>(e)
+    }
+    return this.batch.queue(bitCountCmd(this.key, range))
+  }
+  export pos(bit: bool, range: BitRange = BitRange.All): Future<i64> {
+    return this.batch.queue(bitPosCmd(this.key, bit, range))
+  }
+  export op(operator: BitOp, ...sources: string): Future<i64> {
+    return this.batch.queue(bitOpCmd(this.key, operator, sources))
+  }
+  export bitfield(ops: BitFieldOps): Future<[]Option<i64>> {
+    checkOps(ops, false) catch e {
+      return failedFuture<[]Option<i64>>(e)
+    }
+    return this.batch.queue(bitFieldCmd("BITFIELD", this.key, ops))
+  }
+  export bitfieldRo(ops: BitFieldOps): Future<[]Option<i64>> {
+    checkOps(ops, true) catch e {
+      return failedFuture<[]Option<i64>>(e)
+    }
+    return this.batch.queue(bitFieldCmd("BITFIELD_RO", this.key, ops))
+  }
+}
+
+const maxBitOffset: i64 = 4294967295
+
+fn checkOffset(offset: i64): ()!RedisError {
+  if (offset < 0 || offset > maxBitOffset) {
+    fail RedisError.Invalid("bit offset must be in 0..4294967295, got ${offset}")
+  }
+}
+
+// `tail` after `head`, in a slice of its own: `append` writes into `head`
+// itself, which would change the builder the step was called on.
+fn extendArgs(head: []string, tail: []string): []string {
+  let out = []string(0)
+  out = append(out, ...head)
+  return append(out, ...tail)
+}
+
+// The first problem wins; "" means none.
+fn firstProblem(a: string, b: string): string {
+  if (a != "") {
+    return a
+  }
+  return b
+}
+
+fn typeProblem(t: BitType): string {
+  match (t) {
+    Unsigned(n) => {
+      if (n < 1 || n > 63) {
+        return "unsigned width must be in 1..63, got ${n}"
+      }
+      return ""
+    }
+    Signed(n) => {
+      if (n < 1 || n > 64) {
+        return "signed width must be in 1..64, got ${n}"
+      }
+      return ""
+    }
+  }
+}
+
+fn atProblem(at: BitAt): string {
+  match (at) {
+    Bit(n) => {
+      if (n < 0 || n > maxBitOffset) {
+        return "bit offset must be in 0..4294967295, got ${n}"
+      }
+      return ""
+    }
+    Slot(n) => {
+      if (n < 0) {
+        return "slot index must be >= 0, got ${n}"
+      }
+      return ""
+    }
+  }
+}
+
+// One more operation on `ops`, as a new builder. `readsOnly` stays true only
+// while every step is a `get`.
+fn bitFieldStep(
+  ops: BitFieldOps,
+  words: []string,
+  t: BitType,
+  at: BitAt,
+  isGet: bool,
+): BitFieldOps {
+  let problem = firstProblem(ops.problem, firstProblem(typeProblem(t), atProblem(at)))
+  return BitFieldOps{
+    args = extendArgs(ops.args, words),
+    readsOnly = ops.readsOnly && isGet,
+    problem = problem,
+  }
+}
+
+fn checkOps(ops: BitFieldOps, readOnly: bool): ()!RedisError {
+  if (ops.problem != "") {
+    fail RedisError.Invalid(ops.problem)
+  }
+  if (readOnly && !ops.readsOnly) {
+    fail RedisError.Invalid("bitfieldRo takes only get; use bitfield for set, incrBy and overflow")
+  }
+}
+
+fn bitText(on: bool): string {
+  if (on) {
+    return "1"
+  }
+  return "0"
+}
+
+fn setBitCmd(key: string, offset: i64, on: bool): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["SETBIT", key, "${offset}", bitText(on)],
+    decode = (r) => asBool(r, "SETBIT"),
+    readOnly = false,
+  }
+}
+
+fn getBitCmd(key: string, offset: i64): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["GETBIT", key, "${offset}"],
+    decode = (r) => asBool(r, "GETBIT"),
+    readOnly = true,
+  }
+}
+
+// `[start [end [BIT]]]`; BYTE is the server's default and is not sent, so a
+// call also works on a server that predates the unit.
+fn rangeArgs(range: BitRange): []string {
+  match (range) {
+    All => return []string(0)
+    From(s) => return ["${s}"]
+    Bytes(s, e) => return ["${s}", "${e}"]
+    Bits(s, e) => return ["${s}", "${e}", "BIT"]
+  }
+}
+
+// `BITCOUNT` has no start-only form; the server would answer a syntax error.
+fn checkCountRange(range: BitRange): ()!RedisError {
+  match (range) {
+    From(_) => fail RedisError.Invalid("count needs an end: use BitRange.Bytes or BitRange.Bits")
+    _ => return
+  }
+}
+
+fn bitCountCmd(key: string, range: BitRange): Cmd<i64> {
+  return Cmd<i64>{
+    args = append(["BITCOUNT", key], ...rangeArgs(range)),
+    decode = (r) => asInt(r, "BITCOUNT"),
+    readOnly = true,
+  }
+}
+
+fn bitPosCmd(key: string, bit: bool, range: BitRange): Cmd<i64> {
+  return Cmd<i64>{
+    args = append(["BITPOS", key, bitText(bit)], ...rangeArgs(range)),
+    decode = (r) => asInt(r, "BITPOS"),
+    readOnly = true,
+  }
+}
+
+fn bitOpCmd(dest: string, operator: BitOp, sources: []string): Cmd<i64> {
+  return Cmd<i64>{
+    args = append(["BITOP", operator.text(), dest], ...sources),
+    decode = (r) => asInt(r, "BITOP"),
+    readOnly = false,
+  }
+}
+
+// `BITFIELD` is retry-safe only when it holds nothing but `get`s.
+fn bitFieldCmd(name: string, key: string, ops: BitFieldOps): Cmd<[]Option<i64>> {
+  return Cmd<[]Option<i64>>{
+    args = append([name, key], ...ops.args),
+    decode = (r) => asBitFieldValues(r, name),
+    readOnly = ops.readsOnly,
+  }
+}
+
+// One integer per operation; a null for an `incrBy` that `OVERFLOW FAIL`
+// refused (RESP3's null, or RESP2's null bulk).
+fn asBitFieldValues(r: Reply, cmd: string): []Option<i64>!RedisError {
+  match (r) {
+    Array(items) => return bitFieldValuesFromList(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn bitFieldValuesFromList(list: []Reply, cmd: string): []Option<i64>!RedisError {
+  let out = []Option<i64>(0)
+  let i = 0
+  while (i < len(list)) {
+    out = append(out, bitFieldValue(list[i], cmd)?)
+    i = i + 1
+  }
+  return out
+}
+
+fn bitFieldValue(r: Reply, cmd: string): Option<i64>!RedisError {
+  match (r) {
+    Null => return Option.None
+    Bulk(v) => {
+      if (isNone(v)) {
+        return Option.None
+      }
+      fail RedisError.Unexpected(cmd, "Bulk")
+    }
+    _ => return Option.Some(asInt(r, cmd)?)
+  }
 }
