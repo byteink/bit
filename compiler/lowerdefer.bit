@@ -18,14 +18,28 @@
 // enclose them and thread through every later join (`addJoinParams`) exactly
 // like an ordinary local. `lowerDefer` writes into its own reserved slots
 // and sets its flag true; `runDefers` reads each flag and, guarded on it,
-// replays that one call. A defer inside a loop that runs on several
-// iterations fires ONCE at the function's exit, with its LAST iteration's
-// captured arguments — the flag records "ran at least once", not a count,
-// so this compiler has no per-execution defer stack. Nothing here needs a
-// "did this region's defers already replay" check any more: keeping a
-// registered-but-never-run entry around is harmless (its flag stays false),
-// so the scope-truncation `deferScopeEnd` used to do (and the E0092 refusal
-// it used to fall back to) is gone with it.
+// replays that one call. That form allocates nothing and is right for a defer
+// that runs at most once per call.
+//
+// #7745: SPEC §18.5 says each EXECUTION of a `defer` schedules its own call, so
+// a `defer` inside a loop (`for f of paths { let h = open(f)?; defer h.close() }`)
+// must run once per iteration, each with that iteration's arguments, LIFO. One
+// flag + one slot set per STATEMENT collapses N executions into the last, so a
+// body with a `defer` inside any loop (`deferInLoop`) is lowered the other way
+// round for ALL of its defers: no per-site flag or slots, one `[]func()` local
+// (`$deferStack`, declared at entry like a flag) onto which each execution
+// pushes a thunk closing over its own receiver/arguments, and every exit pops
+// that stack to empty. All defers of such a body share the stack because LIFO
+// order is across sites (two defers in one loop body run b2 a2 b1 a1), which
+// per-site storage cannot express. Go draws the same
+// line: open-coded defers unless a defer is in a loop. Memory: one thunk (the
+// captured words) per executed defer plus the stack's amortized slice growth,
+// bounded by the loop's own trip count and unreachable once the frame returns;
+// SPEC §18.5 and E0205 already say a loop `defer` holds its resources until the
+// function returns. Nothing here needs a "did this region's defers already
+// replay" check: a registered-but-never-run entry is harmless (its flag stays
+// false, or its push never happened), so the scope-truncation `deferScopeEnd`
+// used to do (and the E0092 refusal it used to fall back to) is gone with it.
 
 // The resolved shape of one `defer <call>`'s callee — everything `lowerDefer`
 // needs to build its replay template and slot layout, computed WITHOUT
@@ -346,11 +360,50 @@ fn deferZeroValue(fc: FnCtx, ty: int): int {
   return zeroValue(fc, ty, pointSpan(0, 0))
 }
 
+// Chooses the defer representation for the body `node` (a function or closure
+// block) and reserves its storage BEFORE any of the body's own statements lower:
+// the per-frame stack when any `defer` sits in a loop (#7745), else a flag plus
+// operand slots per `defer` statement.
+fn deferPreScan(fc: FnCtx, node: int) {
+  if (deferInLoop(fc, node, false)) {
+    fc.deferOnStack = true
+    fc.deferStackSlot = declareDeferStack(fc)
+    return
+  }
+  deferPreScanSites(fc, node)
+}
+
+// Whether a loop statement encloses a `defer` anywhere in `node`'s subtree (not
+// crossing into a nested function/arrow body, which owns its own defers).
+fn deferInLoop(fc: FnCtx, node: int, inLoop: bool): bool {
+  if (node == 0) {
+    return false
+  }
+  let t = getNode(fc.c.tree, node).tag
+  if (t == Tag.FuncDecl || t == Tag.ArrowFn) {
+    return false
+  }
+  if (t == Tag.DeferStmt && inLoop) {
+    return true
+  }
+  let inner = inLoop || isLoopTag(t)
+  for k of kidsOf(fc.c.tree, node) {
+    if (deferInLoop(fc, k, inner)) {
+      return true
+    }
+  }
+  return false
+}
+
+fn isLoopTag(t: Tag): bool {
+  return t == Tag.WhileStmt || t == Tag.ForOf || t == Tag.ForIn || t == Tag.ForC || t == Tag.ForInf
+}
+
 // Finds every `defer` statement in `node`'s subtree (not crossing into a
 // nested function/arrow body, which lowers under its own separate FnCtx and
 // owns its own defers) and reserves this function's flag+operand slots for
-// each, in program order, BEFORE any of the body's own statements lower.
-fn deferPreScan(fc: FnCtx, node: int) {
+// each, in program order.
+fn deferPreScanSites(fc: FnCtx, node: int) {
   if (node == 0) {
     return
   }
@@ -362,7 +415,7 @@ fn deferPreScan(fc: FnCtx, node: int) {
     deferPreDeclare(fc, node)
   }
   for k of kidsOf(fc.c.tree, node) {
-    deferPreScan(fc, k)
+    deferPreScanSites(fc, k)
   }
 }
 
@@ -447,7 +500,7 @@ fn lowerDefer(fc: FnCtx, node: int) {
     return
   }
   let idx = findDeferCall(fc, node)
-  if (idx < 0) {
+  if (idx < 0 && !fc.deferOnStack) {
     fcFail(fc, t.span, "a `defer` whose slots were not reserved")
     return
   }
@@ -468,13 +521,17 @@ fn lowerDefer(fc: FnCtx, node: int) {
   if (fc.failed) {
     return
   }
+  if (fc.deferOnStack) {
+    pushDeferThunk(fc, t, recvV, a)
+    return
+  }
   writeDeferOperands(fc, fc.defers[idx], t, recvV, a)
 }
 
 // Emits one guarded replay — `br flag -> call : skip` — reading the CURRENT
 // value of each of `dc`'s slots (never the ids captured when it was lowered;
-// see DeferCall) so a defer inside a loop replays with its LAST iteration's
-// arguments. `skip` is left open for the next defer (or the caller's own
+// see DeferCall) so a defer replays with the arguments its one execution
+// captured. `skip` is left open for the next defer (or the caller's own
 // terminator): neither edge changes any tracked local, so the merge needs no
 // join params, exactly like `lowerShortCircuit`'s side blocks.
 fn emitOneDefer(fc: FnCtx, dc: DeferCall) {
@@ -527,9 +584,192 @@ fn emitOneDefer(fc: FnCtx, dc: DeferCall) {
 // conditional region that never ran, or whose region was left before this
 // specific defer executed, correctly does nothing here.
 fn runDefers(fc: FnCtx) {
+  if (fc.deferOnStack) {
+    runDeferStack(fc)
+    return
+  }
   let i = len(fc.defers) - 1
   while (i >= 0) {
     emitOneDefer(fc, fc.defers[i])
     i = i - 1
   }
+}
+
+// ---- the per-frame defer stack (#7745) --------------------------------------
+
+// The type of one pending deferred call: `func()`. Every defer, whatever its
+// callee, becomes one of these (`synthDeferThunk`), which is what lets one stack
+// hold calls of different shapes.
+fn deferThunkType(fc: FnCtx): int {
+  return mkFunc(fc.c.ctx, []int(0), false, fc.c.ctx.voidId)
+}
+
+// The `[]func()` local holding this frame's pending thunks, declared at
+// function entry (empty) so it threads through every later join like a flag.
+fn declareDeferStack(fc: FnCtx): int {
+  let ty = mkSlice(fc.c.ctx, deferThunkType(fc))
+  declareLocal(fc, "$deferStack", zeroValue(fc, ty, pointSpan(0, 0)), ty)
+  return len(fc.env) - 1
+}
+
+// One execution of a `defer` in a stack-mode body: the receiver and arguments
+// were evaluated by `lowerDefer` (SPEC §18.5), here they are packed into a fresh
+// env object, wrapped in the thunk closure and appended to the frame's stack.
+fn pushDeferThunk(fc: FnCtx, t: DeferTarget, recvV: int, a: []int) {
+  let fieldTys = []int(0)
+  let vals = []int(0)
+  if (t.recvTy != 0) {
+    fieldTys = append(fieldTys, t.recvTy)
+    vals = append(vals, recvV)
+  }
+  fieldTys = append(fieldTys, ...t.paramTypes)
+  vals = append(vals, ...a)
+  let fty = deferThunkType(fc)
+  let layout = layoutFields(fc, fieldTys)
+  let env = builderEmit(fc.b, mkInstr(Op.ConstNil, fty))
+  if (len(fieldTys) > 0) {
+    env = packDeferEnv(fc, fty, layout, vals)
+  }
+  let fid = synthDeferThunk(fc, t, fty, layout)
+  let mc = mkInstr(Op.MakeClosure, fty)
+  mc.name = "defer\$thunk\$${fid}"
+  mc.lhs = env
+  let clo = builderEmit(fc.b, mc)
+  let ctx = appendCtxFor(fc, mkSlice(fc.c.ctx, fty), fty)
+  fc.env[fc.deferStackSlot].value = emitAppendCall(fc, fc.env[fc.deferStackSlot].value, clo, ctx)
+}
+
+// The thunk's env object: `vals` stored at `layout`'s offsets. A decimal is two
+// inline words, stored as `lowerArrowFn` stores a decimal capture.
+fn packDeferEnv(fc: FnCtx, fty: int, layout: StructLayout, vals: []int): int {
+  let ga = mkInstr(Op.GcAlloc, fty)
+  ga.ival = layout.size
+  ga.offsets = layout.ptrOffsets
+  let env = builderEmit(fc.b, ga)
+  let i = 0
+  while (i < len(vals)) {
+    if (isDecimalPrim(fc.c.ctx, layout.types[i])) {
+      let words = explodeValueWords(fc.c.ctx, fc.b, vals[i], decimalWordTypes(fc.c.ctx))
+      emitDecimalFieldSet(fc.c.ctx, fc.b, env, layout.offsets[i], words)
+      i = i + 1
+      continue
+    }
+    let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+    fs.lhs = env
+    fs.ival = layout.offsets[i]
+    fs.rhs = fieldStoreValue(fc.b, vals[i], layout.types[i])
+    fs.ival2 = layout.types[i]
+    builderEmit(fc.b, fs)
+    i = i + 1
+  }
+  return env
+}
+
+// Reads field `i` of the thunk env (parameter 0) back into `b`.
+fn unpackDeferField(fc: FnCtx, b: IrBuilder, layout: StructLayout, i: int): int {
+  if (isDecimalPrim(fc.c.ctx, layout.types[i])) {
+    let i64ty = primType(fc.c.ctx, 3)
+    let lo = mkInstr(Op.FieldGet, i64ty)
+    lo.lhs = 0
+    lo.ival = layout.offsets[i]
+    let hi = mkInstr(Op.FieldGet, i64ty)
+    hi.lhs = 0
+    hi.ival = layout.offsets[i] + 8
+    return buildTupleIn(fc, b, decimalTupleType(fc.c.ctx), [builderEmit(b, lo), builderEmit(b, hi)])
+  }
+  let fg = mkInstr(Op.FieldGet, layout.types[i])
+  fg.lhs = 0
+  fg.ival = layout.offsets[i]
+  return builderEmit(b, fg)
+}
+
+// Synthesizes `defer$thunk$<fid>(env)`: unpacks the receiver/arguments the
+// `defer` captured and issues exactly the call `emitOneDefer` replays for a
+// flag-form defer (same template, same word explosion, same blame span), then
+// returns. Registered as a closure function, so it is reached through
+// `Op.CallValue` like any `func()`. Returns the FuncId.
+fn synthDeferThunk(fc: FnCtx, t: DeferTarget, fty: int, layout: StructLayout): int {
+  let b = newBuilder()
+  builderBeginBlock(b, builderNewBlock(b))
+  builderAddParam(b, fty)
+  let vals = []int(0)
+  let i = 0
+  while (i < len(layout.types)) {
+    vals = append(vals, unpackDeferField(fc, b, layout, i))
+    i = i + 1
+  }
+  let lhs = t.instr.lhs
+  if (t.lhsRecv) {
+    lhs = vals[0]
+    vals = vals[1:len(vals)]
+  }
+  let args = explodeCallArgs(
+    fc.c.ctx, b, t.paramTypes, vals,
+    ArgExplodeGates{ tuples = t.explode, strings = fc.lowerer.explodeStrings },
+  )
+  let d = t.instr
+  builderEmit(
+    b,
+    IrInstr{
+      op = d.op, ty = d.ty, args = args, lhs = lhs, rhs = d.rhs,
+      ival = d.ival, ival2 = d.ival2, fval = d.fval, bval = d.bval, sval = d.sval,
+      name = d.name, offsets = d.offsets, thenArgs = d.thenArgs, elseArgs = d.elseArgs,
+      span = d.span,
+    },
+  )
+  builderEmit(b, mkInstr(Op.Ret, fc.c.ctx.voidId))
+  builderEndBlock(b)
+  let fid = fc.lowerer.reservedCount + len(fc.lowerer.closureFuncs)
+  let tf = irFuncFromBuilder(b, "defer\$thunk\$${fid}", [fty], fc.c.ctx.voidId)
+  tf.inRootModule = fc.lowerer.curModule == fc.lowerer.root
+  fc.lowerer.closureFuncs = append(fc.lowerer.closureFuncs, tf)
+  return fid
+}
+
+// A function exit in stack mode: pop and call every pending thunk, newest first
+// (LIFO across all sites and iterations). `for (i = len; i > 0; i = i - 1)
+// stack[i-1]()`, as blocks. The stack travels as a block parameter beside the
+// index: a value defined before a loop and read inside it fails IR verification
+// (the register allocator does not extend a range across the back edge).
+fn runDeferStack(fc: FnCtx) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let stackIn = fc.env[fc.deferStackSlot].value
+  let lenIns = mkInstr(Op.SliceLen, i64ty)
+  lenIns.lhs = stackIn
+  let n = builderEmit(fc.b, lenIns)
+  let head = builderNewBlock(fc.b)
+  let body = builderNewBlock(fc.b)
+  let done = builderNewBlock(fc.b)
+  emitJump(fc, head, [n, stackIn])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, head)
+  let i = builderAddParam(fc.b, i64ty)
+  let stack = builderAddParam(fc.b, fc.env[fc.deferStackSlot].ty)
+  let cmp = mkInstr(Op.ICmpSgt, primType(fc.c.ctx, 10))
+  cmp.lhs = i
+  cmp.rhs = builderEmit(fc.b, mkInstr(Op.ConstInt, i64ty))
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = builderEmit(fc.b, cmp)
+  br.ival = body
+  br.thenArgs = []int(0)
+  br.ival2 = done
+  br.elseArgs = []int(0)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, body)
+  let one = mkInstr(Op.ConstInt, i64ty)
+  one.ival = 1
+  let sub = mkInstr(Op.Sub, i64ty)
+  sub.lhs = i
+  sub.rhs = builderEmit(fc.b, one)
+  let next = builderEmit(fc.b, sub)
+  let call = mkInstr(Op.CallValue, fc.c.ctx.voidId)
+  call.lhs = emitSliceGetCall(fc, stack, next, deferThunkType(fc))
+  builderEmit(fc.b, call)
+  emitJump(fc, head, [next, stack])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, done)
 }

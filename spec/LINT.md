@@ -184,7 +184,7 @@ information, so they can land first.
 | E0202 | `max-params` | 5 | Past five, the call site stops being readable and the arguments want to be a class. |
 | E0203 | `max-nesting` | 4 | Deep nesting is nearly always a missing early return. |
 | E0204 | `max-complexity` | 10 | Independent paths through a function, the count a reader must hold at once. |
-| E0205 | `defer-in-loop` | - | Defers run at function exit, so one inside a loop holds every resource until the function returns. |
+| E0205 | `defer-in-loop` | - | Each iteration of a loop schedules its own deferred call, and every one runs at function exit, so a `defer` inside a loop holds every iteration's resources until the function returns. |
 | E0212 | `unreachable-code` | - | A statement after `return`/`fail`/`break`/`continue`/`panic` in the same block. |
 | E0216 | `empty-test-file` | - | A `.test.bit` file's own suffix (§19) promises tests; declaring none is almost always a rename that lost its content or a stub nobody finished. |
 

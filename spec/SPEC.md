@@ -6451,7 +6451,10 @@ defer conn.release()
 
 `defer call` schedules a call to run when the enclosing **function** returns, by
 any path (normal `return`, `fail`, or propagation `?`), in **last-in-first-out**
-order. Deferred calls do **not** run on a panic path: a panic (§18.4) aborts
+order. Every execution of a `defer` statement schedules its own call, so a
+`defer` inside a loop schedules one call per iteration, each with that
+iteration's arguments, and all of them run at the function's return, the last
+iteration's first. Deferred calls do **not** run on a panic path: a panic (§18.4) aborts
 immediately, with no unwinding of any kind, deferred or otherwise. That holds on
 both panic paths - an unrecovered panic ends the program, and a panic caught by
 a panic boundary (§18.4) discards the frames between the panic site and the
