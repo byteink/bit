@@ -1,0 +1,180 @@
+// stdlib/quic/credit.test.bit — stream-limit credit (credit.bit, #7707): a
+// peer-initiated stream that closes returns its slot, MAX_STREAMS goes out once
+// half the window is owed with a monotonically increasing limit, the limit never
+// passes 2^60, and a peer that never closes its streams gets no more than the
+// window. The state is built directly (module siblings: `quicconnNewState`,
+// `quicconnHandleFrame`, `quicconnReturnCredit`), with no peer.
+const qcWindow: int = 16
+const qcHalf: int = 8
+
+// A server-side state: the client opens bidi ids 0,4,8,... and uni ids 2,6,10,...
+fn qcState(): quicconnState {
+  let sock = udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind: ${e.message()}")
+    return quicconnNewState(false, UdpSocket{}, false, "127.0.0.1", 1, []byte(0), []byte(0))
+  }
+  return quicconnNewState(false, sock, true, "127.0.0.1", 1, []byte(0), []byte(0))
+}
+
+// The peer opens stream `id` and sends a FIN on it.
+fn qcPeerFin(st: quicconnState, id: int) {
+  let f = Frame.Stream(
+    StreamFrame{
+      id = u64(id), offset = 0, data = []byte(0), hasOffset = true, hasLength = true, fin = true,
+    },
+  )
+  quicconnHandleFrame(st, quicconnLvlApp, f) catch e {
+    assert(false, "handle: ${e.message()}")
+  }
+}
+
+// This endpoint finishes its own side of `id` and the peer acknowledges it.
+fn qcSendDone(st: quicconnState, id: int) {
+  let s = st.streams[id]
+  s.finQueued = true
+  s.finSent = true
+  s.finAcked = true
+  quicconnReturnCredit(st, s)
+}
+
+// Peer stream `id`, opened and closed in both directions.
+fn qcCycle(st: quicconnState, id: int) {
+  qcPeerFin(st, id)
+  qcSendDone(st, id)
+}
+
+// The limits of the queued MAX_STREAMS frames of one direction, in queue order.
+fn qcLimits(st: quicconnState, bidi: bool): []int {
+  let out = []int(0)
+  for f of st.aLevel.pending {
+    match (f) {
+      MaxStreams(b, m) => {
+        if (b == bidi) {
+          out = append(out, int(m))
+        }
+      }
+      _ => {}
+    }
+  }
+  return out
+}
+
+test "one MAX_STREAMS goes out once half the window of peer streams has closed" {
+  let st = qcState()
+  let i = 0
+  while (i < qcHalf - 1) {
+    qcCycle(st, i * 4)
+    i = i + 1
+  }
+  assert(len(qcLimits(st, true)) == 0, "MAX_STREAMS sent before half the window closed")
+  qcCycle(st, (qcHalf - 1) * 4)
+  let got = qcLimits(st, true)
+  assert(
+    len(got) == 1 && got[0] == qcWindow + qcHalf,
+    "${len(got)} frames: want one at ${qcWindow + qcHalf}",
+  )
+  assert(st.creditBidi.limit == qcWindow + qcHalf, "enforced limit ${st.creditBidi.limit}")
+}
+
+test "100 sequential streams: the limit only grows and every stream is admitted" {
+  let st = qcState()
+  let i = 0
+  while (i < 100) {
+    qcCycle(st, i * 4)
+    i = i + 1
+  }
+  assert(st.running, "connection closed: a stream was refused")
+  let got = qcLimits(st, true)
+  assert(len(got) == 12, "${len(got)} MAX_STREAMS frames for 100 closes: want 12")
+  let j = 1
+  while (j < len(got)) {
+    assert(got[j] > got[j - 1], "limit ${got[j]} after ${got[j - 1]}: not increasing")
+    j = j + 1
+  }
+  assert(got[len(got) - 1] == qcWindow + 96, "last limit ${got[len(got) - 1]}")
+  // Open streams (not closed) never exceed the window: the peer's next id past
+  // the limit is refused.
+  qcPeerFin(st, st.creditBidi.limit * 4)
+  assert(!st.running, "a stream past the limit was admitted")
+}
+
+test "a peer that never closes its streams gets no more than the window" {
+  let st = qcState()
+  let i = 0
+  while (i < qcWindow) {
+    qcPeerFin(st, i * 4)
+    i = i + 1
+  }
+  assert(st.running, "the window's streams were refused")
+  assert(len(qcLimits(st, true)) == 0, "MAX_STREAMS sent with nothing closed")
+  qcPeerFin(st, qcWindow * 4)
+  assert(!st.running, "stream ${qcWindow} was admitted over a limit of ${qcWindow}")
+}
+
+test "a stream closed in only one direction returns no credit" {
+  let st = qcState()
+  let i = 0
+  while (i < qcHalf) {
+    qcPeerFin(st, i * 4)
+    i = i + 1
+  }
+  assert(len(qcLimits(st, true)) == 0, "credit returned with the send side still open")
+  i = 0
+  while (i < qcHalf) {
+    quicconnAbortSend(st, i * 4, 0)
+    i = i + 1
+  }
+  assert(len(qcLimits(st, true)) == 1, "an abandoned send side did not close the stream")
+}
+
+test "a peer reset closes the receive side" {
+  let st = qcState()
+  let i = 0
+  while (i < qcHalf) {
+    quicconnHandleFrame(st, quicconnLvlApp, Frame.ResetStream(u64(i * 4), u64(0), u64(0))) catch e {
+      assert(false, "handle: ${e.message()}")
+    }
+    qcSendDone(st, i * 4)
+    i = i + 1
+  }
+  assert(len(qcLimits(st, true)) == 1, "reset streams did not return credit")
+}
+
+test "unidirectional streams close on the receive side and use MAX_STREAMS 0x13" {
+  let st = qcState()
+  let i = 0
+  while (i < qcHalf) {
+    qcPeerFin(st, i * 4 + 2)
+    i = i + 1
+  }
+  let got = qcLimits(st, false)
+  assert(len(got) == 1 && got[0] == qcWindow + qcHalf, "${len(got)} uni frames")
+  assert(len(qcLimits(st, true)) == 0, "bidi MAX_STREAMS sent for uni closes")
+  let enc = quicfrEncodeMaxStreams(false, u64(got[0]))
+  assert(enc[0] == 0x13, "uni MAX_STREAMS type ${enc[0]}")
+}
+
+test "the advertised limit never passes 2^60" {
+  let st = qcState()
+  let c = st.creditBidi
+  c.limit = quicconnMaxStreamsCap - qcHalf
+  c.closed = quicconnMaxStreamsCap
+  qcCycle(st, 0)
+  let got = qcLimits(st, true)
+  assert(len(got) == 1 && got[0] == quicconnMaxStreamsCap, "${len(got)} frames")
+  qcCycle(st, 4)
+  assert(len(qcLimits(st, true)) == 1, "a second frame went out at the cap")
+  assert(c.limit == quicconnMaxStreamsCap, "limit ${c.limit}")
+}
+
+test "a received MAX_STREAMS raises the local open limit and never lowers it" {
+  let st = qcState()
+  st.peerMaxStreamsBidi = 20
+  quicconnOnMaxStreams(st, true, 40)
+  assert(st.peerMaxStreamsBidi == 40, "limit ${st.peerMaxStreamsBidi}")
+  quicconnOnMaxStreams(st, true, 30)
+  assert(
+    st.peerMaxStreamsBidi == 40,
+    "a stale MAX_STREAMS lowered the limit to ${st.peerMaxStreamsBidi}",
+  )
+}
