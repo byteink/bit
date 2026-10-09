@@ -68,6 +68,90 @@ class h3cOrigin {
   ended: chan<int>,
   // Whether the origin stops reading a request after its first chunk.
   upload: bool,
+  // How many request bytes the stalled upload's stream delivered before it ended.
+  received: AtomicI64,
+}
+
+// A UDP relay between a client and the origin, so a test can hold the upload where
+// it is: the QUIC flow-control credit is granted as the origin's connection loop
+// delivers data, not as the test reads it, so nothing the origin does stops a
+// loopback upload from finishing. `hold` lets only the next `h3cWindowDgrams`
+// client datagrams through and parks the relay on the one after, leaving the rest
+// in the socket's buffer, delayed rather than lost so the client's loss recovery is
+// not in play; `release` forwards them all. With none of them acknowledged, the
+// client's congestion window caps what it sends far below the upload.
+class h3cRelay {
+  front: UdpSocket,
+  back: UdpSocket,
+  // The port the client dials.
+  port: int,
+  originPort: int,
+  clientPort: AtomicI64,
+  // Client datagrams seen, and the count up to which they pass without waiting.
+  seen: AtomicI64,
+  limit: AtomicI64,
+  // A value here wakes the relay parked by `limit`.
+  gate: chan<int>,
+}
+
+const h3cDgramMax: int = 2048
+const h3cWindowDgrams: int = 20
+const h3cOpen: int = 1099511627776
+
+fn h3cRelayUp(r: h3cRelay) {
+  let guard = 0
+  while (guard < 1000000) {
+    guard = guard + 1
+    let d = r.front.recv(h3cDgramMax) catch _ {
+      return
+    }
+    r.clientPort.store(d.port)
+    if (r.seen.add(1) > r.limit.load()) {
+      <- r.gate
+    }
+    r.back.send("127.0.0.1", r.originPort, d.data) catch _ {
+      return
+    }
+  }
+}
+
+fn h3cRelayDown(r: h3cRelay) {
+  let guard = 0
+  while (guard < 1000000) {
+    guard = guard + 1
+    let d = r.back.recv(h3cDgramMax) catch _ {
+      return
+    }
+    r.front.send("127.0.0.1", int(r.clientPort.load()), d.data) catch _ {
+      return
+    }
+  }
+}
+
+fn h3cRelayStart(originPort: int): h3cRelay! {
+  let front = udpBind("127.0.0.1", 0)?
+  let back = udpBind("127.0.0.1", 0)?
+  let r = h3cRelay{
+    front = front, back = back, port = front.port()?, originPort = originPort,
+    clientPort = AtomicI64(0), seen = AtomicI64(0), limit = AtomicI64(h3cOpen), gate = chan<int>(1),
+  }
+  spawn h3cRelayUp(r)
+  spawn h3cRelayDown(r)
+  return r
+}
+
+fn h3cRelayHold(r: h3cRelay) {
+  r.limit.store(r.seen.load() + h3cWindowDgrams)
+}
+
+fn h3cRelayRelease(r: h3cRelay) {
+  r.limit.store(h3cOpen)
+  r.gate <- 1
+}
+
+fn h3cRelayClose(r: h3cRelay) {
+  r.front.close()
+  r.back.close()
 }
 
 fn h3cAcceptLoop(lst: H3Listener, o: h3cOrigin) {
@@ -123,7 +207,8 @@ fn h3cStream(s: Stream, o: h3cOrigin) {
   if (o.upload) {
     o.stalled <- 1
     <- o.hold
-    let (_, code) = h3cDrain(s, first)
+    let (got, code) = h3cDrain(s, first)
+    o.received.store(len(got))
     o.ended <- code
     return
   }
@@ -159,7 +244,7 @@ fn h3cStart(upload: bool): h3cOrigin! {
   let lst = h3Listen(sock, h3sdCertPem(), h3sdKeyPem())?
   let o = h3cOrigin{
     sock = sock, port = port, accepts = AtomicI64(0), stalled = chan<int>(4), hold = chan<int>(4),
-    ended = chan<int>(1), upload = upload,
+    ended = chan<int>(1), upload = upload, received = AtomicI64(0),
   }
   spawn h3cAcceptLoop(lst, o)
   return o
@@ -246,28 +331,39 @@ test "cancel of an upload sends RESET_STREAM with H3_REQUEST_CANCELLED to the or
     assert(false, "start: ${e.message()}")
     return
   }
-  let conn = h3DialTls("127.0.0.1", o.port, "localhost", tls5916ClientConfig()) catch e {
+  let r = h3cRelayStart(o.port) catch e {
+    assert(false, "relay: ${e.message()}")
+    return
+  }
+  let conn = h3DialTls("127.0.0.1", r.port, "localhost", tls5916ClientConfig()) catch e {
     assert(false, "dial: ${e.message()}")
     return
   }
   let tok = Cancel()
   let errs = chan<error>(1)
   let out = chan<string>(1)
-  // 256 KiB against a 32 KiB stream window: the FIN cannot have been sent.
+  let size = 262144
+  // The relay passes the next 20 datagrams and delays the rest: the upload is held,
+  // and its FIN cannot reach the origin, until the relay is released.
+  h3cRelayHold(r)
   spawn h3cOnConn(
-    h3cCall{ conn = conn, port = o.port, tok = tok, errs = errs, out = out },
-    repeat("u", 262144),
+    h3cCall{ conn = conn, port = r.port, tok = tok, errs = errs, out = out },
+    repeat("u", size),
   )
   <- o.stalled
   let at = startCancel(tok)
   let e = <- errs
   assertWithin(at, "h3 cancel mid-upload")
   assertCancelled(e, "h3 cancel mid-upload")
-  sleep(100 * 1000000)
+  // The RESET_STREAM was delayed with the rest of what the client sent.
+  h3cRelayRelease(r)
   o.hold <- 1
   let code = <- o.ended
   assert(code == 268, "the origin saw ${code} on the request stream, not RESET_STREAM 0x010c (268)")
+  let got = o.received.load()
+  assert(got < size, "the origin received ${got} of ${size} bytes: the upload was not in flight")
   conn.close()
+  h3cRelayClose(r)
 }
 
 test "an https+h3 request with a token is sent over HTTP/3 and cancelled mid-response" {
