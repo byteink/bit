@@ -1,0 +1,141 @@
+// stdlib/quic/abort.test.bit — `quicconnAbortSend` follows the RFC 9000 §3.1
+// sending-stream state machine (#7687): RESET_STREAM goes out from "Send" and
+// from "Data Sent" (FIN out, something unacknowledged), only "Data Recvd"
+// (FIN and every byte acknowledged) stays silent, and after the reset the
+// stream's STREAM data is never retransmitted (§3.3, §19.4).
+//
+// The state is built directly (module siblings: `quicconnNewState`,
+// `quicconnNewStream`, `quicconnAbortSend`, `quicconnAccumulateLost`,
+// `quicconnSendProbe`), with no peer: "the peer withholds the ACK" is simply
+// an `ackedRanges`/`finAcked` that never got set.
+const qaStreamId: int = 0
+const qaPayload: int = 5
+
+fn qaState(): quicconnState {
+  let sock = udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind: ${e.message()}")
+    return quicconnNewState(true, UdpSocket{}, false, "127.0.0.1", 1, []byte(0), []byte(0))
+  }
+  return quicconnNewState(true, sock, true, "127.0.0.1", 1, []byte(0), []byte(0))
+}
+
+// A stream whose `qaPayload` bytes and FIN have all been sent, none acknowledged.
+fn qaDataSent(st: quicconnState): quicconnStream {
+  let s = quicconnNewStream(st, qaStreamId, false)
+  s.sendLen = qaPayload
+  s.sendOff = qaPayload
+  s.finQueued = true
+  s.finSent = true
+  st.streams[qaStreamId] = s
+  st.present[qaStreamId] = 1
+  return s
+}
+
+fn qaStreamFrame(): Frame {
+  return Frame.Stream(
+    StreamFrame{
+      id = u64(qaStreamId),
+      offset = 0,
+      data = []byte(qaPayload),
+      hasOffset = true,
+      hasLength = true,
+      fin = true,
+    },
+  )
+}
+
+// How many RESET_STREAMs for the stream are queued, and the code of the last.
+fn qaResets(frames: []Frame): (int, int) {
+  let n = 0
+  let code = -1
+  for f of frames {
+    match (f) {
+      ResetStream(id, c, size) => {
+        if (int(id) == qaStreamId && int(size) == qaPayload) {
+          n = n + 1
+          code = int(c)
+        }
+      }
+      _ => {}
+    }
+  }
+  return (n, code)
+}
+
+fn qaStreamFrames(frames: []Frame): int {
+  let n = 0
+  for f of frames {
+    if (quicconnFrameStreamId(f) == qaStreamId) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+test "abort from Data Sent (FIN out, unacked) sends RESET_STREAM with the code" {
+  let st = qaState()
+  let s = qaDataSent(st)
+  quicconnAbortSend(st, qaStreamId, 268)
+  let (n, code) = qaResets(st.aLevel.pending)
+  assert(n == 1, "RESET_STREAM frames queued: ${n}")
+  assert(code == 268, "RESET_STREAM code: ${code}")
+  assert(s.sendAborted, "send side marked aborted")
+}
+
+test "abort from Data Sent drops queued STREAM data and stops retransmitting it" {
+  let st = qaState()
+  let _ = qaDataSent(st)
+  st.aLevel.pending = append(st.aLevel.pending, qaStreamFrame())
+  quicconnAbortSend(st, qaStreamId, 7)
+  assert(qaStreamFrames(st.aLevel.pending) == 0, "queued STREAM frame survived the reset")
+  // The packet that carried the data is declared lost, then probed: neither
+  // re-queues the STREAM frame, while the RESET_STREAM itself stays queued.
+  let sp = quicconnSent{
+    pn = 1, timeSent = 0, size = 40, ackEliciting = true, frames = [qaStreamFrame()],
+  }
+  st.aLevel.sent = [sp]
+  quicconnAccumulateLost(sp, st, st.aLevel)
+  quicconnSendProbe(st)
+  assert(qaStreamFrames(st.aLevel.pending) == 0, "lost STREAM frame was re-queued")
+  let (n, _) = qaResets(st.aLevel.pending)
+  assert(n == 1, "RESET_STREAM frames queued: ${n}")
+}
+
+test "a stream that is not aborted still retransmits lost STREAM data" {
+  let st = qaState()
+  let _ = qaDataSent(st)
+  let sp = quicconnSent{
+    pn = 1, timeSent = 0, size = 40, ackEliciting = true, frames = [qaStreamFrame()],
+  }
+  quicconnAccumulateLost(sp, st, st.aLevel)
+  assert(qaStreamFrames(st.aLevel.pending) == 1, "lost STREAM frame not re-queued")
+}
+
+test "abort from Data Recvd (FIN and all bytes acked) stays silent" {
+  let st = qaState()
+  let s = qaDataSent(st)
+  s.finAcked = true
+  s.ackedRanges = [quicconnRange{ lo = 0, hi = qaPayload - 1 }]
+  quicconnAbortSend(st, qaStreamId, 268)
+  assert(len(st.aLevel.pending) == 0, "frames queued from Data Recvd: ${len(st.aLevel.pending)}")
+  assert(!s.sendAborted, "Data Recvd stream marked aborted")
+}
+
+test "abort from Send (FIN not yet out) sends RESET_STREAM" {
+  let st = qaState()
+  let s = qaDataSent(st)
+  s.finQueued = false
+  s.finSent = false
+  quicconnAbortSend(st, qaStreamId, 9)
+  let (n, code) = qaResets(st.aLevel.pending)
+  assert(n == 1 && code == 9, "RESET_STREAM from Send: n=${n} code=${code}")
+}
+
+test "a second abort does not queue a second RESET_STREAM" {
+  let st = qaState()
+  let _ = qaDataSent(st)
+  quicconnAbortSend(st, qaStreamId, 1)
+  quicconnAbortSend(st, qaStreamId, 2)
+  let (n, code) = qaResets(st.aLevel.pending)
+  assert(n == 1 && code == 1, "RESET_STREAM frames: n=${n} code=${code}")
+}
