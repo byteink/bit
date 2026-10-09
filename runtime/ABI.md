@@ -4974,11 +4974,12 @@ bit_rt_sha256_hw_blocks(state, data, blocks)   // fold `blocks` 64-byte blocks i
 
 `state`/`data` are raw addresses (`int`); `blocks` a `u64` count. `state`
 points at a PACKED 32-byte buffer — 8 running `u32` words (a..h), native
-(little-endian on ARM64) byte order per word — updated in place. That is
-the layout a Bit `[]u32` slice's own `ptrOf` addresses (SPEC §11.8: a
-`[]u32` packs at 4 bytes per element, #7574), so
-`stdlib/crypto/sha256.bit`'s `absorb` passes `ptrOf(state)` of its
-`state: []u32` directly, with no marshalling around the
+(little-endian on ARM64) byte order per word — updated in place. Since
+#7574 that is also the layout a Bit `[]u32` slice's own `ptrOf` addresses
+(SPEC §11.8), but the pinned stage0 that builds the compiler still strides a
+`[]u32` at one 8-byte word per element (#7713), so
+`stdlib/crypto/sha256.bit`'s `absorb` copies its `state: []u32` through a
+local `[]byte(32)` around each
 call. `data` points at `64*blocks` PACKED bytes of message, read
 big-endian per FIPS 180-4's own convention.
 `bit_rt_sha256_hw_blocks` implements the same recurrence
