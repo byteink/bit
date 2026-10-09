@@ -91,9 +91,10 @@ thread parked in `read`, `finish`, or `acceptStream` otherwise waits until the
 timeout, or forever if you never set one and the peer never speaks again.
 
 **A `finish`ed or `reset` send side cannot be reused.** `finish` blocks until every
-byte is acknowledged; `reset` abandons unsent data and tells the peer to stop
-expecting the rest. Do not call `reset` after a `finish` on the same stream is
-already in flight - the two are mutually exclusive endings for the same send side.
+byte is acknowledged; `reset` abandons unsent and unacknowledged data and tells the
+peer to stop expecting the rest. A `reset` after a `finish` whose FIN is out but not
+yet fully acknowledged still sends RESET_STREAM and stops the retransmissions
+(RFC 9000 section 3.1); once everything is acknowledged, `reset` does nothing.
 
 **This implementation is deliberately narrow.** NewReno congestion control only (no
 CUBIC/BBR); connection migration is connection-id basics only, with no path
