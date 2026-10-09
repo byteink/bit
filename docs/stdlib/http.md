@@ -473,7 +473,7 @@ pool with the default `PoolLimits`, which `setPool` and `close` cannot reach.
 An `https://` connection in it is keyed by the whole TLS configuration the call
 passed - roots, `serverName`, `insecureSkipVerify`, `alpn` and the rest - so a
 `getTls` with a pinned CA never rides a connection another configuration
-dialed. HTTP/3 connections are not pooled yet: each call still opens its own.
+dialed. HTTP/3 connections are pooled the same way, see below.
 
 #### Sharing one HTTP/2 connection
 
@@ -524,6 +524,26 @@ request should not share. `maxIdlePerHost = 0` turns sharing off here too:
 each request gets its own connection and closes it. Retrying follows the same
 rule as HTTP/1.1: a `GET` that fails on a shared connection is retried once on
 a new one, a `POST` is not.
+
+#### Sharing one HTTP/3 connection
+
+An `https+h3://` origin is shared like an h2 one: the pool keeps one QUIC
+connection per origin and TLS configuration, and every request to it is a
+stream on that connection. Three requests in a row, or eight at once, make one
+QUIC handshake, not one each. Dials to an origin are one at a time, so a burst
+dials once.
+
+A connection leaves the pool, and its requests already running on it finish
+first, when the server sends `GOAWAY`, when the QUIC connection ends (the peer
+closed it, or its idle timeout passed), when it has been idle for
+`idleTimeoutMs`, when a request on it fails for any reason but a `Cancel` or a
+deadline, and when `close()` or `setPool` retires it. The server's limit on
+open streams is honoured: a request that finds the connection at that limit
+opens a stream on a second connection instead, which becomes the shared one, and
+since nothing was sent on the first, it is repeated there whatever its method.
+A `Cancel` or a request deadline aborts only that request's stream. The
+connection and the other streams on it run on. `maxIdlePerHost = 0` turns
+sharing off for HTTP/3 as well.
 
 ### Following redirects
 

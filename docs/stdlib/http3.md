@@ -306,6 +306,18 @@ Like `h3Dial`, bounded by an absolute deadline in nanoseconds. Once the handshak
 
 What `H3Conn.request` and `h3DialTlsBounded` fail with when their channel received a value. A request that was aborted had only its own stream reset and stopped.
 
+### `H3Unsent`
+
+What `H3Conn.request` fails with when it could not open a request stream: the QUIC connection had closed, or the peer's limit on open streams was reached. Nothing was written, so the request may be repeated on another connection whatever its method. `cause` is the error underneath.
+
+### `H3Conn.watchPeer()`
+
+Starts reading the peer's own streams so that `reusable` learns of a `GOAWAY` or an ended connection. Call it once on a client connection shared between requests; the watcher takes every peer-initiated stream, so do not also call `rawConn().acceptStream()` on that connection.
+
+### `H3Conn.reusable(): bool`
+
+Whether a new request may be started on this connection: false once either side sent `GOAWAY` or the connection ended. It sees the peer's side only after `watchPeer`.
+
 ### `h3Accept(sock: UdpSocket, certChainPem: string, keyPem: string): H3Conn!`
 
 Accepts one HTTP/3 connection on the bound UDP socket `sock`, using the certificate chain and private key for the handshake. Serves a single connection; use `h3Listen` for many.

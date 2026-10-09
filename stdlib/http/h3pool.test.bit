@@ -1,0 +1,209 @@
+// stdlib/http/h3pool.test.bit — the shared HTTP/3 connection per origin
+// (h3pool.bit, #7688): sequential and concurrent requests ride one QUIC
+// connection, a GOAWAY retires it, the peer's stream limit moves the next request
+// to a second connection, and two TLS configs never share one.
+//
+// The origin is `h3Listen` plus `serveH3Conn` (h3.bit), with every accepted QUIC
+// connection counted. `h3sdCertPem`, `h3sdKeyPem` (h3shutdown.test.bit) and
+// `tls5916ClientConfig` (tls.test.bit) are siblings.
+import { UdpSocket } from "std/net"
+
+class h3pOrigin {
+  port: int,
+  // How many QUIC connections the origin accepted.
+  accepts: AtomicI64,
+  // The accepted connections, in order, for a test to send GOAWAY on.
+  conns: chan<H3Conn>,
+}
+
+fn h3pHandler(req: Request): Response {
+  return ok("pong ${req.path}")
+}
+
+fn h3pAcceptLoop(lst: H3Listener, o: h3pOrigin) {
+  let guard = 0
+  while (guard < 64) {
+    guard = guard + 1
+    let conn = lst.accept() catch _ {
+      return
+    }
+    o.accepts.add(1)
+    o.conns <- conn
+    spawn serveH3Conn(conn, h3pHandler, newDrainState())
+  }
+}
+
+fn h3pStart(): h3pOrigin! {
+  let sock = udpBind("127.0.0.1", 0)?
+  let port = sock.port()?
+  let lst = h3Listen(sock, h3sdCertPem(), h3sdKeyPem())?
+  let o = h3pOrigin{ port = port, accepts = AtomicI64(0), conns = chan<H3Conn>(64) }
+  spawn h3pAcceptLoop(lst, o)
+  return o
+}
+
+fn h3pUrl(o: h3pOrigin, path: string): string {
+  return "https+h3://127.0.0.1:${o.port}${path}"
+}
+
+// One GET through `c`: "status body", or the error's text.
+fn h3pGet(c: Client, url: string): string {
+  let res = c.get(url) catch e {
+    return "error: ${e.message()}"
+  }
+  return "${res.status} ${res.body}"
+}
+
+fn h3pGetInto(c: Client, url: string, out: chan<string>) {
+  out <- h3pGet(c, url)
+}
+
+test "three sequential Client.get calls to one https+h3 origin use one QUIC connection" {
+  let o = h3pStart() catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client(tls = tls5916ClientConfig())
+  let i = 0
+  while (i < 3) {
+    let got = h3pGet(c, h3pUrl(o, "/s${i}"))
+    assert(got == "200 pong /s${i}", "request ${i}: ${got}")
+    i = i + 1
+  }
+  assert(o.accepts.load() == 1, "accepts = ${o.accepts.load()}: the connection was not reused")
+  c.pool.retire()
+}
+
+test "eight concurrent Client.get calls to one https+h3 origin use one QUIC connection" {
+  let o = h3pStart() catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client(tls = tls5916ClientConfig())
+  let out = chan<string>(8)
+  let i = 0
+  while (i < 8) {
+    spawn h3pGetInto(c, h3pUrl(o, "/c${i}"), out)
+    i = i + 1
+  }
+  let ok = 0
+  i = 0
+  while (i < 8) {
+    let got = <- out
+    if (hasPrefix(got, "200 pong /c")) {
+      ok = ok + 1
+    } else {
+      assert(false, "a concurrent request failed: ${got}")
+    }
+    i = i + 1
+  }
+  assert(ok == 8, "ok = ${ok}")
+  assert(o.accepts.load() == 1, "accepts = ${o.accepts.load()}: the burst dialed more than once")
+  c.pool.retire()
+}
+
+// Polls, for up to 2 s, until the pool no longer offers the origin's connection
+// (`h3Pool.take` drops one whose peer sent GOAWAY). False when it still does.
+fn h3pDropped(c: Client): bool {
+  let tries = 0
+  while (tries < 200) {
+    tries = tries + 1
+    match (c.pool.h3.take(c.pool.h3.origins[0].key, monotonic().ns)) {
+      Shared(e) => {
+        c.pool.h3.release(e, monotonic().ns)
+        sleep(10 * 1000000)
+      }
+      None => return true
+    }
+  }
+  return false
+}
+
+test "a GOAWAY from the origin makes the next request open a new connection" {
+  let o = h3pStart() catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client(tls = tls5916ClientConfig())
+  assert(h3pGet(c, h3pUrl(o, "/a")) == "200 pong /a", "first request")
+  assert(o.accepts.load() == 1, "accepts = ${o.accepts.load()} after the first request")
+  let first = <- o.conns
+  first.goAway()
+  assert(h3pDropped(c), "the pool kept offering a connection the origin sent GOAWAY on")
+  assert(h3pGet(c, h3pUrl(o, "/b")) == "200 pong /b", "request after the GOAWAY")
+  assert(o.accepts.load() == 2, "accepts = ${o.accepts.load()}: no new connection after GOAWAY")
+  assert(h3pGet(c, h3pUrl(o, "/c")) == "200 pong /c", "request on the new connection")
+  assert(o.accepts.load() == 2, "accepts = ${o.accepts.load()}: the new connection was not shared")
+  c.pool.retire()
+}
+
+test "twenty sequential requests outlast the peer's stream limit on a second connection" {
+  let o = h3pStart() catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client(tls = tls5916ClientConfig())
+  let i = 0
+  while (i < 20) {
+    let got = h3pGet(c, h3pUrl(o, "/n${i}"))
+    assert(got == "200 pong /n${i}", "request ${i}: ${got}")
+    i = i + 1
+  }
+  // The origin advertises 16 bidirectional streams and 3 carry the control and
+  // QPACK streams, so 13 requests fit on a connection.
+  assert(
+    o.accepts.load() >= 2 && o.accepts.load() <= 3,
+    "accepts = ${o.accepts.load()}: want a second connection once the first hit its limit, not one per request",
+  )
+  c.pool.retire()
+}
+
+test "maxIdlePerHost = 0 keeps nothing: every request dials" {
+  let o = h3pStart() catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client(tls = tls5916ClientConfig())
+  c.setPool(PoolLimits{ maxIdlePerHost = 0 }) catch e {
+    assert(false, "setPool: ${e.message()}")
+    return
+  }
+  assert(h3pGet(c, h3pUrl(o, "/a")) == "200 pong /a", "first request")
+  assert(h3pGet(c, h3pUrl(o, "/b")) == "200 pong /b", "second request")
+  assert(
+    o.accepts.load() == 2,
+    "accepts = ${o.accepts.load()}: a connection was shared with sharing off",
+  )
+}
+
+test "two TLS configs never share an HTTP/3 connection" {
+  let o = h3pStart() catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let a = tls5916ClientConfig()
+  let b = tls5916ClientConfig()
+  b.serverName = "other.example"
+  let url = h3pUrl(o, "/t")
+  let first = getTls(url, a) catch e {
+    assert(false, "config A: ${e.message()}")
+    return
+  }
+  assert(first.status == 200, "config A status ${first.status}")
+  let second = getTls(url, b) catch e {
+    assert(false, "config B: ${e.message()}")
+    return
+  }
+  assert(second.status == 200, "config B status ${second.status}")
+  assert(o.accepts.load() == 2, "accepts = ${o.accepts.load()}: two configs shared a connection")
+  let again = getTls(url, a) catch e {
+    assert(false, "config A again: ${e.message()}")
+    return
+  }
+  assert(again.status == 200, "config A again status ${again.status}")
+  assert(
+    o.accepts.load() == 2,
+    "accepts = ${o.accepts.load()}: config A did not reuse its own connection",
+  )
+  defaultPool.h3.closeAll()
+}
