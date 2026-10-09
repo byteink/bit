@@ -64,7 +64,10 @@ fn main(): ()! {
   println("${moved} changed") // 1
 
   // A new writer only counts when they are not there yet.
-  let fresh = writers.add([place("ana", 0.0, 0.0), place("cy", 9.99, 53.55)], GeoAddOptions{ nx = true })?
+  let fresh = writers.add(
+    [place("ana", 0.0, 0.0), place("cy", 9.99, 53.55)],
+    GeoAddOptions{ nx = true },
+  )?
   println("${fresh} added") // 1, ana stayed where she was
   r.close()
   return
@@ -89,7 +92,7 @@ fn main(): ()! {
     Some(p) => println("ana is at ${p.lat}, ${p.lon}")
     None => println("ana has not told us")
   }
-  println(isNone(spots[1])) // true
+  println("${isNone(spots[1])}") // true
 
   match (writers.dist("ana", "bo", GeoUnit.Kilometers)?) {
     Some(km) => println("${km} km apart") // about 26.7
@@ -139,7 +142,11 @@ fn main(): ()! {
 
   // Everyone in a 100 km square, with where they are.
   let square = GeoBy.Box(100.0, 100.0, GeoUnit.Kilometers)
-  let located = writers.search(visitor, square, GeoSearchOptions{ withCoord = true, withHash = true })?
+  let located = writers.search(
+    visitor,
+    square,
+    GeoSearchOptions{ withCoord = true, withHash = true },
+  )?
   for h of located {
     println("${h.member} at ${unwrap(h.at).lat}, ${unwrap(h.at).lon}, cell ${unwrap(h.hash)}")
   }
@@ -201,8 +208,8 @@ fn main(): ()! {
   let readers = r.hll("inkwell:readers:article:41")
 
   let isNew = readers.add("user:7", "user:9")?
-  println(isNew) // true
-  println(readers.add("user:7")?) // false, already counted
+  println("${isNew}")                    // true
+  println("${readers.add("user:7")?}")   // false, already counted
   println("${readers.count()?} readers") // 2
   r.close()
   return
@@ -228,7 +235,7 @@ fn main(): ()! {
   r.hll("inkwell:readers:tue").add("user:3", "user:4")?
 
   // Without storing anything: the union of two days.
-  println(r.hll("inkwell:readers:mon").count("inkwell:readers:tue")?) // 4
+  println("${r.hll("inkwell:readers:mon").count("inkwell:readers:tue")?}") // 4
 
   // Keep the week so far.
   let week = r.hll("inkwell:readers:week")
@@ -273,14 +280,14 @@ fn main(): ()! {
     println("first visit today")
   }
   today.set(7, true)?
-  println(today.get(42)?) // true
-  println(today.get(43)?) // false
+  println("${today.get(42)?}") // true
+  println("${today.get(43)?}") // false
 
-  println("${today.count()?} readers") // 2
-  println("lowest id ${today.pos(true)?}") // 7
+  println("${today.count()?} readers")                                        // 2
+  println("lowest id ${today.pos(true)?}")                                    // 7
   println("readers among ids 0 to 15: ${today.count(BitRange.Bytes(0, 1))?}") // 1
-  println("in bits 8 to 63: ${today.count(BitRange.Bits(8, 63))?}") // 1
-  println("first id from byte 1: ${today.pos(true, BitRange.From(1))?}") // 42
+  println("in bits 8 to 63: ${today.count(BitRange.Bits(8, 63))?}")           // 1
+  println("first id from byte 1: ${today.pos(true, BitRange.From(1))?}")      // 42
   r.close()
   return
 }
@@ -364,7 +371,7 @@ fn main(): ()! {
   // Not here on Monday, by flipping the bits.
   let absent = r.bitmap("inkwell:active:absent")
   absent.op(BitOp.Not, mon)?
-  println(absent.get(0)?) // true, id 0 never read
+  println("${absent.get(0)?}") // true, id 0 never read
   r.close()
   return
 }
@@ -400,10 +407,8 @@ fn main(): ()! {
 
   // Three one-byte counters in one three-byte string: views, likes, shares.
   let byteType = BitType.Unsigned(8)
-  let ops = bitfield()
-    .incrBy(byteType, BitAt.Slot(0), 1)
-    .incrBy(byteType, BitAt.Slot(1), 5)
-    .get(byteType, BitAt.Slot(2))
+  let counted = bitfield().incrBy(byteType, BitAt.Slot(0), 1).incrBy(byteType, BitAt.Slot(1), 5)
+  let ops = counted.get(byteType, BitAt.Slot(2))
   let got = stats.bitfield(ops)?
   println("views ${unwrap(got[0])}, likes ${unwrap(got[1])}, shares ${unwrap(got[2])}")
   r.close()
@@ -427,16 +432,22 @@ fn main(): ()! {
   stats.bitfield(bitfield().set(byteType, BitAt.Slot(0), 250))?
 
   // Saturate: 250 + 10 stops at 255.
-  let capped = stats.bitfield(bitfield().overflow(BitOverflow.Sat).incrBy(byteType, BitAt.Slot(0), 10))?
-  println(unwrap(capped[0])) // 255
+  let capped = stats.bitfield(
+    bitfield().overflow(BitOverflow.Sat).incrBy(byteType, BitAt.Slot(0), 10),
+  )?
+  println("${unwrap(capped[0])}") // 255
 
   // Fail: the counter is full, so the step answers None and nothing changes.
-  let refused = stats.bitfield(bitfield().overflow(BitOverflow.Fail).incrBy(byteType, BitAt.Slot(0), 1))?
-  println(isNone(refused[0])) // true
+  let refused = stats.bitfield(
+    bitfield().overflow(BitOverflow.Fail).incrBy(byteType, BitAt.Slot(0), 1),
+  )?
+  println("${isNone(refused[0])}") // true
 
   // Wrap, the default: 255 + 1 goes around to 0.
-  let wrapped = stats.bitfield(bitfield().overflow(BitOverflow.Wrap).incrBy(byteType, BitAt.Slot(0), 1))?
-  println(unwrap(wrapped[0])) // 0
+  let wrapped = stats.bitfield(
+    bitfield().overflow(BitOverflow.Wrap).incrBy(byteType, BitAt.Slot(0), 1),
+  )?
+  println("${unwrap(wrapped[0])}") // 0
   r.close()
   return
 }
@@ -479,7 +490,10 @@ fn main(): ()! {
   let placed = p.geo("inkwell:writers").add([place("ana", 13.405, 52.52)])
   let unique = p.hll("inkwell:readers:article:41").count()
   let today = p.bitmap("inkwell:active:2026-10-09").count(BitRange.All)
-  let near = p.geo("inkwell:writers").search(GeoFrom.Member("ana"), GeoBy.Radius(10.0, GeoUnit.Kilometers))
+  let near = p.geo("inkwell:writers").search(
+    GeoFrom.Member("ana"),
+    GeoBy.Radius(10.0, GeoUnit.Kilometers),
+  )
   p.exec()?
   println("${unique.get()?} unique, ${today.get()?} active, ${len(near.get()?)} writers nearby")
   println("${seen.get()?} ${active.get()?} ${placed.get()?}")
