@@ -675,6 +675,10 @@ The error `Conn.roundTrip` fails with after its `abort` channel received a value
 `message()` reads `http2: request aborted`. Unlike any other `roundTrip` failure it
 says nothing about the connection, which stays usable.
 
+### `Aborted.message`
+
+The fixed text `http2: request aborted`. To tell an abort from a connection failure, test the error with `e.(Aborted)`, because the text carries no stream id or cause to tell two aborts apart.
+
 ### `Conn.roundTripStream(req: Request, deadlineNs: int = 0): (Response, Stream)!`
 
 Sends `req` and returns as soon as the response headers arrive, with the body

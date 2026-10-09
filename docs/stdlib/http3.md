@@ -306,9 +306,17 @@ Like `h3Dial`, bounded by an absolute deadline in nanoseconds. Once the handshak
 
 What `H3Conn.request` and `h3DialTlsBounded` fail with when their channel received a value. A request that was aborted had only its own stream reset and stopped.
 
+### `H3Aborted.message`
+
+The fixed text `http3: request aborted`. It names no stream and no cause, so branch on `e.(H3Aborted)` to tell an abort from a connection failure and use the text only for a log line.
+
 ### `H3Unsent`
 
 What `H3Conn.request` fails with when it could not open a request stream: the QUIC connection had closed, or the peer's limit on open streams was reached. Nothing was written, so the request may be repeated on another connection whatever its method. `cause` is the error underneath.
+
+### `H3Unsent.message`
+
+The text of `cause`, unchanged, so a log line for an unsent request reads as the QUIC failure that stopped it. Reach `cause` itself, to decide whether the connection is worth keeping, with `e.(H3Unsent)`.
 
 ### `H3Conn.watchPeer()`
 
