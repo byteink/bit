@@ -176,6 +176,42 @@ of it?`. `pattern` filters key names server-side (`SCAN`'s own `MATCH`),
 version: a cursor is several round trips, and a pipeline's `Future<T>` only
 ever resolves one.
 
+## Reading inside a transaction
+
+`tx.str(key)` and `tx.keys()` only queue. `tx.read.str(key)` and
+`tx.read.keys()` are the immediate views of the same handles, run now on the
+transaction's own connection, between `WATCH` and `MULTI`. If another client
+changes a watched key first, the transaction retries and your body runs again
+with fresh reads:
+
+```bit
+import { open } from "redis"
+import { Second } from "std/time"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let key = "session:7"
+  r.transaction<()>([key], (tx) => {
+    match (tx.read.keys().ttl(key)?) {
+      NoExpiry => { tx.keys().expire(key, 60 * Second) }
+      _ => {}
+    }
+    if (tx.read.str(key).strLen()? == 0) {
+      tx.str(key).append("new")
+    }
+    return
+  })?
+  r.close()
+  return
+}
+```
+
+The reads (`strLen`, `getRange`, `lcs`, `lcsLen` on `str`; `ttl`, `pttl`,
+`keyType`, `randomKey`, `objectEncoding`, `getMany` and `scan` on `keys`) work
+through `tx.read`. A write such as `tx.read.str(key).append(...)` would run
+immediately, outside the transaction's `MULTI`/`EXEC`, so it fails with
+`RedisError.Invalid`; queue it with `tx.str(key)` or `tx.keys()`.
+
 ## Sharp edges
 
 - `set`/`setGet`'s `ttl` is nanoseconds, sent as `PX` milliseconds - not

@@ -9,7 +9,7 @@ the whole article, changing it in your program and writing it back, while
 another request does the same and one of the two edits is lost.
 
 Redis can keep the document as JSON and edit it in place. `r.json(key)` is a
-cheap value, `{client, key}`, like every other handle: you can call it again
+cheap value, `{runner, key}`, like every other handle: you can call it again
 any time you need the same key. A JSON key is its own type (`TYPE` says
 `ReJSON-RL`), so the string and hash commands do not work on it, and these do
 not work on a string.
@@ -378,6 +378,38 @@ fn main(): ()! {
   return
 }
 ```
+
+## Reading an article inside a transaction
+
+`tx.json(key)` only queues, so it cannot answer "is this article published?"
+before you decide what to write. `tx.read.json(key)` is the immediate view of
+the same key, run now on the transaction's own connection, between `WATCH` and
+`MULTI`. If another client changes a watched key first, the transaction
+retries and your body runs again with fresh reads:
+
+```bit
+import { open } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let key = "inkwell:article:a41"
+  r.transaction<()>([key], (tx) => {
+    let kinds = tx.read.json(key).typeOf("$.views")?
+    if (len(kinds) == 1 && kinds[0] == "integer") {
+      tx.json(key).numIncrBy(1.0, "$.views")
+    }
+    return
+  })?
+  r.close()
+  return
+}
+```
+
+The reads (`get`, `getAt`, `getPaths`, `mget`, `typeOf`, `strLen`, `arrLen`,
+`arrIndex`, `objKeys`, `objLen`) work through `tx.read`. A write such as
+`tx.read.json(key).set(...)` would run immediately, outside the transaction's
+`MULTI`/`EXEC`, so it fails with `RedisError.Invalid`; queue it with
+`tx.json(key)`.
 
 ## When not to use it
 
