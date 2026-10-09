@@ -390,8 +390,8 @@ irForOfUnhoist() {
 
 # explainForOfLen <oracle_text> <bit2_text> <kind: ir|iropt> -- prints the signature and returns 0 when
 # the rewritten tree dump agrees with the oracle's under the same trials explainIrLag runs on the
-# unrewritten one (a file that needs the packing or the forwarded loads as well is named for this
-# signature). The iropt arm adds the stage-1b trials, the ir arm has no CSE.
+# unrewritten one (a file that needs the packing, the rune call or the forwarded loads as well is named
+# for that signature, a file that needs only this one for 7737-forof-len-once). The iropt arm adds the stage-1b trials, the ir arm has no CSE.
 explainForOfLen() {
   local t o u
   o=$1
@@ -412,12 +412,32 @@ explainForOfLen() {
 
 # forOfTrials <oracle> <tree> <kind> -- explainIrLag's trial set over an already rewritten pair.
 forOfTrials() {
-  local h n r c trials
+  local h n r c trials tr name
   trials="0:0:0:0 1:0:0:0 1:1:0:0 0:0:1:0 1:1:1:0"
   [ "$3" = iropt ] && trials="${trials} 0:0:0:1 1:1:0:1 1:1:1:1"
   for tr in ${trials}; do
     IFS=: read -r h n r c <<<"${tr}"
-    irTrial "$1" "$2" "${h}" "${n}" "${r}" forof "${c}" && return 0
+    # A pair that also needs a packing, the rune call or the forwarded loads keeps that signature's
+    # name, as explainIrLag names a file that needs two of them, so none of those starves into
+    # RETIRED while its files move to this one.
+    name=forof
+    [ "${h}" = 1 ] && name=half
+    [ "${n}" = 1 ] && name=narrow
+    [ "${c}" = 1 ] && name=cse
+    [ "${r}" = 1 ] && name=rune
+    irTrial "$1" "$2" "${h}" "${n}" "${r}" "${name}" "${c}" && return 0
   done
   return 1
+}
+
+# explainIrLagPinForOf <oracle_text> <bit2_text> -- a pinned file (irLagPins) that also has a #7737 loop:
+# the pin's own comparison, run over the same rewritten pair explainForOfLen compares. Prints the pin's
+# signature name, as explainIrLagPin does.
+explainIrLagPinForOf() {
+  local o t u
+  o=$(irDropDeadLoads "$(irParamDedup "$1")")
+  u=$(irForOfUnhoist "$2") || u=$2
+  t=$(irDropDeadLoads "$(irParamDedup "${u}")")
+  [ "${t}" = "$2" ] && return 1
+  explainIrLagPin "${o}" "${t}"
 }

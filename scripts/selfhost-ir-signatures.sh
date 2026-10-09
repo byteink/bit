@@ -348,7 +348,11 @@
 # is `icmp_slt bool <cursor>, <that value's parameter>`, the value and the parameters it reaches (every
 # edge of the function, greatest fixpoint) used nowhere else. Those are deleted and `slice_len` of the
 # ranged slice goes back into the header; the trials of the other signatures then run on the result, so
-# a file that also needs the packing or the forwarded loads is named for this one. Anything else that
+# a file that also needs the packing, the rune call or the forwarded loads keeps that name and only a
+# file that needs nothing else is named for this one. The `iropt` arm, where the optimizer has already
+# turned the compare into a hoisted header parameter, also merges trivial and dead block parameters
+# (scripts/ir-signatures-forof.sh irDedupAwk) and drops header word loads nothing reads, on both
+# sides, and may move the hoisted `slice_len` back into the header (irLenToHeader). Anything else that
 # differs, in the loop or outside it, keeps the file unexplained. Files: see the run output.
 #
 # All six retire at the next stage0 repin (#6533).
@@ -361,7 +365,7 @@ explainMismatch() {
     types) explainLagTypes "$1" "$2" "${4:-}"; return ;;
     ir|iropt)
       explainIrLag "$1" "$2" "$3" && return 0
-      irLagPinned "$3" "${4:-}" && explainIrLagPin "$1" "$2"
+      irLagPinned "$3" "${4:-}" && { explainIrLagPin "$1" "$2" || explainIrLagPinForOf "$1" "$2"; }
       return ;;
   esac
   return 1
