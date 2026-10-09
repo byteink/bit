@@ -1,11 +1,11 @@
-# Drafts as JSON documents
+# Articles as JSON documents
 
 <!-- doctest: per-block -->
 
-Inkwell autosaves a draft every few seconds. The draft is a small document:
+Inkwell autosaves an article every few seconds. The article is a small document:
 a title, an author, tags, sections. Stored as one string, every autosave
 writes all of it, and bumping the view counter or adding a tag means reading
-the whole draft, changing it in your program and writing it back, while
+the whole article, changing it in your program and writing it back, while
 another request does the same and one of the two edits is lost.
 
 Redis can keep the document as JSON and edit it in place. `r.json(key)` is a
@@ -28,7 +28,7 @@ import { Json, JsonEntry } from "std/json"
   words: i64,
 }
 
-@json class Draft {
+@json class Article {
   id: string,
   title: string,
   author: Author,
@@ -41,8 +41,8 @@ import { Json, JsonEntry } from "std/json"
 
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
-  let draft = Draft{
-    id = "d41",
+  let article = Article{
+    id = "a41",
     title = "Why Inkwell is small",
     author = Author{ name = "Ana", handle = "ana" },
     tags = ["essay", "bit"],
@@ -55,19 +55,18 @@ fn main(): ()! {
     subtitle = Option.None,
   }
 
-  r.json("inkwell:draft:d41").set(draft.toJson())?
+  r.json("inkwell:article:a41").set(article)?
 
-  match (r.json("inkwell:draft:d41").get<Draft>()?) {
+  match (r.json("inkwell:article:a41").get<Article>()?) {
     Some(back) => println("${back.title} by ${back.author.name}") // Why Inkwell is small by Ana
-    None => println("no such draft")
+    None => println("no such article")
   }
   r.close()
   return
 }
 ```
 
-`set(value)` takes a `Json` tree, the value type of `std/json`, and a class
-marked `@json` makes one with its own `toJson()`. `get<T>()` reads the whole
+`set(value)` takes any class marked `@json`, and `get<T>()` reads the whole
 document back into a `T`, which must be a `@json` class: nested classes,
 arrays of classes, `Option` fields, enums and floats come back as `std/json`
 defines them. The `@json` mark needs `Json` and `JsonEntry` imported from
@@ -75,7 +74,7 @@ defines them. The `@json` mark needs `Json` and `JsonEntry` imported from
 
 `get<T>()` is `None` when the key does not exist. A document that does not
 fit `T` fails `RedisError.Unexpected`, and the message carries the decoder's
-own path to the field, so a draft saved by an older version of Inkwell tells
+own path to the field, so an article saved by an older version of Inkwell tells
 you which field it lacks:
 
 ```text
@@ -113,14 +112,14 @@ import { Json, JsonEntry, jsonEncode } from "std/json"
 
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
-  let draft = r.json("inkwell:draft:d41")
+  let article = r.json("inkwell:article:a41")
 
-  let sections = draft.getAt<Section>("$.sections[*]")?
+  let sections = article.getAt<Section>("$.sections[*]")?
   for s of sections {
     println("${s.heading}: ${s.words} words")
   }
 
-  let found = draft.getPaths("$.author.name", "$.tags[0]", "$.nothing")?
+  let found = article.getPaths("$.author.name", "$.tags[0]", "$.nothing")?
   for m of found {
     println("${m.path}: ${len(m.values)} match(es)")
   }
@@ -136,9 +135,14 @@ fn main(): ()! {
 whole document. It answers `true` when it wrote and `false` when it did not:
 the path's parent is missing, or `JsonSetOptions` said no. `nx = true` writes
 only where the path matches nothing, `xx = true` only where it matches
-something, which makes "create the draft if nobody has" and "update it only
+something, which makes "create the article if nobody has" and "update it only
 if it exists" one call each. A key that does not exist can only be created at
 the root; setting `$.title` on it is the server's error.
+
+The value is a `@json` class, or a `Json` value from `std/json` for a bare
+number, string or bool (`Json.JsonInt(3)`, `Json.JsonString("x")`,
+`Json.JsonBool(true)`). `merge`, `mset` and the array commands below take the
+same two kinds.
 
 `fpha` is the third option. Redis stores an array of numbers compactly when
 they are all floats, and `JsonFloatType` (`Auto`, `Fp16`, `Bf16`, `Fp32`,
@@ -155,22 +159,30 @@ the rest are `JsonTarget`s.
 import { open, JsonSetOptions, JsonTarget } from "redis"
 import { Json, JsonEntry, jsonParse } from "std/json"
 
+@json class Author {
+  name: string,
+  handle: string,
+}
+
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
-  let draft = r.json("inkwell:draft:d41")
+  let article = r.json("inkwell:article:a41")
+
+  // A class replaces just that part of the document.
+  article.set(Author{ name = "Ana Reis", handle = "ana" }, "$.author")?
 
   // Only the first writer wins.
-  let first = draft.set(Json.JsonString("Untitled"), "$.title", JsonSetOptions{ nx = true })?
+  let first = article.set(Json.JsonString("Untitled"), "$.title", JsonSetOptions{ nx = true })?
   println("${first}") // false, the title is already there
 
   // Update the subtitle, then change just that part of the document.
-  draft.set(Json.JsonString("A short history"), "$.subtitle")?
-  draft.merge(jsonParse("{\"published\": true, \"subtitle\": null}")?)?
+  article.set(Json.JsonString("A short history"), "$.subtitle")?
+  article.merge(jsonParse("{\"published\": true, \"subtitle\": null}")?)?
 
-  // The draft and its newsletter entry change together, or not at all.
-  draft.mset(
+  // The article and its newsletter entry change together, or not at all.
+  article.mset(
     Json.JsonFloat(4.8), "$.rating",
-    JsonTarget{ key = "inkwell:newsletter", path = "$.next", value = Json.JsonString("d41") },
+    JsonTarget{ key = "inkwell:newsletter", path = "$.next", value = Json.JsonString("a41") },
   )?
   r.close()
   return
@@ -191,23 +203,23 @@ import { open } from "redis"
 
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
-  let draft = r.json("inkwell:draft:d41")
+  let article = r.json("inkwell:article:a41")
 
   // Every section grows by 10 words: two matches, two numbers.
-  let words = draft.numIncrBy(10.0, "$.sections[*].words")?
+  let words = article.numIncrBy(10.0, "$.sections[*].words")?
   println("${unwrap(words[0])} ${unwrap(words[1])}") // 330 550
 
-  draft.numMultBy(0.5, "$.rating")?
+  article.numMultBy(0.5, "$.rating")?
 
-  draft.strAppend(" (revised)", "$.title")?
-  let sizes = draft.strLen("$.title")?
+  article.strAppend(" (revised)", "$.title")?
+  let sizes = article.strLen("$.title")?
   println("title is ${unwrap(sizes[0])} characters")
 
-  let now = draft.toggle("$.published")?
+  let now = article.toggle("$.published")?
   println("published: ${unwrap(now[0])}")
 
   // A string is not a number: the slot is None, nothing changes.
-  let wrong = draft.numIncrBy(1.0, "$.title")?
+  let wrong = article.numIncrBy(1.0, "$.title")?
   println("${isNone(wrong[0])}") // true
   r.close()
   return
@@ -230,23 +242,31 @@ start, stop)` keeps only that range.
 
 ```bit
 import { open } from "redis"
-import { Json } from "std/json"
+import { Json, JsonEntry } from "std/json"
+
+@json class Section {
+  heading: string,
+  words: i64,
+}
 
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
-  let draft = r.json("inkwell:draft:d41")
+  let article = r.json("inkwell:article:a41")
 
-  draft.arrAppend("$.tags", Json.JsonString("draft"), Json.JsonString("v2"))?
-  draft.arrInsert("$.tags", 0, Json.JsonString("featured"))?
-  println("${unwrap(draft.arrLen("$.tags")?[0])} tags") // 5
+  // A new section goes on the end as a class.
+  article.arrAppend("$.sections", Section{ heading = "Ship", words = 210 })?
 
-  let at = draft.arrIndex("$.tags", Json.JsonString("draft"))?
-  println("draft is tag number ${unwrap(at[0])}") // 3
+  article.arrAppend("$.tags", Json.JsonString("wip"), Json.JsonString("v2"))?
+  article.arrInsert("$.tags", 0, Json.JsonString("featured"))?
+  println("${unwrap(article.arrLen("$.tags")?[0])} tags") // 5
+
+  let at = article.arrIndex("$.tags", Json.JsonString("wip"))?
+  println("wip is tag number ${unwrap(at[0])}") // 3
 
   // Take the newest tag back off, then keep only the first three.
-  let popped = draft.arrPop("$.tags")?
+  let popped = article.arrPop("$.tags")?
   println("popped ${isSome(popped[0])}") // true
-  draft.arrTrim("$.tags", 0, 2)?
+  article.arrTrim("$.tags", 0, 2)?
   r.close()
   return
 }
@@ -268,19 +288,19 @@ import { open } from "redis"
 
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
-  let draft = r.json("inkwell:draft:d41")
+  let article = r.json("inkwell:article:a41")
 
   // One type per match: "object", then "string" for the second heading.
-  println(draft.typeOf("$.author")?[0])
-  println(draft.typeOf("$.sections[*].heading")?[1])
-  println("${unwrap(draft.objLen("$.author")?[0])} members") // 2
-  for name of unwrap(draft.objKeys("$.author")?[0]) {
+  println(article.typeOf("$.author")?[0])
+  println(article.typeOf("$.sections[*].heading")?[1])
+  println("${unwrap(article.objLen("$.author")?[0])} members") // 2
+  for name of unwrap(article.objKeys("$.author")?[0]) {
     println(name) // name, handle
   }
 
-  let cleared = draft.clear("$.sections[*].words")?
+  let cleared = article.clear("$.sections[*].words")?
   println("${cleared} numbers zeroed") // 2
-  let removed = draft.del("$.subtitle")?
+  let removed = article.del("$.subtitle")?
   println("${removed} removed")
   r.close()
   return
@@ -293,13 +313,13 @@ answer an empty list and `0`, and `get` answers `None`. A JSON command on a
 key that holds a string, or a string command on a JSON key, fails with the
 server's wrong-type message.
 
-## Several drafts at once
+## Several articles at once
 
 `mget<T>(others, path)` reads the same path from this key and from `others` in
 one round trip. It answers a slot per key, this key first, holding the first
 match of the path decoded as a `T`, or `None` for a key that does not exist or
 a path that matches nothing. That is the front page: the title and author of
-twenty drafts in one call.
+twenty articles in one call.
 
 ```bit
 import { open } from "redis"
@@ -312,9 +332,9 @@ import { Json, JsonEntry } from "std/json"
 
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
-  let first = r.json("inkwell:draft:d41")
+  let first = r.json("inkwell:article:a41")
 
-  let authors = first.mget<Author>(["inkwell:draft:d42", "inkwell:draft:gone"], "$.author")?
+  let authors = first.mget<Author>(["inkwell:article:a42", "inkwell:article:gone"], "$.author")?
   for slot of authors {
     match (slot) {
       Some(a) => println(a.name)
@@ -340,17 +360,17 @@ fn main(): ()! {
   let r = open("redis://localhost:6379")?
 
   // Publish: flip the flag and count the view, atomically.
-  let views = r.transaction<Future<[]Option<f64>>>(["inkwell:draft:d41"], (tx) => {
-    let q: JsonBatch = tx.json("inkwell:draft:d41")
+  let views = r.transaction<Future<[]Option<f64>>>(["inkwell:article:a41"], (tx) => {
+    let q: JsonBatch = tx.json("inkwell:article:a41")
     q.set(Json.JsonBool(true), "$.published")
     return q.numIncrBy(1.0, "$.views")
   })?
   println("${unwrap(views.get()?[0])} views")
 
-  // Two drafts' types in one round trip.
+  // Two articles' types in one round trip.
   let p = r.pipeline()
-  let a = p.json("inkwell:draft:d41").typeOf()
-  let b = p.json("inkwell:draft:d42").typeOf()
+  let a = p.json("inkwell:article:a41").typeOf()
+  let b = p.json("inkwell:article:a42").typeOf()
   p.exec()?
   println(a.get()?[0]) // object
   println(b.get()?[0]) // object
@@ -361,11 +381,11 @@ fn main(): ()! {
 
 ## When not to use it
 
-If you only ever write the whole draft and read the whole draft back, a plain
+If you only ever write the whole article and read the whole article back, a plain
 string with `r.set` is smaller and faster; the document store earns its place
 when you edit or read part of a value. If the parts are flat fields, a hash
-([Hashes](hashes.md)) is simpler still. If you need to query drafts by what is
+([Hashes](hashes.md)) is simpler still. If you need to query articles by what is
 inside them, that is a search index, not a key.
 
-Next: [Sorted sets](sorted-sets.md) for ranking the drafts, or
+Next: [Sorted sets](sorted-sets.md) for ranking the articles, or
 [Strings and keys](strings-and-keys.md) for expiring them.
