@@ -1,0 +1,411 @@
+// pkg/redis/json.test.bit - `json.bit`'s wire arguments and reply decoding,
+// tested without a server. `assertArgs` is `list.test.bit`'s (same module).
+// `json.live.test.bit` runs every command against a real server. The decoders
+// are checked on the RESP3 shape the live server sends AND the RESP2 shape a
+// RESP2-only server would, which no live test can reach (#6027).
+
+@json class InkDraft {
+  title: string,
+  words: i64,
+}
+
+@json class InkAddress {
+  city: string,
+  country: string,
+}
+
+@json class InkAuthor {
+  id: string,
+  name: string,
+  address: InkAddress,
+  tags: []string,
+  drafts: []InkDraft,
+  rating: f64,
+  verified: bool,
+  nickname: Option<string>,
+}
+
+fn inkAuthor(): InkAuthor {
+  return InkAuthor{
+    id = "a1",
+    name = "Ana",
+    address = InkAddress{ city = "Lisbon", country = "PT" },
+    tags = ["essays", "bit"],
+    drafts = [InkDraft{ title = "One", words = 900 }, InkDraft{ title = "Two", words = 120 }],
+    rating = 4.5,
+    verified = true,
+    nickname = Option.Some("ana"),
+  }
+}
+
+fn jbulk(s: string): Reply {
+  return Reply.Bulk(Option.Some(s))
+}
+
+fn jarr(items: []Reply): Reply {
+  return Reply.Array(Option.Some(items))
+}
+
+test "JSON.SET lays out key, path, value, then NX, XX and FPHA" {
+  let v = JsonValue.JsonInt(5)
+  assertArgs(jsonSetCmd("k", "$", v, JsonSetOptions{}).args, ["JSON.SET", "k", "$", "5"])
+  assertArgs(
+    jsonSetCmd("k", "$.n", v, JsonSetOptions{ nx = true }).args,
+    ["JSON.SET", "k", "$.n", "5", "NX"],
+  )
+  assertArgs(
+    jsonSetCmd("k", "$.n", v, JsonSetOptions{ xx = true }).args,
+    ["JSON.SET", "k", "$.n", "5", "XX"],
+  )
+  assertArgs(
+    jsonSetCmd("k", "$", v, JsonSetOptions{ fpha = JsonFloatType.Bf16 }).args,
+    ["JSON.SET", "k", "$", "5", "FPHA", "BF16"],
+  )
+  assert(!jsonSetCmd("k", "$", v, JsonSetOptions{}).readOnly, "SET writes")
+}
+
+test "JSON.SET answers true for OK and false for a null reply" {
+  let cmd = jsonSetCmd("k", "$", JsonValue.JsonNull, JsonSetOptions{})
+  let ok = cmd.decode(Reply.Simple("OK")) catch e {
+    panic("ok: ${e.message()}")
+  }
+  assert(ok, "OK is true")
+  let no = cmd.decode(Reply.Null) catch e {
+    panic("null: ${e.message()}")
+  }
+  assert(!no, "null is false")
+  let bad = false
+  cmd.decode(Reply.Int(1)) catch _ {
+    bad = true
+  }
+  assert(bad, "an integer is not a SET reply")
+}
+
+test "a class encodes through toJson into the SET argument" {
+  let a = inkAuthor()
+  let args = jsonSetCmd("k", "$", a.toJson(), JsonSetOptions{}).args
+  assert(args[3] == jsonEncode(a.toJson()), "value argument is the class's own JSON")
+  assert(contains(args[3], "\"city\":\"Lisbon\""), "nested class is inside: ${args[3]}")
+}
+
+test "JSON.MSET repeats key, path, value for the handle and every target" {
+  let first = JsonTarget{ key = "a", path = "$", value = JsonValue.JsonInt(1) }
+  let second = JsonTarget{ key = "b", path = "$.x", value = JsonValue.JsonString("s") }
+  assertArgs(
+    jsonMsetCmd(first, [second]).args,
+    ["JSON.MSET", "a", "$", "1", "b", "$.x", "\"s\""],
+  )
+  assertArgs(jsonMsetCmd(first, []JsonTarget(0)).args, ["JSON.MSET", "a", "$", "1"])
+}
+
+test "JSON.MERGE, JSON.DEL and JSON.CLEAR take key then path" {
+  assertArgs(
+    jsonMergeCmd("k", "$", JsonValue.JsonNull).args,
+    ["JSON.MERGE", "k", "$", "null"],
+  )
+  assertArgs(jsonCountCmd("JSON.DEL", "k", "$.a").args, ["JSON.DEL", "k", "$.a"])
+  assertArgs(jsonCountCmd("JSON.CLEAR", "k", "$").args, ["JSON.CLEAR", "k", "$"])
+  let n = jsonCountCmd("JSON.DEL", "k", "$").decode(Reply.Int(2)) catch e {
+    panic("del: ${e.message()}")
+  }
+  assert(n == 2, "count = ${n}")
+}
+
+test "JSON.GET argv: the root, one path, several paths; MGET puts the path last" {
+  assertArgs(jsonGetCmd<InkAuthor>("k").args, ["JSON.GET", "k", "$"])
+  assertArgs(jsonGetAtCmd<InkDraft>("k", "$.drafts[*]").args, ["JSON.GET", "k", "$.drafts[*]"])
+  assertArgs(jsonGetPathsCmd("k", ["$.a", "$.b"]).args, ["JSON.GET", "k", "$.a", "$.b"])
+  assertArgs(jsonMgetCmd<InkAuthor>(["a", "b"], "$").args, ["JSON.MGET", "a", "b", "$"])
+  assert(jsonGetCmd<InkAuthor>("k").readOnly, "GET is a read")
+}
+
+test "get decodes a nested class out of the one-element match array" {
+  let a = inkAuthor()
+  let reply = jbulk("[" + jsonEncode(a.toJson()) + "]")
+  let got = jsonGetCmd<InkAuthor>("k").decode(reply) catch e {
+    panic("get: ${e.message()}")
+  }
+  match (got) {
+    Some(back) => {
+      assert(back.name == "Ana" && back.address.city == "Lisbon", "fields: ${back.name}")
+      assert(len(back.drafts) == 2 && back.drafts[1].words == 120, "array of classes")
+      assert(back.tags[1] == "bit" && back.verified && back.rating == 4.5, "scalars and arrays")
+      assert(unwrapOr(back.nickname, "") == "ana", "Option field")
+    }
+    None => panic("expected the document")
+  }
+}
+
+test "get is None for a missing key and for a path with no match" {
+  let cmd = jsonGetCmd<InkAuthor>("k")
+  let missing = cmd.decode(Reply.Null) catch e {
+    panic("null: ${e.message()}")
+  }
+  assert(isNone(missing), "a null reply is None")
+  let empty = cmd.decode(jbulk("[]")) catch e {
+    panic("empty: ${e.message()}")
+  }
+  assert(isNone(empty), "no match is None")
+}
+
+test "get names the field when the document does not fit the class" {
+  let failed = false
+  let _ = jsonGetCmd<InkAuthor>("k").decode(jbulk("[{\"id\":\"a1\"}]")) catch e {
+    failed = true
+    assert(contains(e.message(), "cannot decode"), "message: ${e.message()}")
+    Option.None
+  }
+  assert(failed, "a document missing fields fails")
+  let legacy = false
+  let _ = jsonGetCmd<InkAuthor>("k").decode(jbulk("{\"id\":\"a1\"}")) catch e {
+    legacy = true
+    assert(contains(e.message(), "legacy path"), "message: ${e.message()}")
+    Option.None
+  }
+  assert(legacy, "a single value is not a JSONPath answer")
+}
+
+test "getAt decodes every match, in order" {
+  let reply = jbulk("[{\"title\":\"One\",\"words\":9},{\"title\":\"Two\",\"words\":3}]")
+  let got = jsonGetAtCmd<InkDraft>("k", "$.drafts[*]").decode(reply) catch e {
+    panic("getAt: ${e.message()}")
+  }
+  assert(len(got) == 2 && got[0].title == "One" && got[1].words == 3, "matches")
+  let none = jsonGetAtCmd<InkDraft>("k", "$.x").decode(Reply.Null) catch e {
+    panic("missing: ${e.message()}")
+  }
+  assert(len(none) == 0, "a missing key has no matches")
+}
+
+test "getPaths reads the object keyed by path in the order asked" {
+  let reply = jbulk("{\"$.b\":[2],\"$.a\":[1,3]}")
+  let got = jsonGetPathsCmd("k", ["$.a", "$.b", "$.c"]).decode(reply) catch e {
+    panic("paths: ${e.message()}")
+  }
+  assert(len(got) == 3, "one entry per path asked")
+  assert(got[0].path == "$.a" && len(got[0].values) == 2, "first path has two values")
+  assert(got[1].path == "$.b" && len(got[1].values) == 1, "second path has one value")
+  assert(len(got[2].values) == 0, "a path with no entry has no values")
+  let one = jsonGetPathsCmd("k", ["$.a"]).decode(jbulk("[1,3]")) catch e {
+    panic("one path: ${e.message()}")
+  }
+  assert(len(one) == 1 && len(one[0].values) == 2, "a single path answers its own array")
+}
+
+test "mget keeps a slot per key: the first match, None where there is none" {
+  let reply = jarr([jbulk("[{\"title\":\"One\",\"words\":9}]"), Reply.Null, jbulk("[]")])
+  let got = jsonMgetCmd<InkDraft>(["a", "b", "c"], "$").decode(reply) catch e {
+    panic("mget: ${e.message()}")
+  }
+  assert(len(got) == 3, "three slots")
+  assert(unwrapOr(inkTitle(got[0]), "") == "One", "first key")
+  assert(isNone(got[1]) && isNone(got[2]), "missing key and empty match are None")
+}
+
+fn inkTitle(d: Option<InkDraft>): Option<string> {
+  match (d) {
+    Some(x) => return Option.Some(x.title)
+    None => return Option.None
+  }
+}
+
+test "per-match integer answers keep a null as None" {
+  let reply = jarr([Reply.Int(3), Reply.Null, Reply.Int(-1)])
+  let got = jsonLenCmd("JSON.ARRLEN", "k", "$..a").decode(reply) catch e {
+    panic("arrlen: ${e.message()}")
+  }
+  assert(len(got) == 3, "three matches")
+  assert(unwrapOr(got[0], 0) == 3 && isNone(got[1]) && unwrapOr(got[2], 0) == -1, "values")
+  let empty = jsonLenCmd("JSON.OBJLEN", "k", "$.x").decode(jarr([])) catch e {
+    panic("empty: ${e.message()}")
+  }
+  assert(len(empty) == 0, "no match is an empty answer")
+}
+
+test "TYPE reads RESP3's wrapped list, RESP2's flat one, and a missing key" {
+  let cmd = jsonTypeCmd("k", "$..a")
+  let resp3 = cmd.decode(jarr([jarr([jbulk("array"), jbulk("string")])])) catch e {
+    panic("resp3: ${e.message()}")
+  }
+  assert(len(resp3) == 2 && resp3[0] == "array" && resp3[1] == "string", "wrapped")
+  let resp2 = cmd.decode(jarr([jbulk("object")])) catch e {
+    panic("resp2: ${e.message()}")
+  }
+  assert(len(resp2) == 1 && resp2[0] == "object", "flat")
+  let missing = cmd.decode(jarr([Reply.Null])) catch e {
+    panic("missing: ${e.message()}")
+  }
+  assert(len(missing) == 0, "[nil] is no types")
+  let nomatch = cmd.decode(jarr([jarr([])])) catch e {
+    panic("nomatch: ${e.message()}")
+  }
+  assert(len(nomatch) == 0, "an empty wrap is no types")
+}
+
+test "NUMINCRBY and NUMMULTBY send the number and read RESP3 and RESP2 answers" {
+  assertArgs(
+    jsonNumCmd("JSON.NUMINCRBY", "k", "$.n", 2.5).args,
+    ["JSON.NUMINCRBY", "k", "$.n", "2.5"],
+  )
+  let cmd = jsonNumCmd("JSON.NUMMULTBY", "k", "$..n", 2.0)
+  let resp3 = cmd.decode(jarr([Reply.Int(32), Reply.Null, Reply.Double(1.5)])) catch e {
+    panic("resp3: ${e.message()}")
+  }
+  assert(len(resp3) == 3, "three matches")
+  assert(
+    unwrapOr(resp3[0], 0.0) == 32.0 && isNone(resp3[1]) && unwrapOr(resp3[2], 0.0) == 1.5,
+    "resp3",
+  )
+  let resp2 = cmd.decode(jbulk("[32,null,1.5]")) catch e {
+    panic("resp2: ${e.message()}")
+  }
+  assert(len(resp2) == 3, "three matches")
+  assert(
+    unwrapOr(resp2[0], 0.0) == 32.0 && isNone(resp2[1]) && unwrapOr(resp2[2], 0.0) == 1.5,
+    "resp2",
+  )
+  let none = cmd.decode(jarr([])) catch e {
+    panic("none: ${e.message()}")
+  }
+  assert(len(none) == 0, "no match")
+}
+
+test "STRAPPEND sends a JSON string; the array commands send each value encoded" {
+  assertArgs(
+    jsonStrAppendCmd("k", "$.s", "a\"b").args,
+    ["JSON.STRAPPEND", "k", "$.s", "\"a\\\"b\""],
+  )
+  let vals = [JsonValue.JsonInt(1), JsonValue.JsonString("x")]
+  assertArgs(
+    jsonArrAppendCmd("k", "$.t", vals).args,
+    ["JSON.ARRAPPEND", "k", "$.t", "1", "\"x\""],
+  )
+  assertArgs(
+    jsonArrInsertCmd("k", "$.t", -1, vals).args,
+    ["JSON.ARRINSERT", "k", "$.t", "-1", "1", "\"x\""],
+  )
+  assertArgs(
+    jsonArrTrimCmd("k", "$.t", 1, -2).args,
+    ["JSON.ARRTRIM", "k", "$.t", "1", "-2"],
+  )
+}
+
+test "ARRINDEX sends the range only when one is asked for, ARRPOP always its index" {
+  let v = JsonValue.JsonString("x")
+  assertArgs(jsonArrIndexCmd("k", "$.t", v, 0, 0).args, ["JSON.ARRINDEX", "k", "$.t", "\"x\""])
+  assertArgs(
+    jsonArrIndexCmd("k", "$.t", v, 2, 0).args,
+    ["JSON.ARRINDEX", "k", "$.t", "\"x\"", "2", "0"],
+  )
+  assertArgs(
+    jsonArrIndexCmd("k", "$.t", v, 0, 4).args,
+    ["JSON.ARRINDEX", "k", "$.t", "\"x\"", "0", "4"],
+  )
+  assertArgs(jsonArrPopCmd("k", "$.t", -1).args, ["JSON.ARRPOP", "k", "$.t", "-1"])
+}
+
+test "ARRPOP parses each popped element and keeps a null as None" {
+  let reply = jarr([jbulk("{\"title\":\"T\",\"words\":1}"), Reply.Null, jbulk("7")])
+  let got = jsonArrPopCmd("k", "$..t", -1).decode(reply) catch e {
+    panic("arrpop: ${e.message()}")
+  }
+  assert(len(got) == 3, "three arrays")
+  assert(isNone(got[1]), "an empty array pops nothing")
+  match (got[2]) {
+    Some(v) => assert(jsonEncode(v) == "7", "a number pops as a number")
+    None => panic("expected 7")
+  }
+  match (got[0]) {
+    Some(v) => assert(jsonEncode(v) == "{\"title\":\"T\",\"words\":1}", "an object pops whole")
+    None => panic("expected an object")
+  }
+}
+
+test "OBJKEYS lists names per object and TOGGLE reads integers and booleans" {
+  let keys = jsonObjKeysCmd("k", "$..o").decode(jarr([jarr([jbulk("a"), jbulk("b")]), Reply.Null])) catch e {
+    panic("objkeys: ${e.message()}")
+  }
+  assert(len(keys) == 2 && isNone(keys[1]), "a non-object is None")
+  assert(len(unwrapOr(keys[0], []string(0))) == 2, "two names")
+  let flips = jsonToggleCmd("k", "$..ok").decode(jarr([Reply.Int(0), Reply.Bool(true), Reply.Null])) catch e {
+    panic("toggle: ${e.message()}")
+  }
+  assert(len(flips) == 3, "three matches")
+  assert(!unwrapOr(flips[0], true) && unwrapOr(flips[1], false) && isNone(flips[2]), "values")
+}
+
+test "a reply of the wrong shape fails Unexpected naming the command" {
+  let bad = false
+  let _ = jsonLenCmd("JSON.STRLEN", "k", "$").decode(Reply.Int(4)) catch e {
+    bad = true
+    assert(contains(e.message(), "JSON.STRLEN"), "message: ${e.message()}")
+    []Option<i64>(0)
+  }
+  assert(bad, "a legacy-path integer is not a list")
+}
+
+test "numIncrBy refuses a number the server cannot parse before sending" {
+  let nan = 0.0 / 0.0
+  let bad = false
+  checkNumber(nan) catch _ {
+    bad = true
+  }
+  assert(bad, "NaN is refused")
+  checkNumber(1.5) catch e {
+    panic("a finite number: ${e.message()}")
+  }
+}
+
+test "JsonBatch queues the commands with Json's argv" {
+  let batch = Batch()
+  let j = JsonBatch{ batch = batch, key = "k" }
+  let _ = j.set(JsonValue.JsonBool(true), "$.ok")
+  let _ = j.get<InkAuthor>()
+  let _ = j.arrAppend("$.t", JsonValue.JsonInt(1))
+  let _ = j.mset(
+    JsonValue.JsonInt(2),
+    "$.n",
+    JsonTarget{ key = "z", path = "$", value = JsonValue.JsonNull },
+  )
+  let _ = j.mget<InkAuthor>(["z"])
+  let _ = j.toggle("$.ok")
+  assert(len(batch.queued) == 6, "queued ${len(batch.queued)} commands")
+  assertArgs(batch.queued[0], ["JSON.SET", "k", "$.ok", "true"])
+  assertArgs(batch.queued[1], ["JSON.GET", "k", "$"])
+  assertArgs(batch.queued[2], ["JSON.ARRAPPEND", "k", "$.t", "1"])
+  assertArgs(batch.queued[3], ["JSON.MSET", "k", "$.n", "2", "z", "$", "null"])
+  assertArgs(batch.queued[4], ["JSON.MGET", "k", "z", "$"])
+  assertArgs(batch.queued[5], ["JSON.TOGGLE", "k", "$.ok"])
+}
+
+test "set, merge, mset and the array commands take a class and a Json value alike" {
+  let batch = Batch()
+  let j = JsonBatch{ batch = batch, key = "k" }
+  let a = inkAuthor()
+  let one = InkDraft{ title = "One", words = 1 }
+  let two = InkDraft{ title = "Two", words = 2 }
+  let _ = j.set(a)
+  let _ = j.set(JsonValue.JsonInt(7), "$.n")
+  let _ = j.merge(a.address, "$.address")
+  let _ = j.arrAppend("$.drafts", one, two)
+  let _ = j.arrInsert("$.drafts", 0, one)
+  let _ = j.arrIndex("$.drafts", two)
+  let _ = j.mset(
+    a.address,
+    "$.address",
+    JsonTarget{ key = "z", path = "$", value = JsonValue.JsonNull },
+  )
+  assert(len(batch.queued) == 7, "queued ${len(batch.queued)} commands")
+  assertArgs(batch.queued[0], ["JSON.SET", "k", "$", jsonEncode(a.toJson())])
+  assertArgs(batch.queued[1], ["JSON.SET", "k", "$.n", "7"])
+  assertArgs(batch.queued[2], ["JSON.MERGE", "k", "$.address", jsonEncode(a.address.toJson())])
+  let d1 = jsonEncode(one.toJson())
+  let d2 = jsonEncode(two.toJson())
+  assertArgs(batch.queued[3], ["JSON.ARRAPPEND", "k", "$.drafts", d1, d2])
+  assertArgs(batch.queued[4], ["JSON.ARRINSERT", "k", "$.drafts", "0", d1])
+  assertArgs(batch.queued[5], ["JSON.ARRINDEX", "k", "$.drafts", d2])
+  assertArgs(
+    batch.queued[6],
+    ["JSON.MSET", "k", "$.address", jsonEncode(a.address.toJson()), "z", "$", "null"],
+  )
+}
