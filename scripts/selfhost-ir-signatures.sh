@@ -318,7 +318,19 @@
 # convert under _tests_/cases/, examples/strslice and examples/syncmutex, and stdlib/{hash/xxhash64,
 # time/extend,http2/hpack,json/lex,decimal/decimal,crypto/sha512,crypto/field25519}.
 #
-# All four retire at the next stage0 repin (#6533).
+# 6681-multi-assign-oracle-omits-function (`ir`, `iropt`). #6681 (e2852f5d0) lowers a multi-target
+# assignment with index and field targets (`a[i], a[j] = a[j], a[i]`). The pinned stage0 refuses it with
+# E0092 ("cannot lower a multi-target assignment this lowerer does not yet handle"), but only
+# `bit build` reports that: `check` and `--dump-diags` are silent and exit 0, and `--dump-ir` /
+# `--dump-ir-pre` print the rest of the file, exit 0 and write nothing to stderr, so the function holding
+# the assignment is simply absent while its callers still call it. The same shape as the retired
+# 7387-self-result-oracle-omits-function (5e92190a7). Identity: every tree function the oracle dump lacks
+# and still calls is removed from the tree dump, there is at least one, and the two dumps are then
+# byte-equal (explainOmittedFunctions, scripts/ir-signatures-walk.sh). A function both emitted that
+# differs, or a tree function the oracle never calls, keeps the file unexplained. 1 corpus file, on both
+# arms: _tests_/cases/run_tuple_assign_targets.bit (swaps, order).
+#
+# All five retire at the next stage0 repin (#6533).
 #
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
@@ -367,7 +379,7 @@ irLagPinFiles() { irLagPins | awk -F'|' -v k="$1" '$1 == k { print $2 }'; }
 # scripts/ir-signatures-walk.sh.
 declaredSignatureNames() {
   local types="7558-synth-json-alias-column-shift"
-  local ir="7562-packed-halfword-slices 7574-packed-narrow-slices 7637-string-from-rune-range"
+  local ir="7562-packed-halfword-slices 7574-packed-narrow-slices 7637-string-from-rune-range 6681-multi-assign-oracle-omits-function"
   local lag="7574-f32-store-schedule-lag 7674-forwarded-index-get"
   case "${1:-}" in
     types) printf '%s\n' $types ;;
