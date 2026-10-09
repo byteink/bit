@@ -70,6 +70,17 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   expect "7564-synth-table-alias-column-shift" "$(explainMismatch "$tt_o" "$tt_b" types)" "types: table column shift"
   expect "" "$(explainMismatch "$tt_o" "${tt_b/__row: Author/__row: Post}" types)" "types: table row type changed"
   expect "" "$(explainMismatch "$tt_o" "${tt_b/215:3:/215:4:}" types)" "types: table column moved on a line that is not synthesized"
+  # A row past the source file's end is synthesized text: its column may move either way.
+  eoff=$(mktemp "${TMPDIR:-/tmp}/sigeof.XXXXXX"); printf '1\n2\n3\n' > "$eoff"
+  pe_o='2:5: x: i64
+5:11: cols: []string'
+  pe_b='2:5: x: i64
+5:6: cols: []string'
+  expect "7564-synth-table-alias-column-shift" "$(explainMismatch "$pe_o" "$pe_b" types "$eoff")" "types: column moved left past EOF"
+  expect "" "$(explainMismatch "$pe_o" "$pe_b" types)" "types: past-EOF move without the file"
+  expect "" "$(explainMismatch "$pe_o" "${pe_b/cols: []string/cols: []int}" types "$eoff")" "types: past-EOF type changed"
+  expect "" "$(explainMismatch "$pe_o" "${pe_b/2:5:/2:4:}" types "$eoff")" "types: in-file column moved left"
+  rm -f "$eoff"
   expect "" "$(explainMismatch "$ty_o" "${ty_b/30:218:/31:218:}" types)" "types: a line number changed"
   expect "" "$(explainMismatch "$ty_o" "${ty_b/30:319:/30:300:}" types)" "types: a row after the shift did not move"
   expect "" "$(explainMismatch "$ty_o" "$(printf '%s\n' "$ty_b" | sed 1d)" types)" "types: a row is missing"
