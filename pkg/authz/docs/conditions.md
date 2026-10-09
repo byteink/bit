@@ -611,8 +611,13 @@ column of the resource and `user.<name>` the asking user's attribute, the
 | `true`, `false` | an always-true or always-false condition |
 
 Precedence is CEL's: `||` binds loosest, then `&&`, then the comparisons,
-then `!`. A string takes either quote and the escapes `\n \t \\ \' \"` and
-`\uXXXX`; a `//` comment runs to the end of the line. The text is bounded like
+then `!`. A string takes either quote, or three of them to span lines, and an
+`r` prefix keeps its backslashes as written. Every CEL escape reads:
+`\a \b \f \n \r \t \v \\ \? \' \"` and ``\` ``, plus `\xHH`, `\uHHHH`,
+`\UHHHHHHHH` and octal `\ooo`. A surrogate or a value above U+10FFFF is
+refused at its byte. A bytes literal (`b'...'`) lexes, but a condition has no
+bytes value, so it is refused. After a `-`, `9223372036854775808` is the int64
+minimum. A `//` comment runs to the end of the line. The text is bounded like
 JSON: 4096 bytes, 512 tokens and parentheses or `!` nested at most 32 deep.
 
 A condition is refused at save time, never quietly, when it uses CEL that has
