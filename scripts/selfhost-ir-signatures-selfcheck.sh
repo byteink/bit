@@ -60,6 +60,16 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   expect "" "$(explainMismatch "$ty_o" "${ty_b/__json_a4/__json_a5}" types)" "types: a name changed"
   expect "" "$(explainMismatch "$ty_o" "${ty_b/31:5:/31:6:}" types)" "types: a column moved on a line that is not synthesized"
   expect "" "$(explainMismatch "$ty_o" "${ty_b/30:218:/30:150:}" types)" "types: a column moved left"
+  # 7564-synth-table-alias-column-shift: the same rule on an @table synthesized line.
+  tt_o='214:284: cols: []string
+214:307: __row: Author
+215:3: y: i64'
+  tt_b='214:321: cols: []string
+214:344: __row: Author
+215:3: y: i64'
+  expect "7564-synth-table-alias-column-shift" "$(explainMismatch "$tt_o" "$tt_b" types)" "types: table column shift"
+  expect "" "$(explainMismatch "$tt_o" "${tt_b/__row: Author/__row: Post}" types)" "types: table row type changed"
+  expect "" "$(explainMismatch "$tt_o" "${tt_b/215:3:/215:4:}" types)" "types: table column moved on a line that is not synthesized"
   expect "" "$(explainMismatch "$ty_o" "${ty_b/30:218:/31:218:}" types)" "types: a line number changed"
   expect "" "$(explainMismatch "$ty_o" "${ty_b/30:319:/30:300:}" types)" "types: a row after the shift did not move"
   expect "" "$(explainMismatch "$ty_o" "$(printf '%s\n' "$ty_b" | sed 1d)" types)" "types: a row is missing"

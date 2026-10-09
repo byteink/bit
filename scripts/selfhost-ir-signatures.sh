@@ -264,6 +264,12 @@
 # _tests_/imports/ (the rows `cols` and `__row` of run_table_persisted_flag.bit move because they
 # sit on the same synthesized line, after the insertion).
 #
+# 7564-synth-table-alias-column-shift (`types`). #7564 part 1 (d845bc5c5) binds every name an
+# @table class's synthesized code imports (`Rows`, `Value`, `FieldDesc`, ...) under a reserved `__`
+# alias, the same lengthening #7558 did for @json, so the same column-only rule applies on a source
+# line that carries the synthesized `__row` local. 15 corpus files (the @table/relation cases).
+# A file whose moved rows sit on a `__json_` line reads as 7558.
+#
 # 7562-packed-halfword-slices (`ir`, `iropt`). #7562 (05bb7c255, a64ce6f04) packs []i16/[]u16 at
 # 2 bytes per element: the elem_size constant of slice_new/slice_append/slice_get is 2 instead of
 # 8, an element read is `index_get buf[i]` instead of `field_get (buf + (i << 3))[0]`, a store
@@ -378,7 +384,7 @@ irLagPinFiles() { irLagPins | awk -F'|' -v k="$1" '$1 == k { print $2 }'; }
 # the list matches the `print "..."` statements in this file and in
 # scripts/ir-signatures-walk.sh.
 declaredSignatureNames() {
-  local types="7558-synth-json-alias-column-shift"
+  local types="7558-synth-json-alias-column-shift 7564-synth-table-alias-column-shift"
   local ir="7562-packed-halfword-slices 7574-packed-narrow-slices 7637-string-from-rune-range 6681-multi-assign-oracle-omits-function"
   local lag="7574-f32-store-schedule-lag 7674-forwarded-index-get"
   case "${1:-}" in
