@@ -4325,6 +4325,18 @@ type it is applied to, so no single spelling has two readings.
 | class or interface declaring `next(): Option<T>!` | the `T` of each `Some`, until `None`; written `for x of it?` | **rejected** |
 | anything else  | **rejected**                             | **rejected**                      |
 
+**The bound of a slice or array loop is read once.** `for x of xs`,
+`for i in xs` and `for (i, x) in xs` over a `[]T` or `[N]T` evaluate `xs` and
+read its length a single time, before the first iteration, and run exactly
+that many times, as Go's `range` does ("The range expression x is evaluated
+once before beginning the loop", go.dev/ref/spec#For_range). The elements are
+not snapshotted: each iteration reads `xs[i]` live, so a store to a later
+element made by the body is seen. Because `append` may extend `dst` in place
+and share its header with every alias (§5.3), a body that appends to the
+ranged slice through an alias does not lengthen the loop: the appended
+elements are not visited, and the loop terminates after the original length.
+A map is out of this rule: its cursor is a slot position, not a count.
+
 **Iterators.** A class or interface opts into `for_of` structurally, by
 declaring a zero-parameter `next()` whose result is `Option<T>` for a single
 `T` (no `use` required). The loop calls `next()` before every iteration,

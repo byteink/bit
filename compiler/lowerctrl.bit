@@ -45,50 +45,44 @@ class ForOfSliceElem {
 // int-register guard on the index is satisfied by construction here rather
 // than needing to be re-asked.
 //
-// THE BOUNDS CHECK IS GONE (#4354), and the proof is a property of THIS
-// lowering rather than of the runtime. #4347 kept it and recorded the reason:
-// it looked removable only under a monotonic-`len` invariant that no gate
-// pinned, in a body that may `append` to the very slice it is iterating.
+// THE BOUNDS CHECK IS GONE (#4354, argued again by #7737). `len(xs)` is read ONCE, before the first
+// iteration (SPEC §13.1, `declareRangeBound`), so the header tests `idx < $len` against that value and
+// does not re-read the header's own `len`. #4347 kept the check because dropping it needed a
+// monotonic-`len` invariant that no gate pinned; with the bound fixed the unchecked load rests on that
+// invariant outright, and `_tests_/bit/slclenwrites.bit` (`./make test-slclen-writesites`) now pins it.
 //
-// That obligation turned out to be the wrong one, because there is no window
-// for `len` to move in at all. Four facts, each fixed by the code a few lines
-// below rather than by a runtime convention:
+//   1. `iterCur` and `idxVal` ARE the header block's own params. `$iter` is a hidden local the body
+//      cannot name, and only the map arm ever rewrites that env slot - so the header this load reads
+//      is the SAME SSA value `$len` was read from before the loop. Rebinding `xs` in the body (a
+//      reslice, an assignment) makes a different header; it cannot change this one.
+//   2. The header's terminator is `br icmp_slt(idxVal, $len)` and `bodyBlk` is its TRUE target,
+//      entered from nowhere else (the body block takes no params - `br.thenArgs` is empty - because
+//      it reads the header's values directly).
+//   3. `idxVal` is never negative: the preheader edge passes `const 0` and the only other edge into
+//      the header is the step block's `idx + 1`. So the header's SIGNED test implies the UNSIGNED one
+//      `emitBoundsCheck` would have emitted.
+//   4. THE INVARIANT: no in-place write to a slice header's `len` word ever LOWERS it. The writes are
+//      the appends, which store `vlen + 1` or `vlen + n` (n > 0) into the header they grow, the inlined
+//      append's `len + 1`, and the stores into a header that was just allocated (`rtSliceNew`,
+//      `rtSliceSlice`, the `_fresh` clones); a reslice allocates a new header. So `$len`, read from this
+//      header at loop start, never exceeds the header's `len` later, and `idx < $len` puts the element
+//      inside the buffer however many appends the body makes. `buf` and `off` are read from the header
+//      at each iteration, not carried, so an append that reallocated is seen. Appended elements are
+//      not visited: the loop runs the original length.
 //
-//   1. `iterCur` and `idxVal` ARE the header block's own params, read at the
-//      top of the header. `$iter` is a hidden local the body cannot name, and
-//      only the map arm ever rewrites that env slot — so the base the header
-//      measured and the base this addresses are the SAME SSA value, not two
-//      reads that happen to agree.
-//   2. The header's terminator is `br icmp_slt(idxVal, slice_len(iterCur))`
-//      and `bodyBlk` is its TRUE target, entered from nowhere else (the body
-//      block takes no params — `br.thenArgs` is empty — precisely because it
-//      reads the header's values directly).
-//   3. `idxVal` is never negative: the preheader edge passes `const 0` and the
-//      only other edge into the header is the step block's `idx + 1`. So the
-//      header's SIGNED test implies the UNSIGNED one `emitBoundsCheck` would
-//      have emitted.
-//   4. NOTHING RUNS IN BETWEEN. The header contains the `slice_len`, the
-//      compare and the branch; this element load is the first thing emitted
-//      in the body, ahead of every binder and every user statement. No call,
-//      no allocation, no safepoint — the poll sits at the latch, on the back
-//      edge — so no `append` in the body can be reached before this load, and
-//      the next iteration re-reads `len` in the header regardless.
+// `slclenwrites.bit` enumerates every write of that word - runtime/**, the inlined append in
+// compiler/optappend*.bit, stdlib/**, pkg/** - and fails when one is added or one stops growing.
+// `_tests_/cases/forof_bce_mutation.bit` pins facts 1-4 from the OUTSIDE, as program behaviour: it
+// appends to the slice it is iterating, reslices a shorter view of the same buffer inside the loop, and
+// mutates the binder, and asserts the element sequence and the iteration count; `run_forof_len_once.bit`
+// pins the read-once bound itself. `_tests_/cases/forof_bce_oob.bit` pins that an ordinary `xs[i]` in
+// the same body still panics at the right iteration, so the removal did not reach past the one access
+// it was proven for.
 //
-// So `len` shrinking is not a hazard this has to survive; it cannot be
-// observed between the two points. `_tests_/cases/forof_bce_mutation.bit`
-// pins facts 1-4 from the OUTSIDE, as program behaviour: it appends to the
-// slice it is iterating, reslices a shorter view of the same buffer inside the
-// loop, and mutates the binder, and asserts the element sequence and the
-// iteration count. `_tests_/cases/forof_bce_oob.bit` pins that an ordinary
-// `xs[i]` in the same body still panics at the right iteration, so the
-// removal did not reach past the one access it was proven for.
-//
-// What is genuinely load-bearing and is NOT checked here is fact 4's "nothing
-// runs in between": a future pass that spliced a call between the header's
-// compare and this load — or a lowering change that gave the body block its
-// own params and re-read the base — breaks it silently. That is the same
-// class of dependence `emitInlineSliceElem`'s GC-hazard paragraph already
-// carries, stated one level up.
+// What is genuinely load-bearing and is NOT checked here is fact 2: a lowering change that gave the body
+// block its own params and re-read the base, or that compared against something other than `$len`,
+// breaks it silently. That is the same class of dependence `emitInlineSliceElem`'s GC-hazard paragraph
+// already carries, stated one level up.
 //
 // For a PACKED slice (`sliceElemSizeFor` returning elemTy's own size rather
 // than 8, #3862) there is no boxed reference an element load could even
@@ -275,6 +269,24 @@ fn lowerForOfBindMap(fc: FnCtx, k: []int, iterCur: int, idxVal: int, id: Type) {
   rebindCheckerName(fc, subs[1], id.mapVal)
 }
 
+// Reads a slice's length ONCE, before the loop, into a hidden `$len` local
+// (SPEC §13.1 "Iteration": the bound of a `for … of` / `for … in` over a slice is
+// fixed at loop start, as Go's range, #7737). The header compares the cursor
+// against this value, never against `slice_len` of the live header: `append`
+// mutates a header in place (slices.bit `bit_rt_slice_append`), so a body that
+// appends to the ranged slice through an alias would otherwise grow the bound
+// under the loop. An array's length is a compile-time constant and needs no
+// slot. Returns how many hidden locals it declared after `$idx` (1 or 0).
+fn declareRangeBound(fc: FnCtx, id: Type, iterVal: int, i64ty: int): int {
+  if (id.kind != TypeKind.Slice) {
+    return 0
+  }
+  let sl = mkInstr(Op.SliceLen, i64ty)
+  sl.lhs = iterVal
+  declareLocal(fc, "$len", builderEmit(fc.b, sl), i64ty)
+  return 1
+}
+
 fn lowerForOf(fc: FnCtx, node: int) {
   // #5670: the body may run zero, one or many times (lowerkeepalive.bit's
   // banner).
@@ -323,9 +335,10 @@ fn lowerForOf(fc: FnCtx, node: int) {
     startV = builderEmit(fc.b, zero)
   }
   declareLocal(fc, "$idx", startV, i64ty)
+  let boundSlots = declareRangeBound(fc, id, iterVal, i64ty)
   let preLen = len(fc.env)
-  let idxSlot = preLen - 1
-  let iterSlot = preLen - 2
+  let idxSlot = preLen - 1 - boundSlots
+  let iterSlot = idxSlot - 1
   let header = builderNewBlock(fc.b)
   let bodyBlk = builderNewBlock(fc.b)
   let stepBlk = builderNewBlock(fc.b)
@@ -350,9 +363,7 @@ fn lowerForOf(fc: FnCtx, node: int) {
       ci.ival = id.arrayLen
       lenVal = builderEmit(fc.b, ci)
     } else {
-      let sl = mkInstr(Op.SliceLen, i64ty)
-      sl.lhs = iterCur
-      lenVal = builderEmit(fc.b, sl)
+      lenVal = fc.env[preLen - 1].value
     }
     cmp = mkInstr(Op.ICmpSlt, primType(fc.c.ctx, 10))
     cmp.lhs = idxVal
@@ -431,8 +442,8 @@ fn lowerForOf(fc: FnCtx, node: int) {
   builderBeginBlock(fc.b, exitBlk)
   addJoinParams(fc, preLen)
   fc.terminated = false
-  // Drop the hidden $iter/$idx locals.
-  truncateEnv(fc, preLen - 2)
+  // Drop the hidden $iter/$idx (and slice $len) locals.
+  truncateEnv(fc, iterSlot)
 }
 
 // Lowers `for v of c` over a channel (SPEC §16.2's range form): receive until

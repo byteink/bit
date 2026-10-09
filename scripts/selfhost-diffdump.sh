@@ -632,7 +632,7 @@ run_ir() {
   stale="" stalecount=0
   while IFS= read -r pinned; do
     [ -n "$pinned" ] || continue
-    if ! grep -q -F "${pinned}${sep}explained by declared signature '7574-f32-store-schedule-lag'" "$work/explained" 2>/dev/null; then
+    if ! grep -q -F "${pinned}${sep}explained by declared signature '$(irLagPinSig "$NAME" "$pinned")'" "$work/explained" 2>/dev/null; then
       stale="$stale $pinned"
       stalecount=$((stalecount + 1))
     fi

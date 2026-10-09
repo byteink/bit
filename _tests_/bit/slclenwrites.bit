@@ -1,0 +1,392 @@
+// _tests_/bit/slclenwrites.bit — pins the one invariant `for x of xs` rests on (#7737).
+//
+// A `for x of xs` / `for i in xs` over a slice reads `len(xs)` ONCE, at loop start, and then loads
+// each element straight from the header the loop holds: `buf` and `off` read live, no bounds test
+// (#4354, compiler/lowerctrl.bit `lowerForOfSliceElem`). That load is in bounds only if the header's
+// `len` word NEVER LOWERS while a loop runs over it, because the bound the loop kept was read from
+// the same header earlier: `index < len at loop start <= len now`. #4347 refused to rely on that
+// without a gate; this is the gate. It enumerates every place that writes a slice header's `len`
+// word and asserts each one either grows `len` of the header it writes or writes a header that was
+// just allocated and so cannot be one a loop already holds:
+//
+//   runtime/**  every `storeWord(<header> + slcLen, <value>)`, exactly the table `growSites()` lists,
+//               each in its recorded function with the recorded target and value, and each in-place
+//               one (target `h`) carrying `let vlen = loadWord(h + slcLen)` and, when it writes
+//               `want`, `let want = vlen + n` behind `if (n == 0) {` - so it only ever stores
+//               `vlen + 1` or `vlen + n` with n > 0; a fresh one (rtSliceNew, rtSliceSlice) carries the `gcAlloc` that
+//               made its header and a `_fresh` one writes `nh`, `h` itself or a `gcAlloc`, with the same
+//               growth. Any other `slcLen` write, and any
+//               `storeWord` of a header variable (h, nh, hIn, dst, src) at the literal offset 8, in a slice
+//               runtime file, is a finding.
+//   compiler/optappend*.bit
+//               the inlined append: exactly one `Op.FieldSet`, offset 8, whose value is the loaded
+//               length plus the constant 1.
+//   stdlib/**, pkg/**
+//               no `slcLen`, and no raw `storeWord`, outside comments: a package that wrote a header
+//               word itself would be a write this scan has to be taught about.
+//
+// A NEW write site makes a count or a table row wrong and fails the gate; so does changing a value
+// to something that is not provably an increase. The site list prints on pass and on fail, so a scan
+// that found nothing cannot read as an all-clear. BIT_REPO overrides the repository root, which is how
+// the mutation control runs it over a scratch copy.
+import { env, exit } from "std/os"
+import { exists, readFile, walk } from "std/fs"
+import { contains, hasPrefix, hasSuffix, indexOf, split, trimSpace } from "std/strings"
+
+class Site {
+  file: string,
+  fnName: string,
+  line: int,
+  target: string,
+  value: string,
+  body: string,
+}
+
+fn die(msg: string) {
+  eprint("slclenwrites: SETUP FAILED: ${msg}\n")
+  exit(1)
+}
+
+fn repoRoot(): string {
+  let override = env("BIT_REPO")
+  if (len(override) > 0) {
+    return override
+  }
+  for c of [".", "..", "../..", "../../.."] {
+    if (exists("${c}/runtime/root/slices.bit")) {
+      return c
+    }
+  }
+  die("cannot locate runtime/root/slices.bit from this cwd; set BIT_REPO")
+  return ""
+}
+
+fn bitFiles(dir: string): []string {
+  if (!exists(dir)) {
+    die("expected directory ${dir} does not exist")
+  }
+  let all = walk(dir) catch e {
+    die("cannot walk ${dir}: ${e.message()}")
+    return []string(0)
+  }
+  let out = []string(0)
+  for p of all {
+    if (hasSuffix(p, ".bit")) {
+      out = append(out, p)
+    }
+  }
+  if (len(out) == 0) {
+    die("${dir} holds no .bit file")
+  }
+  return out
+}
+
+fn linesOf(path: string): []string {
+  let text = readFile(path) catch e {
+    die("cannot read ${path}: ${e.message()}")
+    return []string(0)
+  }
+  return split(text, "\n")
+}
+
+fn isComment(line: string): bool {
+  return hasPrefix(trimSpace(line), "//")
+}
+
+// The name of the function a line declares, or "" for any other line.
+fn declaredFn(line: string): string {
+  if (isComment(line)) {
+    return ""
+  }
+  let at = indexOf(line, "fn ")
+  if (at < 0 || (at > 0 && line[at - 1:at] != " ")) {
+    return ""
+  }
+  let rest = line[at + 3:]
+  let open = indexOf(rest, "(")
+  if (open <= 0) {
+    return ""
+  }
+  return trimSpace(rest[:open])
+}
+
+// The function's own text: from its declaration to the line before the next declaration.
+fn bodyFrom(lines: []string, from: int): string {
+  let out = lines[from]
+  let i = from + 1
+  while (i < len(lines) && declaredFn(lines[i]) == "") {
+    out = out + "\n" + lines[i]
+    i = i + 1
+  }
+  return out
+}
+
+// `storeWord(<target> + slcLen, <value>)` -> (target, value, true).
+fn parseLenStore(line: string): (string, string, bool) {
+  let at = indexOf(line, "storeWord(")
+  if (at < 0) {
+    return "", "", false
+  }
+  let rest = line[at + 10:]
+  let plus = indexOf(rest, " + slcLen,")
+  if (plus < 0) {
+    return "", "", false
+  }
+  let after = rest[plus + 10:]
+  let end = indexOf(after, ")")
+  if (end < 0) {
+    return "", "", false
+  }
+  return trimSpace(rest[:plus]), trimSpace(after[:end]), true
+}
+
+fn lenSitesIn(path: string, rel: string): []Site {
+  let lines = linesOf(path)
+  let out = []Site(0)
+  let fnLine = 0
+  let fnName = ""
+  let i = 0
+  while (i < len(lines)) {
+    let d = declaredFn(lines[i])
+    if (d != "") {
+      fnName = d
+      fnLine = i
+    }
+    if (!isComment(lines[i]) && contains(lines[i], "storeWord(") && contains(lines[i], "slcLen")) {
+      let (pt, pv, ok) = parseLenStore(lines[i])
+      let t = pt
+      let v = pv
+      if (!ok) {
+        t = "<unparsed>"
+        v = trimSpace(lines[i])
+      }
+      out = append(
+        out,
+        Site{
+          file = rel,
+          fnName = fnName,
+          line = i + 1,
+          target = t,
+          value = v,
+          body = bodyFrom(lines, fnLine),
+        },
+      )
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// file|function|target|value|text the function must contain, `;`-separated. The first four are the
+// site itself; the last is what makes it a growth or a fresh header.
+fn growSites(): []string {
+  let grow = "let vlen = loadWord(h + slcLen)"
+  let want = grow + ";let want = vlen + n;if (n == 0) {"
+  // The `_fresh` entry points write `nh`, which is `h` itself or a header just `gcAlloc`'d: either way
+  // the value is the in-place growth `vlen + 1` / `vlen + n`.
+  let fresh = ";let nh = h;nh = gcAlloc("
+  return [
+    "root/slices.bit|rtSliceNew|h|want|let h = gcAlloc(",
+    "root/slices.bit|rtSliceAppend|h|vlen + 1|${grow}",
+    "root/slices.bit|rtSliceAppendStr|h|want|${want}",
+    "root/slices.bit|rtSliceAppendSlice|h|want|${want}",
+    "root/slices.bit|rtSliceSlice|nh|hi - lo|let nh = gcAlloc(",
+    "root/slicesappendfresh.bit|rtSliceAppendFresh|nh|vlen + 1|${grow}${fresh}",
+    "root/slicesappendfresh.bit|rtSliceAppendStrFresh|nh|want|${want}${fresh}",
+    "root/slicesappendfresh.bit|rtSliceAppendSliceFresh|nh|want|${want}${fresh}",
+  ]
+}
+
+fn siteProblem(s: Site, row: string): string {
+  let f = split(row, "|")
+  if (s.target != f[2] || s.value != f[3]) {
+    return "${s.file}:${s.line} ${s.fnName} stores `${s.value}` into `${s.target}`, the table has `${f[3]}` into `${f[2]}`"
+  }
+  for need of split(f[4], ";") {
+    if (!contains(s.body, need)) {
+      return "${s.file}:${s.line} ${s.fnName} no longer contains `${need}`: what makes this write a growth or a fresh header"
+    }
+  }
+  return ""
+}
+
+fn runtimeProblems(sites: []Site): []string {
+  let problems = []string(0)
+  let rows = growSites()
+  if (len(sites) != len(rows)) {
+    problems = append(
+      problems,
+      "expected exactly ${len(rows)} write site(s) of a slice header's len word under runtime/, found ${len(sites)}",
+    )
+  }
+  for s of sites {
+    let matched = false
+    for row of rows {
+      let f = split(row, "|")
+      if (f[0] == s.file && f[1] == s.fnName) {
+        matched = true
+        let p = siteProblem(s, row)
+        if (p != "") {
+          problems = append(problems, p)
+        }
+      }
+    }
+    if (!matched) {
+      problems = append(
+        problems,
+        "${s.file}:${s.line} ${s.fnName} writes a slice header's len word and is not in growSites(): `${s.target}` <- `${s.value}`",
+      )
+    }
+  }
+  return problems
+}
+
+// A `storeWord` of a header variable at the literal offset 8 is a len write spelled without the name
+// `slcLen`, which the scan above would never see.
+fn isHeaderEightWrite(line: string): bool {
+  for t of ["h", "nh", "hIn", "dst", "src"] {
+    if (contains(line, "storeWord(${t} + 8,")) {
+      return true
+    }
+  }
+  return false
+}
+
+fn rawEightProblems(root: string): []string {
+  let problems = []string(0)
+  for rel of ["root/slices.bit", "root/slicesappendfresh.bit"] {
+    let lines = linesOf("${root}/runtime/${rel}")
+    let i = 0
+    while (i < len(lines)) {
+      if (!isComment(lines[i]) && isHeaderEightWrite(lines[i])) {
+        problems = append(
+          problems,
+          "runtime/${rel}:${i + 1} writes a word at offset 8: ${trimSpace(lines[i])}",
+        )
+      }
+      i = i + 1
+    }
+  }
+  return problems
+}
+
+fn allRuntimeSites(root: string): []Site {
+  let out = []Site(0)
+  let prefix = "${root}/runtime/"
+  for p of bitFiles("${root}/runtime") {
+    let rel = p
+    if (hasPrefix(p, prefix)) {
+      rel = p[len(prefix):]
+    }
+    out = append(out, ...lenSitesIn(p, rel))
+  }
+  return out
+}
+
+fn indexHas(lines: []string, from: int, to: int, want: string): bool {
+  let i = from
+  while (i <= to) {
+    if (i >= 0 && i < len(lines) && trimSpace(lines[i]) == want) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The inlined append's one len write: `set.ival = 8` with `set.rhs` the loaded length plus 1.
+fn inlineAppendProblems(root: string): []string {
+  let problems = []string(0)
+  let found = 0
+  for p of bitFiles("${root}/compiler") {
+    if (!contains(p, "/optappend")) {
+      continue
+    }
+    let lines = linesOf(p)
+    let i = 0
+    while (i < len(lines)) {
+      if (!isComment(lines[i]) && contains(lines[i], "mkInstr(Op.FieldSet")) {
+        found = found + 1
+        problems = append(problems, ...fastStoreProblems(p, lines, i))
+      }
+      i = i + 1
+    }
+  }
+  if (found != 1) {
+    problems = append(
+      problems,
+      "expected exactly 1 `mkInstr(Op.FieldSet` in compiler/optappend*.bit (the inlined append's len bump), found ${found}",
+    )
+  }
+  return problems
+}
+
+fn fastStoreProblems(path: string, lines: []string, at: int): []string {
+  let problems = []string(0)
+  let before = [
+    "let one = mkInstr(Op.ConstInt, i64ty)",
+    "one.ival = 1",
+    "let bump = mkInstr(Op.Add, i64ty)",
+    "bump.lhs = lenV",
+    "bump.rhs = builderEmit(b, one)",
+  ]
+  let after = ["set.lhs = h", "set.ival = 8", "set.rhs = builderEmit(b, bump)"]
+  for want of before {
+    if (!indexHas(lines, at - 12, at - 1, want)) {
+      problems = append(
+        problems,
+        "${path}:${at + 1} the len bump is no longer built from `${want}`",
+      )
+    }
+  }
+  for want of after {
+    if (!indexHas(lines, at + 1, at + 4, want)) {
+      problems = append(problems, "${path}:${at + 1} the len bump no longer has `${want}`")
+    }
+  }
+  return problems
+}
+
+// stdlib/** and pkg/**: no slice header len word is ever named or stored raw.
+fn packageProblems(root: string): []string {
+  let problems = []string(0)
+  for dir of ["stdlib", "pkg"] {
+    for p of bitFiles("${root}/${dir}") {
+      let lines = linesOf(p)
+      let i = 0
+      while (i < len(lines)) {
+        if (!isComment(lines[i]) &&
+          (contains(lines[i], "slcLen") || contains(lines[i], "storeWord("))) {
+          problems = append(
+            problems,
+            "${p}:${i + 1} touches a slice header word outside runtime/: ${trimSpace(lines[i])}",
+          )
+        }
+        i = i + 1
+      }
+    }
+  }
+  return problems
+}
+
+fn main() {
+  let root = repoRoot()
+  let sites = allRuntimeSites(root)
+  eprint("slclenwrites: ${len(sites)} storeWord(... + slcLen, ...) write site(s) under ${root}/runtime/:\n")
+  for s of sites {
+    eprint("slclenwrites:   ${s.file}:${s.line} ${s.fnName}: ${s.target} <- ${s.value}\n")
+  }
+  let problems = runtimeProblems(sites)
+  problems = append(problems, ...rawEightProblems(root))
+  problems = append(problems, ...inlineAppendProblems(root))
+  problems = append(problems, ...packageProblems(root))
+  if (len(problems) == 0) {
+    eprint("slclenwrites: OK - every write of a slice header's len word grows it or writes a fresh header (the invariant lowerForOfSliceElem's unchecked element load rests on)\n")
+    return
+  }
+  eprint("slclenwrites: refusing - a write of a slice header's len word the gate does not know is a way for len to LOWER under a running for-of, whose unchecked element load would then read past the buffer (#7737):\n")
+  for p of problems {
+    eprint("slclenwrites:   ${p}\n")
+  }
+  exit(1)
+}

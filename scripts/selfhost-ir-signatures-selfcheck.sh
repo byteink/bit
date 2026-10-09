@@ -521,6 +521,146 @@ bb0():
 $om_main" "$om_t" ir)" "ir: the function is present in the oracle with another body"
   expect "" "$(explainMismatch "$om_t" "$om_o" ir)" "ir: the oracle has a function the tree lacks"
 
+  # 7737-forof-len-once: the oracle reads `slice_len` of the ranged slice in the loop header; the tree
+  # reads it once in the block that jumps into the loop and carries it as the last block parameter.
+  fl_o='func f(%0: []i64) i64 {
+bb0(%0: []i64):
+  %1 = const_int i64 0
+  %2 = const_int i64 0
+  jump bb1(%0, %1, %0, %2)
+bb1(%4: []i64, %5: i64, %6: []i64, %7: i64):
+  %8 = slice_len %6
+  %9 = icmp_slt bool %7, %8
+  br %9, bb2(), bb4(%4, %5, %6, %7)
+bb2():
+  %11 = rt_call g(%7) void
+  jump bb3(%4, %5, %6, %7)
+bb3(%13: []i64, %14: i64, %15: []i64, %16: i64):
+  %17 = const_int i64 1
+  %18 = add i64 %16, %17
+  jump bb1(%13, %14, %15, %18)
+bb4(%20: []i64, %21: i64, %22: []i64, %23: i64):
+  ret %21
+}'
+  fl_t='func f(%0: []i64) i64 {
+bb0(%0: []i64):
+  %1 = const_int i64 0
+  %2 = const_int i64 0
+  %3 = slice_len %0
+  jump bb1(%0, %1, %0, %2, %3)
+bb1(%5: []i64, %6: i64, %7: []i64, %8: i64, %9: i64):
+  %10 = icmp_slt bool %8, %9
+  br %10, bb2(), bb4(%5, %6, %7, %8, %9)
+bb2():
+  %12 = rt_call g(%8) void
+  jump bb3(%5, %6, %7, %8, %9)
+bb3(%14: []i64, %15: i64, %16: []i64, %17: i64, %18: i64):
+  %19 = const_int i64 1
+  %20 = add i64 %17, %19
+  jump bb1(%14, %15, %16, %20, %18)
+bb4(%22: []i64, %23: i64, %24: []i64, %25: i64, %26: i64):
+  ret %23
+}'
+  expect "7737-forof-len-once" "$(explainMismatch "$fl_o" "$fl_t" ir)" "ir: the loop bound read once before the loop"
+  expect "7737-forof-len-once" "$(explainMismatch "$fl_o" "$fl_t" iropt)" "iropt: the loop bound read once before the loop"
+  expect "" "$(explainMismatch "$fl_o" "$fl_t" ast)" "ast: not a dump kind this signature reads"
+  expect "" "$(explainMismatch "$fl_t" "$fl_o" ir)" "ir: the direction is fixed, the oracle reading once is not explained"
+  expect "" "$(explainMismatch "$fl_o" "${fl_t/icmp_slt/icmp_sle}" ir)" "ir: the header compare is not the loop-bound compare"
+  expect "" "$(explainMismatch "$fl_o" "${fl_t/rt_call g(%8)/rt_call g(%9)}" ir)" "ir: the carried length is also used in the body"
+  expect "" "$(explainMismatch "$fl_o" "${fl_t/ret %23/ret %26}" ir)" "ir: the carried length is returned from the exit block"
+  expect "" "$(explainMismatch "$fl_o" "${fl_t/slice_len %0/slice_len %1}" ir)" "ir: the length is not that of the slice the loop ranges over"
+  expect "" "$(explainMismatch "${fl_o/slice_len %6/slice_len %4}" "$fl_t" ir)" "ir: the oracle header reads another value than the cursor's slice"
+  expect "" "$(explainMismatch "$fl_o" "${fl_t/ret %23/%27 = rt_call h() void
+  ret %23}" ir)" "ir: an unrelated extra line next to the rewritten loop"
+  expect "" "$(explainMismatch "$fl_o" "${fl_t/rt_call g/rt_call h}" ir)" "ir: an unrelated call differs next to the rewritten loop"
+  expect "" "$(explainMismatch "$fl_o" "${fl_t/bb1(%14, %15, %16, %20, %18)/bb1(%14, %15, %16, %20, %17)}" ir)" "ir: the back edge passes something other than the carried length"
+
+  # 7737-forof-len-once, iropt: two hoists of one header word into one block are one value (irMergeLoads).
+  ml_o='func g(%0: []i64) void {
+bb0(%0: []i64):
+  %2 = slice_len %0
+  %3 = slice_len %0
+  %4 = rt_call h(%2) void
+  %5 = rt_call h(%3) void
+  ret
+}'
+  ml_t='func g(%0: []i64) void {
+bb0(%0: []i64):
+  %2 = slice_len %0
+  %4 = rt_call h(%2) void
+  %5 = rt_call h(%2) void
+  ret
+}'
+  expect "7737-forof-len-once" "$(explainMismatch "$ml_o" "$ml_t" iropt)" "iropt: a repeated header word load in one block"
+  expect "" "$(explainMismatch "$ml_o" "$ml_t" ir)" "ir: the merge is for the optimized dump only"
+  ml_oc='func g(%0: []i64) void {
+bb0(%0: []i64):
+  %2 = slice_len %0
+  %4 = rt_call h(%2) void
+  %3 = slice_len %0
+  %5 = rt_call h(%3) void
+  ret
+}'
+  expect "" "$(explainMismatch "$ml_oc" "$ml_t" iropt)" "iropt: a call between the loads keeps them apart"
+
+  # 7737-forof-len-once, the file pin (irLagPins, iropt only): the tree's BCE dropped the bounds guard
+  # of an access the loop test already covers. Only a pinned file, only when the tree lost guards and
+  # nothing else differs once the loop-tested ones are removed from both dumps.
+  gp_o='func g(%0: []i64) i64 {
+bb0(%0: []i64):
+  %1 = const_int i64 0
+  jump bb1(%0, %1)
+bb1(%3: []i64, %4: i64):
+  %5 = slice_len %3
+  %6 = icmp_slt bool %4, %5
+  br %6, bb2(), bb5()
+bb2():
+  %8 = slice_len %3
+  %9 = icmp_ult bool %4, %8
+  br %9, bb4(), bb3()
+bb3():
+  %11 = const_string "index out of range"
+  %12 = rt_call panic(%11) void
+  unreachable
+bb4():
+  %14 = rt_call h(%4) void
+  %15 = const_int i64 1
+  %16 = add i64 %4, %15
+  jump bb1(%3, %16)
+bb5():
+  ret %4
+}'
+  gp_t='func g(%0: []i64) i64 {
+bb0(%0: []i64):
+  %1 = const_int i64 0
+  jump bb1(%0, %1)
+bb1(%3: []i64, %4: i64):
+  %5 = slice_len %3
+  %6 = icmp_slt bool %4, %5
+  br %6, bb2(), bb5()
+bb2():
+  jump bb4()
+bb4():
+  %14 = rt_call h(%4) void
+  %15 = const_int i64 1
+  %16 = add i64 %4, %15
+  jump bb1(%3, %16)
+bb5():
+  ret %4
+}'
+  gp_pin=stdlib/compress/crc32.bit
+  gp_want="7737-forof-len-once"
+  expect "$gp_want" "$(explainMismatch "$gp_o" "$gp_t" iropt "$gp_pin")" "iropt: a pinned file, the loop-tested guard dropped"
+  expect "" "$(explainMismatch "$gp_o" "$gp_t" iropt stdlib/compress/other.bit)" "iropt: the same diff in an unpinned file"
+  expect "" "$(explainMismatch "$gp_o" "$gp_t" ir "$gp_pin")" "ir: the pin is for the iropt arm only"
+  expect "" "$(explainMismatch "$gp_t" "$gp_o" iropt "$gp_pin")" "iropt: the tree gained a guard instead of losing one"
+  expect "" "$(explainMismatch "${gp_o/icmp_ult bool %4, %8/icmp_ult bool %1, %8}" "$gp_t" iropt "$gp_pin")" "iropt: an unrelated guard (not the loop index) disappears"
+  expect "" "$(explainMismatch "${gp_o/icmp_ult bool %4, %8/icmp_ult bool %4, %15}" "$gp_t" iropt "$gp_pin")" "iropt: a guard against another length disappears"
+  expect "" "$(explainMismatch "$gp_o" "${gp_t//rt_call h/rt_call k}" iropt "$gp_pin")" "iropt: a guard dropped and an unrelated call changed"
+  expect "" "$(explainMismatch "${gp_o/index out of range/slice bounds}" "$gp_t" iropt "$gp_pin")" "iropt: the dropped block is not the out-of-range panic"
+  expect "" "$(explainMismatch "$gp_o" "${gp_t/jump bb4()/%20 = rt_call k() void
+  jump bb4()}" iropt "$gp_pin")" "iropt: a guard dropped and a call added"
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever
