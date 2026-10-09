@@ -79,8 +79,9 @@ fn main(): ()! {
 }
 ```
 
-`fromTop = true` ranks from the highest score down (a `ZRANK`-style
-placement); `false` ranks from the lowest up.
+`fromTop = true` ranks from the highest score down (`ZREVRANK`: rank 0 is
+the leader); `false` ranks from the lowest up (`ZRANK`: rank 0 is the
+last place).
 
 ## Conditional updates
 
@@ -232,6 +233,23 @@ fn main(): ()! {
 }
 ```
 
+`interCard(otherKeys, limit)` is `ZINTERCARD`: it counts the players on
+every board without building the list, and a positive `limit` stops the
+count there, which is enough for "are there at least 10?":
+
+```bit
+import { open } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let both = r.zset("game:board:daily").interCard(["game:board:weekly"])?
+  let atLeastTen = r.zset("game:board:daily").interCard(["game:board:weekly"], 10)?
+  println("${both} on both boards, counted up to 10: ${atLeastTen}")
+  r.close()
+  return
+}
+```
+
 `weights` scales each input set's scores before combining (`[]f64(0)` for
 no weighting); `Aggregate` picks how a member's scores from several sets
 combine (`Sum`, `Min` or `Max`). `unionStore`/`interStore`/`diffStore`
@@ -310,7 +328,7 @@ decide on the board as it is at that moment. `tx.read.zset(key)` is the same
 `Zset` as `r.zset(key)`, bound to the transaction's own connection, so its
 reads run now and see the keys the transaction `WATCH`es. The reads are
 `score`, `scores`, `rank`, `card`, `countByScore`, `countByLex`, `top`,
-`bottom`, `byScore`, `byLex`, `union`, `inter`, `diff`, `randMember`,
+`bottom`, `byScore`, `byLex`, `union`, `inter`, `interCard`, `diff`, `randMember`,
 `randMembers` and `scan`. The writes you decide on go through
 `tx.zset(key)`, which queues them for `EXEC`. If another client changes a
 watched key first, the transaction retries and the body runs again with fresh
