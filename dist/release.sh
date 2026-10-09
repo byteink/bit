@@ -80,25 +80,34 @@ BUILT_COMMIT="$(git rev-parse HEAD)"
 # roughly 2x on its four worst rows across two releases. A check that refuses
 # does not get silently skipped the way a checklist line does.
 #
-# The invariant: bench/RESULTS.md (written only by bench/run.sh, alongside
-# README.md and bench/history.csv) must have been committed AFTER the
-# previous release tag, i.e. someone ran bench/run.sh since that tag. Same
-# "previous v* tag reachable from HEAD" resolution dist/changelog.sh already
-# uses, so both scripts agree on what "previous release" means.
+# The invariant: the newest row of bench/history.csv names the commit a
+# MEASURED bench/run.sh run was taken at (git_sha, column 2), and that commit
+# must be AFTER the previous release tag. history.csv is appended only by a
+# measuring run; `bench/run.sh --render` rebuilds README.md and
+# bench/RESULTS.md from bench/last-run.dat without measuring and never touches
+# it, so a render-only commit cannot satisfy this (#6439; keying on RESULTS.md's
+# last commit let one through). Same "previous v* tag reachable from HEAD"
+# resolution dist/changelog.sh already uses, so both scripts agree on what
+# "previous release" means.
 BENCH_PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*' "${BUILT_COMMIT}^" 2>/dev/null || true)"
-BENCH_COMMIT="$(git log -1 --format=%H -- bench/RESULTS.md 2>/dev/null || true)"
+BENCH_SHA="$(tail -n 1 bench/history.csv 2>/dev/null | cut -d, -f2)"
+[ -n "${BENCH_SHA}" ] && [ "${BENCH_SHA}" != "git_sha" ] || {
+	echo "release.sh: bench/history.csv has no measured row - run bench/run.sh before releasing" >&2
+	exit 1
+}
+BENCH_COMMIT="$(git rev-parse --verify --quiet "${BENCH_SHA}^{commit}" || true)"
 [ -n "${BENCH_COMMIT}" ] || {
-	echo "release.sh: bench/RESULTS.md has no commit history - run bench/run.sh before releasing" >&2
+	echo "release.sh: bench/history.csv's newest row names '${BENCH_SHA}', which is not a commit in this repository - run bench/run.sh before releasing" >&2
 	exit 1
 }
 if [ -n "${BENCH_PREV_TAG}" ] && git merge-base --is-ancestor "${BENCH_COMMIT}" "${BENCH_PREV_TAG}"; then
-	echo "release.sh: bench/RESULTS.md was last regenerated at ${BENCH_COMMIT:0:8}, at or before ${BENCH_PREV_TAG} - the benchmark tables were not regenerated for this release" >&2
+	echo "release.sh: the newest measured benchmark run (bench/history.csv) was taken at ${BENCH_COMMIT:0:8}, at or before ${BENCH_PREV_TAG} - the benchmarks were not re-measured for this release (a render-only commit does not count)" >&2
 	echo "  run: boxlock.sh solo bench/run.sh   (needs a quiet box: ps -eo comm= -A | grep -c make-driver == 0)" >&2
 	echo "  then: git add README.md bench/RESULTS.md bench/history.csv && git commit" >&2
 	echo "  then re-run: dist/release.sh ${VERSION}" >&2
 	exit 1
 fi
-echo "release.sh: benchmark tables regenerated at ${BENCH_COMMIT:0:8}, after ${BENCH_PREV_TAG:-<no previous release>}"
+echo "release.sh: benchmarks measured at ${BENCH_COMMIT:0:8}, after ${BENCH_PREV_TAG:-<no previous release>}"
 
 # --- preflight: the vscode grammar must match its published mirror ---------
 # (#4470). github-linguist submodules a grammar repository's ROOT, so
