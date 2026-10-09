@@ -304,9 +304,11 @@ row, so it becomes the always-true condition whatever its join.
 A condition kept in a database cannot hold a closure, so "editors may update
 their own team's articles" has no `user.team` to read when it is saved. It
 names the attribute instead: the operand is the text `"$user.team"`.
-`operandOf` reads stored text into an `Operand`, which is either `Lit(value)`
-or `Param(path)`, and `bind` replaces every `Param` with the value the asking
-user has, once per request, before the condition is evaluated:
+`operandOf` reads stored text into an `Operand`, which is `Lit(value)`,
+`Param(path)` or `Null` (the operand `eqNull` and `neNull` compare against;
+`operandOf` never returns it), and `bind` replaces every `Param` with the
+value the asking user has, once per request, before the condition is
+evaluated:
 
 ```bit
 import { Cond, Operand, Subject, Truth, bind, evalCond, operandOf } from "authz"
@@ -330,6 +332,7 @@ fn describe(o: Operand): string {
   return match (o) {
     Lit(_) => "a value"
     Param(path) => "the user's ${path}"
+    Null => "null"
   }
 }
 
@@ -374,6 +377,7 @@ fn show(text: string): string {
   return match (operandOf(text)) {
     Lit(_) => "${text} is text"
     Param(path) => "${text} is the user's ${path}"
+    Null => "${text} is null"
   }
 }
 
