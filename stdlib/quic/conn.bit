@@ -344,6 +344,8 @@ export class Conn {
   // held as a one-slot token so concurrent `acceptStream` callers take turns —
   // see `quicconnTakeAccepted` (loop.bit). Filled before `doneCh` closes.
   acceptedCh: chan<[]quicconnOpenReply>
+  // How this connection's streams report reads back to the loop (flow.bit).
+  tx: quicconnReadTx
   // The peer's IPv4 address as of the handshake, dotted quad, or "" — see
   // `peerIp`. A plain field rather than a command round-trip to the loop: it is
   // written once, before the handshake is published, and never again.
@@ -395,7 +397,7 @@ export class Conn {
     if (r.id < 0) {
       fail newError("quic: connection closed")
     }
-    return Stream{ streamId = r.id, cmdCh = this.cmdCh, recvCh = r.recvCh, doneCh = this.doneCh }
+    return quicconnNewStreamHandle(this, r)
   }
 
   // Accept the next peer-initiated bidirectional stream, blocking until one opens.
@@ -418,7 +420,7 @@ export class Conn {
     if (r.id < 0) {
       fail newError("quic: connection closed")
     }
-    return Stream{ streamId = r.id, cmdCh = this.cmdCh, recvCh = r.recvCh, doneCh = this.doneCh }
+    return quicconnNewStreamHandle(this, r)
   }
 
   // Set how long this connection tolerates hearing nothing from its peer before it
@@ -469,6 +471,9 @@ export class Stream {
   // Closed by the loop the instant it exits — see `Conn.doneCh`'s doc comment;
   // `finish` races it the same way `openStream`/`acceptStream` do.
   doneCh: chan<int>
+  // Where reads are reported so the loop can grant flow-control credit (flow.bit).
+  tx: quicconnReadTx
+  acct: quicconnReadAcct
   // Queue `data` on the stream. Returns once buffered; the loop delivers it under
   // flow control and congestion control, retransmitting any losses.
   export write(data: []byte): ()! {
@@ -518,6 +523,9 @@ export class Stream {
       replyOpen = chan<quicconnOpenReply>(1),
       replyInt = chan<int>(1),
     }
+    // The application will read no more: what the peer still sends is dropped, so
+    // its bytes must not hold the connection's flow-control credit.
+    streamSendRead(this, quicconnRead{ id = this.streamId, bytes = 0, chunks = 0, discard = true })
   }
 
   // Read the next reassembled inbound chunk, blocking until data, the FIN, or a
@@ -531,6 +539,7 @@ export class Stream {
     if (!ok) {
       fail newError("quic: connection closed")
     }
+    streamNoteRead(this, c)
     return c
   }
 
@@ -614,6 +623,10 @@ class quicconnState {
   dataBlockedSignaled: bool,
   localMaxData: int,
   dataConsumed: int,
+  // Bytes the peer has sent over all streams (the sum of each stream's highest
+  // offset), held under `localMaxData` (flow.bit).
+  dataRecv: int,
+  flowTx: quicconnReadTx,
   needMaxData: bool,
   srtt: int,
   rttvar: int,
@@ -661,6 +674,7 @@ fn quicconnNewState(
   scid: []byte,
   dcid: []byte,
 ): quicconnState {
+  let tick = chan<int>(1)
   return quicconnState{
     isClient = isClient,
     sock = sock,
@@ -704,6 +718,7 @@ fn quicconnNewState(
     dataBlockedSignaled = false,
     localMaxData = quicconnFlowWindow,
     dataConsumed = 0,
+    dataRecv = 0,
     needMaxData = false,
     srtt = 0,
     rttvar = 0,
@@ -718,7 +733,8 @@ fn quicconnNewState(
     maxAckDelay = 5000000,
     inCh = chan<quicconnDgram>(256),
     cmdCh = chan<quicconnCmd>(64),
-    tickCh = chan<int>(1),
+    tickCh = tick,
+    flowTx = quicconnNewReadTx(tick),
     readyCh = chan<int>(1),
     running = true,
     closeSent = false,

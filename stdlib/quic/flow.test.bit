@@ -1,0 +1,346 @@
+// stdlib/quic/flow.test.bit — receive flow-control credit follows the application's
+// reads (flow.bit, #7709; RFC 9000 §4.1, §4.2): buffering data earns the peer no
+// credit, reading it does (MAX_STREAM_DATA and MAX_DATA once half a window is
+// consumed), a peer that sends past the credit it was given is closed with
+// FLOW_CONTROL_ERROR, the chunk queue is bounded, an abandoned stream
+// (`stopSending`) and a reset stream return their connection credit, and over a
+// real handshake a server that never reads is sent no more than the window.
+//
+// The state tests build `quicconnState` directly (module siblings:
+// `quicconnNewState`, `quicconnHandleFrame`, `quicconnFoldReads`) with no peer,
+// and read through the same `streamNoteRead` the public `Stream.read` calls.
+// `quicRefusalCertPem`/`quicRefusalKeyPem` (listener.test.bit) and
+// `quicAcceptClientConfig` (accept.test.bit) supply the identity for the
+// loopback test.
+const qfStream: int = 0
+const qfChunk: int = 1000
+
+fn qfState(): quicconnState {
+  let sock = udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind: ${e.message()}")
+    return quicconnNewState(false, UdpSocket{}, false, "127.0.0.1", 1, []byte(0), []byte(0))
+  }
+  return quicconnNewState(false, sock, true, "127.0.0.1", 1, []byte(0), []byte(0))
+}
+
+// The peer sends `n` bytes of stream `id` at `off`.
+fn qfSend(st: quicconnState, id: int, off: int, n: int, fin: bool) {
+  let f = Frame.Stream(
+    StreamFrame{
+      id = u64(id), offset = u64(off), data = []byte(n), hasOffset = true, hasLength = true, fin = fin,
+    },
+  )
+  quicconnHandleFrame(st, quicconnLvlApp, f) catch e {
+    assert(false, "handle: ${e.message()}")
+  }
+}
+
+// The peer sends `total` bytes of stream `id` in `piece`-byte frames.
+fn qfSendAll(st: quicconnState, id: int, total: int, piece: int) {
+  let off = 0
+  while (off < total) {
+    let n = quicconnMin(piece, total - off)
+    qfSend(st, id, off, n, false)
+    off = off + n
+  }
+}
+
+// The application's handle on stream `id`, as `Conn.acceptStream` builds it.
+fn qfHandle(st: quicconnState, id: int): Stream {
+  return Stream{
+    streamId = id,
+    cmdCh = st.cmdCh,
+    recvCh = st.streams[id].recvCh,
+    doneCh = st.doneCh,
+    tx = st.flowTx,
+    acct = quicconnReadAcct{ bytes = 0, chunks = 0 },
+  }
+}
+
+// One `Stream.read` that does not block: the chunk if one is queued.
+fn qfTake(s: Stream): Option<StreamChunk> {
+  select {
+    case c = <- s.recvCh:
+      streamNoteRead(s, c)
+      return Option.Some(c)
+    default:
+      return Option.None
+  }
+}
+
+// Read every chunk queued right now; returns the bytes.
+fn qfReadQueued(s: Stream): int {
+  let got = 0
+  let guard = 0
+  while (guard < quicconnRecvChunkCap + 1) {
+    guard = guard + 1
+    match (qfTake(s)) {
+      None => { return got }
+      Some(c) => { got = got + len(c.data) }
+    }
+  }
+  return got
+}
+
+// The code of the CONNECTION_CLOSE queued on the connection, or -1.
+fn qfCloseCode(st: quicconnState): int {
+  for f of st.aLevel.pending {
+    match (f) {
+      ConnectionClose(code, _, _) => { return int(code) }
+      _ => {}
+    }
+  }
+  return -1
+}
+
+// The limit of the MAX_STREAM_DATA / MAX_DATA the next flush would send (-1: none).
+fn qfUpdates(st: quicconnState, id: int): (int, int) {
+  let perStream = -1
+  let conn = -1
+  for f of quicconnAppendWindowUpdates(st, []Frame(0)) {
+    match (f) {
+      MaxStreamData(i, m) => {
+        if (int(i) == id) {
+          perStream = int(m)
+        }
+      }
+      MaxData(m) => { conn = int(m) }
+      _ => {}
+    }
+  }
+  return (perStream, conn)
+}
+
+test "data buffered but not read earns the peer no credit" {
+  let st = qfState()
+  qfSendAll(st, qfStream, 30000, qfChunk)
+  let s = st.streams[qfStream]
+  assert(s.recvDelivered == 30000, "delivered ${s.recvDelivered}")
+  assert(!s.needMaxStreamData && !st.needMaxData, "credit queued for bytes nobody read")
+  assert(s.localMaxStreamData == quicconnFlowWindow, "stream limit ${s.localMaxStreamData}")
+  assert(st.localMaxData == quicconnFlowWindow, "connection limit ${st.localMaxData}")
+  let (ps, c) = qfUpdates(st, qfStream)
+  assert(ps == -1 && c == -1, "flush would send MAX_STREAM_DATA ${ps} MAX_DATA ${c}")
+}
+
+test "reading releases stream and connection credit" {
+  let st = qfState()
+  qfSendAll(st, qfStream, 30000, qfChunk)
+  let h = qfHandle(st, qfStream)
+  assert(qfReadQueued(h) == 30000, "queued bytes")
+  quicconnFoldReads(st)
+  let s = st.streams[qfStream]
+  assert(s.recvConsumed >= 30000 - quicconnReadBatchBytes, "consumed ${s.recvConsumed}")
+  assert(s.needMaxStreamData && st.needMaxData, "no credit queued after the reads")
+  let (ps, c) = qfUpdates(st, qfStream)
+  // The window moved when the reads crossed half of it, to a full window past
+  // what had been consumed by then.
+  let half = quicconnFlowWindow / 2
+  assert(
+    ps > half + quicconnFlowWindow && ps <= s.recvConsumed + quicconnFlowWindow,
+    "MAX_STREAM_DATA ${ps}",
+  )
+  assert(
+    c > half + quicconnFlowWindow && c <= st.dataConsumed + quicconnFlowWindow,
+    "MAX_DATA ${c}",
+  )
+}
+
+test "a peer that fills the window and stops is not granted more until it is read" {
+  let st = qfState()
+  qfSendAll(st, qfStream, quicconnFlowWindow, qfChunk)
+  assert(st.running, "closed at exactly the window")
+  assert(!st.streams[qfStream].needMaxStreamData, "credit granted with the window full and unread")
+  let h = qfHandle(st, qfStream)
+  assert(qfReadQueued(h) > 0, "nothing queued")
+  quicconnFoldReads(st)
+  assert(st.streams[qfStream].needMaxStreamData, "no credit after reading the window")
+}
+
+test "a stream sending past its window is closed with FLOW_CONTROL_ERROR" {
+  let st = qfState()
+  qfSend(st, qfStream, 0, quicconnFlowWindow, false)
+  assert(st.running, "closed at exactly the window")
+  qfSend(st, qfStream, quicconnFlowWindow, 1, false)
+  assert(!st.running, "one byte past the window was accepted")
+  assert(qfCloseCode(st) == quicconnErrFlowControl, "close code ${qfCloseCode(st)}")
+}
+
+test "streams sending past the connection window are closed with FLOW_CONTROL_ERROR" {
+  let st = qfState()
+  qfSend(st, 0, 0, 20000, false)
+  assert(st.running, "first stream refused")
+  qfSend(st, 4, 0, 20000, false)
+  assert(!st.running, "40000 bytes accepted against a 32768 connection window")
+  assert(qfCloseCode(st) == quicconnErrFlowControl, "close code ${qfCloseCode(st)}")
+}
+
+test "a retransmitted range is not counted twice against the window" {
+  let st = qfState()
+  let i = 0
+  while (i < 10) {
+    qfSend(st, qfStream, 0, 10000, false)
+    i = i + 1
+  }
+  assert(st.running, "duplicates closed the connection")
+  assert(st.dataRecv == 10000, "counted ${st.dataRecv} bytes for one range")
+}
+
+test "one-byte frames never park the loop on a full queue" {
+  let st = qfState()
+  let total = 3000
+  qfSendAll(st, qfStream, total, 1)
+  let s = st.streams[qfStream]
+  assert(s.chunksOut <= quicconnRecvChunkCap - 1, "${s.chunksOut} chunks queued")
+  assert(s.recvDelivered < total, "everything was queued as chunks")
+  let h = qfHandle(st, qfStream)
+  let got = 0
+  let rounds = 0
+  while (got < total && rounds < 200) {
+    rounds = rounds + 1
+    quicconnFoldReads(st)
+    got = got + qfReadQueued(h)
+  }
+  assert(got == total, "read ${got} of ${total} after ${rounds} rounds")
+}
+
+test "stopSending returns the stream's unread bytes and drops what follows" {
+  let st = qfState()
+  qfSend(st, qfStream, 0, 20000, false)
+  let h = qfHandle(st, qfStream)
+  h.stopSending(7) catch e {
+    assert(false, "stopSending: ${e.message()}")
+  }
+  quicconnFoldReads(st)
+  assert(st.dataConsumed == 20000, "consumed ${st.dataConsumed}")
+  let queued = st.streams[qfStream].chunksOut
+  qfSend(st, qfStream, 20000, 5000, true)
+  assert(st.dataConsumed == 25000, "later bytes not credited: ${st.dataConsumed}")
+  assert(st.streams[qfStream].chunksOut == queued + 1, "only the FIN chunk may be queued")
+  assert(st.streams[qfStream].finDelivered, "FIN not delivered")
+}
+
+test "a reset stream returns the credit of the bytes that never reached the reader" {
+  let st = qfState()
+  qfSend(st, qfStream, 0, 2000, false)
+  quicconnHandleFrame(st, quicconnLvlApp, Frame.ResetStream(u64(4), u64(9), u64(20000))) catch e {
+    assert(false, "handle: ${e.message()}")
+  }
+  assert(st.running, "reset within the window closed the connection")
+  assert(st.dataRecv == 22000, "final size not counted: ${st.dataRecv}")
+  assert(st.dataConsumed == 20000, "credit for the unsent part: ${st.dataConsumed}")
+  assert(
+    st.needMaxData && st.localMaxData == 20000 + quicconnFlowWindow,
+    "MAX_DATA ${st.localMaxData}",
+  )
+}
+
+test "a reset whose final size passes the window is a FLOW_CONTROL_ERROR" {
+  let st = qfState()
+  quicconnHandleFrame(
+    st,
+    quicconnLvlApp,
+    Frame.ResetStream(u64(0), u64(9), u64(quicconnFlowWindow + 1)),
+  ) catch e {
+    assert(false, "handle: ${e.message()}")
+  }
+  assert(!st.running && qfCloseCode(st) == quicconnErrFlowControl, "close code ${qfCloseCode(st)}")
+}
+
+// Server: accept the stream and read NOTHING for `quiet` ms, then count what is
+// queued (without reporting it, so no credit is granted while counting), report
+// it, and read the rest. Answers "queued:total".
+fn qfServer(sock: UdpSocket, quiet: int, resultCh: chan<string>) {
+  let conn = acceptQuic(sock, quicRefusalCertPem(), quicRefusalKeyPem()) catch _ {
+    resultCh <- "handshake-failed"
+    return
+  }
+  let s = conn.acceptStream() catch _ {
+    resultCh <- "accept-failed"
+    return
+  }
+  sleep(quiet * Millisecond)
+  let queued = 0
+  let seen = []StreamChunk(0)
+  let more = true
+  while (more) {
+    select {
+      case c = <- s.recvCh:
+        queued = queued + len(c.data)
+        seen = append(seen, c)
+      default:
+        more = false
+    }
+  }
+  resultCh <- "queued:${queued}"
+  for c of seen {
+    streamNoteRead(s, c)
+  }
+  let total = queued
+  let fin = false
+  for c of seen {
+    fin = fin || c.fin
+  }
+  while (!fin) {
+    let c = s.read() catch _ {
+      resultCh <- "read-failed:${total}"
+      return
+    }
+    total = total + len(c.data)
+    fin = c.fin
+  }
+  resultCh <- "total:${total}"
+  conn.close()
+}
+
+fn qfUpload(s: Stream, n: int, doneCh: chan<bool>) {
+  s.write([]byte(n)) catch _ {
+    doneCh <- false
+    return
+  }
+  s.finish() catch _ {
+    doneCh <- false
+    return
+  }
+  doneCh <- true
+}
+
+test "a server that never reads is sent no more than the window, and reading completes the transfer" {
+  let srv = udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind: ${e.message()}")
+    return
+  }
+  let port = srv.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let res = chan<string>(4)
+  spawn qfServer(srv, 1500, res)
+  let conn = dialQuicTls("127.0.0.1", port, "localhost", quicAcceptClientConfig()) catch e {
+    assert(false, "dialQuicTls: ${e.message()}")
+    return
+  }
+  let s = conn.openStream() catch e {
+    assert(false, "openStream: ${e.message()}")
+    return
+  }
+  let payload = 8 * quicconnFlowWindow
+  let done = chan<bool>(1)
+  spawn qfUpload(s, payload, done)
+  let queued = <- res
+  assert(
+    queued == "queued:${quicconnFlowWindow}",
+    "server was sent ${queued} while reading nothing",
+  )
+  select {
+    case _ = <- done:
+      assert(false, "the upload finished against a server that had read only the window")
+    default:
+      {}
+  }
+  let total = <- res
+  assert(total == "total:${payload}", "after reading: ${total}")
+  let ok = <- done
+  assert(ok, "upload failed")
+  conn.close()
+}
