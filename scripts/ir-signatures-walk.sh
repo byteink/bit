@@ -614,9 +614,10 @@ END {
   else { print "7637-string-from-rune-range" }
 }'
   IR_TYPES_AWK='# The types row: the oracle dump, a line @@@BIT2@@@, then the tree dump. Rows are `line:col: name:
-# type`. #7558 spells the synthesized import alias `__Json`, which lengthens the synthesized text, so
-# only the COLUMN of a row moves: same row count, same line, name and type, a column that grows,
-# on a source line that carries a synthesized `__json_` row, and never shrinks back along the line.
+# type`. #7558 spells the synthesized import alias `__Json`, and #7564 the @table ones (`__Rows`,
+# `__Value`, ...), which lengthens the synthesized text, so only the COLUMN of a row moves: same row
+# count, same line, name and type, a column that grows, on a source line that carries a synthesized
+# row (`__json_*` for @json, `__row` for @table), and never shrinks back along the line.
 function rowPos(l) { return match(l, /^[0-9]+:[0-9]+: /) }
 function lineOf(l,   p) { split(l, p, ":"); return p[1] + 0 }
 function colOf(l,   p) { split(l, p, ":"); return p[2] + 0 }
@@ -627,6 +628,7 @@ END {
   if (na != nb || na == 0) { exit 1 }
   for (i = 1; i <= na; i++) {
     if (rowPos(A[i]) && restOf(A[i]) ~ /^__json_/) { synth[lineOf(A[i])] = 1 }
+    else if (rowPos(A[i]) && restOf(A[i]) ~ /^__row: / && !synth[lineOf(A[i])]) { synth[lineOf(A[i])] = 2 }
   }
   for (i = 1; i <= na; i++) {
     if (!rowPos(A[i]) || !rowPos(B[i])) {
@@ -638,10 +640,10 @@ END {
     if (ln != lineOf(B[i]) || restOf(A[i]) != restOf(B[i]) || d < last[ln]) { exit 1 }
     if (d > 0 && !synth[ln]) { exit 1 }
     last[ln] = d
-    if (d > 0) { moved++ }
+    if (d > 0) { moved++; if (synth[ln] == 1) { json = 1 } }
   }
   if (moved == 0) { exit 1 }
-  print "7558-synth-json-alias-column-shift"
+  if (json) { print "7558-synth-json-alias-column-shift" } else { print "7564-synth-table-alias-column-shift" }
 }'
 }
 
