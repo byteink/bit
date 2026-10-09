@@ -1,0 +1,447 @@
+// Bit standard library — http module: the client's shared HTTP/3 connections (#7688).
+//
+// An HTTP/3 request is one bidirectional stream, and a QUIC connection carries
+// many at once, so the pool keeps ONE live connection per origin and every
+// request to that origin opens a stream on it: 8 concurrent `Client.get` calls
+// to one h3 server make one QUIC handshake, not 8. It is `h2pool.bit`'s shape
+// for HTTP/3 (Go's quic-go `http3.RoundTripper`, curl and Chrome share the same
+// way), keyed the same: `poolKey`, origin plus the TLS scope, so two TLS
+// configs never share a connection.
+//
+// The bounds, all explicit:
+//
+//   streams     the peer's stream limit (initial_max_streams_bidi, raised by
+//               MAX_STREAMS) is enforced by the QUIC layer: `H3Conn.request`
+//               fails with `H3Unsent` once it is reached, and the request
+//               goes to a second connection (`h3tryOnce`) while the first
+//               finishes the ones it has. The connection is retired then: it
+//               can open no more streams.
+//   idle time   a connection with no request in flight for `idleTimeoutMs` is
+//               closed, lazily, like `connPool`'s idle list. QUIC's own idle
+//               timeout (RFC 9000 §10.1) ends one sooner when the peer is gone.
+//   count       at most `maxIdleTotal` shared connections, one per origin;
+//               `maxIdlePerHost = 0` turns sharing off. A connection that may
+//               not be shared is used by the request that dialed it, then
+//               closed.
+//   dialing     dials to one origin are single-flight (`h3Origin.dialTok`,
+//               bounded by the request's own deadline), so a burst of requests
+//               dials once.
+//
+// A connection is dropped from the pool, so no new request takes it, when the
+// peer sent GOAWAY (`H3Conn.watchPeer`), the QUIC connection ended, a request
+// on it failed for any reason but a cancel, or it went idle. Its transport is
+// closed only once the last request using it has released it: closing under
+// a request in flight would fail that request for nothing.
+//
+// Cancel keeps #7640's per-stream semantics: a `Cancel` or the request's
+// deadline aborts only that request's stream (a value on `wake`), and the
+// connection and the other streams on it run on.
+
+// One live h3 connection and the bookkeeping that decides when it may close.
+// `inflight`, `lastUse`, `retired` and `torn` are guarded by `h3Pool.mu`.
+class h3Entry {
+  id: int,
+  key: string,
+  hc: H3Conn,
+  // Requests holding a reference; the transport is closed only at zero.
+  inflight: int,
+  lastUse: int,
+  retired: bool,
+  torn: bool,
+}
+
+// An origin's shared connection, if it has one. `dialTok` is the single-flight
+// token (capacity 1) a dial holds, a channel rather than a `Mutex` so a request
+// waiting behind another's dial gives up at its own deadline. `dialing` counts
+// requests inside `enter`..`leave`, so the origin is not pruned under a dial.
+class h3Origin {
+  key: string,
+  dialTok: chan<int>,
+  conn: []h3Entry,
+  dialing: int,
+  since: int,
+}
+
+// What `h3Pool.take` found.
+enum H3Take {
+  Shared(h3Entry),
+  None,
+}
+
+// The shared connections of one `connPool`, per origin. Every method locks `mu`
+// and never holds it across I/O; a connection to close is collected under the
+// lock and closed after it.
+class h3Pool {
+  limits: PoolLimits
+  mu: Mutex
+  origins: []h3Origin
+  closed: bool
+  seq: int
+
+  // The live connection for `key`, with its `inflight` incremented for the
+  // caller (who must `release` it), or `None`. Expired and unusable connections
+  // are closed on the way.
+  take(key: string, now: int): H3Take {
+    this.mu.lock()
+    let doomed = this.pruneLocked(now)
+    let got = this.takeLocked(key, now)
+    this.mu.unlock()
+    h3closeAll(doomed)
+    return got
+  }
+
+  takeLocked(key: string, now: int): H3Take {
+    let i = this.indexLocked(key)
+    if (i < 0 || len(this.origins[i].conn) == 0) {
+      return H3Take.None
+    }
+    let o = this.origins[i]
+    o.since = now
+    let e = o.conn[0]
+    e.inflight = e.inflight + 1
+    return H3Take.Shared(e)
+  }
+
+  // Joins the single-flight for `key`, waiting for the dial in progress but
+  // not past `deadlineNs`, and not past a value on `wake` (`Cancelled`).
+  // `leave` must follow a success.
+  enter(key: string, now: int, deadlineNs: int, wake: chan<int>): h3Origin! {
+    this.mu.lock()
+    let o = this.originLocked(key, now)
+    o.dialing = o.dialing + 1
+    this.mu.unlock()
+    acquireToken(
+      o.dialTok,
+      deadlineNs,
+      wake,
+      "http3: timed out waiting for another dial",
+      "to ${key} in progress",
+    ) catch e {
+      this.leaveCount(o)
+      fail e
+    }
+    return o
+  }
+
+  leave(o: h3Origin) {
+    <- o.dialTok
+    this.leaveCount(o)
+  }
+
+  leaveCount(o: h3Origin) {
+    this.mu.lock()
+    o.dialing = o.dialing - 1
+    this.mu.unlock()
+  }
+
+  // Makes `e` (created holding one reference) the shared connection for its
+  // origin, or marks it retired when it may not be shared: the pool is closed,
+  // sharing is off, the origin already has one, or `maxIdleTotal` connections
+  // are shared. The creating request uses it either way.
+  install(e: h3Entry, now: int) {
+    this.mu.lock()
+    this.seq = this.seq + 1
+    e.id = this.seq
+    let o = this.originLocked(e.key, now)
+    o.since = now
+    if (this.closed ||
+      this.limits.maxIdlePerHost == 0 ||
+      len(o.conn) > 0 ||
+      this.liveLocked() >= this.limits.maxIdleTotal) {
+      e.retired = true
+    } else {
+      o.conn = [e]
+    }
+    this.mu.unlock()
+  }
+
+  // Marks `e` unusable for new requests; its transport closes when the last
+  // request holding it releases it. Called by a request whose exchange failed.
+  retireEntry(e: h3Entry) {
+    this.mu.lock()
+    let last = this.retireLocked(e)
+    this.mu.unlock()
+    if (last) {
+      e.hc.close()
+    }
+  }
+
+  // Drops the caller's reference to `e`, closing it when it was retired and
+  // nobody else holds it.
+  release(e: h3Entry, now: int) {
+    this.mu.lock()
+    e.inflight = e.inflight - 1
+    e.lastUse = now
+    let last = e.retired && e.inflight == 0 && !e.torn
+    if (last) {
+      e.torn = true
+    }
+    this.mu.unlock()
+    if (last) {
+      e.hc.close()
+    }
+  }
+
+  // Retires every shared connection; the pool stays usable.
+  closeAll() {
+    this.mu.lock()
+    let doomed = []h3Entry(0)
+    for o of this.origins {
+      if (len(o.conn) > 0) {
+        let e = o.conn[0]
+        if (this.retireLocked(e)) {
+          doomed = append(doomed, e)
+        }
+      }
+    }
+    this.mu.unlock()
+    h3closeAll(doomed)
+  }
+
+  // `closeAll`, and from now on nothing new is shared: the owner is gone.
+  retire() {
+    this.mu.lock()
+    this.closed = true
+    this.mu.unlock()
+    this.closeAll()
+  }
+
+  // Removes `e` from its origin and marks it retired; true when it is idle now
+  // and so must be closed by the caller. Caller holds `mu`.
+  retireLocked(e: h3Entry): bool {
+    e.retired = true
+    let i = this.indexLocked(e.key)
+    if (i >= 0 && len(this.origins[i].conn) > 0 && this.origins[i].conn[0].id == e.id) {
+      this.origins[i].conn = []h3Entry(0)
+    }
+    if (e.inflight == 0 && !e.torn) {
+      e.torn = true
+      return true
+    }
+    return false
+  }
+
+  // Index of `key` in `origins`, or -1; caller holds `mu`.
+  indexLocked(key: string): int {
+    let i = 0
+    while (i < len(this.origins)) {
+      if (this.origins[i].key == key) {
+        return i
+      }
+      i = i + 1
+    }
+    return -1
+  }
+
+  // The record for `key`, made if absent; caller holds `mu`.
+  originLocked(key: string, now: int): h3Origin {
+    let i = this.indexLocked(key)
+    if (i >= 0) {
+      return this.origins[i]
+    }
+    let o = h3Origin{
+      key = key,
+      dialTok = chan<int>(1),
+      conn = []h3Entry(0),
+      dialing = 0,
+      since = now,
+    }
+    this.origins = append(this.origins, o)
+    return o
+  }
+
+  // Shared connections right now; caller holds `mu`.
+  liveLocked(): int {
+    let n = 0
+    for o of this.origins {
+      n = n + len(o.conn)
+    }
+    return n
+  }
+
+  // Retires every connection that can take no new request (`H3Conn.reusable`)
+  // or has been idle longer than `idleTimeoutMs`, and forgets origins untouched
+  // that long with nothing live or dialing, so the list is bounded by what was
+  // used recently; caller holds `mu`.
+  pruneLocked(now: int): []h3Entry {
+    let limit = this.limits.idleTimeoutMs * 1000000
+    let doomed = []h3Entry(0)
+    let keep = []h3Origin(0)
+    for o of this.origins {
+      if (len(o.conn) > 0 && h3stale(o.conn[0], now, limit)) {
+        let e = o.conn[0]
+        if (this.retireLocked(e)) {
+          doomed = append(doomed, e)
+        }
+      }
+      if (len(o.conn) > 0 || o.dialing > 0 || now - o.since < limit) {
+        keep = append(keep, o)
+      }
+    }
+    this.origins = keep
+    return doomed
+  }
+}
+
+fn newH3Pool(limits: PoolLimits): h3Pool {
+  return h3Pool{ limits = limits, mu = Mutex(), origins = []h3Origin(0), closed = false, seq = 0 }
+}
+
+// Whether the shared connection `e` must go: its peer said GOAWAY or it ended,
+// or it has had no request in flight for `limit` nanoseconds.
+fn h3stale(e: h3Entry, now: int, limit: int): bool {
+  return !e.hc.reusable() || (e.inflight == 0 && now - e.lastUse >= limit)
+}
+
+fn h3closeAll(list: []h3Entry) {
+  for e of list {
+    e.hc.close()
+  }
+}
+
+// Whether a request's deadline ran out (`fired`) and whether its exchange is
+// over (`done`); written by the timer thread, read by the request's.
+class h3Deadline {
+  fired: bool,
+  done: bool,
+}
+
+// Starts the wall-clock timer of a request with a deadline (`deadlineNs`, 0 =
+// none): at the deadline it sends on `wake`, which aborts the request's stream
+// or its dial. This replaces the lowered QUIC idle timeout a dial-per-request
+// used (#3004), which a connection shared between requests cannot carry.
+fn h3armDeadline(deadlineNs: int, wake: chan<int>): h3Deadline {
+  let t = h3Deadline{ fired = false, done = false }
+  if (deadlineNs != 0) {
+    spawn h3waitDeadline(deadlineNs, wake, t)
+  }
+  return t
+}
+
+fn h3waitDeadline(deadlineNs: int, wake: chan<int>, t: h3Deadline) {
+  let remaining = deadlineNs - monotonic().ns
+  if (remaining > 0) {
+    sleep(remaining)
+  }
+  if (t.done) {
+    return
+  }
+  t.fired = true
+  select {
+    case wake <- 1:
+    default:
+  }
+}
+
+// The connection to run a request for `key` on: the origin's shared one, or a
+// fresh dial under the origin's token that becomes it (after checking whether
+// the dial that held the token before left one). The caller holds a reference
+// and must `release` it. `wake` ends the dial: `Cancelled`.
+fn h3checkout(key: string, u: Url, extras: RequestExtras, wake: chan<int>): h3Entry! {
+  let hp = extras.pool.h3
+  match (hp.take(key, monotonic().ns)) {
+    Shared(e) => return e
+    None => {}
+  }
+  let o = hp.enter(key, monotonic().ns, extras.deadline, wake)?
+  match (hp.take(key, monotonic().ns)) {
+    Shared(e) => {
+      hp.leave(o)
+      return e
+    }
+    None => {}
+  }
+  // No deadline on the dial: it would lower the idle timeout of a connection
+  // other requests share. `wake` carries the deadline instead (`h3armDeadline`).
+  let bound = H3Bound{ deadlineNs = 0, wake = wake }
+  let hc = h3DialTlsBounded(u.host, u.port, u.host, extras.config, bound) catch err {
+    hp.leave(o)
+    fail err
+  }
+  hc.watchPeer()
+  let e = h3Entry{
+    id = 0,
+    key = key,
+    hc = hc,
+    inflight = 1,
+    lastUse = monotonic().ns,
+    retired = false,
+    torn = false,
+  }
+  hp.install(e, monotonic().ns)
+  hp.leave(o)
+  return e
+}
+
+// What one attempt on a pooled connection came to.
+enum H3Try {
+  Done(Response),
+  Retry,
+}
+
+// Whether `err`, a failed `h3clientExchange`, left the connection fit to share:
+// only a cancel (a deadline too) of one stream does.
+fn h3connectionOk(err: error): bool {
+  let (re, wrapped) = err.(RequestError)
+  if (!wrapped) {
+    return false
+  }
+  let (_, cancelled) = re.cause.(Cancelled)
+  return cancelled
+}
+
+// Whether `err` is a request that never got a stream (`H3Unsent`): safe to
+// repeat on another connection whatever its method.
+fn h3neverSent(err: error): bool {
+  let (re, wrapped) = err.(RequestError)
+  if (!wrapped || re.sent) {
+    return false
+  }
+  let (_, unsent) = re.cause.(H3Unsent)
+  return unsent
+}
+
+// One attempt: `req` on the origin's shared connection, released on every exit.
+// A failure other than a cancel retires the connection; one that sent nothing
+// (`h3neverSent`) is `Retry` for another connection, any other is the error.
+fn h3tryOnce(key: string, u: Url, req: H3Request, extras: RequestExtras, wake: chan<int>): H3Try! {
+  let hp = extras.pool.h3
+  let e = h3checkout(key, u, extras, wake) catch err {
+    fail unsentError(h3Failure(err, extras.deadline))
+  }
+  let res = h3clientExchange(e.hc, req, extras.deadline, wake) catch err {
+    if (!h3connectionOk(err)) {
+      hp.retireEntry(e)
+    }
+    hp.release(e, monotonic().ns)
+    if (h3neverSent(err)) {
+      return H3Try.Retry
+    }
+    fail err
+  }
+  hp.release(e, monotonic().ns)
+  return H3Try.Done(res)
+}
+
+// Attempts a request may spend on connections that could not open a stream: each
+// one is a connection at the peer's stream limit, so a few suffice for any burst
+// the limit lets through, and the bound keeps the loop provably finite.
+const h3Attempts: int = 16
+
+fn h3attempts(
+  key: string,
+  u: Url,
+  req: H3Request,
+  extras: RequestExtras,
+  wake: chan<int>,
+): Response! {
+  let tries = 0
+  while (tries < h3Attempts) {
+    tries = tries + 1
+    match (h3tryOnce(key, u, req, extras, wake)?) {
+      Done(res) => return res
+      Retry => {}
+    }
+  }
+  fail unsentError(newError("h3: no connection to ${key} could open a stream"))
+}
