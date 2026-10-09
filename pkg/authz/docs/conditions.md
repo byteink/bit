@@ -545,6 +545,130 @@ true`. Only an `Option` field can be NULL, so `null` on any other field is an
 under `$lt`, `$lte`, `$gt`, `$gte` or inside an `$in` list, where it could
 never match.
 
+## Stored conditions as CEL
+
+An admin who writes expressions rather than JSON can store the same condition
+as CEL, the Common Expression Language, in the part of it that can become a
+database filter. `condFromCel` takes the resource and the text and returns the
+same `Cond` that `condFromJson` gives for the equivalent document, so a list
+read filters on either. "Editors may touch their own team's drafts and
+reviews, or anything in a folder they edit":
+
+```bit
+import { Authz, Cond, Subject, Truth, bind, condFromCel, evalCond } from "authz"
+import { Tabled } from "orm"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+  team: string
+  status: string
+  views: i64
+}
+
+class User {
+  export id: string,
+  export roles: []string,
+  export team: string,
+}
+
+fn main(): ()! {
+  let authz = Authz<Action>()?
+  authz.resource<Article>()?
+  let article = unwrap(authz.resourceByName("Article"))
+
+  let stored: Cond = condFromCel(
+    article,
+    "resource.team == user.team && resource.status in ['draft', 'review']",
+  )?
+
+  let mira = User{ id = "mira", roles = ["editor"], team = "sport" }
+  let (bound, _) = bind(stored, Option<Subject>.Some(mira))
+  let mine = Article{ id = 1, team = "sport", status = "draft", views = 40 }
+  let theirs = Article{ id = 2, team = "news", status = "draft", views = 90 }
+  println("her draft: ${evalCond(bound, mine)? == Truth.True}")
+  println("news draft: ${evalCond(bound, theirs)? == Truth.True}")
+}
+```
+
+This prints `her draft: true` and `news draft: false`. `resource.<field>` is a
+column of the resource and `user.<name>` the asking user's attribute, the
+`"$user.team"` placeholder of the JSON form. The accepted forms are:
+
+| CEL | Same as |
+| --- | ------- |
+| `resource.views >= 18` (`== != < <= >`) | `{ "views": { "$gte": 18 } }` |
+| `18 <= resource.views` | the same comparison read the other way |
+| `resource.views > -5` | a negative number literal |
+| `resource.status in ['draft', 'live']` | `{ "status": { "$in": [...] } }` |
+| `resource.team in user.roles` | `$in` over the user's list attribute |
+| `resource.deletedAt == null` (`!= null`) | `{ "deletedAt": null }` |
+| `resource.published` | `{ "published": true }`, on a bool field |
+| `a && b`, `a \|\| b`, `!a`, `( ... )` | `$and`, `$or`, `$not` |
+| `related(resource.folder, 'editor')` | `{ "folder": { "$related": "editor" } }` |
+| `true`, `false` | an always-true or always-false condition |
+
+Precedence is CEL's: `||` binds loosest, then `&&`, then the comparisons,
+then `!`. A string takes either quote and the escapes `\n \t \\ \' \"` and
+`\uXXXX`; a `//` comment runs to the end of the line. The text is bounded like
+JSON: 4096 bytes, 512 tokens and parentheses or `!` nested at most 32 deep.
+
+A condition is refused at save time, never quietly, when it uses CEL that has
+no database filter form: a function or method call other than `related`
+(`size`, `matches`, `startsWith`, `has`, `exists`), arithmetic, the ternary
+`?:`, a map or list literal outside `in`, indexing, a comparison of two
+fields, of two user attributes or of two literals, a chain such as `a < b < c`,
+and `resource` or `user` on its own. Every refusal is an `InvalidPolicy` that
+names the construct and the byte it starts at, and a field or value that does
+not fit the resource is refused with the same words as in the JSON form:
+
+```bit
+import { Authz, condFromCel } from "authz"
+import { Tabled } from "orm"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+  authorId: string
+  views: i64
+  published: bool
+}
+
+fn show(authz: Authz<Action>, text: string): ()! {
+  let article = unwrap(authz.resourceByName("Article"))
+  let _ = condFromCel(article, text) catch e {
+    println(e.message())
+    return
+  }
+}
+
+fn main(): ()! {
+  let authz = Authz<Action>()?
+  authz.resource<Article>()?
+  show(authz, "resource.authorID == user.id")?
+  show(authz, "resource.views >= 'many'")?
+  show(authz, "resource.published > true")?
+  show(authz, "size(resource.authorId) > 3")?
+  show(authz, "resource.views + 1 > 3")?
+  show(authz, "resource.views == resource.authorId")?
+}
+```
+
+The six lines are:
+
+```text
+invalid policy: cel: Article has no field "authorID" (closest: "authorId") at byte 0
+invalid policy: cel: field views is i64, the value is text at byte 18
+invalid policy: cel: field published is bool, which cannot be ordered at byte 19
+invalid policy: cel: function call size(...) is not supported; only related(resource.<field>, "<relation>") is at byte 0
+invalid policy: cel: arithmetic '+' is not supported; compare a field with a value at byte 15
+invalid policy: cel: comparing resource.views with resource.authorId has no SQL filter form; compare a field with a value at byte 0
+```
+
 ## Filtering a list
 
 "May sara update THIS article" is one row. Inkwell's "my articles" page asks

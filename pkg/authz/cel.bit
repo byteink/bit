@@ -1,0 +1,475 @@
+// pkg/authz/cel.bit — a stored policy's `when` part, written as CEL text. CEL is
+// the Common Expression Language (github.com/google/cel-spec, langdef.md).
+// `condFromCel` reads the part of it that can become a SQL filter into the
+// same `Cond` that `condFromJson` (condjson.bit) builds, so the two front-ends
+// agree and a list read can filter on either:
+//
+//   resource.team == user.team && resource.status in ['draft', 'review']
+//   resource.views >= 10 || related(resource.folder, 'editor')
+//   !resource.archived && resource.deletedAt == null && 3 < resource.score
+//
+// ACCEPTED. A comparison `resource.<field> <op> <value>` (`== != < <= > >=`)
+// with a string, integer (`-5` included), float, `true`, `false` or `null`
+// literal, or a user attribute `user.<name>` (`user.id`, `user.roles`, ...);
+// the mirrored `<value> <op> resource.<field>`; `resource.<field> in [a, b]`
+// and `resource.<field> in user.roles`; `related(resource.<field>, "<relation>")`;
+// `&&`, `||`, `!`, parentheses and the constants `true` and `false`; a bare
+// `resource.<boolField>`, which is `resource.<boolField> == true`; `//` comments.
+// Precedence is CEL's: `||` binds loosest, then `&&`, then the relations, then
+// the unary `!`. A field is checked against the resource with the rules of the
+// JSON front-end: it must be a column, the value must fit its type, an
+// ordering needs an orderable column, an enum column takes its variants, and
+// `null` tests an `Option` column only.
+//
+// REFUSED, each by name and byte offset (`cel: ... at byte 14`), because the
+// tree and SQL cannot hold it: any function or method call but `related`
+// (`size`, `matches`, `startsWith`, `has`, `exists`), arithmetic, the ternary
+// `?:`, a map literal, a list anywhere but after `in`, indexing, nested field
+// access, a comparison of two resource fields, of two user attributes or of
+// two literals, a chain `a < b < c`, a comparison of a boolean expression,
+// and `resource` or `user` used bare.
+//
+// BOUNDED. The text is admin input: the lexer caps it (4096 bytes, 512
+// tokens, cellex.bit) and the descent is recursive only through parentheses
+// and `!`, at most 32 deep. `a && b && c` is a loop, not a recursion.
+//
+// That the relation a `related` names is declared is `Authz.validate`'s
+// check, as for a condition built in code or read from JSON.
+
+const celMaxDepth: int = 32
+const arithOps: string = "+-*/%"
+
+// Whether the operator token `t` is spelled `s`.
+fn celIsOp(t: CelTok, s: string): bool {
+  return match (t) {
+    Op(o) => o == s
+    _ => false
+  }
+}
+
+fn celIsEof(t: CelTok): bool {
+  return match (t) {
+    Eof => true
+    _ => false
+  }
+}
+
+// Whether `t` is the punctuation `p`: one of ( ) [ ] , .
+fn celIsPunct(t: CelTok, p: string): bool {
+  return match (t) {
+    LParen => p == "("
+    RParen => p == ")"
+    LBracket => p == "["
+    RBracket => p == "]"
+    Comma => p == ","
+    Dot => p == "."
+    _ => false
+  }
+}
+
+fn celIdentText(t: CelTok): string {
+  return match (t) {
+    Ident(s) => s
+    _ => ""
+  }
+}
+
+fn celStrText(t: CelTok): Option<string> {
+  return match (t) {
+    Str(s) => Option<string>.Some(s)
+    _ => Option<string>.None
+  }
+}
+
+// The comparison an operator token is, None for any other token.
+fn celRelOp(t: CelTok): Option<Op> {
+  return match (t) {
+    Op(o) => celRelOpNamed(o)
+    _ => Option<Op>.None
+  }
+}
+
+fn celRelOpNamed(o: string): Option<Op> {
+  if (o == "==") {
+    return Option<Op>.Some(Op.Eq)
+  }
+  if (o == "!=") {
+    return Option<Op>.Some(Op.Ne)
+  }
+  if (o == "<") {
+    return Option<Op>.Some(Op.Lt)
+  }
+  if (o == "<=") {
+    return Option<Op>.Some(Op.Lte)
+  }
+  if (o == ">") {
+    return Option<Op>.Some(Op.Gt)
+  }
+  if (o == ">=") {
+    return Option<Op>.Some(Op.Gte)
+  }
+  if (o == "in") {
+    return Option<Op>.Some(Op.In)
+  }
+  return Option<Op>.None
+}
+
+// Whether the one-byte operator `o` is arithmetic.
+fn celIsArith(o: string): bool {
+  if (len(o) != 1) {
+    return false
+  }
+  let i = 0
+  while (i < len(arithOps)) {
+    if (arithOps[i] == o[0]) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The literal a token is, as a node, or None.
+fn celLiteral(t: CelSpanTok): Option<CelNode> {
+  let term = match (t.tok) {
+    Int(n) => Option<CelTerm>.Some(CelTerm.Const(Value.Int(n)))
+    Float(f) => Option<CelTerm>.Some(CelTerm.Const(Value.Float(f)))
+    Str(s) => Option<CelTerm>.Some(CelTerm.Const(Value.Text(s)))
+    Bool(b) => Option<CelTerm>.Some(CelTerm.Const(Value.Bool(b)))
+    Null => Option<CelTerm>.Some(CelTerm.NullLit)
+    _ => Option<CelTerm>.None
+  }
+  if (!isSome(term)) {
+    return Option<CelNode>.None
+  }
+  return Option<CelNode>.Some(CelNode{ term = unwrap(term), at = t.start })
+}
+
+// A token as an error names it. A string literal is not echoed: it may hold
+// any byte.
+fn celDescribe(src: string, t: CelSpanTok): string {
+  return match (t.tok) {
+    Eof => "end of expression"
+    Str(_) => "a string literal"
+    _ => "'${src[t.start:t.end]}'"
+  }
+}
+
+// Whether `n` may stand in a list literal: a value, never a column or a
+// finished condition.
+fn celIsItem(n: CelNode): bool {
+  return match (n.term) {
+    Const(_) => true
+    Attr(_) => true
+    NullLit => true
+    _ => false
+  }
+}
+
+fn celRelShape(ok: bool, t: CelSpanTok): ()! {
+  if (!ok) {
+    fail celErr("related() takes (resource.<field>, \"<relation>\")", t.start)
+  }
+}
+
+// One parse in progress: the tokens, the cursor and the resource.
+class CelParser {
+  src: string
+  w: JsonWalk
+  toks: []CelSpanTok
+  i: int
+
+  init(src: string, w: JsonWalk, toks: []CelSpanTok) {
+    this.src = src
+    this.w = w
+    this.toks = toks
+    this.i = 0
+  }
+
+  // The token under the cursor; `Eof` is last and the cursor never passes it.
+  peek(): CelSpanTok {
+    return this.toks[this.i]
+  }
+
+  // The token `k` ahead of the cursor, `Eof` past the end.
+  ahead(k: int): CelSpanTok {
+    let j = this.i + k
+    if (j >= len(this.toks)) {
+      j = len(this.toks) - 1
+    }
+    return this.toks[j]
+  }
+
+  take(): CelSpanTok {
+    let t = this.toks[this.i]
+    if (this.i < len(this.toks) - 1) {
+      this.i = this.i + 1
+    }
+    return t
+  }
+
+  atOp(s: string): bool {
+    return celIsOp(this.toks[this.i].tok, s)
+  }
+
+  unexpected(t: CelSpanTok): InvalidPolicy {
+    return celErr("unexpected ${celDescribe(this.src, t)}", t.start)
+  }
+
+  // `expr = or ["?" ...]`; the ternary is refused here, where CEL puts it.
+  parseExpr(depth: int): CelNode! {
+    let n = this.parseOr(depth)?
+    if (this.atOp("?")) {
+      fail celErr(
+        "the conditional ?: is not supported (it has no SQL filter form); combine the branches with && and ||",
+        this.peek().start,
+      )
+    }
+    return n
+  }
+
+  parseOr(depth: int): CelNode! {
+    let first = this.parseAnd(depth)?
+    if (!this.atOp("||")) {
+      return first
+    }
+    let parts = [celAsCond(this.w, first)?]
+    while (this.atOp("||")) {
+      this.take()
+      parts = append(parts, celAsCond(this.w, this.parseAnd(depth)?)?)
+    }
+    return CelNode{ term = CelTerm.Test(or(parts)), at = first.at }
+  }
+
+  parseAnd(depth: int): CelNode! {
+    let first = this.parseRelation(depth)?
+    if (!this.atOp("&&")) {
+      return first
+    }
+    let parts = [celAsCond(this.w, first)?]
+    while (this.atOp("&&")) {
+      this.take()
+      parts = append(parts, celAsCond(this.w, this.parseRelation(depth)?)?)
+    }
+    return CelNode{ term = CelTerm.Test(and(parts)), at = first.at }
+  }
+
+  // `unary [relop unary]`; a second relop in a row is refused.
+  parseRelation(depth: int): CelNode! {
+    let left = this.parseUnary(depth)?
+    let opTok = this.peek()
+    let op = celRelOp(opTok.tok)
+    if (!isSome(op)) {
+      return left
+    }
+    this.take()
+    let right = this.parseUnary(depth)?
+    if (isSome(celRelOp(this.peek().tok))) {
+      fail celErr(
+        "chained comparison is not supported; join the two comparisons with &&",
+        this.peek().start,
+      )
+    }
+    let c = celCompare(this.w, left, unwrap(op), opTok.start, right)?
+    return CelNode{ term = CelTerm.Test(c), at = left.at }
+  }
+
+  // `!unary`, or an atom followed by nothing that would continue it.
+  parseUnary(depth: int): CelNode! {
+    let t = this.peek()
+    if (depth > celMaxDepth) {
+      fail celErr("expression nested deeper than ${celMaxDepth} levels", t.start)
+    }
+    if (celIsOp(t.tok, "!")) {
+      this.take()
+      let inner = this.parseUnary(depth + 1)?
+      return CelNode{ term = CelTerm.Test(not(celAsCond(this.w, inner)?)), at = t.start }
+    }
+    let n = this.parseAtom(depth)?
+    this.noTrail()?
+    return n
+  }
+
+  // What may not follow an operand: a selection, an index, arithmetic.
+  noTrail(): ()! {
+    let t = this.peek()
+    if (celIsPunct(t.tok, ".")) {
+      this.trailDot(t.start)?
+    }
+    if (celIsPunct(t.tok, "[")) {
+      fail celErr("indexing is not supported", t.start)
+    }
+    match (t.tok) {
+      Op(o) => {
+        if (celIsArith(o)) {
+          fail celErr("arithmetic '${o}' is not supported; compare a field with a value", t.start)
+        }
+      }
+      _ => {}
+    }
+  }
+
+  // A `.` after an operand: a method call, or a path deeper than one name.
+  trailDot(at: int): ()! {
+    let name = this.ahead(1)
+    if (celIdentText(name.tok) != "" && celIsPunct(this.ahead(2).tok, "(")) {
+      fail celErr(
+        "method call .${celIdentText(name.tok)}(...) is not supported; it has no SQL filter form",
+        name.start,
+      )
+    }
+    fail celErr(
+      "nested field access is not supported; resource fields and user attributes are flat",
+      at,
+    )
+  }
+
+  parseAtom(depth: int): CelNode! {
+    let t = this.take()
+    let lit = celLiteral(t)
+    if (isSome(lit)) {
+      return unwrap(lit)
+    }
+    match (t.tok) {
+      Ident(name) => return this.parseName(name, t.start)?
+      LParen => return this.parseGroup(depth, t.start)?
+      LBracket => return this.parseList(depth, t.start)?
+      Op(o) => return this.parseOpAtom(o, t)?
+      _ => fail this.unexpected(t)
+    }
+  }
+
+  // `-` before a number literal, which is the only negation a SQL filter has,
+  // and `{`, which would open a map literal.
+  parseOpAtom(o: string, t: CelSpanTok): CelNode! {
+    if (o == "{") {
+      fail celErr("a map or message literal is not supported", t.start)
+    }
+    if (o != "-") {
+      fail this.unexpected(t)
+    }
+    let n = this.take()
+    match (n.tok) {
+      Int(v) => return CelNode{ term = CelTerm.Const(Value.Int(0 - v)), at = t.start }
+      Float(f) => return CelNode{ term = CelTerm.Const(Value.Float(0.0 - f)), at = t.start }
+      _ => fail celErr(
+        "unary '-' only applies to a number literal; arithmetic is not supported",
+        t.start,
+      )
+    }
+  }
+
+  // The `bracket` token for the bracket opened at byte `open`.
+  closeWith(bracket: string, open: int): ()! {
+    let t = this.take()
+    if (!celIsPunct(t.tok, bracket)) {
+      fail celErr(
+        "expected '${bracket}' to close the bracket at byte ${open}, found ${celDescribe(
+          this.src,
+          t,
+        )}",
+        t.start,
+      )
+    }
+  }
+
+  parseGroup(depth: int, open: int): CelNode! {
+    let inner = this.parseExpr(depth + 1)?
+    this.closeWith(")", open)?
+    return inner
+  }
+
+  // `[a, b, ...]` of values; a trailing comma is allowed, as in CEL.
+  parseList(depth: int, open: int): CelNode! {
+    let items = []CelNode(0)
+    while (!celIsPunct(this.peek().tok, "]")) {
+      let item = this.parseUnary(depth + 1)?
+      if (!celIsItem(item)) {
+        fail celErr("a list item must be a literal or a user attribute", item.at)
+      }
+      items = append(items, item)
+      if (!celIsPunct(this.peek().tok, ",")) {
+        break
+      }
+      this.take()
+    }
+    this.closeWith("]", open)?
+    return CelNode{ term = CelTerm.Items(items), at = open }
+  }
+
+  // `resource.<field>`, `user.<attribute>` or a call.
+  parseName(name: string, at: int): CelNode! {
+    if (celIsPunct(this.peek().tok, "(")) {
+      return this.parseCall(name, at)?
+    }
+    if (name != "resource" && name != "user") {
+      fail celErr(
+        "unknown name '${name}'; a condition may only use resource.<field> and user.<attribute>",
+        at,
+      )
+    }
+    if (!celIsPunct(this.peek().tok, ".")) {
+      fail celErr("'${name}' cannot be used bare; write ${name}.<name>", at)
+    }
+    this.take()
+    let sel = this.take()
+    let field = celIdentText(sel.tok)
+    if (field == "") {
+      fail celErr(
+        "expected a name after '${name}.', found ${celDescribe(this.src, sel)}",
+        sel.start,
+      )
+    }
+    if (celIsPunct(this.peek().tok, "(")) {
+      fail celErr(
+        "method call .${field}(...) is not supported; it has no SQL filter form",
+        sel.start,
+      )
+    }
+    if (name == "resource") {
+      return CelNode{ term = CelTerm.Col(field), at = at }
+    }
+    return CelNode{ term = CelTerm.Attr(field), at = at }
+  }
+
+  parseCall(name: string, at: int): CelNode! {
+    if (name != "related") {
+      fail celErr(
+        "function call ${name}(...) is not supported; only related(resource.<field>, \"<relation>\") is",
+        at,
+      )
+    }
+    this.take()
+    let r = this.take()
+    celRelShape(celIdentText(r.tok) == "resource", r)?
+    let d = this.take()
+    celRelShape(celIsPunct(d.tok, "."), d)?
+    let f = this.take()
+    celRelShape(celIdentText(f.tok) != "", f)?
+    let c = this.take()
+    celRelShape(celIsPunct(c.tok, ","), c)?
+    let s = this.take()
+    celRelShape(isSome(celStrText(s.tok)), s)?
+    let e = this.take()
+    celRelShape(celIsPunct(e.tok, ")"), e)?
+    let cond = celRelated(this.w, celIdentText(f.tok), unwrap(celStrText(s.tok)), f.start, s.start)?
+    return CelNode{ term = CelTerm.Test(cond), at = at }
+  }
+}
+
+// The condition the CEL text `src` states for resource `res`, or the
+// InvalidPolicy naming the construct and the byte it starts at.
+export fn condFromCel(res: ResourceInfo, src: string): Cond! {
+  let toks = lexCel(src)?
+  if (len(toks) == 1) {
+    fail celErr("the expression is empty; write true for a condition that always holds", 0)
+  }
+  let w = JsonWalk{ res = res, cols = rowColumns(res.columns), nodes = 0 }
+  let p = CelParser(src, w, toks)
+  let n = p.parseExpr(0)?
+  let end = p.peek()
+  if (!celIsEof(end.tok)) {
+    fail celErr("unexpected ${celDescribe(src, end)}; the expression ends before it", end.start)
+  }
+  return celAsCond(w, n)?
+}

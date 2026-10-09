@@ -1,0 +1,301 @@
+// pkg/authz/celcond.bit — what a parsed CEL expression MEANS: the step from
+// the terms cel.bit reads (a column, a user attribute, a literal, a list, a
+// finished condition) to a `Cond`, checked against the resource exactly as
+// condjson.bit checks a JSON document. The type rules are the same functions
+// (`checkFits`, `orderRefusal`, `nullRefusal`, `noFieldError`, `resolveRelated`),
+// so a value that one front-end refuses the other refuses with the same words;
+// only the position differs: `cel: ... at byte 14`, not `when.views.$lt`.
+//
+// A comparison has a resource column on exactly one side. `3 < resource.views`
+// is read as `resource.views > 3`, so the tree is the one the JSON document
+// `{ "views": { "$gt": 3 } }` gives. Everything a SQL filter cannot hold is
+// refused here by name: a comparison of two columns, of two user attributes
+// or of two literals, a comparison of a boolean expression, a list anywhere
+// but after `in`.
+
+// One parsed piece of an expression and the byte it starts at.
+class CelNode {
+  term: CelTerm,
+  at: int,
+}
+
+// What a piece is. `Col` is `resource.<name>`, `Attr` is `user.<path>`; `Test`
+// is a finished boolean expression (`a == 1`, `!b`, `related(...)`).
+enum CelTerm {
+  Col(string),
+  Attr(string),
+  Const(Value),
+  NullLit,
+  Items([]CelNode),
+  Test(Cond),
+}
+
+const policyPrefix: string = "invalid policy: "
+
+// The reason inside a shared check's refusal: `message()` without the
+// "invalid policy: " every InvalidPolicy puts in front.
+fn celDetail(msg: string): string {
+  if (hasPrefix(msg, policyPrefix)) {
+    return msg[len(policyPrefix):]
+  }
+  return msg
+}
+
+fn isCol(n: CelNode): bool {
+  return match (n.term) {
+    Col(_) => true
+    _ => false
+  }
+}
+
+fn isAttr(n: CelNode): bool {
+  return match (n.term) {
+    Attr(_) => true
+    _ => false
+  }
+}
+
+fn colName(n: CelNode): string {
+  return match (n.term) {
+    Col(name) => name
+    _ => ""
+  }
+}
+
+// What a piece is called in a message.
+fn celKind(n: CelNode): string {
+  return match (n.term) {
+    Col(name) => "resource.${name}"
+    Attr(path) => "user.${path}"
+    Const(v) => "a literal (${kindName(v)})"
+    NullLit => "null"
+    Items(_) => "a list"
+    Test(_) => "a boolean expression"
+  }
+}
+
+// The row column `field` names, or the refusal that says why it is none.
+fn celColumn(w: JsonWalk, field: string, at: int): FieldDesc! {
+  let col = columnOf(w.cols, field)
+  if (isSome(col)) {
+    return unwrap(col)
+  }
+  if (isSome(columnOf(w.res.columns, field))) {
+    fail celErr(
+      "resource.${field} is not a plain column; test a relation with related(resource.${field}, \"<relation>\")",
+      at,
+    )
+  }
+  fail celErr(noFieldError(w.res, w.cols, field, "").detail, at)
+}
+
+// `related(resource.<field>, "<relation>")`.
+fn celRelated(w: JsonWalk, field: string, relation: string, fieldAt: int, relAt: int): Cond! {
+  if (relation == "") {
+    fail celErr("related() needs a relation name", relAt)
+  }
+  if (!isSome(columnOf(w.res.columns, field))) {
+    fail celErr(noFieldError(w.res, w.res.columns, field, "").detail, fieldAt)
+  }
+  return resolveRelated(w.res.columns, w.res.name, field, relation) catch e {
+    fail celErr(celDetail(e.message()), fieldAt)
+  }
+}
+
+// `resource.<field>` on its own, as a condition: the field must be a bool.
+fn celBoolCol(w: JsonWalk, name: string, at: int): Cond! {
+  let f = celColumn(w, name, at)?
+  if (unwrap(columnKind(f.typeName)) != ColKind.Bool) {
+    fail celErr(
+      "resource.${name} is ${f.typeName}, not a bool; compare it with a value (resource.${name} == ...)",
+      at,
+    )
+  }
+  return eq(name, Value.Bool(true))
+}
+
+// A literal as a condition: only the constants `true` and `false`.
+fn celConstCond(v: Value, at: int): Cond! {
+  match (v) {
+    Bool(b) => {
+      if (b) {
+        return Cond.True
+      }
+      return Cond.False
+    }
+    _ => fail celErr("expected a condition, found ${kindName(v)}", at)
+  }
+}
+
+// `n` where a condition is needed: a finished one, `true` / `false`, or a bare
+// bool column (`resource.published` is `resource.published == true`).
+fn celAsCond(w: JsonWalk, n: CelNode): Cond! {
+  match (n.term) {
+    Test(c) => return c
+    Const(v) => return celConstCond(v, n.at)?
+    Col(name) => return celBoolCol(w, name, n.at)?
+    Attr(path) => fail celErr(
+      "user.${path} is not a condition; compare it with a resource field (resource.<field> == user.${path})",
+      n.at,
+    )
+    _ => fail celErr("expected a condition, found ${celKind(n)}", n.at)
+  }
+}
+
+// `a < b` seen from the other side: `b > a`.
+fn celMirror(op: Op): Op {
+  return match (op) {
+    Lt => Op.Gt
+    Lte => Op.Gte
+    Gt => Op.Lt
+    Gte => Op.Lte
+    _ => op
+  }
+}
+
+// `field == null` / `field != null`; any other comparison with null never
+// holds, so it is refused as in condjson.bit.
+fn celNull(f: FieldDesc, op: Op, at: int): Cond! {
+  if (!isOptionType(f.typeName)) {
+    fail celErr(nullRefusal(f, "").detail, at)
+  }
+  if (op == Op.Eq) {
+    return eqNull(f.name)
+  }
+  if (op == Op.Ne) {
+    return neNull(f.name)
+  }
+  fail celErr(
+    "field ${f.name}: comparing with null is never true (test for it with == null or != null)",
+    at,
+  )
+}
+
+// The operand a literal, a user attribute or null stands for in a comparison
+// with `f`; `null` is refused here, the caller handles the null test itself.
+fn celOperand(f: FieldDesc, v: CelNode): Operand! {
+  match (v.term) {
+    Attr(path) => return Operand.Param(path)
+    Const(lit) => {
+      checkFits(f, lit, "") catch e {
+        fail celErr(celDetail(e.message()), v.at)
+      }
+      return Operand.Lit(lit)
+    }
+    _ => fail celErr("field ${f.name}: expected a value, found ${celKind(v)}", v.at)
+  }
+}
+
+// `field <op> value`, the column on the left.
+fn celCmp(w: JsonWalk, col: CelNode, op: Op, opAt: int, v: CelNode): Cond! {
+  let f = celColumn(w, colName(col), col.at)?
+  let kind = unwrap(columnKind(f.typeName))
+  if (isOrdering(op) && (!orderable(kind) || isEnumField(f))) {
+    fail celErr(orderRefusal(f, "").detail, opAt)
+  }
+  match (v.term) {
+    NullLit => return celNull(f, op, v.at)?
+    _ => return Cond.Cmp(f.name, op, [celOperand(f, v)?])
+  }
+}
+
+// `field in [a, b]` or `field in user.roles`.
+fn celIn(w: JsonWalk, col: CelNode, list: CelNode): Cond! {
+  let f = celColumn(w, colName(col), col.at)?
+  let items = []CelNode(0)
+  match (list.term) {
+    Items(xs) => { items = xs }
+    _ => items = [list]
+  }
+  if (len(items) == 0) {
+    fail celErr("'in' needs at least one value", list.at)
+  }
+  let operands = []Operand(0)
+  for item of items {
+    if (isNullLit(item)) {
+      fail celErr(
+        "field ${f.name}: comparing with null is never true (test for it with == null or != null)",
+        item.at,
+      )
+    }
+    operands = append(operands, celOperand(f, item)?)
+  }
+  return Cond.Cmp(f.name, Op.In, operands)
+}
+
+fn isNullLit(n: CelNode): bool {
+  return match (n.term) {
+    NullLit => true
+    _ => false
+  }
+}
+
+fn isListOrAttr(n: CelNode): bool {
+  return match (n.term) {
+    Items(_) => true
+    Attr(_) => true
+    _ => false
+  }
+}
+
+// The refusal for a comparison with no resource column in it.
+fn celNoColumn(l: CelNode, r: CelNode): InvalidPolicy {
+  if (isAttr(l) && isAttr(r)) {
+    return celErr(
+      "comparing ${celKind(l)} with ${celKind(r)} does not involve the resource; compare a user attribute with a resource field",
+      l.at,
+    )
+  }
+  if (isAttr(l) || isAttr(r)) {
+    return celErr(
+      "a user attribute must be compared with a resource field (resource.<field> == user.<attribute>)",
+      l.at,
+    )
+  }
+  return celErr("a comparison of two literals is a constant; write true or false", l.at)
+}
+
+// Both sides must be values: not a finished condition, and a list only after `in`.
+fn celSidesOk(l: CelNode, op: Op, r: CelNode): ()! {
+  for n of [l, r] {
+    match (n.term) {
+      Test(_) => fail celErr(
+        "a boolean expression cannot be compared; use && || ! on it, or compare the field itself (resource.<field> == true)",
+        n.at,
+      )
+      Items(_) => {
+        if (op != Op.In) {
+          fail celErr("a list literal can only follow 'in'", n.at)
+        }
+      }
+      _ => {}
+    }
+  }
+}
+
+// `l <op> r` for the operator at byte `opAt`.
+fn celCompare(w: JsonWalk, l: CelNode, op: Op, opAt: int, r: CelNode): Cond! {
+  celSidesOk(l, op, r)?
+  if (op == Op.In) {
+    if (!isCol(l)) {
+      fail celErr("'in' tests a resource field: write resource.<field> in [...]", l.at)
+    }
+    if (!isListOrAttr(r)) {
+      fail celErr("'in' needs a list [...] or user.roles on the right, found ${celKind(r)}", r.at)
+    }
+    return celIn(w, l, r)?
+  }
+  if (isCol(l) && isCol(r)) {
+    fail celErr(
+      "comparing ${celKind(l)} with ${celKind(r)} has no SQL filter form; compare a field with a value",
+      l.at,
+    )
+  }
+  if (isCol(l)) {
+    return celCmp(w, l, op, opAt, r)?
+  }
+  if (isCol(r)) {
+    return celCmp(w, r, celMirror(op), opAt, l)?
+  }
+  fail celNoColumn(l, r)
+}
