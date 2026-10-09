@@ -464,6 +464,42 @@ bb0(%0: []i32, %1: i64, %2: i64):
   expect "" "$(explainMismatch "$rr_o" "$rr_o" ir)" "ir: a []rune call that stayed a byte range is not explained"
   expect "" "$(explainMismatch "$rr_o" "${rr_b/\(%0, %1, %2\)/(%0, %2, %1)}" ir)" "ir: a range call with swapped bounds"
 
+  # 6681-multi-assign-oracle-omits-function: the oracle emits no function for a refused construct.
+  om_main='func main() void {
+bb0():
+  %0 = call @swaps() void
+  ret
+}'
+  om_swaps='func swaps() void {
+bb0():
+  %0 = const_int i64 1
+  ret
+}'
+  om_o="$om_main"
+  om_t="$om_swaps
+
+$om_main"
+  expect "6681-multi-assign-oracle-omits-function" "$(explainMismatch "$om_o" "$om_t" ir)" "ir: a called function the oracle omitted"
+  expect "6681-multi-assign-oracle-omits-function" "$(explainMismatch "$om_o" "$om_t" iropt)" "iropt: a called function the oracle omitted"
+  expect "" "$(explainMismatch "$om_o" "$(printf '%s\n' "$om_t" | sed 's/call @swaps/call @other/')" ir)" "ir: a present function also differs (its callee changed)"
+  om_t_diff="$om_swaps
+
+${om_main/ret/%1 = const_int i64 2
+  ret}"
+  expect "" "$(explainMismatch "$om_o" "$om_t_diff" iropt)" "iropt: a present function also differs (an extra line)"
+  expect "" "$(explainMismatch "$om_o" "${om_swaps//swaps/ghost}
+
+$om_t" iropt)" "iropt: a second omitted function that the oracle never calls"
+  om_present='func swaps() void {
+bb0():
+  %0 = rt_call g() void
+  ret
+}'
+  expect "" "$(explainMismatch "$om_present
+
+$om_main" "$om_t" ir)" "ir: the function is present in the oracle with another body"
+  expect "" "$(explainMismatch "$om_t" "$om_o" ir)" "ir: the oracle has a function the tree lacks"
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever

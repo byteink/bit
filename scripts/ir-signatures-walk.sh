@@ -680,6 +680,39 @@ explainIrLagPin() {
   [ -n "${o}" ] && [ "${o}" = "${t}" ] && awk 'BEGIN { print "7574-f32-store-schedule-lag" }'
 }
 
+# irDropOmitted <oracle_text> <bit2_text> -- the tree dump without the functions the oracle never
+# emitted. A function is dropped only when its name is absent from the oracle dump's function list AND
+# the oracle dump still calls it (`@name(`): the oracle lowered the caller and refused the callee, so
+# the call is the evidence that the function exists and was left out. Prints nothing when no function
+# qualifies; a tree function that does not meet both tests stays and so keeps the file unexplained.
+irDropOmitted() {
+  printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2" | LC_ALL=C awk '
+    function fname(l) { sub(/^func /, "", l); sub(/\(.*$/, "", l); return l }
+    /^@@@BIT2@@@$/ { second = 1; next }
+    !second {
+      if ($0 ~ /^func /) { have[fname($0)] = 1 }
+      s = $0
+      while (match(s, /@[^ (]+\(/)) { called[substr(s, RSTART + 1, RLENGTH - 2)] = 1; s = substr(s, RSTART + RLENGTH) }
+      next
+    }
+    /^func / { n = fname($0); skip = (!(n in have) && (n in called)); dropped += skip }
+    !skip { print }
+    END { if (dropped == 0) { exit 1 } }'
+}
+
+# explainOmittedFunctions <oracle_text> <bit2_text> -- #6681: the pinned stage0 refuses a multi-target
+# assignment with an index or field target (E0092 "cannot lower a multi-target assignment this lowerer
+# does not yet handle") and `--dump-ir`/`--dump-ir-pre` then print the rest of the file with no
+# diagnostic and exit 0, leaving out every function holding one while its callers still call it.
+# Prints the signature when, with exactly those functions removed from the tree dump, the two dumps are
+# byte-equal. Any difference in a function both emitted, or a tree function that is not called from the
+# oracle dump, keeps the file unexplained.
+explainOmittedFunctions() {
+  local t
+  t=$(irDropOmitted "$1" "$2") || return 1
+  [ "$(canon_ir_ids "$1")" = "$(canon_ir_ids "$t")" ] && awk 'BEGIN { print "6681-multi-assign-oracle-omits-function" }'
+}
+
 # explainIrLag <oracle_text> <bit2_text> -- prints the signature name and returns 0 when the two
 # dumps agree after normalization, prints nothing and returns 1 otherwise. The trials run from the
 # narrowest rewrite set to the widest and the first that agrees names the file: halfword alone is
@@ -694,6 +727,7 @@ explainIrLag() {
   irTrial "$1" "$2" 1 1 0 narrow && return 0
   irTrial "$1" "$2" 0 0 1 rune && return 0
   irTrial "$1" "$2" 1 1 1 rune && return 0
+  explainOmittedFunctions "$1" "$2" && return 0
   [ "$3" = iropt ] || return 1
   irTrial "$1" "$2" 0 0 0 cse 1 && return 0
   irTrial "$1" "$2" 1 1 0 cse 1 && return 0
