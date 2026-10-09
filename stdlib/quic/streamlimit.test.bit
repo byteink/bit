@@ -1,0 +1,150 @@
+// stdlib/quic/streamlimit.test.bit — the stream-count limit a peer advertises in
+// initial_max_streams_bidi binds BOTH ends (RFC 9000 §4.6), #7742.
+//
+// Until #7742 only the client adopted the server's limit
+// (`quicconnReadPeerParams`, handshake.bit); a server kept the placeholder
+// `quicconnDefaultPeerMaxStreams` and opened as many streams as it liked, and
+// the client then closed the connection with STREAM_LIMIT_ERROR. Two halves:
+//
+//   * a server's 17th `openStream` against a client that advertised 16 is
+//     refused locally and nothing reaches the wire;
+//   * a peer that DOES break the limit is closed by the client at once with the
+//     first 16 delivered intact (#3247). That peer must not go through
+//     `Conn.openStream`, which now refuses, so it is a server whose own gate is
+//     lifted back to the placeholder through the state `quicconnAcceptState`
+//     (api.bit) hands back. This used to be the quicconn import program's
+//     streamlimitinbound scenario, which could only reach a violation through
+//     the very gap #7742 closes.
+//
+// `quicAcceptClientConfig` (accept.test.bit), `quicRefusalCertPem` and
+// `quicRefusalKeyPem` (listener.test.bit) are module siblings, as are
+// `monotonic`/`since` (conn.bit, listener.test.bit imports).
+
+const quicSlAdvertised: int = 16
+const quicSlTotal: int = 20
+const quicSlIdleNs: int = 500000000
+
+fn quicSlTryOpen(conn: Conn): string {
+  let _ = conn.openStream() catch e {
+    return e.message()
+  }
+  return ""
+}
+
+// Open the client's whole advertised allowance, then report "opened:message" for
+// the one past it, and stay up until the client has read the answer and closed.
+fn quicSlRefusedServer(sock: UdpSocket, resultCh: chan<string>) {
+  let conn = acceptQuic(sock, quicRefusalCertPem(), quicRefusalKeyPem()) catch _ {
+    resultCh <- "handshake-failed"
+    return
+  }
+  let opened = 0
+  while (opened < quicSlAdvertised) {
+    let _ = conn.openStream() catch e {
+      resultCh <- "open-failed:${opened}:${e.message()}"
+      return
+    }
+    opened = opened + 1
+  }
+  resultCh <- "${opened}:${quicSlTryOpen(conn)}"
+  <- conn.doneCh
+}
+
+test "a server's openStream past the client's initial_max_streams_bidi is refused locally" {
+  let srv = udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind: ${e.message()}")
+    return
+  }
+  let port = srv.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let res = chan<string>(1)
+  spawn quicSlRefusedServer(srv, res)
+  let conn = dialQuicTls("127.0.0.1", port, "localhost", quicAcceptClientConfig()) catch e {
+    assert(false, "dialQuicTls: ${e.message()}")
+    return
+  }
+  let got = <- res
+  conn.close()
+  assert(
+    got == "16:quic: peer stream limit reached",
+    "server saw '${got}', want the 16 allowed opens then the stream-limit error",
+  )
+}
+
+// A server whose limit is lifted past what the client advertised: the only way
+// left to put a STREAM frame for a stream the client has no room for on the wire.
+// `finish` (not a bare `write`) is what yields: the default one-worker runtime
+// would otherwise let this loop starve the client's own threads.
+fn quicSlViolatingServer(sock: UdpSocket) {
+  let st = quicconnAcceptState(sock, quicRefusalCertPem(), quicRefusalKeyPem()) catch _ {
+    return
+  }
+  st.peerMaxStreamsBidi = quicconnDefaultPeerMaxStreams
+  let conn = quicconnConnOf(st)
+  let i = 0
+  while (i < quicSlTotal) {
+    let s = conn.openStream() catch _ {
+      return
+    }
+    s.write([]byte("x")) catch _ {
+      return
+    }
+    s.finish() catch _ {
+      return
+    }
+    i = i + 1
+  }
+}
+
+test "a peer past the client's advertised stream limit is closed at once, the first 16 intact" {
+  let srv = udpBind("127.0.0.1", 0) catch e {
+    assert(false, "udpBind: ${e.message()}")
+    return
+  }
+  let port = srv.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  spawn quicSlViolatingServer(srv)
+  let conn = dialQuicTls("127.0.0.1", port, "localhost", quicAcceptClientConfig()) catch e {
+    assert(false, "dialQuicTls: ${e.message()}")
+    return
+  }
+  conn.setIdleTimeout(quicSlIdleNs)
+  let held = conn.acceptStream() catch e {
+    assert(false, "acceptStream: ${e.message()}")
+    return
+  }
+  let first = held.read() catch e {
+    assert(false, "read: ${e.message()}")
+    return
+  }
+  assert(len(first.data) == 1, "first stream carried ${len(first.data)} bytes")
+  let j = 1
+  while (j < quicSlAdvertised) {
+    let s = conn.acceptStream() catch e {
+      assert(false, "acceptStream #${j}: ${e.message()}")
+      return
+    }
+    let chunk = s.read() catch e {
+      assert(false, "read #${j}: ${e.message()}")
+      return
+    }
+    assert(len(chunk.data) == 1, "stream #${j} carried ${len(chunk.data)} bytes")
+    j = j + 1
+  }
+  let start = monotonic()
+  let closed = false
+  let guard = 0
+  while (!closed && guard < 100000) {
+    guard = guard + 1
+    let _ = held.read() catch _ {
+      closed = true
+      continue
+    }
+  }
+  assert(closed, "the connection never closed")
+  assert(since(start) < quicSlIdleNs, "closed by the idle timeout, not by the violating frame")
+}
