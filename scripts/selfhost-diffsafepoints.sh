@@ -35,6 +35,8 @@ set -u
 . "$(dirname -- "$0")/alarmrun.sh"
 # shellcheck source=scripts/diffexit.sh
 . "$(dirname -- "$0")/diffexit.sh"
+# shellcheck source=scripts/selfhost-ir-signatures.sh
+. "$(dirname -- "$0")/selfhost-ir-signatures.sh"
 
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
@@ -228,6 +230,11 @@ echo "self-test: plain-loop safepoint count — seed=$st_seed self=$st_self"
 # delta goes to zero and this signature stops matching anything. Delete it then,
 # exactly as scripts/selfhost-diffall.absent's header says of its own entries.
 
+# SECOND SIGNATURE, 7745-loop-defer-stack (#7762): explainLoopDeferPolls
+# (scripts/selfhost-ir-signatures.sh, fixtures in its selfcheck) explains an extra poll per
+# defer-stack pop loop (the back edge) and nothing else; it retires at the repin its header names.
+# explainSafepoint tries both; explainSafepointDelta stays the 4500 signature alone.
+
 # explainSafepointDelta <oracle_ir_text> <bit2_ir_text> <seed_count> <self_count>
 # Prints the name of the registered signature that explains the divergence and
 # returns 0, or prints nothing and returns 1 if none does. Takes TEXT rather
@@ -262,6 +269,8 @@ explainSafepointDelta() {
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
 }
 
+explainSafepoint() { explainSafepointDelta "$@" || explainLoopDeferPolls "$@"; }
+
 # --- self-test: prove the signature REFUSES, not only accepts -----------------
 # A signature that explained everything would be the mute button #1883 deleted,
 # and a green run under it would be vacuous exactly as a zero-counting objdump
@@ -288,7 +297,7 @@ sigfail=0
 # $4=bit2 text  $5=seed  $6=self
 sigcheck() {
   local want=$1 name=$2 got rc
-  got=$(explainSafepointDelta "$3" "$4" "$5" "$6")
+  got=$(explainSafepoint "$3" "$4" "$5" "$6")
   rc=$?
   if [ "$got" != "$want" ]; then
     echo "FATAL: signature self-test '$name': got '$got' (rc=$rc), want '$want'" >&2
@@ -339,7 +348,7 @@ safepointSignature() {
   if [ "$rc" -ne 0 ]; then
     return 1
   fi
-  explainSafepointDelta "$(cat "$sig_cap_oracle")" "$(cat "$sig_cap_bit2")" "$2" "$3"
+  explainSafepoint "$(cat "$sig_cap_oracle")" "$(cat "$sig_cap_bit2")" "$2" "$3"
 }
 
 # --- the differential ---------------------------------------------------------

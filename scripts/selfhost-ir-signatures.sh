@@ -404,6 +404,39 @@ explainLoopDeferStack() {
   printf '%s\n@@@BIT2@@@\n%s\n' "$(canon_ir_ids "$1")" "$(canon_ir_ids "$2")" | LC_ALL=C awk "${IR_LOOPDEFER_AWK}"
 }
 
+# explainLoopDeferPolls <oracle_ir> <bit2_ir> <seed_count> <self_count> -- the 7745 entry above,
+# read by scripts/selfhost-diffsafepoints.sh for an EXTRA-SAFEPOINT divergence. Prints the signature
+# and returns 0 only when explainLoopDeferStack holds (so the dumps differ in the stack-mode
+# functions and their thunks only) AND, summed over the stack-mode functions, with
+# d = self - seed and P = the added `rt_call slice_get` (one per pop loop, `slice_len` down to 0):
+#   d > 0 and P == d     every extra poll is a pop loop's back edge, and each loop adds one
+#   added call_value == P   each loop body makes exactly one deferred call
+#   added icmp_sgt == P     each loop has exactly one header comparison
+# The pushes add none: `make_closure` and `slice_append` carry no back edge, so a closure
+# allocation per defer is not a poll. A poll with no pop loop (d > P), a pop loop that lost its
+# poll (d < P), or a missing safepoint (d < 0) is refused. Retires with the 7745 entry above.
+explainLoopDeferPolls() {
+  explainLoopDeferStack "$1" "$2" >/dev/null || return 1
+  printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2" | LC_ALL=C awk -v d="$(($4 - $3))" '
+function bump(k) {
+  if ($0 ~ /rt_call slice_get\(/) { N[k, "get"]++ }
+  else if ($0 ~ / call_value /)    { N[k, "val"]++ }
+  else if ($0 ~ / icmp_sgt /)      { N[k, "sgt"]++ }
+  else if (side == 1 && $0 ~ /make_closure @defer\$thunk\$/) { S[cur] = 1 }
+}
+$0 == "@@@BIT2@@@" { side = 1; cur = ""; next }
+/^func / { cur = $2; sub(/\(.*$/, "", cur); next }
+cur != "" { bump(side SUBSEP cur) }
+END {
+  split("get val sgt", K, " ")
+  for (f in S) {
+    for (i = 1; i <= 3; i++) { delta[K[i]] += N[1 SUBSEP f, K[i]] - N[0 SUBSEP f, K[i]] }
+  }
+  if (d > 0 && delta["get"] == d && delta["val"] == d && delta["sgt"] == d) { print "7745-loop-defer-stack"; exit 0 }
+  exit 1
+}'
+}
+
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Only 7745-loop-defer-stack is
