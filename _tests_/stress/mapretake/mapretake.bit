@@ -1,0 +1,119 @@
+// #7784: a map filled by worker 0 while it is the ONLY worker, whose second
+// worker is then started by the monitor's retake while worker 0 sits in a
+// syscall bracket, must read correctly on that second worker.
+//
+// Default pool, one worker at boot, so `mapPeers` is 0 and `mapCtrlPublish`
+// stores ctrl tags plain. `writer` fills `before` (keys 1..perRound), then
+// blocks its worker's OS thread in a `bit_rt_gc_syscall_begin`/`_end` bracket,
+// the shape ../schedretake uses to make the retake start worker 1. `reader`,
+// queued behind it, runs on that new worker during the sleep and checks every
+// key of `before`: the plain stores precede the bracket's state store, which
+// the monitor read before it created the thread. After the bracket, `writer`
+// fills fresh maps while `reader` polls the key being inserted, mapvis-style:
+// worker 0 has read `mapPeers` = 1 since its fenced bracket exit, so these
+// tags are release stores. Valid reads are ok=false or v == key * 10 + 1.
+//
+// `early=false` means the reader did not run during the sleep (no retake), and
+// `concurrent=false` means no read overlapped an insert; either fails the
+// `.expected` like a wrong value would.
+//
+// `reader` is spawned by `writer` right before the bracket, so it can only run
+// once `before` is full, on whichever worker the retake starts.
+
+extern fn bit_rt_gc_syscall_begin()
+extern fn bit_rt_gc_syscall_end()
+extern fn bit_rt_port_park_sleep_ns(ns: int, scratch: *i64)
+
+const perRound: int = 20000
+const rounds: int = 200
+const blockNs: int = 300000000
+
+let blockScratch: [2]i64
+
+fn fill(m: map<int, int>, fp: *i64) {
+  for (let k = 1; k <= perRound; k++) {
+    atomicStore(fp + 1, k)
+    m[k] = k * 10 + 1
+  }
+}
+
+// flags words: [0] the round being filled (negated once done), [1] the key
+// the next insert writes, [2] 1 while `writer` is inside its bracket, [3] the
+// last round `reader` finished. Phase two hands off by spinning, not through a
+// channel: a channel wake queues the woken task on the waker's worker, which
+// put both tasks on worker 0 and left no read overlapping an insert.
+fn writer(before: map<int, int>, cur: []map<int, int>, flags: []i64, out: chan<[]int>) {
+  let fp = ptrOf(flags)
+  fill(before, fp)
+  atomicStore(fp + 2, 1)
+  spawn reader(before, cur, flags, out)
+  bit_rt_gc_syscall_begin()
+  bit_rt_port_park_sleep_ns(blockNs, ptrOf(blockScratch))
+  bit_rt_gc_syscall_end()
+  atomicStore(fp + 2, 0)
+  for (let r = 1; r <= rounds; r++) {
+    cur[0] = map<int, int>(perRound)
+    atomicStore(fp + 1, 0)
+    atomicStore(fp, r)
+    fill(cur[0], fp)
+    atomicStore(fp, -r)
+    while (atomicLoad(fp + 3) != r) {}
+  }
+}
+
+// Every key `writer` inserted before its bracket, read on the retake's worker:
+// the number missing or wrong.
+fn checkBefore(before: map<int, int>): int {
+  let bad = 0
+  for (let k = 1; k <= perRound; k++) {
+    let (v, ok) = before[k]
+    if (!ok || v != k * 10 + 1) {
+      bad = bad + 1
+    }
+  }
+  return bad
+}
+
+// Poll the key being inserted into `m` while round `r` fills.
+fn pollRound(m: map<int, int>, fp: *i64, r: int, counts: []int) {
+  while (atomicLoad(fp) == r) {
+    let k = atomicLoad(fp + 1)
+    if (k == 0) {
+      continue
+    }
+    let (v, ok) = m[k]
+    let p1 = atomicLoad(fp + 1)
+    counts[0] = counts[0] + 1
+    if (ok && v != k * 10 + 1) {
+      counts[1] = counts[1] + 1
+    }
+    if (p1 != k) {
+      counts[3] = counts[3] + 1
+    }
+  }
+}
+
+// counts: [0] reads, [1] wrong, [2] ran inside the bracket, [3] overlapped.
+fn reader(before: map<int, int>, cur: []map<int, int>, flags: []i64, out: chan<[]int>) {
+  let fp = ptrOf(flags)
+  let counts = []int(4)
+  counts[2] = atomicLoad(fp + 2)
+  counts[1] = checkBefore(before)
+  for (let r = 1; r <= rounds; r++) {
+    while (atomicLoad(fp) != r && atomicLoad(fp) != -r) {}
+    pollRound(cur[0], fp, r, counts)
+    atomicStore(fp + 3, r)
+  }
+  out <- counts
+}
+
+fn main() {
+  let flags = []i64(4)
+  let before = map<int, int>(perRound)
+  let cur = []map<int, int>(1)
+  let out = chan<[]int>(1)
+  spawn writer(before, cur, flags, out)
+  let c = <- out
+  eprint("mapretake: reads=${c[0]} overlapped=${c[3]} early=${c[2]} wrong=${c[1]}\n")
+  print("mapretake: early=${c[2] == 1} concurrent=${c[3] > 0} wrong=${c[1]}\n")
+}
