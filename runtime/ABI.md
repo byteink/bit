@@ -2761,7 +2761,10 @@ thread runs the same `schedGrowArm` / `threadStart` / `schedGrowCommit`
 recipe a worker uses (`tryGrowPoolAt`), with the explicit `BIT_WORKERS`
 ceiling widened by the number of blocked workers. `schedMaxWorkers` and
 `scStopping` refuse as ever, and no thread is created while a parked worker
-exists. Measured on darwin arm64 at 23af4e0ca: stranded tasks start 7.1-7.6 ms after spawn
+exists. Before it creates the FIRST peer, the monitor fences and re-reads
+worker 0's state (`rootRetakeConfirm`), and abandons the start unless worker 0
+is still in its bracket: the other half of the plain-store map publish
+(`mapCtrlPublish`, `runtime/root/maptable.bit`, #7784). Measured on darwin arm64 at 23af4e0ca: stranded tasks start 7.1-7.6 ms after spawn
 at the default pool and at `BIT_WORKERS=1` (500 ms before). A syscall that
 is not bracketed is not seen: the collector would already be waiting on that
 thread. The spawn and dispatch paths are unchanged; the monitor's extra work is
