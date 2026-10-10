@@ -1,0 +1,734 @@
+// pkg/redis/timeseries.live.test.bit - `r.timeseries(key)` and
+// `r.timeseriesMulti()` against a real server. `liveUrl`/`liveClient` are
+// `client.live.test.bit`'s own (same module, no import); every test is
+// skipped, and says so, when `REDIS_TEST_URL` is unset.
+// `./make test-package-redis-live` (`_tests_/bit/redislive.bit`) supplies it,
+// against `redis:8.10.2` in a throwaway Docker container, which ships time
+// series built in.
+//
+// Timestamps are fixed small numbers (never the clock), so every bucket and
+// every aggregate below is exact.
+
+fn tsClean(c: Client, keys: []string) {
+  c.del(keys) catch e {
+    panic("del: ${e.message()}")
+  }
+}
+
+fn tsSeries(c: Client, key: string, suite: string, region: string, host: string) {
+  let labels = map<string, string>{ "suite": suite, "region": region, "host": host }
+  c.timeseries(key).create(SeriesOptions{ labels = Option.Some(labels) }) catch e {
+    panic("create ${key}: ${e.message()}")
+  }
+}
+
+fn tsFill(c: Client, key: string, points: []Sample) {
+  let i = 0
+  while (i < len(points)) {
+    c.timeseries(key).add(Stamp.At(points[i].ts), points[i].value) catch e {
+      panic("add ${key}: ${e.message()}")
+    }
+    i = i + 1
+  }
+}
+
+fn tsSample(ts: i64, value: f64): Sample { return Sample{ ts = ts, value = value } }
+
+fn tsRange(c: Client, key: string, opts: RangeOptions): []Sample {
+  return c.timeseries(key).range(Stamp.Oldest, Stamp.Newest, opts) catch e {
+    panic("range ${key}: ${e.message()}")
+  }
+}
+
+fn tsSamplesEq(got: []Sample, want: []Sample): bool {
+  if (len(got) != len(want)) {
+    return false
+  }
+  let i = 0
+  while (i < len(got)) {
+    if (got[i].ts != want[i].ts || got[i].value != want[i].value) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn tsShow(s: []Sample): string {
+  let out = ""
+  let i = 0
+  while (i < len(s)) {
+    out = out + "(${s[i].ts} ${s[i].value}) "
+    i = i + 1
+  }
+  return out
+}
+
+fn tsAssertSamples(what: string, got: []Sample, want: []Sample) {
+  assert(tsSamplesEq(got, want), "${what}: got ${tsShow(got)}, want ${tsShow(want)}")
+}
+
+test "live: create, info and alter round-trip a series' settings and labels" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:ts:settings"
+  tsClean(c, [k])
+  let opts = SeriesOptions{
+    retention = Option.Some(Hour),
+    encoding = Option.Some(Encoding.Uncompressed),
+    chunkSize = Option.Some(1024),
+    duplicatePolicy = Option.Some(DuplicatePolicy.Max),
+    ignore = Option.Some(Ignore{ maxTimeDiff = 10, maxValueDiff = 0.5 }),
+    labels = Option.Some(map<string, string>{ "region": "eu" }),
+  }
+  c.timeseries(k).create(opts) catch e {
+    panic("create: ${e.message()}")
+  }
+  let i = c.timeseries(k).info() catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(i.retention == Hour, "retention = ${i.retention}")
+  assert(i.encoding == Encoding.Uncompressed, "encoding")
+  assert(i.chunkSize == 1024, "chunk size = ${i.chunkSize}")
+  assert(i.ignoreMaxTimeDiff == 10 && i.ignoreMaxValDiff == 0.5, "ignore thresholds")
+  assert(i.labels["region"] == "eu", "label region")
+  assert(i.totalSamples == 0, "a new series is empty")
+  match (i.duplicatePolicy) {
+    Some(p) => assert(p.text() == "MAX", "policy = ${p.text()}")
+    None => panic("the duplicate policy was lost")
+  }
+  match (i.sourceKey) {
+    Some(s) => panic("a plain series has no source, got ${s}")
+    None => {}
+  }
+
+  let dup = false
+  c.timeseries(k).create() catch _ {
+    dup = true
+  }
+  assert(dup, "creating an existing key is the server's error")
+
+  let changed = AlterOptions{
+    retention = Option.Some(2 * Hour),
+    labels = Option.Some(map<string, string>{ "region": "us", "tier": "gold" }),
+  }
+  c.timeseries(k).alter(changed) catch e {
+    panic("alter: ${e.message()}")
+  }
+  let after = c.timeseries(k).info() catch e {
+    panic("info after alter: ${e.message()}")
+  }
+  assert(after.retention == 2 * Hour, "altered retention = ${after.retention}")
+  assert(after.labels["region"] == "us" && after.labels["tier"] == "gold", "altered labels")
+  assert(after.chunkSize == 1024, "alter leaves what it did not name")
+
+  c.timeseries(k).alter(AlterOptions{ labels = Option.Some(map<string, string>()) }) catch e {
+    panic("alter clear: ${e.message()}")
+  }
+  let cleared = c.timeseries(k).info() catch e {
+    panic("info cleared: ${e.message()}")
+  }
+  assert(len(cleared.labels) == 0, "an empty label map removes every label")
+  tsClean(c, [k])
+  c.close()
+}
+
+test "live: add, get, range, revrange, del and the duplicate policy" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:ts:samples"
+  tsClean(c, [k])
+  let empty = c.timeseries(k).get() catch _ {
+    Option.None
+  }
+  assert(!tsSome(empty), "get on a missing key is an error or empty")
+  tsSeries(c, k, "samples", "eu", "a")
+  let none = c.timeseries(k).get() catch e {
+    panic("get empty: ${e.message()}")
+  }
+  assert(!tsSome(none), "an empty series has no newest sample")
+
+  let at = c.timeseries(k).add(Stamp.At(1000), 1.5) catch e {
+    panic("add: ${e.message()}")
+  }
+  assert(at == 1000, "add answers its timestamp, got ${at}")
+  tsFill(
+    c,
+    k,
+    [tsSample(2000, 2.5), tsSample(3000, 3.5), tsSample(4000, 10.0), tsSample(5000, 20.0)],
+  )
+
+  let newest = c.timeseries(k).get() catch e {
+    panic("get: ${e.message()}")
+  }
+  match (newest) {
+    Some(s) => assert(s.ts == 5000 && s.value == 20.0, "newest = ${s.ts} ${s.value}")
+    None => panic("get answered nothing")
+  }
+
+  let all = tsRange(c, k, RangeOptions{})
+  tsAssertSamples(
+    "range",
+    all,
+    [
+      tsSample(1000, 1.5),
+      tsSample(2000, 2.5),
+      tsSample(3000, 3.5),
+      tsSample(4000, 10.0),
+      tsSample(5000, 20.0),
+    ],
+  )
+  let two = tsRange(c, k, RangeOptions{ count = 2 })
+  tsAssertSamples("count", two, [tsSample(1000, 1.5), tsSample(2000, 2.5)])
+  let pick = tsRange(c, k, RangeOptions{ onlyTs = [2000, 4000] })
+  tsAssertSamples("filter by ts", pick, [tsSample(2000, 2.5), tsSample(4000, 10.0)])
+  let big = tsRange(
+    c,
+    k,
+    RangeOptions{ valueRange = Option.Some(ValueRange{ min = 5.0, max = 15.0 }) },
+  )
+  tsAssertSamples("filter by value", big, [tsSample(4000, 10.0)])
+  let window = c.timeseries(k).range(Stamp.At(2000), Stamp.At(3000)) catch e {
+    panic("window: ${e.message()}")
+  }
+  tsAssertSamples("window", window, [tsSample(2000, 2.5), tsSample(3000, 3.5)])
+  let rev = c.timeseries(k).revrange(Stamp.Oldest, Stamp.Newest, RangeOptions{ count = 2 }) catch e {
+    panic("revrange: ${e.message()}")
+  }
+  tsAssertSamples("revrange", rev, [tsSample(5000, 20.0), tsSample(4000, 10.0)])
+
+  let blocked = false
+  c.timeseries(k).add(Stamp.At(1000), 9.0) catch _ {
+    blocked = true
+  }
+  assert(blocked, "the default policy blocks a duplicate")
+  let summed = c.timeseries(k).add(
+    Stamp.At(1000),
+    9.0,
+    SeriesOptions{},
+    Option.Some(DuplicatePolicy.Sum),
+  ) catch e {
+    panic("add sum: ${e.message()}")
+  }
+  assert(summed == 1000, "on-duplicate sum stores at the same timestamp")
+  let first = tsRange(c, k, RangeOptions{ count = 1 })
+  tsAssertSamples("summed", first, [tsSample(1000, 10.5)])
+
+  let removed = c.timeseries(k).del(Stamp.At(2000), Stamp.At(4000)) catch e {
+    panic("del: ${e.message()}")
+  }
+  assert(removed == 3, "del removed ${removed}")
+  tsAssertSamples(
+    "after del",
+    tsRange(c, k, RangeOptions{}),
+    [tsSample(1000, 10.5), tsSample(5000, 20.0)],
+  )
+
+  let auto = c.timeseries(k).add(Stamp.Auto, 1.0) catch e {
+    panic("add auto: ${e.message()}")
+  }
+  assert(auto > 5000, "the server stamped the sample, got ${auto}")
+  tsClean(c, [k])
+  c.close()
+}
+
+test "live: incrBy and decrBy adjust the newest value and create the series" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:ts:counter"
+  tsClean(c, [k])
+  let labels = map<string, string>{ "kind": "hits" }
+  let made = c.timeseries(k).incrBy(
+    5.0,
+    Stamp.At(1000),
+    SeriesOptions{ labels = Option.Some(labels) },
+  ) catch e {
+    panic("incrBy creating: ${e.message()}")
+  }
+  assert(made == 1000, "incrBy answers its timestamp")
+  c.timeseries(k).incrBy(2.0, Stamp.At(2000)) catch e {
+    panic("incrBy: ${e.message()}")
+  }
+  c.timeseries(k).decrBy(3.5, Stamp.At(3000)) catch e {
+    panic("decrBy: ${e.message()}")
+  }
+  tsAssertSamples(
+    "counter",
+    tsRange(c, k, RangeOptions{}),
+    [tsSample(1000, 5.0), tsSample(2000, 7.0), tsSample(3000, 3.5)],
+  )
+  let stamped = c.timeseries(k).incrBy(1.0) catch e {
+    panic("incrBy auto: ${e.message()}")
+  }
+  assert(stamped > 3000, "the server stamped the increment")
+  let info = c.timeseries(k).info() catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(info.labels["kind"] == "hits", "the creating incrBy set the labels")
+  tsClean(c, [k])
+  c.close()
+}
+
+test "live: madd stores several series at once and reports each refusal" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let a = "bit:live:ts:madd:a"
+  let b = "bit:live:ts:madd:b"
+  let plain = "bit:live:ts:madd:plain"
+  tsClean(c, [a, b, plain])
+  tsSeries(c, a, "madd", "eu", "a")
+  tsSeries(c, b, "madd", "eu", "b")
+  let _ = c.set(plain, "text") catch e {
+    panic("set: ${e.message()}")
+  }
+  let got = c.timeseriesMulti().madd(
+    [
+      KeyedSample{ key = a, ts = Stamp.At(1000), value = 1.0 },
+      KeyedSample{ key = b, ts = Stamp.At(1000), value = 2.0 },
+      KeyedSample{ key = plain, ts = Stamp.At(1000), value = 3.0 },
+      KeyedSample{ key = a, ts = Stamp.At(2000), value = 4.0 },
+    ],
+  ) catch e {
+    panic("madd: ${e.message()}")
+  }
+  assert(len(got) == 4, "one result per point, got ${len(got)}")
+  assert(got[0].ts == 1000 && !tsSome(got[0].error), "a@1000 stored")
+  assert(got[1].ts == 1000 && !tsSome(got[1].error), "b@1000 stored")
+  assert(tsSome(got[2].error), "a string key is refused")
+  assert(got[3].ts == 2000 && !tsSome(got[3].error), "a refusal does not stop the next point")
+  tsAssertSamples("a", tsRange(c, a, RangeOptions{}), [tsSample(1000, 1.0), tsSample(2000, 4.0)])
+  tsClean(c, [a, b, plain])
+  c.close()
+}
+
+test "live: an aggregated range buckets, aligns, fills empty buckets and names buckets by start, end or middle" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:ts:agg"
+  tsClean(c, [k])
+  tsSeries(c, k, "agg", "eu", "a")
+  tsFill(
+    c,
+    k,
+    [tsSample(0, 1.0), tsSample(10000, 3.0), tsSample(60000, 10.0), tsSample(240000, 4.0)],
+  )
+  let avg = tsRange(
+    c,
+    k,
+    RangeOptions{ downsample = Option.Some(Downsample{ by = Aggregation.Avg, bucket = Minute }) },
+  )
+  tsAssertSamples(
+    "avg per minute",
+    avg,
+    [tsSample(0, 2.0), tsSample(60000, 10.0), tsSample(240000, 4.0)],
+  )
+
+  let filled = tsRange(
+    c,
+    k,
+    RangeOptions{
+      downsample = Option.Some(Downsample{ by = Aggregation.Count, bucket = Minute, empty = true }),
+    },
+  )
+  assert(len(filled) == 5, "empty buckets are reported, got ${tsShow(filled)}")
+  assert(filled[2].ts == 120000 && filled[2].value == 0.0, "an empty bucket counts 0")
+
+  let mid = tsRange(
+    c,
+    k,
+    RangeOptions{
+      downsample = Option.Some(
+        Downsample{ by = Aggregation.Sum, bucket = Minute, bucketTs = BucketTs.Mid },
+      ),
+    },
+  )
+  assert(mid[0].ts == 30000 && mid[0].value == 4.0, "mid bucket timestamp, got ${tsShow(mid)}")
+  let end = tsRange(
+    c,
+    k,
+    RangeOptions{
+      downsample = Option.Some(
+        Downsample{ by = Aggregation.Sum, bucket = Minute, bucketTs = BucketTs.End },
+      ),
+    },
+  )
+  assert(end[0].ts == 60000, "end bucket timestamp, got ${tsShow(end)}")
+
+  let aligned = c.timeseries(k).range(
+    Stamp.At(5000),
+    Stamp.Newest,
+    RangeOptions{
+      downsample = Option.Some(
+        Downsample{ by = Aggregation.Max, bucket = Minute, align = Option.Some(5000) },
+      ),
+    },
+  ) catch e {
+    panic("aligned: ${e.message()}")
+  }
+  assert(
+    aligned[0].ts == 5000 && aligned[0].value == 10.0,
+    "aligned bucket, got ${tsShow(aligned)}",
+  )
+
+  let rev = c.timeseries(k).revrange(
+    Stamp.Oldest,
+    Stamp.Newest,
+    RangeOptions{
+      downsample = Option.Some(Downsample{ by = Aggregation.Range, bucket = Minute }),
+      count = 1,
+    },
+  ) catch e {
+    panic("revrange agg: ${e.message()}")
+  }
+  tsAssertSamples("newest bucket first", rev, [tsSample(240000, 0.0)])
+  tsClean(c, [k])
+  c.close()
+}
+
+test "live: every aggregator the client names is one the server accepts" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:ts:every"
+  tsClean(c, [k])
+  tsSeries(c, k, "every", "eu", "a")
+  tsFill(c, k, [tsSample(0, 1.0), tsSample(1000, 2.0), tsSample(2000, 6.0)])
+  let all = [
+    Aggregation.Avg,
+    Aggregation.Sum,
+    Aggregation.Min,
+    Aggregation.Max,
+    Aggregation.Range,
+    Aggregation.Count,
+    Aggregation.First,
+    Aggregation.Last,
+    Aggregation.StdP,
+    Aggregation.StdS,
+    Aggregation.VarP,
+    Aggregation.VarS,
+    Aggregation.Twa,
+    Aggregation.CountNan,
+    Aggregation.CountAll,
+  ]
+  let want = [3.0, 9.0, 1.0, 6.0, 5.0, 3.0, 1.0, 6.0]
+  let i = 0
+  while (i < len(all)) {
+    let got = tsRange(
+      c,
+      k,
+      RangeOptions{ downsample = Option.Some(Downsample{ by = all[i], bucket = Minute }) },
+    )
+    let wantLen = 1
+    if (all[i] == Aggregation.CountNan) {
+      wantLen = 0
+    }
+    assert(len(got) == wantLen, "${all[i].text()} answers ${wantLen} bucket, got ${tsShow(got)}")
+    if (i < len(want)) {
+      assert(got[0].value == want[i], "${all[i].text()} = ${got[0].value}, want ${want[i]}")
+    }
+    i = i + 1
+  }
+  tsClean(c, [k])
+  c.close()
+}
+
+fn tsFixture(c: Client, keys: []string, suite: string) {
+  tsClean(c, keys)
+  tsSeries(c, keys[0], suite, "eu", "a")
+  tsSeries(c, keys[1], suite, "eu", "b")
+  tsSeries(c, keys[2], suite, "us", "c")
+  tsFill(c, keys[0], [tsSample(1000, 1.0), tsSample(2000, 2.0), tsSample(61000, 4.0)])
+  tsFill(c, keys[1], [tsSample(1000, 10.0), tsSample(2000, 20.0)])
+  tsFill(c, keys[2], [tsSample(1000, 100.0)])
+}
+
+test "live: queryIndex and mget select series by label filter" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let keys = ["bit:live:ts:m:a", "bit:live:ts:m:b", "bit:live:ts:m:c"]
+  tsFixture(c, keys, "index")
+  let m = c.timeseriesMulti()
+  let suite = label("suite").eq("index")
+
+  let eu = m.queryIndex([suite, label("region").eq("eu"), label("host").oneOf("a", "b")]) catch e {
+    panic("queryIndex: ${e.message()}")
+  }
+  assert(len(eu) == 2, "two series in eu, got ${len(eu)}")
+  let notEu = m.queryIndex([suite, label("host").exists(), label("region").ne("eu")]) catch e {
+    panic("queryIndex ne: ${e.message()}")
+  }
+  assert(len(notEu) == 1 && notEu[0] == keys[2], "only c is outside eu")
+  let none = m.queryIndex([suite, label("host").noneOf("a", "b", "c"), label("region").exists()]) catch e {
+    panic("queryIndex noneOf: ${e.message()}")
+  }
+  assert(len(none) == 0, "no series is left")
+  let raw = m.queryIndex([suite, rawFilter("region=us")]) catch e {
+    panic("queryIndex raw: ${e.message()}")
+  }
+  assert(len(raw) == 1, "the raw filter works")
+
+  let last = m.mget([suite, label("region").eq("eu")], false, LabelsOut.All) catch e {
+    panic("mget: ${e.message()}")
+  }
+  assert(len(last) == 2, "two series, got ${len(last)}")
+  let i = 0
+  while (i < len(last)) {
+    assert(last[i].labels["region"] == "eu", "WITHLABELS carries the labels")
+    match (last[i].sample) {
+      Some(s) => assert(s.ts == 61000 || s.ts == 2000, "newest sample of ${last[i].key}")
+      None => panic("${last[i].key} has samples")
+    }
+    i = i + 1
+  }
+  let picked = m.mget([suite, label("region").eq("us")], false, LabelsOut.Only(["host"])) catch e {
+    panic("mget selected: ${e.message()}")
+  }
+  assert(len(picked) == 1 && picked[0].labels["host"] == "c", "SELECTED_LABELS host")
+  assert(len(picked[0].labels) == 1, "only the selected label")
+  let bare = m.mget([suite, label("region").eq("us")]) catch e {
+    panic("mget bare: ${e.message()}")
+  }
+  assert(len(bare[0].labels) == 0, "no labels unless asked")
+  tsClean(c, keys)
+  c.close()
+}
+
+test "live: mrange and mrevrange filter, aggregate per minute and group by a label" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let keys = ["bit:live:ts:r:a", "bit:live:ts:r:b", "bit:live:ts:r:c"]
+  tsFixture(c, keys, "range")
+  let m = c.timeseriesMulti()
+  let eu = [label("suite").eq("range"), label("region").eq("eu")]
+
+  let raw = m.mrange(Stamp.Oldest, Stamp.Newest, eu) catch e {
+    panic("mrange: ${e.message()}")
+  }
+  assert(len(raw) == 2, "two eu series, got ${len(raw)}")
+  let a = 0
+  if (raw[1].key == keys[0]) {
+    a = 1
+  }
+  assert(raw[a].key == keys[0] && len(raw[a].samples) == 3, "series a has three samples")
+  assert(len(raw[a].labels) == 0, "no labels unless asked")
+
+  let perMinute = MrangeOptions{
+    range = RangeOptions{
+      downsample = Option.Some(Downsample{ by = Aggregation.Sum, bucket = Minute }),
+    },
+    labels = LabelsOut.All,
+  }
+  let agg = m.mrange(Stamp.Oldest, Stamp.Newest, eu, perMinute) catch e {
+    panic("mrange aggregated: ${e.message()}")
+  }
+  assert(len(agg) == 2, "two aggregated series")
+  let j = 0
+  while (j < len(agg)) {
+    assert(agg[j].labels["region"] == "eu", "labels ride along")
+    if (agg[j].key == keys[0]) {
+      tsAssertSamples("a per minute", agg[j].samples, [tsSample(0, 3.0), tsSample(60000, 4.0)])
+    } else {
+      tsAssertSamples("b per minute", agg[j].samples, [tsSample(0, 30.0)])
+    }
+    j = j + 1
+  }
+
+  let grouped = m.mrange(
+    Stamp.Oldest,
+    Stamp.Newest,
+    [label("suite").eq("range"), label("region").exists()],
+    MrangeOptions{
+      range = RangeOptions{
+        downsample = Option.Some(Downsample{ by = Aggregation.Sum, bucket = Minute }),
+      },
+      groupBy = Option.Some(GroupBy{ label = "region", reduce = Aggregation.Sum }),
+    },
+  ) catch e {
+    panic("mrange grouped: ${e.message()}")
+  }
+  assert(len(grouped) == 2, "one group per region, got ${len(grouped)}")
+  let g = 0
+  while (g < len(grouped)) {
+    if (grouped[g].key == "region=eu") {
+      assert(len(grouped[g].sources) == 2, "eu merges two series")
+      tsAssertSamples("eu group", grouped[g].samples, [tsSample(0, 33.0), tsSample(60000, 4.0)])
+    } else {
+      assert(grouped[g].key == "region=us", "the other group is us")
+      tsAssertSamples("us group", grouped[g].samples, [tsSample(0, 100.0)])
+    }
+    g = g + 1
+  }
+
+  let rev = m.mrevrange(
+    Stamp.Oldest,
+    Stamp.Newest,
+    [label("suite").eq("range"), label("host").eq("a")],
+    MrangeOptions{ range = RangeOptions{ count = 1 } },
+  ) catch e {
+    panic("mrevrange: ${e.message()}")
+  }
+  tsAssertSamples("newest first", rev[0].samples, [tsSample(61000, 4.0)])
+
+  let selected = m.mrange(
+    Stamp.Oldest,
+    Stamp.Newest,
+    [label("suite").eq("range"), label("host").eq("c")],
+    MrangeOptions{ labels = LabelsOut.Only(["region"]) },
+  ) catch e {
+    panic("mrange selected: ${e.message()}")
+  }
+  assert(selected[0].labels["region"] == "us" && len(selected[0].labels) == 1, "selected label")
+  tsClean(c, keys)
+  c.close()
+}
+
+test "live: a compaction rule fills the destination, shows in info and stops on deleteRule" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let raw = "bit:live:ts:rule:raw"
+  let perMinute = "bit:live:ts:rule:minute"
+  tsClean(c, [raw, perMinute])
+  tsSeries(c, raw, "rule", "eu", "a")
+  tsSeries(c, perMinute, "rule", "eu", "rollup")
+  c.timeseries(raw).createRule(perMinute, Aggregation.Sum, Minute) catch e {
+    panic("createRule: ${e.message()}")
+  }
+  tsFill(
+    c,
+    raw,
+    [
+      tsSample(1000, 1.0),
+      tsSample(2000, 2.0),
+      tsSample(61000, 4.0),
+      tsSample(62000, 5.0),
+      tsSample(121000, 7.0),
+    ],
+  )
+  tsAssertSamples(
+    "closed buckets",
+    tsRange(c, perMinute, RangeOptions{}),
+    [tsSample(0, 3.0), tsSample(60000, 9.0)],
+  )
+  let open = c.timeseries(perMinute).get(true) catch e {
+    panic("get latest: ${e.message()}")
+  }
+  match (open) {
+    Some(s) => assert(s.ts == 120000 && s.value == 7.0, "open bucket = ${s.ts} ${s.value}")
+    None => panic("latest reports the open bucket")
+  }
+  let withOpen = tsRange(c, perMinute, RangeOptions{ latest = true })
+  assert(len(withOpen) == 3, "latest range includes the open bucket, got ${tsShow(withOpen)}")
+
+  let src = c.timeseries(raw).info() catch e {
+    panic("info source: ${e.message()}")
+  }
+  assert(len(src.rules) == 1, "one rule leaves the source")
+  assert(src.rules[0].dest == perMinute && src.rules[0].bucket == Minute, "rule dest and bucket")
+  assert(src.rules[0].by == Aggregation.Sum && src.rules[0].align == 0, "rule aggregator and align")
+  let dst = c.timeseries(perMinute).info() catch e {
+    panic("info dest: ${e.message()}")
+  }
+  match (dst.sourceKey) {
+    Some(s) => assert(s == raw, "the destination names its source")
+    None => panic("the destination has a source")
+  }
+
+  c.timeseries(raw).deleteRule(perMinute) catch e {
+    panic("deleteRule: ${e.message()}")
+  }
+  let gone = c.timeseries(raw).info() catch e {
+    panic("info after deleteRule: ${e.message()}")
+  }
+  assert(len(gone.rules) == 0, "the rule is gone")
+  tsFill(c, raw, [tsSample(181000, 8.0)])
+  tsAssertSamples(
+    "destination stopped",
+    tsRange(c, perMinute, RangeOptions{}),
+    [tsSample(0, 3.0), tsSample(60000, 9.0)],
+  )
+
+  let aligned = "bit:live:ts:rule:aligned"
+  tsClean(c, [aligned])
+  tsSeries(c, aligned, "rule", "eu", "aligned")
+  c.timeseries(raw).createRule(aligned, Aggregation.Max, Minute, Option.Some(5000)) catch e {
+    panic("createRule aligned: ${e.message()}")
+  }
+  let withAlign = c.timeseries(raw).info() catch e {
+    panic("info aligned: ${e.message()}")
+  }
+  assert(withAlign.rules[0].align == 5000, "the rule's alignment, got ${withAlign.rules[0].align}")
+  tsClean(c, [raw, perMinute, aligned])
+  c.close()
+}
+
+test "live: timeseries commands run in a pipeline through TimeSeriesBatch" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:ts:pipe"
+  tsClean(c, [k])
+  let p = c.pipeline()
+  let q = p.timeseries(k)
+  let made = q.create(SeriesOptions{ labels = Option.Some(map<string, string>{ "kind": "pipe" }) })
+  let a = q.add(Stamp.At(1000), 1.0)
+  let b = q.incrBy(2.0, Stamp.At(2000))
+  let r = q.range(Stamp.Oldest, Stamp.Newest)
+  let g = q.get()
+  let i = q.info()
+  p.exec() catch e {
+    panic("pipeline exec: ${e.message()}")
+  }
+  made.get() catch e {
+    panic("create result: ${e.message()}")
+  }
+  let ra = a.get() catch e {
+    panic("add result: ${e.message()}")
+  }
+  assert(ra == 1000, "queued add answers its timestamp")
+  let rb = b.get() catch e {
+    panic("incrBy result: ${e.message()}")
+  }
+  assert(rb == 2000, "queued incrBy answers its timestamp")
+  let samples = r.get() catch e {
+    panic("range result: ${e.message()}")
+  }
+  tsAssertSamples("queued range", samples, [tsSample(1000, 1.0), tsSample(2000, 3.0)])
+  let newest = g.get() catch e {
+    panic("get result: ${e.message()}")
+  }
+  assert(tsSome(newest), "queued get answers a sample")
+  let info = i.get() catch e {
+    panic("info result: ${e.message()}")
+  }
+  assert(info.labels["kind"] == "pipe", "queued info decodes")
+  tsClean(c, [k])
+  c.close()
+}

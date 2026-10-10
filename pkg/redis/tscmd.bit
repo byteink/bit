@@ -1,0 +1,487 @@
+// pkg/redis/tscmd.bit - one `Cmd<T>` factory per `TS.*` command and the reply
+// decoders they share. Epic #6013, #6028, #6038. Argument lists are
+// `tsargs.bit`'s, the handles that call these are in `timeseries.bit`.
+//
+// THE REPLIES ARE RESP3. `TS.MRANGE`, `TS.MGET` and `TS.INFO` answer maps
+// (series key -> its labels and samples), which RESP2 flattens into arrays of
+// a different nesting. This package negotiates RESP3 (`tx.bit`'s header), so
+// the decoders here read the RESP3 shapes and fail `RedisError.Unexpected`
+// on anything else, naming the command.
+
+import { toLower } from "std/strings"
+
+// ---- argument-only commands -------------------------------------------------
+
+fn tsCreateCmd(key: string, o: SeriesOptions): Cmd<()> {
+  return Cmd<()>{
+    args = append(["TS.CREATE", key], ...seriesArgs(o, Option.None)),
+    decode = (r) => asOk(r, "TS.CREATE"),
+    readOnly = false,
+  }
+}
+
+fn tsAlterCmd(key: string, a: AlterOptions): Cmd<()> {
+  let o = SeriesOptions{
+    retention = a.retention,
+    chunkSize = a.chunkSize,
+    duplicatePolicy = a.duplicatePolicy,
+    ignore = a.ignore,
+    labels = a.labels,
+  }
+  return Cmd<()>{
+    args = append(["TS.ALTER", key], ...seriesArgs(o, Option.None)),
+    decode = (r) => asOk(r, "TS.ALTER"),
+    readOnly = false,
+  }
+}
+
+fn tsAddCmd(
+  key: string,
+  ts: Stamp,
+  value: f64,
+  o: SeriesOptions,
+  onDup: Option<DuplicatePolicy>,
+): Cmd<i64> {
+  return Cmd<i64>{
+    args = append(["TS.ADD", key, ts.text(), "${value}"], ...seriesArgs(o, onDup)),
+    decode = (r) => asInt(r, "TS.ADD"),
+    readOnly = false,
+  }
+}
+
+fn isAuto(ts: Stamp): bool {
+  match (ts) {
+    Auto => return true
+    _ => return false
+  }
+}
+
+// `TS.INCRBY` / `TS.DECRBY`: `TIMESTAMP` is left off for `Stamp.Auto`, which
+// is the server's default.
+fn tsIncrCmd(name: string, key: string, delta: f64, ts: Stamp, o: SeriesOptions): Cmd<i64> {
+  let args = [name, key, "${delta}"]
+  if (!isAuto(ts)) {
+    args = append(append(args, "TIMESTAMP"), ts.text())
+  }
+  return Cmd<i64>{
+    args = append(args, ...seriesArgs(o, Option.None)),
+    decode = (r) => asInt(r, name),
+    readOnly = false,
+  }
+}
+
+fn tsMaddCmd(points: []KeyedSample): Cmd<[]AddResult> {
+  let args = ["TS.MADD"]
+  let i = 0
+  while (i < len(points)) {
+    args = append(append(append(args, points[i].key), points[i].ts.text()), "${points[i].value}")
+    i = i + 1
+  }
+  return Cmd<[]AddResult>{ args = args, decode = (r) => asAddResults(r), readOnly = false }
+}
+
+fn tsDelCmd(key: string, from: Stamp, to: Stamp): Cmd<i64> {
+  return Cmd<i64>{
+    args = ["TS.DEL", key, from.text(), to.text()],
+    decode = (r) => asInt(r, "TS.DEL"),
+    readOnly = false,
+  }
+}
+
+fn tsGetCmd(key: string, latest: bool): Cmd<Option<Sample>> {
+  let args = ["TS.GET", key]
+  if (latest) {
+    args = append(args, "LATEST")
+  }
+  return Cmd<Option<Sample>>{
+    args = args,
+    decode = (r) => asOptSample(r, "TS.GET"),
+    readOnly = true,
+  }
+}
+
+fn tsRangeCmd(name: string, key: string, from: Stamp, to: Stamp, o: RangeOptions): Cmd<[]Sample> {
+  return Cmd<[]Sample>{
+    args = tsRangeArgs(name, key, from, to, o),
+    decode = (r) => asSamples(r, name),
+    readOnly = true,
+  }
+}
+
+fn tsMrangeCmd(
+  name: string,
+  from: Stamp,
+  to: Stamp,
+  filters: []Filter,
+  o: MrangeOptions,
+): Cmd<[]SeriesRange> {
+  return Cmd<[]SeriesRange>{
+    args = mrangeArgs(name, from, to, filters, o),
+    decode = (r) => asSeriesRanges(r, name),
+    readOnly = true,
+  }
+}
+
+fn tsMgetCmd(filters: []Filter, latest: bool, labels: LabelsOut): Cmd<[]SeriesLast> {
+  return Cmd<[]SeriesLast>{
+    args = mgetArgs(filters, latest, labels),
+    decode = (r) => asSeriesLasts(r),
+    readOnly = true,
+  }
+}
+
+fn tsQueryIndexCmd(filters: []Filter): Cmd<[]string> {
+  let args = ["TS.QUERYINDEX"]
+  let i = 0
+  while (i < len(filters)) {
+    args = append(args, filters[i].expr)
+    i = i + 1
+  }
+  return Cmd<[]string>{
+    args = args,
+    decode = (r) => asKeys(r),
+    readOnly = true,
+  }
+}
+
+fn tsInfoCmd(key: string): Cmd<SeriesInfo> {
+  return Cmd<SeriesInfo>{
+    args = ["TS.INFO", key],
+    decode = (r) => asSeriesInfo(r),
+    readOnly = true,
+  }
+}
+
+fn tsCreateRuleCmd(
+  src: string,
+  dest: string,
+  by: Aggregation,
+  bucket: int,
+  align: Option<i64>,
+): Cmd<()> {
+  let args = ["TS.CREATERULE", src, dest, "AGGREGATION", by.text(), "${msCeil(bucket)}"]
+  match (align) {
+    Some(a) => args = append(args, "${a}")
+    None => {}
+  }
+  return Cmd<()>{ args = args, decode = (r) => asOk(r, "TS.CREATERULE"), readOnly = false }
+}
+
+fn tsDeleteRuleCmd(src: string, dest: string): Cmd<()> {
+  return Cmd<()>{
+    args = ["TS.DELETERULE", src, dest],
+    decode = (r) => asOk(r, "TS.DELETERULE"),
+    readOnly = false,
+  }
+}
+
+// `TS.QUERYINDEX` answers a RESP3 set of keys (a RESP2 array).
+fn asKeys(r: Reply): []string!RedisError {
+  match (r) {
+    Set(items) => return stringsFromReplies(items, "TS.QUERYINDEX")?
+    _ => return asStrings(r, "TS.QUERYINDEX")?
+  }
+}
+
+// ---- samples ----------------------------------------------------------------
+
+// A number as `f64`: RESP3 `Double`, a bulk decimal, or an `Int`.
+fn asNumber(r: Reply, cmd: string): f64!RedisError {
+  match (r) {
+    Int(n) => return f64(n)
+    _ => return asDouble(r, cmd)?
+  }
+}
+
+// `[timestamp, value]`.
+fn asSample(r: Reply, cmd: string): Sample!RedisError {
+  let items = replyItems(r, cmd)?
+  if (len(items) != 2) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  return Sample{ ts = asInt(items[0], cmd)?, value = asNumber(items[1], cmd)? }
+}
+
+// `[]` (an empty series) is `None`.
+fn asOptSample(r: Reply, cmd: string): Option<Sample>!RedisError {
+  let items = replyItems(r, cmd)?
+  if (len(items) == 0) {
+    return Option.None
+  }
+  return Option.Some(asSample(r, cmd)?)
+}
+
+fn asSamples(r: Reply, cmd: string): []Sample!RedisError {
+  let items = replyItems(r, cmd)?
+  let out = []Sample(len(items))
+  let i = 0
+  while (i < len(items)) {
+    out[i] = asSample(items[i], cmd)?
+    i = i + 1
+  }
+  return out
+}
+
+// ---- multi-key replies ------------------------------------------------------
+
+fn mapEntries(r: Reply, cmd: string): []MapEntry!RedisError {
+  match (r) {
+    Map(entries) => return entries
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// The `sources` list a `GROUPBY` entry carries between its labels and its
+// samples; empty when the entry has none.
+fn sourcesOf(items: []Reply, cmd: string): []string!RedisError {
+  let i = 1
+  while (i < len(items) - 1) {
+    match (items[i]) {
+      Map(m) => {
+        if (len(m) > 0 && replyToString(m[0].key, cmd)? == "sources") {
+          return asStrings(m[0].value, cmd)?
+        }
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  return []string(0)
+}
+
+// `key -> [labels, metadata.., samples]`.
+fn asSeriesRange(key: Reply, value: Reply, cmd: string): SeriesRange!RedisError {
+  let items = replyItems(value, cmd)?
+  if (len(items) < 2) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  return SeriesRange{
+    key = replyToString(key, cmd)?,
+    labels = asMap(items[0], cmd)?,
+    sources = sourcesOf(items, cmd)?,
+    samples = asSamples(items[len(items) - 1], cmd)?,
+  }
+}
+
+fn asSeriesRanges(r: Reply, cmd: string): []SeriesRange!RedisError {
+  let entries = mapEntries(r, cmd)?
+  let out = []SeriesRange(len(entries))
+  let i = 0
+  while (i < len(entries)) {
+    out[i] = asSeriesRange(entries[i].key, entries[i].value, cmd)?
+    i = i + 1
+  }
+  return out
+}
+
+// `key -> [labels, [timestamp, value]]`.
+fn asSeriesLast(key: Reply, value: Reply): SeriesLast!RedisError {
+  let items = replyItems(value, "TS.MGET")?
+  if (len(items) != 2) {
+    fail RedisError.Unexpected("TS.MGET", "Array")
+  }
+  return SeriesLast{
+    key = replyToString(key, "TS.MGET")?,
+    labels = asMap(items[0], "TS.MGET")?,
+    sample = asOptSample(items[1], "TS.MGET")?,
+  }
+}
+
+fn asSeriesLasts(r: Reply): []SeriesLast!RedisError {
+  let entries = mapEntries(r, "TS.MGET")?
+  let out = []SeriesLast(len(entries))
+  let i = 0
+  while (i < len(entries)) {
+    out[i] = asSeriesLast(entries[i].key, entries[i].value)?
+    i = i + 1
+  }
+  return out
+}
+
+// One reply per `TS.MADD` point: the timestamp, or the server's error text.
+fn asAddResult(r: Reply): AddResult!RedisError {
+  match (r) {
+    Int(n) => return AddResult{ ts = n, error = Option.None }
+    Err(msg) => return AddResult{ ts = 0, error = Option.Some(msg) }
+    _ => fail RedisError.Unexpected("TS.MADD", shapeName(r))
+  }
+}
+
+fn asAddResults(r: Reply): []AddResult!RedisError {
+  let items = replyItems(r, "TS.MADD")?
+  let out = []AddResult(len(items))
+  let i = 0
+  while (i < len(items)) {
+    out[i] = asAddResult(items[i])?
+    i = i + 1
+  }
+  return out
+}
+
+// ---- TS.INFO ----------------------------------------------------------------
+
+fn tsPairs(r: Reply): []MapEntry!RedisError {
+  match (r) {
+    Map(pairs) => return pairs
+    Array(items) => return pairUp(unwrapOr(items, []Reply(0)), "TS.INFO")?
+    _ => fail RedisError.Unexpected("TS.INFO", shapeName(r))
+  }
+}
+
+fn infoI64(p: []MapEntry, name: string): i64!RedisError {
+  let r = infoFind(p, name)
+  match (r) {
+    Null => return 0
+    _ => return asInt(r, "TS.INFO")?
+  }
+}
+
+fn infoF64(p: []MapEntry, name: string): f64!RedisError {
+  let r = infoFind(p, name)
+  match (r) {
+    Null => return 0.0
+    _ => return asNumber(r, "TS.INFO")?
+  }
+}
+
+// A text field: the server sends `chunkType` and `duplicatePolicy` as simple
+// strings, `sourceKey` as a bulk string or null.
+fn infoText(p: []MapEntry, name: string): Option<string>!RedisError {
+  let r = infoFind(p, name)
+  match (r) {
+    Simple(s) => return Option.Some(s)
+    _ => return asOptString(r, "TS.INFO")?
+  }
+}
+
+fn infoLabels(p: []MapEntry): map<string, string>!RedisError {
+  let r = infoFind(p, "labels")
+  match (r) {
+    Null => return map<string, string>()
+    _ => return asMap(r, "TS.INFO")?
+  }
+}
+
+fn aggregationOf(word: string): Option<Aggregation> {
+  let all = [
+    Aggregation.Avg,
+    Aggregation.Sum,
+    Aggregation.Min,
+    Aggregation.Max,
+    Aggregation.Range,
+    Aggregation.Count,
+    Aggregation.First,
+    Aggregation.Last,
+    Aggregation.StdP,
+    Aggregation.StdS,
+    Aggregation.VarP,
+    Aggregation.VarS,
+    Aggregation.Twa,
+    Aggregation.CountNan,
+    Aggregation.CountAll,
+  ]
+  let w = toLower(word)
+  let i = 0
+  while (i < len(all)) {
+    if (all[i].text() == w) {
+      return Option.Some(all[i])
+    }
+    i = i + 1
+  }
+  return Option.None
+}
+
+fn policyOf(word: string): Option<DuplicatePolicy> {
+  let all = [
+    DuplicatePolicy.Block,
+    DuplicatePolicy.First,
+    DuplicatePolicy.Last,
+    DuplicatePolicy.Min,
+    DuplicatePolicy.Max,
+    DuplicatePolicy.Sum,
+  ]
+  let w = toLower(word)
+  let i = 0
+  while (i < len(all)) {
+    if (toLower(all[i].text()) == w) {
+      return Option.Some(all[i])
+    }
+    i = i + 1
+  }
+  return Option.None
+}
+
+fn infoPolicy(p: []MapEntry): Option<DuplicatePolicy>!RedisError {
+  match (infoText(p, "duplicatePolicy")?) {
+    Some(w) => return policyOf(w)
+    None => return Option.None
+  }
+}
+
+fn infoEncoding(p: []MapEntry): Encoding!RedisError {
+  match (infoText(p, "chunkType")?) {
+    Some(w) => {
+      if (toLower(w) == "uncompressed") {
+        return Encoding.Uncompressed
+      }
+      return Encoding.Compressed
+    }
+    None => return Encoding.Compressed
+  }
+}
+
+// `dest -> [bucket ms, aggregation, align]`.
+fn asRule(dest: Reply, spec: Reply): Rule!RedisError {
+  let items = replyItems(spec, "TS.INFO")?
+  if (len(items) != 3) {
+    fail RedisError.Unexpected("TS.INFO", "Array")
+  }
+  let word = replyToString(items[1], "TS.INFO")?
+  match (aggregationOf(word)) {
+    Some(by) => {
+      return Rule{
+        dest = replyToString(dest, "TS.INFO")?,
+        bucket = asInt(items[0], "TS.INFO")? * Millisecond,
+        by = by,
+        align = asInt(items[2], "TS.INFO")?,
+      }
+    }
+    None => fail RedisError.Unexpected("TS.INFO", "aggregation ${word}")
+  }
+}
+
+fn infoRules(p: []MapEntry): []Rule!RedisError {
+  let pairs = []MapEntry(0)
+  let rules = infoFind(p, "rules")
+  match (rules) {
+    Null => {}
+    _ => pairs = tsPairs(rules)?
+  }
+  let out = []Rule(len(pairs))
+  let i = 0
+  while (i < len(pairs)) {
+    out[i] = asRule(pairs[i].key, pairs[i].value)?
+    i = i + 1
+  }
+  return out
+}
+
+fn asSeriesInfo(r: Reply): SeriesInfo!RedisError {
+  let p = tsPairs(r)?
+  return SeriesInfo{
+    totalSamples = infoI64(p, "totalSamples")?,
+    memoryUsage = infoI64(p, "memoryUsage")?,
+    firstTimestamp = infoI64(p, "firstTimestamp")?,
+    lastTimestamp = infoI64(p, "lastTimestamp")?,
+    retention = infoI64(p, "retentionTime")? * Millisecond,
+    chunkCount = infoI64(p, "chunkCount")?,
+    chunkSize = infoI64(p, "chunkSize")?,
+    encoding = infoEncoding(p)?,
+    duplicatePolicy = infoPolicy(p)?,
+    labels = infoLabels(p)?,
+    sourceKey = infoText(p, "sourceKey")?,
+    rules = infoRules(p)?,
+    ignoreMaxTimeDiff = infoI64(p, "ignoreMaxTimeDiff")?,
+    ignoreMaxValDiff = infoF64(p, "ignoreMaxValDiff")?,
+  }
+}
