@@ -47,7 +47,9 @@ through `tx.read` is refused, queue it with `tx.vset(key)`.
 `add(element, vector, opts)` is `VADD`. It answers true when the element is
 new and false when it existed and its vector was replaced. The vector is a
 `Vec`: `Vec.Values([]f32)` for floats, `Vec.Fp32(blob)` for the raw
-little-endian float32 bytes when you already have them.
+little-endian float32 bytes when you already have them. Floats are sent as
+that same `FP32` blob (`f32sToLe` from `std/math` writes it): exact for every
+float, four bytes a component, and nothing for the server to parse as text.
 
 `VectorAddOptions` holds the rest of `VADD`. `quant` is how the set stores
 vectors, fixed when it is created: `VecQuant.Q8` (the server's default, one

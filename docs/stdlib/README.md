@@ -43,7 +43,7 @@ Modules are grouped by what you reach for them to do.
 
 | Module | Import | What it is for |
 |---|---|---|
-| [math](math.md) | `"std/math"` | `f64` maths and integer helpers |
+| [math](math.md) | `"std/math"` | `f64` maths, float bit casts and integer helpers |
 | [decimal](decimal.md) | `"std/decimal"` | Exact base-10 text and rounding for the `decimal` type - money |
 
 ### Networking
