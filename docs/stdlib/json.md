@@ -128,6 +128,32 @@ else. An absent `Option<T>` field decodes to `None` whether the key is
 missing or explicitly `null` - `toJson()` always writes the explicit form, so
 what Inkwell exports always decodes back the same way it went out.
 
+A field of type `Json` holds any JSON value untouched: an object a plugin
+attached to a draft, a string, a number, `null`. It is written and read back
+verbatim, with no shape of its own to check, and a document that leaves its
+key out decodes to `JsonNull` instead of failing, because `Json` already
+has a null. `[]Json`, `map<string, Json>` and `Option<Json>` work like the
+other element types (an `Option<Json>` reads `null` as `None`):
+
+```bit
+import { Json, jsonIsNull, jsonParse, jsonDecode, jsonEncode } from "std/json"
+
+@json class DraftExtras {
+  id: string,
+  extras: Json,
+}
+
+fn roundTrip(): string! {
+  let d = jsonDecode<DraftExtras>(jsonParse("{\"id\":\"d1\",\"extras\":{\"pinned\":true}}")?)?
+  return jsonEncode(d.toJson())
+}
+
+fn withoutExtras(): bool! {
+  let d = jsonDecode<DraftExtras>(jsonParse("{\"id\":\"d2\"}")?)?
+  return jsonIsNull(d.extras)
+}
+```
+
 Every decode failure names the field by its full path from the root -
 `addr.city`, `tags[3]` - through one of four causes: a required key is
 missing, a value is the wrong JSON kind, the document has a key no field
@@ -457,6 +483,12 @@ Appends `true` or `false`.
 
 Appends the literal `null`.
 
+### `jsonAppendValue(out: []byte, j: Json): []byte`
+
+Appends the whole of `j`, the same bytes `jsonEncode(j)` returns, without
+building the intermediate string. It is what `@json`'s generated encoder
+calls for a field of type `Json`.
+
 Use the `jsonAppend*` functions together when you are already writing into a
 `[]byte` and want to skip building a `Json` tree first, such as generated
 code that streams a document one field at a time.
@@ -553,6 +585,12 @@ the key is absent or explicitly `null`.
 
 The value an optional field's key carries, or `None` when the key is absent
 or present as `null`.
+
+### `jsonDecJson(entries: []JsonEntry, key: string): Json`
+
+The value a `Json` field's key carries, as it stands, or `JsonNull` when the
+key is absent. It never fails: a field that accepts any value has no
+`MissingKey`.
 
 ### `jsonDecInt(j: Json, path: string): i64!`
 
@@ -678,6 +716,12 @@ Fails with `UnknownKey` naming the current member's key.
 
 Consumes an explicit `null` under the cursor and reports whether it found
 one.
+
+### `jsonTextValue(r: JsonReader): Json!`
+
+The whole value under the cursor (object, array or scalar) as a `Json`,
+consumed. It is how a `Json` field is read off the text; a malformed value
+fails with the same positional error `jsonParse` gives.
 
 ### `jsonTextNeed(seen: bool, path: string, key: string): ()!`
 

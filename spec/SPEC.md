@@ -1229,10 +1229,14 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   attribute and the field, never a silent fallback to the field name. `@key` on
   a field of a class that does not carry `@json` is **E0139**.
 - Entries are emitted in **declaration order**, one per field.
-- A field's type must be a scalar, `string`, `bool`, `[]T`, `map<string, T>`,
-  `Option<T>`, a payload-free `enum` (every variant carries no payload) or a
-  nested class that itself carries `@json`; in the three container forms `T`
-  must itself be one of those shapes, never another container. A payload-free
+- A field's type must be a scalar, `string`, `bool`, `Json`, `[]T`,
+  `map<string, T>`, `Option<T>`, a payload-free `enum` (every variant carries
+  no payload) or a nested class that itself carries `@json`; in the three
+  container forms `T` must itself be one of those shapes, never another
+  container. A field of type `Json` is `std/json`'s own `Json` (named through
+  the import that binds it, `Json` or an alias or `ns.Json`; a class of the
+  same spelling that is not that import is a nested class as before): any JSON
+  value, `null` included, passed through verbatim in both directions. A payload-free
   `enum` field's value is its variant's own NAME, as a JSON string (`toJson`)
   or accepted back from one of the declared names (`jsonDecode<T>`) - an
   unknown name fails naming the field and every declared variant. Anything
@@ -1268,8 +1272,9 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   that writes exactly the bytes `jsonEncode(this.toJson())` would produce,
   straight into `out`, using `std/json`'s `jsonAppend*` helpers
   (`jsonAppendKey`, `jsonAppendString`, `jsonAppendInt`, `jsonAppendFloat`,
-  `jsonAppendBool`, `jsonAppendNull`, `jsonAppendRaw`) instead of building a
-  `Json` value first. Same field order, same key rules, same conversions and
+  `jsonAppendBool`, `jsonAppendNull`, `jsonAppendRaw`, `jsonAppendValue`)
+  instead of building a `Json` value first; a `Json` field is written by
+  `jsonAppendValue`, one call and no intermediate string. Same field order, same key rules, same conversions and
   the same explicit `null` for an absent `Option<T>` as `toJson`; a nested
   `@json` field's value comes from calling that field's own `__jsonAppend`,
   which self-delimits with its own `{`/`}`.
@@ -1316,6 +1321,16 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   not an `Option`. The encoder always writes an absent `Option` as an explicit
   `null`, so what `@json` emits decodes back; a producer that omits the key
   instead is just as well-formed.
+- A field of type **`Json`** receives the input value untouched, of any kind,
+  with no shape or depth check of its own (the depth bound applies to the
+  `@json` classes around it). An **absent** key decodes it to `JsonNull`: `Json`
+  has a null of its own, so an absent key is never a missing-key failure, and an
+  explicit `null` is the same answer. The encoder writes the held value as it
+  stands, so what `@json` emits decodes back to an equal value. `[]Json` and
+  `map<string, Json>` hold the elements untouched (a `null` element stays
+  `JsonNull`); `Option<Json>` follows the `Option` rule above, so an absent key
+  and an explicit `null` are both `None`, and `Some(JsonNull)` is written as
+  `null` and reads back as `None`.
 - **The walk is depth-bounded.** A `@json` class may be self-referential, so
   the depth a decode recurses to is input-controlled and is not bounded by the
   class. Past the bound it fails with the depth cause rather than exhausting the
@@ -1382,6 +1397,8 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
     fragment is a bare `$ref`), so `Option<NestedClass>` takes 2020-12's
     `anyOf` instead: `{"anyOf": [{"$ref": "#/$defs/<Name>"}, {"type":
     "null"}]}` |
+  | `Json` | `{}` - every JSON value, `null` included, satisfies it; an
+    `Option<Json>` is the same `{}` |
   | a nested `@json` class | `{"$ref": "#/$defs/<ClassName>"}`, with one
     `$defs` entry per DISTINCT class reachable from the root, deduplicated -
     a self-referential class (`class Node { next: Option<Node> }`, already
