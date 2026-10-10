@@ -1,0 +1,199 @@
+// pkg/redis/zsetold.live.test.bit — the 6.2-gated sorted-set reads against a
+// real server (#7840). `scores`, `top`, `bottom` and `byScore` send ZMSCORE and
+// `ZRANGE ... REV|BYSCORE` on Redis 6.2+, and ZSCORE per member, ZREVRANGE,
+// ZRANGE and ZRANGEBYSCORE before it. One checker runs against Redis 8.10.2
+// (RESP3, `REDIS_TEST_URL`) and Redis 5.0.14 (the RESP2 fallback,
+// `REDIS_TEST_V5_URL`) and compares both to the same literal answers, so the
+// two servers give identical results. Same module as `zset.live.test.bit`:
+// `liveUrl`, `liveClient`, `legacyClient` and `delKey` are in scope.
+
+fn inc(v: f64): Bound<f64> { return Bound<f64>.Inclusive(v) }
+
+fn exc(v: f64): Bound<f64> { return Bound<f64>.Exclusive(v) }
+
+fn show(xs: []Scored): string {
+  let out = ""
+  for x of xs {
+    out = out + "${x.member}:${x.score} "
+  }
+  return out
+}
+
+fn showScores(xs: []Option<f64>): string {
+  let out = ""
+  for x of xs {
+    match (x) {
+      Some(v) => out = out + "${v} "
+      None => out = out + "- "
+    }
+  }
+  return out
+}
+
+fn seedGated(c: Client, key: string): Zset {
+  delKey(c, key)
+  let z = c.zset(key)
+  z.addMany(
+    Scored{ member = "lo", score = 0.0 - 1.0 / 0.0 },
+    Scored{ member = "a", score = 1.0 },
+    Scored{ member = "b", score = 2.5 },
+    Scored{ member = "c", score = 3.0 },
+    Scored{ member = "d", score = 4.0 },
+    Scored{ member = "hi", score = 1.0 / 0.0 },
+  ) catch e {
+    panic("addMany: ${e.message()}")
+  }
+  return z
+}
+
+fn expectRange(label: string, run: () => []Scored!RedisError, want: string) {
+  let xs = run() catch e {
+    panic("${label}: ${e.message()}")
+  }
+  assert(show(xs) == want, "${label}: got '${show(xs)}', want '${want}'")
+}
+
+fn checkScores(z: Zset) {
+  let xs = z.scores("c", "nobody", "hi", "lo", "a") catch e {
+    panic("scores: ${e.message()}")
+  }
+  assert(showScores(xs) == "3 - inf -inf 1 ", "scores: '${showScores(xs)}'")
+  let one = z.scores("b") catch e {
+    panic("scores one: ${e.message()}")
+  }
+  assert(showScores(one) == "2.5 ", "scores one: '${showScores(one)}'")
+  z.scores() catch _ {
+    return
+  }
+  panic("scores() with no member should fail")
+}
+
+fn checkRankRanges(z: Zset) {
+  expectRange("top(2)", () => z.top(2), "hi:inf d:4 ")
+  expectRange("bottom(2)", () => z.bottom(2), "lo:-inf a:1 ")
+  expectRange("top(100)", () => z.top(100), "hi:inf d:4 c:3 b:2.5 a:1 lo:-inf ")
+  expectRange("bottom(100)", () => z.bottom(100), "lo:-inf a:1 b:2.5 c:3 d:4 hi:inf ")
+  expectRange("top(0)", () => z.top(0), "")
+}
+
+fn checkScoreRanges(z: Zset) {
+  let all = Bound<f64>.Unbounded
+  expectRange("all", () => z.byScore(all, all, noLimit()), "lo:-inf a:1 b:2.5 c:3 d:4 hi:inf ")
+  expectRange("[1,3]", () => z.byScore(inc(1.0), inc(3.0), noLimit()), "a:1 b:2.5 c:3 ")
+  expectRange("(1,3)", () => z.byScore(exc(1.0), exc(3.0), noLimit()), "b:2.5 ")
+  expectRange("(1,3]", () => z.byScore(exc(1.0), inc(3.0), noLimit()), "b:2.5 c:3 ")
+  expectRange(
+    "[-inf,2.5]",
+    () => z.byScore(inc(0.0 - 1.0 / 0.0), inc(2.5), noLimit()),
+    "lo:-inf a:1 b:2.5 ",
+  )
+  expectRange(
+    "(2.5,+inf]",
+    () => z.byScore(exc(2.5), inc(1.0 / 0.0), noLimit()),
+    "c:3 d:4 hi:inf ",
+  )
+  expectRange(
+    "(-inf,+inf)",
+    () => z.byScore(exc(0.0 - 1.0 / 0.0), exc(1.0 / 0.0), noLimit()),
+    "a:1 b:2.5 c:3 d:4 ",
+  )
+  expectRange("limit 2", () => z.byScore(all, all, limitTo(2)), "lo:-inf a:1 ")
+  expectRange(
+    "offset 2 count 2",
+    () => z.byScore(all, all, Limit{ offset = 2, count = 2 }),
+    "b:2.5 c:3 ",
+  )
+  expectRange(
+    "offset 5 count 9",
+    () => z.byScore(all, all, Limit{ offset = 5, count = 9 }),
+    "hi:inf ",
+  )
+  expectRange("empty range", () => z.byScore(inc(10.0), inc(20.0), noLimit()), "")
+}
+
+// The queued forms read the version off their Batch (a Pipeline's, a Tx's).
+fn checkPipelined(c: Client, key: string, modern: bool) {
+  let p = c.pipeline()
+  let v = p.zset(key)
+  let top = v.top(2)
+  let bottom = v.bottom(1)
+  let by = v.byScore(Bound<f64>.Exclusive(1.0), Bound<f64>.Unbounded, limitTo(2))
+  p.exec() catch e {
+    panic("exec: ${e.message()}")
+  }
+  expectRange("pipelined top", () => top.get(), "hi:inf d:4 ")
+  expectRange("pipelined bottom", () => bottom.get(), "lo:-inf ")
+  expectRange("pipelined byScore", () => by.get(), "b:2.5 c:3 ")
+  checkQueuedScores(c, key, modern)
+}
+
+fn checkQueuedScores(c: Client, key: string, modern: bool) {
+  let p = c.pipeline()
+  let f = p.zset(key).scores("a", "zz")
+  if (!modern) {
+    f.get() catch e {
+      assert(
+        contains(e.message(), "6.2") && contains(e.message(), "5.0"),
+        "message: ${e.message()}",
+      )
+      return
+    }
+    panic("a queued scores on Redis 5 should fail naming 6.2")
+  }
+  p.exec() catch e {
+    panic("exec scores: ${e.message()}")
+  }
+  let xs = f.get() catch e {
+    panic("queued scores: ${e.message()}")
+  }
+  assert(showScores(xs) == "1 - ", "queued scores: '${showScores(xs)}'")
+}
+
+// `tx.read` runs the immediate forms on the attempt's pinned connection.
+fn checkTxRead(c: Client, key: string) {
+  let out = c.transaction<string>([key], (tx) => {
+    let z = tx.read.zset(key)
+    let xs = z.scores("a", "zz")?
+    let top = z.top(1)?
+    let by = z.byScore(Bound<f64>.Inclusive(3.0), Bound<f64>.Unbounded, noLimit())?
+    return showScores(xs) + "| " + show(top) + "| " + show(by)
+  }) catch e {
+    panic("transaction: ${e.message()}")
+  }
+  assert(out == "1 - | hi:inf | c:3 d:4 hi:inf ", "tx.read: '${out}'")
+}
+
+fn checkVersionGatedReads(c: Client, key: string, modern: bool) {
+  if (modern) {
+    assert(c.version >= 6002, "version ${c.version} should be 6.2+")
+  } else {
+    assert(c.version == 5000, "version ${c.version} should be 5.0")
+  }
+  let z = seedGated(c, key)
+  checkScores(z)
+  checkRankRanges(z)
+  checkScoreRanges(z)
+  checkPipelined(c, key, modern)
+  checkTxRead(c, key)
+  delKey(c, key)
+}
+
+test "live: scores, top, bottom and byScore on RESP3 (Redis 8)" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  checkVersionGatedReads(c, "bit:live:zset:gated3", true)
+  c.close()
+}
+
+test "live: scores, top, bottom and byScore give the same answers over the RESP2 fallback (Redis 5)" {
+  let u = liveUrl("REDIS_TEST_V5_URL")
+  if (u == "") {
+    return
+  }
+  let c = legacyClient(u)
+  checkVersionGatedReads(c, "bit:live:zset:gated2", false)
+  c.close()
+}

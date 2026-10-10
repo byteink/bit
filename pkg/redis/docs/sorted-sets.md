@@ -363,6 +363,27 @@ transaction's `MULTI`/`EXEC`, so it fails with `RedisError.Invalid`; queue it
 on `tx.zset(key)` instead. A blocking pop (`blockPopMin` and its kin) fails
 the same way, because the pinned connection cannot wait.
 
+## Older servers
+
+The client reads the server version when it connects, and `scores`, `top`,
+`bottom` and `byScore` send the form that server understands. From Redis 6.2
+that is `ZMSCORE` and `ZRANGE ... REV` / `BYSCORE`. Before 6.2 (Redis 5, for
+example) it is one `ZSCORE` per member, all in a single round trip, then
+`ZREVRANGE`, `ZRANGE` and `ZRANGEBYSCORE`. The results are the same on both:
+the same members, scores and order, `-inf` and `+inf` bounds, `Exclusive`
+bounds and `Limit`s included. A server whose version cannot be read is treated
+as a modern one.
+
+One call has no older form: `p.zset(key).scores(...)` and `tx.zset(key).scores(...)`
+queue a single command, so on a server before 6.2 their `Future` fails with a
+`RedisError.Invalid` naming Redis 6.2. Call `scores` on the handle (`r.zset(key)`
+or `tx.read.zset(key)`) there.
+
+The commands Redis added in 6.2 or later and that have no older form (`rank`'s
+`WITHSCORE` in 7.2, `union`, `inter`, `diff`, `randMember`, `randMembers`,
+`interCard` and the `store*` methods) are sent unchanged, so an older server
+answers with its own error.
+
 ## Sharp edges
 
 A missing key behaves like an empty sorted set for every read (`card`
