@@ -12,7 +12,9 @@
 // that test.
 
 import { readFile, writeFile, mkdir, readDir } from "std/fs"
+import { selfExe } from "std/os"
 import { contains, hasSuffix } from "std/strings"
+import { sleep } from "std/time"
 
 fn scratchPath5721(tag: string): string {
   return "${envOr("TMPDIR", "/tmp")}/bit-kv-5721-${tag}-${timeUnixNs()}"
@@ -233,13 +235,22 @@ test "repeated delete-then-reinsert cycles reuse the free list instead of growin
 
 // --- cross-process writer lock ---------------------------------------------
 //
-// Builds a real second Bit binary (a copy of this module plus a generated
-// `main.bit`, same technique `pkg/web/node.test.bit`'s allocation benchmark
-// uses) and runs it as a genuine child OS process, matching #4014's own
-// cross-process acceptance pattern -- backgrounded from a `/bin/sh` wrapper
-// rather than a Bit-side `spawn`; see `lockWrapperScript`'s own comment for
-// why. Skips, rather than fails, when no usable compiler is discoverable --
-// same contract as `pkg/web`'s bench test.
+// The child is THIS TEST BINARY, re-executed (`selfExe()`, already compiled
+// and already exec'd once, so no compile and no first-exec scan sits inside
+// the test's 30s bound -- #6119: the old child was built with `bit build`
+// inside the timed body and timed out under fleet load). `bit test` runs the
+// binary once per test with `BIT_TEST_INDEX` set; the child inherits it, so
+// it enters this same test, sees `lockChildEnv5721`, and plays the holder.
+//
+// No wall-clock decides the verdict. The handshake is two files in the
+// scratch dir: the child creates `ready` once it HOLDS the writer lock, and
+// holds it until the parent creates `release`. Every wait is bounded by a
+// deadline that only a real hang reaches. Skips nothing: it needs no
+// compiler, so unlike `crash.test.bit` it has no "no usable bit" path.
+
+const lockChildEnv5721 = "BIT_KV_LOCK_CHILD"
+const lockReadyBudgetMs = 20000
+const lockReleaseBudgetMs = 25000
 
 class BitLocation {
   bin: string,
@@ -262,70 +273,6 @@ fn locateBit5721(): BitLocation {
   return BitLocation{ bin = "", stdlib = "", repo = "" }
 }
 
-// Reads its db path, ready-file path and hold duration (ns) from argv, opens
-// the db, and holds the writer lock across a sleep before committing -- the
-// window the parent's own write() attempt has to prove it waited.
-//
-// `main.bit` IMPORTS the copied module from "./kvmod" rather than sitting
-// alongside it as one combined directory module: built as its own directory,
-// pkg/kv's `open` (engine.bit) collides with a runtime-resolved extern link
-// name at the ROOT module only (E0096, SPEC §11.7) -- every other module is
-// unaffected, since only the root module keeps bare link names. A single
-// file named on the command line is its own one-file module (SPEC §17.1), so
-// `main.bit` built directly is the root and `./kvmod` is not.
-fn childMainSrc5721(): string {
-  return "import { arg } from \"std/os\"\n" +
-    "import { writeFile } from \"std/fs\"\n" +
-    "import { sleep } from \"std/time\"\n" +
-    "import { parseInt } from \"std/strings\"\n" +
-    "import { open } from \"./kvmod\"\n" +
-    "fn main() {\n" +
-    "  let dbPath = arg(1)\n" +
-    "  let readyPath = arg(2)\n" +
-    "  let heldNs = parseInt(arg(3)) catch _ { 0 }\n" +
-    "  let db = open(dbPath) catch e { panic(\"child open: \" + e.message()) }\n" +
-    "  db.tx((tx) => {\n" +
-    "    writeFile(readyPath, \"1\")?\n" +
-    "    sleep(heldNs)\n" +
-    "    tx.put([]byte(\"child\"), []byte(\"1\"))?\n" +
-    "  }) catch e { panic(\"child write: \" + e.message()) }\n" +
-    "}\n"
-}
-
-// Every non-test source file in pkg/kv, copied verbatim, plus the generated
-// entry point -- the same "copy the real module" technique `pkg/web`'s own
-// cross-process benchmark uses, for the same reason: a hand-picked file list
-// goes stale the next time this module gains a file.
-fn writeChildModule5721(loc: BitLocation, dir: string) {
-  let kvDir = "${dir}/kvmod"
-  mkdir(kvDir) catch e {
-    panic("kv lock test: mkdir ${kvDir}: ${e.message()}")
-  }
-  let names = readDir("${loc.repo}/pkg/kv") catch e {
-    panic("kv lock test: readDir pkg/kv: ${e.message()}")
-  }
-  for name of names {
-    if (!hasSuffix(name, ".bit") || hasSuffix(name, ".test.bit")) {
-      continue
-    }
-    let src = readFile("${loc.repo}/pkg/kv/${name}") catch e {
-      panic("kv lock test: read ${name}: ${e.message()}")
-    }
-    writeFile("${kvDir}/${name}", src) catch e {
-      panic("kv lock test: write ${name}: ${e.message()}")
-    }
-  }
-  writeFile("${dir}/main.bit", childMainSrc5721()) catch e {
-    panic("kv lock test: write main.bit: ${e.message()}")
-  }
-}
-
-fn buildChild5721(loc: BitLocation, dir: string, prog: string): int {
-  let script = "#!/bin/sh\nBIT_STDLIB='${loc.stdlib}'\nexport BIT_STDLIB\n" +
-    "'${loc.bin}' build '${dir}/main.bit' -o '${prog}'\n"
-  return shellRun5721("${dir}/build.sh", script, 60000)
-}
-
 fn shellRun5721(path: string, script: string, timeoutMs: int): int {
   writeFile(path, script) catch _ {
     return -999
@@ -336,95 +283,117 @@ fn shellRun5721(path: string, script: string, timeoutMs: int): int {
   return osRunBounded(path, timeoutMs)
 }
 
-// Backgrounds the compiled child fixture INSIDE the shell (`&`) and polls
-// for its readiness file there too, rather than a Bit-side `spawn` — proven
-// necessary, not stylistic: `std/process.run`'s blocking fork/exec/wait ties up
-// this test binary's own worker for its ENTIRE lifetime (measured directly —
-// a `spawn`ed `run("/bin/sleep", "2")` stalled this SAME process's own
-// unrelated `sleep`-based loop for the full 2s, not just the spawned task),
-// so a `spawn`+`run()` child never lets the parent's own `write()` attempt
-// proceed concurrently; it only ever observes the lock AFTER the child has
-// already released it. The wrapper script returns as soon as it sees the
-// ready file (bounded poll, `readyTries` of 100ms), leaving the actual
-// database-holding child detached and still running — confirmed separately
-// that a backgrounded grandchild survives its wrapper's own exit under
-// `osRunBounded`.
-fn lockWrapperScript(
-  prog: string,
-  dbPath: string,
-  readyPath: string,
-  heldNsArg: string,
-  readyTries: int,
-): string {
+// Polls for `path` until it exists or `budgetMs` passes; the budget is a
+// hang detector, never the expected wait.
+fn waitForFile5721(path: string, budgetMs: int): bool {
+  let deadline = timeUnixNs() + budgetMs * 1000000
+  while (timeUnixNs() < deadline) {
+    if (exists(path)) {
+      return true
+    }
+    sleep(10000000) // 10ms
+  }
+  return exists(path)
+}
+
+// The holder: takes the writer lock, announces it, keeps it until the parent
+// says release, then commits.
+fn lockChild5721(dir: string) {
+  let db = open("${dir}/db") catch e {
+    panic("child open: ${e.message()}")
+  }
+  db.tx((tx) => {
+    writeFile("${dir}/ready", "1")?
+    if (!waitForFile5721("${dir}/release", lockReleaseBudgetMs)) {
+      panic("child: parent never released the writer lock")
+    }
+    tx.put([]byte("child"), []byte("1"))?
+  }) catch e {
+    panic("child write: ${e.message()}")
+  }
+}
+
+fn childLog5721(dir: string): string {
+  let log = readFile("${dir}/child.log") catch _ {
+    return "<unreadable>"
+  }
+  return log
+}
+
+// `Tx.get` with any failure read back as empty, for the ordering check.
+fn getOrEmpty5721(tx: Tx, key: string): []byte {
+  let v = tx.get([]byte(key)) catch _ {
+    return []byte(0)
+  }
+  return v
+}
+
+// Backgrounds the child and returns at once: the readiness wait is Bit-side
+// (`waitForFile5721`), so the script has no poll budget of its own. Stdout
+// and stderr go to a log the parent prints on failure; stdin and both
+// streams are detached so `osRunBounded` sees EOF without waiting for the
+// child.
+fn lockLaunchScript5721(exe: string, dir: string): string {
   return "#!/bin/sh\n" +
-    "'${prog}' '${dbPath}' '${readyPath}' '${heldNsArg}' > /dev/null 2>&1 &\n" +
-    "n=0\n" +
-    "while [ $n -lt ${readyTries} ]; do\n" +
-    "  [ -f '${readyPath}' ] && exit 0\n" +
-    "  sleep 0.1\n" +
-    "  n=$((n+1))\n" +
-    "done\n" +
-    "exit 3\n"
+    "${lockChildEnv5721}='${dir}' '${exe}' < /dev/null > '${dir}/child.log' 2>&1 &\n" +
+    "exit 0\n"
 }
 
 test "a second os-level process holding the writer lock blocks the parent's write()" {
-  let loc = locateBit5721()
-  if (len(loc.bin) == 0 || len(loc.repo) == 0) {
-    println(
-        "pkg/kv cross-process lock test: no usable bit binary + BIT_STDLIB + " +
-        "BIT_REPO found (run via ./make test-package-kv, or set BIT_BIN/BIT_STDLIB/BIT_REPO) " +
-        "-- skipping",
-    )
+  let childDir = envOr(lockChildEnv5721, "")
+  if (len(childDir) > 0) {
+    lockChild5721(childDir)
     return
   }
   let dir = scratchPath5721("lock")
   mkdir(dir) catch e {
     panic("mkdir ${dir}: ${e.message()}")
   }
-  writeChildModule5721(loc, dir)
-  let prog = "${dir}/child"
-  let buildCode = buildChild5721(loc, dir, prog)
-  if (buildCode != 0) {
-    panic("pkg/kv cross-process lock test: building the child fixture failed (exit ${buildCode})")
-  }
-
   let dbPath = "${dir}/db"
   let seed = open(dbPath) catch e {
     panic("open: ${e.message()}")
   }
   seed.close()
 
-  let readyPath = "${dir}/ready"
-  let heldMs = 1500
-  let readyTries = 100 // 100 x 100ms = 10s bound on the wrapper's own poll
-  let wrapCode = shellRun5721(
-    "${dir}/lock.sh",
-    lockWrapperScript(prog, dbPath, readyPath, "${heldMs * 1000000}", readyTries),
-    15000,
-  )
+  let launchCode = shellRun5721("${dir}/lock.sh", lockLaunchScript5721(selfExe(), dir), 15000)
+  assert(launchCode == 0, "launching the lock-holding child failed (exit ${launchCode})")
+  let held = waitForFile5721("${dir}/ready", lockReadyBudgetMs)
   assert(
-    wrapCode == 0,
-      "the child process never signaled it took the writer lock within " +
-      "${readyTries * 100}ms (wrapper exit ${wrapCode})",
+    held,
+      "the child never signaled it took the writer lock within ${lockReadyBudgetMs}ms; " +
+      "its log: ${childLog5721(dir)}",
   )
 
   let db2 = open(dbPath) catch e {
     panic("open: ${e.message()}")
   }
-  let started = timeUnixNs()
+  // Exclusion, proven without a clock: the child signaled `ready` from
+  // inside its tx, so the writer lock is held right now, and a non-blocking
+  // attempt on this process's own handle must be refused.
+  let got = db2.eng.file.tryLock() catch e {
+    panic("tryLock: ${e.message()}")
+  }
+  if (got) {
+    db2.eng.file.unlock() catch _ {}
+  }
+  assert(!got, "this process took the writer lock while another process held it")
+
+  // Release the child, then write. Whether this tx blocks depends on who
+  // wins the race, but it can only ENTER after the child's commit, so the
+  // child's key must already be visible inside the closure.
+  writeFile("${dir}/release", "1") catch e {
+    panic("write release: ${e.message()}")
+  }
   db2.tx((tx) => {
+    let seen = getOrEmpty5721(tx, "child")
+    assert(
+      string(seen) == "1",
+      "the parent's write() ran before the child's commit finished; its log: " + childLog5721(dir),
+    )
     tx.put([]byte("parent"), []byte("1"))?
   }) catch e {
     panic("parent write failed: ${e.message()}")
   }
-  let elapsedMs = (timeUnixNs() - started) / 1000000
-
-  assert(
-    elapsedMs >= heldMs - 300,
-      "the parent's write() returned after only ${elapsedMs}ms; it must WAIT for the " +
-      "child's ${heldMs}ms hold on the writer lock -- proving cross-process exclusion, " +
-      "not merely an in-process one",
-  )
   assert(
     string(getOrEmpty(db2.eng, db2.root, []byte("child"))) == "1",
     "the child's own write must have committed",
