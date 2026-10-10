@@ -1,0 +1,612 @@
+// pkg/redis/bloom.live.test.bit - the Bloom, cuckoo, count-min, top-k and
+// t-digest handles against a real server. `liveUrl`/`liveClient` are
+// `client.live.test.bit`'s own (same module, no import); every test is
+// skipped, and says so, when `REDIS_TEST_URL` is unset.
+// `./make test-package-redis-live` (`_tests_/bit/redislive.bit`) supplies it,
+// against `redis:8.10.2`, which carries these types built in.
+//
+// The structures are probabilistic, so each test uses few items, far below
+// the capacity where a false positive or an estimate error could show.
+
+fn sketchClean(c: Client, keys: []string) {
+  c.del(keys) catch e {
+    panic("del: ${e.message()}")
+  }
+}
+
+// True when `r` is the server refusing the command (a missing key, a bad
+// argument): `RedisError.Server` or `WrongType`.
+fn refusedByServer(e: RedisError): bool {
+  match (e) {
+    Server(_, _) => return true
+    WrongType(_) => return true
+    _ => return false
+  }
+}
+
+test "live: bloom reserve, add, exists, card and info" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:bf:a"
+  let ns = "bit:live:bf:ns"
+  sketchClean(c, [k, ns])
+  let bf = c.bloom(k)
+
+  bf.reserve(0.01, 100, BloomGrowth.Expansion(2)) catch e {
+    panic("reserve: ${e.message()}")
+  }
+  let first = bf.add("ana") catch e {
+    panic("add: ${e.message()}")
+  }
+  let again = bf.add("ana") catch e {
+    panic("add again: ${e.message()}")
+  }
+  assert(first && !again, "a new item is true, a repeat false: ${first} ${again}")
+  let many = bf.addMany("ana", "bo", "cy") catch e {
+    panic("addMany: ${e.message()}")
+  }
+  assert(len(many) == 3 && !many[0] && many[1] && many[2], "addMany flags")
+  let has = bf.exists("bo") catch e {
+    panic("exists: ${e.message()}")
+  }
+  let hasNot = bf.exists("zed") catch e {
+    panic("exists missing: ${e.message()}")
+  }
+  assert(has && !hasNot, "exists: ${has} ${hasNot}")
+  let hm = bf.existsMany("ana", "zed", "cy") catch e {
+    panic("existsMany: ${e.message()}")
+  }
+  assert(hm[0] && !hm[1] && hm[2], "existsMany flags")
+  let card = bf.card() catch e {
+    panic("card: ${e.message()}")
+  }
+  assert(card == 3, "three distinct items, got ${card}")
+  let info = bf.info() catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(info.capacity == 100 && info.items == 3 && info.filters == 1, "info fields")
+  assert(info.size > 0 && info.expansion == Option.Some(2), "size and expansion 2")
+
+  c.bloom(ns).reserve(0.01, 10, BloomGrowth.NonScaling) catch e {
+    panic("reserve nonscaling: ${e.message()}")
+  }
+  let fixed = c.bloom(ns).info() catch e {
+    panic("info nonscaling: ${e.message()}")
+  }
+  assert(fixed.expansion == Option.None, "a non-scaling filter has no expansion rate")
+  sketchClean(c, [k, ns])
+  c.close()
+}
+
+test "live: bloom insert creates with its own settings, noCreate refuses a missing key" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:bf:ins"
+  let missing = "bit:live:bf:nokey"
+  sketchClean(c, [k, missing])
+
+  let opts = BloomInsertOptions{
+    capacity = Option.Some(50),
+    errorRate = Option.Some(0.001),
+    growth = BloomGrowth.NonScaling,
+  }
+  let added = c.bloom(k).insert(["a", "b", "a"], opts) catch e {
+    panic("insert: ${e.message()}")
+  }
+  assert(len(added) == 3 && added[0] && added[1] && !added[2], "insert flags")
+  let info = c.bloom(k).info() catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(
+    info.capacity == 50 && info.expansion == Option.None,
+    "the insert options created the filter",
+  )
+
+  let refused = false
+  let _ = c.bloom(missing).insert(["a"], BloomInsertOptions{ noCreate = true }) catch e {
+    refused = refusedByServer(e)
+    []bool(0)
+  }
+  assert(refused, "NOCREATE on a missing key is the server's error")
+  sketchClean(c, [k, missing])
+  c.close()
+}
+
+test "live: bloom scanDump and loadChunk copy a filter" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let src = "bit:live:bf:dump"
+  let dst = "bit:live:bf:load"
+  sketchClean(c, [src, dst])
+  c.bloom(src).reserve(0.01, 100) catch e {
+    panic("reserve: ${e.message()}")
+  }
+  c.bloom(src).addMany("ana", "bo") catch e {
+    panic("addMany: ${e.message()}")
+  }
+
+  let it = 0
+  let pieces = 0
+  while (pieces < 100) {
+    let chunk = c.bloom(src).scanDump(it) catch e {
+      panic("scanDump: ${e.message()}")
+    }
+    if (chunk.iterator == 0) {
+      break
+    }
+    c.bloom(dst).loadChunk(chunk.iterator, chunk.data) catch e {
+      panic("loadChunk: ${e.message()}")
+    }
+    it = chunk.iterator
+    pieces = pieces + 1
+  }
+  assert(pieces > 0, "the dump had at least one chunk")
+  let copy = c.bloom(dst).existsMany("ana", "bo", "zed") catch e {
+    panic("existsMany: ${e.message()}")
+  }
+  assert(copy[0] && copy[1] && !copy[2], "the copy answers like the original")
+  sketchClean(c, [src, dst])
+  c.close()
+}
+
+test "live: cuckoo add, insert, count, delete and info" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:cf:a"
+  sketchClean(c, [k])
+  let cf = c.cuckoo(k)
+
+  let opts = CuckooReserveOptions{
+    bucketSize = Option.Some(2),
+    maxIterations = Option.Some(20),
+    expansion = Option.Some(1),
+  }
+  cf.reserve(100, opts) catch e {
+    panic("reserve: ${e.message()}")
+  }
+  let added = cf.add("ana") catch e {
+    panic("add: ${e.message()}")
+  }
+  let skipped = cf.addIfMissing("ana") catch e {
+    panic("addIfMissing: ${e.message()}")
+  }
+  let fresh = cf.addIfMissing("bo") catch e {
+    panic("addIfMissing new: ${e.message()}")
+  }
+  assert(added && !skipped && fresh, "add ${added}, addIfMissing ${skipped} ${fresh}")
+  let ins = cf.insert(["ana", "cy"]) catch e {
+    panic("insert: ${e.message()}")
+  }
+  assert(
+    len(ins) == 2 && ins[0] == CuckooInsert.Added && ins[1] == CuckooInsert.Added,
+    "insert results",
+  )
+  let nx = cf.insertIfMissing(["cy", "di"]) catch e {
+    panic("insertIfMissing: ${e.message()}")
+  }
+  assert(nx[0] == CuckooInsert.Exists && nx[1] == CuckooInsert.Added, "insertIfMissing results")
+
+  let n = cf.count("ana") catch e {
+    panic("count: ${e.message()}")
+  }
+  assert(n == 2, "ana was stored twice, count ${n}")
+  let hm = cf.existsMany("ana", "zed", "di") catch e {
+    panic("existsMany: ${e.message()}")
+  }
+  let one = cf.exists("bo") catch e {
+    panic("exists: ${e.message()}")
+  }
+  assert(hm[0] && !hm[1] && hm[2] && one, "exists flags")
+  let gone = cf.delete("bo") catch e {
+    panic("delete: ${e.message()}")
+  }
+  let gone2 = cf.delete("bo") catch e {
+    panic("delete again: ${e.message()}")
+  }
+  assert(gone && !gone2, "delete removes one copy: ${gone} ${gone2}")
+
+  let info = cf.info() catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(info.bucketSize == 2 && info.maxIterations == 20 && info.expansion == 1, "info settings")
+  assert(
+    info.items == 4 && info.deleted == 1 && info.filters == 1 && info.size > 0,
+    "info counters",
+  )
+  sketchClean(c, [k])
+  c.close()
+}
+
+test "live: cuckoo insert reports Full, noCreate refuses, scanDump and loadChunk copy" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let tiny = "bit:live:cf:tiny"
+  let missing = "bit:live:cf:nokey"
+  let src = "bit:live:cf:dump"
+  let dst = "bit:live:cf:load"
+  sketchClean(c, [tiny, missing, src, dst])
+
+  c.cuckoo(tiny).reserve(
+    2,
+    CuckooReserveOptions{
+      bucketSize = Option.Some(1),
+      maxIterations = Option.Some(1),
+      expansion = Option.Some(0),
+    },
+  ) catch e {
+    panic("reserve tiny: ${e.message()}")
+  }
+  let items = []string(0)
+  let i = 0
+  while (i < 40) {
+    items = append(items, "item-${i}")
+    i = i + 1
+  }
+  let res = c.cuckoo(tiny).insert(items) catch e {
+    panic("insert tiny: ${e.message()}")
+  }
+  let full = 0
+  for r of res {
+    if (r == CuckooInsert.Full) {
+      full = full + 1
+    }
+  }
+  assert(full > 0, "a two-slot filter must report Full for some of 40 items")
+
+  let refused = false
+  let _ = c.cuckoo(missing).insert(["a"], CuckooInsertOptions{ noCreate = true }) catch e {
+    refused = refusedByServer(e)
+    []CuckooInsert(0)
+  }
+  assert(refused, "NOCREATE on a missing key is the server's error")
+
+  c.cuckoo(src).reserve(100) catch e {
+    panic("reserve src: ${e.message()}")
+  }
+  c.cuckoo(src).insert(["ana", "bo"], CuckooInsertOptions{ capacity = Option.Some(100) }) catch e {
+    panic("insert src: ${e.message()}")
+  }
+  let it = 0
+  let pieces = 0
+  while (pieces < 100) {
+    let chunk = c.cuckoo(src).scanDump(it) catch e {
+      panic("scanDump: ${e.message()}")
+    }
+    if (chunk.iterator == 0) {
+      break
+    }
+    c.cuckoo(dst).loadChunk(chunk.iterator, chunk.data) catch e {
+      panic("loadChunk: ${e.message()}")
+    }
+    it = chunk.iterator
+    pieces = pieces + 1
+  }
+  let copy = c.cuckoo(dst).existsMany("ana", "bo", "zed") catch e {
+    panic("existsMany: ${e.message()}")
+  }
+  assert(pieces > 0 && copy[0] && copy[1] && !copy[2], "the copy answers like the original")
+  sketchClean(c, [tiny, missing, src, dst])
+  c.close()
+}
+
+test "live: count-min create, incrBy, query, merge with weights and info" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let a = "bit:live:cms:a"
+  let b = "bit:live:cms:b"
+  let dst = "bit:live:cms:dst"
+  let prob = "bit:live:cms:prob"
+  sketchClean(c, [a, b, dst, prob])
+
+  for k of [a, b, dst] {
+    c.cms(k).create(CmsSize.Dims(100, 5)) catch e {
+      panic("create ${k}: ${e.message()}")
+    }
+  }
+  let now = c.cms(a).incrBy([counted("ana", 3), counted("bo", 2)]) catch e {
+    panic("incrBy: ${e.message()}")
+  }
+  assert(now[0] == 3 && now[1] == 2, "incrBy returns the new estimates")
+  c.cms(b).incrBy([counted("ana", 4)]) catch e {
+    panic("incrBy b: ${e.message()}")
+  }
+  let q = c.cms(a).query("ana", "bo", "zed") catch e {
+    panic("query: ${e.message()}")
+  }
+  assert(q[0] == 3 && q[1] == 2 && q[2] == 0, "query estimates")
+  let info = c.cms(a).info() catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(info.width == 100 && info.depth == 5 && info.count == 5, "info dims and total")
+
+  c.cms(dst).merge([CmsSource{ key = a }, CmsSource{ key = b, weight = 2 }]) catch e {
+    panic("merge: ${e.message()}")
+  }
+  let m = c.cms(dst).query("ana", "bo") catch e {
+    panic("query merged: ${e.message()}")
+  }
+  assert(m[0] == 11 && m[1] == 2, "ana 3 + 2*4, bo 2: ${m[0]} ${m[1]}")
+
+  c.cms(prob).create(CmsSize.Bounds(0.01, 0.01)) catch e {
+    panic("create bounds: ${e.message()}")
+  }
+  let pi = c.cms(prob).info() catch e {
+    panic("info bounds: ${e.message()}")
+  }
+  assert(pi.width >= 200 && pi.depth >= 5, "width ${pi.width} depth ${pi.depth}")
+  let twice = false
+  c.cms(a).create(CmsSize.Dims(10, 2)) catch e {
+    twice = refusedByServer(e)
+  }
+  assert(twice, "creating an existing sketch is the server's error")
+  sketchClean(c, [a, b, dst, prob])
+  c.close()
+}
+
+test "live: top-k reserve, add, incrBy, query, count, list and info" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:topk:a"
+  let sized = "bit:live:topk:sized"
+  sketchClean(c, [k, sized])
+  let t = c.topk(k)
+
+  t.reserve(3) catch e {
+    panic("reserve: ${e.message()}")
+  }
+  let out = t.add("ana", "bo", "cy", "di") catch e {
+    panic("add: ${e.message()}")
+  }
+  assert(len(out) == 4, "one answer per item")
+  assert(
+    out[0] == Option.None && out[1] == Option.None && out[2] == Option.None,
+    "nothing expelled yet",
+  )
+  let expelled = t.incrBy([counted("ana", 10), counted("ed", 5)]) catch e {
+    panic("incrBy: ${e.message()}")
+  }
+  assert(len(expelled) == 2, "one answer per item")
+  let q = t.query("ana", "zed") catch e {
+    panic("query: ${e.message()}")
+  }
+  assert(q[0] && !q[1], "ana is in the top 3, zed is not")
+  let n = t.count("ana") catch e {
+    panic("count: ${e.message()}")
+  }
+  assert(n[0] >= 10, "ana counted ${n[0]}")
+  let top = t.list() catch e {
+    panic("list: ${e.message()}")
+  }
+  assert(len(top) == 3 && top[0].item == "ana" && top[0].count >= 10, "ana leads the list")
+  assert(top[1].item == "ed" && top[1].count == 5, "ed is second with 5")
+  let info = t.info() catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(info.k == 3 && info.width > 0 && info.depth > 0 && info.decay > 0.0, "default shape")
+
+  c.topk(sized).reserve(2, TopKShape.Sized(16, 4, 0.8)) catch e {
+    panic("reserve sized: ${e.message()}")
+  }
+  let si = c.topk(sized).info() catch e {
+    panic("info sized: ${e.message()}")
+  }
+  assert(si.k == 2 && si.width == 16 && si.depth == 4 && si.decay == 0.8, "sized shape")
+  sketchClean(c, [k, sized])
+  c.close()
+}
+
+test "live: t-digest create, add, quantile, cdf, ranks, extremes, trimmed mean, merge, reset, info" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:td:a"
+  let other = "bit:live:td:b"
+  let dst = "bit:live:td:dst"
+  sketchClean(c, [k, other, dst])
+  let td = c.tdigest(k)
+
+  td.create(Option.Some(100)) catch e {
+    panic("create: ${e.message()}")
+  }
+  let empty = td.quantile(0.5) catch e {
+    panic("quantile empty: ${e.message()}")
+  }
+  let emptyMin = td.min() catch e {
+    panic("min empty: ${e.message()}")
+  }
+  let emptyRank = td.rank(1.0) catch e {
+    panic("rank empty: ${e.message()}")
+  }
+  assert(empty[0] != empty[0] && emptyMin != emptyMin, "an empty digest answers NaN")
+  assert(emptyRank[0] == -2, "an empty digest ranks -2, got ${emptyRank[0]}")
+
+  td.add(1.0, 2.0, 3.0, 4.0, 5.0) catch e {
+    panic("add: ${e.message()}")
+  }
+  let qs = td.quantile(0.5, 1.0) catch e {
+    panic("quantile: ${e.message()}")
+  }
+  assert(qs[0] == 3.0 && qs[1] == 5.0, "median 3, p100 5: ${qs[0]} ${qs[1]}")
+  let cdf = td.cdf(3.0, 100.0) catch e {
+    panic("cdf: ${e.message()}")
+  }
+  assert(cdf[0] > 0.4 && cdf[0] < 0.7 && cdf[1] == 1.0, "cdf ${cdf[0]} ${cdf[1]}")
+  let ranks = td.rank(0.0, 3.0, 9.0) catch e {
+    panic("rank: ${e.message()}")
+  }
+  assert(ranks[0] == -1 && ranks[1] == 2 && ranks[2] == 5, "rank below, middle, above")
+  let rev = td.revRank(0.0, 3.0, 9.0) catch e {
+    panic("revRank: ${e.message()}")
+  }
+  assert(rev[0] == 5 && rev[1] == 2 && rev[2] == -1, "revRank above, middle, below")
+  let by = td.byRank(0, 9) catch e {
+    panic("byRank: ${e.message()}")
+  }
+  assert(by[0] == 1.0 && by[1] > 1.0e300, "byRank 0 is the min, past the end is +inf")
+  let byRev = td.byRevRank(0, 9) catch e {
+    panic("byRevRank: ${e.message()}")
+  }
+  assert(byRev[0] == 5.0 && byRev[1] < -1.0e300, "byRevRank 0 is the max, past the end is -inf")
+  let lo = td.min() catch e {
+    panic("min: ${e.message()}")
+  }
+  let hi = td.max() catch e {
+    panic("max: ${e.message()}")
+  }
+  let mean = td.trimmedMean(0.1, 0.9) catch e {
+    panic("trimmedMean: ${e.message()}")
+  }
+  assert(lo == 1.0 && hi == 5.0 && mean == 3.0, "min ${lo}, max ${hi}, trimmed mean ${mean}")
+
+  c.tdigest(other).create() catch e {
+    panic("create other: ${e.message()}")
+  }
+  c.tdigest(other).add(10.0, 20.0) catch e {
+    panic("add other: ${e.message()}")
+  }
+  c.tdigest(dst).create() catch e {
+    panic("create dst: ${e.message()}")
+  }
+  c.tdigest(dst).merge([k, other], TDigestMergeOptions{ compression = Option.Some(200) }) catch e {
+    panic("merge: ${e.message()}")
+  }
+  let merged = c.tdigest(dst).info() catch e {
+    panic("info merged: ${e.message()}")
+  }
+  assert(
+    merged.compression == 200 && merged.observations == 7,
+    "merged digest: ${merged.observations}",
+  )
+  c.tdigest(dst).merge([other], TDigestMergeOptions{ overwrite = true }) catch e {
+    panic("merge overwrite: ${e.message()}")
+  }
+  let over = c.tdigest(dst).info() catch e {
+    panic("info overwritten: ${e.message()}")
+  }
+  assert(over.observations == 2, "overwrite replaced the content: ${over.observations}")
+
+  let info = td.info() catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(info.compression == 100 && info.observations == 5 && info.memoryUsage > 0, "info")
+  assert(info.capacity > 0 && info.mergedNodes + info.unmergedNodes > 0, "centroids")
+  assert(info.mergedWeight + info.unmergedWeight == 5, "weights")
+  td.reset() catch e {
+    panic("reset: ${e.message()}")
+  }
+  let after = td.info() catch e {
+    panic("info after reset: ${e.message()}")
+  }
+  assert(after.observations == 0 && after.compression == 100, "reset empties, keeps compression")
+  sketchClean(c, [k, other, dst])
+  c.close()
+}
+
+test "live: all five handles queue through a pipeline and a transaction, and tx.read refuses a write" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let keys = [
+    "bit:live:q:bf",
+    "bit:live:q:cf",
+    "bit:live:q:cms",
+    "bit:live:q:topk",
+    "bit:live:q:td",
+  ]
+  sketchClean(c, keys)
+
+  let p = c.pipeline()
+  let bfAdd = p.bloom(keys[0]).add("ana")
+  let cfAdd = p.cuckoo(keys[1]).add("ana")
+  let cmsMake = p.cms(keys[2]).create(CmsSize.Dims(50, 4))
+  let cmsInc = p.cms(keys[2]).incrBy([counted("ana", 2)])
+  let tkMake = p.topk(keys[3]).reserve(3)
+  let tkAdd = p.topk(keys[3]).add("ana")
+  let tdMake = p.tdigest(keys[4]).create()
+  let tdAdd = p.tdigest(keys[4]).add(7.0)
+  let tdMax = p.tdigest(keys[4]).max()
+  p.exec() catch e {
+    panic("pipeline exec: ${e.message()}")
+  }
+  let a = bfAdd.get() catch e {
+    panic("bf future: ${e.message()}")
+  }
+  let b = cfAdd.get() catch e {
+    panic("cf future: ${e.message()}")
+  }
+  cmsMake.get() catch e {
+    panic("cms create future: ${e.message()}")
+  }
+  let inc = cmsInc.get() catch e {
+    panic("cms future: ${e.message()}")
+  }
+  tkMake.get() catch e {
+    panic("topk create future: ${e.message()}")
+  }
+  let tk = tkAdd.get() catch e {
+    panic("topk future: ${e.message()}")
+  }
+  tdMake.get() catch e {
+    panic("td create future: ${e.message()}")
+  }
+  tdAdd.get() catch e {
+    panic("td add future: ${e.message()}")
+  }
+  let top = tdMax.get() catch e {
+    panic("td max future: ${e.message()}")
+  }
+  assert(a && b && inc[0] == 2 && len(tk) == 1 && top == 7.0, "pipelined results")
+
+  let read = c.transaction<Future<bool>>([keys[0]], (tx) => {
+    let queued = tx.bloom(keys[0]).add("bo")
+    let r = tx.read.bloom(keys[0])
+    let seen = r.exists("ana")?
+    assert(seen, "tx.read sees the key as it is now")
+    let refused = false
+    let _ = r.add("cy") catch _ {
+      refused = true
+      false
+    }
+    assert(refused, "a write through tx.read is refused")
+    let tq = tx.topk(keys[3]).query("ana")
+    let _ = tq
+    return queued
+  }) catch e {
+    panic("transaction: ${e.message()}")
+  }
+  let isNew = read.get() catch e {
+    panic("tx future: ${e.message()}")
+  }
+  assert(isNew, "the queued add stored bo")
+  let has = c.bloom(keys[0]).existsMany("bo", "cy") catch e {
+    panic("existsMany: ${e.message()}")
+  }
+  assert(has[0] && !has[1], "bo stored, cy refused")
+  sketchClean(c, keys)
+  c.close()
+}
