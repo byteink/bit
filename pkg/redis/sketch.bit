@@ -1,0 +1,414 @@
+// pkg/redis/sketch.bit - `r.cms(key)` and `r.topk(key)`: the count-min sketch
+// (`CMS.*`) and top-k (`TOPK.*`) commands, plus the decoders and the
+// `Counted` pair the five probabilistic families share. Epic #6013, #6028,
+// #6039. Follows `cmd.bit`'s HOW-TO header and `counter.bit`'s shape: one
+// `Cmd<T>` factory per command, an immediate method on the handle, a queued
+// one on its `...Batch`. `bloom.bit` holds the Bloom and cuckoo filters,
+// `tdigest.bit` the t-digest.
+//
+// Both handles hold `runner: Runner`, as `set.bit`'s `Set` does: `r.cms(key)`
+// runs over the pool, and the queued views come from `tx.cms(key)` /
+// `p.cms(key)`. A write through a pinned runner is refused (#7738).
+//
+// ONE METHOD PER COMMAND, TYPED OPTIONS. `CMS.INITBYDIM` and
+// `CMS.INITBYPROB` are one `init` that takes a `CmsSize` (`Dims` or `Bounds`);
+// `TOPK.RESERVE`'s optional width/depth/decay come as a `TopKShape`. A
+// command that takes several items (`CMS.QUERY`, `TOPK.ADD`, ...) takes them
+// variadic and answers one result per item, in order.
+//
+// `TopK.list` ALWAYS ASKS FOR `WITHCOUNT`: the plain item list is the same
+// call with `.item` read off each `Counted`, and one return type beats a flag
+// that flips it.
+
+// An item with a count: the increment `CMS.INCRBY` and `TOPK.INCRBY` take,
+// and the entry `TOPK.LIST` returns.
+export class Counted { export item: string, export count: i64 }
+
+// `Counted` without the class literal: `counted("ana", 3)`.
+export fn counted(item: string, count: i64): Counted {
+  return Counted{ item = item, count = count }
+}
+
+// One chunk of `BF.SCANDUMP` / `CF.SCANDUMP`. Dumping starts at iterator 0;
+// each call returns the next iterator and a chunk of bytes to hand to
+// `loadChunk` with the iterator that PRODUCED it. The dump is finished when
+// the iterator comes back 0 (that last chunk is empty).
+export class ScanChunk { export iterator: i64, export data: string }
+
+// A list reply decoded element by element; a null array is the empty list.
+fn sketchList<T>(r: Reply, cmd: string, one: (Reply) => T!RedisError): []T!RedisError {
+  let list = replyItems(r, cmd)?
+  let out = []T(0)
+  let i = 0
+  while (i < len(list)) {
+    out = append(out, one(list[i])?)
+    i = i + 1
+  }
+  return out
+}
+
+// A map reply or a flat name/value array as one list of pairs.
+fn sketchPairs(r: Reply, cmd: string): []MapEntry!RedisError {
+  match (r) {
+    Map(pairs) => return pairs
+    Array(items) => return pairUp(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// An integer that may arrive as `Int`, or as a decimal `Bulk` (RESP2 and the
+// fields a module reports as strings).
+fn sketchInt(r: Reply, cmd: string): i64!RedisError {
+  match (r) {
+    Int(n) => return n
+    Bulk(v) => return parseInt(unwrapOr(v, "")) catch _ {
+      fail RedisError.Unexpected(cmd, "Bulk")
+    }
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// A field of an `INFO` reply as an integer; a field the server did not send
+// reads 0, so a newer or older server is never a decode failure.
+fn sketchField(pairs: []MapEntry, name: string, cmd: string): i64!RedisError {
+  let r = infoFind(pairs, name)
+  match (r) {
+    Null => return 0
+    _ => return sketchInt(r, cmd)?
+  }
+}
+
+// An integer field that is nil when it does not apply (`BF.INFO`'s expansion
+// rate on a non-scaling filter, sent as a null or an empty string).
+fn sketchOptField(pairs: []MapEntry, name: string, cmd: string): Option<i64>!RedisError {
+  let r = infoFind(pairs, name)
+  match (r) {
+    Null => return Option.None
+    Bulk(v) => return sketchOptBulk(v, r, cmd)?
+    _ => return Option.Some(sketchInt(r, cmd)?)
+  }
+}
+
+fn sketchOptBulk(v: Option<string>, r: Reply, cmd: string): Option<i64>!RedisError {
+  if (unwrapOr(v, "") == "") {
+    return Option.None
+  }
+  return Option.Some(sketchInt(r, cmd)?)
+}
+
+fn sketchInts(r: Reply, cmd: string): []i64!RedisError {
+  return sketchList<i64>(r, cmd, (e) => sketchInt(e, cmd))?
+}
+
+fn sketchBools(r: Reply, cmd: string): []bool!RedisError {
+  return sketchList<bool>(r, cmd, (e) => asBool(e, cmd))?
+}
+
+// One `(iterator, data)` pair.
+fn asScanChunk(r: Reply, cmd: string): ScanChunk!RedisError {
+  let list = replyItems(r, cmd)?
+  if (len(list) != 2) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let it = sketchInt(list[0], cmd)?
+  let data = asOptString(list[1], cmd)?
+  return ScanChunk{ iterator = it, data = unwrapOr(data, "") }
+}
+
+// ---------------------------------------------------------------- count-min
+
+// The size of a count-min sketch. `Dims(width, depth)` is `CMS.INITBYDIM`:
+// `width` counters per row, `depth` rows. `Bounds(error, probability)` is
+// `CMS.INITBYPROB`: the overestimate is at most `error` times the total of
+// all increments, with probability `1 - probability`.
+export enum CmsSize {
+  Dims(i64, i64)
+  Bounds(f64, f64)
+}
+
+// One source of `CMS.MERGE`: a sketch key and the factor its counters are
+// multiplied by (1 for a plain sum).
+export class CmsSource { export key: string, export weight: i64 = 1 }
+
+// `CMS.INFO`: `count` is the total of every increment so far.
+export class CmsInfo { export width: i64, export depth: i64, export count: i64 }
+
+export class Cms {
+  runner: Runner
+  key: string
+
+  // `CMS.INITBYDIM` / `CMS.INITBYPROB`: creates the sketch; an existing key
+  // is the server's error.
+  export init(size: CmsSize): ()!RedisError {
+    return this.runner.runCmd(cmsInitCmd(this.key, size))?
+  }
+  // `CMS.INCRBY`: adds to each item's counter and returns the new estimates.
+  export incrBy(items: []Counted): []i64!RedisError {
+    return this.runner.runCmd(cmsIncrByCmd(this.key, items))?
+  }
+  // `CMS.QUERY`: each item's estimate (never below the truth, 0 if unseen).
+  export query(...items: string): []i64!RedisError {
+    return this.runner.runCmd(cmsQueryCmd(this.key, items))?
+  }
+  // `CMS.MERGE`: overwrites this sketch (created with the same width and
+  // depth as every source) with the weighted sum of `sources`.
+  export merge(sources: []CmsSource): ()!RedisError {
+    return this.runner.runCmd(cmsMergeCmd(this.key, sources))?
+  }
+  export info(): CmsInfo!RedisError { return this.runner.runCmd(cmsInfoCmd(this.key))? }
+}
+
+// The queued view `Pipeline.cms`/`Tx.cms` both return.
+export class CmsBatch {
+  batch: Batch
+  key: string
+
+  export init(size: CmsSize): Future<()> { return this.batch.queue(cmsInitCmd(this.key, size)) }
+  export incrBy(items: []Counted): Future<[]i64> {
+    return this.batch.queue(cmsIncrByCmd(this.key, items))
+  }
+  export query(...items: string): Future<[]i64> {
+    return this.batch.queue(cmsQueryCmd(this.key, items))
+  }
+  export merge(sources: []CmsSource): Future<()> {
+    return this.batch.queue(cmsMergeCmd(this.key, sources))
+  }
+  export info(): Future<CmsInfo> { return this.batch.queue(cmsInfoCmd(this.key)) }
+}
+
+fn cmsInitArgs(key: string, size: CmsSize): []string {
+  match (size) {
+    Dims(w, d) => return ["CMS.INITBYDIM", key, "${w}", "${d}"]
+    Bounds(e, p) => return ["CMS.INITBYPROB", key, "${e}", "${p}"]
+  }
+}
+
+fn cmsInitCmd(key: string, size: CmsSize): Cmd<()> {
+  let args = cmsInitArgs(key, size)
+  return Cmd<()>{ args = args, decode = (r) => asOk(r, args[0]), readOnly = false }
+}
+
+fn cmsIncrByCmd(key: string, items: []Counted): Cmd<[]i64> {
+  return Cmd<[]i64>{
+    args = countedArgs(["CMS.INCRBY", key], items),
+    decode = (r) => sketchInts(r, "CMS.INCRBY"),
+    readOnly = false,
+  }
+}
+
+// `item count item count ...`, appended to `head`.
+fn countedArgs(head: []string, items: []Counted): []string {
+  let out = head
+  let i = 0
+  while (i < len(items)) {
+    out = append(out, items[i].item)
+    out = append(out, "${items[i].count}")
+    i = i + 1
+  }
+  return out
+}
+
+fn cmsQueryCmd(key: string, items: []string): Cmd<[]i64> {
+  return Cmd<[]i64>{
+    args = append(["CMS.QUERY", key], ...items),
+    decode = (r) => sketchInts(r, "CMS.QUERY"),
+    readOnly = true,
+  }
+}
+
+// `CMS.MERGE dest numKeys src... WEIGHTS w...`: the weights are always sent,
+// 1 being the plain sum.
+fn cmsMergeArgs(dest: string, sources: []CmsSource): []string {
+  let out = ["CMS.MERGE", dest, "${len(sources)}"]
+  let i = 0
+  while (i < len(sources)) {
+    out = append(out, sources[i].key)
+    i = i + 1
+  }
+  out = append(out, "WEIGHTS")
+  i = 0
+  while (i < len(sources)) {
+    out = append(out, "${sources[i].weight}")
+    i = i + 1
+  }
+  return out
+}
+
+fn cmsMergeCmd(dest: string, sources: []CmsSource): Cmd<()> {
+  return Cmd<()>{
+    args = cmsMergeArgs(dest, sources),
+    decode = (r) => asOk(r, "CMS.MERGE"),
+    readOnly = false,
+  }
+}
+
+fn cmsInfoCmd(key: string): Cmd<CmsInfo> {
+  return Cmd<CmsInfo>{ args = ["CMS.INFO", key], decode = (r) => asCmsInfo(r), readOnly = true }
+}
+
+fn asCmsInfo(r: Reply): CmsInfo!RedisError {
+  let pairs = sketchPairs(r, "CMS.INFO")?
+  return CmsInfo{
+    width = sketchField(pairs, "width", "CMS.INFO")?,
+    depth = sketchField(pairs, "depth", "CMS.INFO")?,
+    count = sketchField(pairs, "count", "CMS.INFO")?,
+  }
+}
+
+// -------------------------------------------------------------------- top-k
+
+// The optional shape of `TOPK.RESERVE`: `Default` leaves it to the server,
+// `Sized(width, depth, decay)` sets the counter array (`width` counters per
+// row, `depth` rows) and the `decay` (0..1) applied to a counter that loses.
+export enum TopKShape {
+  Default
+  Sized(i64, i64, f64)
+}
+
+// `TOPK.INFO`.
+export class TopKInfo {
+  export k: i64,
+  export width: i64,
+  export depth: i64,
+  export decay: f64,
+}
+
+export class TopK {
+  runner: Runner
+  key: string
+
+  // `TOPK.RESERVE`: tracks the `k` most frequent items.
+  export reserve(k: i64, shape: TopKShape = TopKShape.Default): ()!RedisError {
+    return this.runner.runCmd(topkReserveCmd(this.key, k, shape))?
+  }
+  // `TOPK.ADD`: counts each item once; the answer holds, per item, the item
+  // it pushed out of the top k, or `None`.
+  export add(...items: string): []Option<string>!RedisError {
+    return this.runner.runCmd(topkAddCmd(this.key, items))?
+  }
+  // `TOPK.INCRBY`: like `add`, with a count per item.
+  export incrBy(items: []Counted): []Option<string>!RedisError {
+    return this.runner.runCmd(topkIncrByCmd(this.key, items))?
+  }
+  // `TOPK.QUERY`: whether each item is in the top k now.
+  export query(...items: string): []bool!RedisError {
+    return this.runner.runCmd(topkQueryCmd(this.key, items))?
+  }
+  // `TOPK.COUNT`: each item's estimated count.
+  export count(...items: string): []i64!RedisError {
+    return this.runner.runCmd(topkCountCmd(this.key, items))?
+  }
+  // `TOPK.LIST WITHCOUNT`: the current top k, most frequent first.
+  export list(): []Counted!RedisError { return this.runner.runCmd(topkListCmd(this.key))? }
+  export info(): TopKInfo!RedisError { return this.runner.runCmd(topkInfoCmd(this.key))? }
+}
+
+// The queued view `Pipeline.topk`/`Tx.topk` both return.
+export class TopKBatch {
+  batch: Batch
+  key: string
+
+  export reserve(k: i64, shape: TopKShape = TopKShape.Default): Future<()> {
+    return this.batch.queue(topkReserveCmd(this.key, k, shape))
+  }
+  export add(...items: string): Future<[]Option<string>> {
+    return this.batch.queue(topkAddCmd(this.key, items))
+  }
+  export incrBy(items: []Counted): Future<[]Option<string>> {
+    return this.batch.queue(topkIncrByCmd(this.key, items))
+  }
+  export query(...items: string): Future<[]bool> {
+    return this.batch.queue(topkQueryCmd(this.key, items))
+  }
+  export count(...items: string): Future<[]i64> {
+    return this.batch.queue(topkCountCmd(this.key, items))
+  }
+  export list(): Future<[]Counted> { return this.batch.queue(topkListCmd(this.key)) }
+  export info(): Future<TopKInfo> { return this.batch.queue(topkInfoCmd(this.key)) }
+}
+
+fn topkReserveArgs(key: string, k: i64, shape: TopKShape): []string {
+  match (shape) {
+    Default => return ["TOPK.RESERVE", key, "${k}"]
+    Sized(w, d, decay) => return ["TOPK.RESERVE", key, "${k}", "${w}", "${d}", "${decay}"]
+  }
+}
+
+fn topkReserveCmd(key: string, k: i64, shape: TopKShape): Cmd<()> {
+  return Cmd<()>{
+    args = topkReserveArgs(key, k, shape),
+    decode = (r) => asOk(r, "TOPK.RESERVE"),
+    readOnly = false,
+  }
+}
+
+fn topkAddCmd(key: string, items: []string): Cmd<[]Option<string>> {
+  return Cmd<[]Option<string>>{
+    args = append(["TOPK.ADD", key], ...items),
+    decode = (r) => asOptStrings(r, "TOPK.ADD"),
+    readOnly = false,
+  }
+}
+
+fn topkIncrByCmd(key: string, items: []Counted): Cmd<[]Option<string>> {
+  return Cmd<[]Option<string>>{
+    args = countedArgs(["TOPK.INCRBY", key], items),
+    decode = (r) => asOptStrings(r, "TOPK.INCRBY"),
+    readOnly = false,
+  }
+}
+
+fn topkQueryCmd(key: string, items: []string): Cmd<[]bool> {
+  return Cmd<[]bool>{
+    args = append(["TOPK.QUERY", key], ...items),
+    decode = (r) => sketchBools(r, "TOPK.QUERY"),
+    readOnly = true,
+  }
+}
+
+fn topkCountCmd(key: string, items: []string): Cmd<[]i64> {
+  return Cmd<[]i64>{
+    args = append(["TOPK.COUNT", key], ...items),
+    decode = (r) => sketchInts(r, "TOPK.COUNT"),
+    readOnly = true,
+  }
+}
+
+fn topkListCmd(key: string): Cmd<[]Counted> {
+  return Cmd<[]Counted>{
+    args = ["TOPK.LIST", key, "WITHCOUNT"],
+    decode = (r) => asTopKList(r),
+    readOnly = true,
+  }
+}
+
+// `[item, count, item, count, ...]`.
+fn asTopKList(r: Reply): []Counted!RedisError {
+  let list = replyItems(r, "TOPK.LIST")?
+  if (len(list) % 2 != 0) {
+    fail RedisError.Unexpected("TOPK.LIST", "Array")
+  }
+  let out = []Counted(0)
+  let i = 0
+  while (i < len(list)) {
+    let item = replyToString(list[i], "TOPK.LIST")?
+    let n = sketchInt(list[i + 1], "TOPK.LIST")?
+    out = append(out, Counted{ item = item, count = n })
+    i = i + 2
+  }
+  return out
+}
+
+fn topkInfoCmd(key: string): Cmd<TopKInfo> {
+  return Cmd<TopKInfo>{ args = ["TOPK.INFO", key], decode = (r) => asTopKInfo(r), readOnly = true }
+}
+
+fn asTopKInfo(r: Reply): TopKInfo!RedisError {
+  let pairs = sketchPairs(r, "TOPK.INFO")?
+  return TopKInfo{
+    k = sketchField(pairs, "k", "TOPK.INFO")?,
+    width = sketchField(pairs, "width", "TOPK.INFO")?,
+    depth = sketchField(pairs, "depth", "TOPK.INFO")?,
+    decay = asDouble(infoFind(pairs, "decay"), "TOPK.INFO")?,
+  }
+}
