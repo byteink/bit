@@ -562,6 +562,70 @@ fn joinWorker(done: *i32, timeoutNs: int): bool {
   return false
 }
 
+// Step 8's worker join (#7836): every worker `ji < reapCount` reaped under ONE
+// `joinGraceNs` deadline taken here, once, so N workers parked in calls that poll
+// nothing cost the process 100 ms in all, not 15 s each. True when every worker
+// was joined; `boot` closes the netpoller only then (step 8b).
+fn bootReapWorkers(reapCount: int): bool {
+  let deadline = parkMonoNs() + joinGraceNs
+  let allJoined = true
+  let ji = 0
+  while (ji < reapCount) {
+    if (!bootReapWorker(ji, deadline)) {
+      allJoined = false
+    }
+    ji = ji + 1
+  }
+  return allJoined
+}
+
+// Reap worker `ji`'s OS thread, step 8's per-slot body (#5930), moved here from
+// ./boot.bit by #7836 to keep that file under the 800-line cap. Split out of
+// `boot` so the join-timeout guard below does not grow that function's own
+// complexity debt entry (`tools/build/complexity-debt.txt`); `startDones` and
+// `startHandles` are this module's own state, already in scope for a sibling
+// function exactly as `boot` used them inline.
+//
+// `deadline` is the ONE `parkMonoNs` reading every worker's join shares (#7836,
+// `joinGraceNs` after step 8 began), not a bound per worker: the 15 s this used to
+// allow EACH made a returned `main` wait 15 s for a worker parked in a call that
+// polls nothing (a raw foreign `read` with no `gcBlockingBegin` bracket) and N *
+// 15 s for N of them. `joinWorker` looks at the done word once even when the
+// deadline has passed, so a worker that already finished is still joined.
+// True when this worker was joined.
+//
+// ONLY CALL `threadRelease` (`pthread_join`, ../../thread/darwin/spawn.bit)
+// WHEN `joinWorker` REPORTS THE CHILD ACTUALLY FINISHED within the deadline.
+// `pthread_join` has no timed form, so calling it unconditionally turned a
+// documented, bounded timeout into an unbounded wait whenever the child's Bit
+// task never returns, which `_tests_/stress/netclosereuse`'s abandoned stale
+// reader does by design ("left to the process exit rather than joined").
+// ../linux/boottail.bit's `threadRelease` differs here: its own bounded on-stack
+// spin already returns false on exactly this timeout, so it is called either way
+// there; Darwin's has no such bound and must not be reached on a timeout.
+fn bootReapWorker(ji: int, deadline: int): bool {
+  let joined = joinWorker(ptrOf(startDones) + ji, deadline - parkMonoNs())
+  if (!joined) {
+    // A TIMED-OUT JOIN LEAKS THE THREAD'S RESOURCES rather than blocking
+    // forever, the same trade ../linux/boottail.bit's `threadRelease` already
+    // makes on its own timeout: the process is tearing down either way, and the
+    // kernel reclaims the leaked OS thread at exit.
+    return false
+  }
+  // The residual gap `threadRelease` itself documents (a few instructions of
+  // libSystem teardown) is still a window with no safepoint reachable, so
+  // bracket it `blocked` (ABI.md §5) exactly as step 7's `bootWaitForMain`
+  // brackets its own wait: a stop-the-world requested in that gap is then passed
+  // at once instead of spinning `stwSpinBound` for a slot that cannot poll until
+  // the join returns. PRECONDITION as for every bracket in this file: `boot`
+  // holds no live Bit reference across it (see ./boot.bit's header), and this
+  // function runs only from `boot`'s own step 8, after the same holds.
+  gcBlockingBegin()
+  threadRelease(*(ptrOf(startHandles) + ji))
+  gcBlockingEnd()
+  return true
+}
+
 // The boot thread's step-7 wait for `main` (`./boot.bit`), placed here because
 // the two halves of that rendezvous only make sense read together: this waits
 // on `mainDone`, and `mainTrampoline` below is its only writer.

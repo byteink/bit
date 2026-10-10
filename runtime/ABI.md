@@ -2475,6 +2475,21 @@ up the process says who, once, on stderr:
 | `thread token` | `gcThreadToken()` of the OS thread that owns the slot, the value the thread provider uses to find it |
 | `is still <state>` | the slot's last published state (`running` when the contract was broken; `parked` with an `acked epoch` older than the `stop epoch` is a thread still on its way out of an earlier stop) |
 
+**The same contract bounds the scheduler, not only the collector (#7836).** A task
+that blocks its worker's OS thread in a kernel wait or foreign call with no
+bracket leaves the worker's slot `running`, and the monitor thread's retake
+(`runtime/sched/retake.bit`, #7128) keys on the slot being `syscall` or `blocked`:
+an unbracketed block is indistinguishable from a CPU-bound task that has not
+reached a safepoint yet. So at `BIT_WORKERS=1` such a task holds the only worker
+and nothing queued behind it, `main` included, runs until the call returns. That
+is the contract, not a gap to retake around: Go's `sysmon` hands a P off only from
+`_Psyscall` (`retake` / `handoffp` in `runtime/proc.go`), a state its cgo and
+syscall paths enter themselves (`cgocall` -> `entersyscall`), so a foreign call
+Go does not bracket cannot occur there; here the compiler emits no bracket around an `extern fn` call (SPEC
+section 11.7), so the caller brackets it. Teardown does not depend on
+it: a returned `main` joins the workers under ONE 100 ms deadline (`boot`, step 8)
+and the process exits with a worker still blocked.
+
 `BIT_GC_STATS=1` adds a field, `stuck=<n>`: how many abandoned
 rendezvous named a slot, over the whole run. The line itself is printed once
 per process, after the world is restarted (a blocked stderr must never hold the
