@@ -139,13 +139,13 @@ test "a concurrent duplicate while the first is in flight is 409, and the origin
 
 // Always refuses `begin`; the other two never run in these tests.
 class FailingBeginStore {
-  export begin(key: string, fingerprint: string, ttl: i64): Option<IdempotencyEntry>! {
+  export begin(key: string, fingerprint: string, ttl: i64): IdempotencyClaim! {
     fail newError("idempotency store is down")
   }
-  export finish(key: string, resp: CachedResponse, ttl: i64): ()! {
+  export finish(key: string, token: string, resp: CachedResponse, ttl: i64): ()! {
     return
   }
-  export abandon(key: string): ()! {
+  export abandon(key: string, token: string): ()! {
     return
   }
 }
@@ -170,14 +170,14 @@ test "a begin() failure refuses the request rather than risk running the handler
 class FailingFinishStore {
   inner: MemoryIdempotencyStore
 
-  export begin(key: string, fingerprint: string, ttl: i64): Option<IdempotencyEntry>! {
+  export begin(key: string, fingerprint: string, ttl: i64): IdempotencyClaim! {
     return this.inner.begin(key, fingerprint, ttl)?
   }
-  export finish(key: string, resp: CachedResponse, ttl: i64): ()! {
+  export finish(key: string, token: string, resp: CachedResponse, ttl: i64): ()! {
     fail newError("cache write is down")
   }
-  export abandon(key: string): ()! {
-    this.inner.abandon(key)?
+  export abandon(key: string, token: string): ()! {
+    this.inner.abandon(key, token)?
   }
 }
 
@@ -203,6 +203,71 @@ test "a finish() failure still serves the real response, logged, uncached" {
   assert(
     contains(sinkText(sink), "finish failed") && contains(sinkText(sink), "key=k1"),
     "the finish() failure must be logged, got '${sinkText(sink)}'",
+  )
+}
+
+// --- the middleware hands the store the token begin() issued (#7832) ------------
+
+// Wraps a real store and records the token each call carried.
+class TokenSpyStore {
+  inner: MemoryIdempotencyStore
+  issued: string
+  finishedWith: string
+  abandonedWith: string
+
+  export begin(key: string, fingerprint: string, ttl: i64): IdempotencyClaim! {
+    let claim = this.inner.begin(key, fingerprint, ttl)?
+    if (claim.won()) {
+      this.issued = claim.token
+    }
+    return claim
+  }
+  export finish(key: string, token: string, resp: CachedResponse, ttl: i64): ()! {
+    this.finishedWith = token
+    this.inner.finish(key, token, resp, ttl)?
+  }
+  export abandon(key: string, token: string): ()! {
+    this.abandonedWith = token
+    this.inner.abandon(key, token)?
+  }
+}
+
+test "a successful handler finishes with the token begin() issued" {
+  let spy = TokenSpyStore{ inner = MemoryIdempotencyStore(1000) }
+  let app = idemApp(spy, 60, (c) => {
+    return c.text("ok")
+  })
+
+  let _ = app.handle(idemReq("k1", "{}"))
+
+  assert(len(spy.issued) == 32, "begin() must have issued a token, got '${spy.issued}'")
+  assert(spy.finishedWith == spy.issued, "finish() got '${spy.finishedWith}', want '${spy.issued}'")
+  assert(spy.abandonedWith == "", "a handler that returned must not abandon")
+}
+
+test "a failing handler abandons with the token begin() issued, and the retry runs again" {
+  let calls = 0
+  let spy = TokenSpyStore{ inner = MemoryIdempotencyStore(1000) }
+  let app = idemApp(spy, 60, (c) => {
+    calls = calls + 1
+    if (calls == 1) {
+      fail newError("boom")
+    }
+    return c.text("ok")
+  })
+
+  let first = app.handle(idemReq("k1", "{}"))
+  let issuedFirst = spy.issued
+  let second = app.handle(idemReq("k1", "{}"))
+
+  assert(first.status == 500, "precondition: the first attempt fails, got ${first.status}")
+  assert(
+    spy.abandonedWith == issuedFirst,
+    "abandon() got '${spy.abandonedWith}', want '${issuedFirst}'",
+  )
+  assert(
+    second.status == 200 && calls == 2,
+    "an abandoned key must be retryable, got ${second.status}",
   )
 }
 
@@ -240,11 +305,13 @@ test "begin() reserves an absent key InFlight, and a same-fingerprint retry sees
   let s = MemoryIdempotencyStore(1000)
 
   let first = s.beginAt("k", "fp-a", 10, 1000)
-  assert(!isSome(first), "the first begin() on an absent key must win — Option.None")
+  assert(first.won(), "the first begin() on an absent key must win and carry a token")
+  assert(len(first.token) == 32, "want a 128-bit hex token, got '${first.token}'")
 
   let second = s.beginAt("k", "fp-a", 10, 1001)
-  assert(isSome(second), "a retry against a claimed key must see the reservation")
-  let e = unwrap(second)
+  assert(!second.won(), "a retry against a claimed key must see the reservation")
+  assert(second.token == "", "a caller that lost holds no token")
+  let e = unwrap(second.existing)
   assert(
     e.state == IdempotencyState.InFlight,
     "the reservation must still read InFlight before finish()",
@@ -252,57 +319,201 @@ test "begin() reserves an absent key InFlight, and a same-fingerprint retry sees
   assert(e.fingerprint == "fp-a", "the stored fingerprint must be the one begin() reserved with")
 }
 
+test "two reservations never share a token" {
+  let s = MemoryIdempotencyStore(1000)
+  let a = s.beginAt("k1", "fp", 10, 1000)
+  let b = s.beginAt("k2", "fp", 10, 1000)
+  assert(a.token != b.token, "tokens must be unique per reservation")
+}
+
 test "a different fingerprint against a claimed key is reported regardless of state" {
   let s = MemoryIdempotencyStore(1000)
   let _ = s.beginAt("k", "fp-a", 10, 1000)
 
   let found = s.beginAt("k", "fp-b", 10, 1001)
-  assert(isSome(found), "a claimed key must be reported even under a different fingerprint")
-  let e = unwrap(found)
+  assert(!found.won(), "a claimed key must be reported even under a different fingerprint")
   assert(
-    e.fingerprint == "fp-a",
+    unwrap(found.existing).fingerprint == "fp-a",
     "the stored fingerprint must be the FIRST caller's, not the retry's own",
   )
 }
 
 test "finish() moves a key to Done, and begin() then replays it with the cached response" {
   let s = MemoryIdempotencyStore(1000)
-  let _ = s.beginAt("k", "fp-a", 10, 1000)
-  s.finishAt("k", CachedResponse{ status = 201, body = "done", headers = []Header(0) }, 10, 1001)
+  let a = s.beginAt("k", "fp-a", 10, 1000)
+  s.finishAt(
+    "k",
+    a.token,
+    CachedResponse{ status = 201, body = "done", headers = []Header(0) },
+    10,
+    1001,
+  )
 
   let found = s.beginAt("k", "fp-a", 10, 1002)
-  assert(isSome(found), "a finished key must still read as claimed")
-  let e = unwrap(found)
+  assert(!found.won(), "a finished key must still read as claimed")
+  let e = unwrap(found.existing)
   assert(e.state == IdempotencyState.Done, "want Done after finish(), got InFlight")
+  assert(e.fingerprint == "fp-a", "finish() must keep the fingerprint begin() stored")
   assert(e.response.status == 201, "want the cached status, got ${e.response.status}")
   assert(e.response.body == "done", "want the cached body, got '${e.response.body}'")
 }
 
 test "a key's ttl expires, and a begin() after it starts a fresh reservation" {
   let s = MemoryIdempotencyStore(1000)
-  let _ = s.beginAt("k", "fp-a", 10, 1000)
-  s.finishAt("k", CachedResponse{ status = 200, body = "x", headers = []Header(0) }, 10, 1000)
+  let a = s.beginAt("k", "fp-a", 10, 1000)
+  s.finishAt(
+    "k",
+    a.token,
+    CachedResponse{ status = 200, body = "x", headers = []Header(0) },
+    10,
+    1000,
+  )
 
   // Created (finished) at 1000 with a ttl of 10, so it dies at 1010.
   let stillLive = s.beginAt("k", "fp-a", 10, 1009)
-  assert(isSome(stillLive), "the entry must still be readable one second before it expires")
+  assert(!stillLive.won(), "the entry must still be readable one second before it expires")
 
   let afterExpiry = s.beginAt("k", "fp-b", 10, 1010)
   assert(
-    !isSome(afterExpiry),
+    afterExpiry.won(),
     "an expired key must be gone at its expiry second, letting a fresh begin() win",
   )
 }
 
 test "abandon() frees a key immediately, before its ttl would otherwise expire it" {
   let s = MemoryIdempotencyStore(1000)
-  let _ = s.beginAt("k", "fp-a", 3600, 1000)
-  s.abandonAt("k")
+  let a = s.beginAt("k", "fp-a", 3600, 1000)
+  s.abandonAt("k", a.token)
 
   let found = s.beginAt("k", "fp-b", 10, 1000)
   assert(
-    !isSome(found),
+    found.won(),
     "abandon() must free the key for an immediate fresh begin(), regardless of ttl",
+  )
+}
+
+// --- whose reservation is it (#7832) ------------------------------------------
+//
+// A's reservation expires while A's handler is still running; B begins the
+// same key; A then fails (late abandon) or succeeds (late finish). Neither may
+// touch B's reservation, or a third retry would run the handler again.
+
+test "a late abandon from an expired reservation leaves the later reservation intact" {
+  let s = MemoryIdempotencyStore(1000)
+  let a = s.beginAt("k", "fp", 10, 1000)
+  let b = s.beginAt("k", "fp", 10, 1010)
+  assert(b.won(), "precondition: B takes the key once A's reservation expired")
+
+  s.abandonAt("k", a.token)
+
+  let third = s.beginAt("k", "fp", 10, 1011)
+  assert(
+    !third.won(),
+    "A's late abandon deleted B's reservation: a third retry would run the handler",
+  )
+  assert(
+    unwrap(third.existing).state == IdempotencyState.InFlight,
+    "B's reservation must still be InFlight",
+  )
+}
+
+test "a late finish from an expired reservation leaves the later reservation intact" {
+  let s = MemoryIdempotencyStore(1000)
+  let a = s.beginAt("k", "fp-b", 10, 1000)
+  let b = s.beginAt("k", "fp-b", 10, 1010)
+  assert(b.won(), "precondition: B takes the key once A's reservation expired")
+
+  s.finishAt(
+    "k",
+    a.token,
+    CachedResponse{ status = 200, body = "from A", headers = []Header(0) },
+    10,
+    1011,
+  )
+
+  let third = s.beginAt("k", "fp-b", 10, 1012)
+  assert(!third.won(), "the key must still be claimed")
+  assert(
+      unwrap(third.existing).state == IdempotencyState.InFlight &&
+      unwrap(third.existing).response.body == "",
+    "A's late finish overwrote B's reservation with A's response",
+  )
+}
+
+test "the owner's own finish and abandon still work after a stranger's were refused" {
+  let s = MemoryIdempotencyStore(1000)
+  let a = s.beginAt("k", "fp", 10, 1000)
+  let b = s.beginAt("k", "fp", 10, 1010)
+
+  s.abandonAt("k", a.token)
+  s.finishAt(
+    "k",
+    a.token,
+    CachedResponse{ status = 200, body = "from A", headers = []Header(0) },
+    10,
+    1011,
+  )
+  s.finishAt(
+    "k",
+    b.token,
+    CachedResponse{ status = 201, body = "from B", headers = []Header(0) },
+    10,
+    1012,
+  )
+
+  let done = s.beginAt("k", "fp", 10, 1013)
+  assert(!done.won(), "B's finished response must be stored")
+  assert(
+      unwrap(done.existing).state == IdempotencyState.Done &&
+      unwrap(done.existing).response.body == "from B",
+    "B's own finish must store B's response",
+  )
+
+  let c = s.beginAt("k2", "fp", 10, 1013)
+  s.abandonAt("k2", c.token)
+  assert(s.beginAt("k2", "fp", 10, 1013).won(), "B's own abandon must free the key")
+}
+
+test "an abandon after finish does not delete the cached response, and an empty token matches nothing" {
+  let s = MemoryIdempotencyStore(1000)
+  let a = s.beginAt("k", "fp", 10, 1000)
+  s.finishAt(
+    "k",
+    a.token,
+    CachedResponse{ status = 200, body = "x", headers = []Header(0) },
+    10,
+    1001,
+  )
+
+  s.abandonAt("k", a.token)
+  s.abandonAt("k", "")
+  s.finishAt("k", "", CachedResponse{ status = 200, body = "y", headers = []Header(0) }, 10, 1002)
+
+  let found = s.beginAt("k", "fp", 10, 1003)
+  assert(
+      !found.won() &&
+      unwrap(found.existing).state == IdempotencyState.Done &&
+      unwrap(found.existing).response.body == "x",
+    "the cached response must survive a stale abandon and an empty-token call",
+  )
+}
+
+test "a finish with no reservation left caches nothing" {
+  let s = MemoryIdempotencyStore(1000)
+  let a = s.beginAt("k", "fp", 10, 1000)
+
+  // Past A's expiry, nobody has begun since: the key is effectively absent.
+  s.finishAt(
+    "k",
+    a.token,
+    CachedResponse{ status = 200, body = "late", headers = []Header(0) },
+    10,
+    1011,
+  )
+
+  assert(
+    s.beginAt("k", "fp", 10, 1012).won(),
+    "nothing may be cached under an expired reservation",
   )
 }
 
@@ -316,12 +527,12 @@ test "a begin() past the cap evicts the soonest-expiring key instead of failing"
   assert(len(s.entries) == 3, "precondition: the store must be full")
 
   let d = s.beginAt("d", "fp", 5400, 1000)
-  assert(!isSome(d), "a begin() past the cap must still win the reservation")
+  assert(d.won(), "a begin() past the cap must still win the reservation")
   assert(len(s.entries) == 3, "the cap was crossed: ${len(s.entries)} keys under a cap of 3")
 
   let evicted = s.beginAt("b", "fp-new", 10, 1000)
   assert(
-    !isSome(evicted),
+    evicted.won(),
     "the soonest-expiring key must be the one evicted, freeing it for a fresh begin()",
   )
 }

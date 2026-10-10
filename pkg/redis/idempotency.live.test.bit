@@ -6,7 +6,7 @@
 //
 // THE CONCURRENCY TEST IS THE POINT: `idemRace` starts N tasks, each on its
 // own connection and released together by one barrier, all calling `begin`
-// on ONE never-seen key. Exactly one may get `None`; the other N-1 must get
+// on ONE never-seen key. Exactly one may win a token; the other N-1 must get
 // the winner's `InFlight` entry. A non-atomic `begin` (read, then write)
 // lets two of them read "absent" and both win.
 //
@@ -37,10 +37,26 @@ fn idemBegin(
   key: string,
   fp: string,
   ttl: i64,
-): Option<IdempotencyEntry> {
+): IdempotencyClaim {
   return s.begin(key, fp, ttl) catch e {
     panic("begin(${key}): ${e.message()}")
   }
+}
+
+// Begins `key` until this caller wins it, polling for A's 1s reservation to
+// expire.
+fn idemWaitWin(s: RedisIdempotencyStore, key: string, fp: string, ttl: i64): IdempotencyClaim {
+  let polls = 0
+  while (polls < 100) {
+    polls = polls + 1
+    sleep(100 * Millisecond)
+    let got = idemBegin(s, key, fp, ttl)
+    if (got.won()) {
+      return got
+    }
+  }
+  assert(false, "the key was never released after its 1s ttl")
+  return IdempotencyClaim{}
 }
 
 fn idemPttl(c: Client, name: string, key: string): i64 {
@@ -54,11 +70,11 @@ fn idemPttl(c: Client, name: string, key: string): i64 {
 
 // 0 = this caller created the reservation, 1 = it saw InFlight, 2 = it saw
 // Done, 9 = anything else.
-fn idemOutcome(got: Option<IdempotencyEntry>): int {
-  if (isNone(got)) {
+fn idemOutcome(got: IdempotencyClaim): int {
+  if (got.won()) {
     return 0
   }
-  let e = unwrap(got)
+  let e = unwrap(got.existing)
   if (e.state == IdempotencyState.InFlight) {
     return 1
   }
@@ -154,8 +170,14 @@ test "live: racers arriving after finish() all see the stored response" {
   let c = liveClient(u)
   let s = idemStore(c, "racedone")
   idemClear(c, "racedone", "k")
-  assert(isNone(idemBegin(s, "k", "fp-0", 60)), "the first begin wins")
-  s.finish("k", CachedResponse{ status = 201, body = "made", headers = []Header(0) }, 60) catch e {
+  let claim = idemBegin(s, "k", "fp-0", 60)
+  assert(claim.won(), "the first begin wins")
+  s.finish(
+    "k",
+    claim.token,
+    CachedResponse{ status = 201, body = "made", headers = []Header(0) },
+    60,
+  ) catch e {
     panic("finish: ${e.message()}")
   }
   let counts = idemRace(u, "racedone", "k")
@@ -175,10 +197,11 @@ test "live: begin() reports the first caller's fingerprint to later callers" {
   let c = liveClient(u)
   let s = idemStore(c, "fp")
   idemClear(c, "fp", "k")
-  assert(isNone(idemBegin(s, "k", "aaa", 60)), "first begin creates the reservation")
+  assert(idemBegin(s, "k", "aaa", 60).won(), "first begin creates the reservation")
   let again = idemBegin(s, "k", "bbb", 60)
-  assert(isSome(again), "a second begin sees the reservation")
-  let e = unwrap(again)
+  assert(!again.won(), "a second begin sees the reservation")
+  assert(again.token == "", "a loser is handed no token")
+  let e = unwrap(again.existing)
   assert(e.state == IdempotencyState.InFlight, "still InFlight")
   assert(
     e.fingerprint == "aaa",
@@ -196,7 +219,8 @@ test "live: finish() stores the response and keeps the fingerprint, begin() repl
   let c = liveClient(u)
   let s = idemStore(c, "fin")
   idemClear(c, "fin", "k")
-  assert(isNone(idemBegin(s, "k", "f:p", 60)), "reserve")
+  let claim = idemBegin(s, "k", "f:p", 60)
+  assert(claim.won(), "reserve")
   let resp = CachedResponse{
     status = 201,
     body = "{\"id\":7}\n",
@@ -205,12 +229,12 @@ test "live: finish() stores the response and keeps the fingerprint, begin() repl
       Header{ name = "X-Run", value = "1" },
     ],
   }
-  s.finish("k", resp, 60) catch e {
+  s.finish("k", claim.token, resp, 60) catch e {
     panic("finish: ${e.message()}")
   }
   let got = idemBegin(s, "k", "someone-else", 60)
-  assert(isSome(got), "a finished key is claimed")
-  let e = unwrap(got)
+  assert(!got.won(), "a finished key is claimed")
+  let e = unwrap(got.existing)
   assert(e.state == IdempotencyState.Done, "state is Done")
   assert(e.fingerprint == "f:p", "finish kept the fingerprint, got '${e.fingerprint}'")
   assert(
@@ -239,21 +263,23 @@ test "live: a body of every byte value and a megabyte of text round-trip exactly
     big = append(big, byte(97 + i % 26))
     i = i + 1
   }
-  assert(isNone(idemBegin(s, "k", "fp", 60)), "reserve")
+  let claim = idemBegin(s, "k", "fp", 60)
+  assert(claim.won(), "reserve")
   s.finish(
     "k",
+    claim.token,
     CachedResponse{ status = 200, body = body + string(big), headers = []Header(0) },
     60,
   ) catch e {
     panic("finish: ${e.message()}")
   }
-  let e = unwrap(idemBegin(s, "k", "fp", 60))
+  let e = unwrap(idemBegin(s, "k", "fp", 60).existing)
   assert(e.response.body == body + string(big), "body differs: ${len(e.response.body)} bytes back")
   idemClear(c, "bin", "k")
   c.close()
 }
 
-test "live: finish() without a reservation (expired mid-flight) still caches, with an empty fingerprint" {
+test "live: finish() without a reservation (expired mid-flight) writes nothing" {
   let u = liveUrl("REDIS_TEST_URL")
   if (u == "") {
     return
@@ -261,12 +287,15 @@ test "live: finish() without a reservation (expired mid-flight) still caches, wi
   let c = liveClient(u)
   let s = idemStore(c, "late")
   idemClear(c, "late", "k")
-  s.finish("k", CachedResponse{ status = 200, body = "late", headers = []Header(0) }, 60) catch e {
+  s.finish(
+    "k",
+    "no-such-token",
+    CachedResponse{ status = 200, body = "late", headers = []Header(0) },
+    60,
+  ) catch e {
     panic("finish: ${e.message()}")
   }
-  let e = unwrap(idemBegin(s, "k", "fp", 60))
-  assert(e.state == IdempotencyState.Done && e.response.body == "late", "cached")
-  assert(e.fingerprint == "", "empty fingerprint, got '${e.fingerprint}'")
+  assert(idemBegin(s, "k", "fp", 60).won(), "nothing was cached under a key nobody holds")
   idemClear(c, "late", "k")
   c.close()
 }
@@ -279,19 +308,90 @@ test "live: abandon() frees the key at once, and abandoning a missing key is fin
   let c = liveClient(u)
   let s = idemStore(c, "ab")
   idemClear(c, "ab", "k")
-  assert(isNone(idemBegin(s, "k", "fp", 60)), "reserve")
-  assert(isSome(idemBegin(s, "k", "fp", 60)), "reserved")
-  s.abandon("k") catch e {
+  let claim = idemBegin(s, "k", "fp", 60)
+  assert(claim.won(), "reserve")
+  assert(!idemBegin(s, "k", "fp", 60).won(), "reserved")
+  s.abandon("k", claim.token) catch e {
     panic("abandon: ${e.message()}")
   }
-  assert(isNone(idemBegin(s, "k", "fp", 60)), "after abandon the next begin wins again")
-  s.abandon("k") catch e {
-    panic("abandon: ${e.message()}")
-  }
-  s.abandon("never-existed") catch e {
+  assert(idemBegin(s, "k", "fp", 60).won(), "after abandon the next begin wins again")
+  s.abandon("never-existed", claim.token) catch e {
     panic("abandon of a missing key: ${e.message()}")
   }
   idemClear(c, "ab", "k")
+  c.close()
+}
+
+// #7832: A's reservation expires, B begins the same key; A's late finish and
+// late abandon must leave B's reservation intact, and B's own calls work.
+test "live: a late abandon or finish from an expired reservation leaves the later reservation intact" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = idemStore(c, "own")
+  idemClear(c, "own", "k")
+  let a = idemBegin(s, "k", "fp-a", 1)
+  assert(a.won(), "A reserves for 1s")
+  let b = idemWaitWin(s, "k", "fp-b", 60)
+  assert(b.token != a.token, "B holds a different token than A")
+
+  s.abandon("k", a.token) catch e {
+    panic("late abandon: ${e.message()}")
+  }
+  let seen = idemBegin(s, "k", "fp-b", 60)
+  assert(
+    !seen.won() && unwrap(seen.existing).state == IdempotencyState.InFlight,
+    "A's late abandon deleted B's reservation",
+  )
+  s.finish(
+    "k",
+    a.token,
+    CachedResponse{ status = 200, body = "from A", headers = []Header(0) },
+    60,
+  ) catch e {
+    panic("late finish: ${e.message()}")
+  }
+  let still = idemBegin(s, "k", "fp-b", 60)
+  assert(
+      !still.won() &&
+      unwrap(still.existing).state == IdempotencyState.InFlight &&
+      unwrap(still.existing).fingerprint == "fp-b",
+    "A's late finish overwrote B's reservation",
+  )
+
+  s.finish(
+    "k",
+    b.token,
+    CachedResponse{ status = 201, body = "from B", headers = []Header(0) },
+    60,
+  ) catch e {
+    panic("B finish: ${e.message()}")
+  }
+  let done = unwrap(idemBegin(s, "k", "fp-b", 60).existing)
+  assert(
+      done.state == IdempotencyState.Done &&
+      done.response.body == "from B" &&
+      done.fingerprint == "fp-b",
+    "B's own finish must store B's response",
+  )
+  s.abandon("k", b.token) catch e {
+    panic("B abandon after finish: ${e.message()}")
+  }
+  assert(
+    !idemBegin(s, "k", "fp-b", 60).won(),
+    "an abandon after finish must not delete the cached response",
+  )
+  idemClear(c, "own", "k")
+
+  let b2 = idemBegin(s, "k", "fp-b", 60)
+  assert(b2.won(), "key is free after the clear")
+  s.abandon("k", b2.token) catch e {
+    panic("B abandon: ${e.message()}")
+  }
+  assert(idemBegin(s, "k", "fp-b", 60).won(), "B's own abandon frees the key")
+  idemClear(c, "own", "k")
   c.close()
 }
 
@@ -303,10 +403,16 @@ test "live: begin() sets the ttl, finish() restarts it from its own call" {
   let c = liveClient(u)
   let s = idemStore(c, "ttl")
   idemClear(c, "ttl", "k")
-  assert(isNone(idemBegin(s, "k", "fp", 10)), "reserve for 10s")
+  let claim = idemBegin(s, "k", "fp", 10)
+  assert(claim.won(), "reserve for 10s")
   let p1 = idemPttl(c, "ttl", "k")
   assert(p1 > 0 && p1 <= 10000, "PTTL after begin = ${p1}, want 1..10000")
-  s.finish("k", CachedResponse{ status = 200, body = "x", headers = []Header(0) }, 1000) catch e {
+  s.finish(
+    "k",
+    claim.token,
+    CachedResponse{ status = 200, body = "x", headers = []Header(0) },
+    1000,
+  ) catch e {
     panic("finish: ${e.message()}")
   }
   let p2 = idemPttl(c, "ttl", "k")
@@ -326,14 +432,14 @@ test "live: a reservation expires after its ttl and the key can be claimed again
   let c = liveClient(u)
   let s = idemStore(c, "exp")
   idemClear(c, "exp", "k")
-  assert(isNone(idemBegin(s, "k", "fp", 1)), "reserve for 1s")
-  assert(isSome(idemBegin(s, "k", "fp", 1)), "still reserved right away")
+  assert(idemBegin(s, "k", "fp", 1).won(), "reserve for 1s")
+  assert(!idemBegin(s, "k", "fp", 1).won(), "still reserved right away")
   let polls = 0
   let reclaimed = false
   while (!reclaimed && polls < 100) {
     polls = polls + 1
     sleep(100 * Millisecond)
-    reclaimed = isNone(idemBegin(s, "k", "fp", 60))
+    reclaimed = idemBegin(s, "k", "fp", 60).won()
   }
   assert(reclaimed, "the key was never released after its 1s ttl")
   idemClear(c, "exp", "k")
@@ -348,17 +454,18 @@ test "live: a finished response expires after its ttl too" {
   let c = liveClient(u)
   let s = idemStore(c, "expdone")
   idemClear(c, "expdone", "k")
-  assert(isNone(idemBegin(s, "k", "fp", 60)), "reserve")
-  s.finish("k", CachedResponse{ status = 200, body = "x", headers = []Header(0) }, 1) catch e {
+  let claim = idemBegin(s, "k", "fp", 60)
+  assert(claim.won(), "reserve")
+  s.finish("k", claim.token, CachedResponse{ status = 200, body = "x", headers = []Header(0) }, 1) catch e {
     panic("finish: ${e.message()}")
   }
-  assert(isSome(idemBegin(s, "k", "fp", 60)), "the response is stored")
+  assert(!idemBegin(s, "k", "fp", 60).won(), "the response is stored")
   let polls = 0
   let gone = false
   while (!gone && polls < 100) {
     polls = polls + 1
     sleep(100 * Millisecond)
-    gone = isNone(idemBegin(s, "k", "fp", 60))
+    gone = idemBegin(s, "k", "fp", 60).won()
   }
   assert(gone, "the stored response outlived its 1s ttl")
   idemClear(c, "expdone", "k")
@@ -374,7 +481,7 @@ test "live: a client-supplied key cannot reach outside the prefix" {
   let s = idemStore(c, "esc")
   let key = "a\r\nb *3 \"quoted\" {tag} \x00 end"
   idemClear(c, "esc", key)
-  assert(isNone(idemBegin(s, key, "fp", 60)), "a key with wire metacharacters is just a key")
+  assert(idemBegin(s, key, "fp", 60).won(), "a key with wire metacharacters is just a key")
   let n = c.exists([idemKey("esc") + key]) catch e {
     panic("exists: ${e.message()}")
   }
