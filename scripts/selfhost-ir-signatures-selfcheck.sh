@@ -11,7 +11,8 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 
 # Self-check: run directly (not sourced) to assert explainMismatch explains
 # only what scripts/selfhost-ir-signatures.sh declares (7745-loop-defer-stack on
-# ir/iropt; the retired ones are in its Retirement history), and that
+# ir/iropt, 7766-synth-json-helper-column-shift on types; the retired ones
+# are in its Retirement history), and that
 # declaredSignatureNames() stays in sync with it.
 # `bash scripts/selfhost-ir-signatures-selfcheck.sh`. Same pattern as
 # scripts/selfhost-ir-canon.sh's self-check.
@@ -160,6 +161,48 @@ bb8():
   expect "" "$(explainLoopDeferPolls "$ld_o" "${ld_p/icmp_sgt/icmp_slt}" 1 2)" "polls: a pop loop with no header comparison"
   expect "" "$(explainLoopDeferPolls "$ld_o" "${ld_p/= call_value %25() void/= const_nil}" 1 2)" "polls: a pop loop that makes no deferred call"
   expect "" "$(explainLoopDeferPolls "$ld_o" "${ld_o/rt_call print/rt_call eprint}" 1 2)" "polls: no stack-mode function at all"
+
+  # 7766-synth-json-helper-column-shift: only a column moves, on a line that carries a synthesized
+  # `__json_` row, and only a synthesized name moves there; the file declares a `@json` class.
+  jt_dir=$(mktemp -d "${TMPDIR:-/tmp}/t7785-sig.XXXXXX") || exit 2
+  jt_json="$jt_dir/json.bit"
+  jt_plain="$jt_dir/plain.bit"
+  printf '// a comment\n@table @json class User { id: int }\n' >"$jt_json"
+  printf '// @json is only named in a comment\nclass User { id: int }\n' >"$jt_plain"
+  jt_o='7:5: x: i64
+9:600: __json_p4: bool
+9:610: __json_o: []JsonEntry
+9:700: __json_x0: string
+9:760: cols: []string
+9:780: __row: User
+11:3: y: bool'
+  jt_b='7:5: x: i64
+9:634: __json_p4: bool
+9:644: __json_o: []JsonEntry
+9:760: __json_x0: string
+9:820: cols: []string
+9:840: __row: User
+11:3: y: bool'
+  jt_sig=7766-synth-json-helper-column-shift
+  expect "$jt_sig" "$(explainMismatch "$jt_o" "$jt_b" types "$jt_json")" "types: json helper column shift"
+  expect "" "$(explainMismatch "$jt_o" "$jt_b" types "$jt_plain")" "types: a file with no @json class (the word only in a comment)"
+  expect "" "$(explainMismatch "$jt_o" "$jt_b" types)" "types: no file named"
+  expect "" "$(explainMismatch "$jt_o" "$jt_b" types "$jt_dir/missing.bit")" "types: a file that does not exist"
+  expect "" "$(explainMismatch "$jt_o" "$jt_o" types "$jt_json")" "types: no row moved"
+  expect "" "$(explainMismatch "$jt_o" "$jt_b" ir "$jt_json")" "ir: not a dump kind this signature reads"
+  expect "" "$(explainMismatch "$jt_b" "$jt_o" types "$jt_json")" "types: the direction is fixed, a column that shrank"
+  expect "" "$(explainMismatch "$jt_o" "${jt_b/__json_o: []JsonEntry/__json_o: []Json}" types "$jt_json")" "types: a __json_ type changed"
+  expect "" "$(explainMismatch "$jt_o" "${jt_b/__json_x0/__json_x1}" types "$jt_json")" "types: a __json_ name changed"
+  expect "" "$(explainMismatch "$jt_o" "${jt_b/x: i64/x: string}" types "$jt_json")" "types: a user binding changed type"
+  expect "" "$(explainMismatch "$jt_o" "${jt_b/7:5:/7:6:}" types "$jt_json")" "types: a user binding moved on a line with no __json_ row"
+  expect "" "$(explainMismatch "${jt_o/cols/n}" "${jt_b/cols/n}" types "$jt_json")" "types: a user-named binding moved on a synthesized line"
+  expect "" "$(explainMismatch "$jt_o" "${jt_b/9:634:/10:634:}" types "$jt_json")" "types: a line number changed"
+  expect "" "$(explainMismatch "$jt_o" "${jt_b/9:760:/9:710:}" types "$jt_json")" "types: a row after the shift did not move as far"
+  expect "" "$(explainMismatch "$jt_o" "$(printf '%s\n' "$jt_b" | sed 2d)" types "$jt_json")" "types: a row is missing"
+  expect "" "$(explainMismatch "$jt_o" "$jt_b
+12:1: z: bool" types "$jt_json")" "types: a row was added"
+  rm -f "${jt_json:?}" "${jt_plain:?}"
+  rmdir "${jt_dir:?}"
 
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
