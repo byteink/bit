@@ -1,0 +1,255 @@
+// pkg/redis/idempotency.bit - `RedisIdempotencyStore`: the `IdempotencyStore`
+// (pkg/web/idempotency.bit) for an app that runs on more than one process.
+// Epic #6061, #6097.
+//
+//     let store = RedisIdempotencyStore(r)
+//     app.use(idempotency(IdempotencyPolicy{ store = store, ttl = 86400 }))
+//
+// WHY THIS PACKAGE DEPENDS ON `web`. `IdempotencyStore.begin` returns an
+// `Option<IdempotencyEntry>`, and `IdempotencyEntry`/`CachedResponse` are
+// classes `web` owns; an interface is satisfied structurally (SPEC 14.3), but
+// only by the same types. So `bit.json` names `web`, and the four types below
+// are the only things this file takes from it.
+//
+// ONE KEY PER IDEMPOTENCY KEY, ONE STRING PER KEY. The value is
+//
+//     I<n>:<fingerprint>                              reserved, handler running
+//     D<n>:<fingerprint><status>\n<h>\n<headers><body>   finished, response stored
+//
+// `<n>` is the byte length of the fingerprint, `<h>` the header count, each
+// header `<nlen>:<name><vlen>:<value>`, and the body is whatever bytes are
+// left, so it is never escaped, quoted or copied twice (JSON would have
+// escaped every quote in it and bloated binary bodies by a factor of up to
+// six). Redis strings are binary-safe, so any body round-trips.
+//
+// `begin` IS ONE COMMAND. `SET key <reserved> PX <ms> NX GET` writes the
+// reservation only when the key is absent, and answers with the value that
+// was there before, or a null when there was none (`NX` and `GET` together
+// need Redis 7.0 or Valkey 7.2). Redis runs a command to completion before
+// the next one starts, so of N callers racing one never-seen key exactly one
+// gets the null reply; every other gets the winner's value back, in the same
+// round trip. There is no get-then-set window to lose a race in.
+//
+// `finish` IS ONE SCRIPT, because it must keep the fingerprint `begin`
+// stored (the interface hands `finish` only the response) and rewrite the
+// key with a fresh `ttl` in one step; `GET` then `SET` from the client would
+// let an `abandon` or an expiry slip between them. The script reads the
+// length-prefixed head, so it never parses the response.
+//
+// A FAILED `begin` IS NEVER RETRIED by the client (a write is not repeated
+// on a dropped connection, `client.bit`): if the `SET` ran and its reply was
+// lost, the key stays reserved until `ttl` runs out and a retry sees
+// `InFlight`, the safe direction (`409`) rather than a second run.
+//
+// A STORED ENTRY THAT DOES NOT PARSE is `RedisError.Protocol`, not a silent
+// "absent": treating garbage as no reservation would run the handler twice.
+// An `Idempotency-Key` is client-supplied, so it is only ever appended to
+// `prefix`; whatever bytes it holds, it names one key under that prefix.
+
+import { CachedResponse, Header, IdempotencyEntry, IdempotencyState } from "web"
+
+// Seconds a key may be remembered: the largest `ttl * Second` that fits an
+// `int` of nanoseconds, so the conversion below cannot wrap.
+const maxIdempotencyTtl: i64 = 9_000_000_000
+
+// Digits read for one length or count. 18 digits always fit an `int`.
+const maxIdempotencyDigits: int = 18
+
+const idempotencyFinishSrc: string = `
+local v = redis.call('GET', KEYS[1])
+local head = '0:'
+if v then
+  local c = string.find(v, ':', 2, true)
+  local n = c and tonumber(string.sub(v, 2, c - 1))
+  if n then
+    head = string.sub(v, 2, c + n)
+  end
+end
+redis.call('SET', KEYS[1], 'D' .. head .. ARGV[1], 'PX', ARGV[2])
+return 1
+`
+
+// The store. `prefix` namespaces its keys: the default `idem:` keeps them
+// apart from everything else in the database, and a second app sharing the
+// server picks its own.
+export class RedisIdempotencyStore {
+  client: Client
+  prefix: string
+  finishScript: Script
+
+  // Fails when the server is older than Redis 7.0 (`NX` with `GET` is a
+  // syntax error there), so a server `begin` cannot run on never gets a
+  // store, instead of failing every request that carries a key.
+  init(client: Client, prefix: string = "idem:")! {
+    requireNxGet(client)?
+    this.client = client
+    this.prefix = prefix
+    this.finishScript = Script(idempotencyFinishSrc)
+  }
+
+  // Reserves `key` for `ttl` seconds and returns `Option.None` to the one
+  // caller that created it; every other caller gets the entry as it stands.
+  export begin(key: string, fingerprint: string, ttl: i64): Option<IdempotencyEntry>! {
+    checkIdempotencyTtl(ttl)?
+    let reserved = encodeInFlight(fingerprint)
+    let prev = this.client.setGet(this.prefix + key, reserved, ttl = ttl * Second, ifAbsent = true)?
+    if (isNone(prev)) {
+      return Option.None
+    }
+    return Option.Some(decodeEntry(unwrap(prev))?)
+  }
+
+  // Stores `resp` under `key` for `ttl` seconds counted from this call, with
+  // the fingerprint `begin` recorded. A key that expired mid-flight is
+  // written anyway with an empty fingerprint, as `MemoryIdempotencyStore`
+  // does: a correct response is cached rather than lost to its own `ttl`.
+  export finish(key: string, resp: CachedResponse, ttl: i64): ()! {
+    checkIdempotencyTtl(ttl)?
+    let args = [encodeResponse(resp), "${ttl * 1000}"]
+    this.finishScript.run(this.client, luaInt, keys = [this.prefix + key], args = args)?
+  }
+
+  // Deletes the reservation so a retry can run at once.
+  export abandon(key: string): ()! {
+    this.client.del([this.prefix + key])?
+  }
+}
+
+// The leading number of `redis_version:` in `INFO server`, 0 when absent.
+// Valkey reports it too (7.2 and later).
+fn serverMajor(info: string): int {
+  let tag = "redis_version:"
+  let at = indexOf(info, tag)
+  if (at < 0) {
+    return 0
+  }
+  let rest = info[at + len(tag):len(info)]
+  let dot = indexOf(rest, ".")
+  if (dot <= 0) {
+    return 0
+  }
+  return parseInt(rest[0:dot]) catch _ {
+    return 0
+  }
+}
+
+fn requireNxGet(client: Client): ()!RedisError {
+  let major = serverMajor(client.info(InfoSection.Server)?)
+  if (major < 7) {
+    fail RedisError.Invalid("redis: RedisIdempotencyStore needs Redis 7 or newer (SET with NX and GET); the server reported major version ${major}")
+  }
+}
+
+fn checkIdempotencyTtl(ttl: i64): ()!RedisError {
+  if (ttl < 1 || ttl > maxIdempotencyTtl) {
+    fail RedisError.Invalid("redis: idempotency ttl is ${ttl} second(s), want 1..${maxIdempotencyTtl}")
+  }
+}
+
+fn encodeInFlight(fingerprint: string): string {
+  return "I${len(fingerprint)}:${fingerprint}"
+}
+
+// The status line, the header block, then the body untouched.
+fn encodeResponse(r: CachedResponse): string {
+  let out = "${r.status}\n${len(r.headers)}\n"
+  for h of r.headers {
+    out = out + "${len(h.name)}:${h.name}${len(h.value)}:${h.value}"
+  }
+  return out + r.body
+}
+
+fn badEntry(why: string): RedisError {
+  return RedisError.Protocol("redis: idempotency entry is corrupt: ${why}")
+}
+
+// A cursor over one stored value; every read is bounds-checked, so a
+// truncated or foreign value is an error, never a panic.
+class EntryReader {
+  src: string
+  pos: int
+
+  // A decimal number ended by `stop`, the cursor left after it.
+  num(stop: int): int!RedisError {
+    let n = 0
+    let digits = 0
+    while (this.pos < len(this.src)) {
+      let b = int(this.src[this.pos])
+      this.pos = this.pos + 1
+      if (b == stop) {
+        if (digits == 0) {
+          fail badEntry("empty number")
+        }
+        return n
+      }
+      if (b < 48 || b > 57 || digits >= maxIdempotencyDigits) {
+        fail badEntry("bad number")
+      }
+      n = n * 10 + (b - 48)
+      digits = digits + 1
+    }
+    fail badEntry("truncated number")
+  }
+
+  // The next `n` bytes.
+  take(n: int): string!RedisError {
+    if (n > len(this.src) - this.pos) {
+      fail badEntry("truncated text")
+    }
+    let s = this.src[this.pos:this.pos + n]
+    this.pos = this.pos + n
+    return s
+  }
+
+  // One `<len>:<text>` field.
+  field(): string!RedisError {
+    let n = this.num(58)?
+    return this.take(n)?
+  }
+
+  rest(): string {
+    return this.src[this.pos:len(this.src)]
+  }
+}
+
+fn decodeEntry(v: string): IdempotencyEntry!RedisError {
+  if (len(v) == 0) {
+    fail badEntry("empty value")
+  }
+  let rd = EntryReader{ src = v, pos = 1 }
+  let fp = rd.field()?
+  if (v[0] == 73) {
+    return IdempotencyEntry{
+      state = IdempotencyState.InFlight,
+      fingerprint = fp,
+      response = CachedResponse{},
+    }
+  }
+  if (v[0] != 68) {
+    fail badEntry("unknown state")
+  }
+  return IdempotencyEntry{
+    state = IdempotencyState.Done,
+    fingerprint = fp,
+    response = decodeResponse(rd)?,
+  }
+}
+
+fn decodeResponse(rd: EntryReader): CachedResponse!RedisError {
+  let status = rd.num(10)?
+  let count = rd.num(10)?
+  // A header takes at least 4 bytes (`0:0:`), so a count the rest cannot
+  // hold is corruption caught before it drives a loop.
+  if (count > (len(rd.src) - rd.pos) / 4) {
+    fail badEntry("header count")
+  }
+  let headers = []Header(0)
+  let i = 0
+  while (i < count) {
+    let name = rd.field()?
+    let value = rd.field()?
+    headers = append(headers, Header{ name = name, value = value })
+    i = i + 1
+  }
+  return CachedResponse{ status = status, body = rd.rest(), headers = headers }
+}
