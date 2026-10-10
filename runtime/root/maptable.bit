@@ -34,7 +34,8 @@
 // the read-only scalar entry points (`mapTableBase`, below).
 //
 // THE INVARIANT. A table's prefix is written before it is published and never
-// after, and every buffer it names holds exactly `cap` slots. The header's
+// after, and every buffer it names holds `cap` slots (a scalar `keys` buffer
+// on arm64 then holds the zero-stored bits, `mapZeroWord`). The header's
 // `mapTbl` word is written by `mapPublish` alone (a release store, after the
 // rehash has filled the new buffers) and read only by `mapTable` and
 // `mapTableBase` (plain loads, whose ordering the note on `mapTable` argues). So a reader that loads
@@ -182,12 +183,48 @@ const mapTokenBit: int = 4611686018427387904
 //   worker 0: the bracket exit's `mRunning` store (`worldResumeWhenClear`);
 //            fence (`gcSyscallEnd`/`gcBlockingEnd`); every later load here.
 // Both loads cannot read the old value. So either the monitor abandons, or
-// worker 0 reads 1 from its first store after the bracket. Its plain stores
-// before the bracket precede the bracket's `atomicStore` of the state, which
-// the monitor's `atomicLoad` reads before it creates the thread, so the peer
-// starts with them visible. x86-64 orders stores anyway and never asks.
+// worker 0 reads the mark from its first store after the bracket. Its plain
+// stores before the bracket precede the bracket's `atomicStore` of the state,
+// which the monitor's `atomicLoad` reads before it creates the thread, so the
+// peer starts with them visible. x86-64 orders stores anyway and never asks.
 @nosplit fn mapCtrlPublish(c: int, i: int, tag: int) {
   if (onX64() || loadWord(int(ptrOf(mapPeers))) == 0) {
+    storeByte(c + i, tag)
+    return
+  }
+  atomicStoreRelease(mapCtrlAt(c, i), u8(tag))
+}
+
+// `mapCtrlPublish` for a SCALAR-key map (#7837): a release only for a claim
+// whose tag is key 0's, the value `mapPeers` holds once a peer exists. The
+// `stlrb` on every claim made each insert wait for its key and value store
+// misses (bench/cases/map +11% cycles at BIT_WORKERS=4). Every scalar reader,
+// and what it needs:
+// - A read of K != 0, plain or comma-ok with a non-zero value word: nothing
+//   (#7812, above `mapKeyOrdered`). A key word is written once per table,
+//   0 -> K, so a key load reading K proves the slot is K's whatever the byte
+//   said, and the value word holds 0 or a value stored under K.
+// - A comma-ok hit on K != 0 whose value word reads 0 (`mapHitTail`): the
+//   zero-stored bit decides, not the tag (`mapZeroStore`).
+// - A read of key 0, plain or comma-ok (`mapScalarBound`, `mapHitTail`), and
+//   `rtMapHas`: `mapProbe`/`mapProbeSwar` with `mapTagDep`. Key 0 matches a
+//   ctrl byte only if it equals tag(0). A byte goes EMPTY -> its claim's tag
+//   -> TOMB in one table, so tag(0) is seen only at a slot whose claim had
+//   that tag, and that claim is released here: the dependent key load reads
+//   the claim's key, which equals 0 only in key 0's own slot, whose value
+//   store precedes the release too. Another tag never matches key 0, so its
+//   order is unobservable there; `rtMapHas` of K != 0 is the first case.
+// `p != tag` also covers `p == 0` (a tag has `ctrlFullBit` set); a stale 0
+// is safe for the reason `mapCtrlPublish` gives.
+//
+// Two tests, not `onX64() || ...`: the `||` was materialised as a `cset`
+// before the branch, one more instruction per insert.
+@nosplit fn mapCtrlPublishScalar(c: int, i: int, tag: int) {
+  if (onX64()) {
+    storeByte(c + i, tag)
+    return
+  }
+  if (loadWord(int(ptrOf(mapPeers))) != tag) {
     storeByte(c + i, tag)
     return
   }
@@ -218,9 +255,9 @@ const mapTokenBit: int = 4611686018427387904
 // than `mapPeersMark`'s store, and every worker thread but the reader's own is
 // started after that store (thread creation orders it first), so the byte was
 // written by the reader's own thread, whose key and value stores precede it in
-// program order. A probe that reads 1 takes the dependency. Never a branch-free
-// select here: that would make `d` depend on the flag load as well and put the
-// load latency on every hit.
+// program order. A probe that reads the mark takes the dependency. Never a
+// branch-free select here: that would make `d` depend on the flag load as well
+// and put the load latency on every hit.
 @nosplit fn mapTagDep(c: int, tag: int): int {
   if (onX64()) {
     return 0
@@ -291,23 +328,91 @@ const mapTokenBit: int = 4611686018427387904
 // The token for a scalar hit on `key` at slot `i` of table `ctrl` that
 // `mapFastToken` did not take. x86-64 orders loads, so the plain token is
 // right there. Key 0 re-probes on the ordered generic path. Otherwise the
-// value word read 0: the ctrl byte is loaded again and the token carries
-// `mapTagDep`'s dependency on it, so `bit_rt_map_val_at` reads the value the
-// insert stored before `mapCtrlPublish` released the tag. A byte that is no
-// longer the tag is a delete's TOMB since the match: absent, which a racing
-// delete allows. Out of the loop, so its call costs the loop nothing.
-@nosplit fn mapHitTail(m: int, key: int, ctrl: int, i: int, tag: int): int {
+// value word read 0. It is re-read (no older, by coherence): non-zero is a
+// value stored under `key`. A zero is a stored zero only if the slot's
+// zero-stored bit says so (`mapZeroStore`); clear means the word is the fresh
+// table's (a racing insert) or a traced delete's drop, both absent. Out of the
+// loop, so its calls cost the loop nothing.
+@nosplit fn mapHitTail(m: int, key: int, ctrl: int, i: int): int {
   if (onX64()) {
     return mapValToken(ctrl, i)
   }
   if (key == 0) {
     return mapSlotSlow(m, key)
   }
-  let c = loadByte(ctrl + i)
-  if (c != tag) {
+  let va = loadWord(ctrl + tblVals) + i * 8
+  let v = loadWord(va)
+  if (v == 0 && !mapZeroStored(ctrl, i, v)) {
     return -1
   }
-  return mapValToken(ctrl, i + mapTagDep(c, tag))
+  return va + mapTokenBit
+}
+
+// The word holding slot `i`'s zero-stored bit in scalar table `c` (arm64):
+// `(cap + 63) / 64` words past the `cap` key words, in the untraced scalar
+// `keys` buffer (`allocTable`), bit `i & 63`. Zero for a fresh table.
+@nosplit fn mapZeroWord(c: int, i: int): int {
+  return loadWord(c + tblKeys) + (loadWord(c + tblCap) + (i >> 6)) * 8
+}
+
+// Stores value 0 into slot `i` of scalar table `c`, after setting the slot's
+// zero-stored bit (#7837): with ctrl tags published plain
+// (`mapCtrlPublishScalar`), `mapHitTail` cannot tell a stored zero from the
+// fresh table's word by the tag. With a peer the value store is a RELEASE, so
+// the bit precedes it; the reader loads the bit through an address dependency
+// on the zero it read (`mapZeroStored`). A reader that read THIS zero then
+// sees the bit. A reader that read the fresh word or a traced delete's drop
+// may see the bit too, from this or an earlier zero store under the same key
+// (the slot is bound to one key per table, `mapClaimSlot`), and answers zero:
+// SPEC 13.7's "last value k held". A bit set by `mapGrow` before `mapPublish`
+// is ordered by that release; one set while `mapPeers` read 0 by the thread
+// creation that follows (`mapCtrlPublish`). A plain read-or-write: the map
+// has one writer (SPEC 13.7, two writers race) and a reader loads the whole
+// word. x86-64 orders stores and never reads the bit.
+@nosplit fn mapZeroStore(c: int, i: int) {
+  let va = loadWord(c + tblVals) + i * 8
+  if (onX64()) {
+    storeWord(va, 0)
+    return
+  }
+  let w = mapZeroWord(c, i)
+  storeWord(w, loadWord(w) | (1 << (i & 63)))
+  if (loadWord(int(ptrOf(mapPeers))) == 0) {
+    storeWord(va, 0)
+    return
+  }
+  atomicStoreRelease(wordAt(va), 0)
+}
+
+// Whether slot `i`'s zero-stored bit is set, the load's address depending on
+// `v`, the zero the caller read from the value word (ARMv8 orders it after
+// that read; `mapTable` argues the guarantee).
+@nosplit fn mapZeroStored(c: int, i: int, v: int): bool {
+  return ((loadWord(mapZeroWord(c, i) + v) >> (i & 63)) & 1) != 0
+}
+
+// `rtMapSet`'s store of `val` into slot `i` of scalar table `c`, whose value
+// word is at `va`. Small enough to be spliced into the probe loop, which is
+// why the caller computes `va`; a zero goes through `mapZeroStore` on both
+// targets (x86-64 stores it plain there), so the test is one `cbz`.
+@nosplit fn mapScalarVal(va: int, c: int, i: int, val: int) {
+  if (val != 0) {
+    storeWord(va, val)
+    return
+  }
+  mapZeroStore(c, i)
+}
+
+// `mapGrow`'s mark for the zero value it copied into slot `j` of the
+// unpublished table `nc` of map `m`: the bit `mapZeroStore` sets, for a
+// scalar map on arm64, ordered by `mapPublish`. Called only for a zero, so
+// the copy loop pays one `cbz` per slot and no call.
+@nosplit fn mapGrowZero(m: int, nc: int, j: int) {
+  if (onX64() || loadWord(m + mapKeyDesc) != mapKeyScalar) {
+    return
+  }
+  let w = mapZeroWord(nc, j)
+  storeWord(w, loadWord(w) | (1 << (j & 63)))
 }
 
 // Whether slot `i` of table `c` still holds the key a probe just matched, for
@@ -337,8 +442,10 @@ const mapTokenBit: int = 4611686018427387904
   return int(atomicLoad(mapCtrlAt(c, i))) == tag
 }
 
-// 1 once a second worker slot has been prepared, set before its thread is
-// created and never cleared; 0 for the whole life of a one-worker program.
+// Non-zero once a second worker slot has been prepared, set before its thread
+// is created and never cleared; 0 for the whole life of a one-worker program.
+// The value is key 0's ctrl tag (`mapCtrlPublishScalar`): the hash seed is
+// drawn at boot before `schedInit` (`bootSeedHash`) and never changes.
 let mapPeers: [1]i64
 
 // The only writer of `mapPeers`: `schedInitWorkerSlot` (../sched/worker.bit)
@@ -346,7 +453,7 @@ let mapPeers: [1]i64
 // on every later grow, before that slot's thread exists. Pinned because
 // `runtime/sched` cannot import this module and reaches it through `extern`.
 export @nosplit @symbol("bit_rt_port_root_map_peers_mark") fn mapPeersMark() {
-  atomicStore(ptrOf(mapPeers), 1)
+  atomicStore(ptrOf(mapPeers), mapCtrlTag(scalarHash(0)))
 }
 
 // A fresh `vcap`-slot table for map `m`, every ctrl byte EMPTY (`gcAllocRaw`
@@ -358,7 +465,12 @@ export @nosplit @symbol("bit_rt_port_root_map_peers_mark") fn mapPeersMark() {
   let base = infoAddr
   // `elemSize` is explicit 8: maps stay word-per-element regardless of key/value
   // type (ABI.md §2/#3119).
-  let keys = allocBuf(vcap, loadWord(m + mapKeyDesc) != mapKeyScalar, 8)
+  let scalar = loadWord(m + mapKeyDesc) == mapKeyScalar
+  let kn = vcap
+  if (scalar && !onX64()) {
+    kn = vcap + ((vcap + 63) >> 6) // the zero-stored bits, `mapZeroWord`
+  }
+  let keys = allocBuf(kn, !scalar, 8)
   let vals = allocBuf(vcap, loadWord(m + mapValIsRef) != 0, 8)
   let c = gcAllocRaw(g, tblPrefix + vcap, base + riMapTbl * 8) + tblPrefix
   storeWord(c + tblCap, vcap)
