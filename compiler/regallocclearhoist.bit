@@ -18,9 +18,19 @@
 // clear point passes, so a hoisted clear is as sound as one before a call. It
 // only ever adds a clear point; the forward pass then drops every clear it
 // makes redundant, and the hoisted one itself where the register is already
-// zero (an enclosing branch hoisted it first). Anticipation does not see a
-// join's other predecessors, so a function keeps its hoists only when they
-// leave it fewer clears in all.
+// zero (an enclosing branch hoisted it first).
+//
+// #7763: anticipation does not see a join's other predecessors, so a hoist can
+// fail to pay: a join reached dirty from elsewhere keeps its own clear. Each
+// hoisted (branch, register) is judged on its own, after the pass with every
+// hoist: walking forward from the branch's successors, the first original
+// clear point needing the register on each path (hoisted points are
+// transparent, an occupancy touching it ends the path) either still zeroes it
+// or no longer does. Only those can change, since after one the register is
+// zero either way. A hoist that silences at most one of them saves no clear in
+// the function and adds one on every path that misses it, so it is dropped,
+// and the pass runs once more with the rest.
+// A function still keeps its hoists only when they leave it fewer clears in all.
 //
 // A clear before a `br` never zeroes a register the instruction just before
 // it reads. arm64 fuses a compare against zero into its branch as a CBZ that
@@ -77,24 +87,23 @@ fn maxPos(ps: []int, floor: int): int {
   return m
 }
 
-// `placeClears` with the branches hoisted to, or without them when that emits
-// no fewer clears: a join whose other predecessor arrives dirty keeps its own
-// clear, so a hoist that feeds only such joins is one clear more.
+// `placeClears` with the hoists that pay (`payingNeeds`), or without any when
+// that emits no fewer clears.
 fn hoistBranchClears(st: ClearState, edges: []CfgEdge, starts: []int): []int {
   let base = placeClears(st, edges, starts)
-  let ant = anticipatedOnEntry(st, edges, starts, blockLasts(edges, starts))
-  let hoisted = placeClears(
-    ClearState{
-      spans = st.spans, calleeSaved = st.calleeSaved, nregs = st.nregs,
-      need = branchNeeds(st, edges, ant),
-    },
-    edges,
-    starts,
-  )
-  if (clearBits(hoisted) < clearBits(base)) {
-    return hoisted
+  let lasts = blockLasts(edges, starts)
+  let all = branchNeeds(st, edges, anticipatedOnEntry(st, edges, starts, lasts))
+  let hoisted = placeClears(withNeed(st, all), edges, starts)
+  let scan = hoistScan(st, edges, starts, lasts)
+  let kept = placeClears(withNeed(st, payingNeeds(scan, all, hoisted)), edges, starts)
+  if (clearBits(kept) < clearBits(base)) {
+    return kept
   }
   return base
+}
+
+fn withNeed(st: ClearState, need: []int): ClearState {
+  return ClearState{ spans = st.spans, calleeSaved = st.calleeSaved, nregs = st.nregs, need = need }
 }
 
 // `st.need` plus, at the terminator of every two-way branch outside every loop
@@ -205,4 +214,143 @@ fn anticipatedIn(st: ClearState, lo: int, end: int): int {
     p = p - 1
   }
   return a & ~touchedIn(st.spans, lo, hi)
+}
+
+// #7763: what judging a hoist reads, per block: `firstEdge`, the index of its
+// first successor edge (-1 when none); `pass`, the registers it leaves neither
+// needed by an original clear point nor touched; `first[b * nregs + r]`, the
+// original clear point in it that needs `r` first, before any touch (-1 when
+// none). `seen` marks the blocks the walk numbered `walk` has queued.
+class HoistScan {
+  st: ClearState,
+  edges: []CfgEdge,
+  firstEdge: []int,
+  pass: []int,
+  first: []int,
+  seen: []int,
+  walk: int,
+}
+
+fn hoistScan(st: ClearState, edges: []CfgEdge, starts: []int, lasts: []int): HoistScan {
+  let n = len(starts)
+  let h = HoistScan{
+    st = st, edges = edges, firstEdge = filledInts(n), pass = []int(n),
+    first = filledInts(n * st.nregs), seen = filledInts(n), walk = 0,
+  }
+  let i = len(edges) - 1
+  while (i >= 0) {
+    h.firstEdge[edges[i].src] = i
+    i = i - 1
+  }
+  let b = 0
+  while (b < n) {
+    if (starts[b] >= 0) {
+      h.pass[b] = scanBlockNeeds(h, b, starts[b], blockEnd(lasts, b))
+    }
+    b = b + 1
+  }
+  return h
+}
+
+// `n` ints, every one -1.
+fn filledInts(n: int): []int {
+  let out = []int(n)
+  let i = 0
+  while (i < n) {
+    out[i] = -1
+    i = i + 1
+  }
+  return out
+}
+
+// Walks block `b`, [lo, end), as `walkClears` does, filling its `h.first`
+// row; returns its `h.pass`.
+fn scanBlockNeeds(h: HoistScan, b: int, lo: int, end: int): int {
+  let st = h.st
+  let open = (1 << st.nregs) - 1
+  let pos = lo
+  let p = lo
+  while (p < end && p < len(st.need)) {
+    if (st.need[p] != 0) {
+      open = open & ~touchedIn(st.spans, pos, p)
+      let r = 0
+      while (r < st.nregs) {
+        if ((((open & st.need[p]) >> r) & 1) == 1) {
+          h.first[b * st.nregs + r] = p
+        }
+        r = r + 1
+      }
+      open = open & ~st.need[p]
+      pos = p
+    }
+    p = p + 1
+  }
+  return open & ~touchedIn(st.spans, pos, end)
+}
+
+// `h.st.need` plus each bit of `all` it lacks (a hoist) that silences at
+// least two original clear points in `hoisted`, the pass run with all of
+// them (see the header).
+fn payingNeeds(h: HoistScan, all: []int, hoisted: []int): []int {
+  let need = []int(len(all))
+  let p = 0
+  while (p < len(all)) {
+    let extra = all[p] & ~h.st.need[p]
+    need[p] = h.st.need[p]
+    let r = 0
+    while (extra != 0 && r < h.st.nregs) {
+      if (((extra >> r) & 1) == 1 && silencedFrom(h, p, r, hoisted) >= 2) {
+        need[p] = need[p] | (1 << r)
+      }
+      r = r + 1
+    }
+    p = p + 1
+  }
+  return need
+}
+
+// How many of the original clear points first reached from the branch at
+// `p` that need `r` (see the header) `out` leaves without a clear of it. A
+// breadth-first walk over blocks, each queued at most once.
+fn silencedFrom(h: HoistScan, p: int, r: int, out: []int): int {
+  h.walk = h.walk + 1
+  let work = []int(len(h.seen))
+  let top = 0
+  for e of h.edges {
+    if (e.srcLast == p) {
+      top = queueBlock(h, work, top, e.dst)
+    }
+  }
+  let silenced = 0
+  let k = 0
+  while (k < top) {
+    let b = work[k]
+    let q = h.first[b * h.st.nregs + r]
+    if (q >= 0 && ((out[q] >> r) & 1) == 0) {
+      silenced = silenced + 1
+    } else if (q < 0 && ((h.pass[b] >> r) & 1) == 1) {
+      top = queueSuccessors(h, work, top, b)
+    }
+    k = k + 1
+  }
+  return silenced
+}
+
+fn queueSuccessors(h: HoistScan, work: []int, top: int, b: int): int {
+  let t = top
+  let i = h.firstEdge[b]
+  while (i >= 0 && i < len(h.edges) && h.edges[i].src == b) {
+    t = queueBlock(h, work, t, h.edges[i].dst)
+    i = i + 1
+  }
+  return t
+}
+
+fn queueBlock(h: HoistScan, work: []int, top: int, b: int): int {
+  if (h.seen[b] == h.walk) {
+    return top
+  }
+  h.seen[b] = h.walk
+  work[top] = b
+  return top + 1
 }

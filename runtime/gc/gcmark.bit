@@ -358,3 +358,202 @@ export @nosplit @symbol("bit_rt_port_gc_mark_conservative") fn gcMarkConservativ
   spinRelease(heapLock(g))
   return swept
 }
+
+// ---------------------------------------------------------------------------
+// Root jobs (#5841)
+// ---------------------------------------------------------------------------
+//
+// The task-registry roots (`../stw/stwscan.bit`'s `stwScanTasks`) are word
+// ranges scanned conservatively. When the helper gang is open, the collector
+// records each range here instead of scanning it (`gcRootRange`), and the
+// mark phase hands them out as jobs of `gcRtJobRanges` ranges: every member
+// claims the next job with `atomicAdd` on `gcRtNext` and marks into its own
+// segment (`gcMkRootJobs`, below) before it drains. With no gang, or when the
+// parallel mark cannot start, the coordinator runs every job in order on the
+// serial worklist (`gcRootJobsSerial`), which is today's order and result.
+//
+// EVERY JOB RUNS EXACTLY ONCE. `atomicAdd` hands each index to one claimant.
+// The coordinator claims until `gcRtNext` passes the job count before it can
+// go idle, and a helper claims only after joining, so termination ("every
+// joined member idle") implies every claimed job finished. `gcRootJobsClose`
+// checks that the finished count equals the job count, fatal otherwise.
+//
+// ONE TABLE, ONE OWNER. `gcRtOwner` holds the collector block whose roots the
+// table holds. A second heap collecting at once (`_tests_/stress/stwcollect`
+// drives a private one) finds it taken and scans its roots inline.
+
+const gcRtMaxRanges = 65536 // table capacity; 16 bytes per range, 1 MiB virtual
+const gcRtJobRanges = 32    // ranges per job
+
+let gcRtBase: i64 = 0  // the side mapping, 0 until first use
+let gcRtOwner: i64 = 0 // 0, or the `g` whose roots the table holds
+let gcRtN: i64 = 0     // ranges recorded this collection
+let gcRtNext: i64 = 0  // next job index to claim
+let gcRtDone: i64 = 0  // jobs finished
+
+// Take the table for `g` when the gang has helpers to share it with. Called
+// with the world stopped, before any root range is offered.
+export @nosplit @symbol("bit_rt_port_gc_root_jobs_open") fn gcRootJobsOpen(g: *i64): bool {
+  if (!worldGangHasHelpers(g)) {
+    return false
+  }
+  if (!atomicCmpxchg(ptrOf(gcRtOwner), 0, int(g))) {
+    return false
+  }
+  if (gcRtBase == 0) {
+    gcRtBase = memMapPages(gcRtMaxRanges * 16)
+  }
+  if (gcRtBase == 0) {
+    atomicStore(ptrOf(gcRtOwner), 0)
+    return false
+  }
+  gcRtN = 0
+  atomicStore(ptrOf(gcRtNext), 0)
+  atomicStore(ptrOf(gcRtDone), 0)
+  return true
+}
+
+// Conservatively mark the `n` words at `lo`, or record them as a root range
+// when `g` owns the table and it has room.
+export @nosplit @symbol("bit_rt_port_gc_root_range") fn gcRootRange(g: *i64, lo: int, n: int) {
+  if (n <= 0) {
+    return
+  }
+  if (atomicLoad(ptrOf(gcRtOwner)) == int(g) && gcRtN < gcRtMaxRanges) {
+    storeWord(gcRtBase + gcRtN * 16, lo)
+    storeWord(gcRtBase + gcRtN * 16 + 8, n)
+    gcRtN = gcRtN + 1
+    return
+  }
+  let i = 0
+  while (i < n) { // bounded: the caller's word count
+    gcMarkConservative(g, loadWord(lo + i * 8))
+    i = i + 1
+  }
+}
+
+@nosplit fn gcRtJobs(): int {
+  return (gcRtN + gcRtJobRanges - 1) / gcRtJobRanges
+}
+
+// Mark job `j`'s words. By mode: 0 the serial worklist, 1 the member's
+// segment, 2 mark-and-overflow (no segment could be taken).
+@nosplit fn gcRtRunJob(g: *i64, c: *i64, j: int, mode: int) {
+  let r = j * gcRtJobRanges
+  let end = r + gcRtJobRanges
+  if (end > gcRtN) {
+    end = gcRtN
+  }
+  while (r < end) { // bounded: gcRtJobRanges ranges
+    let lo = loadWord(gcRtBase + r * 16)
+    let n = loadWord(gcRtBase + r * 16 + 8)
+    let i = 0
+    while (i < n) { // bounded: the range's recorded word count
+      gcRtMarkWord(g, c, loadWord(lo + i * 8), mode)
+      i = i + 1
+    }
+    r = r + 1
+  }
+  let _ = atomicAdd(ptrOf(gcRtDone), 1)
+}
+
+@nosplit fn gcRtMarkWord(g: *i64, c: *i64, w: int, mode: int) {
+  if (mode == 1) {
+    gcMkRoot(c, w)
+    return
+  }
+  if (mode == 0) {
+    gcMarkConservative(g, w)
+    return
+  }
+  if (w == 0 || w < *(g + gcLoAddr) || w >= *(g + gcHiAddr) || !gcOwns(g, w)) {
+    return
+  }
+  if (hdrTryMark(headerFromBody(w))) {
+    atomicStore(g + gcOverflow, 1)
+  }
+}
+
+// Run every job no member has claimed, in order, on the serial worklist.
+@nosplit fn gcRootJobsSerial(g: *i64) {
+  if (atomicLoad(ptrOf(gcRtOwner)) != int(g)) {
+    return
+  }
+  let jobs = gcRtJobs()
+  let k = 0
+  while (k < jobs) { // bounded: each turn claims a fresh index
+    let j = atomicAdd(ptrOf(gcRtNext), 1)
+    if (j >= jobs) {
+      return
+    }
+    gcRtRunJob(g, nil, j, 0)
+    k = k + 1
+  }
+}
+
+// Check every job ran exactly once and give the table back. Fatal on a
+// mismatch: a root range no member scanned is a live object swept.
+@nosplit fn gcRootJobsClose(g: *i64) {
+  if (atomicLoad(ptrOf(gcRtOwner)) != int(g)) {
+    return
+  }
+  if (atomicLoad(ptrOf(gcRtDone)) != gcRtJobs()) {
+    worldHelperFatal()
+  }
+  gcRtN = 0
+  atomicStore(ptrOf(gcRtOwner), 0)
+}
+
+// Take a free segment as `c`'s local, carving one when the free list is empty.
+@nosplit fn gcMkTakeFree(c: *i64): bool {
+  let tries = 0
+  while (tries <= gcMkSegMax) { // bounded: gcMkSegMax + 1 attempts
+    spinAcquire(ptrOf(gcMkLock))
+    let ok = gcMkFree > 0
+    if (ok) {
+      gcMkFree = gcMkFree - 1
+      *(c + gcMkCtxSeg) = *gcMkFreeAt(gcMkFree)
+      *(c + gcMkCtxN) = 0
+    }
+    spinRelease(ptrOf(gcMkLock))
+    if (ok) {
+      return true
+    }
+    if (!gcMkGrow()) {
+      return false
+    }
+    tries = tries + 1
+  }
+  return false
+}
+
+// A member's root jobs, run after it joins and before it drains
+// (`./gcmarkpar.bit`'s `gcMarkPar` and `gcMarkHelp`). A helper with no
+// segment leaves the jobs to the coordinator; the coordinator then marks and
+// sets `gcOverflow`, so the rescan finds the children.
+@nosplit fn gcMkRootJobs(c: *i64, helper: bool) {
+  let g = wordAt(*(c + gcMkCtxG))
+  if (atomicLoad(ptrOf(gcRtOwner)) != int(g)) {
+    return
+  }
+  let jobs = gcRtJobs()
+  if (atomicLoad(ptrOf(gcRtNext)) >= jobs) {
+    return
+  }
+  let mode = 1
+  if (!gcMkTakeFree(c)) {
+    if (helper) {
+      return
+    }
+    mode = 2
+  }
+  let k = 0
+  while (k < jobs) { // bounded: each turn claims a fresh index
+    let j = atomicAdd(ptrOf(gcRtNext), 1)
+    if (j >= jobs) {
+      return
+    }
+    gcRtRunJob(g, c, j, mode)
+    k = k + 1
+  }
+}
