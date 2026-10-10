@@ -1,0 +1,102 @@
+// #7772: a read racing delete(K) must not return K's value for a lookup key
+// that was never in the map.
+//
+// `delete` used to zero the slot's key word. A reader that had already loaded
+// the old FULL ctrl tag, and then loaded the key word after the zeroing, saw 0,
+// which compares equal to the scalar key 0 and to "", so it returned the
+// deleted key's value for the ABSENT key with ok=true. The deleted key's 7-bit
+// tag has to equal the lookup key's tag, so the churner cycles through
+// `distinct` keys: whatever the per-process hash seed is, about one in 128 of
+// them collides with the lookup key's tag.
+//
+// Two phases: `map<int, int>` read at 0 and `map<string, int>` read at "". (A
+// composite key is a box that is never nil, so its zeroed word equals no
+// lookup key.) Each map is presized small, so the churner's `m[K] = val;
+// delete(m, K)` keeps slots on the lookup key's probe path, and holds one
+// permanent anchor entry so the readers' `len == 0` early exit never skips the
+// probe. The lookup key is NEVER stored, so any `ok=true`, and any plain read
+// that is not the zero word, is another key's value. The readers spin on both
+// read forms: the two-call comma-ok (`bit_rt_map_slot` then
+// `bit_rt_map_val_at`) and the one-call plain read.
+//
+// THE RACE HAS TO BE REAL: `workers` pins BIT_WORKERS=4, and a reader counts
+// OVERLAPPED reads (the churner's round counter moved across ONE read, with no
+// back edge between the two loads), see maprace.bit. `concurrent=false` fails
+// the `.expected` like a wrong value would.
+
+const val: int = 777
+const distinct: int = 509
+const rounds: int = 600000
+const readers: int = 3
+const hint: int = 4
+
+// The churner for a map whose keys come from `keys`: insert and delete one
+// key per round, then publish the round.
+fn churn<K>(m: map<K, int>, keys: []K, flags: []i64) {
+  let fp = ptrOf(flags)
+  for (let r = 1; r <= rounds; r++) {
+    let k = keys[r % distinct]
+    m[k] = val
+    delete(m, k)
+    atomicStore(fp, r)
+  }
+  atomicStore(fp + 1, 1)
+}
+
+// One reader of the absent key `zero`: [0] reads, [1] wrong comma-ok, [2] wrong
+// plain, [3] overlapped reads.
+fn reader<K>(m: map<K, int>, zero: K, flags: []i64, out: chan<[]int>) {
+  let fp = ptrOf(flags)
+  let counts = []int(4)
+  while (atomicLoad(fp + 1) == 0) {
+    let p0 = atomicLoad(fp)
+    let (_, ok) = m[zero]
+    let p1 = atomicLoad(fp)
+    if (ok) {
+      counts[1] = counts[1] + 1
+    }
+    if (p1 != p0) {
+      counts[3] = counts[3] + 1
+    }
+    if (m[zero] != 0) {
+      counts[2] = counts[2] + 1
+    }
+    counts[0] = counts[0] + 1
+  }
+  out <- counts
+}
+
+// Runs one phase and returns [reads, wrong, overlapped].
+fn phase<K>(keys: []K, zero: K, anchor: K): []int {
+  let m = map<K, int>(hint)
+  m[anchor] = val
+  let flags = []i64(2)
+  let out = chan<[]int>(readers)
+  for (let c = 0; c < readers; c++) {
+    spawn reader(m, zero, flags, out)
+  }
+  spawn churn(m, keys, flags)
+  let total = []int(3)
+  for (let c = 0; c < readers; c++) {
+    let counts = <- out
+    total[0] = total[0] + counts[0]
+    total[1] = total[1] + counts[1] + counts[2]
+    total[2] = total[2] + counts[3]
+  }
+  return total
+}
+
+fn main() {
+  let ints = []int(distinct)
+  let strs = []string(distinct)
+  for (let i = 0; i < distinct; i++) {
+    ints[i] = i + 1
+    strs[i] = "key-${i}"
+  }
+  let a = phase(ints, 0, -1)
+  let b = phase(strs, "", "anchor")
+  eprint("mapdelzero: int reads=${a[0]} overlapped=${a[2]} wrong=${a[1]}\n")
+  eprint("mapdelzero: string reads=${b[0]} overlapped=${b[2]} wrong=${b[1]}\n")
+  let conc = a[2] > 0 && b[2] > 0
+  print("mapdelzero: concurrent=${conc} wrong=${a[1] + b[1]}\n")
+}
