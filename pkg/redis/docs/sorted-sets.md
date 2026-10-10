@@ -295,10 +295,11 @@ fn main(): ()! {
 }
 ```
 
-`for entry of it?` calls `it.next(): Option<Scored>!` until it runs out.
-A page fetch that fails (network, timeout, server error) comes back as the
-error, so the loop returns it from `main` instead of ending early as if the
-cursor were exhausted.
+`for entry of it?` calls `it.next(): Option<Scored>!RedisError` until it runs
+out. A page fetch that fails (network, timeout, server error) comes back as a
+`RedisError`, so the loop returns it from `main` instead of ending early as if
+the cursor were exhausted. Inside a transaction body, `tx.read.zset(key).scan()`
+gives the same cursor and `it.next()?` returns that error.
 
 ## Pipelines and transactions
 

@@ -168,10 +168,10 @@ fn main(): ()! {
 ```
 
 `scan(pattern = "", count = 0, keyType = "")` returns an iterator whose
-`next(): Option<string>!` fetches a new page only when the current one runs
-out; a page that fails to arrive is returned as a `RedisError`, hence `for key
-of it?`. `pattern` filters key names server-side (`SCAN`'s own `MATCH`),
-`count` is a hint for how many keys to fetch per round trip, and `keyType`
+`next(): Option<string>!RedisError` fetches a new page only when the current
+one runs out; a page that fails to arrive is returned as a `RedisError`, hence
+`for key of it?`; inside a transaction body `it.next()?` returns the same error. `pattern`
+filters key names server-side (`SCAN`'s own `MATCH`), `count` is a hint for how many keys to fetch per round trip, and `keyType`
 (`"string"`, `"hash"`, ...) filters by `TYPE`. There is no queued/pipelined
 version: a cursor is several round trips, and a pipeline's `Future<T>` only
 ever resolves one.

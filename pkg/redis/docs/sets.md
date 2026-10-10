@@ -225,7 +225,7 @@ fn main(): ()! {
 
 `pattern` filters members on the server (`SSCAN`'s own `MATCH`); `count` is a
 hint for how many members to fetch per round trip, not a promise. The
-iterator's `next(): Option<string>!` returns `Option.None` once the cursor has
+iterator's `next(): Option<string>!RedisError` returns `Option.None` once the cursor has
 come all the way round. Small sets can come back in a single page whatever
 `count` says.
 
@@ -233,7 +233,8 @@ come all the way round. Small sets can come back in a single page whatever
 connection, a timeout or a server error on page 5 comes back as a
 `RedisError`, never a panic. That is why the loop is written `for tag of
 it?` and sits in a function that returns `()!`; the error leaves the loop the
-way `?` does anywhere else.
+way `?` does anywhere else. Inside a transaction body, `tx.read.sset(key).scan()`
+gives the same iterator and `it.next()?` returns the same `RedisError`.
 
 A scan is not a snapshot: a member added or removed while you iterate may or
 may not be seen, and a member can be returned more than once. If you need a
