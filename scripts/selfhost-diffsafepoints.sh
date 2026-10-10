@@ -56,6 +56,13 @@ BIT2=bit-out/bin/bit
 # BIT_GC=stress was fixed by task-5999's keepalive-base fix, confirmed an
 # ancestor of v0.32.0 before the flip. #6245 deleted the flag once the pinned
 # oracle carried the default too, so no override is needed here any more.
+#
+# #6416: the `if` branch-chain lowering (#5926) defaults ON in this tree since
+# the 0.41.0 repin; that ORACLE carries the code but still defaults it off,
+# and it reshapes the blocks codegen places safepoints from. Both sides
+# inherit this environment, so force "1" to compare ON against ON. Delete
+# with the flag, one release after the flip.
+export BIT_IF_BRANCHCHAIN=1
 
 # 60s, not the 20s dump-call convention (diffdump.sh/diffcheck.sh/diffverdict.sh/
 # diffdoc.sh) this used to follow (#3689): this script's calls are a full
