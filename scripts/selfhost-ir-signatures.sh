@@ -280,7 +280,30 @@
 #
 # --- Declared signatures (against the 0.41.0 oracle) ---
 #
-# Retires at the next stage0 repin, the first oracle cut from a tree that carries #7745.
+# Retires at the next stage0 repin, the first oracle cut from a tree that carries #7745
+# (7745-loop-defer-stack) or #7766 and #7773 (7766-synth-json-helper-column-shift).
+#
+# 7766-synth-json-helper-column-shift (`types`). #7766 (a9a95fc70) added `jsonAppendValue`,
+# `jsonDecJson` and `jsonTextValue` to the helper lists a `@json` class synthesizes imports for
+# (jsonAppendHelperNames, jsonDecHelperNames, jsonDecTextHelperNames), and #7773 (1f0ea0c1a)
+# added `jsonTextEnumKey`, `jsonTextEnumIndex` and the `__json_dv` local to the text decoder's.
+# Every helper name is written into the synthesized text twice (the name and its `__` alias), so
+# the text is longer and every row `--dump-types` places after the insertion moves right. Only the
+# COLUMN moves. `explainJsonHelperShift` prints the signature and returns 0 only when ALL hold:
+#   1. the file declares a `@json` class (its path is the 4th argument of explainMismatch);
+#   2. both dumps have the same, nonzero number of rows, and every row agrees on line, name and
+#      type, in the same order (a non-row line must be equal);
+#   3. a column moves only on a source line that carries a synthesized `__json_` row, and only a
+#      synthesized name moves there: `__json_*`, or `cols`/`__row` of an `@table` class on that line;
+#   4. a column only grows, and never shrinks back along the line (the shift is cumulative: the
+#      later the insertion point, the fewer rows sit after it);
+#   5. at least one column moved.
+# 12 corpus files: run_json_attr, run_json_decode, run_json_decode_classgeneric/_enum/_errors/
+# _generic/_lenient/_text, run_json_schema, run_synth_alias_collision, run_table_persisted_flag
+# (its `cols` and `__row` sit on the `@table @json` line, after the insertion) and
+# _tests_/imports/jsonattr/model/user.bit. A changed type, a changed name, a moved row of a user
+# binding, a moved row on a line with no `__json_` row, or a file with no `@json` class stays
+# unexplained.
 #
 # 7745-loop-defer-stack (`ir`, `iropt`). #7745 (lowerdefer.bit) lowers a function with a `defer`
 # inside a loop onto a per-frame stack of thunks: every execution of a defer builds
@@ -437,13 +460,49 @@ END {
 }'
 }
 
+# explainJsonHelperShift <oracle_text> <bit2_text> <file> -- the 7766 entry above.
+explainJsonHelperShift() {
+  [ -f "${3:-}" ] || return 1
+  command grep -qE '^[^/]*@json([[:space:](]|$)' "$3" || return 1
+  printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2" | LC_ALL=C awk '
+function rowPos(l) { return match(l, /^[0-9]+:[0-9]+: /) }
+function lineOf(l,   p) { split(l, p, ":"); return p[1] + 0 }
+function colOf(l,   p) { split(l, p, ":"); return p[2] + 0 }
+function restOf(l) { sub(/^[0-9]+:[0-9]+: /, "", l); return l }
+function synthName(l) { return restOf(l) ~ /^(__json_[A-Za-z0-9_]+|cols|__row): / }
+/^@@@BIT2@@@$/ { second = 1; next }
+{ if (second) { B[++nb] = $0 } else { A[++na] = $0 } }
+END {
+  if (na != nb || na == 0) { exit 1 }
+  for (i = 1; i <= na; i++) {
+    if (rowPos(A[i]) && restOf(A[i]) ~ /^__json_/) { synth[lineOf(A[i])] = 1 }
+  }
+  for (i = 1; i <= na; i++) {
+    if (!rowPos(A[i]) || !rowPos(B[i])) {
+      if (A[i] != B[i]) { exit 1 }
+      continue
+    }
+    ln = lineOf(A[i])
+    d = colOf(B[i]) - colOf(A[i])
+    if (ln != lineOf(B[i]) || restOf(A[i]) != restOf(B[i])) { exit 1 }
+    if (d < last[ln]) { exit 1 }
+    if (d > 0 && (!synth[ln] || !synthName(A[i]))) { exit 1 }
+    last[ln] = d
+    if (d > 0) { moved++ }
+  }
+  if (moved == 0) { exit 1 }
+  print "7766-synth-json-helper-column-shift"
+}'
+}
+
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
-# and returns 0, or prints nothing and returns 1 if none does. Only 7745-loop-defer-stack is
-# registered, on the `ir` and `iropt` kinds.
+# and returns 0, or prints nothing and returns 1 if none does. 7745-loop-defer-stack is registered
+# on the `ir` and `iropt` kinds, 7766-synth-json-helper-column-shift on `types`.
 explainMismatch() {
   case "$3" in
     ir|iropt) explainLoopDeferStack "$1" "$2"; return ;;
+    types) explainJsonHelperShift "$1" "$2" "${4:-}"; return ;;
   esac
   return 1
 }
@@ -456,10 +515,13 @@ explainMismatch() {
 # that explainMismatch no longer prints would make that check fail on every
 # run. Kept in sync by hand, and selfhost-ir-signatures-selfcheck.sh asserts
 # the list matches the `print "..."` statements in this file. Declared for
-# `ir` and `iropt` only.
+# `ir`, `iropt` and `types`.
 declaredSignatureNames() {
   case "${1:-}" in
     ir|iropt|"") printf '%s\n' 7745-loop-defer-stack ;;
+  esac
+  case "${1:-}" in
+    types|"") printf '%s\n' 7766-synth-json-helper-column-shift ;;
   esac
   return 0
 }
