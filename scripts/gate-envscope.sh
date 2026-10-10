@@ -635,7 +635,7 @@ argvliteral_gate_paths() {
 #     has_other=1 and resolves to bucket `full`, which runs every gate via the
 #     aggregate `test` step. Verified, not assumed: `RANGE=... bash
 #     scripts/gate.sh` on a bench/-only diff prints `bucket: full` and exits 3.
-#   _tests_/freestanding, _tests_/testproj — the same has_other=1 -> `full`
+#   _tests_/freestanding, _tests_/testproj, _tests_/windows (#5802) — the same has_other=1 -> `full`
 #     route, and stated as such in scripts/gate-filemap.sh's own header for
 #     testproj: scripts/gate-classify.sh's `case` has no arm for either (they
 #     are siblings of _tests_/bit, _tests_/imports and _tests_/stress, not
@@ -656,7 +656,7 @@ argvliteral_gate_paths() {
 argvliteral_bucket_for_dir() {
   case "$1" in
     bench | editors | tools | tools/*) return 0 ;;
-    _tests_/freestanding | _tests_/testproj) return 0 ;;
+    _tests_/freestanding | _tests_/testproj | _tests_/windows) return 0 ;;
     compiler) printf 'selfhost\n' ;;
     runtime) printf 'runtime\n' ;;
     stdlib) printf 'stdlib\n' ;;
