@@ -723,6 +723,16 @@ The whole value under the cursor (object, array or scalar) as a `Json`,
 consumed. It is how a `Json` field is read off the text; a malformed value
 fails with the same positional error `jsonParse` gives.
 
+### `jsonTextEnumKey(r: JsonReader, path: string, key: string, allowed: []string): string!`
+
+The variant name under the cursor, consumed and checked against `allowed`.
+An unknown name fails exactly as `jsonDecEnumKey` does, with the field's path
+and the full list, so decoding from text and from a `Json` tree agree.
+
+### `jsonTextEnumIndex(r: JsonReader, path: string, i: i64, allowed: []string): string!`
+
+The same, for an array element.
+
 ### `jsonTextNeed(seen: bool, path: string, key: string): ()!`
 
 Fails with `MissingKey` at `path`.`key` when `seen` is `false`. This is the
