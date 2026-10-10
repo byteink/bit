@@ -148,10 +148,10 @@ fn main(): ()! {
 ```
 
 `scan(pattern = "", count = 0)` returns an iterator whose `next(): Option<
-(string, string)>!` fetches a new page only when the current one runs out.
-A page that fails to arrive (a dropped connection, a timeout, a server error)
-is returned as a `RedisError`, so the loop is `for pair of it?` inside a
-function that returns `()!`. Pass `pattern` to filter field names server-side (`HSCAN`'s own `MATCH`),
+(string, string)>!RedisError` fetches a new page only when the current one
+runs out. A page that fails to arrive (a dropped connection, a timeout, a
+server error) is returned as a `RedisError`, so the loop is `for pair of it?`
+inside a function that returns `()!`, or inside a transaction body (below). Pass `pattern` to filter field names server-side (`HSCAN`'s own `MATCH`),
 and `count` as a hint for how many entries to fetch per round trip. There is no
 queued/pipelined version of `scan()`: a cursor is several round trips, and a
 pipeline's `Future<T>` only ever resolves one.
@@ -228,7 +228,31 @@ fn main(): ()! {
 }
 ```
 
-Every read on `Hash` works through `tx.read`, `scan` included. A write such as
+Every read on `Hash` works through `tx.read`, `scan` included. The scan's
+`next()` fails with a `RedisError`, the same type the body fails with, so
+`for ... of scan()?` needs no wrapping or mapping:
+
+```bit
+import { open } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let key = "user:1"
+  let n = r.transaction<int>([key], (tx) => {
+    let seen = 0
+    for (field, value) of tx.read.hash(key).scan()? {
+      println("${field} = ${value}")
+      seen = seen + 1
+    }
+    return seen
+  })?
+  println("${n} fields")
+  r.close()
+  return
+}
+```
+
+A write such as
 `tx.read.hash(key).setField(...)` would run immediately, outside the
 transaction's `MULTI`/`EXEC`, so it fails with `RedisError.Invalid`; queue it
 with `tx.hash(key)`.

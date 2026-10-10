@@ -66,6 +66,7 @@ reply shapes these methods match against and what nil means on the wire.
 ## Where to go next
 
 [Strings and keys](strings-and-keys.md), [Hashes](hashes.md),
+[Pub/sub](pubsub.md) (`publish`, `subscribe` and the `PUBSUB` commands),
 [Sorted sets](sorted-sets.md) and
 [Locations, unique counts and bitmaps](geo-hll-bitmaps.md) each build on
 `command()` for a specific Redis data type; [Connecting](connecting.md) covers the pool, timeouts and

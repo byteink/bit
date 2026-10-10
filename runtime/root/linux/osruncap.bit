@@ -107,13 +107,6 @@ const osCapDiscardBytes: int = 65536
 // with `osPollNs`'s 2ms cadence long before a 4 MiB cap is in sight.
 const osCapMaxReadsPerTick: int = 8
 
-// Extra poll ticks run AFTER the child is confirmedly gone (normal exit or
-// post-timeout reap), to reach true EOF on both streams: the tick that
-// detected the exit may have drained less than everything the child had
-// already written. Bounded (Power of 10 rule 2); in practice both streams
-// reach EOF within one or two ticks once the writer side is closed.
-const osCapPostReapMaxTicks: int = 64
-
 // ---------------------------------------------------------------------------
 // Per-worker capture state (#5780): PER-WORKER SLOT, the same
 // `osScratchSlot()` shape `../os.bit`'s `osArgvBuf`/`osStatusBuf` establish
@@ -401,25 +394,34 @@ let osCapDiscard: [270336]i64
 }
 
 // After the child is confirmedly gone (exit detected or post-timeout reap),
-// keep draining until both streams report EOF or the bounded tick budget
-// runs out (this file's header: the tick that detected the exit may not have
-// drained everything already written).
-@nosplit fn osCapDrainToEof(stateBase: int, outBuf: int, errBuf: int) {
+// keep draining until both streams report EOF or the CALLER'S deadline
+// passes (#5804). One full pass always runs first: the tick that detected the
+// exit may not have drained everything already written, and a child killed
+// at the deadline still gets its buffered output read. A stream that is still
+// open at the deadline (a grandchild holding the pipe) is not waited for: the
+// caller keeps whatever was captured and gets `false`. Bounded by the
+// deadline, itself clamped to `osBoundedMaxMs`, and by `osBoundedMaxPolls`
+// (Power of 10 rule 2).
+@nosplit fn osCapDrainToEof(stateBase: int, outBuf: int, errBuf: int): bool {
   let discardAddr = osCapDiscardAddr()
   let outRead = loadWord(stateBase + osCapOutReadOff)
   let errRead = loadWord(stateBase + osCapErrReadOff)
+  let deadline = loadWord(stateBase + osCapDeadlineOff)
   let ticks = 0
-  while (ticks < osCapPostReapMaxTicks) {
+  let eof = false
+  let late = false
+  while (!eof && !late && ticks <= osBoundedMaxPolls) {
     osCapDrainOne(outRead, outBuf, discardAddr, stateBase, false)
     osCapDrainOne(errRead, errBuf, discardAddr, stateBase, true)
-    if (loadWord(stateBase + osCapStdoutDoneOff) != 0 &&
-      loadWord(stateBase + osCapStderrDoneOff) != 0) {
-      ticks = osCapPostReapMaxTicks
-    } else {
+    eof = loadWord(stateBase + osCapStdoutDoneOff) != 0 &&
+      loadWord(stateBase + osCapStderrDoneOff) != 0
+    late = osMonoNs() >= deadline
+    if (!eof && !late) {
       osPollSleep()
-      ticks = ticks + 1
     }
+    ticks = ticks + 1
   }
+  return eof
 }
 
 @nosplit fn osCapForkAndRun(
@@ -453,7 +455,14 @@ let osCapDiscard: [270336]i64
   let outstanding = osMarkChildOutstanding(forked)
   let result = osCapPollLoop(forked, stateBase, outBuf, errBuf)
   storeWord(outstanding, 0)
-  osCapDrainToEof(stateBase, outBuf, errBuf)
+  // #5804: the caller's deadline bounds the drain too. A stream still open at
+  // the deadline substitutes the `-2` timeout sentinel for the child's exit
+  // code and the captured prefix is kept -- Python's `subprocess.run(timeout=)`
+  // (`TimeoutExpired` out of `communicate`, partial output kept), not Go's
+  // `WaitDelay`, which would return the child's own exit status.
+  if (!osCapDrainToEof(stateBase, outBuf, errBuf)) {
+    result = 0 - 2
+  }
   osCapCloseReadFds(stateBase)
   return result
 }

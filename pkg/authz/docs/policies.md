@@ -329,6 +329,77 @@ fn main() {
 This prints `invalid policy: unknown role reader (defined: )`: here nothing
 was registered. With the three roles above it passes.
 
+## Policies as data
+
+An admin who cannot deploy code writes the same policy as a document. A
+`PolicyDoc` is a name and statements; each statement has an `effect`
+(`"allow"` or `"deny"`), `actions` by variant name, a `resource` by class name
+(or `"*"` for all) and an optional `when`, the JSON of [Conditions](conditions.md)
+or CEL text. `validateDoc` checks it against what is registered and returns the
+same `Rule`s `p.can` would have recorded:
+
+```bit
+import { Authz, PolicyDoc, Statement } from "authz"
+import { Tabled } from "orm"
+import { jsonParse } from "std/json"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+  team: string
+  status: string
+}
+
+fn main() {
+  let authz = Authz<Action>() catch e {
+    panic(e.message())
+  }
+  authz.resource<Article>() catch e {
+    panic(e.message())
+  }
+  let when = jsonParse("{ \"team\": \"$user.team\", \"status\": \"review\" }") catch e {
+    panic(e.message())
+  }
+  let doc = PolicyDoc{
+    name = "PublishOwnTeam",
+    statements = [
+      Statement{ effect = "allow", actions = ["Publish"], resource = "Article", when = when },
+    ],
+  }
+  let compiled = authz.validateDoc(doc) catch e {
+    panic(e.message())
+  }
+  println("${compiled.name}: ${len(compiled.rules)} rule")
+  let typo = PolicyDoc{
+    name = "PublishOwnTeam",
+    statements = [
+      Statement{ effect = "allow", actions = ["Publsh"], resource = "Article", when = when },
+    ],
+  }
+  let _ = authz.validateDoc(typo) catch e {
+    println(e.message())
+    return
+  }
+}
+```
+
+This prints `PublishOwnTeam: 1 rule`, then `invalid policy:
+/statements/0/actions/0: unknown action 'Publsh'; valid actions: Manage, Read,
+Create, Update, Delete, Publish`. Every refusal starts with the
+[JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901) of the fault in the
+document, so an admin's form can mark the field. The limits are fixed: a name is
+1 to 64 characters of letters, digits, `_`, `.` and `-`; a policy holds 1 to 64
+statements; a document holds at most 64 KiB (the whole document is `#` in a
+pointer). `"*"` is a resource, never an action: to grant every action the
+statement names `Manage`.
+
+An `Attachment` says who gets a stored policy: `policy`, `to` (a `Target` with
+exactly one of `role`, `group` or `user`) and `tenant` (empty is global).
+`authz.validateAttachment(a)` checks the names the same way; that the policy
+exists is the store's check.
+
 ## Sharp edges
 
 - `Policy`'s type arguments come from the type the policy is written
@@ -343,7 +414,8 @@ was registered. With the three roles above it passes.
 - `can` and `cannot` only record rules. Deny-wins and default-deny are
   applied when you ask, by `authz.can` (the [Deciding](decisions.md) chapter).
 - Roles come from `user.roles` alone. Policies attached to one user directly
-  arrive with stored policies.
+  arrive with stored policies; `validateDoc` and `validateAttachment` check
+  their documents today.
 
 ## Next
 

@@ -1,0 +1,317 @@
+// _tests_/bit/remmagic.bit — `./make test-rem-magic` (#5803). Gates the
+// `%`-by-constant magic lowering that #5792 turned on for aarch64-linux only
+// (`remTakesMagic`, compiler/optdivmagic.bit), which no other gate can reach:
+// golden runs on aarch64-macos, where the transform is off.
+//
+// WHAT. The harness writes a program with one function per (width, divisor):
+//
+//     fn c_i64_7(o: []i64, k: i64): int   // count of x where x % 7 != x % (7 - k)
+//
+// `x % 7` is the lowered side; `x % (7 - k)` divides by a RUNTIME value, so the
+// optimizer cannot lower it and the CPU's own divide is the oracle. Divisors are
+// every constant 2..1024, 2147483647 and 1000000007 and their negatives (unsigned
+// widths take the positives), at i64, u64, i32 and u32, over 8 edge operands
+// (i64 min, min+1, -(2^32+1), -1, 0, 1, 2^32+1, i64 max) plus 300 xorshift64
+// values. k is `len(args()) - 1`: 0 for a bare run, 1 when the harness passes one
+// extra argument, which moves every opaque divisor off its constant.
+//
+// FOUR STEPS, each failing the gate by name:
+//   1. `bit build --target aarch64-linux` of the generated program.
+//   2. LIVENESS: the binary holds at least `minMulh` smulh/umulh instructions.
+//      Without the transform it holds a few dozen (the runtime's), so a gate whose
+//      `%` quietly stopped lowering would pass step 3 on plain divides.
+//   3. The bare run in `bit-linux-gate:latest` prints `mismatches=0` and the
+//      expected check count.
+//   4. The PERTURBED run prints `mismatches>0`, so a comparison that cannot fail
+//      cannot pass step 3.
+//
+// WITHOUT DOCKER the gate FAILS (dockerlive.bit, #6353); the registry marks it
+// darwinOnly so a Linux host reads SKIP. The scratch directory is KEPT on failure.
+//
+// ENV (set by `./make test-rem-magic`, tools/build/gatestable2.bit):
+//   BIT_REPO, BIT_BIN (the compiler under test), BIT_STDLIB.
+import { output } from "std/process"
+import { env, envOr, exit } from "std/os"
+import { mkdir, readFile, writeFile } from "std/fs"
+import { contains, parseInt, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import {
+  dockerOutput,
+  dockerRunTimeoutMs,
+  failureText,
+  releaseDocker,
+  requireDocker,
+} from "./dockerlive"
+
+const image: string = "bit-linux-gate:latest"
+const buildTimeoutMs: int = 300000
+const operandsPerDivisor: int = 308
+const maxSmall: int = 1024
+const minMulh: int = 2000
+
+// Everything one run needs; `scratch` holds prog.bit and run/prog.
+class Job { bin: string, stdlib: string, scratch: string }
+
+let dockerBin: string = ""
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (len(v) == 0) {
+    eprint("remmagic: ${name} is not set — run this through `./make test-rem-magic`\n")
+    exit(2)
+  }
+  return v
+}
+
+fn fail1(scratch: string, msg: string) {
+  eprint("remmagic: FAIL: ${msg}\n  scratch kept for a hand re-run: ${scratch}\n")
+  releaseDocker(dockerBin)
+  exit(1)
+}
+
+// The divisors of one width: 2..maxSmall plus the two big ones, and for a signed
+// width their negatives too.
+fn divisorsOf(signed: bool): []int {
+  let ds = []int(0)
+  let d = 2
+  while (d <= maxSmall) {
+    ds = append(ds, d)
+    d = d + 1
+  }
+  ds = append(ds, 2147483647)
+  ds = append(ds, 1000000007)
+  if (!signed) {
+    return ds
+  }
+  let all = ds
+  for p of ds {
+    all = append(all, 0 - p)
+  }
+  return all
+}
+
+// Divisors written as a literal the parser takes in every slot.
+fn lit(d: int): string {
+  if (d < 0) {
+    return "(-${0 - d})"
+  }
+  return "${d}"
+}
+
+// The per-divisor function: counts operands where the constant-divisor `%`
+// differs from the runtime-divisor one.
+fn caseFn(ty: string, name: string, d: int): string {
+  return "fn ${name}(o: []${ty}, k: ${ty}): int {\n" +
+    "  let bad = 0\n" +
+    "  for x of o {\n" +
+    "    if (x % ${lit(d)} != x % (${lit(d)} - k)) {\n" +
+    "      bad = bad + 1\n" +
+    "    }\n" +
+    "  }\n" +
+    "  return bad\n" +
+    "}\n\n"
+}
+
+// The operand builder of one width: the 8 edges, then 300 xorshift64 values.
+fn opsFn(ty: string): string {
+  return "fn ops_${ty}(): []${ty} {\n" +
+    "  let o = []${ty}(0)\n" +
+    "  for e of edges() {\n" +
+    "    o = append(o, ${ty}(e))\n" +
+    "  }\n" +
+    "  let s: u64 = 88172645463325252\n" +
+    "  let i = 0\n" +
+    "  while (i < 300) {\n" +
+    "    s = s ^ (s << 13)\n" +
+    "    s = s ^ (s >> 7)\n" +
+    "    s = s ^ (s << 17)\n" +
+    "    o = append(o, ${ty}(s))\n" +
+    "    i = i + 1\n" +
+    "  }\n" +
+    "  return o\n" +
+    "}\n\n"
+}
+
+const preamble: string = "import { args } from \"std/os\"\n\n" +
+  "fn edges(): []i64 {\n" +
+  "  let min = 0 - 9223372036854775807 - 1\n" +
+  "  return [min, min + 1, 0 - 4294967297, 0 - 1, 0, 1, 4294967297, 9223372036854775807]\n" +
+  "}\n\n"
+
+// One width: its operand builder, its case functions, and the main() lines that
+// call each. Returns (functions, calls, number of calls).
+class Width { fns: string, calls: string, n: int }
+
+fn widthOf(ty: string, signed: bool): Width {
+  let fns = opsFn(ty)
+  let calls = "  let o_${ty} = ops_${ty}()\n  let k_${ty}: ${ty} = ${ty}(k)\n"
+  let n = 0
+  for d of divisorsOf(signed) {
+    let name = "c_${ty}_${n}"
+    fns = fns + caseFn(ty, name, d)
+    calls = calls + "  bad = bad + ${name}(o_${ty}, k_${ty})\n  checks = checks + len(o_${ty})\n"
+    n = n + 1
+  }
+  return Width{ fns = fns, calls = calls, n = n }
+}
+
+// The whole program and how many (width, divisor) cases it holds.
+fn programText(): (string, int) {
+  let src = preamble
+  let calls = "fn main() {\n  let k = len(args()) - 1\n  let bad = 0\n  let checks = 0\n"
+  let cases = 0
+  for ty of ["i64", "u64", "i32", "u32"] {
+    let w = widthOf(ty, ty[0] == 'i')
+    src = src + w.fns
+    calls = calls + w.calls
+    cases = cases + w.n
+  }
+  calls = calls + "  print(\"remmagic: checks=\${checks} mismatches=\${bad}\\n\")\n}\n"
+  return src + calls, cases
+}
+
+// Counts smulh/umulh (Rd, Rn, Rm) words: the instructions the magic quotient
+// needs and a hardware divide never emits.
+fn countMulh(path: string): int {
+  let b = readFile(path) catch _ {
+    return 0 - 1
+  }
+  let n = 0
+  let i = 0
+  while (i + 4 <= len(b)) {
+    let w = int(b[i]) | (int(b[i + 1]) << 8) | (int(b[i + 2]) << 16) | (int(b[i + 3]) << 24)
+    let top = w & 0xFFE0FC00                      // opcode bits, Rm/Rn/Rd masked off
+    if (top == 0x9B407C00 || top == 0x9BC07C00) { // smulh, umulh
+      n = n + 1
+    }
+    i = i + 4
+  }
+  return n
+}
+
+// The integer after `key` in `out`, or -1 when `key` is absent or not followed by digits.
+fn field(out: string, key: string): int {
+  let at = 0 - 1
+  let i = 0
+  while (i + len(key) <= len(out)) {
+    if (out[i:i + len(key)] == key) {
+      at = i + len(key)
+      break
+    }
+    i = i + 1
+  }
+  if (at < 0) {
+    return 0 - 1
+  }
+  let j = at
+  while (j < len(out) && out[j] >= '0' && out[j] <= '9') {
+    j = j + 1
+  }
+  return parseInt(out[at:j]) catch _ {
+    0 - 1
+  }
+}
+
+// One run of the program in the image; `extra` is the perturbing argument or "".
+fn runIn(docker: string, j: Job, extra: string): (int, string) {
+  let args = ["run", "--rm", "-v", "${j.scratch}/run:/w", image, "/w/prog"]
+  if (extra != "") {
+    args = append(args, extra)
+  }
+  let r = dockerOutput(docker, args, dockerRunTimeoutMs) catch e {
+    return 0 - 1, "docker run did not start: ${e.message()}"
+  }
+  let text = trimSpace(r.stdout)
+  if (r.exitCode != 0) {
+    text = text + " " + failureText(r, dockerRunTimeoutMs)
+  }
+  return r.exitCode, text
+}
+
+// "" when the bare run is clean and the perturbed run is not, else why not.
+fn judge(docker: string, j: Job, want: int): string {
+  let (rc, bare) = runIn(docker, j, "")
+  if (rc != 0 || field(bare, "checks=") != want || field(bare, "mismatches=") != 0) {
+    return "bare run rc=${rc}, want rc=0 checks=${want} mismatches=0; got: ${bare}"
+  }
+  let (rcP, pert) = runIn(docker, j, "perturb")
+  if (rcP != 0 || field(pert, "checks=") != want || field(pert, "mismatches=") <= 0) {
+    return "perturbed run rc=${rcP}, want rc=0 checks=${want} mismatches>0 (the comparison cannot fail otherwise); got: ${pert}"
+  }
+  println("remmagic: bare ${trimSpace(bare)}; perturbed ${trimSpace(pert)}")
+  return ""
+}
+
+fn buildProgram(j: Job): string {
+  let r = output(
+    "/usr/bin/env",
+    [
+      "BIT_STDLIB=${j.stdlib}",
+      j.bin,
+      "build",
+      "${j.scratch}/prog.bit",
+      "--target",
+      "aarch64-linux",
+      "-o",
+      "${j.scratch}/run/prog",
+    ],
+    buildTimeoutMs,
+  )
+  if (r.exitCode != 0) {
+    return "${j.bin} build --target aarch64-linux exited ${r.exitCode}: ${failureText(
+      r,
+      buildTimeoutMs,
+    )}"
+  }
+  let mulh = countMulh("${j.scratch}/run/prog")
+  if (mulh < minMulh) {
+    return "only ${mulh} smulh/umulh words in the aarch64-linux binary (want >= ${minMulh}): the % magic lowering is not live"
+  }
+  println("remmagic: ${mulh} smulh/umulh words in the aarch64-linux binary")
+  return ""
+}
+
+fn removeScratch(scratch: string) {
+  if (len(scratch) < 2 || !contains(scratch, "bit-remmagic-")) {
+    eprint("remmagic: refusing to remove unexpected scratch path \"${scratch}\"\n")
+    exit(2)
+  }
+  let r = output("/bin/rm", ["-rf", scratch], 30000)
+  if (r.exitCode != 0) {
+    eprint("remmagic: cannot remove ${scratch}: ${failureText(r, 30000)}\n")
+    exit(2)
+  }
+}
+
+fn main() {
+  let repo = requiredEnv("BIT_REPO")
+  let docker = requireDocker("remmagic")
+  dockerBin = docker
+  let scratch = envOr("TMPDIR", "/tmp") + "/bit-remmagic-${uuidFormat(uuidV4())}"
+  let j = Job{
+    bin = envOr("BIT_BIN", "${repo}/bit-out/bin/bit"),
+    stdlib = requiredEnv("BIT_STDLIB"),
+    scratch = scratch,
+  }
+  mkdir(scratch) catch e {
+    eprint("remmagic: cannot create ${scratch}: ${e.message()}\n")
+    exit(2)
+  }
+  mkdir("${scratch}/run") catch e {
+    fail1(scratch, "cannot create ${scratch}/run: ${e.message()}")
+  }
+  let (src, cases) = programText()
+  writeFile("${scratch}/prog.bit", src) catch e {
+    fail1(scratch, "cannot write ${scratch}/prog.bit: ${e.message()}")
+  }
+  let why = buildProgram(j)
+  if (why == "") {
+    why = judge(docker, j, cases * operandsPerDivisor)
+  }
+  releaseDocker(docker)
+  if (why != "") {
+    fail1(scratch, why)
+  }
+  removeScratch(scratch)
+  println("remmagic: ok — ${cases} (width, divisor) cases agree with the hardware remainder on aarch64-linux in ${image}")
+}

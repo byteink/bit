@@ -4451,10 +4451,21 @@ stream:
 ```
  >= 0     child exited normally with this code (0-255)
  -1       spawn failure (fork/exec/wait error), same sentinel as os_run
- -2       timed out: the deadline elapsed, so the child was SIGKILLed and reaped
+ -2       timed out: the deadline elapsed, so the child was SIGKILLed and reaped,
+          or the child exited but a stream had not reached EOF by then
  <= -100  child was killed by a signal observed during a poll; signal number
           is -(result) - 100 (e.g. -109 = killed by SIGKILL from outside)
 ```
+
+`timeout_ms` bounds the whole call, including the drain after the child has
+exited. If the deadline passes while a stream is still open (a grandchild
+inherited the pipe write end and outlives the child), the result is `-2` with
+whatever was captured up to then, and the read ends are closed. This is
+Python's `subprocess.run(timeout=)` (partial output kept), not Go's `WaitDelay`
+(which keeps the child's exit status). A stream that reaches EOF inside the
+deadline never turns a normal exit into `-2`. The Windows provider does not
+wait for EOF after the child exits (it drains what is buffered), so it never
+reaches this case.
 
 Each stream is capped at `osRunCaptureMaxBytes` (4 MiB, `runtime/root/os.bit`).
 Both pipes are drained to EOF regardless of the cap: bytes read past the cap

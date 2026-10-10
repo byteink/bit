@@ -50,11 +50,9 @@ import { spinAcquire, spinRelease } from "../../"
 // for however long the racing sibling keeps running (verified directly
 // against this kernel outside Bit, #5790's own ticket comment: a background
 // process holding an inherited pipe write end open delays a plain `cat` of
-// the read end by exactly that process's own lifetime). `osCapForceTimeout`
-// below is a no-op once the child is already reaped, so a landed race never
-// substitutes the `-2` sentinel for a clean child's real exit code — the
-// observable defect is added latency, unbounded by this function's own
-// `timeoutMs` (only `osBoundedMaxPolls`, far larger, ends the stall).
+// the read end by exactly that process's own lifetime). Before #5804 the
+// observable defect was added latency, unbounded by this function's own
+// `timeoutMs`; `osCapRunLoop` now bounds the drain by that deadline (below).
 //
 // Closed by `osForkLockWord` below: ONE process-wide spin lock, held across
 // both `pipe()`+`fcntl()` pairs AND this function's own `fork()` in
@@ -465,13 +463,38 @@ const osCapStillRunning: int = 0 - 1000000
   rootExit(127)
 }
 
+// Both streams have reported EOF.
+@nosplit fn osCapStreamsDone(base: int): bool {
+  return loadWord(base + 32) != 0 && loadWord(base + 40) != 0
+}
+
+// #5804: the caller's deadline bounds the WHOLE call, including the stream
+// drain after the child has exited. `exitedBefore` is whether the child was
+// already reaped when this tick STARTED, so the tick's own drains ran after
+// the exit and a child killed by `osCapWaitOnce` at the deadline still gets
+// one full drain tick of its buffered output before this fires. When the
+// deadline has passed and a stream is still open (a grandchild holding the
+// pipe), the result becomes the `-2` timeout sentinel and the caller keeps
+// whatever was captured -- Python's `subprocess.run(timeout=)`
+// (`TimeoutExpired` out of `communicate`, partial output kept, covers the
+// drain too), not Go's `WaitDelay`, which would return the child's own exit
+// status.
+@nosplit fn osCapDrainExpired(base: int, exitedBefore: bool): bool {
+  if (!exitedBefore || osMonoNs() < loadWord(base + 64)) {
+    return false
+  }
+  storeWord(base + 56, 0 - 2)
+  return true
+}
+
 // The 2ms-tick poll loop proper: drain both streams non-blocking, check the
 // child non-blocking, sleep once per tick if nothing changed, until both
-// streams are at EOF AND the child has been reaped. Allocates both capture
-// buffers up front (`osRunCaptureMaxBytes` each, the same `rtStrAlloc`
-// primitive `bit_rt_fs_read_all` uses — this runtime does no OTHER
-// managed-heap allocation) and stores the trimmed result before returning
-// just the exit encoding.
+// streams are at EOF AND the child has been reaped, or the caller's deadline
+// passes with a stream still open (`osCapDrainExpired`). Allocates both
+// capture buffers up front (`osRunCaptureMaxBytes` each, the same
+// `rtStrAlloc` primitive `bit_rt_fs_read_all` uses -- this runtime does no
+// OTHER managed-heap allocation) and stores the trimmed result before
+// returning just the exit encoding.
 @nosplit fn osCapRunLoop(pid: int, outFd: int, errFd: int, timeoutMs: int): int {
   let base = osCapStateBase()
   osCapStateReset(base, timeoutMs)
@@ -480,10 +503,13 @@ const osCapStillRunning: int = 0 - 1000000
   let polls = 0
   let done = false
   while (!done && polls <= osBoundedMaxPolls) {
+    let exitedBefore = loadWord(base + 48) != 0
     osCapDrain(base, outFd, outBuf, 0)
     osCapDrain(base, errFd, errBuf, 1)
     osCapCheckChild(base, pid)
-    if (loadWord(base + 48) != 0 && loadWord(base + 32) != 0 && loadWord(base + 40) != 0) {
+    if (loadWord(base + 48) != 0 && osCapStreamsDone(base)) {
+      done = true
+    } else if (osCapDrainExpired(base, exitedBefore)) {
       done = true
     } else {
       osPollSleep()
