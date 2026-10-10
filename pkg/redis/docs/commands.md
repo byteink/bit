@@ -71,3 +71,5 @@ reply shapes these methods match against and what nil means on the wire.
 [Locations, unique counts and bitmaps](geo-hll-bitmaps.md) each build on
 `command()` for a specific Redis data type; [Connecting](connecting.md) covers the pool, timeouts and
 TLS these methods run over.
+
+[Requests per minute: time series](timeseries.md) covers the `TS.*` commands behind `r.timeseries(key)`.

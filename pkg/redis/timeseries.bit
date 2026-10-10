@@ -1,17 +1,233 @@
-// pkg/redis/timeseries.bit — `r.timeseries(key)`: the RedisTimeSeries handle. Epic
-// #6013, #6028: SCAFFOLD ONLY, no commands wired yet (`TS.ADD, TS.RANGE, TS.CREATE`, a
-// follow-up ticket) — this file exists so later family tickets touch only
-// their own file, never `client.bit`. `cmd.bit`'s header is the template:
-// one `Cmd<T>` factory per command, called from a method here.
+// pkg/redis/timeseries.bit - `r.timeseries(key)`: the RedisTimeSeries
+// commands, `TS.CREATE`, `TS.ALTER`, `TS.ADD`, `TS.MADD`, `TS.INCRBY`,
+// `TS.DECRBY`, `TS.DEL`, `TS.GET`, `TS.MGET`, `TS.RANGE`, `TS.REVRANGE`,
+// `TS.MRANGE`, `TS.MREVRANGE`, `TS.QUERYINDEX`, `TS.INFO`, `TS.CREATERULE`
+// and `TS.DELETERULE`. Epic #6013, #6028, #6038. Follows `cmd.bit`'s HOW-TO
+// header: the option and result types are in `tsopts.bit`, the wire arguments
+// in `tsargs.bit`, one `Cmd<T>` factory per command and the decoders in
+// `tscmd.bit`, an immediate method here on `TimeSeries`, a queued one on
+// `TimeSeriesBatch`. Redis 8 ships the module built in.
+//
+// A TIME SERIES KEY IS ITS OWN TYPE: `TYPE` says `TSDB-TYPE`, so the string
+// commands do not work on it and these do not work on a string. It holds
+// samples ordered by timestamp, a timestamp being unix milliseconds. Each
+// series may carry labels (`name -> value`), which is what the commands across
+// several series select on.
+//
+// TWO HANDLES. `r.timeseries(key)` is one series: `create`, `add`, `range`,
+// `info`, the compaction rule that leaves it. `r.timeseriesMulti()` is the
+// commands that name no single series: `madd` across keys, and `mget`,
+// `mrange`, `mrevrange` and `queryIndex`, which pick series by label filter
+// (`label("region").eq("eu")`, `tsopts.bit`).
+//
+// `TimeSeries` and `TimeSeriesMulti` HOLD `runner: Runner`: over the pool
+// from `r`, over a transaction attempt's pinned connection from `tx.read`
+// (`tx.bit`'s header), where the reads see the keys the transaction `WATCH`es
+// and a write is refused (#7738). The queued `TimeSeriesBatch` is what
+// `Pipeline.timeseries` and `Tx.timeseries` return.
+//
+// `add` CREATES A SERIES THAT DOES NOT EXIST, with the `SeriesOptions` it is
+// given (the server's rule for `TS.ADD`, `TS.INCRBY` and `TS.DECRBY`);
+// against an existing series the options are ignored.
+
 export class TimeSeries {
-  client: Client,
-  key: string,
+  runner: Runner
+  key: string
+
+  // `TS.CREATE`: a new, empty series. A key that already exists is the
+  // server's error.
+  export create(opts: SeriesOptions = SeriesOptions{}): ()!RedisError {
+    return this.runner.runCmd(tsCreateCmd(this.key, opts))?
+  }
+  // `TS.ALTER`: changes an existing series. Only the fields set in `opts` are
+  // sent.
+  export alter(opts: AlterOptions): ()!RedisError {
+    return this.runner.runCmd(tsAlterCmd(this.key, opts))?
+  }
+  // `TS.ADD`: stores `value` at `ts` and returns the timestamp it was stored
+  // at (`Stamp.Auto` is the server's clock). `onDuplicate` overrides the
+  // series' duplicate policy for this sample.
+  export add(
+    ts: Stamp,
+    value: f64,
+    opts: SeriesOptions = SeriesOptions{},
+    onDuplicate: Option<DuplicatePolicy> = Option.None,
+  ): i64!RedisError {
+    return this.runner.runCmd(tsAddCmd(this.key, ts, value, opts, onDuplicate))?
+  }
+  // `TS.INCRBY`: adds `delta` to the newest sample's value, as a new sample at
+  // `ts`; returns that timestamp.
+  export incrBy(
+    delta: f64,
+    ts: Stamp = Stamp.Auto,
+    opts: SeriesOptions = SeriesOptions{},
+  ): i64!RedisError {
+    return this.runner.runCmd(tsIncrCmd("TS.INCRBY", this.key, delta, ts, opts))?
+  }
+  // `TS.DECRBY`: `incrBy` with `delta` subtracted.
+  export decrBy(
+    delta: f64,
+    ts: Stamp = Stamp.Auto,
+    opts: SeriesOptions = SeriesOptions{},
+  ): i64!RedisError {
+    return this.runner.runCmd(tsIncrCmd("TS.DECRBY", this.key, delta, ts, opts))?
+  }
+  // `TS.DEL`: removes the samples from `from` to `to`, both included; returns
+  // how many.
+  export del(from: Stamp, to: Stamp): i64!RedisError {
+    return this.runner.runCmd(tsDelCmd(this.key, from, to))?
+  }
+  // `TS.GET`: the newest sample, `None` for an empty series. `latest` also
+  // reports a compaction rule's open bucket.
+  export get(latest: bool = false): Option<Sample>!RedisError {
+    return this.runner.runCmd(tsGetCmd(this.key, latest))?
+  }
+  // `TS.RANGE`: the samples from `from` to `to`, oldest first; with
+  // `opts.downsample`, one aggregated sample per bucket.
+  export range(
+    from: Stamp,
+    to: Stamp,
+    opts: RangeOptions = RangeOptions{},
+  ): []Sample!RedisError {
+    return this.runner.runCmd(tsRangeCmd("TS.RANGE", this.key, from, to, opts))?
+  }
+  // `TS.REVRANGE`: `range`, newest first.
+  export revrange(
+    from: Stamp,
+    to: Stamp,
+    opts: RangeOptions = RangeOptions{},
+  ): []Sample!RedisError {
+    return this.runner.runCmd(tsRangeCmd("TS.REVRANGE", this.key, from, to, opts))?
+  }
+  // `TS.INFO`: the series' settings, counters and compaction rules.
+  export info(): SeriesInfo!RedisError {
+    return this.runner.runCmd(tsInfoCmd(this.key))?
+  }
+  // `TS.CREATERULE`: from now on every sample of this series is aggregated
+  // by `by` into buckets of `bucket` (a duration, `Minute`) and stored in
+  // `dest`, which must exist and have no other source. `align` moves where the
+  // buckets start (unix ms, default 0).
+  export createRule(
+    dest: string,
+    by: Aggregation,
+    bucket: int,
+    align: Option<i64> = Option.None,
+  ): ()!RedisError {
+    return this.runner.runCmd(tsCreateRuleCmd(this.key, dest, by, bucket, align))?
+  }
+  // `TS.DELETERULE`: stops compacting this series into `dest`; `dest` keeps
+  // what it has.
+  export deleteRule(dest: string): ()!RedisError {
+    return this.runner.runCmd(tsDeleteRuleCmd(this.key, dest))?
+  }
 }
 
-// The queued view `Pipeline.timeseries`/`Tx.timeseries` both return — `cmd.bit`'s
-// `Batch` is the ONE client-side queue the two executors share, so this
-// is the ONLY queued view TimeSeries needs (`cmd.bit`'s header, point 2).
+// The commands that name no single series: `r.timeseriesMulti()`.
+export class TimeSeriesMulti {
+  runner: Runner
+
+  // `TS.MADD`: stores each point and answers one `AddResult` per point, in
+  // order; a refused point does not stop the others.
+  export madd(points: []KeyedSample): []AddResult!RedisError {
+    return this.runner.runCmd(tsMaddCmd(points))?
+  }
+  // `TS.MGET`: the newest sample of every series matching all of `filters`.
+  export mget(
+    filters: []Filter,
+    latest: bool = false,
+    labels: LabelsOut = LabelsOut.Omit,
+  ): []SeriesLast!RedisError {
+    return this.runner.runCmd(tsMgetCmd(filters, latest, labels))?
+  }
+  // `TS.MRANGE`: `range` over every series matching all of `filters`; with
+  // `opts.groupBy` the series are merged by one label.
+  export mrange(
+    from: Stamp,
+    to: Stamp,
+    filters: []Filter,
+    opts: MrangeOptions = MrangeOptions{},
+  ): []SeriesRange!RedisError {
+    return this.runner.runCmd(tsMrangeCmd("TS.MRANGE", from, to, filters, opts))?
+  }
+  // `TS.MREVRANGE`: `mrange`, newest first.
+  export mrevrange(
+    from: Stamp,
+    to: Stamp,
+    filters: []Filter,
+    opts: MrangeOptions = MrangeOptions{},
+  ): []SeriesRange!RedisError {
+    return this.runner.runCmd(tsMrangeCmd("TS.MREVRANGE", from, to, filters, opts))?
+  }
+  // `TS.QUERYINDEX`: the keys of the series matching all of `filters`.
+  export queryIndex(filters: []Filter): []string!RedisError {
+    return this.runner.runCmd(tsQueryIndexCmd(filters))?
+  }
+}
+
+// The queued view `Pipeline.timeseries`/`Tx.timeseries` both return -
+// `cmd.bit`'s `Batch` is the ONE client-side queue the two executors share.
 export class TimeSeriesBatch {
-  batch: Batch,
-  key: string,
+  batch: Batch
+  key: string
+
+  export create(opts: SeriesOptions = SeriesOptions{}): Future<()> {
+    return this.batch.queue(tsCreateCmd(this.key, opts))
+  }
+  export alter(opts: AlterOptions): Future<()> {
+    return this.batch.queue(tsAlterCmd(this.key, opts))
+  }
+  export add(
+    ts: Stamp,
+    value: f64,
+    opts: SeriesOptions = SeriesOptions{},
+    onDuplicate: Option<DuplicatePolicy> = Option.None,
+  ): Future<i64> {
+    return this.batch.queue(tsAddCmd(this.key, ts, value, opts, onDuplicate))
+  }
+  export incrBy(
+    delta: f64,
+    ts: Stamp = Stamp.Auto,
+    opts: SeriesOptions = SeriesOptions{},
+  ): Future<i64> {
+    return this.batch.queue(tsIncrCmd("TS.INCRBY", this.key, delta, ts, opts))
+  }
+  export decrBy(
+    delta: f64,
+    ts: Stamp = Stamp.Auto,
+    opts: SeriesOptions = SeriesOptions{},
+  ): Future<i64> {
+    return this.batch.queue(tsIncrCmd("TS.DECRBY", this.key, delta, ts, opts))
+  }
+  export del(from: Stamp, to: Stamp): Future<i64> {
+    return this.batch.queue(tsDelCmd(this.key, from, to))
+  }
+  export get(latest: bool = false): Future<Option<Sample>> {
+    return this.batch.queue(tsGetCmd(this.key, latest))
+  }
+  export range(
+    from: Stamp,
+    to: Stamp,
+    opts: RangeOptions = RangeOptions{},
+  ): Future<[]Sample> {
+    return this.batch.queue(tsRangeCmd("TS.RANGE", this.key, from, to, opts))
+  }
+  export revrange(
+    from: Stamp,
+    to: Stamp,
+    opts: RangeOptions = RangeOptions{},
+  ): Future<[]Sample> {
+    return this.batch.queue(tsRangeCmd("TS.REVRANGE", this.key, from, to, opts))
+  }
+  export info(): Future<SeriesInfo> { return this.batch.queue(tsInfoCmd(this.key)) }
+  export createRule(
+    dest: string,
+    by: Aggregation,
+    bucket: int,
+    align: Option<i64> = Option.None,
+  ): Future<()> {
+    return this.batch.queue(tsCreateRuleCmd(this.key, dest, by, bucket, align))
+  }
+  export deleteRule(dest: string): Future<()> {
+    return this.batch.queue(tsDeleteRuleCmd(this.key, dest))
+  }
 }
