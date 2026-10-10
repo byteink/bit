@@ -385,7 +385,7 @@ for t in "${TARGETS[@]}"; do
 	}
 	# Windows needs the .exe suffix on the OUTPUT PATH - the compiler writes
 	# exactly what -o names, it does not append one itself (confirmed against
-	# _tests_/bit/windowssmoke.bit, which does the same). dist/package.sh looks
+	# _tests_/bit/windowssmoke/windowssmoke.bit, which does the same). dist/package.sh looks
 	# for this same name (BIN_NAME).
 	binName="bit"
 	[ "${t}" = "x86_64-windows" ] && binName="bit.exe"
@@ -558,7 +558,7 @@ fi
 # PowerShell variable and newline escape doubled up. Building the file with a
 # single-quoted heredoc (no bash expansion at all) and substituting the
 # placeholders with bash's own parameter substitution avoids that class of
-# mistake entirely -- see _tests_/bit/windowssmoke.bit's header for the same
+# mistake entirely -- see _tests_/bit/windowssmoke/windowssmoke.bit's header for the same
 # target's other hazards (WSL-alias interop, the scp drive-letter colon).
 echo "release.sh: verifying the Windows artifact"
 winZip="${OUT}/bit-${VERSION}-windows-x86_64.zip"
