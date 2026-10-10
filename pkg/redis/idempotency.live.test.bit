@@ -1,0 +1,440 @@
+// pkg/redis/idempotency.live.test.bit - `RedisIdempotencyStore` against a
+// real server. `liveUrl`/`liveClient` are `client.live.test.bit`'s own (same
+// module, no import); every test is skipped, and says so, when
+// `REDIS_TEST_URL` is unset. `./make test-package-redis-live`
+// (`_tests_/bit/redislive.bit`) supplies it against a throwaway Redis 8.10.2.
+//
+// THE CONCURRENCY TEST IS THE POINT: `idemRace` starts N tasks, each on its
+// own connection and released together by one barrier, all calling `begin`
+// on ONE never-seen key. Exactly one may get `None`; the other N-1 must get
+// the winner's `InFlight` entry. A non-atomic `begin` (read, then write)
+// lets two of them read "absent" and both win.
+//
+// `IdempotencyStore` is imported by `idempotency.test.bit` (module-wide).
+// `Request` (std/http) and the app classes are this file's own imports.
+
+import { App, Config, IdempotencyPolicy, idempotency } from "web"
+import { Request } from "std/http"
+
+const idemRacers: int = 16
+
+fn idemKey(name: string): string { return "bit:live:idem:" + name + ":" }
+
+fn idemStore(c: Client, name: string): RedisIdempotencyStore {
+  return RedisIdempotencyStore(c, idemKey(name)) catch e {
+    panic("RedisIdempotencyStore: ${e.message()}")
+  }
+}
+
+fn idemClear(c: Client, name: string, key: string) {
+  c.del([idemKey(name) + key]) catch e {
+    panic("del: ${e.message()}")
+  }
+}
+
+fn idemBegin(
+  s: RedisIdempotencyStore,
+  key: string,
+  fp: string,
+  ttl: i64,
+): Option<IdempotencyEntry> {
+  return s.begin(key, fp, ttl) catch e {
+    panic("begin(${key}): ${e.message()}")
+  }
+}
+
+fn idemPttl(c: Client, name: string, key: string): i64 {
+  let r = c.command(["PTTL", idemKey(name) + key]) catch e {
+    panic("PTTL: ${e.message()}")
+  }
+  return asInt(r, "PTTL") catch e {
+    panic("PTTL decode: ${e.message()}")
+  }
+}
+
+// 0 = this caller created the reservation, 1 = it saw InFlight, 2 = it saw
+// Done, 9 = anything else.
+fn idemOutcome(got: Option<IdempotencyEntry>): int {
+  if (isNone(got)) {
+    return 0
+  }
+  let e = unwrap(got)
+  if (e.state == IdempotencyState.InFlight) {
+    return 1
+  }
+  return 2
+}
+
+// What one racing task needs: where to connect, which store and key, the
+// fingerprint it claims with, the barrier it waits on and where it reports.
+class IdemRacer {
+  url: string,
+  name: string,
+  key: string,
+  fp: string,
+  start: chan<int>,
+  out: chan<int>,
+}
+
+fn idemRacer(r: IdemRacer) {
+  let c = open(r.url) catch _ {
+    r.out <- 9
+    return
+  }
+  let s = idemStore(c, r.name)
+  <- r.start
+  let got = s.begin(r.key, r.fp, 60) catch _ {
+    c.close()
+    r.out <- 9
+    return
+  }
+  c.close()
+  r.out <- idemOutcome(got)
+}
+
+// Runs `idemRacers` racers against `key` and returns the count of each
+// outcome, indexed 0, 1, 2 and 9 folded into slot 3.
+fn idemRace(u: string, name: string, key: string): []int {
+  let start = chan<int>(idemRacers)
+  let out = chan<int>(idemRacers)
+  let i = 0
+  while (i < idemRacers) {
+    spawn idemRacer(
+      IdemRacer{ url = u, name = name, key = key, fp = "fp-${i}", start = start, out = out },
+    )
+    i = i + 1
+  }
+  i = 0
+  while (i < idemRacers) {
+    start <- 1
+    i = i + 1
+  }
+  let counts = [0, 0, 0, 0]
+  i = 0
+  while (i < idemRacers) {
+    let o = <- out
+    if (o == 9) {
+      o = 3
+    }
+    counts[o] = counts[o] + 1
+    i = i + 1
+  }
+  return counts
+}
+
+test "live: N racing begin() calls on one new key produce exactly one winner and N-1 in-progress" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let round = 0
+  while (round < 5) {
+    let key = "race-${round}"
+    idemClear(c, "race", key)
+    let counts = idemRace(u, "race", key)
+    assert(counts[3] == 0, "round ${round}: ${counts[3]} racer(s) failed")
+    assert(counts[0] == 1, "round ${round}: ${counts[0]} winners, want exactly 1")
+    assert(
+      counts[1] == idemRacers - 1,
+      "round ${round}: ${counts[1]} in-progress, want ${idemRacers - 1}",
+    )
+    assert(counts[2] == 0, "round ${round}: nothing finished, but ${counts[2]} saw Done")
+    idemClear(c, "race", key)
+    round = round + 1
+  }
+  c.close()
+}
+
+test "live: racers arriving after finish() all see the stored response" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = idemStore(c, "racedone")
+  idemClear(c, "racedone", "k")
+  assert(isNone(idemBegin(s, "k", "fp-0", 60)), "the first begin wins")
+  s.finish("k", CachedResponse{ status = 201, body = "made", headers = []Header(0) }, 60) catch e {
+    panic("finish: ${e.message()}")
+  }
+  let counts = idemRace(u, "racedone", "k")
+  assert(
+    counts[2] == idemRacers,
+    "every racer sees Done, got ${counts[0]}/${counts[1]}/${counts[2]}/${counts[3]}",
+  )
+  idemClear(c, "racedone", "k")
+  c.close()
+}
+
+test "live: begin() reports the first caller's fingerprint to later callers" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = idemStore(c, "fp")
+  idemClear(c, "fp", "k")
+  assert(isNone(idemBegin(s, "k", "aaa", 60)), "first begin creates the reservation")
+  let again = idemBegin(s, "k", "bbb", 60)
+  assert(isSome(again), "a second begin sees the reservation")
+  let e = unwrap(again)
+  assert(e.state == IdempotencyState.InFlight, "still InFlight")
+  assert(
+    e.fingerprint == "aaa",
+    "the stored fingerprint is the first caller's, got '${e.fingerprint}'",
+  )
+  idemClear(c, "fp", "k")
+  c.close()
+}
+
+test "live: finish() stores the response and keeps the fingerprint, begin() replays it" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = idemStore(c, "fin")
+  idemClear(c, "fin", "k")
+  assert(isNone(idemBegin(s, "k", "f:p", 60)), "reserve")
+  let resp = CachedResponse{
+    status = 201,
+    body = "{\"id\":7}\n",
+    headers = [
+      Header{ name = "Content-Type", value = "application/json" },
+      Header{ name = "X-Run", value = "1" },
+    ],
+  }
+  s.finish("k", resp, 60) catch e {
+    panic("finish: ${e.message()}")
+  }
+  let got = idemBegin(s, "k", "someone-else", 60)
+  assert(isSome(got), "a finished key is claimed")
+  let e = unwrap(got)
+  assert(e.state == IdempotencyState.Done, "state is Done")
+  assert(e.fingerprint == "f:p", "finish kept the fingerprint, got '${e.fingerprint}'")
+  assert(
+    e.response.status == 201 && e.response.body == "{\"id\":7}\n",
+    "response = ${e.response.status} '${e.response.body}'",
+  )
+  assert(len(e.response.headers) == 2, "headers = ${len(e.response.headers)}")
+  assert(e.response.headers[0].name == "Content-Type", "header order kept")
+  assert(e.response.headers[1].value == "1", "second header value")
+  idemClear(c, "fin", "k")
+  c.close()
+}
+
+test "live: a body of every byte value and a megabyte of text round-trip exactly" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = idemStore(c, "bin")
+  idemClear(c, "bin", "k")
+  let body = idemNeverBytes() + "\r\n$-1\r\n" + idemNeverBytes()
+  let big = []byte(0)
+  let i = 0
+  while (i < 1048576) {
+    big = append(big, byte(97 + i % 26))
+    i = i + 1
+  }
+  assert(isNone(idemBegin(s, "k", "fp", 60)), "reserve")
+  s.finish(
+    "k",
+    CachedResponse{ status = 200, body = body + string(big), headers = []Header(0) },
+    60,
+  ) catch e {
+    panic("finish: ${e.message()}")
+  }
+  let e = unwrap(idemBegin(s, "k", "fp", 60))
+  assert(e.response.body == body + string(big), "body differs: ${len(e.response.body)} bytes back")
+  idemClear(c, "bin", "k")
+  c.close()
+}
+
+test "live: finish() without a reservation (expired mid-flight) still caches, with an empty fingerprint" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = idemStore(c, "late")
+  idemClear(c, "late", "k")
+  s.finish("k", CachedResponse{ status = 200, body = "late", headers = []Header(0) }, 60) catch e {
+    panic("finish: ${e.message()}")
+  }
+  let e = unwrap(idemBegin(s, "k", "fp", 60))
+  assert(e.state == IdempotencyState.Done && e.response.body == "late", "cached")
+  assert(e.fingerprint == "", "empty fingerprint, got '${e.fingerprint}'")
+  idemClear(c, "late", "k")
+  c.close()
+}
+
+test "live: abandon() frees the key at once, and abandoning a missing key is fine" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = idemStore(c, "ab")
+  idemClear(c, "ab", "k")
+  assert(isNone(idemBegin(s, "k", "fp", 60)), "reserve")
+  assert(isSome(idemBegin(s, "k", "fp", 60)), "reserved")
+  s.abandon("k") catch e {
+    panic("abandon: ${e.message()}")
+  }
+  assert(isNone(idemBegin(s, "k", "fp", 60)), "after abandon the next begin wins again")
+  s.abandon("k") catch e {
+    panic("abandon: ${e.message()}")
+  }
+  s.abandon("never-existed") catch e {
+    panic("abandon of a missing key: ${e.message()}")
+  }
+  idemClear(c, "ab", "k")
+  c.close()
+}
+
+test "live: begin() sets the ttl, finish() restarts it from its own call" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = idemStore(c, "ttl")
+  idemClear(c, "ttl", "k")
+  assert(isNone(idemBegin(s, "k", "fp", 10)), "reserve for 10s")
+  let p1 = idemPttl(c, "ttl", "k")
+  assert(p1 > 0 && p1 <= 10000, "PTTL after begin = ${p1}, want 1..10000")
+  s.finish("k", CachedResponse{ status = 200, body = "x", headers = []Header(0) }, 1000) catch e {
+    panic("finish: ${e.message()}")
+  }
+  let p2 = idemPttl(c, "ttl", "k")
+  assert(
+    p2 > 900000 && p2 <= 1000000,
+    "PTTL after finish = ${p2}, want ~1000000: finish does not inherit begin's ttl",
+  )
+  idemClear(c, "ttl", "k")
+  c.close()
+}
+
+test "live: a reservation expires after its ttl and the key can be claimed again" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = idemStore(c, "exp")
+  idemClear(c, "exp", "k")
+  assert(isNone(idemBegin(s, "k", "fp", 1)), "reserve for 1s")
+  assert(isSome(idemBegin(s, "k", "fp", 1)), "still reserved right away")
+  let polls = 0
+  let reclaimed = false
+  while (!reclaimed && polls < 100) {
+    polls = polls + 1
+    sleep(100 * Millisecond)
+    reclaimed = isNone(idemBegin(s, "k", "fp", 60))
+  }
+  assert(reclaimed, "the key was never released after its 1s ttl")
+  idemClear(c, "exp", "k")
+  c.close()
+}
+
+test "live: a finished response expires after its ttl too" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = idemStore(c, "expdone")
+  idemClear(c, "expdone", "k")
+  assert(isNone(idemBegin(s, "k", "fp", 60)), "reserve")
+  s.finish("k", CachedResponse{ status = 200, body = "x", headers = []Header(0) }, 1) catch e {
+    panic("finish: ${e.message()}")
+  }
+  assert(isSome(idemBegin(s, "k", "fp", 60)), "the response is stored")
+  let polls = 0
+  let gone = false
+  while (!gone && polls < 100) {
+    polls = polls + 1
+    sleep(100 * Millisecond)
+    gone = isNone(idemBegin(s, "k", "fp", 60))
+  }
+  assert(gone, "the stored response outlived its 1s ttl")
+  idemClear(c, "expdone", "k")
+  c.close()
+}
+
+test "live: a client-supplied key cannot reach outside the prefix" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = idemStore(c, "esc")
+  let key = "a\r\nb *3 \"quoted\" {tag} \x00 end"
+  idemClear(c, "esc", key)
+  assert(isNone(idemBegin(s, key, "fp", 60)), "a key with wire metacharacters is just a key")
+  let n = c.exists([idemKey("esc") + key]) catch e {
+    panic("exists: ${e.message()}")
+  }
+  assert(n == 1, "stored under the prefix")
+  idemClear(c, "esc", key)
+  c.close()
+}
+
+class IdemCalls {
+  n: int,
+}
+
+fn idemChargeApp(store: RedisIdempotencyStore, calls: IdemCalls): App {
+  let app = App(Config{ secret = "test-secret" })
+  app.use(idempotency(IdempotencyPolicy{ store = store, ttl = 60 }))
+  app.post("/charge", (c) => {
+    calls.n = calls.n + 1
+    return c.text("charged").status(201)
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+test "live: two app instances sharing Redis run a retried request once" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c1 = liveClient(u)
+  let c2 = liveClient(u)
+  idemClear(c1, "app", "pay-1")
+  let calls = IdemCalls{ n = 0 }
+  let a = idemChargeApp(idemStore(c1, "app"), calls)
+  let b = idemChargeApp(idemStore(c2, "app"), calls)
+  let req = Request{
+    method = "POST",
+    path = "/charge",
+    headers = "Idempotency-Key: pay-1",
+    body = "{\"amount\":10}",
+  }
+  let r1 = a.handle(req)
+  let r2 = b.handle(req)
+  let other = b.handle(
+    Request{
+      method = "POST",
+      path = "/charge",
+      headers = "Idempotency-Key: pay-1",
+      body = "{\"amount\":99}",
+    },
+  )
+  assert(r1.status == 201 && r1.body == "charged", "first: ${r1.status} '${r1.body}'")
+  assert(
+    r2.status == 201 && r2.body == "charged",
+    "the retry on the other instance replays: ${r2.status} '${r2.body}'",
+  )
+  assert(other.status == 422, "the same key with another body is 422, got ${other.status}")
+  assert(calls.n == 1, "the handler ran ${calls.n} times, want 1")
+  idemClear(c1, "app", "pay-1")
+  c1.close()
+  c2.close()
+}

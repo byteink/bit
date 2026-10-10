@@ -24,7 +24,7 @@ to a whole millisecond on the way out.
 `create` makes the series. Its options say how long to keep samples
 (`retention`), what a label is, and what to do when two samples share a
 timestamp. Every field of `SeriesOptions` is left to the server's default until
-you set it:
+you set it, and `labels` is a plain map literal:
 
 ```bit
 import { open, SeriesOptions, DuplicatePolicy, Encoding, Ignore, Stamp } from "redis"
@@ -41,7 +41,7 @@ fn main(): ()! {
       encoding = Option.Some(Encoding.Compressed),
       chunkSize = Option.Some(4096),
       ignore = Option.Some(Ignore{ maxTimeDiff = 1000, maxValueDiff = 0.0 }),
-      labels = Option.Some(map<string, string>{ "region": "eu", "app": "inkwell" }),
+      labels = { "region": "eu", "app": "inkwell" },
     },
   )?
 
@@ -59,7 +59,8 @@ existing timestamp: `Block` refuses it (the default), `First` and `Last` keep
 one, `Min` and `Max` keep the smaller or larger, `Sum` adds them.
 `ignore` drops a sample that is within `maxTimeDiff` milliseconds and
 `maxValueDiff` of the last one, which keeps a flat reading from filling the
-series. `create` on a key that exists is the server's error.
+series. `labels` is the `name -> value` pairs the filters below select on; an
+empty map sets none. `create` on a key that exists is the server's error.
 
 `add(ts, value)` answers the timestamp it stored at. `Stamp.At(ms)` is an
 explicit one, `Stamp.Auto` the server's clock. A third argument,
@@ -178,6 +179,25 @@ fn main(): ()! {
     },
   )?
   println("${len(filled)} minutes")
+
+  // Average and busiest second in one query: `also` adds aggregators after
+  // `by`, and each sample answers `value` for `by`, then `also` in order.
+  let shape = eu.range(
+    Stamp.Oldest,
+    Stamp.Newest,
+    RangeOptions{
+      downsample = Option.Some(
+        Downsample{
+          by = Aggregation.Avg,
+          also = [Aggregation.Max, Aggregation.Min],
+          bucket = Minute,
+        },
+      ),
+    },
+  )?
+  for s of shape {
+    println("${s.ts}: avg ${s.value}, max ${s.also[0]}, min ${s.also[1]}")
+  }
   r.close()
   return
 }
@@ -190,6 +210,11 @@ fn main(): ()! {
 `CountAll` (every sample, NaN or not). A bucket with no sample is left out
 unless `empty = true`; then `Sum`, `Count` and `CountAll` answer 0, `Last` repeats
 the previous value, `Twa` interpolates, and the rest answer NaN.
+`also` takes any of them, up to the server's own limit, and a single query then
+sends `AGGREGATION avg,max,min`: one pass over the samples instead of three.
+`also` works on `range`, `revrange`, `mrange` and `mrevrange`; it is the server
+that refuses it together with `groupBy`, and a compaction rule takes exactly one
+aggregator.
 `bucketTs` says which timestamp a bucket carries: `Start` (the default),
 `End` (where the next bucket starts) or `Mid`. Buckets begin at `align` (a
 timestamp, default 0) plus whole buckets, which is how a day starts at local
@@ -320,13 +345,16 @@ stops the feed and the destination keeps what it has.
 `lastTimestamp`, `retention`, `chunkCount`, `chunkSize`, `encoding`,
 `duplicatePolicy` (`None` if the series has none), `labels`, `sourceKey` (set on
 a rule's destination), `rules`, and the `ignoreMaxTimeDiff` and
-`ignoreMaxValDiff` thresholds.
+`ignoreMaxValDiff` thresholds. `info(true)` is `TS.INFO .. DEBUG`: the same
+`SeriesInfo` with `chunks` filled, a `ChunkInfo` per chunk (`startTimestamp`,
+`endTimestamp`, `samples`, `size` in bytes and `bytesPerSample`), which is how
+you see what the chunk size and encoding cost; without it `chunks` is empty.
 
 `alter(AlterOptions{...})` changes a series in place. It takes `SeriesOptions`
 without `encoding`, which is fixed when the series is created (the server
 silently ignores it on `TS.ALTER`, so the type does not offer it). A field you
-leave `None` stays as it is; `labels = Option.Some(m)` replaces every label,
-and an empty `m` removes them all.
+leave `None` stays as it is. A non-empty `labels` replaces every label,
+`clearLabels = true` removes them all, and an empty `labels` leaves them be.
 
 ```bit
 import { open, AlterOptions, DuplicatePolicy } from "redis"
@@ -340,7 +368,7 @@ fn main(): ()! {
     AlterOptions{
       retention = Option.Some(48 * Hour),
       duplicatePolicy = Option.Some(DuplicatePolicy.Max),
-      labels = Option.Some(map<string, string>{ "region": "eu", "app": "inkwell", "tier": "web" }),
+      labels = { "region": "eu", "app": "inkwell", "tier": "web" },
     },
   )?
 
@@ -356,10 +384,12 @@ fn main(): ()! {
 `p.timeseries(key)` and `tx.timeseries(key)` return a `TimeSeriesBatch`, the
 same commands as `TimeSeries` (`create`, `alter`, `add`, `incrBy`, `decrBy`,
 `del`, `get`, `range`, `revrange`, `info`, `createRule`, `deleteRule`), each
-answering a `Future`. The multi-series commands are not queued.
+answering a `Future`. `p.timeseriesMulti()` and `tx.timeseriesMulti()` return a
+`TimeSeriesMultiBatch`, the same as `TimeSeriesMulti` (`madd`, `mget`, `mrange`,
+`mrevrange`, `queryIndex`).
 
 ```bit
-import { open, Stamp } from "redis"
+import { open, label, KeyedSample, LabelsOut, Stamp } from "redis"
 
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
@@ -367,16 +397,68 @@ fn main(): ()! {
   let eu = p.timeseries("inkwell:requests:eu")
   let a = eu.incrBy(1.0)
   let n = eu.get()
+
+  let all = p.timeseriesMulti()
+  let stored = all.madd(
+    [KeyedSample{ key = "inkwell:requests:us", ts = Stamp.Auto, value = 3.0 }],
+  )
+  let newest = all.mget([label("app").eq("inkwell")], false, LabelsOut.All)
   p.exec()?
+
   println("stored at ${a.get()?}")
   match (n.get()?) {
     Some(s) => println("newest ${s.value}")
     None => println("empty")
   }
+  println("${len(stored.get()?)} points, ${len(newest.get()?)} series")
   r.close()
   return
 }
 ```
+
+## Reading inside a transaction
+
+Inkwell caps a region at 1,000 requests: a request is counted only while the
+newest total is under the cap, and the decision must be made on the series as
+it is when the transaction commits. `tx.read.timeseries(key)` is the same
+`TimeSeries` as `r.timeseries(key)`, bound to the transaction's own connection,
+so its reads (`get`, `range`, `revrange`) run now and see the keys the
+transaction `WATCH`es. `tx.read.timeseriesMulti()` does the same for `mget`,
+`mrange`, `mrevrange` and `queryIndex`. The write goes through
+`tx.timeseries(key)`, queued for `EXEC`. If another client changes the series
+first, the transaction retries and the body runs again with fresh reads.
+
+```bit
+import { open, Future, Stamp } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let key = "inkwell:requests:eu"
+  let counted = r.transaction<Future<i64>>([key], (tx) => {
+    let used = 0.0
+    match (tx.read.timeseries(key).get()?) {
+      Some(s) => used = s.value
+      None => {}
+    }
+    let delta = 1.0
+    if (used >= 1000.0) {
+      delta = 0.0
+    }
+    return tx.timeseries(key).incrBy(delta, Stamp.Auto)
+  })?
+  println("stored at ${counted.get()?}")
+  r.close()
+  return
+}
+```
+
+`tx.read` is for reads only: `tx.read.timeseries(key).add(...)` or
+`tx.read.timeseriesMulti().madd(...)` would run immediately, outside the
+transaction's `MULTI`/`EXEC`, so they fail with `RedisError.Invalid`. So does
+`tx.read.timeseries(key).info()`, for another reason: the server counts a
+`TS.INFO` as touching the key, which would make the transaction's own `EXEC`
+conflict on every attempt. Queue it with `tx.timeseries(key).info()` and read it
+after the transaction.
 
 ## Sharp edges
 

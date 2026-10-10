@@ -93,6 +93,21 @@ fn timeoutMs(): int {
   return s * 1000
 }
 
+// How long one remote child may run before `runchild.ps1` kills it (#7824). Under
+// the harness's own `ms` (two thirds of it at most), so a hung fixture is reported
+// by the box as a timeout failure and killed there, instead of the local script
+// giving up on an ssh whose child keeps running. BIT_SMOKE_CHILD_TIMEOUT_S lowers it.
+fn childTimeoutSec(ms: int): int {
+  let limit = ms / 1000 * 2 / 3
+  let s = parseInt(envOr("BIT_SMOKE_CHILD_TIMEOUT_S", "120")) catch _ {
+    120
+  }
+  if (s <= 0 || s > limit) {
+    return limit
+  }
+  return s
+}
+
 // BIT_REPO IS REQUIRED, same reason as every other shell-out gate in this
 // repo (_tests_/bit/coldboot.bit's header): a silent "." default would build
 // and ship whatever directory `bit` happened to be invoked from.
@@ -227,6 +242,7 @@ class Session {
   bitBin: string,
   runId: string,
   ms: int,
+  childSec: int,
 }
 
 // Phase 0: is the box even reachable? Fail here with a diagnostic that names
@@ -395,11 +411,7 @@ fn shipAndRun(s: Session, exePath: string) {
   // remote PowerShell session, so the child process inherits it (#3614) —
   // this is what forces a collection at every back-edge poll, the shape
   // that exposed #3592 and #3554.
-  let (rc4, out4) = remote(
-    s,
-    "run",
-    "\"\\$env:BIT_GC='stress'; & (Join-Path \\$PWD.Path '${remoteName}')\"",
-  )
+  let (rc4, out4) = runChild(s, "run", "\\$env:BIT_GC='stress'; ", remoteName, "")
   // Best-effort cleanup regardless of the run's own result; teardown() also
   // retries this, so a failure here is not itself fatal.
   let _ = remote(s, "cleanup", "'Remove-Item -Force ${remoteName}'")
@@ -490,6 +502,53 @@ fn remote(s: Session, tag: string, cmd: string): (int, string) {
   )
 }
 
+// Runs the shipped `exe` (RELATIVE to the SSH home) on `s.host` through
+// `runchild.ps1`, which kills it and everything it started after `s.childSec`
+// seconds and when the session ends, and exits 124 on a timeout (#7824). `prelude`
+// is the PowerShell that sets the child's environment, `redirect` a file name the
+// child's stdout goes to through `cmd /c` (or ""). Returns (exit code, output).
+fn runChild(
+  s: Session,
+  tag: string,
+  prelude: string,
+  exe: string,
+  redirect: string,
+): (int, string) {
+  let script = "powershell -NoProfile -ExecutionPolicy Bypass -File ${s.runId}-runchild.ps1"
+  return remote(
+    s,
+    tag,
+    "\"${prelude}${script} ${exe} ${s.childSec} ${redirect}; exit \\$LASTEXITCODE\"",
+  )
+}
+
+// Ships `runchild.ps1` under this run's name; teardown removes it.
+fn shipRunner(s: Session) {
+  shipFile(
+    s,
+    "${s.root}/_tests_/bit/windowssmoke/runchild.ps1",
+    "${s.runId}-runchild.ps1",
+    "runchild",
+  )
+}
+
+// Kills every wsmoke-* process on `s.host` older than a child may live (`runchild.ps1`
+// kills its own at `s.childSec`), which only a run that died without its teardown
+// leaves, and says how many (#7824). A younger one may be a concurrent run's.
+fn sweepLeftovers(s: Session) {
+  let stale = s.childSec + 30
+  let find = "Get-Process -Name 'wsmoke-*' -ErrorAction SilentlyContinue | Where-Object { \\$_.StartTime -lt (Get-Date).AddSeconds(-${stale}) }"
+  let (rc, out) = remote(
+    s,
+    "sweep",
+    "\"\\$old = @(${find}); \\$old | ForEach-Object { \\$_.Kill() }; \\$old.Count\"",
+  )
+  if (rc != 0) {
+    failStage(s, "sweep leftover wsmoke-* processes on ${s.host}", rc, out)
+  }
+  println("windowssmoke: swept ${trimSpace(out)} leftover wsmoke-* process(es) on ${s.host}")
+}
+
 // scp `exePath` to `remotePath` (RELATIVE to the SSH home, see shipAndRun) on
 // `s.host`; `tag` names the scratch files and the failure.
 fn shipFile(s: Session, exePath: string, remotePath: string, tag: string) {
@@ -514,11 +573,7 @@ fn shipFile(s: Session, exePath: string, remotePath: string, tag: string) {
 fn shipAndRunThreadReg(s: Session, exePath: string, remoteTag: string, envPrelude: string): string {
   let remoteName = "${s.runId}-${remoteTag}.exe"
   shipFile(s, exePath, remoteName, remoteTag)
-  let (rcRun, outRun) = remote(
-    s,
-    "${remoteTag}-run",
-    "\"${envPrelude}& (Join-Path \\$PWD.Path '${remoteName}')\"",
-  )
+  let (rcRun, outRun) = runChild(s, "${remoteTag}-run", envPrelude, remoteName, "")
   // Best-effort cleanup regardless of the run's own result, same shape as
   // shipAndRun's own cleanup step above.
   let _ = remote(s, "${remoteTag}-cleanup", "'Remove-Item -Force ${remoteName}'")
@@ -581,6 +636,7 @@ fn main() {
     bitBin = "${root}/bit-out/bin/bit",
     runId = "wsmoke-" + uuidFormat(uuidV4()),
     ms = ms,
+    childSec = childTimeoutSec(ms),
   }
   // `exit()` does not run pending defers (#3694) — every exit/fail path
   // below (checkReachable, buildArchive/buildProgram via failStage,
@@ -589,6 +645,8 @@ fn main() {
   // runThreadRegPhase tears down on ITS OWN success (#4252) — this function
   // is the only place that does, once, after every phase has passed.
   checkReachable(s)
+  sweepLeftovers(s)
+  shipRunner(s)
   let archivePath = buildArchive(s)
   let exePath = buildProgram(s, archivePath)
   shipAndRun(s, exePath)
@@ -644,7 +702,7 @@ fn splitLines(s: string): []string {
 fn teardown(scratch: string, host: string, runId: string, ms: int) {
   shell(
     "${scratch}/cleanup-remote.sh",
-    "#!/bin/sh\nssh -o BatchMode=yes -o ConnectTimeout=5 '${host}' 'Remove-Item -Force ${runId}.exe' > /dev/null 2>&1\nexit 0\n",
+    "#!/bin/sh\nssh -o BatchMode=yes -o ConnectTimeout=5 '${host}' 'Get-Process -Name \"${runId}*\" -ErrorAction SilentlyContinue | Stop-Process -Force; Remove-Item -Force ${runId}.exe,${runId}-runchild.ps1' > /dev/null 2>&1\nexit 0\n",
     ms,
   ) catch _ {
     0

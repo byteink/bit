@@ -411,6 +411,33 @@ distinguishable from every failure.
 overflow and underflow are correctly-rounded conversion results, not parse
 failures.
 
+The special values are accepted as IEEE 754 values, spelled as Go's
+`strconv.ParseFloat` spells them and in any ASCII case: `inf`, `+inf`, `-inf`,
+`infinity`, `+infinity`, `-infinity` and `nan`. `nan` takes no sign, and
+nothing near these words parses: `infx`, `na`, `in` and `+nan` fail like any
+other bad text. Ordinary numbers are decided before these words are looked at,
+so they cost nothing extra.
+
+The predeclared `parseFloat` builtin reads the same infinity spellings, so
+`parseFloat("-inf")` is `-Inf` with or without this import. It has no error to
+fail with: a failed parse and `nan` are both NaN there, which is why
+`strings.parseFloat` is the one to use when `nan` must be told apart from
+garbage.
+
+```bit
+import * as strings from "std/strings"
+
+fn main() {
+  let hi = strings.parseFloat("-Infinity") catch _ {
+    return
+  }
+  let none = strings.parseFloat("NaN") catch _ {
+    return
+  }
+  println("${hi < 0.0} ${none != none}") // true true
+}
+```
+
 A named `import { parseFloat }` warns with `E0048`, since `parseFloat` is also
 a predeclared identifier; use the namespace form to avoid it.
 

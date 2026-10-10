@@ -227,8 +227,14 @@ distinguishable from every successful one - `parseFloat("nonsense")` is not
 `parseFloat("0")`. Callers test the result with `v != v`, which is true only for
 NaN. `parseFloat` does not panic and is not fallible: the value *is* the report.
 Only the failure is specified, not a particular NaN payload or sign, and a NaN is
-therefore not a legal successful result - the text `"nan"` is not a `FLOAT_LIT`
-and does not parse.
+therefore not a legal successful result.
+
+The infinities have spellings of their own, tried only when the text is not
+a number: `inf`, `+inf`, `-inf`, `infinity`, `+infinity` and `-infinity`, in
+any ASCII case, yield `+Inf` or `-Inf`. `nan` in any case yields the NaN a
+failed parse yields, so the builtin cannot tell it from a failure; the
+fallible `std/strings.parseFloat` can, and accepts exactly these seven
+spellings. Nothing near them parses: `infx`, `na` and `+nan` are failed parses.
 
 Rationale for the NaN rather than a `f64!` or a `(f64, bool)`: `parseFloat` is
 predeclared, so its signature is part of every program's scope and cannot change

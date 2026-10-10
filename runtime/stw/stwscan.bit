@@ -15,18 +15,29 @@
 // Root enumeration
 // ---------------------------------------------------------------------------
 
-// #4255: a test-only escape hatch. For the RUNNING task, this range is scanned
-// TWICE — once precisely, by `gcScanSnapshot` (`../gc/stackmap.bit`) walking
-// the emitted StackMapEntry table, and once here, conservatively, as class 8's
-// catch-all for a GC reference an ABI boundary forced into a bare `int` (stw.bit's
-// ROOT SET header, class 8). The two are redundant by design for that case, and
-// the redundancy has a cost no test could previously see: a regression that
-// drops one StackMapEntry is invisible, because the raw pointer is still
-// sitting in memory and this conservative walk finds it regardless of whether
-// the stack map named it. This flag removes the conservative half so a fixture
-// can prove a precise root is the ONLY thing keeping a value alive — see
-// `_tests_/stress/precisemask/precisemask.bit`'s header for the mutation-tested
-// proof and how to reproduce it by hand.
+// #4255: a test-only escape hatch. For a stack a precise walk covers, the range
+// is scanned TWICE — once precisely, by `gcScanSnapshot` (`../gc/stackmap.bit`)
+// walking the emitted StackMapEntry table, and once here, conservatively, as
+// class 8's catch-all for a GC reference an ABI boundary forced into a bare
+// `int` (stw.bit's ROOT SET header, class 8). The two are redundant by design
+// for that case, and the redundancy has a cost no test could previously see: a
+// regression that drops one StackMapEntry is invisible, because the raw pointer
+// is still sitting in memory and this conservative walk finds it regardless of
+// whether the stack map named it. This flag removes the conservative half so a
+// fixture can prove a precise root is the ONLY thing keeping a value alive —
+// see `_tests_/stress/precisemask/precisemask.bit`'s header for the
+// mutation-tested proof and how to reproduce it by hand.
+//
+// IT REMOVES THE HALF ONLY WHERE THERE IS A PRECISE HALF (#7821). A stack is
+// walked precisely only while an OS thread is on it: the collector's own (class
+// 2, 8b), or a mutator stopped at a safepoint with a published snapshot (class
+// 3, `stwPreciseCovers`). A task SWITCHED OUT — parked on a channel, or
+// preempted by sysmon — has no snapshot and no stack-map walk; class 4's
+// conservative scan of `[ctxSp, stackTop)` is the ONLY thing that roots its
+// spilled slots and the callee-saved values its park path pushed (ABI.md §5).
+// The flag used to drop that scan too, which lost a preempted task's canaries
+// in 3 of 6 BIT_WORKERS=8 runs of `_tests_/bit/gcretention/parkroots` and
+// proved nothing about the precise path: nothing was ever going to root them.
 //
 // Never read anywhere but here and its own setter below, so it carries no ABI
 // meaning and needs no `@symbol` pin of its own — a test harness reaches the
@@ -34,9 +45,9 @@
 // `stwPollOn`'s "private bindings" already serves.
 let stwNoConservativeScan = false
 
-// Test-only: forces every future `stwScanStackRange` call to return
-// immediately (`true`) or restores its normal behaviour (`false`). See the
-// flag's own comment above.
+// Test-only: removes the conservative stack scan of every stack a precise walk
+// covers (`true`) or restores its normal behaviour (`false`). See the flag's
+// own comment above.
 export @nosplit @symbol("bit_rt_port_stw_set_no_conservative_scan") fn stwSetNoConservativeScan(v: bool) {
   stwNoConservativeScan = v
 }
@@ -50,8 +61,11 @@ export @nosplit @symbol("bit_rt_port_stw_set_no_conservative_scan") fn stwSetNoC
 // ends (a stopped task's stack) may be handed to the gang as a root job
 // (`gcRootRange`); the collector's own stack is still being written, so it is
 // always scanned here and now.
-@nosplit fn stwScanStackRange(g: *i64, sp: int, top: int, later: bool) {
-  if (stwNoConservativeScan) {
+//
+// `precise` (#7821): a precise walk covers this stack, so the test-only flag
+// above may drop it.
+@nosplit fn stwScanStackRange(g: *i64, sp: int, top: int, later: bool, precise: bool) {
+  if (precise && stwNoConservativeScan) {
     return
   }
   if (sp <= 0) {
@@ -305,19 +319,40 @@ export @nosplit @symbol("bit_rt_port_stw_set_no_conservative_scan") fn stwSetNoC
 // Only ever LOWERS the bound, and bounded by the high-water mark, for the two
 // reasons `stwSyscallLo` above states.
 @nosplit fn stwParkedLo(world: *i64, t: *i64, lo: int): int {
+  let f = stwParkedFrame(world, t)
+  if (f > 0 && (f < lo || lo <= 0)) {
+    return f
+  }
+  return lo
+}
+
+// The lowest `SafepointFrame` any mutator has published as parked inside task
+// `t`, or 0 when none has.
+@nosplit fn stwParkedFrame(world: *i64, t: *i64): int {
   let n = worldHighWaterMark(world)
   let i = 0
+  let lo = 0
   // Bounded by the high-water mark, itself capped at `maxMutators`.
   while (i < n) {
     let f = worldParkedFrame(world, i)
-    if (f > 0 && stwTaskHoldsSp(t, f)) {
-      if (f < lo || lo <= 0) {
-        lo = f
-      }
+    if (f > 0 && stwTaskHoldsSp(t, f) && (f < lo || lo <= 0)) {
+      lo = f
     }
     i = i + 1
   }
   return lo
+}
+
+// Does a precise stack-map walk cover task `t`'s stack this collection (#7821)?
+// The task `running` on the collector's own thread is walked from its snapshot
+// (class 2), a task a mutator is stopped in from that mutator's (class 3). A
+// switched-out task is walked by nobody. Only asked while the test-only
+// `stwNoConservativeScan` flag is set, so the production path pays one load.
+@nosplit fn stwPreciseCovers(world: *i64, t: *i64, running: bool): bool {
+  if (!stwNoConservativeScan) {
+    return false
+  }
+  return running || stwParkedFrame(world, t) > 0
 }
 
 // Class 8b (#2650): the collecting thread's OWN OS-thread stack, when the walk
@@ -346,7 +381,7 @@ export @nosplit @symbol("bit_rt_port_stw_set_no_conservative_scan") fn stwSetNoC
   // past the guard, so it only counts an attempt that actually scanned a
   // range — every early `return` above is a refusal, not a scan.
   let _ = atomicAdd(ptrOf(stwOwnScans), 1)
-  stwScanStackRange(g, sp, top, false)
+  stwScanStackRange(g, sp, top, false, true)
 }
 
 //
@@ -394,7 +429,10 @@ export @nosplit @symbol("bit_rt_port_stw_set_no_conservative_scan") fn stwSetNoC
       // not where the thread is now. It published where it is, as the address
       // of the frame it parked with.
       lo = stwParkedLo(world, t, lo)
-      stwScanStackRange(g, lo, *(t + taskStackBase) + *(t + taskStackBytes), !running)
+      stwScanStackRange(
+        g, lo, *(t + taskStackBase) + *(t + taskStackBytes), !running,
+        stwPreciseCovers(world, t, running),
+      )
       // The running task's own registers are live CPU state, not a saved
       // block — scanning `t[0..ctxWords)` for it would read whatever this
       // task's context slots last held (stale, from its previous park) and
