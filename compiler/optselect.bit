@@ -33,6 +33,20 @@
 //
 // Only forward edges are touched (A before R before J in the block schedule),
 // so no loop header, back edge or back-edge safepoint moves.
+//
+// ## The branch-chain range test (#7761)
+//
+// `lowerCondBr` (lowercondchain.bit) lowers an `if`'s `x >= lo && x <= hi` to
+// one `br` per operand, so there is no `band` for rangeTest to meet:
+//
+//   A: ...; br (icmp_uge x, lo), R(), F(args)
+//   R:      br (icmp_ule x, hi), T(targs), F(args)
+//
+// A then ends `br (x - lo) <=u (hi - lo), T(targs), F(args)` in place of both,
+// with R's body run in A first, and R is gone. `x < lo || x > hi` is the same
+// pair with `icmp_ult`/`icmp_ugt` and each `br`'s edges swapped. Sound for the
+// reasons above: R's body is constants and its own compare, F takes the same
+// arguments from both edges, and R, T and F all follow A in the schedule.
 
 // R's non-constant instructions above which it stays a branch: they run on
 // the path where `%a` already decided. 4 admits a two-sided range test
@@ -58,13 +72,15 @@ fn speculatable(op: Op): bool {
 }
 
 // One round's decisions, indexed by the block they are made at. `r[a]` is the
-// R block A absorbs (-1 none), `j[a]` its join, `isOr[a]` the operator.
+// R block A absorbs (-1 none), `j[a]` its join, `isOr[a]` the operator, and
+// `isRange[a]` marks an R that is a range test's high bound (no join).
 // `next[c]` is the block appended after block `c`'s body (-1 none), and
 // `absorbed` marks every block emitted inside another.
 class SelectPlan {
   r: []int,
   j: []int,
   isOr: []bool,
+  isRange: []bool,
   next: []int,
   absorbed: []bool,
   count: int,
@@ -184,8 +200,8 @@ fn selectAt(f: IrFunc, sf: SelectFacts, a: int): (int, bool) {
 
 fn newSelectPlan(n: int): SelectPlan {
   let p = SelectPlan{
-    r = []int(n), j = []int(n), isOr = []bool(n), next = []int(n),
-    absorbed = []bool(n), count = 0,
+    r = []int(n), j = []int(n), isOr = []bool(n), isRange = []bool(n),
+    next = []int(n), absorbed = []bool(n), count = 0,
   }
   let i = 0
   while (i < n) {
@@ -218,12 +234,16 @@ fn chainNext(f: IrFunc, sf: SelectFacts, p: SelectPlan, c: int, chained: bool): 
   return y
 }
 
-// Plans the chain that starts at block `bi`.
-fn planChain(f: IrFunc, sf: SelectFacts, p: SelectPlan, bi: int) {
+// Plans the chain that starts at block `bi`. A range test ends it: R
+// branches, so nothing follows it into A.
+fn planChain(ctx: TypeContext, f: IrFunc, sf: SelectFacts, p: SelectPlan, bi: int) {
   let c = bi
   let chained = false
   let steps = 0
   while (steps < len(f.blocks)) {
+    if (planRange(ctx, f, sf, p, c)) {
+      return
+    }
     let (r, isOr) = selectAt(f, sf, c)
     if (r >= 0) {
       p.r[c] = r
@@ -244,13 +264,13 @@ fn planChain(f: IrFunc, sf: SelectFacts, p: SelectPlan, bi: int) {
   }
 }
 
-fn selectPlanOf(f: IrFunc, sf: SelectFacts): SelectPlan {
+fn selectPlanOf(ctx: TypeContext, f: IrFunc, sf: SelectFacts): SelectPlan {
   let p = newSelectPlan(len(f.blocks))
   let order = blockEmissionOrder(f)
   let k = 0
   while (k < len(order)) {
     if (!p.absorbed[order[k]]) {
-      planChain(f, sf, p, order[k])
+      planChain(ctx, f, sf, p, order[k])
     }
     k = k + 1
   }
@@ -321,46 +341,175 @@ fn emitJoinOp(sc: SelectCtx, op: Op, br: IrInstr, rv: int): int {
   return builderEmit(sc.b, n)
 }
 
-// The `const_int` value `v` holds in the new body, when it is one.
-fn newConst(sc: SelectCtx, v: int): (bool, int) {
-  let ins = sc.b.instrs[v]
-  return (ins.op == Op.ConstInt, ins.ival)
-}
-
 // `x >=u lo && x <=u hi` as `(x - lo) <=u (hi - lo)` (#7243, the rule
 // `emitRunTest` applies to a switch run, lowerswitchrange.bit): one compare in
-// place of two and a `band`. Unsigned only, so `x - lo` wraps below `lo` to a
-// value above `hi - lo`; `lo <= hi`, or the range is empty and stays as is.
-// The two compares it replaces are left for DCE. -1 when `ge`/`le` are not
-// that shape.
+// place of two and a `band`. The two compares it replaces are left for DCE.
+// -1 when `ge`/`le` are not that shape (rangeShape).
 fn rangeTest(sc: SelectCtx, br: IrInstr, ge: int, le: int): int {
   let g = sc.b.instrs[ge]
   let l = sc.b.instrs[le]
-  if (g.op != Op.ICmpUge || l.op != Op.ICmpUle || g.lhs != l.lhs) {
+  if (g.op != Op.ICmpUge || l.op != Op.ICmpUle) {
     return -1
   }
-  let xty = sc.b.instrs[g.lhs].ty
-  let p = primOfType(sc.ctx, xty)
-  let (gk, lo) = newConst(sc, g.rhs)
-  let (lk, hi) = newConst(sc, l.rhs)
-  if (!gk || !lk || !isIntPrim(p) || isSignedPrim(p)) {
+  if (!rangeShape(sc.ctx, sc.b.instrs, ge, le)) {
     return -1
+  }
+  return emitRangeCmp(sc, br.span, ge, le)
+}
+
+// Whether compares `ge` (`x` against `lo`) and `le` (`x` against `hi`) in
+// `ins` bound a non-empty unsigned range: the same `x`, an unsigned integer,
+// both bounds `const_int`, `lo <= hi`. Unsigned only, so `x - lo` wraps below
+// `lo` to a value above `hi - lo`; an empty range stays as is.
+fn rangeShape(ctx: TypeContext, ins: []IrInstr, ge: int, le: int): bool {
+  let g = ins[ge]
+  let l = ins[le]
+  if (g.lhs != l.lhs || ins[g.rhs].op != Op.ConstInt || ins[l.rhs].op != Op.ConstInt) {
+    return false
+  }
+  let p = primOfType(ctx, ins[g.lhs].ty)
+  if (!isIntPrim(p) || isSignedPrim(p)) {
+    return false
   }
   let bits = primBits(p)
-  if (u64(maskTo(lo, bits)) > u64(maskTo(hi, bits))) {
-    return -1
-  }
+  return u64(maskTo(ins[g.rhs].ival, bits)) <= u64(maskTo(ins[l.rhs].ival, bits))
+}
+
+// `(x - lo) <=u (hi - lo)` for new-body compares `ge`/`le` that pass
+// rangeShape; returns the compare.
+fn emitRangeCmp(sc: SelectCtx, span: Span, ge: int, le: int): int {
+  let g = sc.b.instrs[ge]
+  let l = sc.b.instrs[le]
+  let xty = sc.b.instrs[g.lhs].ty
+  let bits = primBits(primOfType(sc.ctx, xty))
   let off = mkInstr(Op.Sub, xty)
   off.lhs = g.lhs
   off.rhs = g.rhs
-  off.span = br.span
+  off.span = span
   let w = mkInstr(Op.ConstInt, xty)
-  w.ival = maskTo(hi - lo, bits)
+  w.ival = maskTo(sc.b.instrs[l.rhs].ival - sc.b.instrs[g.rhs].ival, bits)
   let t = mkInstr(Op.ICmpUle, l.ty)
   t.lhs = builderEmit(sc.b, off)
   t.rhs = builderEmit(sc.b, w)
-  t.span = br.span
+  t.span = span
   return builderEmit(sc.b, t)
+}
+
+// One bound's `br` of a chained range test, its edges sorted by the side of
+// the bound `x` is on: `in*` the edge taken inside the range, `out*` the
+// other. `cond` is the compare, -1 when block `bi` does not end in a `br` on
+// `inOp` (THEN edge inside) or `outOp`, its negation (ELSE edge inside).
+class RangeEdge {
+  cond: int,
+  inBlk: int,
+  inArgs: []int,
+  outBlk: int,
+  outArgs: []int,
+}
+
+fn rangeEdgeOf(f: IrFunc, bi: int, inOp: Op, outOp: Op): RangeEdge {
+  let t = termIdx(f, bi)
+  if (t < 0 || f.instrs[t].op != Op.Br) {
+    return noRangeEdge()
+  }
+  let br = f.instrs[t]
+  let op = f.instrs[br.lhs].op
+  if (op == inOp) {
+    return RangeEdge{
+      cond = br.lhs, inBlk = br.ival, inArgs = br.thenArgs, outBlk = br.ival2, outArgs = br.elseArgs,
+    }
+  }
+  if (op == outOp) {
+    return RangeEdge{
+      cond = br.lhs, inBlk = br.ival2, inArgs = br.elseArgs, outBlk = br.ival, outArgs = br.thenArgs,
+    }
+  }
+  return noRangeEdge()
+}
+
+fn noRangeEdge(): RangeEdge {
+  return RangeEdge{ cond = -1, inBlk = -1, inArgs = []int(0), outBlk = -1, outArgs = []int(0) }
+}
+
+// The R block `a` absorbs as a chained range test's high bound, or -1.
+fn rangeAt(ctx: TypeContext, f: IrFunc, sf: SelectFacts, a: int): int {
+  let lo = rangeEdgeOf(f, a, Op.ICmpUge, Op.ICmpUlt)
+  if (lo.cond < 0 || !rangeArm(f, sf, a, lo.inBlk)) {
+    return -1
+  }
+  let r = lo.inBlk
+  let hi = rangeEdgeOf(f, r, Op.ICmpUle, Op.ICmpUgt)
+  if (hi.cond < 0 || !rangeExits(sf, r, lo, hi)) {
+    return -1
+  }
+  if (!rangeBody(f, r, hi.cond) || !rangeShape(ctx, f.instrs, lo.cond, hi.cond)) {
+    return -1
+  }
+  return r
+}
+
+// Whether `r` is entered from A's `br` alone, after it, with no params.
+fn rangeArm(f: IrFunc, sf: SelectFacts, a: int, r: int): bool {
+  if (r == a || sf.pos[a] >= sf.pos[r]) {
+    return false
+  }
+  return selectPreds(sf, r) == 1 && f.blocks[r].paramCount == 0
+}
+
+// Whether R leaves for A's out-edge target with A's arguments, and both its
+// edges run forward, so A's do too and no back edge or poll moves.
+fn rangeExits(sf: SelectFacts, r: int, lo: RangeEdge, hi: RangeEdge): bool {
+  if (hi.outBlk != lo.outBlk || !intListEq(hi.outArgs, lo.outArgs)) {
+    return false
+  }
+  return sf.pos[r] < sf.pos[hi.inBlk] && sf.pos[r] < sf.pos[hi.outBlk]
+}
+
+// Whether R's body is constants and the compare `cond`: all A runs of it on
+// the edge R was not taken.
+fn rangeBody(f: IrFunc, r: int, cond: int): bool {
+  let blk = f.blocks[r]
+  let i = blk.instsStart
+  while (i < blk.instsStart + blk.instsLen - 1) {
+    let op = f.instrs[i].op
+    if (i != cond && op != Op.ConstInt && op != Op.ConstBool) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Records the chained range test at block `c`, if there is one.
+fn planRange(ctx: TypeContext, f: IrFunc, sf: SelectFacts, p: SelectPlan, c: int): bool {
+  let r = rangeAt(ctx, f, sf, c)
+  if (r < 0 || p.absorbed[r]) {
+    return false
+  }
+  p.r[c] = r
+  p.isRange[c] = true
+  p.absorbed[r] = true
+  p.count = p.count + 1
+  return true
+}
+
+// R's body, then A's `br` on the one compare: T's edge as R had it, F's as A
+// had it. A's body is already emitted.
+fn emitRangeBr(sc: SelectCtx, a: int) {
+  let r = sc.p.r[a]
+  let blk = sc.f.blocks[r]
+  emitRange(sc, blk.instsStart, blk.instsStart + blk.instsLen - 1)
+  let lo = rangeEdgeOf(sc.f, a, Op.ICmpUge, Op.ICmpUlt)
+  let hi = rangeEdgeOf(sc.f, r, Op.ICmpUle, Op.ICmpUgt)
+  let at = sc.f.instrs[termIdx(sc.f, a)]
+  let br = mkInstr(Op.Br, at.ty)
+  br.lhs = emitRangeCmp(sc, at.span, sc.remap[lo.cond], sc.remap[hi.cond])
+  br.ival = sc.blockMap[hi.inBlk]
+  br.thenArgs = trList(sc.remap, hi.inArgs)
+  br.ival2 = sc.blockMap[lo.outBlk]
+  br.elseArgs = trList(sc.remap, lo.outArgs)
+  br.span = at.span
+  let _ = builderEmit(sc.b, br)
 }
 
 // The arguments block `c` passes on into its chain successor.
@@ -389,6 +538,10 @@ fn emitChain(sc: SelectCtx, bi: int) {
       break
     }
     emitRange(sc, cb.instsStart + cb.paramCount, cb.instsStart + cb.instsLen - 1)
+    if (sc.p.isRange[c]) {
+      emitRangeBr(sc, c)
+      break
+    }
     let args = chainArgs(sc, c)
     let y = sc.p.next[c]
     if (y < 0) {
@@ -447,7 +600,7 @@ fn selectShortCircuits(ctx: TypeContext, f: IrFunc): IrFunc {
   let g = f
   let round = 0
   while (round < len(f.blocks)) {
-    let p = selectPlanOf(g, selectFactsOf(g))
+    let p = selectPlanOf(ctx, g, selectFactsOf(g))
     if (p.count == 0) {
       return g
     }
