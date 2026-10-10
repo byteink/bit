@@ -1,0 +1,287 @@
+// pkg/redis/tsmulti.live.test.bit - the time series commands that
+// `timeseries.live.test.bit` (already at the file ceiling) does not carry:
+// several aggregators in one query, `TS.INFO .. DEBUG`, the transaction forms
+// (`tx.read.timeseries`, `tx.read.timeseriesMulti`, `Tx.timeseries`,
+// `Tx.timeseriesMulti`) and the queued multi-series view in a pipeline (#7823).
+// Its helpers (`tsClean`, `tsSeries`, `tsFill`, `tsSample`, `liveUrl`,
+// `liveClient`) are the sibling files', same module. Skipped, and says so,
+// when `REDIS_TEST_URL` is unset; `./make test-package-redis-live` supplies it.
+//
+// Timestamps are fixed small numbers, so every bucket is exact: with a bucket
+// of one second, 1000 and 1500 share a bucket and so do 2000 and 2500.
+
+fn msPoints(): []Sample {
+  return [tsSample(1000, 1.0), tsSample(1500, 5.0), tsSample(2000, 3.0), tsSample(2500, 9.0)]
+}
+
+fn msAvgMaxMin(): RangeOptions {
+  return RangeOptions{
+    downsample = Option.Some(
+      Downsample{
+        by = Aggregation.Avg,
+        also = [Aggregation.Max, Aggregation.Min],
+        bucket = Second,
+      },
+    ),
+  }
+}
+
+// One bucket of `avg,max,min`: the timestamp, then the three values.
+fn msBucket(what: string, s: Sample, ts: i64, avg: f64, max: f64, min: f64) {
+  assert(s.ts == ts && s.value == avg, "${what}: ${s.ts} avg ${s.value}, want ${ts} avg ${avg}")
+  assert(len(s.also) == 2, "${what}: two further aggregators, got ${len(s.also)}")
+  assert(s.also[0] == max && s.also[1] == min, "${what}: max ${s.also[0]} min ${s.also[1]}")
+}
+
+fn msInfoRefused(r: TimeSeries): bool {
+  let _ = r.info(true) catch _ {
+    return true
+  }
+  return false
+}
+
+test "live: range, revrange and mrange answer several aggregators per bucket" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:ts:agg:a"
+  tsClean(c, [k])
+  tsSeries(c, k, "agg", "eu", "a")
+  tsFill(c, k, msPoints())
+
+  let got = tsRange(c, k, msAvgMaxMin())
+  assert(len(got) == 2, "two buckets, got ${len(got)}")
+  msBucket("first bucket", got[0], 1000, 3.0, 5.0, 1.0)
+  msBucket("second bucket", got[1], 2000, 6.0, 9.0, 3.0)
+
+  let rev = c.timeseries(k).revrange(Stamp.Oldest, Stamp.Newest, msAvgMaxMin()) catch e {
+    panic("revrange: ${e.message()}")
+  }
+  msBucket("newest bucket first", rev[0], 2000, 6.0, 9.0, 3.0)
+
+  let single = tsRange(
+    c,
+    k,
+    RangeOptions{ downsample = Option.Some(Downsample{ by = Aggregation.Avg, bucket = Second }) },
+  )
+  assert(len(single[0].also) == 0, "one aggregator leaves also empty")
+
+  let multi = c.timeseriesMulti().mrange(
+    Stamp.Oldest,
+    Stamp.Newest,
+    [label("suite").eq("agg")],
+    MrangeOptions{ range = msAvgMaxMin(), labels = LabelsOut.All },
+  ) catch e {
+    panic("mrange: ${e.message()}")
+  }
+  assert(len(multi) == 1 && multi[0].key == k, "one series")
+  assert(multi[0].labels["region"] == "eu", "labels ride along")
+  assert(len(multi[0].sources) == 0, "the aggregators entry is not a group's sources")
+  msBucket("mrange first bucket", multi[0].samples[0], 1000, 3.0, 5.0, 1.0)
+
+  let refused = false
+  let _ = c.timeseriesMulti().mrange(
+    Stamp.Oldest,
+    Stamp.Newest,
+    [label("suite").eq("agg")],
+    MrangeOptions{
+      range = msAvgMaxMin(),
+      groupBy = Option.Some(GroupBy{ label = "region", reduce = Aggregation.Sum }),
+    },
+  ) catch _ {
+    refused = true
+    []SeriesRange(0)
+  }
+  assert(refused, "the server refuses several aggregators with GROUPBY")
+  tsClean(c, [k])
+  c.close()
+}
+
+test "live: info(debug) lists the chunks, info() does not" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:ts:debug"
+  tsClean(c, [k])
+  tsSeries(c, k, "debug", "eu", "a")
+  tsFill(c, k, msPoints())
+  let plain = c.timeseries(k).info() catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(len(plain.chunks) == 0, "no chunks without DEBUG")
+  let deep = c.timeseries(k).info(true) catch e {
+    panic("info debug: ${e.message()}")
+  }
+  assert(deep.totalSamples == 4, "the settings still decode, got ${deep.totalSamples}")
+  assert(len(deep.chunks) == 1, "one chunk, got ${len(deep.chunks)}")
+  let ch = deep.chunks[0]
+  assert(ch.startTimestamp == 1000 && ch.endTimestamp == 2500, "span ${ch.startTimestamp}..${ch.endTimestamp}")
+  assert(ch.samples == 4 && ch.size > 0 && ch.bytesPerSample > 0.0, "samples and size")
+  tsClean(c, [k])
+  c.close()
+}
+
+test "live: tx.read.timeseries reads now, tx.timeseries queues the write and the info, a write is refused" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let k = "bit:live:ts:tx:one"
+  tsClean(c, [k])
+  tsSeries(c, k, "txone", "eu", "a")
+  tsFill(c, k, [tsSample(1000, 1.0), tsSample(2000, 2.0)])
+  let out = c.transaction<(Future<i64>, Future<SeriesInfo>)>([k], (tx) => {
+    let queued = tx.timeseries(k).add(Stamp.At(3000), 3.0)
+    let queuedInfo = tx.timeseries(k).info(true)
+    let r = tx.read.timeseries(k)
+    let seen = r.range(Stamp.Oldest, Stamp.Newest)?
+    assert(len(seen) == 2, "range runs now: the queued third sample is not there yet, got ${len(seen)}")
+    let newest = r.get()?
+    assert(!isNone(newest) && unwrap(newest).ts == 2000, "get runs now")
+    assert(msInfoRefused(r), "TS.INFO through tx.read is refused: it would conflict the EXEC")
+    let refused = false
+    let _ = r.add(Stamp.At(4000), 4.0) catch _ {
+      refused = true
+      0
+    }
+    assert(refused, "a write through tx.read is refused")
+    return queued, queuedInfo
+  }) catch e {
+    panic("transaction: ${e.message()}")
+  }
+  let (add, info) = out
+  let at = add.get() catch e {
+    panic("future: ${e.message()}")
+  }
+  assert(at == 3000, "the queued add committed at its timestamp, got ${at}")
+  let infoSeen = info.get() catch e {
+    panic("queued info: ${e.message()}")
+  }
+  assert(infoSeen.totalSamples == 3 && len(infoSeen.chunks) == 1, "the queued info ran at EXEC, after the add")
+  let after = tsRange(c, k, RangeOptions{})
+  assert(len(after) == 3 && after[2].ts == 3000, "the third sample landed at EXEC, 4000 never did")
+  tsClean(c, [k])
+  c.close()
+}
+
+test "live: tx.read.timeseriesMulti selects by label now, tx.timeseriesMulti queues madd" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let keys = ["bit:live:ts:tx:a", "bit:live:ts:tx:b"]
+  tsClean(c, keys)
+  tsSeries(c, keys[0], "txmulti", "eu", "a")
+  tsSeries(c, keys[1], "txmulti", "us", "b")
+  tsFill(c, keys[0], msPoints())
+  let f = [label("suite").eq("txmulti")]
+  let out = c.transaction<Future<[]AddResult>>(keys, (tx) => {
+    let queued = tx.timeseriesMulti().madd(
+      [KeyedSample{ key = keys[1], ts = Stamp.At(5000), value = 7.0 }],
+    )
+    let m = tx.read.timeseriesMulti()
+    let idx = m.queryIndex(f)?
+    assert(len(idx) == 2, "queryIndex runs now, got ${len(idx)}")
+    let lasts = m.mget(f)?
+    let nonEmpty = 0
+    for l of lasts {
+      if (!isNone(l.sample)) {
+        nonEmpty = nonEmpty + 1
+      }
+    }
+    assert(nonEmpty == 1, "mget runs now: b is still empty, got ${nonEmpty} non-empty")
+    let ranged = m.mrange(
+      Stamp.Oldest,
+      Stamp.Newest,
+      f,
+      MrangeOptions{ range = msAvgMaxMin() },
+    )?
+    assert(len(ranged) == 2, "mrange runs now with several aggregators")
+    let rev = m.mrevrange(Stamp.Oldest, Stamp.Newest, f)?
+    assert(len(rev) == 2, "mrevrange runs now")
+    let refused = false
+    let _ = m.madd([KeyedSample{ key = keys[0], ts = Stamp.At(9000), value = 1.0 }]) catch _ {
+      refused = true
+      []AddResult(0)
+    }
+    assert(refused, "madd through tx.read is refused")
+    return queued
+  }) catch e {
+    panic("transaction: ${e.message()}")
+  }
+  let added = out.get() catch e {
+    panic("future: ${e.message()}")
+  }
+  assert(len(added) == 1 && added[0].ts == 5000, "the queued madd committed")
+  let b = tsRange(c, keys[1], RangeOptions{})
+  assert(len(b) == 1 && b[0].value == 7.0, "b holds the madd point, and only it")
+  tsClean(c, keys)
+  c.close()
+}
+
+test "live: timeseriesMulti queues madd, mget, mrange, mrevrange and queryIndex in a pipeline" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let keys = ["bit:live:ts:pipem:a", "bit:live:ts:pipem:b"]
+  tsClean(c, keys)
+  tsSeries(c, keys[0], "pipem", "eu", "a")
+  tsSeries(c, keys[1], "pipem", "us", "b")
+  let f = [label("suite").eq("pipem")]
+  let p = c.pipeline()
+  let q = p.timeseriesMulti()
+  let added = q.madd(
+    [
+      KeyedSample{ key = keys[0], ts = Stamp.At(1000), value = 1.0 },
+      KeyedSample{ key = keys[0], ts = Stamp.At(1500), value = 5.0 },
+      KeyedSample{ key = keys[1], ts = Stamp.At(1000), value = 2.0 },
+    ],
+  )
+  let idx = q.queryIndex(f)
+  let lasts = q.mget(f, false, LabelsOut.All)
+  let ranged = q.mrange(
+    Stamp.Oldest,
+    Stamp.Newest,
+    f,
+    MrangeOptions{ range = msAvgMaxMin(), labels = LabelsOut.Only(["region"]) },
+  )
+  let rev = q.mrevrange(Stamp.Oldest, Stamp.Newest, f, MrangeOptions{ range = RangeOptions{ count = 1 } })
+  p.exec() catch e {
+    panic("pipeline exec: ${e.message()}")
+  }
+  let a = added.get() catch e {
+    panic("madd result: ${e.message()}")
+  }
+  assert(len(a) == 3 && a[2].ts == 1000, "three points stored")
+  let keysOut = idx.get() catch e {
+    panic("queryIndex result: ${e.message()}")
+  }
+  assert(len(keysOut) == 2, "queryIndex finds both series, got ${len(keysOut)}")
+  let l = lasts.get() catch e {
+    panic("mget result: ${e.message()}")
+  }
+  assert(len(l) == 2 && l[0].labels["suite"] == "pipem", "mget decodes labels")
+  let r = ranged.get() catch e {
+    panic("mrange result: ${e.message()}")
+  }
+  assert(len(r) == 2, "mrange finds both series")
+  let j = 0
+  while (j < len(r)) {
+    assert(len(r[j].labels) == 1 && len(r[j].samples[0].also) == 2, "selected label and two extra values")
+    j = j + 1
+  }
+  let v = rev.get() catch e {
+    panic("mrevrange result: ${e.message()}")
+  }
+  assert(len(v) == 2 && len(v[0].samples) == 1, "mrevrange counts one sample per series")
+  tsClean(c, keys)
+  c.close()
+}
