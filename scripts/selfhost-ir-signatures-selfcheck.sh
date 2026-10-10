@@ -245,6 +245,13 @@ bb0():
   rc_add=${rc_t/"  %9 = convert"/"  %12 = add u8 %8, %1
   %9 = convert"}
   rc_ren=${rc_t/"func g()"/"func k()"}
+  rc_jmp=${rc_t/"bb2(%8: u8):"/"bb3():
+  jump bb2(%0)
+bb2(%8: u8):"}
+  rc_ret=${rc_t/"  %9 = convert i64 %2
+  ret %9
+}"/"  %9 = convert i64 %2
+}"}
   rc_conv=${rc_t/"  %9 = convert i64 %2
   ret %9"/"  ret %2"}
   rc_blk=${rc_t/"bb2(%8: u8):"/"bb3():
@@ -256,7 +263,7 @@ bb2(%8: u8):"}
   rc_nog=${rc_t%%"func g"*}
   rc_pre="global @g i64
 $rc_t"
-  for v in "$rc_h" "$rc_sub" "$rc_ugt" "$rc_ule" "$rc_add" "$rc_ren" "$rc_conv" "$rc_blk" "$rc_nog" "$rc_pre"; do
+  for v in "$rc_h" "$rc_sub" "$rc_ugt" "$rc_ule" "$rc_add" "$rc_ren" "$rc_jmp" "$rc_ret" "$rc_conv" "$rc_blk" "$rc_nog" "$rc_pre"; do
     [ "$v" != "$rc_t" ] || { echo "FAIL: a 7761 fixture variant equals its base"; fail=1; }
   done
   [ "$rc_opnd" != "$rc_o" ] && [ "$rc_slt" != "$rc_o" ] || { echo "FAIL: a 7761 oracle variant equals its base"; fail=1; }
@@ -269,6 +276,8 @@ $rc_t"
   expect "" "$(explainMismatch "$rc_o" "$rc_ule" iropt)" "iropt: one icmp_ule more than fused || sites"
   expect "" "$(explainMismatch "$rc_o" "$rc_add" iropt)" "iropt: an op neither transform adds (add)"
   expect "" "$(explainMismatch "$rc_o" "$rc_ren" iropt)" "iropt: a function renamed"
+  expect "" "$(explainMismatch "$rc_o" "$rc_jmp" iropt)" "iropt: a block added behind a jump"
+  expect "" "$(explainMismatch "$rc_o" "$rc_ret" iropt)" "iropt: a ret dropped"
   expect "" "$(explainMismatch "$rc_o" "$rc_conv" iropt)" "iropt: a dropped op CSE never forwards (convert)"
   expect "" "$(explainMismatch "$rc_o" "$rc_blk" iropt)" "iropt: an emptied block kept for a fused site"
   expect "" "$(explainMismatch "$rc_slt" "$rc_t" iropt)" "iropt: a signed compare is never fused"

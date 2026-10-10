@@ -446,15 +446,16 @@ END {
 # `sub`, and any other pure op or load on such a param to its earlier twin. Both are post-opt only, so
 # `--dump-ir-pre` (`ir`) does not move. Checked per FUNCTION, ids and block numbers being function-local:
 # the two dumps hold the same functions in the same order and the same text ahead of the first, at
-# least one function differs, and each that differs
-# satisfies, with d[op] = tree count - oracle count, n1 = -d[icmp_uge] and n2 = -d[icmp_ult] (the
-# fused `&&` and `||` sites, both >= 0):
-#   exact     d[icmp_ugt] = -n2, d[icmp_ule] = +n2 (`&&` trades its ule for the fused one),
-#             d[br] = d[blocks] = -(n1 + n2) (one R dropped per site)
-#   bounded   d[sub] <= n1 + n2 and d[const_int] <= n1 + n2 (each site adds at most one `sub` and the
-#             `hi - lo` constant); every other op d <= 0; an op that decreases is one CSE forwards
-#             (`opIsCsePure`/`opIsCseLoad`/element `index_get`) or one of the identities above
-#   nonempty  n1 + n2 >= 1, or some op decreased (a #7770-only function)
+# least one function differs, and each that differs satisfies, with d[op] = tree count - oracle
+# count and n = -d[br] the fused sites (CSE never removes a `br`):
+#   exact     n >= 0, d[jump] <= 0 and d[blocks] = d[br] + d[jump]: every block that goes takes its
+#             own `br` (a fused R) or `jump` (an inlined fused copy folding further), never a `ret`
+#   bounded   some split n = n1 (`&&`) + n2 (`||`), both >= 0, with d[icmp_uge] <= -n1,
+#             d[icmp_ult] <= -n2, d[icmp_ugt] <= -n2 and d[icmp_ule] <= n2 (equalities but for the
+#             compares CSE also forwards); d[sub] <= n and d[const_int] <= n (each site adds at most
+#             one `sub` and the `hi - lo` constant); every other op d <= 0, and one that decreases is
+#             an op CSE forwards (`opIsCsePure`/`opIsCseLoad`/element `index_get`)
+#   nonempty  n >= 1, or some op decreased (a #7770-only function)
 # What it does not check is which value a forwarded use now reads; the golden cases
 # ir_if_range_chain, opt_select_range_chain and ir_cse_param_edge pin that. Files: see the run output.
 #
@@ -468,6 +469,9 @@ function cse(op) {
   return op ~ /^(add|sub|mul|smulhi|umulhi|fadd|fsub|fmul|fdiv|band|bor|bxor|shl|ashr|lshr|icmp_[a-z]+|fcmp_[a-z]+|const_int|const_bool|const_float|field_get|slice_len|index_get)$/
 }
 function note(op) { if (index(OPS[cur], " " op " ") == 0) { OPS[cur] = OPS[cur] " " op " " } }
+function dl(f, op) { return C[1, f, op] - C[0, f, op] }
+function mx(a, b) { return a > b ? a : b }
+function mn(a, b) { return a < b ? a : b }
 BEGIN { side = 0 }
 $0 == "@@@BIT2@@@" { side = 1; cur = ""; next }
 /^func / {
@@ -485,18 +489,20 @@ END {
     if (NAME[1, i] != f) { exit 1 }
     if (T[0, f] == T[1, f]) { continue }
     changed++
-    n1 = C[0, f, "icmp_uge"] - C[1, f, "icmp_uge"]; n2 = C[0, f, "icmp_ult"] - C[1, f, "icmp_ult"]; n = n1 + n2
-    if (n1 < 0 || n2 < 0) { exit 1 }
-    if (C[1, f, "icmp_ugt"] - C[0, f, "icmp_ugt"] != -n2 || C[1, f, "icmp_ule"] - C[0, f, "icmp_ule"] != n2) { exit 1 }
-    if (C[1, f, "br"] - C[0, f, "br"] != -n || B[1, f] - B[0, f] != -n) { exit 1 }
-    m = split(OPS[f], L, " "); fell = 0
+    n = -dl(f, "br"); jd = dl(f, "jump")
+    if (n < 0 || jd > 0 || B[1, f] - B[0, f] != jd - n) { exit 1 }
+    lo = mx(mx(0, dl(f, "icmp_ule")), n + dl(f, "icmp_uge"))
+    hi = mn(mn(n, -dl(f, "icmp_ugt")), -dl(f, "icmp_ult"))
+    if (lo > hi) { exit 1 }
+    m = split(OPS[f], L, " "); fell = (jd < 0)
     for (j = 1; j <= m; j++) {
       op = L[j]
-      if (op == "" || op ~ /^(icmp_uge|icmp_ult|icmp_ugt|icmp_ule|br)$/) { continue }
-      d = C[1, f, op] - C[0, f, op]
+      if (op == "" || op ~ /^(br|jump)$/) { continue }
+      d = dl(f, op)
+      if (d < 0) { fell = 1 }
+      if (op ~ /^icmp_u(ge|lt|gt|le)$/) { continue }
       if (d > ((op == "sub" || op == "const_int") ? n : 0)) { exit 1 }
       if (d < 0 && !cse(op)) { exit 1 }
-      if (d < 0) { fell = 1 }
     }
     if (n == 0 && !fell) { exit 1 }
   }
