@@ -199,7 +199,7 @@ tail would be half a float.
 import { f32sToLe, f32sFromLe } from "std/math"
 
 fn roundTrip(xs: []f32): []f32! {
-  return f32sFromLe(f32sToLe(xs))
+  return f32sFromLe(f32sToLe(xs))?
 }
 ```
 
