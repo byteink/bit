@@ -1,11 +1,11 @@
 # Idempotency keys across servers
 
 <!-- doctest: per-block -->
-<!-- doctest: deps web -->
+<!-- doctest: deps web redis -->
 
 Inkwell's "Publish" button posts an article, and the request is slow
 enough that a phone on a bad connection gives up and sends it again. Without
-a guard the article is published twice. `pkg/web`'s `idempotency` middleware
+a guard the article is published twice. `web`'s `idempotency` middleware
 is that guard: a request that carries an `Idempotency-Key` header runs its
 handler once, and a retry with the same key gets the first answer back. Its
 store decides where "seen this key" lives, and the in-process one only
@@ -16,12 +16,15 @@ for all of them.
 
 ## The simplest thing that works
 
-Open a client, hand it to the store, and give the store to the middleware:
+`RedisIdempotencyStore` lives in `webredis`, the package that depends on both
+`web` and `redis`: `open` comes from `redis`, the middleware from `web`. Open
+a client, hand it to the store, and give the store to the middleware:
 
 ```bit
 import { App, Config, IdempotencyPolicy, idempotency } from "web"
+import { RedisIdempotencyStore } from "webredis"
 import { env } from "std/os"
-import { open, RedisIdempotencyStore } from "redis"
+import { open } from "redis"
 
 fn main(): ()! {
   let r = open(env("REDIS_URL"))?
@@ -37,10 +40,10 @@ A client now sends `Idempotency-Key: 7c1f...` with each publish. The first
 request with that key runs the handler. A retry with the same key, method,
 path and body gets the same `201 published` back with the handler unrun. The
 same key with a different body is `422`, and a retry that arrives while the
-first request is still running is `409`. Those answers are `pkg/web`'s, the
-statuses the IETF `Idempotency-Key` draft asks for; the store only has to
-remember. The middleware itself is covered in `pkg/web`'s operational
-middleware chapter.
+first request is still running is `409`. Those answers are the
+middleware's, the statuses the IETF `Idempotency-Key` draft asks for; the
+store only has to remember. The middleware itself is covered in the
+operational middleware chapter of `pkg/web`.
 
 `ttl` is how long a key is remembered, in seconds. It is also the retry
 window you promise clients, so pick it for the endpoint: a day is common for
@@ -98,7 +101,8 @@ of the reservation.
 Use your own prefix when several apps share a server:
 
 ```bit
-import { open, RedisIdempotencyStore } from "redis"
+import { RedisIdempotencyStore } from "webredis"
+import { open } from "redis"
 
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
@@ -163,4 +167,5 @@ hop. The store also does not make a handler's own side effects idempotent: a
 payment provider call made before `finish` can still happen twice if the
 process dies in between. Pass the provider the same idempotency key.
 
-Next: [Scripting](scripting.md) for the Lua behind `finish` and `abandon`.
+Next: the operational middleware chapter of `pkg/web` for the rest of the chain
+the middleware sits in.
