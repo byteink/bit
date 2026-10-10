@@ -1,0 +1,142 @@
+// #7837: a scalar map publishes an insert's ctrl tag with a plain store,
+// except a tag equal to key 0's, and marks every stored zero value in a
+// per-slot bit. Two readers depend on those rules.
+//
+// Phase "tag": a read of key 0 matches any slot whose tag equals key 0's and
+// whose key word still reads 0, which is what a claim's key word is until its
+// store is visible. Only the release of that claim's tag keeps the reader
+// from taking the claimed key's value. The churner cycles through `distinct`
+// keys, so whatever the per-process hash seed is, about one in 128 of them
+// collides with key 0's tag; the map is presized small and every key is
+// deleted again, so each insert claims a fresh slot on key 0's probe path.
+// Key 0 is NEVER stored: any `ok=true`, and any plain read that is not 0, is
+// another key's value.
+//
+// Phase "zero": every value stored is 0. The writer inserts `keys` keys, the
+// map growing as it goes, and publishes each one only after its insert; it
+// also flips key -1 between 0 and 1. A reader comma-ok reads the last
+// published key and key -1: both are present from the moment it can see them
+// and never deleted, so `ok=false`, or a value that was never stored, is
+// wrong. A zero value word is a stored zero only by its bit, so a bit the
+// insert, the overwrite or the grow failed to set reads as absent.
+//
+// THE RACE HAS TO BE REAL: `workers` pins BIT_WORKERS=4, and a reader counts
+// OVERLAPPED reads (the writer's round counter moved across ONE read), see
+// maprace.bit. `concurrent=false` fails the `.expected` like a wrong value.
+
+const val: int = 777
+const distinct: int = 509
+const rounds: int = 600000
+const keys: int = 300000
+const readers: int = 3
+
+// Phase "tag"'s churner: insert and delete one key per round, then publish
+// the round.
+fn churn(m: map<int, int>, flags: []i64) {
+  let fp = ptrOf(flags)
+  for (let r = 1; r <= rounds; r++) {
+    let k = r % distinct + 1
+    m[k] = val
+    delete(m, k)
+    atomicStore(fp, r)
+  }
+  atomicStore(fp + 1, 1)
+}
+
+// Phase "zero"'s writer: insert `k` with value 0, flip key -1, publish `k`.
+fn fill(m: map<int, int>, flags: []i64) {
+  let fp = ptrOf(flags)
+  for (let k = 1; k <= keys; k++) {
+    m[k] = 0
+    m[-1] = k & 1
+    atomicStore(fp, k)
+  }
+  atomicStore(fp + 1, 1)
+}
+
+// Phase "tag"'s reader of the absent key 0: [0] reads, [1] wrong, [2]
+// overlapped reads.
+fn tagReader(m: map<int, int>, flags: []i64, out: chan<[]int>) {
+  let fp = ptrOf(flags)
+  let counts = []int(3)
+  while (atomicLoad(fp + 1) == 0) {
+    let p0 = atomicLoad(fp)
+    let (_, ok) = m[0]
+    let p1 = atomicLoad(fp)
+    if (ok || m[0] != 0) {
+      counts[1] = counts[1] + 1
+    }
+    if (p1 != p0) {
+      counts[2] = counts[2] + 1
+    }
+    counts[0] = counts[0] + 1
+  }
+  out <- counts
+}
+
+// Phase "zero"'s reader, counting as `tagReader` does.
+fn zeroReader(m: map<int, int>, flags: []i64, out: chan<[]int>) {
+  let fp = ptrOf(flags)
+  let counts = []int(3)
+  while (atomicLoad(fp + 1) == 0) {
+    let p0 = atomicLoad(fp)
+    if (p0 > 0) {
+      let (v, ok) = m[int(p0)]
+      let (f, fok) = m[-1]
+      let p1 = atomicLoad(fp)
+      if (!ok || v != 0 || !fok || f < 0 || f > 1) {
+        counts[1] = counts[1] + 1
+      }
+      if (p1 != p0) {
+        counts[2] = counts[2] + 1
+      }
+    }
+    counts[0] = counts[0] + 1
+  }
+  out <- counts
+}
+
+// Sums the readers' counts into [reads, wrong, overlapped].
+fn collect(out: chan<[]int>): []int {
+  let total = []int(3)
+  for (let c = 0; c < readers; c++) {
+    let counts = <- out
+    for (let j = 0; j < 3; j++) {
+      total[j] = total[j] + counts[j]
+    }
+  }
+  return total
+}
+
+fn tagPhase(): []int {
+  let m = map<int, int>(4)
+  m[-1] = val
+  let flags = []i64(2)
+  let out = chan<[]int>(readers)
+  for (let c = 0; c < readers; c++) {
+    spawn tagReader(m, flags, out)
+  }
+  spawn churn(m, flags)
+  return collect(out)
+}
+
+fn zeroPhase(): []int {
+  let m = map<int, int>(4)
+  m[-1] = 0
+  let flags = []i64(2)
+  let out = chan<[]int>(readers)
+  for (let c = 0; c < readers; c++) {
+    spawn zeroReader(m, flags, out)
+  }
+  spawn fill(m, flags)
+  return collect(out)
+}
+
+fn main() {
+  let a = tagPhase()
+  let b = zeroPhase()
+  eprint("mapzerotag: tag reads=${a[0]} overlapped=${a[2]} wrong=${a[1]}\n")
+  eprint("mapzerotag: zero reads=${b[0]} overlapped=${b[2]} wrong=${b[1]}\n")
+  let conc = a[2] > 0 && b[2] > 0
+  print("mapzerotag: concurrent=${conc} wrong=${a[1] + b[1]}\n")
+}
