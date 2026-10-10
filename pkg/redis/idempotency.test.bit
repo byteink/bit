@@ -1,0 +1,273 @@
+// pkg/redis/idempotency.test.bit - `idempotency.bit` without a server: the
+// stored-value codec directly, and `begin`/`finish`/`abandon` against the
+// scripted fake server `script.test.bit` defines (`dialSeq`), which pins the
+// exact command each one sends. `idempotency.live.test.bit` runs the same
+// store against a real Redis, including the concurrency proof.
+//
+// `IdempotencyStore` is the only name this file imports from `web`; the
+// classes it uses come from `idempotency.bit`'s own import (an import binds
+// per module, SPEC 17.1).
+
+import { IdempotencyStore } from "web"
+
+fn idemNeverBytes(): string {
+  let out = []byte(0)
+  let i = 0
+  while (i < 256) {
+    out = append(out, byte(i))
+    i = i + 1
+  }
+  return string(out)
+}
+
+const idemInfo: string = "# Server\r\nredis_version:8.10.2\r\n"
+
+// The reply to the `INFO server` the constructor sends, then `replies`.
+fn idemDial(replies: []string): (Client, chan<string>, Listener) {
+  let all = ["$${len(idemInfo)}\r\n" + idemInfo + "\r\n"]
+  for r of replies {
+    all = append(all, r)
+  }
+  return dialSeq(all)
+}
+
+// What the server saw after the constructor's own INFO command.
+fn idemAfterInfo(log: string): string {
+  let at = indexOf(log[1:len(log)], "*")
+  if (at < 0) {
+    return ""
+  }
+  return log[1 + at:len(log)]
+}
+
+fn idemStoreOf(client: Client, prefix: string = "idem:"): RedisIdempotencyStore {
+  return RedisIdempotencyStore(client, prefix) catch e {
+    panic("RedisIdempotencyStore: ${e.message()}")
+  }
+}
+
+fn idemRoundTrip(r: CachedResponse): CachedResponse {
+  let v = "D3:abc" + encodeResponse(r)
+  let e = decodeEntry(v) catch err {
+    panic("decode: ${err.message()}")
+  }
+  assert(e.state == IdempotencyState.Done, "a D value decodes Done")
+  assert(e.fingerprint == "abc", "fingerprint = '${e.fingerprint}'")
+  return e.response
+}
+
+fn idemCorrupt(v: string): bool {
+  let bad = false
+  let _ = decodeEntry(v) catch e {
+    match (e) {
+      Protocol(_) => bad = true
+      _ => bad = false
+    }
+    IdempotencyEntry{
+      state = IdempotencyState.InFlight,
+      fingerprint = "",
+      response = CachedResponse{},
+    }
+  }
+  return bad
+}
+
+test "an in-flight value decodes to InFlight with its fingerprint and no response" {
+  let e = decodeEntry(encodeInFlight("f00d")) catch err {
+    panic("decode: ${err.message()}")
+  }
+  assert(e.state == IdempotencyState.InFlight, "state")
+  assert(e.fingerprint == "f00d", "fingerprint = '${e.fingerprint}'")
+  assert(e.response.status == 0 && e.response.body == "", "InFlight carries no response")
+  assert(encodeInFlight("f00d") == "I4:f00d", "wire form = ${encodeInFlight("f00d")}")
+}
+
+test "a response with headers and a body round-trips" {
+  let r = CachedResponse{
+    status = 201,
+    body = "{\"id\":7}",
+    headers = [
+      Header{ name = "Content-Type", value = "application/json" },
+      Header{ name = "X-Run", value = "1" },
+    ],
+  }
+  let got = idemRoundTrip(r)
+  assert(got.status == 201, "status = ${got.status}")
+  assert(got.body == "{\"id\":7}", "body = '${got.body}'")
+  assert(len(got.headers) == 2, "headers = ${len(got.headers)}")
+  assert(
+    got.headers[0].name == "Content-Type" && got.headers[0].value == "application/json",
+    "first header",
+  )
+  assert(got.headers[1].name == "X-Run" && got.headers[1].value == "1", "second header")
+}
+
+test "a body holding every byte value, newlines and colons round-trips untouched" {
+  let body = idemNeverBytes() + "\n3:abc\n0\n" + idemNeverBytes()
+  let r = CachedResponse{
+    status = 200,
+    body = body,
+    headers = [Header{ name = "A:B", value = "x\ny:" }],
+  }
+  let got = idemRoundTrip(r)
+  assert(got.body == body, "body bytes differ: ${len(got.body)} vs ${len(body)}")
+  assert(
+    got.headers[0].name == "A:B" && got.headers[0].value == "x\ny:",
+    "header text survives its own colon and newline",
+  )
+}
+
+test "an empty body and no headers round-trips, and an empty fingerprint is legal" {
+  let got = idemRoundTrip(CachedResponse{ status = 204, body = "", headers = []Header(0) })
+  assert(got.status == 204 && got.body == "" && len(got.headers) == 0, "status = ${got.status}")
+  let e = decodeEntry(
+    "D0:" + encodeResponse(CachedResponse{ status = 200, body = "x", headers = []Header(0) }),
+  ) catch err {
+    panic("decode: ${err.message()}")
+  }
+  assert(e.fingerprint == "" && e.response.body == "x", "empty fingerprint")
+}
+
+test "a value that does not parse is a Protocol error, never a panic or an empty entry" {
+  assert(idemCorrupt(""), "empty value")
+  assert(idemCorrupt("X1:a"), "unknown state byte")
+  assert(idemCorrupt("I"), "no length")
+  assert(idemCorrupt("I:"), "empty length")
+  assert(idemCorrupt("I4:abc"), "fingerprint shorter than its length")
+  assert(idemCorrupt("I1x:a"), "non-digit in the length")
+  assert(idemCorrupt("I9999999999999999999999:a"), "length past 18 digits")
+  assert(idemCorrupt("D1:a200"), "response cut off before the status ends")
+  assert(idemCorrupt("D1:a200\n"), "response cut off before the header count")
+  assert(idemCorrupt("D1:a200\n99999\n"), "a header count the rest cannot hold")
+  assert(idemCorrupt("D1:a200\n1\n3:abc"), "header value missing")
+  assert(idemCorrupt("D1:a200\n1\n3:abc9:xy"), "header value shorter than its length")
+}
+
+test "RedisIdempotencyStore satisfies web's IdempotencyStore" {
+  let (client, done, l) = idemDial([]string(0))
+  let s: IdempotencyStore = idemStoreOf(client)
+  assert(s != nil, "the store converts to the interface")
+  client.close()
+  <- done
+  l.close()
+}
+
+test "begin on a never-seen key is ONE SET ... NX ... GET ... PX command and returns None" {
+  let (client, done, l) = idemDial(["$-1\r\n"])
+  let s = idemStoreOf(client)
+  let got = s.begin("k1", "fp1", 86400) catch e {
+    panic("begin: ${e.message()}")
+  }
+  client.close()
+  let log = idemAfterInfo(<- done)
+  l.close()
+  assert(isNone(got), "a null reply means this caller created the reservation")
+  assert(log[0:2] == "*7", "one command of 7 words: ${log}")
+  assert(indexOf(log, "SET") > 0 && indexOf(log, "idem:k1") > 0, "SET idem:k1: ${log}")
+  assert(indexOf(log, "I3:fp1") > 0, "the reservation value: ${log}")
+  assert(indexOf(log, "NX") > 0 && indexOf(log, "GET") > 0, "NX and GET: ${log}")
+  assert(indexOf(log, "PX") > 0 && indexOf(log, "86400000") > 0, "PX in milliseconds: ${log}")
+  let second = indexOf(log[2:len(log)], "*")
+  assert(second < 0, "exactly one command was sent, a second '*' at ${second}: ${log}")
+}
+
+test "begin on a claimed key returns the stored entry" {
+  let (client, done, l) = idemDial(["$6\r\nI3:abc\r\n"])
+  let s = idemStoreOf(client, "app:")
+  let got = s.begin("k", "other", 60) catch e {
+    panic("begin: ${e.message()}")
+  }
+  client.close()
+  let log = idemAfterInfo(<- done)
+  l.close()
+  assert(isSome(got), "a reply value means the key was already claimed")
+  let e = unwrap(got)
+  assert(e.state == IdempotencyState.InFlight && e.fingerprint == "abc", "entry = ${e.fingerprint}")
+  assert(indexOf(log, "app:k") > 0, "the custom prefix is used: ${log}")
+}
+
+test "begin refuses a ttl outside 1..maxIdempotencyTtl before sending anything" {
+  let (client, done, l) = idemDial([]string(0))
+  let s = idemStoreOf(client)
+  let bad = 0
+  for ttl of [0, -5, 9_000_000_001] {
+    let _ = s.begin("k", "fp", ttl) catch _ {
+      bad = bad + 1
+      Option<IdempotencyEntry>.None
+    }
+  }
+  client.close()
+  let log = idemAfterInfo(<- done)
+  l.close()
+  assert(bad == 3, "all three ttls are refused, got ${bad}")
+  assert(log == "", "nothing reached the server: ${log}")
+}
+
+test "begin on a corrupt stored value fails rather than reporting an absent key" {
+  let (client, done, l) = idemDial(["$3\r\nzzz\r\n"])
+  let s = idemStoreOf(client)
+  let failed = false
+  let _ = s.begin("k", "fp", 60) catch _ {
+    failed = true
+    Option<IdempotencyEntry>.None
+  }
+  client.close()
+  <- done
+  l.close()
+  assert(failed, "garbage must not read as None: the handler would run twice")
+}
+
+test "finish is one EVALSHA on the prefixed key with the response and the ttl in milliseconds" {
+  let (client, done, l) = idemDial([":1\r\n"])
+  let s = idemStoreOf(client)
+  s.finish("k", CachedResponse{ status = 200, body = "ok", headers = []Header(0) }, 90) catch e {
+    panic("finish: ${e.message()}")
+  }
+  client.close()
+  let log = idemAfterInfo(<- done)
+  l.close()
+  assert(indexOf(log, "EVALSHA") > 0, "EVALSHA: ${log}")
+  assert(indexOf(log, idempotencyFinishScriptSha()) > 0, "the finish script's hash: ${log}")
+  assert(indexOf(log, "idem:k") > 0, "the key: ${log}")
+  assert(indexOf(log, "200\n0\nok") > 0, "the encoded response: ${log}")
+  assert(indexOf(log, "90000") > 0, "ttl in milliseconds: ${log}")
+}
+
+test "abandon is a DEL of the prefixed key" {
+  let (client, done, l) = idemDial([":1\r\n"])
+  let s = idemStoreOf(client)
+  s.abandon("k") catch e {
+    panic("abandon: ${e.message()}")
+  }
+  client.close()
+  let log = idemAfterInfo(<- done)
+  l.close()
+  assert(indexOf(log, "DEL") > 0 && indexOf(log, "idem:k") > 0, "DEL idem:k: ${log}")
+}
+
+fn idempotencyFinishScriptSha(): string {
+  return Script(idempotencyFinishSrc).sha
+}
+
+fn idemRefused(client: Client): bool {
+  let _ = RedisIdempotencyStore(client) catch _ {
+    return true
+  }
+  return false
+}
+
+test "the constructor refuses a server older than Redis 7 and accepts Valkey's version line" {
+  let old = "# Server\r\nredis_version:6.2.14\r\n"
+  let (client, done, l) = dialSeq(["$${len(old)}\r\n" + old + "\r\n"])
+  let refused = idemRefused(client)
+  client.close()
+  <- done
+  l.close()
+  assert(refused, "Redis 6 has no SET ... NX GET: the store must not be built")
+  assert(
+    serverMajor("redis_version:7.2.4\r\nredis_mode:standalone\r\n") == 7,
+    "Valkey reports 7.2.x",
+  )
+  assert(serverMajor("# Server\nredis_version:8.10.2\n") == 8, "major 8")
+  assert(serverMajor("no version here") == 0, "absent version is 0")
+}
