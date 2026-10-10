@@ -1,0 +1,259 @@
+// pkg/redis/pubsub.live.test.bit - `r.subscribe` and friends against a real
+// server. `liveUrl`/`liveClient` are `client.live.test.bit`'s own (same
+// module, no import); every test is skipped, and says so, when
+// `REDIS_TEST_URL` is unset. `./make test-package-redis-live`
+// (`_tests_/bit/redislive.bit`) supplies it, against `redis:8.10.2` in a
+// throwaway Docker container.
+//
+// PUBLISH RETURNS HOW MANY SUBSCRIBERS RECEIVED THE MESSAGE, and a
+// `Subscription` returns from `subscribe` only after the server confirmed, so
+// a publish right after `subscribe` reaches it: no sleep to "let it settle".
+// Everything that waits for a message waits with a deadline (`recvWithin`),
+// so a lost message fails the test instead of hanging it.
+
+// The next message within `ns` nanoseconds, or `None`.
+fn recvWithin(sub: Subscription, ns: int): Option<Message> {
+  let timeout = after(ns)
+  select {
+    case m = <- sub.messages():
+      return Option.Some(m)
+    case _ = <- timeout:
+      return Option.None
+  }
+}
+
+fn expectMessage(sub: Subscription, what: string): Message {
+  match (recvWithin(sub, 5 * Second)) {
+    Some(m) => return m
+    None => panic("${what}: no message within 5s")
+  }
+}
+
+fn expectSilence(sub: Subscription, what: string) {
+  match (recvWithin(sub, 300 * Millisecond)) {
+    Some(m) => panic("${what}: unexpected message ${m.channel}/${m.payload}")
+    None => {}
+  }
+}
+
+fn publishOk(c: Client, channel: string, payload: string): i64 {
+  return c.publish(channel, payload) catch e {
+    panic("publish ${channel}: ${e.message()}")
+  }
+}
+
+fn subscribeOk(c: Client, channel: string): Subscription {
+  return c.subscribe(channel) catch e {
+    panic("subscribe ${channel}: ${e.message()}")
+  }
+}
+
+test "live: subscribe receives what publish sends, and PUBSUB reports the subscriber" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let sub = subscribeOk(c, "bit:ps:news")
+  let n = publishOk(c, "bit:ps:news", "hello")
+  assert(n == 1, "one subscriber received it, got ${n}")
+  let m = expectMessage(sub, "publish")
+  assert(m.channel == "bit:ps:news" && m.payload == "hello", "got ${m.channel}/${m.payload}")
+  assert(m.pattern == Option<string>.None, "a channel subscription has no pattern")
+
+  let channels = c.pubsubChannels("bit:ps:*") catch e {
+    panic("PUBSUB CHANNELS: ${e.message()}")
+  }
+  assert(len(channels) == 1 && channels[0] == "bit:ps:news", "active channels: ${len(channels)}")
+  let counts = c.pubsubNumSub("bit:ps:news", "bit:ps:nobody") catch e {
+    panic("PUBSUB NUMSUB: ${e.message()}")
+  }
+  assert(
+    counts["bit:ps:news"] == 1 && counts["bit:ps:nobody"] == 0,
+    "numsub ${counts["bit:ps:news"]}",
+  )
+
+  sub.close()
+  let (_, open) = <- sub.messages()
+  assert(!open, "close ends the message channel")
+  assert(publishOk(c, "bit:ps:news", "after") == 0, "no subscriber after close")
+}
+
+test "live: psubscribe delivers the matching pattern and PUBSUB NUMPAT counts it" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let before = c.pubsubNumPat() catch e {
+    panic("NUMPAT: ${e.message()}")
+  }
+  let sub = c.psubscribe("bit:ps:p:*") catch e {
+    panic("psubscribe: ${e.message()}")
+  }
+  assert(publishOk(c, "bit:ps:p:x", "one") == 1, "pattern subscriber received it")
+  let m = expectMessage(sub, "pattern")
+  assert(m.channel == "bit:ps:p:x" && m.payload == "one", "got ${m.channel}/${m.payload}")
+  assert(m.pattern == Option.Some("bit:ps:p:*"), "the matching pattern is reported")
+  let during = c.pubsubNumPat() catch e {
+    panic("NUMPAT: ${e.message()}")
+  }
+  assert(during == before + 1, "numpat ${before} -> ${during}")
+  sub.close()
+}
+
+test "live: ssubscribe receives what spublish sends" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let sub = c.ssubscribe("bit:ps:shard") catch e {
+    panic("ssubscribe: ${e.message()}")
+  }
+  let n = c.spublish("bit:ps:shard", "sharded") catch e {
+    panic("spublish: ${e.message()}")
+  }
+  assert(n == 1, "one shard subscriber, got ${n}")
+  let m = expectMessage(sub, "sharded")
+  assert(m.channel == "bit:ps:shard" && m.payload == "sharded", "got ${m.channel}/${m.payload}")
+  let shards = c.pubsubShardChannels("bit:ps:*") catch e {
+    panic("SHARDCHANNELS: ${e.message()}")
+  }
+  assert(len(shards) == 1 && shards[0] == "bit:ps:shard", "shard channels: ${len(shards)}")
+  let counts = c.pubsubShardNumSub("bit:ps:shard") catch e {
+    panic("SHARDNUMSUB: ${e.message()}")
+  }
+  assert(counts["bit:ps:shard"] == 1, "shardnumsub ${counts["bit:ps:shard"]}")
+  sub.close()
+}
+
+test "live: add and remove change the set of a running subscription" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let sub = subscribeOk(c, "bit:ps:a")
+  sub.add("bit:ps:b", "bit:ps:a") catch e {
+    panic("add: ${e.message()}")
+  }
+  assert(len(sub.names()) == 2, "a duplicate name is skipped, have ${len(sub.names())}")
+  assert(publishOk(c, "bit:ps:b", "to-b") == 1, "b is subscribed once add returns")
+  assert(expectMessage(sub, "added").payload == "to-b", "message from the added channel")
+
+  sub.remove("bit:ps:a", "bit:ps:never") catch e {
+    panic("remove: ${e.message()}")
+  }
+  assert(publishOk(c, "bit:ps:a", "to-a") == 0, "a is gone once remove returns")
+  expectSilence(sub, "removed channel")
+  assert(publishOk(c, "bit:ps:b", "again") == 1, "b is still subscribed")
+  assert(expectMessage(sub, "kept").payload == "again", "message from the kept channel")
+  sub.close()
+}
+
+// Kills every pub/sub connection on the server (`CLIENT KILL TYPE pubsub`);
+// this file's tests run one after another, and each closes its subscription.
+fn killSubscribers(c: Client) {
+  c.command(["CLIENT", "KILL", "TYPE", "pubsub"]) catch e {
+    panic("CLIENT KILL TYPE pubsub: ${e.message()}")
+  }
+}
+
+test "live: a killed subscriber reconnects, resubscribes, and later messages arrive" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let sub = subscribeOk(c, "bit:ps:kill")
+  sub.add("bit:ps:kill2") catch e {
+    panic("add: ${e.message()}")
+  }
+  killSubscribers(c)
+  // Publishing reaches nobody while the subscriber is down; poll until the
+  // reader is back (each subscriber receives once), bounded by the deadline.
+  let deadline = monotonic().ns + 20 * Second
+  let reached = 0
+  while (reached < 2 && monotonic().ns < deadline) {
+    reached = publishOk(c, "bit:ps:kill", "back") + publishOk(c, "bit:ps:kill2", "back")
+    if (reached < 2) {
+      sleep(100 * Millisecond)
+    }
+  }
+  assert(reached == 2, "both channels resubscribed after the kill, reached ${reached}")
+  let first = expectMessage(sub, "after kill")
+  let second = expectMessage(sub, "after kill 2")
+  assert(first.payload == "back" && second.payload == "back", "payloads after the reconnect")
+  assert(sub.dropped() == 0, "nothing was dropped")
+  sub.close()
+}
+
+test "live: a slow consumer loses the oldest messages and dropped() counts them" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let opts = parseUrl(u) catch e {
+    panic("parseUrl: ${e.message()}")
+  }
+  opts.subscribeBuffer = 4
+  let c = connect(opts) catch e {
+    panic("connect: ${e.message()}")
+  }
+  let sub = subscribeOk(c, "bit:ps:slow")
+  let i = 0
+  while (i < 20) {
+    let _ = publishOk(c, "bit:ps:slow", "m${i}")
+    i = i + 1
+  }
+  let deadline = monotonic().ns + 10 * Second
+  while (sub.dropped() < 16 && monotonic().ns < deadline) {
+    sleep(10 * Millisecond)
+  }
+  assert(sub.dropped() == 16, "20 messages through a buffer of 4 drop 16, dropped ${sub.dropped()}")
+  let want = 16
+  while (want < 20) {
+    let m = expectMessage(sub, "buffered")
+    assert(m.payload == "m${want}", "the newest four survive in order, got ${m.payload}")
+    want = want + 1
+  }
+  expectSilence(sub, "drained")
+  sub.close()
+}
+
+test "live: for msg of sub iterates until close, and RESP2 delivers the same messages" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let opts = parseUrl(u) catch e {
+    panic("parseUrl: ${e.message()}")
+  }
+  opts.protocol = 2
+  let c = connect(opts) catch e {
+    panic("connect resp2: ${e.message()}")
+  }
+  let sub = subscribeOk(c, "bit:ps:iter")
+  let _ = publishOk(c, "bit:ps:iter", "one")
+  let _ = publishOk(c, "bit:ps:iter", "two")
+  sub.close()
+  let got = []string(0)
+  for m of sub {
+    got = append(got, m.payload)
+  }
+  assert(len(got) == 2 && got[0] == "one" && got[1] == "two", "iterated ${len(got)} messages")
+}
+
+test "live: subscribe with no channel is refused before dialling" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let refused = false
+  c.subscribe() catch _ {
+    refused = true
+  }
+  assert(refused, "an empty subscribe is a caller mistake")
+}

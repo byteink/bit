@@ -352,7 +352,10 @@ case "${BUCKET}" in
     # stage0-built libbitrt.a); #7750 shipped an aarch64-linux startup SIGBUS
     # through a green gate for that reason. test-tree-archive-x64 (#7752) is the
     # same check for x86_64-linux on the real x86 host.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword test-no-warnings test-call-shapes test-fmt-prec-matrix test-hashseed test-tree-archive test-tree-archive-x64)
+    # test-rem-magic (#5803): a compiler/** diff in the `%`-by-constant magic
+    # lowering (remTakesMagic, optdivmagic.bit) changes aarch64-linux code that
+    # golden, running on aarch64-macos, never executes.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword test-no-warnings test-call-shapes test-fmt-prec-matrix test-hashseed test-tree-archive test-tree-archive-x64 test-rem-magic)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did

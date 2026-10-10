@@ -1,0 +1,324 @@
+// pkg/authz/doc.bit — a policy stored as data. An admin posts a document, the
+// store keeps it, and `Authz.validateDoc` turns it into the same `Rule`s a
+// policy written in code makes (policy.bit), so evaluation reads one shape:
+//
+//   { "name": "PublishOwnTeam",
+//     "statements": [ { "effect": "allow", "actions": ["Publish"], "resource": "Article",
+//                       "when": { "team": "$user.team", "status": "review" } } ] }
+//   { "policy": "PublishOwnTeam", "to": { "role": "author" }, "tenant": "inkwell" }
+//
+// EVERY REFUSAL NAMES WHERE, as an RFC 6901 JSON Pointer into the document:
+// `/statements/0/actions/1: unknown action 'Publsh'; valid actions: ...`. The
+// pointer of the whole document is spelled `#` (RFC 6901 §6). A `when`
+// condition is read by condjson.bit or cel.bit, whose own paths
+// (`when.$or[1].status`) are rewritten into the same form.
+//
+// LIMITS, all explicit: a name is 1 to 64 characters of `[A-Za-z0-9_.-]`; a
+// policy holds 1 to 64 statements; a document is at most 64 KiB of content
+// (every string and the encoded `when` of each statement). Conditions have
+// their own bounds (condjson.bit, cel.bit). The size is checked before
+// anything is walked, so no loop below runs over more than 64 KiB.
+//
+// "*" is a resource (every resource) and never an action: to match every
+// action the document names the enum's wildcard variant, as code does.
+//
+// `when` is absent or null for "always", a JSON object (condFromJson) or a
+// string of CEL (condFromCel). The decode of `Json` fields by `@json` is a
+// compiler gap (#7766); until it lands `Statement` and `PolicyDoc` are plain
+// classes the caller fills from a parsed document, and `Target` and
+// `Attachment` are the `@json` classes the document shapes call for.
+
+import { jsonEncode, jsonIsNull } from "std/json"
+import { indexOf as find, join } from "std/strings"
+
+const maxStatements: int = 64
+const maxDocBytes: int = 65536
+const maxNameLen: int = 64
+const maxUserLen: int = 256
+
+// One statement of a stored policy, as the document spells it: `effect` is
+// "allow" or "deny", `actions` are variant names, `resource` is a registered
+// class name or "*", `when` the condition (null for always).
+export class Statement {
+  export effect: string,
+  export actions: []string,
+  export resource: string,
+  export when: Json,
+}
+
+// A stored policy: its name and statements.
+export class PolicyDoc {
+  export name: string,
+  export statements: []Statement,
+}
+
+// Who an attachment is for: exactly one of the three is set. A key left out of
+// the document is `None`.
+export @json class Target {
+  export role: Option<string>,
+  export group: Option<string>,
+  export user: Option<string>,
+}
+
+// Attaches the stored policy `policy` to `to`, for `tenant` ("" is global).
+export @json class Attachment {
+  export policy: string,
+  export to: Target,
+  export tenant: string,
+}
+
+// A stored policy once checked: the same `Rule`s a code policy makes, each
+// stamped with the policy name.
+export class CompiledPolicy<A: ActionEnum> {
+  export name: string,
+  export rules: []Rule<A>,
+}
+
+// The refusal `why` at JSON Pointer `ptr`.
+fn docBad(ptr: string, why: string): InvalidPolicy {
+  return InvalidPolicy{ detail = "${ptr}: ${why}" }
+}
+
+// What is wrong with `name` as a policy, tenant, role or group name, or "".
+fn nameFault(name: string): string {
+  if (len(name) < 1 || len(name) > maxNameLen) {
+    return "must be 1 to ${maxNameLen} characters, got ${len(name)}"
+  }
+  let i = 0
+  while (i < len(name)) {
+    if (!roleChar(name[i])) {
+      return "character ${i} is not one of A-Z a-z 0-9 _ . -"
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+fn checkName(ptr: string, name: string): ()! {
+  let why = nameFault(name)
+  if (why != "") {
+    fail docBad(ptr, why)
+  }
+}
+
+// The condition's JSON Pointer from the dotted path condjson.bit and cel.bit
+// write (`when.$or[1].status` is `/when/$or/1/status`), with `~` and `/` in a
+// key escaped as RFC 6901 says.
+fn pointerOf(path: string): string {
+  let out = "/"
+  let i = 0
+  while (i < len(path)) {
+    let c = path[i]
+    if (c == 46 || c == 91) {
+      out = out + "/"
+    } else if (c == 126) {
+      out = out + "~0"
+    } else if (c == 47) {
+      out = out + "~1"
+    } else if (c != 93) {
+      out = out + path[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// A condition refusal (`when.x: why`) moved under the statement at `base`.
+fn reroot(base: string, message: string): InvalidPolicy {
+  let m = faultText(message)
+  let cut = find(m, ": ")
+  if (cut < 0) {
+    return docBad("${base}/when", m)
+  }
+  return docBad(base + pointerOf(m[:cut]), m[cut + 2:])
+}
+
+fn effectOf(ptr: string, s: string): Effect! {
+  if (s == "allow") {
+    return Effect.Allow
+  }
+  if (s == "deny") {
+    return Effect.Deny
+  }
+  fail docBad("${ptr}/effect", "must be \"allow\" or \"deny\", got \"${s}\"")
+}
+
+fn oneAction<A: ActionEnum>(ptr: string, name: string): A! {
+  if (name == "*") {
+    fail docBad(ptr, "\"*\" is not an action; write the variant that matches every action (Manage)")
+  }
+  return parseAction<A>(name) catch e {
+    fail docBad(ptr, faultText(e.message()))
+  }
+}
+
+fn actionsOf<A: ActionEnum>(ptr: string, names: []string): []A! {
+  if (len(names) == 0) {
+    fail docBad("${ptr}/actions", "needs at least one action")
+  }
+  let out = []A(0)
+  let i = 0
+  while (i < len(names)) {
+    out = append(out, oneAction<A>("${ptr}/actions/${i}", names[i])?)
+    i = i + 1
+  }
+  return out
+}
+
+// "*" is every resource, anything else must be registered.
+fn resourceOf(list: []ResourceInfo, ptr: string, s: string): ResourceRef! {
+  if (s == "*") {
+    return ResourceRef.All
+  }
+  if (!isSome(findResource(list, s))) {
+    fail docBad(
+      "${ptr}/resource",
+      "unknown resource '${s}' (registered: ${join(namesIn(list), ", ")})",
+    )
+  }
+  return ResourceRef.Named(s)
+}
+
+// What conditions on `ref` are read against: the resource, or for "*" one with
+// no columns, so a condition on every resource can name no field.
+fn infoFor(list: []ResourceInfo, ref: ResourceRef): ResourceInfo {
+  return match (ref) {
+    Named(n) => unwrap(findResource(list, n))
+    All => ResourceInfo{ name = "*", table = "", columns = []FieldDesc(0) }
+  }
+}
+
+fn celWhen(res: ResourceInfo, base: string, src: string): Cond! {
+  return condFromCel(res, src) catch e {
+    fail docBad("${base}/when", faultText(e.message()))
+  }
+}
+
+fn jsonWhen(res: ResourceInfo, base: string, j: Json): Cond! {
+  return condFromJson(res, j) catch e {
+    fail reroot(base, e.message())
+  }
+}
+
+// The condition `j` states for `res`: null is always, a string is CEL, an
+// object is the JSON tree.
+fn whenOf(res: ResourceInfo, base: string, j: Json): Cond! {
+  if (jsonIsNull(j)) {
+    return Cond.True
+  }
+  match (j) {
+    JsonString(src) => { return celWhen(res, base, src)? }
+    JsonObject(_) => { return jsonWhen(res, base, j)? }
+    _ => {}
+  }
+  fail docBad("${base}/when", "must be a JSON object, a CEL string or null, got ${jsonKind(j)}")
+}
+
+// Statement `s`, at JSON Pointer `ptr`, as the Rule it states.
+fn ruleOf<A: ActionEnum>(
+  list: []ResourceInfo,
+  decls: []RelationDecl,
+  name: string,
+  ptr: string,
+  s: Statement,
+): Rule<A>! {
+  let effect = effectOf(ptr, s.effect)?
+  let actions = actionsOf<A>(ptr, s.actions)?
+  let ref = resourceOf(list, ptr, s.resource)?
+  let cond = whenOf(infoFor(list, ref), ptr, s.when)?
+  validateIn(list, decls, ref, cond) catch e {
+    fail docBad("${ptr}/when", faultText(e.message()))
+  }
+  return Rule<A>{ effect = effect, actions = actions, resource = ref, cond = cond, policy = name }
+}
+
+fn statementBytes(s: Statement): int {
+  let n = len(s.effect) + len(s.resource) + len(jsonEncode(s.when))
+  for a of s.actions {
+    n = n + len(a)
+  }
+  return n
+}
+
+// The bytes of content `doc` holds, counted until the cap is passed.
+fn docBytes(doc: PolicyDoc): int {
+  let n = len(doc.name)
+  for s of doc.statements {
+    n = n + statementBytes(s)
+    if (n > maxDocBytes) {
+      return n
+    }
+  }
+  return n
+}
+
+// Checks what bounds the walk, before any statement is read.
+fn checkDocShape(doc: PolicyDoc): ()! {
+  checkName("/name", doc.name)?
+  let n = len(doc.statements)
+  if (n < 1 || n > maxStatements) {
+    fail docBad("/statements", "must hold 1 to ${maxStatements} statements, got ${n}")
+  }
+  let bytes = docBytes(doc)
+  if (bytes > maxDocBytes) {
+    fail docBad("#", "document holds ${bytes} bytes; the limit is ${maxDocBytes}")
+  }
+}
+
+// `doc` checked against the registered `list` and `decls`, as the rules it
+// states, or the first InvalidPolicy found with its JSON Pointer.
+fn compileDocIn<A: ActionEnum>(
+  list: []ResourceInfo,
+  decls: []RelationDecl,
+  doc: PolicyDoc,
+): CompiledPolicy<A>! {
+  checkDocShape(doc)?
+  let rules = []Rule<A>(0)
+  let i = 0
+  while (i < len(doc.statements)) {
+    rules = append(rules, ruleOf<A>(list, decls, doc.name, "/statements/${i}", doc.statements[i])?)
+    i = i + 1
+  }
+  return CompiledPolicy<A>{ name = doc.name, rules = rules }
+}
+
+// 1 when the target key `key` is set (and well named), else 0.
+fn countKey(ptr: string, key: string, v: Option<string>): int! {
+  if (!isSome(v)) {
+    return 0
+  }
+  checkTargetName(ptr, key, unwrap(v))?
+  return 1
+}
+
+// Exactly one of role, group and user is set, and it is a valid name.
+fn checkTarget(ptr: string, t: Target): ()! {
+  let set = countKey(ptr, "role", t.role)? +
+    countKey(ptr, "group", t.group)? +
+    countKey(ptr, "user", t.user)?
+  if (set != 1) {
+    fail docBad(ptr, "exactly one of role, group, user must be set, got ${set}")
+  }
+}
+
+// A role or group is named like a policy; a user id is whatever the identity
+// provider issues, so only its length is bounded.
+fn checkTargetName(ptr: string, key: string, v: string): ()! {
+  if (key != "user") {
+    return checkName("${ptr}/${key}", v)?
+  }
+  if (len(v) < 1 || len(v) > maxUserLen) {
+    fail docBad("${ptr}/user", "must be 1 to ${maxUserLen} characters, got ${len(v)}")
+  }
+}
+
+// `a` checked as a document: its policy and target are named well and its
+// tenant is empty (global) or named well. That the policy exists is the
+// store's check, not this one.
+fn checkAttachment(a: Attachment): ()! {
+  checkName("/policy", a.policy)?
+  checkTarget("/to", a.to)?
+  if (a.tenant != "") {
+    checkName("/tenant", a.tenant)?
+  }
+}

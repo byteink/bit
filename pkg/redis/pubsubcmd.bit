@@ -1,0 +1,153 @@
+// pkg/redis/pubsubcmd.bit - the wire halves of pub/sub that need no
+// connection of their own (#6041, epic #6013): `PUBLISH`/`SPUBLISH` and the
+// `PUBSUB` introspection commands as `Cmd<T>`s (`cmd.bit`), and `parsePush`,
+// which tells a subscription what one server push means. `pubsub.bit` owns
+// the `Subscription` that reads them off a dedicated connection.
+//
+// ONE PARSER FOR BOTH PROTOCOLS. RESP3 sends a message as a `Push` reply
+// (`>3 message news hello`); RESP2 sends the same items as an ordinary
+// `Array`. `pushItems` hands back the items of either, so a connection that
+// fell back to RESP2 (`conn.bit`'s `HELLO` fallback, or `Options.protocol =
+// 2`) needs no second code path. A push that is neither a message nor a
+// subscribe/unsubscribe confirmation (a RESP3 `invalidate`, RESP2's `pong`)
+// parses to nothing and is ignored.
+
+// What one server push meant: a confirmation of a (un)subscribe, a message to
+// hand to the consumer, or neither.
+class PushEvent {
+  confirm: bool,
+  message: Option<Message>,
+}
+
+// A bulk or simple string as text; anything else is "".
+fn replyText(r: Reply): string {
+  match (r) {
+    Bulk(v) => return unwrapOr(v, "")
+    Simple(s) => return s
+    _ => return ""
+  }
+}
+
+// The elements of a `Push` (RESP3) or an `Array` (RESP2); no other reply has
+// any.
+fn pushItems(r: Reply): []Reply {
+  match (r) {
+    Push(items) => return items
+    Array(items) => return unwrapOr(items, []Reply(0))
+    _ => return []Reply(0)
+  }
+}
+
+// The six replies a (P/S)(UN)SUBSCRIBE produces, one per channel named.
+fn isConfirm(kind: string): bool {
+  return kind == "subscribe" ||
+    kind == "unsubscribe" ||
+    kind == "psubscribe" ||
+    kind == "punsubscribe" ||
+    kind == "ssubscribe" ||
+    kind == "sunsubscribe"
+}
+
+// `message channel payload` / `smessage channel payload` / `pmessage pattern
+// channel payload`. A frame of the wrong arity is dropped rather than
+// guessed at.
+fn parseMessage(kind: string, items: []Reply): Option<Message> {
+  if ((kind == "message" || kind == "smessage") && len(items) == 3) {
+    return Option.Some(
+      Message{
+        channel = replyText(items[1]),
+        pattern = Option.None,
+        payload = replyText(items[2]),
+      },
+    )
+  }
+  if (kind == "pmessage" && len(items) == 4) {
+    return Option.Some(
+      Message{
+        channel = replyText(items[2]),
+        pattern = Option.Some(replyText(items[1])),
+        payload = replyText(items[3]),
+      },
+    )
+  }
+  return Option.None
+}
+
+fn parsePush(r: Reply): PushEvent {
+  let items = pushItems(r)
+  if (len(items) == 0) {
+    return PushEvent{ confirm = false, message = Option.None }
+  }
+  let kind = replyText(items[0])
+  return PushEvent{ confirm = isConfirm(kind), message = parseMessage(kind, items) }
+}
+
+// `PUBLISH` / `SPUBLISH`: the number of subscribers the message reached. Never
+// retried (`readOnly = false`): a second attempt would deliver it twice.
+fn publishCmd(channel: string, payload: string): Cmd<i64> {
+  return Cmd<i64>{
+    args = ["PUBLISH", channel, payload],
+    decode = (r) => asInt(r, "PUBLISH"),
+    readOnly = false,
+  }
+}
+
+fn spublishCmd(channel: string, payload: string): Cmd<i64> {
+  return Cmd<i64>{
+    args = ["SPUBLISH", channel, payload],
+    decode = (r) => asInt(r, "SPUBLISH"),
+    readOnly = false,
+  }
+}
+
+// `PUBSUB CHANNELS [pattern]` / `PUBSUB SHARDCHANNELS [pattern]`. `verb` is
+// the PUBSUB subcommand; an empty `pattern` lists every active channel.
+fn pubsubChannelsCmd(verb: string, pattern: string): Cmd<[]string> {
+  let args = ["PUBSUB", verb]
+  if (pattern != "") {
+    args = append(args, pattern)
+  }
+  return Cmd<[]string>{
+    args = args,
+    decode = (r) => asStrings(r, "PUBSUB ${verb}"),
+    readOnly = true,
+  }
+}
+
+fn pubsubNumPatCmd(): Cmd<i64> {
+  return Cmd<i64>{
+    args = ["PUBSUB", "NUMPAT"],
+    decode = (r) => asInt(r, "PUBSUB NUMPAT"),
+    readOnly = true,
+  }
+}
+
+// `PUBSUB NUMSUB channel...` / `PUBSUB SHARDNUMSUB channel...`: subscriber
+// count per channel, every named channel present (0 when nobody listens).
+fn pubsubNumSubCmd(verb: string, channels: []string): Cmd<map<string, i64>> {
+  let args = ["PUBSUB", verb]
+  args = append(args, ...channels)
+  return Cmd<map<string, i64>>{
+    args = args,
+    decode = (r) => asCounts(r, "PUBSUB ${verb}"),
+    readOnly = true,
+  }
+}
+
+// RESP3 answers NUMSUB with a map, RESP2 with a flat `[channel, count, ...]`
+// array; both end up as one map.
+fn asCounts(r: Reply, cmd: string): map<string, i64>!RedisError {
+  let entries = []MapEntry(0)
+  match (r) {
+    Map(e) => { entries = e }
+    Array(items) => { entries = pairUp(unwrapOr(items, []Reply(0)), cmd)? }
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+  let out = map<string, i64>()
+  let i = 0
+  while (i < len(entries)) {
+    out[replyText(entries[i].key)] = asInt(entries[i].value, cmd)?
+    i = i + 1
+  }
+  return out
+}

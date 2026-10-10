@@ -1,16 +1,497 @@
-// pkg/redis/pubsub.bit — `r.subscribe("news")?` / `for msg of ...`. Epic
-// #6013, #6028: SCAFFOLD ONLY, an empty `Subscription` for a follow-up
-// ticket to fill in against `PSUBSCRIBE`/`SSUBSCRIBE` and RESP3 `Push`
-// replies (`resp3.bit`'s `Reply.Push`). Not wired to `Client` yet — no
-// `subscribe`/`psubscribe` method exists until that ticket lands, so this
-// file has nothing to test beyond compiling.
+// pkg/redis/pubsub.bit - `r.subscribe("news")?` / `for msg of sub { ... }`
+// (#6041, epic #6013). `pubsubcmd.bit` holds the wire halves: `PUBLISH`, the
+// `PUBSUB` introspection commands and `parsePush`.
 //
-// Per epic #6013's SPINE DECISIONS comment (5): iterated with `for msg of`
-// via `next(): Option<Message>` (a class with that method satisfies Bit's
-// iterator trait, #6014 probe d), and separately exposes `messages(): chan
-// <Message>` for select-style use alongside other channels.
-export class Message { export channel: string, export payload: string }
+// A SUBSCRIPTION OWNS A DEDICATED CONNECTION, never a pooled one: a
+// subscribed connection cannot run other commands, so leasing it from the
+// `Client`'s pool would poison the pool. It is dialled with the Client's own
+// `Options` (`conn.bit`'s `dialConn`) and read by ONE reader task
+// (`runReader`), which pushes each `Message` into a bounded channel. The
+// consumer takes them with `next()` (so `for msg of sub` works, SPEC §10.4)
+// or `messages()` (so `select` can wait on it beside other channels).
+//
+// ONE KIND PER SUBSCRIPTION: `subscribe` (channels), `psubscribe` (patterns)
+// or `ssubscribe` (sharded channels). `add`/`remove` change the set of that
+// kind, live, and return once the server has confirmed.
+//
+// BOUNDED BUFFER, DROP OLDEST. The channel holds `Options.subscribeBuffer`
+// messages. A consumer that falls behind loses the OLDEST buffered message
+// (`dropped()` counts them), never blocks the reader: Redis disconnects a
+// subscriber whose output buffer grows past `client-output-buffer-limit
+// pubsub`, so a reader stalled on a slow consumer would turn a slow consumer
+// into a lost connection and every message with it.
+//
+// RECONNECT. When the connection drops, the reader redials with exponential
+// backoff and jitter (`backoffNs`), at most `maxReconnects` times, then
+// resubscribes everything in `want`. Messages published while it was down
+// are LOST: Redis pub/sub has no replay. After the last attempt fails the
+// channel closes, so the iterator ends, and `failure()` says why.
+//
+// LOCKING. `mu` guards the connection's WRITE side, `want` and `conn`'s
+// replacement. The reader never takes it while reading. `add`/`remove` hold
+// it across write-and-confirm so two changes cannot interleave their
+// confirmations; the reader signals a lost connection through `acks` (0), so
+// a change waiting on a dead connection fails at once instead of holding `mu`
+// until its timeout while the reader waits for `mu` to reconnect.
+
+import { Mutex, AtomicI64 } from "std/sync"
+import { sleep, after } from "std/time"
+import { intn } from "std/rand"
+
+// One delivered message. `pattern` is `Some` only for a `psubscribe`
+// subscription: the pattern that matched `channel`.
+export class Message {
+  export channel: string,
+  export pattern: Option<string>,
+  export payload: string,
+}
+
+enum SubKind {
+  Channel,
+  Pattern,
+  Shard,
+}
+
+const maxReconnects: int = 10
+const backoffBaseNs: int = 100000000
+const backoffCapNs: int = 5000000000
+const defaultBuffer: int = 256
+
+// Ack values the reader sends on `Subscription.acks`.
+const ackLost: int = 0
+const ackConfirm: int = 1
+const ackRejected: int = -1
+
+fn subVerb(kind: SubKind): string {
+  match (kind) {
+    Channel => return "SUBSCRIBE"
+    Pattern => return "PSUBSCRIBE"
+    Shard => return "SSUBSCRIBE"
+  }
+}
+
+fn unsubVerb(kind: SubKind): string {
+  match (kind) {
+    Channel => return "UNSUBSCRIBE"
+    Pattern => return "PUNSUBSCRIBE"
+    Shard => return "SUNSUBSCRIBE"
+  }
+}
+
+// Exponential from `backoffBaseNs`, capped at `backoffCapNs`, then jittered
+// into [d/2, d] so a fleet that lost one server does not redial in lockstep.
+fn backoffNs(attempt: int): int {
+  let d = backoffBaseNs
+  let i = 0
+  while (i < attempt && d < backoffCapNs) {
+    d = d * 2
+    i = i + 1
+  }
+  if (d > backoffCapNs) {
+    d = backoffCapNs
+  }
+  let half = d / 2
+  return half + intn(half + 1)
+}
+
+fn hasName(names: []string, n: string): bool {
+  let i = 0
+  while (i < len(names)) {
+    if (names[i] == n) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// `names` that are not already in `have`, each once.
+fn newNames(have: []string, names: []string): []string {
+  let out = []string(0)
+  let i = 0
+  while (i < len(names)) {
+    if (!hasName(have, names[i]) && !hasName(out, names[i])) {
+      out = append(out, names[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// `names` that are in `have`, each once.
+fn presentNames(have: []string, names: []string): []string {
+  let out = []string(0)
+  let i = 0
+  while (i < len(names)) {
+    if (hasName(have, names[i]) && !hasName(out, names[i])) {
+      out = append(out, names[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// `have` without `drop`.
+fn withoutNames(have: []string, drop: []string): []string {
+  let out = []string(0)
+  let i = 0
+  while (i < len(have)) {
+    if (!hasName(drop, have[i])) {
+      out = append(out, have[i])
+    }
+    i = i + 1
+  }
+  return out
+}
 
 export class Subscription {
-  client: Client,
+  opts: Options
+  roots: TrustStore
+  kind: SubKind
+  mu: Mutex
+  conn: redisConn
+  want: []string
+  out: chan<Message>
+  acks: chan<int>
+  drops: AtomicI64
+  closing: AtomicI64
+  failed: Option<RedisError>
+  rejected: Option<RedisError>
+
+  // The next message, blocking until one arrives; `None` once the
+  // subscription is closed (or gave up reconnecting) and the buffer is
+  // drained. This is what `for msg of sub` calls.
+  export next(): Option<Message> {
+    let (m, ok) = <- this.out
+    if (!ok) {
+      return Option.None
+    }
+    return Option.Some(m)
+  }
+
+  // The same stream as a channel, for `select` beside other channels. Closed
+  // exactly when `next()` would return `None`.
+  export messages(): chan<Message> {
+    return this.out
+  }
+
+  // How many messages were discarded because the consumer fell behind.
+  export dropped(): i64 {
+    return this.drops.load()
+  }
+
+  // `Some` when the subscription ended because the server could not be
+  // reached again; `None` while running and after a plain `close()`.
+  export failure(): Option<RedisError> {
+    return this.failed
+  }
+
+  // The names currently subscribed.
+  export names(): []string {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.want
+  }
+
+  // Subscribes to more names of this subscription's kind and returns once
+  // the server confirmed all of them. Names already subscribed are skipped.
+  // On a lost connection the names are kept and applied on reconnect, and
+  // the call fails with `RedisError.Io`.
+  export add(...names: string): ()!RedisError {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let fresh = newNames(this.want, names)
+    return this.change(subVerb(this.kind), fresh, append(this.want, ...fresh))?
+  }
+
+  // Unsubscribes from names; the ones not subscribed are skipped.
+  export remove(...names: string): ()!RedisError {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let gone = presentNames(this.want, names)
+    return this.change(unsubVerb(this.kind), gone, withoutNames(this.want, gone))?
+  }
+
+  // Sends `verb names...` and waits for one confirmation per name. `want`
+  // moves first, so a connection lost mid-call still resubscribes the new
+  // set; a server rejection (`NOPERM`) puts it back.
+  change(verb: string, names: []string, next: []string): ()!RedisError {
+    if (len(names) == 0) {
+      return
+    }
+    if (this.closing.load() == 1) {
+      fail RedisError.Closed
+    }
+    let before = this.want
+    this.want = next
+    drainAcks(this)
+    sendCmd(this, verb, names)?
+    awaitAcks(this, len(names)) catch e {
+      if (wasRejected(this)) {
+        this.want = before
+      }
+      fail e
+    }
+  }
+
+  // Unsubscribes, closes the connection and the message channel. Messages
+  // already buffered stay readable. Idempotent.
+  export close() {
+    if (this.closing.swap(1) == 1) {
+      return
+    }
+    this.mu.lock()
+    defer this.mu.unlock()
+    // The server's reply is what wakes the reader to see `closing`; when the
+    // write fails the connection is dead and the reader is waking anyway.
+    sendCmd(this, unsubVerb(this.kind), []string(0)) catch _ {
+      this.conn.close()
+    }
+  }
+}
+
+fn wasRejected(sub: Subscription): bool {
+  match (sub.rejected) {
+    Some(_) => return true
+    None => return false
+  }
+}
+
+fn sendCmd(sub: Subscription, verb: string, names: []string): ()!RedisError {
+  let args = [verb]
+  args = append(args, ...names)
+  sub.conn.s.write(encodeCommand(args)) catch e {
+    fail classifyTransportError(e)
+  }
+}
+
+// Throws away confirmations nobody asked for (a server-initiated
+// `sunsubscribe`, a stale lost-connection marker) before a change starts
+// counting its own.
+fn drainAcks(sub: Subscription) {
+  let more = true
+  while (more) {
+    select {
+      case _ = <- sub.acks:
+      default:
+        more = false
+    }
+  }
+}
+
+fn signalAck(sub: Subscription, v: int) {
+  select {
+    case sub.acks <- v:
+    default:
+  }
+}
+
+// One ack per name, within `commandTimeout`. A lost connection (`ackLost`) or
+// a server rejection (`ackRejected`) ends the wait with the matching error.
+fn awaitAcks(sub: Subscription, n: int): ()!RedisError {
+  let timeout = after(sub.opts.commandTimeout)
+  let got = 0
+  while (got < n) {
+    let v = ackLost
+    let timedOut = false
+    select {
+      case x = <- sub.acks:
+        v = x
+      case _ = <- timeout:
+        timedOut = true
+    }
+    if (timedOut) {
+      fail RedisError.Timeout
+    }
+    got = got + ackStep(sub, v)?
+  }
+}
+
+fn ackStep(sub: Subscription, v: int): int!RedisError {
+  if (v == ackConfirm) {
+    return 1
+  }
+  if (v == ackRejected) {
+    fail unwrapOr(sub.rejected, RedisError.Closed)
+  }
+  fail RedisError.Io("redis: subscription connection lost, names are applied on reconnect")
+}
+
+// Hands `m` to the consumer. Full buffer: discard the oldest message and try
+// again, a bounded number of times (the consumer may be draining as well).
+fn offer(sub: Subscription, m: Message) {
+  let tries = 0
+  while (tries < 3) {
+    select {
+      case sub.out <- m:
+        return
+      default:
+    }
+    select {
+      case _ = <- sub.out:
+        let _ = sub.drops.add(1)
+      default:
+    }
+    tries = tries + 1
+  }
+  let _ = sub.drops.add(1)
+}
+
+// Reads one reply off the subscription's connection and delivers it. True
+// when it was a (un)subscribe confirmation. A server error reply is a
+// failure here; `connectionBad` tells the caller whether the connection
+// survived it.
+fn readEvent(sub: Subscription): bool!RedisError {
+  let conn = sub.conn
+  let (reply, rest) = decodeReply(conn, conn.buf) catch e {
+    fail classifyDecodeError(e)
+  }
+  conn.buf = rest
+  let r = unwrapAttr(conn, reply)
+  match (r) {
+    Err(msg) => fail fromServer(msg)
+    _ => {}
+  }
+  let ev = parsePush(r)
+  match (ev.message) {
+    Some(m) => offer(sub, m)
+    None => {}
+  }
+  return ev.confirm
+}
+
+// Reads until `n` confirmations arrived, delivering any message that
+// interleaves. Bounded by `commandTimeout` on the whole wait; a timeout
+// mid-reply loses bytes, which is why every caller drops the connection on
+// failure.
+fn confirmInline(sub: Subscription, n: int): ()!RedisError {
+  sub.conn.setDeadline(monotonic().ns + sub.opts.commandTimeout)
+  let seen = 0
+  while (seen < n) {
+    if (readEvent(sub)?) {
+      seen = seen + 1
+    }
+  }
+  sub.conn.setDeadline(0)
+}
+
+fn resubscribe(sub: Subscription): ()!RedisError {
+  if (len(sub.want) == 0) {
+    return
+  }
+  sendCmd(sub, subVerb(sub.kind), sub.want)?
+  confirmInline(sub, len(sub.want))?
+}
+
+// One redial: a fresh connection, swapped in and resubscribed under `mu`.
+fn tryResume(sub: Subscription): bool {
+  let c = dialConn(sub.opts, sub.roots) catch _ {
+    return false
+  }
+  sub.mu.lock()
+  defer sub.mu.unlock()
+  if (sub.closing.load() == 1) {
+    c.close()
+    return false
+  }
+  sub.conn = c
+  resubscribe(sub) catch _ {
+    c.close()
+    return false
+  }
+  return true
+}
+
+// Redials with backoff, at most `maxReconnects` times. False when it gave up
+// or the subscription was closed meanwhile.
+fn reconnect(sub: Subscription): bool {
+  sub.conn.close()
+  let attempt = 0
+  while (attempt < maxReconnects) {
+    sleep(backoffNs(attempt))
+    if (sub.closing.load() == 1) {
+      return false
+    }
+    if (tryResume(sub)) {
+      return true
+    }
+    attempt = attempt + 1
+  }
+  sub.failed = Option.Some(
+    RedisError.Io("redis: subscription lost the server, ${maxReconnects} reconnect attempts failed"),
+  )
+  return false
+}
+
+fn onReadError(sub: Subscription, e: RedisError): bool {
+  if (sub.closing.load() == 1) {
+    return false
+  }
+  if (!connectionBad(e)) {
+    sub.rejected = Option.Some(e)
+    signalAck(sub, ackRejected)
+    return true
+  }
+  signalAck(sub, ackLost)
+  return reconnect(sub)
+}
+
+// One reader step; false once the subscription is over.
+fn pumpOnce(sub: Subscription): bool {
+  let isAck = readEvent(sub) catch e {
+    return onReadError(sub, e)
+  }
+  if (isAck) {
+    signalAck(sub, ackConfirm)
+  }
+  return sub.closing.load() == 0
+}
+
+fn runReader(sub: Subscription) {
+  while (pumpOnce(sub)) {}
+  sub.closing.store(1)
+  sub.conn.close()
+  close(sub.out)
+}
+
+fn bufferCap(opts: Options): int {
+  if (opts.subscribeBuffer < 1) {
+    return defaultBuffer
+  }
+  return opts.subscribeBuffer
+}
+
+// Dials the dedicated connection, subscribes to `names` and starts the
+// reader. Fails (and leaves nothing running) when the server refuses.
+fn openSubscription(opts: Options, kind: SubKind, names: []string): Subscription!RedisError {
+  let want = newNames([]string(0), names)
+  if (len(want) == 0) {
+    fail RedisError.Invalid("redis: subscribe needs at least one name")
+  }
+  let roots = tlsRootsFor(opts)?
+  let conn = dialConn(opts, roots)?
+  let sub = Subscription{
+    opts = opts,
+    roots = roots,
+    kind = kind,
+    mu = Mutex(),
+    conn = conn,
+    want = want,
+    out = chan<Message>(bufferCap(opts)),
+    acks = chan<int>(64),
+    drops = AtomicI64(0),
+    closing = AtomicI64(0),
+    failed = Option.None,
+    rejected = Option.None,
+  }
+  sendCmd(sub, subVerb(kind), want) catch e {
+    conn.close()
+    fail e
+  }
+  confirmInline(sub, len(want)) catch e {
+    conn.close()
+    fail e
+  }
+  spawn runReader(sub)
+  return sub
 }
