@@ -1,21 +1,530 @@
-// pkg/redis/bloom.bit — `r.bloom(key)`: the probabilistic data-structures
-// handle covering RedisBloom's five types (bloom, cuckoo, count-min sketch,
-// top-k, t-digest — epic #6013's data-type list). Epic #6013, #6028:
-// SCAFFOLD ONLY, no commands wired yet (`BF.ADD`, `CF.ADD`, `CMS.INCRBY`,
-// `TOPK.ADD`, `TDIGEST.ADD`, ...). One class for now; a follow-up ticket
-// splits it into five once real commands land, if `Bloom` alone would
-// otherwise cross spec/LINT.md's 800-line/complexity-10 ceilings — not
-// before, since an empty split has nothing to prove it is a pure move yet.
-// `cmd.bit`'s header is the template.
-export class Bloom {
-  client: Client,
-  key: string,
+// pkg/redis/bloom.bit - `r.bloom(key)` and `r.cuckoo(key)`: the Bloom filter
+// (`BF.*`) and cuckoo filter (`CF.*`) commands. Epic #6013, #6028, #6039.
+// Follows `cmd.bit`'s HOW-TO header and `counter.bit`'s shape: one `Cmd<T>`
+// factory per command, an immediate method on the handle, a queued one on
+// its `...Batch`. `sketch.bit` holds the count-min sketch and top-k (and the
+// decoders all five families share), `tdigest.bit` the t-digest.
+//
+// A Bloom filter answers "have I seen this?" with no false negatives and a
+// false-positive rate you choose, in a fixed amount of memory; it cannot
+// remove an item. A cuckoo filter answers the same question and CAN remove
+// one (`delete`) and count one (`count`), at a little more memory.
+//
+// Both hold `runner: Runner`, as `set.bit`'s `Set` does; a write through a
+// pinned runner (`tx.read`) is refused (#7738), `tx.bloom(key)` queues it.
+//
+// ONE METHOD PER COMMAND, TYPED OPTIONS. `reserve` takes the growth policy as
+// a `BloomGrowth` (`EXPANSION` and `NONSCALING` exclude each other, so they
+// are one value, not two flags); `insert` takes its `CAPACITY`, `ERROR`,
+// `NOCREATE` as an options class. `BF.ADD` is `add`, `BF.MADD` is `addMany`
+// and the same split holds for `exists`, as `set.bit`'s `has`/`hasMany`.
+//
+// `BF.INFO key FIELD` (one field) is not wired: `info()` returns every field
+// as a `BloomInfo`, which is the same round trip.
+
+// How a Bloom filter grows when it reaches its capacity. `Default` leaves it
+// to the server, `Expansion(n)` makes each new sub-filter `n` times the size
+// of the last, `NonScaling` refuses to grow (adding past capacity is then the
+// server's error).
+export enum BloomGrowth {
+  Default,
+  Expansion(i64),
+  NonScaling,
 }
 
-// The queued view `Pipeline.bloom`/`Tx.bloom` both return — `cmd.bit`'s
-// `Batch` is the ONE client-side queue the two executors share, so this
-// is the ONLY queued view Bloom needs (`cmd.bit`'s header, point 2).
+// `BF.INSERT`'s optional arguments. A `None` (or `Default`) leaves the
+// server's own default; `noCreate` fails when the key does not exist instead
+// of creating it.
+export class BloomInsertOptions {
+  export capacity: Option<i64> = Option.None,
+  export errorRate: Option<f64> = Option.None,
+  export growth: BloomGrowth = BloomGrowth.Default,
+  export noCreate: bool = false,
+}
+
+// `BF.INFO`. `expansion` is `None` for a non-scaling filter.
+export class BloomInfo {
+  export capacity: i64,
+  export size: i64,
+  export filters: i64,
+  export items: i64,
+  export expansion: Option<i64>,
+}
+
+// `CF.RESERVE`'s optional arguments; a `None` leaves the server's default.
+export class CuckooReserveOptions {
+  export bucketSize: Option<i64> = Option.None,
+  export maxIterations: Option<i64> = Option.None,
+  export expansion: Option<i64> = Option.None,
+}
+
+// `CF.INSERT` / `CF.INSERTNX`'s optional arguments.
+export class CuckooInsertOptions {
+  export capacity: Option<i64> = Option.None,
+  export noCreate: bool = false,
+}
+
+// What `CF.INSERT` / `CF.INSERTNX` did with one item: stored it (`Added`),
+// skipped it because it was there already (`Exists`, only `INSERTNX`), or
+// could not store it because the filter is full (`Full`).
+export enum CuckooInsert {
+  Added,
+  Exists,
+  Full,
+}
+
+// `CF.INFO`.
+export class CuckooInfo {
+  export size: i64,
+  export buckets: i64,
+  export filters: i64,
+  export items: i64,
+  export deleted: i64,
+  export bucketSize: i64,
+  export expansion: i64,
+  export maxIterations: i64,
+}
+
+export class Bloom {
+  runner: Runner
+  key: string
+
+  // `BF.RESERVE`: creates the filter for about `capacity` items at a
+  // false-positive probability of `errorRate` (e.g. 0.01).
+  export reserve(
+    errorRate: f64,
+    capacity: i64,
+    growth: BloomGrowth = BloomGrowth.Default,
+  ): ()!RedisError {
+    return this.runner.runCmd(bfReserveCmd(this.key, errorRate, capacity, growth))?
+  }
+  // `BF.ADD`: true when the item was new, false when it was probably there.
+  // Creates the filter with the server's defaults if the key is missing.
+  export add(item: string): bool!RedisError {
+    return this.runner.runCmd(bfAddCmd(this.key, item))?
+  }
+  // `BF.MADD`: `add` for several items, one answer each.
+  export addMany(...items: string): []bool!RedisError {
+    return this.runner.runCmd(bfAddManyCmd(this.key, items))?
+  }
+  // `BF.INSERT`: `addMany` that can create the filter with your own settings.
+  export insert(
+    items: []string,
+    opts: BloomInsertOptions = BloomInsertOptions{},
+  ): []bool!RedisError {
+    return this.runner.runCmd(bfInsertCmd(this.key, items, opts))?
+  }
+  // `BF.EXISTS`: false is certain, true is "probably".
+  export exists(item: string): bool!RedisError {
+    return this.runner.runCmd(bfExistsCmd(this.key, item))?
+  }
+  // `BF.MEXISTS`: `exists` for several items.
+  export existsMany(...items: string): []bool!RedisError {
+    return this.runner.runCmd(bfExistsManyCmd(this.key, items))?
+  }
+  // `BF.CARD`: how many distinct items were added.
+  export card(): i64!RedisError { return this.runner.runCmd(bfCardCmd(this.key))? }
+  export info(): BloomInfo!RedisError { return this.runner.runCmd(bfInfoCmd(this.key))? }
+  // `BF.SCANDUMP`: the next chunk of a dump, starting at iterator 0.
+  export scanDump(iterator: i64): ScanChunk!RedisError {
+    return this.runner.runCmd(scanDumpCmd("BF.SCANDUMP", this.key, iterator))?
+  }
+  // `BF.LOADCHUNK`: restores a chunk `scanDump` produced at `iterator`.
+  export loadChunk(iterator: i64, data: string): ()!RedisError {
+    return this.runner.runCmd(loadChunkCmd("BF.LOADCHUNK", this.key, iterator, data))?
+  }
+}
+
+// The queued view `Pipeline.bloom`/`Tx.bloom` both return - `cmd.bit`'s
+// `Batch` is the ONE client-side queue the two executors share.
 export class BloomBatch {
-  batch: Batch,
+  batch: Batch
+  key: string
+
+  export reserve(
+    errorRate: f64,
+    capacity: i64,
+    growth: BloomGrowth = BloomGrowth.Default,
+  ): Future<()> {
+    return this.batch.queue(bfReserveCmd(this.key, errorRate, capacity, growth))
+  }
+  export add(item: string): Future<bool> { return this.batch.queue(bfAddCmd(this.key, item)) }
+  export addMany(...items: string): Future<[]bool> {
+    return this.batch.queue(bfAddManyCmd(this.key, items))
+  }
+  export insert(
+    items: []string,
+    opts: BloomInsertOptions = BloomInsertOptions{},
+  ): Future<[]bool> {
+    return this.batch.queue(bfInsertCmd(this.key, items, opts))
+  }
+  export exists(item: string): Future<bool> {
+    return this.batch.queue(bfExistsCmd(this.key, item))
+  }
+  export existsMany(...items: string): Future<[]bool> {
+    return this.batch.queue(bfExistsManyCmd(this.key, items))
+  }
+  export card(): Future<i64> { return this.batch.queue(bfCardCmd(this.key)) }
+  export info(): Future<BloomInfo> { return this.batch.queue(bfInfoCmd(this.key)) }
+  export scanDump(iterator: i64): Future<ScanChunk> {
+    return this.batch.queue(scanDumpCmd("BF.SCANDUMP", this.key, iterator))
+  }
+  export loadChunk(iterator: i64, data: string): Future<()> {
+    return this.batch.queue(loadChunkCmd("BF.LOADCHUNK", this.key, iterator, data))
+  }
+}
+
+export class Cuckoo {
+  runner: Runner
+  key: string
+
+  // `CF.RESERVE`: creates the filter for about `capacity` items.
+  export reserve(
+    capacity: i64,
+    opts: CuckooReserveOptions = CuckooReserveOptions{},
+  ): ()!RedisError {
+    return this.runner.runCmd(cfReserveCmd(this.key, capacity, opts))?
+  }
+  // `CF.ADD`: stores the item (a duplicate is stored again, and `count`
+  // goes up); fails when the filter is full. Creates the key if missing.
+  export add(item: string): bool!RedisError {
+    return this.runner.runCmd(cfAddCmd("CF.ADD", this.key, item))?
+  }
+  // `CF.ADDNX`: stores the item only if it is not there; true when stored.
+  export addIfMissing(item: string): bool!RedisError {
+    return this.runner.runCmd(cfAddCmd("CF.ADDNX", this.key, item))?
+  }
+  // `CF.INSERT`: `add` for several items, one `CuckooInsert` each.
+  export insert(
+    items: []string,
+    opts: CuckooInsertOptions = CuckooInsertOptions{},
+  ): []CuckooInsert!RedisError {
+    return this.runner.runCmd(cfInsertCmd("CF.INSERT", this.key, items, opts))?
+  }
+  // `CF.INSERTNX`: `addIfMissing` for several items.
+  export insertIfMissing(
+    items: []string,
+    opts: CuckooInsertOptions = CuckooInsertOptions{},
+  ): []CuckooInsert!RedisError {
+    return this.runner.runCmd(cfInsertCmd("CF.INSERTNX", this.key, items, opts))?
+  }
+  export exists(item: string): bool!RedisError {
+    return this.runner.runCmd(cfExistsCmd(this.key, item))?
+  }
+  export existsMany(...items: string): []bool!RedisError {
+    return this.runner.runCmd(cfExistsManyCmd(this.key, items))?
+  }
+  // `CF.DEL`: removes one copy of the item; false when it was not there.
+  export delete(item: string): bool!RedisError {
+    return this.runner.runCmd(cfDeleteCmd(this.key, item))?
+  }
+  // `CF.COUNT`: how many copies of the item were stored.
+  export count(item: string): i64!RedisError {
+    return this.runner.runCmd(cfCountCmd(this.key, item))?
+  }
+  export info(): CuckooInfo!RedisError { return this.runner.runCmd(cfInfoCmd(this.key))? }
+  export scanDump(iterator: i64): ScanChunk!RedisError {
+    return this.runner.runCmd(scanDumpCmd("CF.SCANDUMP", this.key, iterator))?
+  }
+  export loadChunk(iterator: i64, data: string): ()!RedisError {
+    return this.runner.runCmd(loadChunkCmd("CF.LOADCHUNK", this.key, iterator, data))?
+  }
+}
+
+// The queued view `Pipeline.cuckoo`/`Tx.cuckoo` both return.
+export class CuckooBatch {
+  batch: Batch
+  key: string
+
+  export reserve(
+    capacity: i64,
+    opts: CuckooReserveOptions = CuckooReserveOptions{},
+  ): Future<()> {
+    return this.batch.queue(cfReserveCmd(this.key, capacity, opts))
+  }
+  export add(item: string): Future<bool> {
+    return this.batch.queue(cfAddCmd("CF.ADD", this.key, item))
+  }
+  export addIfMissing(item: string): Future<bool> {
+    return this.batch.queue(cfAddCmd("CF.ADDNX", this.key, item))
+  }
+  export insert(
+    items: []string,
+    opts: CuckooInsertOptions = CuckooInsertOptions{},
+  ): Future<[]CuckooInsert> {
+    return this.batch.queue(cfInsertCmd("CF.INSERT", this.key, items, opts))
+  }
+  export insertIfMissing(
+    items: []string,
+    opts: CuckooInsertOptions = CuckooInsertOptions{},
+  ): Future<[]CuckooInsert> {
+    return this.batch.queue(cfInsertCmd("CF.INSERTNX", this.key, items, opts))
+  }
+  export exists(item: string): Future<bool> {
+    return this.batch.queue(cfExistsCmd(this.key, item))
+  }
+  export existsMany(...items: string): Future<[]bool> {
+    return this.batch.queue(cfExistsManyCmd(this.key, items))
+  }
+  export delete(item: string): Future<bool> { return this.batch.queue(cfDeleteCmd(this.key, item)) }
+  export count(item: string): Future<i64> { return this.batch.queue(cfCountCmd(this.key, item)) }
+  export info(): Future<CuckooInfo> { return this.batch.queue(cfInfoCmd(this.key)) }
+  export scanDump(iterator: i64): Future<ScanChunk> {
+    return this.batch.queue(scanDumpCmd("CF.SCANDUMP", this.key, iterator))
+  }
+  export loadChunk(iterator: i64, data: string): Future<()> {
+    return this.batch.queue(loadChunkCmd("CF.LOADCHUNK", this.key, iterator, data))
+  }
+}
+
+// ------------------------------------------------------------------- shared
+
+// `name value` when `v` is set, nothing otherwise.
+fn optInt(name: string, v: Option<i64>): []string {
+  match (v) {
+    Some(n) => return [name, "${n}"]
+    None => return []string(0)
+  }
+}
+
+fn optFloat(name: string, v: Option<f64>): []string {
+  match (v) {
+    Some(f) => return [name, "${f}"]
+    None => return []string(0)
+  }
+}
+
+fn scanDumpCmd(name: string, key: string, iterator: i64): Cmd<ScanChunk> {
+  return Cmd<ScanChunk>{
+    args = [name, key, "${iterator}"],
+    decode = (r) => asScanChunk(r, name),
+    readOnly = true,
+  }
+}
+
+fn loadChunkCmd(name: string, key: string, iterator: i64, data: string): Cmd<()> {
+  return Cmd<()>{
+    args = [name, key, "${iterator}", data],
+    decode = (r) => asOk(r, name),
+    readOnly = false,
+  }
+}
+
+// -------------------------------------------------------------------- bloom
+
+fn growthWords(growth: BloomGrowth): []string {
+  match (growth) {
+    Default => return []string(0)
+    Expansion(n) => return ["EXPANSION", "${n}"]
+    NonScaling => return ["NONSCALING"]
+  }
+}
+
+fn bfReserveCmd(key: string, errorRate: f64, capacity: i64, growth: BloomGrowth): Cmd<()> {
+  return Cmd<()>{
+    args = append(["BF.RESERVE", key, "${errorRate}", "${capacity}"], ...growthWords(growth)),
+    decode = (r) => asOk(r, "BF.RESERVE"),
+    readOnly = false,
+  }
+}
+
+fn bfAddCmd(key: string, item: string): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["BF.ADD", key, item],
+    decode = (r) => asBool(r, "BF.ADD"),
+    readOnly = false,
+  }
+}
+
+fn bfAddManyCmd(key: string, items: []string): Cmd<[]bool> {
+  return Cmd<[]bool>{
+    args = append(["BF.MADD", key], ...items),
+    decode = (r) => sketchBools(r, "BF.MADD"),
+    readOnly = false,
+  }
+}
+
+fn bfInsertArgs(key: string, items: []string, opts: BloomInsertOptions): []string {
+  let args = append(["BF.INSERT", key], ...optInt("CAPACITY", opts.capacity))
+  args = append(args, ...optFloat("ERROR", opts.errorRate))
+  args = append(args, ...growthWords(opts.growth))
+  if (opts.noCreate) {
+    args = append(args, "NOCREATE")
+  }
+  args = append(args, "ITEMS")
+  return append(args, ...items)
+}
+
+fn bfInsertCmd(key: string, items: []string, opts: BloomInsertOptions): Cmd<[]bool> {
+  return Cmd<[]bool>{
+    args = bfInsertArgs(key, items, opts),
+    decode = (r) => sketchBools(r, "BF.INSERT"),
+    readOnly = false,
+  }
+}
+
+fn bfExistsCmd(key: string, item: string): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["BF.EXISTS", key, item],
+    decode = (r) => asBool(r, "BF.EXISTS"),
+    readOnly = true,
+  }
+}
+
+fn bfExistsManyCmd(key: string, items: []string): Cmd<[]bool> {
+  return Cmd<[]bool>{
+    args = append(["BF.MEXISTS", key], ...items),
+    decode = (r) => sketchBools(r, "BF.MEXISTS"),
+    readOnly = true,
+  }
+}
+
+fn bfCardCmd(key: string): Cmd<i64> {
+  return Cmd<i64>{ args = ["BF.CARD", key], decode = (r) => asInt(r, "BF.CARD"), readOnly = true }
+}
+
+fn bfInfoCmd(key: string): Cmd<BloomInfo> {
+  return Cmd<BloomInfo>{ args = ["BF.INFO", key], decode = (r) => asBloomInfo(r), readOnly = true }
+}
+
+fn asBloomInfo(r: Reply): BloomInfo!RedisError {
+  let pairs = sketchPairs(r, "BF.INFO")?
+  return BloomInfo{
+    capacity = sketchField(pairs, "Capacity", "BF.INFO")?,
+    size = sketchField(pairs, "Size", "BF.INFO")?,
+    filters = sketchField(pairs, "Number of filters", "BF.INFO")?,
+    items = sketchField(pairs, "Number of items inserted", "BF.INFO")?,
+    expansion = sketchOptField(pairs, "Expansion rate", "BF.INFO")?,
+  }
+}
+
+// ------------------------------------------------------------------- cuckoo
+
+fn cfReserveArgs(key: string, capacity: i64, opts: CuckooReserveOptions): []string {
+  let args = append(["CF.RESERVE", key, "${capacity}"], ...optInt("BUCKETSIZE", opts.bucketSize))
+  args = append(args, ...optInt("MAXITERATIONS", opts.maxIterations))
+  return append(args, ...optInt("EXPANSION", opts.expansion))
+}
+
+fn cfReserveCmd(key: string, capacity: i64, opts: CuckooReserveOptions): Cmd<()> {
+  return Cmd<()>{
+    args = cfReserveArgs(key, capacity, opts),
+    decode = (r) => asOk(r, "CF.RESERVE"),
+    readOnly = false,
+  }
+}
+
+fn cfAddCmd(name: string, key: string, item: string): Cmd<bool> {
+  return Cmd<bool>{ args = [name, key, item], decode = (r) => asBool(r, name), readOnly = false }
+}
+
+fn cfInsertArgs(name: string, key: string, items: []string, opts: CuckooInsertOptions): []string {
+  let args = append([name, key], ...optInt("CAPACITY", opts.capacity))
+  if (opts.noCreate) {
+    args = append(args, "NOCREATE")
+  }
+  args = append(args, "ITEMS")
+  return append(args, ...items)
+}
+
+fn cfInsertCmd(
+  name: string,
   key: string,
+  items: []string,
+  opts: CuckooInsertOptions,
+): Cmd<[]CuckooInsert> {
+  return Cmd<[]CuckooInsert>{
+    args = cfInsertArgs(name, key, items, opts),
+    decode = (r) => sketchList<CuckooInsert>(r, name, (e) => asCuckooInsert(e, name)),
+    readOnly = false,
+  }
+}
+
+// `1` (RESP3 may send a boolean for it) stored, `0` was there, `-1` full.
+fn asCuckooInsert(r: Reply, cmd: string): CuckooInsert!RedisError {
+  match (r) {
+    Bool(b) => return cuckooInsertOf(b, cmd)
+    Int(n) => return cuckooInsertOfInt(n, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// RESP3 turns `CF.INSERT`'s 1 / -1 into true / false, so there false is the
+// full filter; `CF.INSERTNX` answers 1 / 0 / -1 as integers on both protocols
+// and never sends a boolean, where false would mean "was there".
+fn cuckooInsertOf(stored: bool, cmd: string): CuckooInsert {
+  if (stored) {
+    return CuckooInsert.Added
+  }
+  if (cmd == "CF.INSERT") {
+    return CuckooInsert.Full
+  }
+  return CuckooInsert.Exists
+}
+
+fn cuckooInsertOfInt(n: i64, cmd: string): CuckooInsert!RedisError {
+  if (n == 1) {
+    return CuckooInsert.Added
+  }
+  if (n == 0) {
+    return CuckooInsert.Exists
+  }
+  if (n == -1) {
+    return CuckooInsert.Full
+  }
+  fail RedisError.Unexpected(cmd, "Int")
+}
+
+fn cfExistsCmd(key: string, item: string): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["CF.EXISTS", key, item],
+    decode = (r) => asBool(r, "CF.EXISTS"),
+    readOnly = true,
+  }
+}
+
+fn cfExistsManyCmd(key: string, items: []string): Cmd<[]bool> {
+  return Cmd<[]bool>{
+    args = append(["CF.MEXISTS", key], ...items),
+    decode = (r) => sketchBools(r, "CF.MEXISTS"),
+    readOnly = true,
+  }
+}
+
+fn cfDeleteCmd(key: string, item: string): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["CF.DEL", key, item],
+    decode = (r) => asBool(r, "CF.DEL"),
+    readOnly = false,
+  }
+}
+
+fn cfCountCmd(key: string, item: string): Cmd<i64> {
+  return Cmd<i64>{
+    args = ["CF.COUNT", key, item],
+    decode = (r) => asInt(r, "CF.COUNT"),
+    readOnly = true,
+  }
+}
+
+fn cfInfoCmd(key: string): Cmd<CuckooInfo> {
+  return Cmd<CuckooInfo>{
+    args = ["CF.INFO", key],
+    decode = (r) => asCuckooInfo(r),
+    readOnly = true,
+  }
+}
+
+fn asCuckooInfo(r: Reply): CuckooInfo!RedisError {
+  let pairs = sketchPairs(r, "CF.INFO")?
+  return CuckooInfo{
+    size = sketchField(pairs, "Size", "CF.INFO")?,
+    buckets = sketchField(pairs, "Number of buckets", "CF.INFO")?,
+    filters = sketchField(pairs, "Number of filters", "CF.INFO")?,
+    items = sketchField(pairs, "Number of items inserted", "CF.INFO")?,
+    deleted = sketchField(pairs, "Number of items deleted", "CF.INFO")?,
+    bucketSize = sketchField(pairs, "Bucket size", "CF.INFO")?,
+    expansion = sketchField(pairs, "Expansion rate", "CF.INFO")?,
+    maxIterations = sketchField(pairs, "Max iterations", "CF.INFO")?,
+  }
 }

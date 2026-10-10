@@ -146,7 +146,7 @@ PLATFORM_PAIRS="alloc cryptohw gc net park rand root sched thread"
 # bit_rt_port_park_wake`/`bit_rt_port_park_wait`, which only
 # runtime/park/<os>/wait.bit provides, so this was the actual reason ANY
 # program failed to LINK for x86_64-windows before this landed (verified
-# 2026-08-21, _tests_/bit/windowssmoke.bit's header). `sched` landed #3339 (the
+# 2026-08-21, _tests_/bit/windowssmoke/windowssmoke.bit's header). `sched` landed #3339 (the
 # IOCP netpoller, runtime/sched/windows/poll.bit) and IS both consumed and
 # wired: runtime/root/windows/boot.bit's step 4b/8b and `workerBody` call
 # `pollCreate`/`pollDrain`/`pollClose` from it, the same three points

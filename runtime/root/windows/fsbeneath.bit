@@ -6,44 +6,52 @@
 // data stream, a reparse point (symlink, junction, mount point, anything) in
 // ANY `rel` component, a directory, a non-disk device, or any open failure.
 //
-// WHY NOT HANDLE-RELATIVE (`NtCreateFile` with `RootDirectory`, the exact
-// analogue of Linux's `openat` walk): it needs ntdll.dll, and the Windows
-// admission table (compiler/pesyms.bit) admits only kernel32 and friends
-// for the file system; `GetFinalPathNameByHandleW`, `OpenFileById` and
-// `GetProcAddress` are not admitted either. So this is the path-based walk
-// built from `CreateFileW` and `GetFileInformationByHandle` alone, made
-// race-free by PINNING, not by string checks:
+// HANDLE-RELATIVE, the exact analogue of Linux's `openat2(RESOLVE_BENEATH |
+// RESOLVE_NO_SYMLINKS)` walk (#7817; #5808 shipped a path-based walk with
+// pinned ancestors, which left `root`'s own path string re-resolved at every
+// step). No path string is resolved after the first open:
 //
-// - `root` is opened normally, following its own symlinks and junctions (the
-//   trusted boundary, same as the other two platforms).
-// - Then `rel` is walked one component at a time, opening the cumulative
-//   path `root\a`, `root\a\b`, ... Every prefix is opened with
-//   `FILE_FLAG_OPEN_REPARSE_POINT`, so a reparse point at that component is
-//   opened ITSELF, not followed, and `GetFileInformationByHandle` on that
-//   same handle reports `FILE_ATTRIBUTE_REPARSE_POINT`: refused. The check
-//   reads the object the handle is bound to, never the name (the shape
-//   ./fsrw.bit's `rtFsOpenNoFollowW` already uses for the leaf).
-// - Every directory handle stays open until the leaf is open. A directory
-//   opened with `FILE_LIST_DIRECTORY` and a share mode of `FILE_SHARE_READ`
-//   alone (no WRITE, no DELETE) cannot be renamed, deleted or replaced by
-//   another opener (rename and delete need DELETE access; setting a reparse
-//   point needs write access, and a non-empty directory cannot become one at
-//   all). `FILE_READ_ATTRIBUTES` access alone would NOT pin: the I/O manager
-//   records share access only for data/delete access, so the list-directory
-//   bit is load-bearing. With every ancestor pinned and verified a
-//   non-reparse directory, re-resolving the prefix string for the next
-//   component can only reach the objects already held: the parent-swap race
-//   #5787 found has no window.
+// - `root` is opened ONCE with `CreateFileW`, following its own symlinks and
+//   junctions (the trusted boundary, same as the other two platforms). That
+//   handle is the walk's anchor.
+// - Every component of `rel` is then opened with `NtCreateFile`
+//   (ntdll.dll, https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntcreatefile)
+//   whose `OBJECT_ATTRIBUTES.RootDirectory` is the PREVIOUS component's
+//   handle and whose `ObjectName` is that one component (the docs: "if this
+//   value is non-NULL, the ObjectName member specifies a file name relative
+//   to this directory"). The kernel never looks at an ancestor's name again,
+//   so a link swapped anywhere above the handle, in `root`'s path or in
+//   `rel`'s, cannot redirect the walk.
+// - `OBJ_DONT_REPARSE` in `OBJECT_ATTRIBUTES.Attributes` (docs: "no reparse
+//   points will be followed when parsing the name of the associated object.
+//   If any reparses are encountered the attempt will fail", status
+//   `STATUS_REPARSE_POINT_ENCOUNTERED`;
+//   https://learn.microsoft.com/en-us/windows/win32/api/ntdef/ns-ntdef-_object_attributes).
+//   A pre-1607 kernel rejects the unknown attribute bit: every open then
+//   fails, which is closed.
+// - `FILE_OPEN_REPARSE_POINT` in `CreateOptions` (docs: "normal reparse
+//   processing does not occur and NtCreateFile attempts to directly open the
+//   reparse point file"; .../ddi/ntifs/nf-ntifs-ntcreatefile). A reparse
+//   point at a component is opened ITSELF, and `GetFileInformationByHandle`
+//   on that same handle reports `FILE_ATTRIBUTE_REPARSE_POINT`: refused. The
+//   check reads the object the handle is bound to, never the name. The two
+//   flags are independent defences: either alone refuses a link.
+// - `OBJ_CASE_INSENSITIVE` keeps Win32's case-insensitive name match, which
+//   `NtCreateFile` otherwise replaces by the file system's exact match.
+// - `FILE_DIRECTORY_FILE` for an ancestor and `FILE_NON_DIRECTORY_FILE` for
+//   the leaf (docs: the file "is a directory" / "is not a directory"), so a
+//   file in the middle or a directory at the end fails in the kernel as well
+//   as in the attribute check.
+// - `FILE_SYNCHRONOUS_IO_NONALERT` with `SYNCHRONIZE` makes the returned
+//   leaf handle a synchronous one, as `CreateFileW` does: `ReadFile` in
+//   ./fsrw.bit is called without an OVERLAPPED.
+// - Only the previous handle is held while the next opens, and it is closed
+//   once the next is open. An ancestor handle stays bound to its directory
+//   object however its name is later renamed or relinked, which is `openat`.
 // - The leaf handle is the returned fd. It was opened and checked as one
 //   object, so a swap of the name afterwards changes nothing about what the
 //   fd reads. Opened with `FILE_SHARE_READ|WRITE|DELETE` like any ordinary
 //   open (./fs.bit's `winShareAll`).
-//
-// KNOWN BOUNDARY: only `rel`'s ancestors are pinned, plus `root`'s own last
-// component. `root` is the caller's trusted configuration; if a link INSIDE
-// root's own path string is swappable by an attacker, the cumulative
-// re-resolution follows it. The other two platforms resolve against the
-// root's fd and do not have this. Closing it needs `NtCreateFile` (above).
 //
 // `rel` IS CHECKED IN UTF-16, AFTER ENCODING, because that is what Win32
 // normalizes. Both `/` and `\` separate components (the lexical
@@ -59,8 +67,10 @@
 // handle must also be `FILE_TYPE_DISK`, the backstop for a device name the
 // list above misses.
 //
-// MAX_PATH: `root\rel` must fit 259 UTF-16 units like every path in this
-// module (./fs.bit's header); a longer one is refused, never truncated.
+// LENGTH: `root` is a Win32 path handed to `CreateFileW`, so it must fit 259
+// UTF-16 units like every path in this module (./fs.bit's header); `rel` is
+// not a Win32 path any more, only `fsBeneathRelUnits` (4096) units of scratch.
+// Either longer is refused, never truncated.
 //
 // A reparse point of ANY kind is refused, including ones Windows resolves
 // transparently (OneDrive placeholders, deduplicated or WOF-compressed
@@ -79,19 +89,52 @@ extern fn GetFileType(handle: *byte): i32
 
 // `CreateFileW` flag and access values, from `winbase.h`/`winnt.h`.
 const winFileFlagBackupSemantics: int = 33554432 // 0x02000000, needed to open a directory
-const beneathDirAccess: int = 129                // FILE_LIST_DIRECTORY (0x1) | FILE_READ_ATTRIBUTES (0x80)
-const beneathDirShare: int = 1                   // FILE_SHARE_READ only: the pin, see the header
+const beneathDirAccess: int = 129                // FILE_LIST_DIRECTORY (0x1) | FILE_READ_ATTRIBUTES (0x80), the root
 const winFileTypeDisk: int = 1                   // FILE_TYPE_DISK
 
 const winPathSep: int = 92 // '\'
 
-// One handle slot per directory on the walk: `root` plus at most 129
-// components fit 259 UTF-16 units; 132 leaves headroom. Per worker plus the
-// fallback, like every scratch in this module (./fs.bit). Scalar arrays,
-// never scanned by the collector (ABI.md §5, rule 1).
-const beneathMaxDepth: int = 132
-let fsBeneathHandles: [4356]i64 // 33 * beneathMaxDepth
-let fsBeneathBuf: [2145]i64     // 33 slots of fsWinPathBytes, the cumulative path
+// Per worker plus the fallback, like every scratch in this module (./fs.bit).
+// Scalar arrays, never scanned by the collector (ABI.md §5, rule 1).
+const fsBeneathRelUnits: int = 4096
+const fsBeneathRelBytes: int = 8192 // fsBeneathRelUnits * 2
+let fsBeneathBuf: [2145]i64         // 33 slots of fsWinPathBytes: the NUL-terminated `root`
+let fsBeneathRel: [33792]i64        // 33 slots of fsBeneathRelBytes: the encoded `rel`
+
+// `NtCreateFile` (winternl.h) and the structures it takes, all in one
+// 96-byte per-worker slot: OBJECT_ATTRIBUTES @0 (48 bytes on x64), the
+// UNICODE_STRING it names @48 (16), IO_STATUS_BLOCK @64 (16), the PHANDLE
+// out @80 (8).
+extern fn NtCreateFile(
+  handleOut: *byte,
+  access: i32,
+  objAttrs: *byte,
+  ioStatus: *byte,
+  allocSize: *byte,
+  fileAttrs: i32,
+  share: i32,
+  disposition: i32,
+  options: i32,
+  eaBuffer: *byte,
+  eaLength: i32,
+): i32
+let fsNtScratch: [396]i64 // 33 slots of 12 words
+const ntSlotBytes: int = 96
+const ntOaLength: int = 48
+const ntUsOff: int = 48
+const ntIosbOff: int = 64
+const ntHandleOff: int = 80
+
+// `OBJECT_ATTRIBUTES.Attributes`: OBJ_CASE_INSENSITIVE (0x40) | OBJ_DONT_REPARSE (0x1000).
+const ntObjAttrs: int = 4160
+const ntFileOpen: int = 1 // CreateDisposition FILE_OPEN: fail if absent
+// DesiredAccess: FILE_LIST_DIRECTORY (0x1) | FILE_READ_ATTRIBUTES (0x80) | SYNCHRONIZE (0x100000)
+const ntDirAccess: int = 1048705
+const ntLeafAccess: int = 1179785 // FILE_GENERIC_READ (0x120089)
+// CreateOptions: FILE_DIRECTORY_FILE (0x1) | FILE_SYNCHRONOUS_IO_NONALERT (0x20) | FILE_OPEN_REPARSE_POINT (0x200000)
+const ntDirOptions: int = 2097185
+// FILE_NON_DIRECTORY_FILE (0x40) in place of FILE_DIRECTORY_FILE
+const ntLeafOptions: int = 2097248
 
 // Packed lowercase-ASCII keys of the legacy DOS device stems (`lowerKey`).
 const keyCon: int = 6516590
@@ -283,66 +326,83 @@ const keyConOut: int = 27988542801409060 // "conout$"
   return int(GetFileType(h)) == winFileTypeDisk
 }
 
-// Opens the NUL-terminated UTF-16 path `p` as a pinned directory (see the
-// header). `follow` is the root: links followed, a reparse point allowed.
-// Otherwise the reparse point itself is opened and refused. -1 on failure.
-@nosplit fn openPinnedDir(p: int, follow: bool): int {
-  let flags = winFileFlagBackupSemantics
-  if (!follow) {
-    flags = flags | winFileFlagOpenReparsePoint
-  }
+// Opens the NUL-terminated UTF-16 path `p` as the walk's anchor: links
+// followed, a reparse point allowed (the trusted root). -1 on failure.
+@nosplit fn openRoot(p: int): int {
   let nilSec: *byte = nil
   let nilTemplate: *byte = nil
   let h = CreateFileW(
     hAt(p),
     i32(beneathDirAccess),
-    i32(beneathDirShare),
-    nilSec,
-    i32(winOpenExisting),
-    i32(flags),
-    nilTemplate,
-  )
-  if (int(h) == winInvalidHandle) {
-    return 0 - 1
-  }
-  if (!handleIsExpected(h, true, follow)) {
-    CloseHandle(h)
-    return 0 - 1
-  }
-  return int(h)
-}
-
-// Opens the NUL-terminated UTF-16 path `p` as the leaf: a file, read-only,
-// the reparse point itself if it is one (then refused). -1 on failure.
-@nosplit fn openLeaf(p: int): int {
-  let nilSec: *byte = nil
-  let nilTemplate: *byte = nil
-  let h = CreateFileW(
-    hAt(p),
-    i32(winGenericRead),
     i32(winShareAll),
     nilSec,
     i32(winOpenExisting),
-    i32(winFileAttrNormal | winFileFlagOpenReparsePoint),
+    i32(winFileFlagBackupSemantics),
     nilTemplate,
   )
   if (int(h) == winInvalidHandle) {
     return 0 - 1
   }
-  if (!handleIsExpected(h, false, false)) {
+  if (!handleIsExpected(h, true, true)) {
     CloseHandle(h)
     return 0 - 1
   }
   return int(h)
 }
 
-// Closes the `count` handles stored from `hs`. BOUNDED by `count`.
-@nosplit fn closeHeld(hs: int, count: int) {
-  let i = 0
-  while (i < count) {
-    CloseHandle(hAt(loadWord(hs + i * 8)))
-    i = i + 1
+// Fills this worker's `fsNtScratch` slot for an open of the `units`-unit name
+// at `name` relative to the directory handle `parent`; the slot's address.
+@nosplit fn ntPrepare(parent: int, name: int, units: int): int {
+  let sl = int(ptrOf(fsNtScratch)) + fsScratchSlot() * ntSlotBytes
+  storeWord(sl, ntOaLength)
+  storeWord(sl + 8, parent)
+  storeWord(sl + 16, sl + ntUsOff)
+  storeWord(sl + 24, ntObjAttrs)
+  storeWord(sl + 32, 0)
+  storeWord(sl + 40, 0)
+  storeWord(sl + ntUsOff, (units * 2) | ((units * 2) << 16)) // Length, MaximumLength
+  storeWord(sl + ntUsOff + 8, name)
+  storeWord(sl + ntHandleOff, 0)
+  return sl
+}
+
+// Opens the `units`-unit component at `name` relative to `parent`: a
+// directory, or the leaf (a file) when `leaf`. -1 on any failure, including a
+// reparse point, which `OBJ_DONT_REPARSE` and `FILE_OPEN_REPARSE_POINT` each
+// stop and `handleIsExpected` refuses once more. Does NOT close `parent`.
+@nosplit fn ntOpenAt(parent: int, name: int, units: int, leaf: bool): int {
+  let sl = ntPrepare(parent, name, units)
+  let access = ntDirAccess
+  let options = ntDirOptions
+  if (leaf) {
+    access = ntLeafAccess
+    options = ntLeafOptions
   }
+  let nilPtr: *byte = nil
+  let status = NtCreateFile(
+    hAt(sl + ntHandleOff),
+    i32(access),
+    hAt(sl),
+    hAt(sl + ntIosbOff),
+    nilPtr,
+    i32(0),
+    i32(winShareAll),
+    i32(ntFileOpen),
+    i32(options),
+    nilPtr,
+    i32(0),
+  )
+  // NT_SUCCESS is "top bit clear"; tested on the bit so it holds whether
+  // `int()` sign- or zero-extends the i32.
+  if ((int(status) & 2147483648) != 0) {
+    return 0 - 1
+  }
+  let h = hAt(loadWord(sl + ntHandleOff))
+  if (!handleIsExpected(h, !leaf, false)) {
+    CloseHandle(h)
+    return 0 - 1
+  }
+  return int(h)
 }
 
 // The unit index of the `\` ending the component that starts at `i`, or `e`.
@@ -355,77 +415,51 @@ const keyConOut: int = 27988542801409060 // "conout$"
   return j
 }
 
-// Opens `buf`'s prefix ending at unit `j` (a directory, or the leaf when `j`
-// is `e`): temporarily NUL-terminates the cumulative path there.
-@nosplit fn openPrefix(buf: int, j: int, e: int): int {
-  let saved = unitAt(buf, j)
-  setUnit(buf, j, 0)
-  let h = 0 - 1
-  if (j == e) {
-    h = openLeaf(buf)
-  } else {
-    h = openPinnedDir(buf, false)
-  }
-  setUnit(buf, j, saved)
-  return h
-}
-
-// The walk: `buf` holds `root\rel` (root units [0, rootU), `rel` units
-// [relStart, relEnd)). Holds every directory handle until the leaf is open,
-// then closes them all but the leaf. BOUNDED by `relEnd` and
-// `beneathMaxDepth`.
-@nosplit fn walkPinned(buf: int, rootU: int, relStart: int, relEnd: int): int {
-  let hs = int(ptrOf(fsBeneathHandles)) + fsScratchSlot() * beneathMaxDepth * 8
-  setUnit(buf, rootU, 0)
-  let root = openPinnedDir(buf, true)
-  setUnit(buf, rootU, winPathSep)
-  if (root < 0) {
-    return 0 - 1
-  }
-  storeWord(hs, root)
-  let held = 1
-  let i = relStart
+// The walk: `buf` holds `rel` (units [0, relEnd)); `cur` is the open `root`
+// handle, owned from here on. Each component opens relative to the previous
+// handle, which is closed once the next is open (or on failure). The leaf
+// handle, or -1. BOUNDED by `relEnd`.
+@nosplit fn walkHandles(buf: int, relEnd: int, root: int): int {
+  let cur = root
+  let i = 0
   while (i <= relEnd) {
     let j = componentEnd(buf, i, relEnd)
-    let h = 0 - 1
-    if (held < beneathMaxDepth) {
-      h = openPrefix(buf, j, relEnd)
-    }
+    let h = ntOpenAt(cur, buf + i * 2, j - i, j == relEnd)
+    CloseHandle(hAt(cur))
     if (h < 0) {
-      closeHeld(hs, held)
       return 0 - 1
     }
-    storeWord(hs + held * 8, h)
-    held = held + 1
+    cur = h
     i = j + 1
   }
-  let leaf = loadWord(hs + (held - 1) * 8)
-  closeHeld(hs, held - 1)
-  return leaf
+  return cur
 }
 
-// Shared body of the two exports below. Encodes `root\rel` into this
-// worker's `fsBeneathBuf` slot (one UTF-16 string, so the walk's prefixes are
-// NUL-terminated in place), refuses an unsafe `rel`, then walks.
+// Shared body of the two exports below. Encodes `root` into this worker's
+// `fsBeneathBuf` slot (NUL-terminated, for `CreateFileW`) and `rel` into its
+// `fsBeneathRel` slot, refuses an unsafe `rel`, opens the root once, walks.
 @nosplit fn openBeneathImpl(rootWords: int, rootN: int, relWords: int, relN: int): int {
-  let buf = int(ptrOf(fsBeneathBuf)) + fsScratchSlot() * fsWinPathBytes
-  let rootU = encodeNulFree(rootWords, rootN, buf, fsWinPathUnits - 3)
+  let slot = fsScratchSlot()
+  let rootBuf = int(ptrOf(fsBeneathBuf)) + slot * fsWinPathBytes
+  let relBuf = int(ptrOf(fsBeneathRel)) + slot * fsBeneathRelBytes
+  let rootU = encodeNulFree(rootWords, rootN, rootBuf, fsWinPathUnits - 1)
   if (rootU <= 0) {
     return 0 - 1
   }
-  setUnit(buf, rootU, winPathSep)
-  let relStart = rootU + 1
-  let relU = encodeNulFree(relWords, relN, buf + relStart * 2, fsWinPathUnits - 1 - relStart)
+  setUnit(rootBuf, rootU, 0)
+  let relU = encodeNulFree(relWords, relN, relBuf, fsBeneathRelUnits)
   if (relU <= 0) {
     return 0 - 1
   }
-  let relEnd = relStart + relU
-  setUnit(buf, relEnd, 0)
-  normalizeSeps(buf, relStart, relEnd)
-  if (!relIsSafe(buf, relStart, relEnd)) {
+  normalizeSeps(relBuf, 0, relU)
+  if (!relIsSafe(relBuf, 0, relU)) {
     return 0 - 1
   }
-  return walkPinned(buf, rootU, relStart, relEnd)
+  let root = openRoot(rootBuf)
+  if (root < 0) {
+    return 0 - 1
+  }
+  return walkHandles(relBuf, relU, root)
 }
 
 export @nosplit @symbol("bit_rt_fs_open_beneath_w") fn rtFsOpenBeneathW(
