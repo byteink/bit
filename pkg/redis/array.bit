@@ -1,17 +1,176 @@
-// pkg/redis/array.bit — `r.array(key)`: the array handle. Epic
-// #6013, #6028: SCAFFOLD ONLY, no commands wired yet (`ARSET, ARGET, ARAPPEND (Redis 8.8's array type)`, a
-// follow-up ticket) — this file exists so later family tickets touch only
-// their own file, never `client.bit`. `cmd.bit`'s header is the template:
-// one `Cmd<T>` factory per command, called from a method here.
+// pkg/redis/array.bit - `r.array(key)`: Redis 8.8's array type, a sparse
+// sequence addressed by `u64` index (`ARSET`, `ARGET`, `ARINSERT` and the rest
+// of the `AR*` commands; all of them exist in `redis:8.10.2`). Epic #6013,
+// #6028, #6040. Follows `cmd.bit`'s HOW-TO header and `counter.bit`'s shape:
+// one `Cmd<T>` factory per command (`arraycmd.bit`, which also holds the
+// option types), an immediate method on the handle, a queued one on its
+// `...Batch`.
+//
+// An array is a list you can write anywhere: `set(1000000, "x")` stores one
+// value and costs one value. Slots never written are empty (`None`). It also
+// has an append cursor: `insert` writes at the next free index, `ring` wraps
+// that cursor inside a fixed window (a bounded recent-items buffer), `seek`
+// moves it.
+//
+// INDEXES ARE `u64`, 0 through 2^64-2 (`arraycmd.bit`'s header). `length()`
+// is the highest index plus one; `count()` is how many slots hold a value.
+//
+// `Arr` holds `runner: Runner` (`set.bit`'s `Set` does): `r.array(key)` runs
+// over the pool; a write through a pinned runner (`tx.read`) is refused
+// (#7738), `tx.array(key)` queues it.
+
 export class Arr {
-  client: Client,
-  key: string,
+  runner: Runner
+  key: string
+
+  // `ARSET`: stores `values` at `index`, `index + 1`, ...; how many were set.
+  export set(index: u64, ...values: string): i64!RedisError {
+    return this.runner.runCmd(arsetCmd(this.key, index, values))?
+  }
+  // `ARMSET`: stores each entry at its own index; how many were set.
+  export mset(...entries: ArEntry): i64!RedisError {
+    return this.runner.runCmd(armsetCmd(this.key, entries))?
+  }
+  // `ARGET`: the value at `index`; `None` for an empty slot or a missing key.
+  export get(index: u64): Option<string>!RedisError {
+    return this.runner.runCmd(argetCmd(this.key, index))?
+  }
+  // `ARMGET`: `get` for several indexes.
+  export mget(...indexes: u64): []Option<string>!RedisError {
+    return this.runner.runCmd(armgetCmd(this.key, indexes))?
+  }
+  // `ARGETRANGE`: every slot from `start` to `end` inclusive; `start > end`
+  // reads backwards.
+  export getRange(start: u64, end: u64): []Option<string>!RedisError {
+    return this.runner.runCmd(argetrangeCmd(this.key, start, end))?
+  }
+  // `ARINSERT`: appends `values` at the cursor; the index of the last one.
+  export insert(...values: string): u64!RedisError {
+    return this.runner.runCmd(arinsertCmd(this.key, values))?
+  }
+  // `ARRING`: appends `values` into a ring of `size` slots, overwriting the
+  // oldest; the index of the last one written.
+  export ring(size: i64, ...values: string): u64!RedisError {
+    return this.runner.runCmd(arringCmd(this.key, size, values))?
+  }
+  // `ARNEXT`: the index `insert` would write at.
+  export next(): u64!RedisError { return this.runner.runCmd(arnextCmd(this.key))? }
+  // `ARSEEK`: moves the cursor `insert` and `ring` use.
+  export seek(index: u64): bool!RedisError {
+    return this.runner.runCmd(arseekCmd(this.key, index))?
+  }
+  // `ARLASTITEMS`: the `count` most recently inserted values, oldest first
+  // (newest first with `rev`).
+  export lastItems(count: i64, rev: bool = false): []Option<string>!RedisError {
+    return this.runner.runCmd(arlastitemsCmd(this.key, count, rev))?
+  }
+  // `ARCOUNT`: how many slots hold a value.
+  export count(): i64!RedisError { return this.runner.runCmd(arcountCmd(this.key))? }
+  // `ARLEN`: the highest index plus one.
+  export length(): u64!RedisError { return this.runner.runCmd(arlenCmd(this.key))? }
+  // `ARDEL`: empties the slots; how many held a value.
+  export del(...indexes: u64): i64!RedisError {
+    return this.runner.runCmd(ardelCmd(this.key, indexes))?
+  }
+  // `ARDELRANGE`: empties every slot in the inclusive ranges.
+  export delRange(...ranges: ArRange): i64!RedisError {
+    return this.runner.runCmd(ardelrangeCmd(this.key, ranges))?
+  }
+  // `ARSCAN`: the filled slots in `start..end`, with their indexes; at most
+  // `limit` of them.
+  export scan(start: u64, end: u64, limit: Option<i64> = Option.None): []ArEntry!RedisError {
+    return this.runner.runCmd(arscanCmd(this.key, start, end, limit))?
+  }
+  // `ARGREP`: the indexes in `start..end` whose value satisfies `preds`.
+  export grep(
+    start: u64,
+    end: u64,
+    preds: []ArPred,
+    opts: ArGrepOptions = ArGrepOptions{},
+  ): []u64!RedisError {
+    return this.runner.runCmd(argrepCmd(this.key, start, end, preds, opts))?
+  }
+  // `ARGREP ... WITHVALUES`: `grep` with the matching values.
+  export grepValues(
+    start: u64,
+    end: u64,
+    preds: []ArPred,
+    opts: ArGrepOptions = ArGrepOptions{},
+  ): []ArEntry!RedisError {
+    return this.runner.runCmd(argrepValuesCmd(this.key, start, end, preds, opts))?
+  }
+  // `AROP`: sums, mins, ... the numeric values in `start..end`, or counts the
+  // ones equal to a value or the filled slots.
+  export aggregate(start: u64, end: u64, op: ArOp): ArAgg!RedisError {
+    return this.runner.runCmd(aropCmd(this.key, start, end, op))?
+  }
+  // `ARINFO`; `full` adds the slice statistics.
+  export info(full: bool = false): ArInfo!RedisError {
+    return this.runner.runCmd(arinfoCmd(this.key, full))?
+  }
 }
 
-// The queued view `Pipeline.array`/`Tx.array` both return — `cmd.bit`'s
-// `Batch` is the ONE client-side queue the two executors share, so this
-// is the ONLY queued view Arr needs (`cmd.bit`'s header, point 2).
+// The queued view `Pipeline.array`/`Tx.array` both return - `cmd.bit`'s
+// `Batch` is the ONE client-side queue the two executors share.
 export class ArrBatch {
-  batch: Batch,
-  key: string,
+  batch: Batch
+  key: string
+
+  export set(index: u64, ...values: string): Future<i64> {
+    return this.batch.queue(arsetCmd(this.key, index, values))
+  }
+  export mset(...entries: ArEntry): Future<i64> {
+    return this.batch.queue(armsetCmd(this.key, entries))
+  }
+  export get(index: u64): Future<Option<string>> {
+    return this.batch.queue(argetCmd(this.key, index))
+  }
+  export mget(...indexes: u64): Future<[]Option<string>> {
+    return this.batch.queue(armgetCmd(this.key, indexes))
+  }
+  export getRange(start: u64, end: u64): Future<[]Option<string>> {
+    return this.batch.queue(argetrangeCmd(this.key, start, end))
+  }
+  export insert(...values: string): Future<u64> {
+    return this.batch.queue(arinsertCmd(this.key, values))
+  }
+  export ring(size: i64, ...values: string): Future<u64> {
+    return this.batch.queue(arringCmd(this.key, size, values))
+  }
+  export next(): Future<u64> { return this.batch.queue(arnextCmd(this.key)) }
+  export seek(index: u64): Future<bool> { return this.batch.queue(arseekCmd(this.key, index)) }
+  export lastItems(count: i64, rev: bool = false): Future<[]Option<string>> {
+    return this.batch.queue(arlastitemsCmd(this.key, count, rev))
+  }
+  export count(): Future<i64> { return this.batch.queue(arcountCmd(this.key)) }
+  export length(): Future<u64> { return this.batch.queue(arlenCmd(this.key)) }
+  export del(...indexes: u64): Future<i64> { return this.batch.queue(ardelCmd(this.key, indexes)) }
+  export delRange(...ranges: ArRange): Future<i64> {
+    return this.batch.queue(ardelrangeCmd(this.key, ranges))
+  }
+  export scan(start: u64, end: u64, limit: Option<i64> = Option.None): Future<[]ArEntry> {
+    return this.batch.queue(arscanCmd(this.key, start, end, limit))
+  }
+  export grep(
+    start: u64,
+    end: u64,
+    preds: []ArPred,
+    opts: ArGrepOptions = ArGrepOptions{},
+  ): Future<[]u64> {
+    return this.batch.queue(argrepCmd(this.key, start, end, preds, opts))
+  }
+  export grepValues(
+    start: u64,
+    end: u64,
+    preds: []ArPred,
+    opts: ArGrepOptions = ArGrepOptions{},
+  ): Future<[]ArEntry> {
+    return this.batch.queue(argrepValuesCmd(this.key, start, end, preds, opts))
+  }
+  export aggregate(start: u64, end: u64, op: ArOp): Future<ArAgg> {
+    return this.batch.queue(aropCmd(this.key, start, end, op))
+  }
+  export info(full: bool = false): Future<ArInfo> {
+    return this.batch.queue(arinfoCmd(this.key, full))
+  }
 }

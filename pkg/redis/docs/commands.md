@@ -74,3 +74,5 @@ reply shapes these methods match against and what nil means on the wire.
 TLS these methods run over.
 
 [Requests per minute: time series](timeseries.md) covers the `TS.*` commands behind `r.timeseries(key)`.
+
+[Similar players and per-round scores](vectors-and-arrays.md) covers the `V*` commands behind `r.vset(key)` and the `AR*` commands behind `r.array(key)`.

@@ -11,6 +11,7 @@
 | [Sorted sets](sorted-sets.md) | `r.zset(key)`: leaderboards, ranges by rank, score or name, blocking pops, combining boards |
 | [Locations, unique counts and bitmaps](geo-hll-bitmaps.md) | `r.geo(key)`, `r.hll(key)`, `r.bitmap(key)`: nearby search, HyperLogLog counts, `BITOP`, `BITFIELD` |
 | [Seen, trending and percentiles](probabilistic.md) | `r.bloom(key)`, `r.cuckoo(key)`, `r.cms(key)`, `r.topk(key)`, `r.tdigest(key)`: has this been seen, how often, the top items, p99 latency |
+| [Similar players and per-round scores](vectors-and-arrays.md) | `r.vset(key)`, `r.array(key)`: nearest-neighbour search with attribute filters, sparse `u64`-indexed arrays, cursors, rings, `ARGREP`, `AROP` |
 | [Articles as JSON documents](json.md) | `r.json(key)`: paths, writing a part, counters and flags in place, arrays, several articles at once, reads inside a transaction |
 | [Strings and keys](strings-and-keys.md) | `set`/`get` options, `r.str(key)`, `r.keys()`: TTLs, `TYPE`, `RENAME`, `SCAN`, reads inside a transaction |
 | [Requests per minute: time series](timeseries.md) | `r.timeseries(key)`, `r.timeseriesMulti()`: samples, counting, aggregated ranges, label filters, grouping, compaction rules |
