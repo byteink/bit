@@ -33,6 +33,8 @@ class AllocPoints {
   // later instruction can still read one. `polls` is deliberately NOT included:
   // a poll clobbers a different, smaller set and is handled separately. An `asm`
   // block naming a caller-saved register is one too (#6382, asmPointPositions).
+  // #7778: `withCallCfg` moves the call safepoints out to `clobberCalls`, so
+  // only the poll-cache prefetch and the asm points stay on the linear test.
   clobbers: []int,
   // #6561: the plain calls (codegenlive.bit's `isPlainCallOp`: Op.Call, and
   // Op.RtCall since #7708), carried apart from `clobbers` because every
@@ -52,6 +54,15 @@ class AllocPoints {
   // #7771: per element k of `calls`, at 2k and 2k + 1, the first position of
   // each block the call's own block branches to, or -1.
   callSuccs: []int,
+  // #7778: the returning call safepoints that are not plain calls (gc_alloc,
+  // make_closure, value and interface calls), with their own `callReads` and
+  // `callSuccs`. Judged by the CFG as `calls` are, but on `crossesPoint`'s
+  // inclusive boundary: make_closure stores its environment after the
+  // allocation returns and a value or interface call probes after loading,
+  // so a read AT one of them is a read after the registers die.
+  clobberCalls: []int,
+  clobberReads: []int,
+  clobberSuccs: []int,
   // #7251: the caller-saved registers each `asm` block pins as `input` or
   // `result` (AsmPin). Empty on a backend that still excludes every pin from
   // the whole function.
@@ -91,7 +102,8 @@ fn allocPoints(safepoints: []int, clobbers: []int): AllocPoints {
   return AllocPoints{
     safepoints = safepoints, calleeSafepoints = safepoints,
     polls = []int(0), clobbers = clobbers, calls = []int(0), callReads = []int(0),
-    callSuccs = []int(0), pins = []AsmPin(0),
+    callSuccs = []int(0), clobberCalls = []int(0), clobberReads = []int(0),
+    clobberSuccs = []int(0), pins = []AsmPin(0),
   }
 }
 
@@ -273,23 +285,42 @@ fn crossesAnyCallLinear(iv: LiveInterval, ps: []int): bool {
 // successor starting outside the interval is one the value is dead in. Both
 // halves keep `crossesCall`'s linear test, so this is true only where the
 // linear answer was.
+//
+// #7778: the other call safepoints (`clobberCalls`) are judged the same way on
+// `crossesPoint`; an allocation inlined into a cold `fail newError(...)` block
+// had kept argon2ParseInt's `c - '0'` in a stack slot on x86-64. `callReads`
+// and `clobberReads` are filled together, so one emptiness test covers both.
 fn crossesAnyCall(iv: LiveInterval, points: AllocPoints): bool {
   if (len(points.callReads) == 0) {
     return crossesAnyCallLinear(iv, points.calls)
   }
-  assert(iv.vreg >= 0 && iv.vreg < len(points.callReads))
-  assert(len(points.callSuccs) == 2 * len(points.calls))
-  if (crossesCall(iv, points.callReads[iv.vreg])) {
+  return crossesCfg(iv, points.calls, points.callReads, points.callSuccs, false) ||
+    crossesCfg(iv, points.clobberCalls, points.clobberReads, points.clobberSuccs, true)
+}
+
+// Live across one of `at` by the CFG facts `reads` and `succs`, on
+// `crossesPoint` when `inclusive`, else on `crossesCall`.
+fn crossesCfg(iv: LiveInterval, at: []int, reads: []int, succs: []int, inclusive: bool): bool {
+  assert(iv.vreg >= 0 && iv.vreg < len(reads))
+  assert(len(succs) == 2 * len(at))
+  if (crossesAt(iv, reads[iv.vreg], inclusive)) {
     return true
   }
   let k = 0
-  while (k < len(points.calls)) {
-    if (crossesCall(iv, points.calls[k]) && entersInterval(iv, points.callSuccs, k)) {
+  while (k < len(at)) {
+    if (crossesAt(iv, at[k], inclusive) && entersInterval(iv, succs, k)) {
       return true
     }
     k = k + 1
   }
   return false
+}
+
+fn crossesAt(iv: LiveInterval, p: int, inclusive: bool): bool {
+  if (inclusive) {
+    return crossesPoint(iv, p)
+  }
+  return crossesCall(iv, p)
 }
 
 // Whether a successor of call k's block starts inside `iv`.
@@ -302,21 +333,49 @@ fn coversPos(iv: LiveInterval, p: int): bool {
 }
 
 // #7771: `p` with the CFG facts `crossesAnyCall` reads, from `f` and the
-// intervals and copy roots `buildIntervals` made for it.
+// intervals and copy roots `buildIntervals` made for it. #7778: the members
+// of `clobbers` that are call safepoints move to `clobberCalls`, derived as the
+// backends derive them (`xClobberPoints` over `plainCallPoints(.., false)`).
+// One occurrence each: the poll-cache prefetch shares the entry block's first
+// position with a call there, and stays.
 fn withCallCfg(f: IrFunc, built: IntervalBuild, p: AllocPoints): AllocPoints {
-  p.callReads = callReadsOf(f, built, p.calls)
+  p.callReads = callReadsOf(f, built, p.calls, false)
   p.callSuccs = callSuccsOf(f, p.calls)
+  p.clobberCalls = nonReturningFiltered(f, plainCallPoints(f, p.calleeSafepoints, false))
+  p.clobbers = withoutEach(p.clobbers, p.clobberCalls, len(f.instrs))
+  p.clobberReads = callReadsOf(f, built, p.clobberCalls, true)
+  p.clobberSuccs = callSuccsOf(f, p.clobberCalls)
   return p
 }
 
+// `xs` less one occurrence of each of `drop`, all of which it must hold, over
+// positions below `n`. Bounded by len(xs) + len(drop).
+fn withoutEach(xs: []int, drop: []int, n: int): []int {
+  let left = []int(n)
+  for d of drop {
+    left[d] = left[d] + 1
+  }
+  let out = []int(0)
+  for x of xs {
+    if (left[x] > 0) {
+      left[x] = left[x] - 1
+      continue
+    }
+    out = append(out, x)
+  }
+  assert(len(out) + len(drop) == len(xs), "#7778: a call safepoint missing from clobbers")
+  return out
+}
+
 // Per vreg, the latest of `calls` ahead of one of its reads inside the read's
-// block, or -1. A read is charged to the reader's copy root and the answer is
-// copied back to every alias: an alias shares its root's register
-// (`mergeAliases`), so a read of either is a read of that register. A read
+// block, or -1; `inclusive` makes a member the witness of its own operands.
+// A read is charged to the reader's copy root and the answer is copied back to
+// every alias: an alias shares its root's register (`mergeAliases`), so a
+// read of either is a read of that register. A read
 // `buildIntervals` did not charge (an edge argument whose param is dead, #2934)
 // lies past the value's end and is skipped; the allocator already treats the
 // value as dead there. Bounded by the instruction count and operand lists.
-fn callReadsOf(f: IrFunc, built: IntervalBuild, calls: []int): []int {
+fn callReadsOf(f: IrFunc, built: IntervalBuild, calls: []int, inclusive: bool): []int {
   let n = len(f.instrs)
   assert(len(built.intervals) == n && (len(built.roots) == 0 || len(built.roots) == n))
   let isCall = []bool(n)
@@ -330,15 +389,7 @@ fn callReadsOf(f: IrFunc, built: IntervalBuild, calls: []int): []int {
     i = i + 1
   }
   for b of f.blocks {
-    let last = -1
-    let q = b.instsStart + b.paramCount
-    while (q < b.instsStart + b.instsLen) {
-      noteCallReads(out, built, instrOperands(f, q), q, last)
-      if (isCall[q]) {
-        last = q
-      }
-      q = q + 1
-    }
+    noteBlockReads(out, f, built, b, isCall, inclusive)
   }
   i = 0
   while (i < len(built.roots)) {
@@ -346,6 +397,23 @@ fn callReadsOf(f: IrFunc, built: IntervalBuild, calls: []int): []int {
     i = i + 1
   }
   return out
+}
+
+fn noteBlockReads(
+  out: []int, f: IrFunc, built: IntervalBuild, b: IrBlock, isCall: []bool, inclusive: bool,
+) {
+  let last = -1
+  let q = b.instsStart + b.paramCount
+  while (q < b.instsStart + b.instsLen) {
+    if (inclusive && isCall[q]) {
+      last = q
+    }
+    noteCallReads(out, built, instrOperands(f, q), q, last)
+    if (isCall[q]) {
+      last = q
+    }
+    q = q + 1
+  }
 }
 
 fn noteCallReads(out: []int, built: IntervalBuild, ops: []int, q: int, last: int) {
