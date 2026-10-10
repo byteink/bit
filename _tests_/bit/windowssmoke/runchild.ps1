@@ -18,6 +18,12 @@
 # `wsmoke-run: TIMEOUT` line on stderr; 125 when the job object could not be set up.
 # <redirectTo> runs the child as `cmd /c "<exe> > <redirectTo>"`, the raw handle
 # redirect the manyprints phase asserts on.
+#
+# With WSMOKE_LAG set (#7829) the child's stdout is relayed through this script and
+# a final `wsmoke-run: lag-ms=<n>` line follows it: <n> is the wall clock when the
+# child ended minus the `unixms=<ms>` stamp the child printed just before it
+# returned (exitblockedwindows), i.e. how long the process outlived `main`. -1 when
+# the child printed no stamp.
 param(
   [Parameter(Mandatory = $true)][string]$Exe,
   [Parameter(Mandatory = $true)][int]$TimeoutSec,
@@ -73,10 +79,21 @@ if ($RedirectTo -eq '') {
   $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
   $psi.Arguments = '/c ""' + $path + '" > "' + (Join-Path $PWD.Path $RedirectTo) + '""'
 }
+$lag = $env:WSMOKE_LAG -ne $null -and $env:WSMOKE_LAG -ne ''
+$psi.RedirectStandardOutput = $lag
 $p = [System.Diagnostics.Process]::Start($psi)
+$relay = if ($lag) { $p.StandardOutput.ReadToEndAsync() } else { $null }
 if (-not $p.WaitForExit($TimeoutSec * 1000)) {
   $p.Kill()
   [Console]::Error.WriteLine("wsmoke-run: TIMEOUT after ${TimeoutSec}s, killed $Exe (pid $($p.Id))")
   exit 124
+}
+$endMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+if ($lag) {
+  $text = $relay.Result
+  [Console]::Out.Write($text)
+  $m = [regex]::Match($text, 'unixms=(\d+)')
+  $ms = if ($m.Success) { $endMs - [int64]$m.Groups[1].Value } else { -1 }
+  [Console]::Out.WriteLine("wsmoke-run: lag-ms=$ms")
 }
 exit $p.ExitCode
