@@ -17,5 +17,4 @@
 | [Requests per minute: time series](timeseries.md) | `r.timeseries(key)`, `r.timeseriesMulti()`: samples, counting, aggregated ranges, label filters, grouping, compaction rules |
 | [Pub/sub](pubsub.md) | `r.subscribe`, `psubscribe`, `ssubscribe`: live score updates, adding and removing channels, reconnects, a slow reader, `publish` and `PUBSUB` |
 | [Scripting](scripting.md) | `Script`: EVALSHA with automatic load, `Fn` and `Functions`, scripts in pipelines, read-only scripts |
-| [Idempotency keys across servers](idempotency.md) | `RedisIdempotencyStore`: `pkg/web`'s `idempotency` middleware over Redis, the atomic `SET ... NX GET`, what is stored, failures |
 | [RESP2](resp.md) | The wire protocol: `Reply`, nil vs. empty, errors, what is not implemented |
