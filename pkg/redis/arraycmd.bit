@@ -1,0 +1,420 @@
+// pkg/redis/arraycmd.bit - the wire half of `array.bit`: one `Cmd<T>` factory
+// per `AR*` command, the argument builders behind them and the decoders for
+// their replies. Epic #6013, #6028, #6040. A pure split of one family, the way
+// `jsoncmd.bit` is `json.bit`'s.
+//
+// INDEXES ARE `u64`. The server accepts 0 through 2^64-2. RESP3 has no
+// unsigned integer: an index above 2^63-1 arrives as a big number (`(...`),
+// and under RESP2 as a bulk string. `asIndex` reads all three; `parseU64`
+// is the only place a decimal string becomes a `u64`.
+//
+// A SLOT WITH NO VALUE IS `None`. `ARGET`, `ARMGET`, `ARGETRANGE` and
+// `ARLASTITEMS` answer a null for an index nothing was ever set at.
+
+// One index and the value stored there.
+export class ArEntry {
+  export index: u64,
+  export value: string,
+}
+
+// An inclusive index range, for `delRange`.
+export class ArRange {
+  export start: u64,
+  export end: u64,
+}
+
+// `ARGREP`'s textual predicates: `Exact` the whole value, `Match` a
+// substring, `Glob` a glob pattern, `Re` a regular expression.
+export enum ArPred {
+  Exact(string),
+  Match(string),
+  Glob(string),
+  Re(string),
+}
+
+// How `ARGREP` combines several predicates; `Default` leaves it to the
+// server (`Or`).
+export enum ArCombine {
+  Default,
+  And,
+  Or,
+}
+
+// `ARGREP`'s optional arguments; unset leaves the server's default.
+export class ArGrepOptions {
+  export combine: ArCombine = ArCombine.Default,
+  export limit: Option<i64> = Option.None,
+  export noCase: bool = false,
+}
+
+// What `aggregate` computes over the elements of a range.
+export enum ArOp {
+  Sum,
+  Min,
+  Max,
+  And,
+  Or,
+  Xor,
+  Match(string),
+  Used,
+}
+
+// An `ARINFO`'s `FULL` extras.
+export class ArInfoFull {
+  export denseSlices: i64,
+  export sparseSlices: i64,
+  export avgDenseSize: f64,
+  export avgDenseFill: f64,
+  export avgSparseSize: f64,
+}
+
+// `ARINFO`. `len` is the highest index plus one; `full` is set by
+// `info(full = true)`.
+export class ArInfo {
+  export count: i64,
+  export len: u64,
+  export nextInsertIndex: u64,
+  export slices: i64,
+  export directorySize: i64,
+  export superDirEntries: i64,
+  export sliceSize: i64,
+  export full: Option<ArInfoFull> = Option.None,
+}
+
+// `AROP`'s answer: the integer ops give `Int`, `Sum`/`Min`/`Max` give the
+// number the server printed (`Int` when whole, `Float` otherwise), and an
+// empty range has no `Min`/`Max`: `Empty`.
+export enum ArAgg {
+  Int(i64),
+  Float(f64),
+  Empty,
+}
+
+fn parseU64(s: string, cmd: string): u64!RedisError {
+  if (s == "" || len(s) > 20) {
+    fail RedisError.Unexpected(cmd, "Bulk")
+  }
+  let n = u64(0)
+  let i = 0
+  while (i < len(s)) {
+    let d = parseInt(s[i:i + 1]) catch _ {
+      fail RedisError.Unexpected(cmd, "Bulk")
+    }
+    n = n * u64(10) + u64(d)
+    i = i + 1
+  }
+  return n
+}
+
+fn asIndex(r: Reply, cmd: string): u64!RedisError {
+  match (r) {
+    Int(n) => return indexOfInt(n, cmd)?
+    BigNumber(s) => return parseU64(s, cmd)?
+    Bulk(v) => return parseU64(unwrapOr(v, ""), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn indexOfInt(n: i64, cmd: string): u64!RedisError {
+  if (n < 0) {
+    fail RedisError.Unexpected(cmd, "Int")
+  }
+  return u64(n)
+}
+
+fn asIndexes(r: Reply, cmd: string): []u64!RedisError {
+  return sketchList<u64>(r, cmd, (e) => asIndex(e, cmd))?
+}
+
+fn asArEntry(r: Reply, cmd: string): ArEntry!RedisError {
+  let pair = replyItems(r, cmd)?
+  if (len(pair) != 2) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  return ArEntry{ index = asIndex(pair[0], cmd)?, value = replyToString(pair[1], cmd)? }
+}
+
+fn asArEntries(r: Reply, cmd: string): []ArEntry!RedisError {
+  return sketchList<ArEntry>(r, cmd, (e) => asArEntry(e, cmd))?
+}
+
+fn asAgg(r: Reply): ArAgg!RedisError {
+  match (r) {
+    Int(n) => return ArAgg.Int(n)
+    Null => return ArAgg.Empty
+    Bulk(v) => return aggOfText(v)?
+    _ => fail RedisError.Unexpected("AROP", shapeName(r))
+  }
+}
+
+fn aggOfText(v: Option<string>): ArAgg!RedisError {
+  match (v) {
+    None => return ArAgg.Empty
+    Some(s) => {
+      let whole = parseInt(s) catch _ {
+        return ArAgg.Float(doubleFromBulk(v, "AROP")?)
+      }
+      return ArAgg.Int(whole)
+    }
+  }
+}
+
+fn asArInfo(r: Reply, full: bool): ArInfo!RedisError {
+  let p = sketchPairs(r, "ARINFO")?
+  let extra: Option<ArInfoFull> = Option.None
+  if (full) {
+    extra = Option.Some(infoFull(p)?)
+  }
+  return ArInfo{
+    count = sketchField(p, "count", "ARINFO")?,
+    len = asIndex(infoFind(p, "len"), "ARINFO")?,
+    nextInsertIndex = asIndex(infoFind(p, "next-insert-index"), "ARINFO")?,
+    slices = sketchField(p, "slices", "ARINFO")?,
+    directorySize = sketchField(p, "directory-size", "ARINFO")?,
+    superDirEntries = sketchField(p, "super-dir-entries", "ARINFO")?,
+    sliceSize = sketchField(p, "slice-size", "ARINFO")?,
+    full = extra,
+  }
+}
+
+fn infoFull(p: []MapEntry): ArInfoFull!RedisError {
+  return ArInfoFull{
+    denseSlices = sketchField(p, "dense-slices", "ARINFO")?,
+    sparseSlices = sketchField(p, "sparse-slices", "ARINFO")?,
+    avgDenseSize = asDouble(infoFind(p, "avg-dense-size"), "ARINFO")?,
+    avgDenseFill = asDouble(infoFind(p, "avg-dense-fill"), "ARINFO")?,
+    avgSparseSize = asDouble(infoFind(p, "avg-sparse-size"), "ARINFO")?,
+  }
+}
+
+// ------------------------------------------------------------------ builders
+
+fn indexArgs(indexes: []u64): []string {
+  let out = []string(0)
+  for i of indexes {
+    out = append(out, "${i}")
+  }
+  return out
+}
+
+fn entryArgs(entries: []ArEntry): []string {
+  let out = []string(0)
+  for e of entries {
+    out = append(out, "${e.index}", e.value)
+  }
+  return out
+}
+
+fn arRangeArgs(ranges: []ArRange): []string {
+  let out = []string(0)
+  for r of ranges {
+    out = append(out, "${r.start}", "${r.end}")
+  }
+  return out
+}
+
+fn predArgs(preds: []ArPred): []string {
+  let out = []string(0)
+  for p of preds {
+    match (p) {
+      Exact(s) => out = append(out, "EXACT", s)
+      Match(s) => out = append(out, "MATCH", s)
+      Glob(s) => out = append(out, "GLOB", s)
+      Re(s) => out = append(out, "RE", s)
+    }
+  }
+  return out
+}
+
+fn combineArgs(c: ArCombine): []string {
+  match (c) {
+    Default => return []string(0)
+    And => return ["AND"]
+    Or => return ["OR"]
+  }
+}
+
+fn grepArgs(head: []string, preds: []ArPred, opts: ArGrepOptions, withValues: bool): []string {
+  let args = append([]string(0), ...head)
+  args = append(args, ...predArgs(preds))
+  args = append(args, ...combineArgs(opts.combine))
+  args = append(args, ...optInt("LIMIT", opts.limit))
+  if (withValues) {
+    args = append(args, "WITHVALUES")
+  }
+  if (opts.noCase) {
+    args = append(args, "NOCASE")
+  }
+  return args
+}
+
+fn opArgs(op: ArOp): []string {
+  match (op) {
+    Sum => return ["SUM"]
+    Min => return ["MIN"]
+    Max => return ["MAX"]
+    And => return ["AND"]
+    Or => return ["OR"]
+    Xor => return ["XOR"]
+    Match(v) => return ["MATCH", v]
+    Used => return ["USED"]
+  }
+}
+
+// -------------------------------------------------------------------- Cmd<T>
+
+fn arsetCmd(key: string, index: u64, values: []string): Cmd<i64> {
+  return Cmd<i64>{
+    args = append(["ARSET", key, "${index}"], ...values),
+    decode = (r) => asInt(r, "ARSET"),
+    readOnly = false,
+  }
+}
+
+fn armsetCmd(key: string, entries: []ArEntry): Cmd<i64> {
+  return Cmd<i64>{
+    args = append(["ARMSET", key], ...entryArgs(entries)),
+    decode = (r) => asInt(r, "ARMSET"),
+    readOnly = false,
+  }
+}
+
+fn argetCmd(key: string, index: u64): Cmd<Option<string>> {
+  return Cmd<Option<string>>{
+    args = ["ARGET", key, "${index}"],
+    decode = (r) => asOptString(r, "ARGET"),
+    readOnly = true,
+  }
+}
+
+fn armgetCmd(key: string, indexes: []u64): Cmd<[]Option<string>> {
+  return Cmd<[]Option<string>>{
+    args = append(["ARMGET", key], ...indexArgs(indexes)),
+    decode = (r) => asOptStrings(r, "ARMGET"),
+    readOnly = true,
+  }
+}
+
+fn argetrangeCmd(key: string, start: u64, end: u64): Cmd<[]Option<string>> {
+  return Cmd<[]Option<string>>{
+    args = ["ARGETRANGE", key, "${start}", "${end}"],
+    decode = (r) => asOptStrings(r, "ARGETRANGE"),
+    readOnly = true,
+  }
+}
+
+fn arinsertCmd(key: string, values: []string): Cmd<u64> {
+  return Cmd<u64>{
+    args = append(["ARINSERT", key], ...values),
+    decode = (r) => asIndex(r, "ARINSERT"),
+    readOnly = false,
+  }
+}
+
+fn arringCmd(key: string, size: i64, values: []string): Cmd<u64> {
+  return Cmd<u64>{
+    args = append(["ARRING", key, "${size}"], ...values),
+    decode = (r) => asIndex(r, "ARRING"),
+    readOnly = false,
+  }
+}
+
+fn arnextCmd(key: string): Cmd<u64> {
+  return Cmd<u64>{ args = ["ARNEXT", key], decode = (r) => asIndex(r, "ARNEXT"), readOnly = true }
+}
+
+fn arseekCmd(key: string, index: u64): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["ARSEEK", key, "${index}"],
+    decode = (r) => asBool(r, "ARSEEK"),
+    readOnly = false,
+  }
+}
+
+fn arlastitemsCmd(key: string, count: i64, rev: bool): Cmd<[]Option<string>> {
+  let args = ["ARLASTITEMS", key, "${count}"]
+  if (rev) {
+    args = append(args, "REV")
+  }
+  return Cmd<[]Option<string>>{
+    args = args,
+    decode = (r) => asOptStrings(r, "ARLASTITEMS"),
+    readOnly = true,
+  }
+}
+
+fn arcountCmd(key: string): Cmd<i64> {
+  return Cmd<i64>{ args = ["ARCOUNT", key], decode = (r) => asInt(r, "ARCOUNT"), readOnly = true }
+}
+
+fn arlenCmd(key: string): Cmd<u64> {
+  return Cmd<u64>{ args = ["ARLEN", key], decode = (r) => asIndex(r, "ARLEN"), readOnly = true }
+}
+
+fn ardelCmd(key: string, indexes: []u64): Cmd<i64> {
+  return Cmd<i64>{
+    args = append(["ARDEL", key], ...indexArgs(indexes)),
+    decode = (r) => asInt(r, "ARDEL"),
+    readOnly = false,
+  }
+}
+
+fn ardelrangeCmd(key: string, ranges: []ArRange): Cmd<i64> {
+  return Cmd<i64>{
+    args = append(["ARDELRANGE", key], ...arRangeArgs(ranges)),
+    decode = (r) => asInt(r, "ARDELRANGE"),
+    readOnly = false,
+  }
+}
+
+fn arscanCmd(key: string, start: u64, end: u64, limit: Option<i64>): Cmd<[]ArEntry> {
+  return Cmd<[]ArEntry>{
+    args = append(["ARSCAN", key, "${start}", "${end}"], ...optInt("LIMIT", limit)),
+    decode = (r) => asArEntries(r, "ARSCAN"),
+    readOnly = true,
+  }
+}
+
+fn argrepCmd(
+  key: string,
+  start: u64,
+  end: u64,
+  preds: []ArPred,
+  opts: ArGrepOptions,
+): Cmd<[]u64> {
+  return Cmd<[]u64>{
+    args = grepArgs(["ARGREP", key, "${start}", "${end}"], preds, opts, false),
+    decode = (r) => asIndexes(r, "ARGREP"),
+    readOnly = true,
+  }
+}
+
+fn argrepValuesCmd(
+  key: string,
+  start: u64,
+  end: u64,
+  preds: []ArPred,
+  opts: ArGrepOptions,
+): Cmd<[]ArEntry> {
+  return Cmd<[]ArEntry>{
+    args = grepArgs(["ARGREP", key, "${start}", "${end}"], preds, opts, true),
+    decode = (r) => asArEntries(r, "ARGREP"),
+    readOnly = true,
+  }
+}
+
+fn aropCmd(key: string, start: u64, end: u64, op: ArOp): Cmd<ArAgg> {
+  return Cmd<ArAgg>{
+    args = append(["AROP", key, "${start}", "${end}"], ...opArgs(op)),
+    decode = (r) => asAgg(r),
+    readOnly = true,
+  }
+}
+
+fn arinfoCmd(key: string, full: bool): Cmd<ArInfo> {
+  let args = ["ARINFO", key]
+  if (full) {
+    args = append(args, "FULL")
+  }
+  return Cmd<ArInfo>{ args = args, decode = (r) => asArInfo(r, full), readOnly = true }
+}
