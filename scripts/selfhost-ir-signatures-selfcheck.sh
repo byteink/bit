@@ -135,6 +135,32 @@ bb0(%0: fn() void):
   expect "" "$(explainMismatch "${ld_o/func f() void/func f2() void}" "$ld_t" ir)" "ir: the oracle has no function of the stack-mode function's name"
   expect "" "$(explainMismatch "$ld_o" "${ld_o/rt_call print/rt_call eprint}" ir)" "ir: no stack-mode function at all"
 
+  # 7745-loop-defer-stack read by scripts/selfhost-diffsafepoints.sh (#7762): explainLoopDeferPolls
+  # explains one extra poll per defer-stack pop loop (slice_len down to 0: icmp_sgt, slice_get,
+  # call_value, back edge) added to ld_t's f, and nothing else.
+  ld_p=${ld_t/"bb3(%12: []fn() void):
+  ret"/"bb3(%12: []fn() void):
+  %20 = slice_len %12
+  jump bb6(%20)
+bb6(%21: i64):
+  %22 = const_int i64 0
+  %23 = icmp_sgt bool %21, %22
+  br %23, bb7(), bb8()
+bb7():
+  %25 = rt_call slice_get(%12, %21, %22) fn() void
+  %26 = call_value %25() void
+  jump bb6(%21)
+bb8():
+  ret"}
+  expect "7745-loop-defer-stack" "$(explainLoopDeferPolls "$ld_o" "$ld_p" 1 2)" "polls: one pop loop, one extra poll"
+  expect "" "$(explainLoopDeferPolls "$ld_o" "$ld_p" 1 3)" "polls: two extra polls for one pop loop"
+  expect "" "$(explainLoopDeferPolls "$ld_o" "$ld_p" 1 1)" "polls: a pop loop that gained no poll"
+  expect "" "$(explainLoopDeferPolls "$ld_o" "$ld_p" 2 1)" "polls: a MISSING safepoint is never explained"
+  expect "" "$(explainLoopDeferPolls "$ld_o" "$ld_t" 1 2)" "polls: an extra poll with no pop loop"
+  expect "" "$(explainLoopDeferPolls "$ld_o" "${ld_p/icmp_sgt/icmp_slt}" 1 2)" "polls: a pop loop with no header comparison"
+  expect "" "$(explainLoopDeferPolls "$ld_o" "${ld_p/= call_value %25() void/= const_nil}" 1 2)" "polls: a pop loop that makes no deferred call"
+  expect "" "$(explainLoopDeferPolls "$ld_o" "${ld_o/rt_call print/rt_call eprint}" 1 2)" "polls: no stack-mode function at all"
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever
