@@ -289,6 +289,23 @@ One `key`/`value` pair of a `JsonObject`, in source order.
 A JSON value: `JsonNull`, `JsonBool(bool)`, `JsonInt(i64)`, `JsonFloat(f64)`,
 `JsonString(string)`, `JsonArray([]Json)`, or `JsonObject([]JsonEntry)`.
 
+### `Json.toJson(): Json`
+
+Returns the value itself. A `@json` class has the same method, so code that
+asks for `toJson(): Json` accepts a class instance or a hand-built `Json`
+alike:
+
+```bit
+import { Json, JsonEntry, jsonEncode } from "std/json"
+
+fn linkDoc(code: string): string {
+  let doc = Json.JsonObject(
+    []JsonEntry{ JsonEntry{ key = "code", value = Json.JsonString(code) } },
+  )
+  return jsonEncode(doc.toJson())
+}
+```
+
 ## Checking and reading a value
 
 ### `jsonIsNull(j: Json): bool`
