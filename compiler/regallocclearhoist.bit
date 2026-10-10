@@ -1,0 +1,208 @@
+// #7757: hoisting a callee-saved register clear to a branch. Sibling of
+// regallocclear.bit, same module: `computeRegClears` hands every clear point
+// to `hoistBranchClears`, which runs #7733's forward pass with and without
+// the hoists.
+//
+// #7733's forward pass drops a clear only where the register is zero on every
+// path in, so `if (c) { call() }; call()` still zeroes it twice: the
+// conditional call does, but the skip edge reaches the join dirty and the
+// join's call zeroes it again (`bench/cases/json`, five times in one function).
+// Zeroing it once before the branch covers both calls.
+//
+// A register is ANTICIPATED on entry to a block when every path from there
+// reaches a clear point that needs it before any occupancy touches it and
+// before a return: a backward must-dataflow, the mirror of #7733's
+// `cleanOnEntry`. Where both successors of a branch outside every loop body
+// anticipate a register, the branch becomes a clear point for it, provided
+// the register is free there and last held a heap word. That is the test every
+// clear point passes, so a hoisted clear is as sound as one before a call. It
+// only ever adds a clear point; the forward pass then drops every clear it
+// makes redundant, and the hoisted one itself where the register is already
+// zero (an enclosing branch hoisted it first). Anticipation does not see a
+// join's other predecessors, so a function keeps its hoists only when they
+// leave it fewer clears in all.
+//
+// A clear before a `br` never zeroes a register the instruction just before
+// it reads. arm64 fuses a compare against zero into its branch as a CBZ that
+// reads the compared register AT the branch, after that value's interval
+// ended (arm64branch.bit, `cbzFusedOperand`, #4384), so a clear there would
+// make it test zero. #7732's loop-entry clears follow the same rule where the
+// entry is a `br`; a `jump` reads nothing (`entryMaskAt`).
+
+// The registers a clear point before the `br` at `p` may zero.
+fn branchMaskAt(st: ClearState, p: int): int {
+  return clearMaskAt(st, p) & ~touchedIn(st.spans, p - 1, p)
+}
+
+// The registers the loop-entry terminator at `p` may zero: `branchMaskAt` when
+// its block has two successors (`cfgEdges` gives a `br` two edges, a `jump` one).
+fn entryMaskAt(st: ClearState, edges: []CfgEdge, p: int): int {
+  let n = 0
+  for e of edges {
+    if (e.srcLast == p) {
+      n = n + 1
+    }
+  }
+  if (n == 2) {
+    return branchMaskAt(st, p)
+  }
+  return clearMaskAt(st, p)
+}
+
+// Per position up to the last clear point, what the clear point there needs
+// zero before #7733's dedupe: a call outside every loop body (`clearMaskAt`)
+// or a loop-entry terminator (`entryMaskAt`). `calls` is not empty.
+fn clearPoints(st: ClearState, edges: []CfgEdge, calls: []int): []int {
+  let entries = loopEntryPositions(edges, calls)
+  let need = []int(maxPos(entries, maxPos(calls, 0)) + 1)
+  for p of calls {
+    if (!inLoopBody(edges, p)) {
+      need[p] = clearMaskAt(st, p)
+    }
+  }
+  for p of entries {
+    need[p] = entryMaskAt(st, edges, p)
+  }
+  return need
+}
+
+// The largest of `floor` and every position in `ps`.
+fn maxPos(ps: []int, floor: int): int {
+  let m = floor
+  for p of ps {
+    if (p > m) {
+      m = p
+    }
+  }
+  return m
+}
+
+// `placeClears` with the branches hoisted to, or without them when that emits
+// no fewer clears: a join whose other predecessor arrives dirty keeps its own
+// clear, so a hoist that feeds only such joins is one clear more.
+fn hoistBranchClears(st: ClearState, edges: []CfgEdge, starts: []int): []int {
+  let base = placeClears(st, edges, starts)
+  let ant = anticipatedOnEntry(st, edges, starts, blockLasts(edges, starts))
+  let hoisted = placeClears(
+    ClearState{
+      spans = st.spans, calleeSaved = st.calleeSaved, nregs = st.nregs,
+      need = branchNeeds(st, edges, ant),
+    },
+    edges,
+    starts,
+  )
+  if (clearBits(hoisted) < clearBits(base)) {
+    return hoisted
+  }
+  return base
+}
+
+// `st.need` plus, at the terminator of every two-way branch outside every loop
+// body, the registers both successors anticipate (`ant`, see the header).
+// `edges` list one block's successors together, a `br`'s two as consecutive
+// entries (codegenlive.bit, `cfgEdges`). A branch past every clear point has
+// no successor that reaches one, so it is skipped rather than given a slot.
+fn branchNeeds(st: ClearState, edges: []CfgEdge, ant: []int): []int {
+  let need = []int(len(st.need))
+  let p = 0
+  while (p < len(need)) {
+    need[p] = st.need[p]
+    p = p + 1
+  }
+  let i = 1
+  while (i < len(edges)) {
+    let a = edges[i - 1]
+    p = a.srcLast
+    if (a.src == edges[i].src && p < len(need) && !inLoopBody(edges, p)) {
+      need[p] = need[p] | (ant[a.dst] & ant[edges[i].dst] & branchMaskAt(st, p))
+    }
+    i = i + 1
+  }
+  return need
+}
+
+// How many register clears `out` holds.
+fn clearBits(out: []int): int {
+  let n = 0
+  for m of out {
+    let r = m
+    while (r != 0) {
+      r = r & (r - 1)
+      n = n + 1
+    }
+  }
+  return n
+}
+
+// Per block, the registers anticipated on entry. The greatest fixed point
+// from "all" for every block an edge leaves; a block no edge leaves
+// anticipates only what it zeroes itself. A pass that changes anything clears
+// at least one bit, so it ends within `blocks x registers` passes. A block's
+// entry is `gen | (exit & ~kill)`: `anticipatedIn` from nothing, and every
+// register an occupancy touches in it.
+fn anticipatedOnEntry(st: ClearState, edges: []CfgEdge, starts: []int, lasts: []int): []int {
+  let n = len(starts)
+  let gen = []int(n)
+  let kill = []int(n)
+  let ant = []int(n)
+  let b = 0
+  while (b < n) {
+    if (starts[b] >= 0) {
+      gen[b] = anticipatedIn(st, starts[b], blockEnd(lasts, b))
+      kill[b] = touchedIn(st.spans, starts[b], blockEnd(lasts, b))
+      ant[b] = gen[b]
+    }
+    b = b + 1
+  }
+  for e of edges {
+    ant[e.src] = (1 << st.nregs) - 1
+  }
+  let passes = 0
+  while (meetSuccessors(edges, gen, kill, ant)) {
+    passes = passes + 1
+    assert(passes <= n * st.nregs, "#7757: register-anticipation dataflow did not settle")
+  }
+  return ant
+}
+
+// One backward pass: every block an edge leaves keeps what all its successors
+// anticipate and it does not touch, plus what it zeroes itself. True if any
+// block changed.
+fn meetSuccessors(edges: []CfgEdge, gen: []int, kill: []int, ant: []int): bool {
+  let changed = false
+  let met = -1
+  let i = len(edges) - 1
+  while (i >= 0) {
+    let src = edges[i].src
+    met = met & ant[edges[i].dst]
+    if (i == 0 || edges[i - 1].src != src) {
+      assert(i == 0 || edges[i - 1].src < src, "#7757: a block's successors are listed together")
+      let next = gen[src] | (met & ~kill[src])
+      changed = changed || next != ant[src]
+      ant[src] = next
+      met = -1
+    }
+    i = i - 1
+  }
+  return changed
+}
+
+// The registers a clear point in [lo, end) needs before any occupancy touches
+// them on the way from `lo`: `walkClears` run backward, with the same
+// segments between consecutive clear points.
+fn anticipatedIn(st: ClearState, lo: int, end: int): int {
+  let a = 0
+  let hi = end
+  let p = len(st.need) - 1
+  if (end < len(st.need)) {
+    p = end - 1
+  }
+  while (p >= lo) {
+    if (st.need[p] != 0) {
+      a = (a & ~touchedIn(st.spans, p, hi)) | st.need[p]
+      hi = p
+    }
+    p = p - 1
+  }
+  return a & ~touchedIn(st.spans, lo, hi)
+}
