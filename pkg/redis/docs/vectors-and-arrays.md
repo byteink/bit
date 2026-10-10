@@ -156,8 +156,8 @@ import {
 } from "redis"
 
 @json class Player {
-  team: string
-  level: i64
+  team: string,
+  level: i64,
 }
 
 fn main(): ()! {
