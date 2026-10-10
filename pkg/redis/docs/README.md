@@ -10,8 +10,10 @@
 | [Sets](sets.md) | `r.sset(key)`: members, set algebra, `scan`, reads inside a transaction |
 | [Sorted sets](sorted-sets.md) | `r.zset(key)`: leaderboards, ranges by rank, score or name, blocking pops, combining boards |
 | [Locations, unique counts and bitmaps](geo-hll-bitmaps.md) | `r.geo(key)`, `r.hll(key)`, `r.bitmap(key)`: nearby search, HyperLogLog counts, `BITOP`, `BITFIELD` |
+| [Seen, trending and percentiles](probabilistic.md) | `r.bloom(key)`, `r.cuckoo(key)`, `r.cms(key)`, `r.topk(key)`, `r.tdigest(key)`: has this been seen, how often, the top items, p99 latency |
 | [Articles as JSON documents](json.md) | `r.json(key)`: paths, writing a part, counters and flags in place, arrays, several articles at once, reads inside a transaction |
 | [Strings and keys](strings-and-keys.md) | `set`/`get` options, `r.str(key)`, `r.keys()`: TTLs, `TYPE`, `RENAME`, `SCAN`, reads inside a transaction |
+| [Requests per minute: time series](timeseries.md) | `r.timeseries(key)`, `r.timeseriesMulti()`: samples, counting, aggregated ranges, label filters, grouping, compaction rules |
 | [Pub/sub](pubsub.md) | `r.subscribe`, `psubscribe`, `ssubscribe`: live score updates, adding and removing channels, reconnects, a slow reader, `publish` and `PUBSUB` |
 | [Scripting](scripting.md) | `Script`: EVALSHA with automatic load, `Fn` and `Functions`, scripts in pipelines, read-only scripts |
 | [RESP2](resp.md) | The wire protocol: `Reply`, nil vs. empty, errors, what is not implemented |

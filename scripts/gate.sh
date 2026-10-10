@@ -741,7 +741,7 @@ for s in ${POST_SCRIPTS}; do run_step bash "${s}"; done
 # than a ./make step name, so it lives here rather than in BUILD_STEPS. Needs
 # bit-out/bin/bit already built, exactly like the selfhost-diffruntime.sh POST
 # script above under --x64/--arm64 (see the note printed above). Deliberately
-# NOT _tests_/bit/windowssmoke.bit — that needs the reachable
+# NOT _tests_/bit/windowssmoke/windowssmoke.bit — that needs the reachable
 # Windows test host and stays a manual `./make test-windows-smoke` step.
 if [ "${has_windows}" -eq 1 ]; then
   WIN_SCRATCH="$(mktemp -d)"

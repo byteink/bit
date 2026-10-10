@@ -1,0 +1,185 @@
+// `bit_rt_fs_open_beneath_w` under a link-swap race on Windows (#7817): the
+// Windows twin of `_tests_/bit/openbeneath` (#5793). Two races, each
+// `raceIterations` opens of `relPath` against a `spawn`ed swapper:
+//
+// ROOT PATH. The root is `<dir>/rp/root`, and `rp` is a junction the swapper
+// keeps re-pointing, by four renames of the junctions themselves, between
+// `d1` (`root/a/b/.../o/target.txt` = INSIDE, every directory real) and `d2`
+// (`root/a` is a junction to `outside`, where `b/.../o/target.txt` = OUTSIDE-LEAK).
+// An open that resolves `root` through `rp` -> `d2` meets the junction at `a`
+// and is refused; the walk of #5808 re-resolved the cumulative path string at
+// every step, so `rp` flipping between its `a` check and its leaf open
+// returned OUTSIDE-LEAK. Once `root` is open every component is relative to a
+// handle, and no flip can change which tree the walk is in.
+//
+// REL PATH. The root is `<dir>/q/root`, and the swapper flips `root/a`
+// between the real directory and a junction `root/L` to `outside`: the same
+// shape as `_tests_/bit/openbeneath`.
+//
+// Either race passes only with LEAKED=0 and with both outcomes seen
+// (served > 0 and refused > 0): a run where the swapper never interleaved
+// tests nothing. It needs real concurrency, so the harness sets
+// BIT_WORKERS=4 (the default pool starts at one OS thread and would run the
+// swapper and the opener cooperatively on it).
+//
+// WINDOWS-ONLY, HAND-RUN FROM `_tests_/bit/windowssmoke/windowssmoke.bit`
+// (`fsrPrelude` in ./phases.bit builds the junctions, which std/fs cannot),
+// and placed under `_tests_/stress/thread/` for the reason ../gcthreadswindows
+// states: nothing imports it, so the stress corpus walker never loads it.
+// Prints `fsbeneathrace ok ...` or exits 1 after a `FAIL` line.
+import { rename, remove } from "std/fs"
+import { openBeneath } from "std/fs/secure"
+import { env, exit } from "std/os"
+
+const raceIterations: int = 30000
+
+// 16 components deep on purpose: the walk of #5808 re-resolved the whole path
+// at every step, so the window in which a flip of the root's path goes
+// unnoticed grows with the depth. `chain` is `relPath` minus the leaf.
+const relPath: string = "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/target.txt"
+const chain: []string = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o"]
+
+// `\` -> `/`: `std/path` is not platform-aware and secure.bit's lexical
+// `contains` runs on the root string.
+fn fwd(s: string): string {
+  let b = []byte(s)
+  let i = 0
+  while (i < len(b)) {
+    if (b[i] == 92) {
+      b[i] = 47
+    }
+    i = i + 1
+  }
+  return string(b)
+}
+
+fn mv(x: string, y: string): bool {
+  rename(x, y) catch _ {
+    return false
+  }
+  return true
+}
+
+// The swapper: `x` and `y` trade places through the free name `r`, four
+// renames per cycle, so `x` is cycled through "missing" and "the other
+// object" and back. Every rename may lose a race with an open handle and
+// simply fail; a failed step leaves the names as they were.
+fn swapLoop(x: string, y: string, r: string, iters: int, done: chan<int>) {
+  let n = 0
+  let swapped = 0
+  while (n < iters) {
+    if (mv(x, r)) {
+      swapped = swapped + 1
+    }
+    let _ = mv(y, x)
+    let _ = mv(x, y)
+    let _ = mv(r, x)
+    n = n + 1
+  }
+  done <- swapped
+}
+
+// 1 (a miss, already printed) when `label`'s race leaked or never
+// interleaved; 0 otherwise.
+fn race(label: string, root: string, x: string, y: string, r: string): int {
+  let done = chan<int>()
+  spawn swapLoop(x, y, r, raceIterations, done)
+  let served = 0
+  let leaked = 0
+  let refused = 0
+  let n = 0
+  while (n < raceIterations) {
+    n = n + 1
+    let f = openBeneath(root, relPath) catch _ {
+      refused = refused + 1
+      continue
+    }
+    let body = f.readAll() catch _ {
+      ""
+    }
+    f.close()
+    if (body == "OUTSIDE-LEAK") {
+      leaked = leaked + 1
+    } else if (body == "INSIDE") {
+      served = served + 1
+    }
+  }
+  let swapped = <- done
+  print("race ${label}: requests=${raceIterations} served=${served} LEAKED=${leaked} refused=${refused} swaps=${swapped}\n")
+  if (leaked != 0) {
+    print("FAIL ${label}: ${leaked} read(s) of OUTSIDE-LEAK in ${raceIterations} opens\n")
+    return 1
+  }
+  if (served == 0 || refused == 0) {
+    print("FAIL ${label}: the race never interleaved (served=${served} refused=${refused}); run with BIT_WORKERS=4\n")
+    return 1
+  }
+  return 0
+}
+
+fn removeQuiet(path: string) {
+  remove(path) catch _ {
+    return
+  }
+}
+
+// Removes `base`'s chain of directories, deepest first, and the leaf file in
+// the last one. `skip` leaves out the first `skip` names of `chain`.
+fn removeChain(base: string, skip: int) {
+  let n = len(chain)
+  let path = base
+  let i = skip
+  while (i < n) {
+    path = "${path}/${chain[i]}"
+    i = i + 1
+  }
+  removeQuiet("${path}/target.txt")
+  while (n > skip) {
+    removeQuiet(path)
+    path = path[:len(path) - len(chain[n - 1]) - 1]
+    n = n - 1
+  }
+}
+
+// Removes the tree the prelude built, by name, never recursively: a junction
+// that is somehow still in the way is removed as the link it is.
+fn cleanup(b: string) {
+  removeChain("${b}/d1/root", 0)
+  removeChain("${b}/q/root", 0)
+  removeChain("${b}/outside", 1)
+  for d of [
+    "d1/root",
+    "d1",
+    "d2/root/a",
+    "d2/root",
+    "d2",
+    "q/root/L",
+    "q/root/R",
+    "q/root",
+    "q",
+    "outside",
+    "rp",
+    "L",
+    "R",
+  ] {
+    removeQuiet("${b}/${d}")
+  }
+  removeQuiet(b)
+}
+
+fn main() {
+  let b = fwd(env("BIT_FSB_DIR"))
+  if (len(b) == 0) {
+    print("fsbeneathrace FAIL: BIT_FSB_DIR is not set; run through test-windows-smoke\n")
+    exit(1)
+  }
+  let misses = race("root-path", "${b}/rp/root", "${b}/rp", "${b}/L", "${b}/R")
+  misses = misses +
+    race("rel-path", "${b}/q/root", "${b}/q/root/a", "${b}/q/root/L", "${b}/q/root/R")
+  cleanup(b)
+  if (misses != 0) {
+    print("fsbeneathrace FAIL: ${misses} race(s) failed\n")
+    exit(1)
+  }
+  print("fsbeneathrace ok requests=${raceIterations} per race, 0 leaked in 2 races\n")
+}

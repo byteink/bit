@@ -158,7 +158,7 @@ while IFS= read -r f; do
     # (never instead of) has_runtime=1 — the compiler can already cross-build
     # for x86_64-windows with no hardware (scripts/g2archive.sh), and #4294 had
     # to verify that by hand for lack of a gate here. This does not replace
-    # test-windows-smoke (_tests_/bit/windowssmoke.bit), which needs the
+    # test-windows-smoke (_tests_/bit/windowssmoke/windowssmoke.bit), which needs the
     # reachable Windows test host and stays a manual
     # `./make test-windows-smoke` step — this is compile+link only, run below
     # via has_windows regardless of which bucket the diff resolves to (#4311).

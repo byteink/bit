@@ -156,6 +156,94 @@ const mapTokenBit: int = 4611686018427387904
   atomicStoreRelease(wordAt(m + mapTbl), c - tblPrefix)
 }
 
+// A `*u8` at the ctrl byte of slot `i` of table `c`.
+@nosplit fn mapCtrlAt(c: int, i: int): *u8 {
+  let n: *u8 = nil
+  return n + (c + i)
+}
+
+// The ONLY write of a FULL ctrl tag into a published table: a release store,
+// after the caller wrote the slot's key and value words (#5813). A plain
+// `storeByte` lets arm64 make the tag visible before the value word, so a
+// reader that matched the new tag and key loaded the zero a fresh table holds.
+//
+// PLAIN WHILE `mapPeers` READS 0 (#7784): the `stlrb` cost bench/cases/map
+// 7-12% cycles on one worker, where no other core reads. Only worker threads
+// run Bit code, and every thread holding a stale 0 here is worker 0 (any other
+// worker starts after `mapPeersMark`, thread creation ordering it), so the
+// question is only whether worker 0 can plain-store while a peer reads. The
+// mark has three writers' paths: boot (`schedInit`, before any worker thread),
+// worker 0's own grow (program order), and the monitor's retake, which runs
+// while worker 0 sits in a syscall/blocked bracket. That last one is a Dekker
+// pair, each side's store and load split by a `dmb ish` (`worldFence`):
+//   monitor: `mapPeersMark` store; fence; load worker 0's registry state
+//            (`rootRetakeConfirm`, ../root/retake.bit); start only if it is
+//            still `mSyscall`/`mBlocked`, else abandon (`schedGrowCommit` 0).
+//   worker 0: the bracket exit's `mRunning` store (`worldResumeWhenClear`);
+//            fence (`gcSyscallEnd`/`gcBlockingEnd`); every later load here.
+// Both loads cannot read the old value. So either the monitor abandons, or
+// worker 0 reads 1 from its first store after the bracket. Its plain stores
+// before the bracket precede the bracket's `atomicStore` of the state, which
+// the monitor's `atomicLoad` reads before it creates the thread, so the peer
+// starts with them visible. x86-64 orders stores anyway and never asks.
+@nosplit fn mapCtrlPublish(c: int, i: int, tag: int) {
+  if (onX64() || loadWord(int(ptrOf(mapPeers))) == 0) {
+    storeByte(c + i, tag)
+    return
+  }
+  atomicStoreRelease(mapCtrlAt(c, i), u8(tag))
+}
+
+// The ACQUIRE half, as an ADDRESS DEPENDENCY, not an acquire load. A probe
+// that matched `tag` in `c`, its plain load of slot `i`'s ctrl byte, adds this
+// to the address of every word it loads from the slot (the key, and the value
+// or the token naming it): `c - tag` is zero there, but the register carries
+// the ctrl load's result into those addresses, and ARMv8 orders a load after
+// the load its address depends on, whatever the value (the guarantee
+// `mapTable` argues for the table pointer). Observing the tag
+// `mapCtrlPublish` released then makes the key and value words written before
+// it visible. The first version re-loaded the byte with `atomicLoad` (an
+// `ldarb`): correct, and +12% cycles on bench/cases/map, whose loop is bound by
+// cache misses that an acquire stops overlapping. x86-64 orders loads anyway,
+// so it adds nothing there. A hit returns `i + d` for the same reason: the
+// caller loads the value through the returned slot.
+//
+// ONLY WHILE A SECOND WORKER CAN EXIST. The dependency still cost bench/cases/map
+// +10% cycles: the key and value misses wait for the ctrl miss instead of
+// overlapping it. A program on one worker thread cannot see another core's
+// reordering, so this returns 0 there, and the `+ d` loads carry no
+// dependency. `mapPeers` is checked AFTER the tag matched, through an address
+// that depends on `c` too, which is what makes a stale 0 safe: the flag load is
+// ordered after the ctrl load, so a probe that reads 0 read a ctrl byte older
+// than `mapPeersMark`'s store, and every worker thread but the reader's own is
+// started after that store (thread creation orders it first), so the byte was
+// written by the reader's own thread, whose key and value stores precede it in
+// program order. A probe that reads 1 takes the dependency. Never a branch-free
+// select here: that would make `d` depend on the flag load as well and put the
+// load latency on every hit.
+@nosplit fn mapTagDep(c: int, tag: int): int {
+  if (onX64()) {
+    return 0
+  }
+  let d = c - tag
+  if (loadWord(int(ptrOf(mapPeers)) + d) == 0) {
+    return 0
+  }
+  return d
+}
+
+// 1 once a second worker slot has been prepared, set before its thread is
+// created and never cleared; 0 for the whole life of a one-worker program.
+let mapPeers: [1]i64
+
+// The only writer of `mapPeers`: `schedInitWorkerSlot` (../sched/worker.bit)
+// calls it for every slot past the first, at boot when `BIT_WORKERS` > 1 and
+// on every later grow, before that slot's thread exists. Pinned because
+// `runtime/sched` cannot import this module and reaches it through `extern`.
+export @nosplit @symbol("bit_rt_port_root_map_peers_mark") fn mapPeersMark() {
+  atomicStore(ptrOf(mapPeers), 1)
+}
+
 // A fresh `vcap`-slot table for map `m`, every ctrl byte EMPTY (`gcAllocRaw`
 // zeroes); returns its ctrl pointer. Tracing of `keys`/`vals` follows the
 // header's key descriptor and value flag, as `rtMapNew` documents. Exhaustion
