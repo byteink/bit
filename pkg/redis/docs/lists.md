@@ -29,7 +29,7 @@ fn main(): ()! {
 }
 ```
 
-`r.list(key)` is a cheap value, `{client, key}` - call it again any time you
+`r.list(key)` is a cheap value, `{runner, key}` - call it again any time you
 need the same list. A list is created by the first push and disappears when
 its last element is taken.
 
@@ -398,6 +398,37 @@ back to back under one `commandTimeout`, so a blocked pop would stall the rest
 of the batch and be cut off at that timeout. Inside `MULTI` the server never
 blocks at all: a blocking pop there behaves like the plain one. Use `popFront`
 in a transaction and the immediate handle for a real wait.
+
+## Reading a list inside a transaction
+
+`tx.list(key)` only queues, so it cannot answer "how many jobs are waiting?"
+before you decide what to push. `tx.read.list(key)` is the immediate view of
+the same list, run now on the transaction's own connection, between `WATCH`
+and `MULTI`. If another client changes a watched key first, the transaction
+retries and your body runs again with fresh reads:
+
+```bit
+import { open } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let key = "inkwell:publish"
+  r.transaction<()>([key], (tx) => {
+    if (tx.read.list(key).len()? < 100) {
+      tx.list(key).push("a9")
+    }
+    return
+  })?
+  r.close()
+  return
+}
+```
+
+The reads (`range`, `all`, `len`, `index`, `position`, `positions`) work
+through `tx.read`. A write such as `tx.read.list(key).push(...)` would run
+immediately, outside the transaction's `MULTI`/`EXEC`, so it fails with
+`RedisError.Invalid`, and so does a blocking pop, because the transaction's
+connection cannot wait: queue the write with `tx.list(key)`.
 
 ## Sharp edges
 

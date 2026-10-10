@@ -26,7 +26,7 @@ fn main(): ()! {
 }
 ```
 
-`r.hash(key)` is a cheap value, `{client, key}` - call it again any time you
+`r.hash(key)` is a cheap value, `{runner, key}` - call it again any time you
 need the same hash, it never allocates a connection of its own.
 
 ## Reading and writing fields
@@ -202,6 +202,36 @@ fn main(): ()! {
   of a new TTL.
 - `getDel(...fields): []Option<string>` - `HGETDEL`, reads and removes
   fields atomically.
+
+## Reading a hash inside a transaction
+
+`tx.hash(key)` only queues, so it cannot answer "does this field exist yet?"
+before you decide what to write. `tx.read.hash(key)` is the immediate view of
+the same hash, run now on the transaction's own connection, between `WATCH`
+and `MULTI`. If another client changes a watched key first, the transaction
+retries and your body runs again with fresh reads:
+
+```bit
+import { open } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let key = "user:1"
+  r.transaction<()>([key], (tx) => {
+    if (!tx.read.hash(key).has("region")?) {
+      tx.hash(key).setField("region", "eu")
+    }
+    return
+  })?
+  r.close()
+  return
+}
+```
+
+Every read on `Hash` works through `tx.read`, `scan` included. A write such as
+`tx.read.hash(key).setField(...)` would run immediately, outside the
+transaction's `MULTI`/`EXEC`, so it fails with `RedisError.Invalid`; queue it
+with `tx.hash(key)`.
 
 ## Sharp edges
 

@@ -12,16 +12,27 @@
 // `args` is the wire command; `decode` turns the raw `Reply` into the typed
 // result or fails `RedisError.Unexpected` — reuse one of this file's decode
 // helpers (`asInt`, `asOptString`, `asBool`, `asDouble`, `asStrings`,
-// `asMap`, `asScored`, `asScanPage`) when the reply shape fits, or write a
-// short inline closure when it does not (`client.bit`'s `pingCmd` is the example: PING's
-// reply is `Simple` OR `Bulk`, a shape none of the shared helpers matches).
+// `asMap`, `asScored`, `asScanPage`, `asOptStrings`, `asInts`, `asOk`) when
+// the reply shape fits, or write a short inline closure when it does not
+// (`client.bit`'s `pingCmd` is the example: PING's reply is `Simple` OR
+// `Bulk`, a shape none of the shared helpers matches). A decode helper that
+// a second family would also write goes HERE, not in the family's file: a
+// local copy under another name is how `asHashOptStrings`, `asMgetResults`
+// and `asGeoHashes` came to be one function three times (#6109).
+//
 // `readOnly` picks the retry policy `Client.runCmd` uses — true only for a
-// command that is safe to run twice (a read; never `SET`, `INCR`, ...).
+// command that is safe to run twice (a read; never `SET`, `INCR`, ...). It is
+// also what `tx.read` checks: a pinned runner refuses a command with
+// `readOnly = false` (`runPinnedCmd`), so a read flagged false cannot be
+// used inside a transaction body.
 //
 // Then give the family TWO methods, immediate and queued, each ONE line:
 //
 //   // On the family's immediate handle (e.g. `Counter` in counter.bit) —
-//   // a `runner: Runner` field, never a `client: Client` one (#6029):
+//   // a `runner: Runner` field, never a `client: Client` one (#6029). Every
+//   // family does this; `Client`'s accessor (`client.bit`)
+//   // builds it over `poolRunner(this)`, `TxRead`'s (`tx.bit`) over
+//   // `pinnedRunner(..)`, which is all `tx.read.<family>(key)` takes:
 //   export incr(): i64!RedisError { return this.runner.runCmd(incrCmd(this.key)) }
 //   // On the family's QUEUED view (e.g. `CounterBatch`, same file) — the
 //   // ONE view `Pipeline.counter(key)` AND `Tx.counter(key)` both return,
@@ -30,6 +41,11 @@
 //
 // The command definition — `args` and `decode` — is written exactly once;
 // only these two one-line calls differ, `runner.runCmd` vs `batch.queue`.
+//
+// Then wire the family in two places: `Client.<family>` (`client.bit`) and
+// `TxRead.<family>` (`tx.bit`) next to the others, one line each. A blocking
+// command (`BLPOP`, `BZPOPMIN`, `XREAD BLOCK`, ...) runs through `blockRun`
+// below, which dials its own connection and refuses a pinned runner.
 //
 // WHY THE IMMEDIATE HANDLE HOLDS A `Runner`, NOT A `Client`, DIRECTLY
 // (#6029): `Client.counter(key)` and a transaction body's `tx.read.counter
@@ -364,20 +380,55 @@ fn mapFromFlatArray(list: []Reply, cmd: string): map<string, string>!RedisError 
   return out
 }
 
-// A flat `Reply.Array` of alternating member, score (`ZRANGE ...
-// WITHSCORES`'s RESP2 shape) as `[]Scored`.
+// Member/score pairs as `[]Scored`, in either wire shape. RESP3 (this
+// package's default) answers `ZRANGE ... WITHSCORES`, `ZPOPMIN`/`ZPOPMAX`,
+// `ZUNION`/`ZINTER`/`ZDIFF ... WITHSCORES` and `ZRANDMEMBER ... WITHSCORES`
+// with an array of nested `[member, score]` pairs; RESP2 answers a flat
+// `[member, score, member, score, ...]` array, which is also the shape of a
+// `ZSCAN` page's items. The first element says which one this is (#6109,
+// #6033).
 export fn asScored(r: Reply, cmd: string): []Scored!RedisError {
   match (r) {
-    Array(items) => return scoredFromOpt(items, cmd)?
+    Array(items) => return scoredFromList(unwrapOr(items, []Reply(0)), cmd)?
     _ => fail RedisError.Unexpected(cmd, shapeName(r))
   }
 }
 
-fn scoredFromOpt(items: Option<[]Reply>, cmd: string): []Scored!RedisError {
-  match (items) {
-    Some(list) => return scoredFromFlatArray(list, cmd)?
-    None => return []Scored(0)
+fn scoredFromList(list: []Reply, cmd: string): []Scored!RedisError {
+  if (len(list) == 0) {
+    return []Scored(0)
   }
+  match (list[0]) {
+    Array(_) => return scoredPairsFromList(list, cmd)?
+    _ => return scoredFromFlatArray(list, cmd)?
+  }
+}
+
+fn scoredPairsFromList(list: []Reply, cmd: string): []Scored!RedisError {
+  let out = []Scored(0)
+  let i = 0
+  while (i < len(list)) {
+    let pair = scoredPair(list[i], cmd)?
+    out = append(out, pair)
+    i = i + 1
+  }
+  return out
+}
+
+fn scoredPair(r: Reply, cmd: string): Scored!RedisError {
+  match (r) {
+    Array(items) => return scoredPairFromList(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn scoredPairFromList(list: []Reply, cmd: string): Scored!RedisError {
+  if (len(list) != 2) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let member = replyToString(list[0], cmd)?
+  let score = asDouble(list[1], cmd)?
+  return Scored{ member = member, score = score }
 }
 
 fn scoredFromFlatArray(list: []Reply, cmd: string): []Scored!RedisError {
@@ -390,6 +441,75 @@ fn scoredFromFlatArray(list: []Reply, cmd: string): []Scored!RedisError {
     let member = replyToString(list[i], cmd)?
     let score = asDouble(list[i + 1], cmd)?
     out = append(out, Scored{ member = member, score = score })
+    i = i + 2
+  }
+  return out
+}
+
+// One bulk-or-null per element as `[]Option<string>` - `MGET`, `HMGET`,
+// `HGETEX`, `HGETDEL`, `GEOHASH`: a missing key/field/member is `None`.
+export fn asOptStrings(r: Reply, cmd: string): []Option<string>!RedisError {
+  match (r) {
+    Array(items) => return optStringsFromList(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn optStringsFromList(list: []Reply, cmd: string): []Option<string>!RedisError {
+  let out = []Option<string>(0)
+  let i = 0
+  while (i < len(list)) {
+    out = append(out, asOptString(list[i], cmd)?)
+    i = i + 1
+  }
+  return out
+}
+
+// One integer per element as `[]i64` - `LPOS .. COUNT`'s indexes, the
+// per-field sentinels of the hash field-expiry commands.
+export fn asInts(r: Reply, cmd: string): []i64!RedisError {
+  match (r) {
+    Array(items) => return intsFromList(unwrapOr(items, []Reply(0)), cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn intsFromList(list: []Reply, cmd: string): []i64!RedisError {
+  let out = []i64(len(list))
+  let i = 0
+  while (i < len(list)) {
+    out[i] = asInt(list[i], cmd)?
+    i = i + 1
+  }
+  return out
+}
+
+// A bare `+OK` reply, discarded - `SET`, `RENAME`, `MSET`, `JSON.MSET`.
+export fn asOk(r: Reply, cmd: string): ()!RedisError {
+  match (r) {
+    Simple(_) => return
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// An array reply's elements; a null array has none. `XINFO`, `JSON.*`.
+export fn replyItems(r: Reply, cmd: string): []Reply!RedisError {
+  match (r) {
+    Array(items) => return unwrapOr(items, []Reply(0))
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// A flat `[k, v, k, v, ...]` list as key/value `MapEntry`s, still `Reply`s
+// (the caller knows what each side holds). An odd length is malformed.
+export fn pairUp(list: []Reply, cmd: string): []MapEntry!RedisError {
+  if (len(list) % 2 != 0) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let out = []MapEntry(0)
+  let i = 0
+  while (i < len(list)) {
+    out = append(out, MapEntry{ key = list[i], value = list[i + 1] })
     i = i + 2
   }
   return out
@@ -455,4 +575,15 @@ fn runBlocking<T>(client: Client, cmd: Cmd<T>, blockNs: int): T!RedisError {
   }
   conn.close()
   return cmd.decode(r)?
+}
+
+// A blocking call over a family's `Runner`: dials its own connection
+// (`runBlocking`) from a pool-backed runner. A transaction attempt's pinned
+// connection cannot wait, so `tx.read.<family>(key)` refuses it; `family`
+// names the accessor in that error.
+fn blockRun<T>(runner: Runner, cmd: Cmd<T>, blockNs: int, family: string): T!RedisError {
+  match (runner.client) {
+    Some(c) => return runBlocking<T>(c, cmd, blockNs)?
+    None => fail RedisError.Invalid("a blocking call needs r.${family}(key), not tx.read.${family}(key)")
+  }
 }

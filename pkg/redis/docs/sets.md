@@ -24,7 +24,7 @@ fn main(): ()! {
 }
 ```
 
-`r.sset(key)` is a cheap value, `{client, key}` - call it again any time you
+`r.sset(key)` is a cheap value, `{runner, key}` - call it again any time you
 need the same set. It is `sset`, not `set`, because `r.set(key, value)` is
 already the plain string command.
 
