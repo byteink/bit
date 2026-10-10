@@ -12,5 +12,6 @@
 | [Locations, unique counts and bitmaps](geo-hll-bitmaps.md) | `r.geo(key)`, `r.hll(key)`, `r.bitmap(key)`: nearby search, HyperLogLog counts, `BITOP`, `BITFIELD` |
 | [Articles as JSON documents](json.md) | `r.json(key)`: paths, writing a part, counters and flags in place, arrays, several articles at once, reads inside a transaction |
 | [Strings and keys](strings-and-keys.md) | `set`/`get` options, `r.str(key)`, `r.keys()`: TTLs, `TYPE`, `RENAME`, `SCAN`, reads inside a transaction |
+| [Pub/sub](pubsub.md) | `r.subscribe`, `psubscribe`, `ssubscribe`: live score updates, adding and removing channels, reconnects, a slow reader, `publish` and `PUBSUB` |
 | [Scripting](scripting.md) | `Script`: EVALSHA with automatic load, `Fn` and `Functions`, scripts in pipelines, read-only scripts |
 | [RESP2](resp.md) | The wire protocol: `Reply`, nil vs. empty, errors, what is not implemented |

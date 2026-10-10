@@ -1,0 +1,231 @@
+// pkg/redis/pubsub.test.bit - `pubsub.bit` and `pubsubcmd.bit` without a
+// server: push parsing for both protocols, wire arguments, NUMSUB decoding,
+// the name-set helpers, the backoff bounds, and the bounded buffer, driven
+// through the real `readEvent` over a captured byte stream. `assertArgs` is
+// `list.test.bit`'s (same module). `pubsub.live.test.bit` runs it all against
+// a real server.
+
+fn bulk(s: string): Reply {
+  return Reply.Bulk(Option.Some(s))
+}
+
+fn push3(kind: string, a: string, b: string): Reply {
+  return Reply.Push([bulk(kind), bulk(a), bulk(b)])
+}
+
+fn messageOf(r: Reply): Message {
+  let ev = parsePush(r)
+  match (ev.message) {
+    Some(m) => return m
+    None => panic("expected a message")
+  }
+}
+
+test "RESP3 push and RESP2 array parse to the same message" {
+  let a = messageOf(push3("message", "news", "hello"))
+  assert(a.channel == "news", "channel = ${a.channel}")
+  assert(a.payload == "hello", "payload = ${a.payload}")
+  assert(a.pattern == Option<string>.None, "message has no pattern")
+  let b = messageOf(Reply.Array(Option.Some([bulk("message"), bulk("news"), bulk("hello")])))
+  assert(b.channel == "news" && b.payload == "hello", "RESP2 array parses alike")
+}
+
+test "pmessage carries the matching pattern, smessage the shard channel" {
+  let p = messageOf(Reply.Push([bulk("pmessage"), bulk("n*"), bulk("news"), bulk("x")]))
+  assert(p.pattern == Option.Some("n*"), "pattern")
+  assert(p.channel == "news" && p.payload == "x", "channel and payload")
+  let s = messageOf(push3("smessage", "shard", "y"))
+  assert(s.channel == "shard" && s.payload == "y", "smessage")
+  assert(s.pattern == Option<string>.None, "smessage has no pattern")
+}
+
+test "confirmations are not messages, and unknown pushes parse to nothing" {
+  for kind of [
+    "subscribe",
+    "unsubscribe",
+    "psubscribe",
+    "punsubscribe",
+    "ssubscribe",
+    "sunsubscribe",
+  ] {
+    let ev = parsePush(Reply.Push([bulk(kind), bulk("news"), Reply.Int(1)]))
+    assert(ev.confirm, "${kind} is a confirmation")
+    assert(ev.message == Option<Message>.None, "${kind} carries no message")
+  }
+  let inv = parsePush(Reply.Push([bulk("invalidate"), bulk("k")]))
+  assert(!inv.confirm && inv.message == Option<Message>.None, "invalidate is ignored")
+  let pong = parsePush(Reply.Array(Option.Some([bulk("pong"), bulk("")])))
+  assert(!pong.confirm && pong.message == Option<Message>.None, "RESP2 pong is ignored")
+  let short = parsePush(Reply.Push([bulk("message"), bulk("news")]))
+  assert(short.message == Option<Message>.None, "a message frame of the wrong arity is dropped")
+  let none = parsePush(Reply.Simple("OK"))
+  assert(!none.confirm && none.message == Option<Message>.None, "a non-push reply is ignored")
+}
+
+test "an empty payload and a binary payload survive parsing" {
+  assert(messageOf(push3("message", "c", "")).payload == "", "empty payload")
+  assert(messageOf(push3("message", "c", "a\r\nb")).payload == "a\r\nb", "CRLF inside a payload")
+}
+
+test "PUBLISH, SPUBLISH and the PUBSUB commands lay out their arguments" {
+  assertArgs(publishCmd("c", "p").args, ["PUBLISH", "c", "p"])
+  assertArgs(spublishCmd("c", "p").args, ["SPUBLISH", "c", "p"])
+  assertArgs(pubsubChannelsCmd("CHANNELS", "").args, ["PUBSUB", "CHANNELS"])
+  assertArgs(pubsubChannelsCmd("CHANNELS", "n*").args, ["PUBSUB", "CHANNELS", "n*"])
+  assertArgs(pubsubChannelsCmd("SHARDCHANNELS", "").args, ["PUBSUB", "SHARDCHANNELS"])
+  assertArgs(pubsubNumSubCmd("NUMSUB", ["a", "b"]).args, ["PUBSUB", "NUMSUB", "a", "b"])
+  assertArgs(pubsubNumSubCmd("SHARDNUMSUB", []string(0)).args, ["PUBSUB", "SHARDNUMSUB"])
+  assertArgs(pubsubNumPatCmd().args, ["PUBSUB", "NUMPAT"])
+  assert(!publishCmd("c", "p").readOnly, "PUBLISH must never be retried")
+  assert(pubsubNumPatCmd().readOnly, "NUMPAT is a read")
+}
+
+test "PUBLISH answers an integer, NUMSUB a map in either protocol" {
+  let n = publishCmd("c", "p").decode(Reply.Int(3)) catch e {
+    panic("publish: ${e.message()}")
+  }
+  assert(n == 3, "receivers = ${n}")
+  let flat = Reply.Array(Option.Some([bulk("a"), Reply.Int(2), bulk("b"), Reply.Int(0)]))
+  let m = pubsubNumSubCmd("NUMSUB", ["a", "b"]).decode(flat) catch e {
+    panic("numsub flat: ${e.message()}")
+  }
+  assert(m["a"] == 2 && m["b"] == 0, "flat array: a=${m["a"]} b=${m["b"]}")
+  let wire = Reply.Map([MapEntry{ key = bulk("a"), value = Reply.Int(5) }])
+  let m3 = pubsubNumSubCmd("NUMSUB", ["a"]).decode(wire) catch e {
+    panic("numsub map: ${e.message()}")
+  }
+  assert(m3["a"] == 5, "RESP3 map: a=${m3["a"]}")
+  let bad = false
+  publishCmd("c", "p").decode(Reply.Simple("OK")) catch _ {
+    bad = true
+  }
+  assert(bad, "a simple string is not a PUBLISH reply")
+}
+
+test "name-set helpers skip duplicates and unknown names" {
+  assertArgs(newNames(["a"], ["a", "b", "b", "c"]), ["b", "c"])
+  assertArgs(presentNames(["a", "b"], ["b", "z", "b", "a"]), ["b", "a"])
+  assertArgs(withoutNames(["a", "b", "c"], ["b"]), ["a", "c"])
+  assertArgs(withoutNames(["a"], []string(0)), ["a"])
+}
+
+test "backoff stays within [d/2, d], doubling up to the cap" {
+  let attempt = 0
+  while (attempt < 40) {
+    let want = backoffBaseNs
+    let i = 0
+    while (i < attempt && want < backoffCapNs) {
+      want = want * 2
+      i = i + 1
+    }
+    if (want > backoffCapNs) {
+      want = backoffCapNs
+    }
+    let d = backoffNs(attempt)
+    assert(d >= want / 2 && d <= want, "attempt ${attempt}: ${d} outside [${want / 2}, ${want}]")
+    attempt = attempt + 1
+  }
+  assert(backoffNs(1000) <= backoffCapNs, "a huge attempt number stays capped")
+}
+
+// A stream that serves one captured byte string, then reports EOF.
+class psWireStream {
+  data: string
+  done: bool
+  readUp(n: int): string! {
+    if (this.done) {
+      return ""
+    }
+    this.done = true
+    return this.data
+  }
+
+  write(s: string): ()! {}
+
+  setDeadline(deadlineNs: int) {}
+
+  close() {}
+}
+
+fn pushWire(a: string, b: string): string {
+  return ">3\r\n$7\r\nmessage\r\n$${len(a)}\r\n${a}\r\n$${len(b)}\r\n${b}\r\n"
+}
+
+fn fakeSub(wire: string, buffer: int): Subscription {
+  let conn = redisConn{
+    s = psWireStream{ data = wire, done = false },
+    buf = "",
+    lastAttrs = []MapEntry(0),
+    unread = 0,
+    watching = false,
+    multi = false,
+  }
+  return Subscription{
+    opts = Options{},
+    roots = emptyTrustStore(),
+    kind = SubKind.Channel,
+    mu = Mutex(),
+    conn = conn,
+    want = ["news"],
+    out = chan<Message>(buffer),
+    acks = chan<int>(4),
+    drops = AtomicI64(0),
+    closing = AtomicI64(0),
+    failed = Option.None,
+    rejected = Option.None,
+  }
+}
+
+test "readEvent decodes a captured RESP3 push and delivers it" {
+  let sub = fakeSub(pushWire("news", "hello"), 4)
+  let ack = readEvent(sub) catch e {
+    panic("readEvent: ${e.message()}")
+  }
+  assert(!ack, "a message is not a confirmation")
+  let m = <- sub.out
+  assert(m.channel == "news" && m.payload == "hello", "delivered ${m.channel}/${m.payload}")
+}
+
+test "readEvent reports a confirmation and a server error reply" {
+  let sub = fakeSub(">3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n", 4)
+  let ack = readEvent(sub) catch e {
+    panic("readEvent: ${e.message()}")
+  }
+  assert(ack, "subscribe push is a confirmation")
+  let bad = fakeSub("-NOPERM this user has no permissions\r\n", 4)
+  let failed = false
+  readEvent(bad) catch e {
+    failed = !connectionBad(e)
+  }
+  assert(failed, "a server error is a failure that leaves the connection usable")
+}
+
+test "a full buffer drops the oldest message and counts it" {
+  let sub = fakeSub("", 2)
+  let i = 0
+  while (i < 5) {
+    offer(sub, Message{ channel = "c", pattern = Option.None, payload = "m${i}" })
+    i = i + 1
+  }
+  assert(sub.dropped() == 3, "dropped = ${sub.dropped()}")
+  assert(
+    sub.next() == Option.Some(Message{ channel = "c", pattern = Option.None, payload = "m3" }),
+    "oldest survivor is m3",
+  )
+  let last = sub.next()
+  match (last) {
+    Some(m) => assert(m.payload == "m4", "newest survives, got ${m.payload}")
+    None => panic("expected m4")
+  }
+}
+
+test "next() ends once the channel is closed and drained" {
+  let sub = fakeSub("", 2)
+  offer(sub, Message{ channel = "c", pattern = Option.None, payload = "x" })
+  close(sub.out)
+  let seen = 0
+  for _ of sub {
+    seen = seen + 1
+  }
+  assert(seen == 1, "iterated ${seen} messages")
+}
