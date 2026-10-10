@@ -422,9 +422,13 @@ so they cost nothing extra.
 import * as strings from "std/strings"
 
 fn main() {
-  let hi = strings.parseFloat("-Infinity") catch _ { return }
-  let none = strings.parseFloat("NaN") catch _ { return }
-  println("${hi < 0.0} ${none != none}")  // true true
+  let hi = strings.parseFloat("-Infinity") catch _ {
+    return
+  }
+  let none = strings.parseFloat("NaN") catch _ {
+    return
+  }
+  println("${hi < 0.0} ${none != none}") // true true
 }
 ```
 
