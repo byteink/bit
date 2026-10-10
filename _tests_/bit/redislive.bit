@@ -1,9 +1,10 @@
 // _tests_/bit/redislive.bit — `./make test-package-redis-live` (#6021, epic
 // #6013). Provisions its OWN Redis server rather than depending on one
 // someone else started: a throwaway `docker run --rm -d` container per
-// scheme (plain, TLS), PING-polled ready, handed to
-// pkg/redis/client.live.test.bit as REDIS_TEST_URL / REDIS_TEST_TLS_URL,
-// then always removed — see `cleanup()` for exactly what "always" covers.
+// scheme (plain, TLS, and a RESP2-only legacy server), PING-polled ready,
+// handed to pkg/redis/client.live.test.bit and conn.live.test.bit as REDIS_TEST_URL /
+// REDIS_TEST_TLS_URL / REDIS_TEST_V5_URL (plus the TLS test CAs), then always
+// removed — see `cleanup()` for exactly what "always" covers.
 //
 // IMAGE: `redis:8.10.2` (Redis Open Source, stable 2026-09-17 per its GitHub
 // release, `prerelease: false`), pinned BY DIGEST so a retag upstream cannot
@@ -17,13 +18,33 @@
 //   curl -s https://hub.docker.com/v2/repositories/library/redis/tags/8.10.2 | jq .digest
 //   curl -s https://api.github.com/repos/redis/redis/releases/tags/<version> | jq .prerelease
 //
-// THE IMAGE ITSELF IS KEPT, never deleted by this gate: `docker run`
-// auto-pulls it on first use (no explicit `docker pull` step below), and
-// deleting a ~55 MB pinned image after every green run only to re-pull it
-// next time makes a gate meant to run often slow for no safety benefit —
+// LEGACY IMAGE: `redis:5.0.14` (the last 5.x release; Redis 5 is the newest
+// line without `HELLO`, which arrived in 6.0), pinned by the multi-arch index
+// digest the Docker Hub tag API reports for `5.0.14` (amd64 and arm64 among
+// its platforms):
+//
+//   redis@sha256:fc5ecd863862f89f04334b7cbb57e93c9790478ea8188a49f6e57b0967d38c75
+//
+// A real old server, not a fake and not a renamed command: it answers `HELLO`
+// with the one message a RESP2 fallback keys on (`-ERR unknown command
+// 'HELLO'`), and speaks only RESP2 afterwards. Redis 5 has no TLS and no
+// `--enable-debug-command`, so it serves only the plain-text fallback tests.
+//
+// OPENSSL IMAGE: `alpine/openssl:3.5.9` by digest. The TLS fixtures (a CA, a
+// server certificate it signed for localhost/127.0.0.1, and a second,
+// unrelated CA) are generated inside this throwaway container and read back
+// off its stdout (so remote-docker mode, which cannot return a mounted
+// directory, works too); no openssl runs on the host, and none is needed.
+//
+//   alpine/openssl@sha256:e8a2319d15637db5296c0ff540bb028cfabc480b22fcdd4a020582393d32673f
+//
+// THE IMAGES THEMSELVES ARE KEPT, never deleted by this gate: `docker run`
+// auto-pulls them on first use (no explicit `docker pull` step below), and
+// deleting pinned images after every green run only to re-pull them next
+// time makes a gate meant to run often slow for no safety benefit —
 // the local-machine-hygiene rule (bitlang-ws's top-level CLAUDE.md) is about
 // not leaving ONE-OFF, throwaway installs behind, and a pinned image this
-// gate itself depends on every run is neither. Only the two CONTAINERS are
+// gate itself depends on every run is neither. Only the CONTAINERS are
 // throwaway and torn down every run — see CLEANUP below.
 //
 // WITHOUT DOCKER: no `docker` binary, or `docker info` failing three times
@@ -49,9 +70,16 @@
 //   BIT_REPO   repo root, so pkg/redis resolves regardless of cwd (required)
 //   BIT_BIN    compiler under test    (default bit-out/bin/bit)
 //
+// ENV vars this harness hands the test process (client.live.test.bit, conn.live.test.bit):
+//   REDIS_TEST_URL            plain redis 8.10.2
+//   REDIS_TEST_TLS_URL        the same server over TLS (tls-port), signed by the CA below
+//   REDIS_TEST_V5_URL         redis 5.0.14, no HELLO: the RESP2 fallback's real server
+//   REDIS_TEST_TLS_CA         PEM of the CA that signed the TLS server's certificate
+//   REDIS_TEST_TLS_OTHER_CA   PEM of an unrelated CA (must be refused)
+//
 // `bit test` inherits no argv (`bit run` forwards none either) and this
-// package's live tests read their target off `REDIS_TEST_URL`/
-// `REDIS_TEST_TLS_URL`, not a CLI flag — `runLiveTests()` below sets both by
+// package's live tests read their target off `REDIS_TEST_*`
+// variables, not a CLI flag — `runLiveTests()` below sets them by
 // exec'ing `/usr/bin/env VAR=... <bit> test <file>` rather than the plain
 // `<bit> test <file>` every other gate uses: `std/process`'s `run`/`output`
 // exec directly with no shell and inherit only THIS process's own
@@ -64,16 +92,18 @@
 
 import { output } from "std/process"
 import { env, envOr, exit } from "std/os"
-import { mkdir, readFile, remove, writeFile } from "std/fs"
-import { contains, hasSuffix, parseInt, split, trimSpace } from "std/strings"
+import { mkdir, remove, writeFile } from "std/fs"
+import { contains, hasSuffix, indexOf, parseInt, split, trimSpace } from "std/strings"
 import { uuidV4, format as uuidFormat } from "std/uuid"
 import { sleep, Millisecond } from "std/time"
 import {
-  dockerQuickTimeoutMs, dockerRunTimeoutMs, dockerRun, findBin, hostPort, relay, requireDocker,
-  releaseDocker,
+  dockerOutput, dockerQuickTimeoutMs, dockerRunTimeoutMs, dockerRun, failureText, hostPort,
+  relay, requireDocker, releaseDocker,
 } from "./dockerlive"
 
 const image: string = "redis@sha256:d5ac52db24d4e70566fe9944f22cf5bdc2bc739b05c0f426335161ea6c23f3b3"
+const legacyImage: string = "redis@sha256:fc5ecd863862f89f04334b7cbb57e93c9790478ea8188a49f6e57b0967d38c75"
+const opensslImage: string = "alpine/openssl@sha256:e8a2319d15637db5296c0ff540bb028cfabc480b22fcdd4a020582393d32673f"
 const runLabel: string = "bit.redis.live=1"
 // Pairs with `runLabel` on every container this run starts (see
 // `startPlain`/`startTls` below): the owning process's own pid, learned via
@@ -96,17 +126,6 @@ fn repoRoot(): string {
     panic("redislive: BIT_REPO is not set — run this through `./make test-package-redis-live`")
   }
   return r
-}
-
-fn opensslCandidates(): []string {
-  return [
-    "/usr/bin/openssl", "/opt/homebrew/bin/openssl", "/usr/local/bin/openssl",
-    "/usr/local/opt/openssl/bin/openssl",
-  ]
-}
-
-fn opensslBin(): string {
-  return findBin(opensslCandidates())
 }
 
 // This process's own pid, read off `/bin/sh -c 'echo $PPID'`: `std/process`
@@ -192,81 +211,167 @@ class liveContainer {
   port: int,
 }
 
-fn startPlain(bin: string, name: string, password: string, ownerLabel: string): liveContainer! {
-  dockerRun(
-    bin,
-    [
-      "run", "--rm", "-d", "--name", name, "--label", runLabel, "--label", ownerLabel,
-      "-p", "127.0.0.1:0:6379", image, "redis-server", "--requirepass", password,
-      // "local" checks the PEER'S address as Redis sees it inside the
-      // container, which is the Docker bridge gateway for a port-published
-      // connection, not 127.0.0.1 — "local" refused every live test's
-      // DEBUG SLEEP. "yes" is safe here: this container is throwaway,
-      // password-protected, and reachable only from 127.0.0.1 on the host
-      // (the `-p 127.0.0.1:0:6379` publish above).
-      "--enable-debug-command", "yes",
-    ],
-  )?
+fn concat(a: []string, b: []string): []string {
+  let out = []string(0)
+  for x of a {
+    out = append(out, x)
+  }
+  for x of b {
+    out = append(out, x)
+  }
+  return out
+}
+
+// What differs between the servers: the image, the `-v` arguments if any, the
+// `redis-server` arguments, and the `redis-cli` arguments that reach it from
+// inside the container.
+class serverSpec {
+  image: string,
+  mounts: []string,
+  serverArgs: []string,
+  cliArgs: []string,
+}
+
+// One throwaway server: `spec.image` running `redis-server <serverArgs>`, its
+// port 6379 published on a random loopback port, polled with `redis-cli
+// <cliArgs> ping` run INSIDE the container until it answers PONG.
+fn startServer(bin: string, name: string, ownerLabel: string, spec: serverSpec): liveContainer! {
+  let runArgs = [
+    "run", "--rm", "-d", "--name", name, "--label", runLabel, "--label", ownerLabel,
+    "-p", "127.0.0.1:0:6379",
+  ]
+  let serverCmd = [spec.image, "redis-server"]
+  dockerRun(bin, concat(concat(concat(runArgs, spec.mounts), serverCmd), spec.serverArgs))?
   let port = hostPort(bin, name, "6379/tcp")?
-  let ready = pingReady(
-    bin,
-    [
-      "exec", name, "redis-cli", "-a", password, "--no-auth-warning", "ping",
-    ],
-  )
+  let cli = concat(["exec", name, "redis-cli"], spec.cliArgs)
+  let ready = pingReady(bin, concat(cli, ["ping"]))
   if (!ready) {
     fail newError("${name}: PING never answered PONG within ${readyAttempts * readyDelayMs}ms")
   }
   return liveContainer{ name = name, port = port }
 }
 
+fn startPlain(bin: string, name: string, password: string, ownerLabel: string): liveContainer! {
+  // "local" checks the PEER'S address as Redis sees it inside the
+  // container, which is the Docker bridge gateway for a port-published
+  // connection, not 127.0.0.1 — "local" refused every live test's
+  // DEBUG SLEEP. "yes" is safe here: this container is throwaway,
+  // password-protected, and reachable only from 127.0.0.1 on the host
+  // (the `-p 127.0.0.1:0:6379` publish in `startServer`).
+  return startServer(
+    bin,
+    name,
+    ownerLabel,
+    serverSpec{
+      image = image,
+      mounts = []string(0),
+      serverArgs = ["--requirepass", password, "--enable-debug-command", "yes"],
+      cliArgs = ["-a", password, "--no-auth-warning"],
+    },
+  )?
+}
+
+// A real Redis 5: no `HELLO`, so `pkg/redis`'s RESP2 fallback is the only way
+// in. No `--enable-debug-command` (the flag does not exist before 7.0).
+fn startLegacy(bin: string, name: string, password: string, ownerLabel: string): liveContainer! {
+  return startServer(
+    bin,
+    name,
+    ownerLabel,
+    serverSpec{
+      image = legacyImage,
+      mounts = []string(0),
+      serverArgs = ["--requirepass", password],
+      cliArgs = ["-a", password, "--no-auth-warning"],
+    },
+  )?
+}
+
 fn startTls(
   bin: string, name: string, password: string, tlsCertDir: string, ownerLabel: string,
 ): liveContainer! {
-  dockerRun(
+  return startServer(
     bin,
-    [
-      "run", "--rm", "-d", "--name", name, "--label", runLabel, "--label", ownerLabel,
-      "-p", "127.0.0.1:0:6379", "-v", "${tlsCertDir}:/tls:ro", image,
-      "redis-server", "--requirepass", password, "--port", "0", "--tls-port", "6379",
-      "--tls-cert-file", "/tls/server.crt", "--tls-key-file", "/tls/server.key",
-      "--tls-ca-cert-file", "/tls/ca.crt", "--tls-auth-clients", "no",
-    ],
+    name,
+    ownerLabel,
+    serverSpec{
+      image = image,
+      mounts = ["-v", "${tlsCertDir}:/tls:ro"],
+      serverArgs = [
+        "--requirepass", password, "--port", "0", "--tls-port", "6379",
+        "--tls-cert-file", "/tls/server.crt", "--tls-key-file", "/tls/server.key",
+        "--tls-ca-cert-file", "/tls/ca.crt", "--tls-auth-clients", "no",
+      ],
+      cliArgs = [
+        "--tls",
+        "--cacert",
+        "/tls/ca.crt",
+        "-a",
+        password,
+        "--no-auth-warning",
+        "-p",
+        "6379",
+      ],
+    },
   )?
-  let port = hostPort(bin, name, "6379/tcp")?
-  let ready = pingReady(
-    bin,
-    [
-      "exec", name, "redis-cli", "--tls", "--cacert", "/tls/ca.crt",
-      "-a", password, "--no-auth-warning", "-p", "6379", "ping",
-    ],
-  )
-  if (!ready) {
-    fail newError("${name}: TLS PING never answered PONG within ${readyAttempts * readyDelayMs}ms")
-  }
-  return liveContainer{ name = name, port = port }
 }
 
-// A self-signed leaf certificate, generated fresh at gate time under
-// $TMPDIR — it is its own root, so the same file serves as both the server
-// certificate and the CA the client (and `pingReady`'s own `redis-cli
-// --cacert`) verifies against.
-fn generateCert(bin: string, dir: string): ()! {
+// Runs inside `opensslImage` (`sh -c`), prints every file below as
+// `@@@ <name>` followed by its PEM. `ca` is a real CA (basicConstraints CA:TRUE,
+// keyCertSign) that signed `server.crt` for DNS:localhost and IP:127.0.0.1;
+// `other-ca.crt` is a second CA that signed nothing, the "wrong root" fixture.
+const certScript: string = `set -e
+cd /tmp
+for n in ca other-ca; do
+  openssl req -x509 -newkey rsa:2048 -nodes -days 2 -keyout $n.key -out $n.crt -subj /CN=bit-redis-live-$n -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign 2>/dev/null
+done
+openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj /CN=localhost 2>/dev/null
+echo subjectAltName=DNS:localhost,IP:127.0.0.1 > server.ext
+echo extendedKeyUsage=serverAuth >> server.ext
+echo basicConstraints=CA:FALSE >> server.ext
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 -out server.crt -extfile server.ext 2>/dev/null
+for f in ca.crt other-ca.crt server.crt server.key; do echo "@@@ $f"; cat $f; done`
+
+// The text after the line "@@@ <name>" up to the next marker (or the end).
+fn section(out: string, name: string): string! {
+  let mark = "@@@ ${name}\n"
+  let at = indexOf(out, mark)
+  if (at < 0) {
+    fail newError("openssl container printed no ${name}")
+  }
+  let rest = out[at + len(mark):]
+  let end = indexOf(rest, "@@@ ")
+  if (end < 0) {
+    return rest
+  }
+  return rest[0:end]
+}
+
+class certs {
+  ca: string,
+  otherCa: string,
+}
+
+// A throwaway PKI generated at gate time INSIDE `opensslImage`: server.key,
+// server.crt and ca.crt are written to `dir` (the TLS server's mount); the CA
+// PEMs are returned for the test process.
+fn generateCerts(bin: string, dir: string, ownerLabel: string): certs! {
   mkdir(dir)?
-  let r = output(
+  let r = dockerOutput(
     bin,
     [
-      "req", "-x509", "-newkey", "rsa:2048", "-days", "2", "-nodes",
-      "-keyout", "${dir}/server.key", "-out", "${dir}/server.crt",
-      "-subj", "/CN=bit-redis-live-test",
+      "run", "--rm", "--label", runLabel, "--label", ownerLabel, "--entrypoint", "sh",
+      opensslImage, "-c", certScript,
     ],
     dockerRunTimeoutMs,
-  )
+  )?
   if (r.exitCode != 0) {
-    fail newError("openssl: ${trimSpace(r.stderr)}")
+    fail newError("openssl container: ${failureText(r, dockerRunTimeoutMs)}")
   }
-  let leaf = readFile("${dir}/server.crt")?
-  writeFile("${dir}/ca.crt", leaf)?
+  for f of ["server.key", "server.crt", "ca.crt"] {
+    writeFile("${dir}/${f}", section(r.stdout, f)?)?
+  }
+  return certs{ ca = section(r.stdout, "ca.crt")?, otherCa = section(r.stdout, "other-ca.crt")? }
 }
 
 fn cleanupCertDir(dir: string) {
@@ -279,7 +384,7 @@ fn cleanupCertDir(dir: string) {
   remove(dir) catch _ {}
 }
 
-// Always removes both containers (by name, `--rm` already means a stopped
+// Always removes every container (by name, `--rm` already means a stopped
 // one vanishes, `rm -f` handles a still-running one too) and the generated
 // cert directory — called from every path through `main()` below, success
 // or failure alike, never only on the happy path.
@@ -291,6 +396,15 @@ fn cleanup(bin: string, names: []string, certDir: string) {
   releaseDocker(bin)
 }
 
+// The environment one live run hands the test process; see the header.
+class liveEnv {
+  url: string,
+  tlsUrl: string,
+  v5Url: string,
+  tlsCa: string,
+  tlsOtherCa: string,
+}
+
 // Targets the pkg/redis DIRECTORY, not client.live.test.bit alone: SPEC
 // §17.1, "a single .bit file named directly on the command line is a module
 // of exactly that one file — its siblings are not part of it", and
@@ -300,72 +414,76 @@ fn cleanup(bin: string, names: []string, certDir: string) {
 // client.test.bit/resp.test.bit/errors.test.bit's fakes — harmless either
 // way, but pointless work under a Docker container's own wall clock.
 //
-// Sets REDIS_TEST_URL/REDIS_TEST_TLS_URL for exactly the child this spawns —
-// see the file header's ENV section for why `/usr/bin/env` is the vehicle.
-fn runLiveTests(bitPath: string, repo: string, url: string, tlsUrl: string): int {
+// Sets the REDIS_TEST_* variables for exactly the child this spawns — see
+// the file header's ENV section for why `/usr/bin/env` is the vehicle.
+fn runLiveTests(bitPath: string, repo: string, e: liveEnv): int {
   let r = output(
     "/usr/bin/env",
     [
-      "REDIS_TEST_URL=${url}", "REDIS_TEST_TLS_URL=${tlsUrl}",
-      bitPath, "test", "${repo}/pkg/redis", "--run", "live: ",
+      "REDIS_TEST_URL=${e.url}", "REDIS_TEST_TLS_URL=${e.tlsUrl}",
+      "REDIS_TEST_V5_URL=${e.v5Url}", "REDIS_TEST_TLS_CA=${e.tlsCa}",
+      "REDIS_TEST_TLS_OTHER_CA=${e.tlsOtherCa}", bitPath, "test", "${repo}/pkg/redis", "--run",
+      "live: ",
     ],
     testRunTimeoutMs,
   )
   return relay(r, "redislive", testRunTimeoutMs)
 }
 
+// Prints `msg`, removes everything this run started, exits 1.
+fn abort(bin: string, names: []string, certDir: string, msg: string) {
+  eprint("redislive: ${msg}\n")
+  cleanup(bin, names, certDir)
+  exit(1)
+}
+
 fn main() {
   let bin = requireDocker("redislive")
   sweepOrphans(bin)
 
-  let ssl = opensslBin()
-  if (ssl == "") {
-    eprint("redislive: docker is available but no openssl binary was found (checked ${len(opensslCandidates())} paths) — cannot generate the TLS test's certificate\n")
-    exit(1)
-    return
-  }
-
   let repo = repoRoot()
   let bitPath = envOr("BIT_BIN", "${repo}/bit-out/bin/bit")
   let runId = uuidFormat(uuidV4())
-  let plainName = "bit-redis-live-${runId}"
-  let tlsName = "bit-redis-live-tls-${runId}"
+  let names = [
+    "bit-redis-live-${runId}", "bit-redis-live-tls-${runId}", "bit-redis-live-v5-${runId}",
+  ]
   let password = uuidFormat(uuidV4())
   let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
   let certDir = "${tmp}/bit-redis-live-tls-${runId}"
-  let names = [plainName, tlsName]
-
-  generateCert(ssl, certDir) catch e {
-    eprint("redislive: ${e.message()}\n")
-    cleanup(bin, names, certDir)
-    exit(1)
-    return
-  }
 
   let pid = selfPid() catch e {
-    eprint("redislive: ${e.message()}\n")
-    cleanup(bin, names, certDir)
-    exit(1)
+    abort(bin, names, certDir, e.message())
     return
   }
   let ownerLabel = "${ownerLabelKey}=${pid}"
-
-  let plain = startPlain(bin, plainName, password, ownerLabel) catch e {
-    eprint("redislive: ${e.message()}\n")
-    cleanup(bin, names, certDir)
-    exit(1)
+  let pki = generateCerts(bin, certDir, ownerLabel) catch e {
+    abort(bin, names, certDir, e.message())
     return
   }
-  let tls = startTls(bin, tlsName, password, certDir, ownerLabel) catch e {
-    eprint("redislive: ${e.message()}\n")
-    cleanup(bin, names, certDir)
-    exit(1)
+  let plain = startPlain(bin, names[0], password, ownerLabel) catch e {
+    abort(bin, names, certDir, e.message())
+    return
+  }
+  let tls = startTls(bin, names[1], password, certDir, ownerLabel) catch e {
+    abort(bin, names, certDir, e.message())
+    return
+  }
+  let v5 = startLegacy(bin, names[2], password, ownerLabel) catch e {
+    abort(bin, names, certDir, e.message())
     return
   }
 
-  let url = "redis://:${password}@127.0.0.1:${plain.port}"
-  let tlsUrl = "rediss://:${password}@127.0.0.1:${tls.port}"
-  let rc = runLiveTests(bitPath, repo, url, tlsUrl)
+  let rc = runLiveTests(
+    bitPath,
+    repo,
+    liveEnv{
+      url = "redis://:${password}@127.0.0.1:${plain.port}",
+      tlsUrl = "rediss://:${password}@127.0.0.1:${tls.port}",
+      v5Url = "redis://:${password}@127.0.0.1:${v5.port}",
+      tlsCa = pki.ca,
+      tlsOtherCa = pki.otherCa,
+    },
+  )
 
   cleanup(bin, names, certDir)
   exit(rc)

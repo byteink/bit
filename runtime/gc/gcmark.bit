@@ -381,13 +381,31 @@ export @nosplit @symbol("bit_rt_port_gc_mark_conservative") fn gcMarkConservativ
 // ONE TABLE, ONE OWNER. `gcRtOwner` holds the collector block whose roots the
 // table holds. A second heap collecting at once (`_tests_/stress/stwcollect`
 // drives a private one) finds it taken and scans its roots inline.
+//
+// PARKED FRAMES ARE JOBS TOO (#7783). `../stw/stw.bit`'s class 3 records each
+// other parked mutator's snapshot here (`gcRootSnapshot`); one job per frame
+// follows the range jobs. A precise walk rewrites its register file as it
+// unwinds (./stackmap.bit), so each frame job walks with a context of its own
+// after the range table: `gcRtWalkG` the collector block, `gcRtWalkC` the
+// member, `gcRtWalkMode` the mode `gcRtRunJob` names, `gcRtWalkFrame` the
+// snapshot, then the 32 registers. One claimant per job index means one
+// writer per context.
 
-const gcRtMaxRanges = 65536 // table capacity; 16 bytes per range, 1 MiB virtual
-const gcRtJobRanges = 32    // ranges per job
+const gcRtMaxRanges = 65536  // table capacity; 16 bytes per range, 1 MiB virtual
+const gcRtJobRanges = 32     // ranges per job
+const gcRtWalkOff = 1048576  // gcRtMaxRanges * 16
+const gcRtWalkBytes = 320    // 4 words + 32 registers, padded to 64-byte lines
+const gcRtMapBytes = 1130496 // gcRtWalkOff + maxMutators * gcRtWalkBytes
+const gcRtWalkG = 0
+const gcRtWalkC = 1
+const gcRtWalkMode = 2
+const gcRtWalkFrame = 3
+const gcRtWalkRegs = 4
 
 let gcRtBase: i64 = 0  // the side mapping, 0 until first use
 let gcRtOwner: i64 = 0 // 0, or the `g` whose roots the table holds
 let gcRtN: i64 = 0     // ranges recorded this collection
+let gcRtNs: i64 = 0    // parked frames recorded this collection
 let gcRtNext: i64 = 0  // next job index to claim
 let gcRtDone: i64 = 0  // jobs finished
 
@@ -401,13 +419,14 @@ export @nosplit @symbol("bit_rt_port_gc_root_jobs_open") fn gcRootJobsOpen(g: *i
     return false
   }
   if (gcRtBase == 0) {
-    gcRtBase = memMapPages(gcRtMaxRanges * 16)
+    gcRtBase = memMapPages(gcRtMapBytes)
   }
   if (gcRtBase == 0) {
     atomicStore(ptrOf(gcRtOwner), 0)
     return false
   }
   gcRtN = 0
+  gcRtNs = 0
   atomicStore(ptrOf(gcRtNext), 0)
   atomicStore(ptrOf(gcRtDone), 0)
   return true
@@ -432,45 +451,139 @@ export @nosplit @symbol("bit_rt_port_gc_root_range") fn gcRootRange(g: *i64, lo:
   }
 }
 
-@nosplit fn gcRtJobs(): int {
+// Walk the parked frame `f` precisely, or record it as a frame job when `g`
+// owns the table.
+export @nosplit @symbol("bit_rt_port_gc_root_snapshot") fn gcRootSnapshot(g: *i64, f: int) {
+  if (atomicLoad(ptrOf(gcRtOwner)) == int(g) && gcRtNs < maxMutators) {
+    *(gcRtWalk(gcRtNs) + gcRtWalkFrame) = f
+    gcRtNs = gcRtNs + 1
+    return
+  }
+  gcScanSnapshot(g, f)
+}
+
+@nosplit fn gcRtWalk(k: int): *i64 {
+  return wordAt(gcRtBase + gcRtWalkOff + k * gcRtWalkBytes)
+}
+
+@nosplit fn gcRtRangeJobs(): int {
   return (gcRtN + gcRtJobRanges - 1) / gcRtJobRanges
+}
+
+@nosplit fn gcRtJobs(): int {
+  return gcRtRangeJobs() + gcRtNs
+}
+
+// Run job `j` (`gcRtRunJob` names the modes): a range job, or past them the
+// walk of a recorded parked frame.
+@nosplit fn gcRtRun(g: *i64, c: *i64, j: int, mode: int) {
+  let k = j - gcRtRangeJobs()
+  if (k < 0) {
+    gcRtRunJob(g, c, j, mode)
+  } else {
+    let m = gcRtWalk(k)
+    *(m + gcRtWalkG) = int(g)
+    *(m + gcRtWalkC) = int(c)
+    *(m + gcRtWalkMode) = mode
+    smWalk(m, *(m + gcRtWalkFrame))
+  }
+  let _ = atomicAdd(ptrOf(gcRtDone), 1)
 }
 
 // Mark job `j`'s words. By mode: 0 the serial worklist, 1 the member's
 // segment, 2 mark-and-overflow (no segment could be taken).
+//
+// THE MODE IS READ ONCE PER RANGE, THE HEAP WINDOW ONCE PER JOB (#7783). A
+// per-word dispatch cost a call and a 0x30 frame for every word, most of which
+// are not heap pointers at all. The window `[gcLoAddr, gcHiAddr)` cannot move
+// while this runs: `noteBody` (./gcalloc.bit) widens it only from
+// `linkObject`, and nothing links an object with the world stopped
+// (`growMarkStack` takes its block from the heap without linking it). So a
+// word outside the window read here is a word `gcMarkRoot` and `gcMkRoot`
+// reject; the words inside still go through their whole validation.
 @nosplit fn gcRtRunJob(g: *i64, c: *i64, j: int, mode: int) {
   let r = j * gcRtJobRanges
   let end = r + gcRtJobRanges
   if (end > gcRtN) {
     end = gcRtN
   }
+  let lo = *(g + gcLoAddr)
+  let hi = *(g + gcHiAddr)
   while (r < end) { // bounded: gcRtJobRanges ranges
-    let lo = loadWord(gcRtBase + r * 16)
+    let a = loadWord(gcRtBase + r * 16)
     let n = loadWord(gcRtBase + r * 16 + 8)
-    let i = 0
-    while (i < n) { // bounded: the range's recorded word count
-      gcRtMarkWord(g, c, loadWord(lo + i * 8), mode)
-      i = i + 1
+    if (mode == 1) {
+      gcRtScanSeg(c, a, a + n * 8, lo, hi)
+    } else if (mode == 0) {
+      gcRtScanSerial(g, a, a + n * 8, lo, hi)
+    } else {
+      gcRtScanOverflow(g, a, a + n * 8, lo, hi)
     }
     r = r + 1
   }
-  let _ = atomicAdd(ptrOf(gcRtDone), 1)
 }
 
-@nosplit fn gcRtMarkWord(g: *i64, c: *i64, w: int, mode: int) {
-  if (mode == 1) {
-    gcMkRoot(c, w)
-    return
+// The words in `[p, end)` inside the window `[lo, hi)`, marked into member
+// `c`'s segment.
+@nosplit fn gcRtScanSeg(c: *i64, p: int, end: int, lo: int, hi: int) {
+  while (p < end) { // bounded: the range's recorded word count
+    let w = loadWord(p)
+    if (w >= lo) {
+      if (w < hi) {
+        gcMkRoot(c, w)
+      }
+    }
+    p = p + 8
   }
-  if (mode == 0) {
-    gcMarkConservative(g, w)
-    return
+}
+
+// `gcRtScanSeg` on the serial worklist.
+@nosplit fn gcRtScanSerial(g: *i64, p: int, end: int, lo: int, hi: int) {
+  while (p < end) { // bounded: the range's recorded word count
+    let w = loadWord(p)
+    if (w >= lo) {
+      if (w < hi) {
+        gcMarkRoot(g, w)
+      }
+    }
+    p = p + 8
   }
-  if (w == 0 || w < *(g + gcLoAddr) || w >= *(g + gcHiAddr) || !gcOwns(g, w)) {
-    return
+}
+
+// `gcRtScanSeg` with no segment: mark, and leave the children to the rescan
+// `gcOverflow` asks for.
+@nosplit fn gcRtScanOverflow(g: *i64, p: int, end: int, lo: int, hi: int) {
+  while (p < end) { // bounded: the range's recorded word count
+    let w = loadWord(p)
+    if (w >= lo && w < hi) {
+      gcRtMarkOver(g, w)
+    }
+    p = p + 8
   }
-  if (hdrTryMark(headerFromBody(w))) {
+}
+
+// Mark the in-window word `w` with no segment to push it on.
+@nosplit fn gcRtMarkOver(g: *i64, w: int) {
+  if (gcOwns(g, w) && hdrTryMark(headerFromBody(w))) {
     atomicStore(g + gcOverflow, 1)
+  }
+}
+
+// One reference the precise walk with context `m` found (./stackmap.bit),
+// marked as its mode says. Per reference, not per word: a frame names few.
+@nosplit fn gcRtMarkRef(m: *i64, ref: int) {
+  let g = wordAt(*(m + gcRtWalkG))
+  let mode = *(m + gcRtWalkMode)
+  if (mode == 0) {
+    gcMarkRoot(g, ref)
+    return
+  }
+  if (mode == 1) {
+    gcMkRoot(wordAt(*(m + gcRtWalkC)), ref)
+    return
+  }
+  if (ref >= *(g + gcLoAddr) && ref < *(g + gcHiAddr)) {
+    gcRtMarkOver(g, ref)
   }
 }
 
@@ -486,7 +599,7 @@ export @nosplit @symbol("bit_rt_port_gc_root_range") fn gcRootRange(g: *i64, lo:
     if (j >= jobs) {
       return
     }
-    gcRtRunJob(g, nil, j, 0)
+    gcRtRun(g, nil, j, 0)
     k = k + 1
   }
 }
@@ -501,6 +614,7 @@ export @nosplit @symbol("bit_rt_port_gc_root_range") fn gcRootRange(g: *i64, lo:
     worldHelperFatal()
   }
   gcRtN = 0
+  gcRtNs = 0
   atomicStore(ptrOf(gcRtOwner), 0)
 }
 
@@ -553,7 +667,7 @@ export @nosplit @symbol("bit_rt_port_gc_root_range") fn gcRootRange(g: *i64, lo:
     if (j >= jobs) {
       return
     }
-    gcRtRunJob(g, c, j, mode)
+    gcRtRun(g, c, j, mode)
     k = k + 1
   }
 }

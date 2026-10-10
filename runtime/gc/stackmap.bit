@@ -37,7 +37,8 @@
 //
 // One shared copy is sound because the world lock serializes collectors: exactly
 // one thread is inside a collection at a time, and this walk runs only from
-// inside one.
+// inside one. A parked frame walked as a root job (#7783, ./gcmark.bit) runs
+// on a gang member beside others, so it walks with its job's own copy.
 //
 // This file sorts AFTER `gcmark.bit` and `mem.bit` (#1511), so `gcMarkRoot`,
 // `loadWord` and `loadByte` are already lowered when the module concatenates and
@@ -90,7 +91,7 @@
 //
 // #4046 explicitly left this open. `runtime/stw/stw.bit:729-737` skips class
 // 7's `stwScanCtx` for the RUNNING task — its ctx block is a stale copy from
-// the task's last park, not live state — and `gcMarkRoot(g, *(regs + rn))`
+// the task's last park, not live state — and `gcRtMarkRef(m, *(regs + rn))`
 // above is, for a task that IS the collector, the only thing that marks a
 // live register directly. #4111 tested whether a conservative scan
 // nonetheless rediscovers it, the way class 8/10 rediscover a spilled slot.
@@ -143,9 +144,10 @@ const sfRegs = 16
 // this many and the working copy below is exactly this wide.
 const smNumRegs = 32
 
-// The working register file described in the header. Written only under the
-// world lock, from inside a collection.
-let scanRegs: [32]i64
+// The serial walk's context (`gcRtWalk*`, ./gcmark.bit): the register file
+// described in the header and the mark target. Written only under the world
+// lock, from inside a collection.
+let scanWalk: [36]i64
 
 // ---------------------------------------------------------------------------
 // Unaligned little-endian blob readers — `runtime/root/`'s `blobU16`/`U32`/`U64`/`I32`
@@ -566,17 +568,17 @@ export @nosplit fn smLinearFind(pc: int): int {
 
 // Marks every live reference the safepoint record at `sp` names: stack slots
 // through `fp`, registers through the working file. `smSpEnd` proved its spans.
-@nosplit fn smMarkSafepoint(g: *i64, base: int, sp: int, fp: int) {
+@nosplit fn smMarkSafepoint(m: *i64, base: int, sp: int, fp: int) {
   let numSlots = blobU16(base, sp + 4)
   let k = 0
   // Bounded: this safepoint's slot count.
   while (k < numSlots) {
-    gcMarkRoot(g, loadWord(fp + blobI32(base, sp + 6 + k * 4)))
+    gcRtMarkRef(m, loadWord(fp + blobI32(base, sp + 6 + k * 4)))
     k = k + 1
   }
   let regsOff = sp + 6 + numSlots * 4 + 2
   let numRegs = blobU16(base, regsOff - 2)
-  let regs = ptrOf(scanRegs)
+  let regs = m + gcRtWalkRegs
   k = 0
   // Bounded: this safepoint's register count.
   while (k < numRegs) {
@@ -588,7 +590,7 @@ export @nosplit fn smLinearFind(pc: int): int {
     // bounds-checked array access and this is the same check, not a
     // weakened one.
     if (rn < smNumRegs) {
-      gcMarkRoot(g, *(regs + rn))
+      gcRtMarkRef(m, *(regs + rn))
     }
     k = k + 1
   }
@@ -597,9 +599,9 @@ export @nosplit fn smLinearFind(pc: int): int {
 // Rewrites the working file to the CALLER's callee-saved values the frame at
 // `fp` spilled, so the next frame out reads them. Reads land inside the saved
 // span `smSpsStart` proved.
-@nosplit fn smRestoreSaved(base: int, off: int, fp: int) {
+@nosplit fn smRestoreSaved(m: *i64, base: int, off: int, fp: int) {
   let numSaved = blobU16(base, off + 14)
-  let regs = ptrOf(scanRegs)
+  let regs = m + gcRtWalkRegs
   let k = 0
   // Bounded: this entry's saved-register count.
   while (k < numSaved) {
@@ -615,7 +617,7 @@ export @nosplit fn smLinearFind(pc: int): int {
 // Scans the entry at `off`, which spans `pc`: marks what the safepoint at `pc`
 // names, then restores the caller's callee-saved values. Re-proves the entry's
 // spans as it goes, so no read depends on who found `off`.
-@nosplit fn scanEntry(g: *i64, off: int, pc: int, fp: int) {
+@nosplit fn scanEntry(m: *i64, off: int, pc: int, fp: int) {
   let base = smTblBase()
   let tblLen = smTblLen()
   let p = smSpsStart(base, tblLen, off)
@@ -634,12 +636,12 @@ export @nosplit fn smLinearFind(pc: int): int {
       return
     }
     if (codeAddr + blobU32(base, p) == pc) {
-      smMarkSafepoint(g, base, p, fp)
+      smMarkSafepoint(m, base, p, fp)
     }
     p = next
     si = si + 1
   }
-  smRestoreSaved(base, off, fp)
+  smRestoreSaved(m, base, off, fp)
 }
 
 // #7303: the live-register mask of the poll at `pc` in the entry at `off` of
@@ -721,12 +723,12 @@ export @nosplit fn smLiveRegsAt(pc: int): int {
 // callee-saved values this frame spilled, so the next frame out reads them
 // correctly. Returns false when `pc` is in no Bit function, which is the top of
 // the Bit portion of the stack and stops the walk.
-@nosplit fn scanFrame(g: *i64, pc: int, fp: int): bool {
+@nosplit fn scanFrame(m: *i64, pc: int, fp: int): bool {
   let off = smFindEntry(pc)
   if (off < 0) {
     return false
   }
-  scanEntry(g, off, pc, fp)
+  scanEntry(m, off, pc, fp)
   return true
 }
 
@@ -743,6 +745,14 @@ export @nosplit fn smLiveRegsAt(pc: int): int {
 // means no stack-map table is linked into this image at all. Both are "nothing
 // precise to walk", not an error.
 export @nosplit @symbol("bit_rt_port_gc_scan_snapshot") fn gcScanSnapshot(g: *i64, snapAddr: int) {
+  let m = ptrOf(scanWalk)
+  *(m + gcRtWalkG) = int(g)
+  *(m + gcRtWalkMode) = 0
+  smWalk(m, snapAddr)
+}
+
+// The walk of the snapshot at `snapAddr` with the context `m`.
+@nosplit fn smWalk(m: *i64, snapAddr: int) {
   if (snapAddr == 0) {
     return
   }
@@ -754,7 +764,7 @@ export @nosplit @symbol("bit_rt_port_gc_scan_snapshot") fn gcScanSnapshot(g: *i6
     return
   }
 
-  let regs = ptrOf(scanRegs)
+  let regs = m + gcRtWalkRegs
   let i = 0
   // Bounded: exactly `smNumRegs` words.
   while (i < smNumRegs) {
@@ -768,7 +778,7 @@ export @nosplit @symbol("bit_rt_port_gc_scan_snapshot") fn gcScanSnapshot(g: *i6
   // Bounded by `smMaxFrames`; the real exits are "pc left the Bit call graph"
   // and the frame-pointer sanity test below.
   while (frame < smMaxFrames) {
-    if (!scanFrame(g, pc, fp)) {
+    if (!scanFrame(m, pc, fp)) {
       break
     }
     let nextRet = loadWord(fp + 8)
