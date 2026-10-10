@@ -35,7 +35,7 @@ fn main(): ()! {
 ```
 
 The full method surface, the connection URL and `Options`, and what this
-package does not implement (pipelining, pub/sub, cluster) are in
+package does not implement (cluster) are in
 [`docs/`](docs/README.md).
 
 For how first-party packages in this repository are laid out, gated,
