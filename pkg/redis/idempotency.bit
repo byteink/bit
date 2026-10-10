@@ -6,15 +6,21 @@
 //     app.use(idempotency(IdempotencyPolicy{ store = store, ttl = 86400 }))
 //
 // WHY THIS PACKAGE DEPENDS ON `web`. `IdempotencyStore.begin` returns an
-// `Option<IdempotencyEntry>`, and `IdempotencyEntry`/`CachedResponse` are
-// classes `web` owns; an interface is satisfied structurally (SPEC 14.3), but
-// only by the same types. So `bit.json` names `web`, and the four types below
-// are the only things this file takes from it.
+// `IdempotencyClaim`, and `IdempotencyClaim`/`IdempotencyEntry`/
+// `CachedResponse` are classes `web` owns; an interface is satisfied
+// structurally (SPEC 14.3), but only by the same types. So `bit.json` names
+// `web`, and the names imported below are the only things this file takes
+// from it.
 //
 // ONE KEY PER IDEMPOTENCY KEY, ONE STRING PER KEY. The value is
 //
-//     I<n>:<fingerprint>                              reserved, handler running
+//     I<n>:<fingerprint><token>                       reserved, handler running
 //     D<n>:<fingerprint><status>\n<h>\n<headers><body>   finished, response stored
+//
+// `<token>` is the reservation token `begin` minted (web's
+// `newReservationToken`, 32 hex characters): it runs to the end of the value,
+// so it needs no length of its own. A `D` value carries none, because a
+// finished response has no owner left to protect.
 //
 // `<n>` is the byte length of the fingerprint, `<h>` the header count, each
 // header `<nlen>:<name><vlen>:<value>`, and the body is whatever bytes are
@@ -30,11 +36,17 @@
 // gets the null reply; every other gets the winner's value back, in the same
 // round trip. There is no get-then-set window to lose a race in.
 //
-// `finish` IS ONE SCRIPT, because it must keep the fingerprint `begin`
-// stored (the interface hands `finish` only the response) and rewrite the
-// key with a fresh `ttl` in one step; `GET` then `SET` from the client would
-// let an `abandon` or an expiry slip between them. The script reads the
-// length-prefixed head, so it never parses the response.
+// `finish` AND `abandon` ARE ONE SCRIPT EACH (#7832), because each must act
+// only while the key still holds THEIR reservation: a handler that outlives
+// `ttl` has lost it, a later request may have begun a new one under the same
+// key, and a plain `DEL` or `SET` would destroy that request's reservation
+// (the compare-and-delete of the redis.io distributed-lock pattern). Both
+// scripts compare the stored token to the one `begin` returned, in the same
+// step as the write, and do nothing when it differs or the key is gone or
+// `Done`. `finish` also keeps the fingerprint `begin` stored (the interface
+// hands it only the response) and rewrites the key with a fresh `ttl`; a
+// client-side `GET` then `SET` would let an expiry slip between them. The
+// scripts read the length-prefixed head, so they never parse the response.
 //
 // A FAILED `begin` IS NEVER RETRIED by the client (a write is not repeated
 // on a dropped connection, `client.bit`): if the `SET` ran and its reply was
@@ -46,7 +58,14 @@
 // An `Idempotency-Key` is client-supplied, so it is only ever appended to
 // `prefix`; whatever bytes it holds, it names one key under that prefix.
 
-import { CachedResponse, Header, IdempotencyEntry, IdempotencyState } from "web"
+import {
+  CachedResponse,
+  Header,
+  IdempotencyClaim,
+  IdempotencyEntry,
+  IdempotencyState,
+  newReservationToken,
+} from "web"
 
 // Seconds a key may be remembered: the largest `ttl * Second` that fits an
 // `int` of nanoseconds, so the conversion below cannot wrap.
@@ -55,18 +74,27 @@ const maxIdempotencyTtl: i64 = 9_000_000_000
 // Digits read for one length or count. 18 digits always fit an `int`.
 const maxIdempotencyDigits: int = 18
 
-const idempotencyFinishSrc: string = `
+// The shared head of both scripts: leaves `v`, `c` and `n` set when KEYS[1]
+// holds an `I` value whose token is ARGV[1], and returns 0 otherwise.
+const idempotencyOwnedSrc: string = `
 local v = redis.call('GET', KEYS[1])
-local head = '0:'
-if v then
-  local c = string.find(v, ':', 2, true)
-  local n = c and tonumber(string.sub(v, 2, c - 1))
-  if n then
-    head = string.sub(v, 2, c + n)
-  end
-end
-redis.call('SET', KEYS[1], 'D' .. head .. ARGV[1], 'PX', ARGV[2])
+if not v or string.sub(v, 1, 1) ~= 'I' then return 0 end
+local c = string.find(v, ':', 2, true)
+local n = c and tonumber(string.sub(v, 2, c - 1))
+if not n or string.sub(v, c + n + 1) ~= ARGV[1] then return 0 end
+`
+
+// ARGV: token, encoded response, ttl in milliseconds.
+const idempotencyFinishSrc: string = idempotencyOwnedSrc +
+  `
+redis.call('SET', KEYS[1], 'D' .. string.sub(v, 2, c + n) .. ARGV[2], 'PX', ARGV[3])
 return 1
+`
+
+// ARGV: token.
+const idempotencyAbandonSrc: string = idempotencyOwnedSrc +
+  `
+return redis.call('DEL', KEYS[1])
 `
 
 // The store. `prefix` namespaces its keys: the default `idem:` keeps them
@@ -76,6 +104,7 @@ export class RedisIdempotencyStore {
   client: Client
   prefix: string
   finishScript: Script
+  abandonScript: Script
 
   // Fails when the server is older than Redis 7.0 (`NX` with `GET` is a
   // syntax error there), so a server `begin` cannot run on never gets a
@@ -85,33 +114,39 @@ export class RedisIdempotencyStore {
     this.client = client
     this.prefix = prefix
     this.finishScript = Script(idempotencyFinishSrc)
+    this.abandonScript = Script(idempotencyAbandonSrc)
   }
 
-  // Reserves `key` for `ttl` seconds and returns `Option.None` to the one
-  // caller that created it; every other caller gets the entry as it stands.
-  export begin(key: string, fingerprint: string, ttl: i64): Option<IdempotencyEntry>! {
+  // Reserves `key` for `ttl` seconds and returns the reservation token to the
+  // one caller that created it; every other caller gets the entry as it
+  // stands, with an empty token.
+  export begin(key: string, fingerprint: string, ttl: i64): IdempotencyClaim! {
     checkIdempotencyTtl(ttl)?
-    let reserved = encodeInFlight(fingerprint)
+    let token = newReservationToken()
+    let reserved = encodeInFlight(fingerprint, token)
     let prev = this.client.setGet(this.prefix + key, reserved, ttl = ttl * Second, ifAbsent = true)?
     if (isNone(prev)) {
-      return Option.None
+      return IdempotencyClaim{ token = token }
     }
-    return Option.Some(decodeEntry(unwrap(prev))?)
+    return IdempotencyClaim{ existing = Option.Some(decodeEntry(unwrap(prev))?) }
   }
 
   // Stores `resp` under `key` for `ttl` seconds counted from this call, with
-  // the fingerprint `begin` recorded. A key that expired mid-flight is
-  // written anyway with an empty fingerprint, as `MemoryIdempotencyStore`
-  // does: a correct response is cached rather than lost to its own `ttl`.
-  export finish(key: string, resp: CachedResponse, ttl: i64): ()! {
+  // the fingerprint `begin` recorded, but only while the key still holds the
+  // reservation `token` names. A reservation that expired, was freed or was
+  // taken over by a later `begin` is left alone and the call succeeds
+  // without writing: caching under a key with no reservation would store a
+  // response with no fingerprint.
+  export finish(key: string, token: string, resp: CachedResponse, ttl: i64): ()! {
     checkIdempotencyTtl(ttl)?
-    let args = [encodeResponse(resp), "${ttl * 1000}"]
+    let args = [token, encodeResponse(resp), "${ttl * 1000}"]
     this.finishScript.run(this.client, luaInt, keys = [this.prefix + key], args = args)?
   }
 
-  // Deletes the reservation so a retry can run at once.
-  export abandon(key: string): ()! {
-    this.client.del([this.prefix + key])?
+  // Deletes the reservation `token` names so a retry can run at once; a key
+  // holding anyone else's reservation, or a finished response, is left alone.
+  export abandon(key: string, token: string): ()! {
+    this.abandonScript.run(this.client, luaInt, keys = [this.prefix + key], args = [token])?
   }
 }
 
@@ -146,8 +181,8 @@ fn checkIdempotencyTtl(ttl: i64): ()!RedisError {
   }
 }
 
-fn encodeInFlight(fingerprint: string): string {
-  return "I${len(fingerprint)}:${fingerprint}"
+fn encodeInFlight(fingerprint: string, token: string): string {
+  return "I${len(fingerprint)}:${fingerprint}${token}"
 }
 
 // The status line, the header block, then the body untouched.

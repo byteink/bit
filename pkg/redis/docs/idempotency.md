@@ -78,11 +78,14 @@ The value starts with a state letter and the request fingerprint, and once
 the handler finishes it carries the response:
 
 ```text
-I<n>:<fingerprint>                                reserved, handler running
+I<n>:<fingerprint><token>                         reserved, handler running
 D<n>:<fingerprint><status>\n<count>\n<headers><body>   finished
 ```
 
-`<n>` is the fingerprint's length and each header is `<len>:<name><len>:<value>`.
+`<token>` is the reservation token `begin` returned to the request that
+created the key: 32 hex characters from the OS random source, running to the
+end of the value. A finished value carries none. `<n>` is the fingerprint's
+length and each header is `<len>:<name><len>:<value>`.
 The body is whatever bytes are left, stored exactly as the handler produced
 it: no JSON escaping, no base64, so a response costs its own size plus a few
 dozen bytes. A body of any bytes, including binary, comes back identical.
@@ -118,6 +121,24 @@ lost, the key stays reserved until `ttl` ends and a retry gets `409`, never a
 second run. `finish` failing only costs the cache write; the response goes out
 regardless and the failure is logged.
 
+## Whose reservation is it
+
+`finish` and `abandon` are one Lua script each. Both read the key, and act
+only if it still holds an `I` value whose token is the one `begin` returned
+to this request, all in one step on the server. When the key is gone, was
+re-reserved by a later request, or already holds a finished response, the
+script does nothing and the call succeeds.
+
+This is what keeps a slow handler from undoing a later retry. Say a handler
+runs longer than `ttl`: its reservation expires, a retry reserves the key
+again, and then the first handler fails. A plain `DEL` would delete the
+retry's reservation and let a third request run the handler. With the token,
+the first handler's `abandon` finds someone else's token and leaves the key
+alone. A late `finish` is refused the same way, and also when nobody has
+reserved the key since: a response cannot be cached under a key with no
+fingerprint, so it is dropped and the next request after the expiry runs the
+handler.
+
 A stored value that does not parse (another program wrote to the key, or the
 format changed) fails `begin` with `RedisError.Protocol` instead of reading as
 "not seen", because treating garbage as absent would run the handler twice.
@@ -127,10 +148,10 @@ format changed) fails `begin` with `RedisError.Protocol` instead of reading as
 - A handler that raises releases its reservation at once (`abandon` deletes
   the key). A handler that panics cannot, so the key stays `409` until `ttl`
   ends; keep `ttl` short enough that this is bearable.
-- `abandon` has no way to tell whose reservation it deletes. If a handler runs
-  longer than `ttl`, a second request can reserve the same key, and the first
-  handler failing late then frees the second one's reservation. Pick a `ttl`
-  longer than your slowest handler.
+- A handler that runs longer than `ttl` loses its reservation: a second
+  request can reserve the same key and run the handler at the same time, which
+  no token can prevent. The late `finish` or `abandon` is harmless (see above),
+  but pick a `ttl` longer than your slowest handler.
 - A `ttl` is 1 to 9,000,000,000 seconds; anything else is
   `RedisError.Invalid` and nothing is sent.
 - Each key is one Redis key, so the store works unchanged on a cluster.
@@ -142,4 +163,4 @@ hop. The store also does not make a handler's own side effects idempotent: a
 payment provider call made before `finish` can still happen twice if the
 process dies in between. Pass the provider the same idempotency key.
 
-Next: [Scripting](scripting.md) for the Lua behind `finish`.
+Next: [Scripting](scripting.md) for the Lua behind `finish` and `abandon`.
