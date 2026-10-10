@@ -232,6 +232,84 @@ const mapTokenBit: int = 4611686018427387904
   return d
 }
 
+// WHY A SCALAR READ HIT NEEDS NO ORDER (#7812; `rtMapGet`/`rtMapSlot`,
+// mapscalar.bit). `mapTagDep` on every hit made the key and value misses wait
+// for the ctrl miss on bench/cases/map. In one table a slot's scalar key word
+// is written once, 0 -> K, by the insert that claims it (an insert never
+// claims a TOMB, `mapClaimSlot`; a delete keeps a scalar key word,
+// `mapDropKey`), and its value word holds 0, a value stored under K, or the
+// zero a traced delete leaves. So a plain key load that reads K != 0 proves
+// the slot is K's whatever the ctrl byte said, and a plain value load then
+// reads one of those three. `rtMapGet` may return any of them: 0 is also its
+// answer for an absent K, which a racing insert allows. Key 0 is the
+// exception (`mapKeyOrdered`): a stale key word 0 of another key's slot with
+// the same tag compares equal, so it takes the ordered generic path. x86-64
+// orders loads, so every key is unordered there.
+//
+// The key-0 test is not an `&&` beside the entry's key-kind test: that was
+// materialised as a bool on every call, string maps included (+4
+// instructions per read on bench/cases/strmap).
+@nosplit fn mapKeyOrdered(key: int): bool {
+  if (onX64()) {
+    return false
+  }
+  return key == 0
+}
+
+// `rtMapGet`'s scalar walk bound: the table's `vcap`, or 0 for a key whose
+// read must be ordered (`mapKeyOrdered`, written out here so the splice stays
+// one level deep), which skips the walk for the ordered shared path.
+@nosplit fn mapScalarBound(key: int, vcap: int): int {
+  if (onX64()) {
+    return vcap
+  }
+  if (key == 0) {
+    return 0
+  }
+  return vcap
+}
+
+// `rtMapSlot`'s token for a scalar hit on `key` whose value word is at `va`,
+// when that word reads non-zero; 0 otherwise, and always 0 for key 0 and on
+// x86-64, where every hit leaves the loop for `mapHitTail`. The pair returns
+// `ok = true`, so a stale zero (a racing insert's value not yet visible) would
+// be a zero never stored under the key; a NON-zero word cannot be stale that
+// way (above), and `bit_rt_map_val_at` re-reads it no older (per-location
+// coherence). Small enough to be spliced into the probe loop, which is why
+// the caller computes `va`: a call there, even one that returns, put the
+// loop's state in callee-saved registers (`rtMapSlot` 0x20 -> 0x60).
+@nosplit fn mapFastToken(va: int, key: int): int {
+  if (mapKeyOrdered(key)) {
+    return 0
+  }
+  if (loadWord(va) == 0) {
+    return 0
+  }
+  return va + mapTokenBit
+}
+
+// The token for a scalar hit on `key` at slot `i` of table `ctrl` that
+// `mapFastToken` did not take. x86-64 orders loads, so the plain token is
+// right there. Key 0 re-probes on the ordered generic path. Otherwise the
+// value word read 0: the ctrl byte is loaded again and the token carries
+// `mapTagDep`'s dependency on it, so `bit_rt_map_val_at` reads the value the
+// insert stored before `mapCtrlPublish` released the tag. A byte that is no
+// longer the tag is a delete's TOMB since the match: absent, which a racing
+// delete allows. Out of the loop, so its call costs the loop nothing.
+@nosplit fn mapHitTail(m: int, key: int, ctrl: int, i: int, tag: int): int {
+  if (onX64()) {
+    return mapValToken(ctrl, i)
+  }
+  if (key == 0) {
+    return mapSlotSlow(m, key)
+  }
+  let c = loadByte(ctrl + i)
+  if (c != tag) {
+    return -1
+  }
+  return mapValToken(ctrl, i + mapTagDep(c, tag))
+}
+
 // Whether slot `i` of table `c` still holds the key a probe just matched, for
 // the one match the plain compare cannot vouch for: a key WORD of 0 (#7772).
 // `mapDropKey` (mapscalar.bit) zeroes a deleted string or composite key, and 0
@@ -247,7 +325,11 @@ const mapTokenBit: int = 4611686018427387904
 // `atomicLoad` rather than plain so the optimizer cannot fold the tag read into
 // the probe's earlier one. Callers test `k != 0` first: a stored key word is 0 only
 // for "", a nil key or the scalar 0, so the common hit pays one compare and no
-// call.
+// call. And they test it BEFORE the key compare, not after: the string compare
+// is a call, and a test after it kept `k` and the ctrl byte live across it, two
+// more callee-saved registers in every probe loop (#7812: `mapProbeStr` 0x60 ->
+// 0x70, `mapProbeSwar`/`mapProbeSwarStr` 0x70 -> 0x80). A dead slot matches no
+// key, so the order changes no answer.
 @nosplit fn mapKeyLive(c: int, keys: int, i: int, tag: int): bool {
   if (atomicLoad(wordAt(keys + i * 8)) != 0) {
     return true
