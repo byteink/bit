@@ -418,6 +418,12 @@ nothing near these words parses: `infx`, `na`, `in` and `+nan` fail like any
 other bad text. Ordinary numbers are decided before these words are looked at,
 so they cost nothing extra.
 
+The predeclared `parseFloat` builtin reads the same infinity spellings, so
+`parseFloat("-inf")` is `-Inf` with or without this import. It has no error to
+fail with: a failed parse and `nan` are both NaN there, which is why
+`strings.parseFloat` is the one to use when `nan` must be told apart from
+garbage.
+
 ```bit
 import * as strings from "std/strings"
 
