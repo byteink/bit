@@ -45,7 +45,12 @@ export @nosplit @symbol("bit_rt_port_stw_set_no_conservative_scan") fn stwSetNoC
 // `conservativeStack`. Every word goes through `gcMarkConservative`, which
 // validates against the heap bounds and an exact ownership test before decoding
 // anything, so a small integer that looks like a pointer is simply ignored.
-@nosplit fn stwScanStackRange(g: *i64, sp: int, top: int) {
+//
+// `later` (#5841): a range whose words cannot change before the mark phase
+// ends (a stopped task's stack) may be handed to the gang as a root job
+// (`gcRootRange`); the collector's own stack is still being written, so it is
+// always scanned here and now.
+@nosplit fn stwScanStackRange(g: *i64, sp: int, top: int, later: bool) {
   if (stwNoConservativeScan) {
     return
   }
@@ -55,12 +60,28 @@ export @nosplit @symbol("bit_rt_port_stw_set_no_conservative_scan") fn stwSetNoC
   // Align UP, as `std.mem.alignForward` does: a misaligned base would read
   // words straddling two slots, which are not object references in any case.
   let a = (sp + 7) / 8 * 8
-  let n = 0
+  if (a + 8 > top) {
+    return
+  }
   // Bounded by the mapped stack AND by `stwMaxStackWords`.
-  while (a + 8 <= top && n < stwMaxStackWords) {
-    gcMarkConservative(g, loadWord(a))
-    a = a + 8
-    n = n + 1
+  let n = (top - a) / 8
+  if (n > stwMaxStackWords) {
+    n = stwMaxStackWords
+  }
+  stwScanWords(g, a, n, later)
+}
+
+// Conservatively mark the `n` words at `a`, or offer them as a root job when
+// `later` is set (`gcRootRange` scans them at once when no table is open).
+@nosplit fn stwScanWords(g: *i64, a: int, n: int, later: bool) {
+  if (later) {
+    gcRootRange(g, a, n)
+    return
+  }
+  let i = 0
+  while (i < n) { // bounded: the caller's word count
+    gcMarkConservative(g, loadWord(a + i * 8))
+    i = i + 1
   }
 }
 
@@ -121,11 +142,7 @@ export @nosplit @symbol("bit_rt_port_stw_set_no_conservative_scan") fn stwSetNoC
   // frame before testing it — scanning them copied the raw tag onto whatever
   // stack the collector was running on (#3905, #3919). Bounded: at most
   // `chanScratchWords` words, and never past the mapping.
-  let i = scrCounter
-  while (i < n) {
-    gcMarkConservative(g, loadWord(base + i * 8))
-    i = i + 1
-  }
+  stwScanWords(g, base + scrCounter * 8, n - scrCounter, true)
 }
 
 // Class 7: a parked task's OWN saved callee-saved register file — `t[0
@@ -165,11 +182,7 @@ export @nosplit @symbol("bit_rt_port_stw_set_no_conservative_scan") fn stwSetNoC
 // fresh block zeroed. Gating this class on `taskState != taskRunning` instead
 // would miss a task that has switched out before its worker stores the state.
 @nosplit fn stwScanCtx(g: *i64, t: *i64) {
-  let i = 0
-  while (i < ctxWords) {
-    gcMarkConservative(g, *(t + i))
-    i = i + 1
-  }
+  stwScanWords(g, int(t), ctxWords, true)
 }
 
 // Classes 4, 5, 6 and 7: every registered task's `arg`, scratch area and
@@ -333,10 +346,15 @@ export @nosplit @symbol("bit_rt_port_stw_set_no_conservative_scan") fn stwSetNoC
   // past the guard, so it only counts an attempt that actually scanned a
   // range — every early `return` above is a refusal, not a scan.
   let _ = atomicAdd(ptrOf(stwOwnScans), 1)
-  stwScanStackRange(g, sp, top)
+  stwScanStackRange(g, sp, top, false)
 }
 
-@nosplit fn stwScanTasks(g: *i64, world: *i64, sched: *i64, slot: int) {
+//
+// `keep` (#5841): the root table is open (`gcRootJobsOpen`), so the deferred
+// ranges are scanned during the mark phase and the registry lock stays held
+// until `stwCollect` releases it after the mark: no task stack named in the
+// table may be unmapped before its job runs.
+@nosplit fn stwScanTasks(g: *i64, world: *i64, sched: *i64, slot: int, keep: bool) {
   let sp = stwReadSp()
   let held = false
   // Atomic (#3299): see the comment on `stwScanCount` above.
@@ -376,7 +394,7 @@ export @nosplit @symbol("bit_rt_port_stw_set_no_conservative_scan") fn stwSetNoC
       // not where the thread is now. It published where it is, as the address
       // of the frame it parked with.
       lo = stwParkedLo(world, t, lo)
-      stwScanStackRange(g, lo, *(t + taskStackBase) + *(t + taskStackBytes))
+      stwScanStackRange(g, lo, *(t + taskStackBase) + *(t + taskStackBytes), !running)
       // The running task's own registers are live CPU state, not a saved
       // block — scanning `t[0..ctxWords)` for it would read whatever this
       // task's context slots last held (stale, from its previous park) and
@@ -390,7 +408,9 @@ export @nosplit @symbol("bit_rt_port_stw_set_no_conservative_scan") fn stwSetNoC
     addr = schedRegNext(t)
     n = n + 1
   }
-  schedRegUnlock(sched)
+  if (!keep) {
+    schedRegUnlock(sched)
+  }
   if (!held) {
     // Atomic (#3299): see the comment on `stwUnheldCount` above.
     let _ = atomicAdd(ptrOf(stwUnheld), 1)
