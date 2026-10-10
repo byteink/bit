@@ -280,7 +280,8 @@
 #
 # --- Declared signatures (against the 0.41.0 oracle) ---
 #
-# Retires at the next stage0 repin, the first oracle cut from a tree that carries #7745.
+# Each retires at the next stage0 repin, the first oracle cut from a tree that carries #7745
+# (7745-loop-defer-stack) or #7761 and #7770 (7761-range-chain-cse).
 #
 # 7745-loop-defer-stack (`ir`, `iropt`). #7745 (lowerdefer.bit) lowers a function with a `defer`
 # inside a loop onto a per-frame stack of thunks: every execution of a defer builds
@@ -437,13 +438,81 @@ END {
 }'
 }
 
+# 7761-range-chain-cse (`iropt`). #7761 (optselect.bit) fuses an if's branch-chain range check into one
+# unsigned compare: `br (icmp_uge x lo), R, F` + R `br (icmp_ule x hi), T, F` becomes
+# `t = sub x lo; br (icmp_ule t (hi-lo)), T, F` and R is dropped; the mirror `c < lo || c > hi`
+# (`icmp_ult` + `icmp_ugt`) becomes the same compare with the edges swapped. #7770 (optcse.bit) then keys
+# a single-predecessor block's param as its edge argument, so the body's `c - lo` is forwarded to that
+# `sub`, and any other pure op or load on such a param to its earlier twin. Both are post-opt only, so
+# `--dump-ir-pre` (`ir`) does not move. Checked per FUNCTION, ids and block numbers being function-local:
+# the two dumps hold the same functions in the same order and the same text ahead of the first, at
+# least one function differs, and each that differs
+# satisfies, with d[op] = tree count - oracle count, n1 = -d[icmp_uge] and n2 = -d[icmp_ult] (the
+# fused `&&` and `||` sites, both >= 0):
+#   exact     d[icmp_ugt] = -n2, d[icmp_ule] = +n2 (`&&` trades its ule for the fused one),
+#             d[br] = d[blocks] = -(n1 + n2) (one R dropped per site)
+#   bounded   d[sub] <= n1 + n2 and d[const_int] <= n1 + n2 (each site adds at most one `sub` and the
+#             `hi - lo` constant); every other op d <= 0; an op that decreases is one CSE forwards
+#             (`opIsCsePure`/`opIsCseLoad`/element `index_get`) or one of the identities above
+#   nonempty  n1 + n2 >= 1, or some op decreased (a #7770-only function)
+# What it does not check is which value a forwarded use now reads; the golden cases
+# ir_if_range_chain, opt_select_range_chain and ir_cse_param_edge pin that. Files: see the run output.
+#
+# explainRangeChainCse <oracle_text> <bit2_text> -- see the 7761 entry above.
+explainRangeChainCse() {
+  printf '%s\n@@@BIT2@@@\n%s\n' "$(canon_ir_ids "$1")" "$(canon_ir_ids "$2")" | LC_ALL=C awk '
+function opOf(l) {
+  sub(/^ +/, "", l); sub(/^%[0-9]+ = /, "", l); sub(/ .*$/, "", l); return l
+}
+function cse(op) {
+  return op ~ /^(add|sub|mul|smulhi|umulhi|fadd|fsub|fmul|fdiv|band|bor|bxor|shl|ashr|lshr|icmp_[a-z]+|fcmp_[a-z]+|const_int|const_bool|const_float|field_get|slice_len|index_get)$/
+}
+function note(op) { if (index(OPS[cur], " " op " ") == 0) { OPS[cur] = OPS[cur] " " op " " } }
+BEGIN { side = 0 }
+$0 == "@@@BIT2@@@" { side = 1; cur = ""; next }
+/^func / {
+  cur = $2; sub(/\(.*$/, "", cur); N[side]++; NAME[side, N[side]] = cur; T[side, cur] = ""
+}
+cur == "" { P[side] = P[side] $0 "\n"; next }
+{ T[side, cur] = T[side, cur] $0 "\n" }
+/^bb[0-9]+\(/ { B[side, cur]++; next }
+/^  / { op = opOf($0); C[side, cur, op]++; note(op) }
+END {
+  if (N[0] != N[1] || N[0] == 0 || P[0] != P[1]) { exit 1 }
+  changed = 0
+  for (i = 1; i <= N[0]; i++) {
+    f = NAME[0, i]
+    if (NAME[1, i] != f) { exit 1 }
+    if (T[0, f] == T[1, f]) { continue }
+    changed++
+    n1 = C[0, f, "icmp_uge"] - C[1, f, "icmp_uge"]; n2 = C[0, f, "icmp_ult"] - C[1, f, "icmp_ult"]; n = n1 + n2
+    if (n1 < 0 || n2 < 0) { exit 1 }
+    if (C[1, f, "icmp_ugt"] - C[0, f, "icmp_ugt"] != -n2 || C[1, f, "icmp_ule"] - C[0, f, "icmp_ule"] != n2) { exit 1 }
+    if (C[1, f, "br"] - C[0, f, "br"] != -n || B[1, f] - B[0, f] != -n) { exit 1 }
+    m = split(OPS[f], L, " "); fell = 0
+    for (j = 1; j <= m; j++) {
+      op = L[j]
+      if (op == "" || op ~ /^(icmp_uge|icmp_ult|icmp_ugt|icmp_ule|br)$/) { continue }
+      d = C[1, f, op] - C[0, f, op]
+      if (d > ((op == "sub" || op == "const_int") ? n : 0)) { exit 1 }
+      if (d < 0 && !cse(op)) { exit 1 }
+      if (d < 0) { fell = 1 }
+    }
+    if (n == 0 && !fell) { exit 1 }
+  }
+  if (changed == 0) { exit 1 }
+  print "7761-range-chain-cse"
+}'
+}
+
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
-# and returns 0, or prints nothing and returns 1 if none does. Only 7745-loop-defer-stack is
-# registered, on the `ir` and `iropt` kinds.
+# and returns 0, or prints nothing and returns 1 if none does. 7745-loop-defer-stack is
+# registered on the `ir` and `iropt` kinds, 7761-range-chain-cse on `iropt` only.
 explainMismatch() {
   case "$3" in
-    ir|iropt) explainLoopDeferStack "$1" "$2"; return ;;
+    ir) explainLoopDeferStack "$1" "$2"; return ;;
+    iropt) explainLoopDeferStack "$1" "$2" || explainRangeChainCse "$1" "$2"; return ;;
   esac
   return 1
 }
@@ -459,7 +528,8 @@ explainMismatch() {
 # `ir` and `iropt` only.
 declaredSignatureNames() {
   case "${1:-}" in
-    ir|iropt|"") printf '%s\n' 7745-loop-defer-stack ;;
+    ir) printf '%s\n' 7745-loop-defer-stack ;;
+    iropt|"") printf '%s\n' 7745-loop-defer-stack 7761-range-chain-cse ;;
   esac
   return 0
 }
