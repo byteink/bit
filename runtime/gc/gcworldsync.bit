@@ -347,6 +347,25 @@ extern fn bit_rt_port_thread_stack_base(): int
   return bit_rt_port_thread_stack_base()
 }
 
+// The slot `token` owns in `world`, or -1, WITHOUT claiming one: the hint
+// (`mutHintSlot`, re-verified against the owner word) first, then the exact
+// search, which refreshes the hint. The bracket exits use this rather than a
+// bare `worldFindOwner` (#7866): their thread entered through `currentMutator`
+// a moment ago, so the hint is almost always a hit, one load instead of a loop.
+// PINNED for `mutatorSlot`'s reason below: the exits are inlined into callers'
+// objects, and `--freestanding` refuses a mangled name no sibling defines.
+@nosplit @symbol("bit_rt_port_gc_mutator_find") fn mutatorFind(world: *i64, token: int): int {
+  let hint = mutHintSlot
+  if (hint != 0 && atomicLoad(wMut(world, hint - 1) + muOwner) == token) {
+    return hint - 1
+  }
+  let found = worldFindOwner(world, token)
+  if (found >= 0) {
+    mutHintSlot = found + 1
+  }
+  return found
+}
+
 // PINNED for the same reason `currentMutator` is, and the reason is recorded
 // two comments up: both wrappers above are called from another object, the
 // inliner pulls this body along with them, and `--freestanding` refuses a
@@ -377,21 +396,13 @@ extern fn bit_rt_port_thread_stack_base(): int
   // threadlocal, and no value is trusted without checking it against the
   // registry's own atomic word first. A hit costs one extra atomic load and no
   // call; a miss costs nothing more than today's full search below.
+  let found = -1
   if (useHint) {
-    let hint = mutHintSlot
-    if (hint != 0) {
-      let hintSlot = hint - 1
-      if (atomicLoad(wMut(world, hintSlot) + muOwner) == token) {
-        return hint
-      }
-    }
+    found = mutatorFind(world, token)
+  } else {
+    found = worldFindOwner(world, token)
   }
-
-  let found = worldFindOwner(world, token)
   if (found >= 0) {
-    if (useHint) {
-      mutHintSlot = found + 1
-    }
     return found + 1
   }
   let slot = worldClaimFor(world, token)
@@ -566,7 +577,7 @@ export @nosplit @symbol("bit_rt_gc_blocking_end") fn gcBlockingEnd() {
     return
   }
   let world = ptrOf(worldBlock)
-  let slot = worldFindOwner(world, token)
+  let slot = mutatorFind(world, token)
   if (slot < 0) {
     return
   }
@@ -582,6 +593,28 @@ export @nosplit @symbol("bit_rt_gc_blocking_end") fn gcBlockingEnd() {
 // blocking_begin/end. See `mSyscall` (./gcworld.bit) for why neither `running`
 // nor `blocked` can express this, and `worldBeginSyscall` (./gcworldstop.bit)
 // for the contract.
+//
+// ONE FULL BARRIER PER BRACKET, AND WHERE IT IS (#7866). Every user `extern fn`
+// call pays this pair (#7842), and on x86-64 each `atomicStore` is a locked
+// `xchg`: six of them cost 27.6 ns a call where arm64's `stlr` paid 7.8. The
+// protocol needs exactly one store-to-load order, on the way OUT:
+//
+//     exit:      store `running`     then  load the stop word
+//     collector: store the stop word then  load every slot's state
+//
+// That is the Dekker pair `worldResumeWhenClear` closes, so its `running`
+// store stays `atomicStore`. Every other store in the pair is a PUBLICATION,
+// released with `atomicStoreRelease` (a plain `mov` on x86-TSO, the same
+// `stlr` on arm64): `muFrame`, `muSp` and the register file before `syscall`,
+// the redundant re-store of `syscall` on the way out, and the `muSp` clear.
+// What makes a weaker publication safe is which way it can be late. A
+// collector that misses `syscall` reads `running` and waits for this slot, the
+// side that waits; it never marks behind a thread it did not count, and the
+// store buffer drains on its own. No load after a publication picks a branch
+// the collector must agree with: the exit's stop-word read is re-taken after
+// the `running` store, and the `mapPeers` pair (`rootRetakeConfirm`,
+// ../root/retake.bit) orders on the exit's `running` store and `worldFence`,
+// so a monitor that reads a stale `running` on entry only abandons a start.
 
 // This thread's live stack pointer — the same one-instruction form as
 // `../stw/stwscan.bit`'s `stwReadSp` and `../sched/identity.bit`'s `readSp`, inline by
@@ -667,7 +700,7 @@ export @nosplit @symbol("bit_rt_gc_syscall_end") fn gcSyscallEnd() {
     return
   }
   let world = ptrOf(worldBlock)
-  let slot = worldFindOwner(world, token)
+  let slot = mutatorFind(world, token)
   if (slot < 0) {
     return
   }
