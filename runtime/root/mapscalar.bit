@@ -101,6 +101,15 @@ import { onX64 } from "../syscalls"
   storeWord(m + mapLen, loadWord(m + mapLen) + 1)
 }
 
+// `mapClaimSlot` for `rtMapSet`'s scalar arm: the same accounting, and the
+// tag released only where a scalar reader can observe its order
+// (`mapCtrlPublishScalar`, maptable.bit).
+@nosplit fn mapClaimScalar(m: int, ctrl: int, slot: int, tag: int) {
+  storeWord(m + mapUsed, loadWord(m + mapUsed) + 1)
+  mapCtrlPublishScalar(ctrl, slot, tag)
+  storeWord(m + mapLen, loadWord(m + mapLen) + 1)
+}
+
 // The shared `m[key] = val` for a `string` or composite key: hash and probe
 // through `maps.bit`'s descriptor-dispatching path. A separate function, not an
 // arm of `rtMapSet`, so the exported entry point stays inside E0204's limit
@@ -117,6 +126,23 @@ import { onX64 } from "../syscalls"
   let slot = mapProbeSlot(r)
   storeWord(loadWord(ctrl + tblKeys) + slot * 8, key)
   storeWord(loadWord(ctrl + tblVals) + slot * 8, val)
+  if (!mapProbeFound(r)) {
+    mapClaimSlot(m, ctrl, slot, mapCtrlTag(h))
+  }
+}
+
+// `mapSetSlow` for a scalar key, where `rtMapSet`'s loop ran out of slots
+// (only two racing writers can get there; the load factor otherwise leaves an
+// EMPTY one): a zero value still sets the bit `mapHitTail` reads
+// (maptable.bit). Not a branch in `mapSetSlow`: the call after its probe held
+// one more callee-saved register on the `string` insert path (0x40 -> 0x50).
+@nosplit fn mapSetScalarSlow(m: int, key: int, val: int) {
+  let h = scalarHash(u64(key))
+  let ctrl = mapTable(m)
+  let r = mapProbe(m, ctrl, key, h)
+  let slot = mapProbeSlot(r)
+  storeWord(loadWord(ctrl + tblKeys) + slot * 8, key)
+  mapScalarVal(loadWord(ctrl + tblVals) + slot * 8, ctrl, slot, val)
   if (!mapProbeFound(r)) {
     mapClaimSlot(m, ctrl, slot, mapCtrlTag(h))
   }
@@ -154,21 +180,22 @@ export @nosplit @symbol("bit_rt_map_set") fn rtMapSet(m: int, key: int, val: int
       // gone, and `tag` always has bit 7 set, so `c == tag` rejects it.
       if (c == ctrlEmpty) {
         storeWord(keys + i * 8, key)
-        storeWord(loadWord(ctrl + tblVals) + i * 8, val)
-        mapClaimSlot(m, ctrl, i, tag)
+        mapScalarVal(loadWord(ctrl + tblVals) + i * 8, ctrl, i, val)
+        mapClaimScalar(m, ctrl, i, tag)
         return
       }
       if (c == tag) {
         if (loadWord(keys + i * 8) == key) {
-          storeWord(loadWord(ctrl + tblVals) + i * 8, val)
+          mapScalarVal(loadWord(ctrl + tblVals) + i * 8, ctrl, i, val)
           return
         }
       }
       i = (i + 1) & mask
       steps = steps + 1
     }
-    // Unreachable (the load factor guarantees an EMPTY slot): fall through to
-    // the shared path below rather than restate its non-panicking answer here.
+    // Unreachable with one writer (the load factor guarantees an EMPTY slot).
+    mapSetScalarSlow(m, key, val)
+    return
   }
   mapSetSlow(m, key, val)
 }
@@ -192,22 +219,25 @@ export @nosplit @symbol("bit_rt_map_get") fn rtMapGet(m: int, key: int): int {
     let i = int(h & u64(mask))
     let tag = mapCtrlTag(h)
     let steps = 0
-    // Bounded by `cap`, as `mapProbe`'s loop is.
-    while (steps < vcap) {
+    // Bounded by `cap`, as `mapProbe`'s loop is, or by 0 for a read of key 0
+    // that must be ordered, which then takes the shared path below.
+    let bound = mapScalarBound(key, vcap)
+    while (steps < bound) {
       let c = loadByte(ctrl + i)
       if (c == ctrlEmpty) {
         return 0
       }
+      // No ordering on this hit (maptable.bit, `mapKeyOrdered`).
       if (c == tag) {
-        let d = mapTagDep(c, tag)
-        if (loadWord(keys + i * 8 + d) == key) {
-          return loadWord(loadWord(ctrl + tblVals) + i * 8 + d)
+        if (loadWord(keys + i * 8) == key) {
+          return loadWord(loadWord(ctrl + tblVals) + i * 8)
         }
       }
       i = (i + 1) & mask
       steps = steps + 1
     }
-    // Unreachable; the shared path below gives the same answer.
+    // Reached by key 0 only (`mapScalarBound`): the load factor guarantees
+    // an EMPTY slot. The shared path below gives the same answer, ordered.
   }
   let h = mapHash(m, key)
   let ctrl = mapTable(m)
@@ -255,12 +285,13 @@ export @nosplit @symbol("bit_rt_map_slot") fn rtMapSlot(m: int, key: int): int {
       return -1
     }
     if (c == tag) {
-      let d = mapTagDep(c, tag)
-      if (loadWord(keys + i * 8 + d) == key) {
+      if (loadWord(keys + i * 8) == key) {
         // The hit, per target (header note): `onX64()` folds to a constant
-        // (compiler/opttarget.bit), so each target keeps one of these.
-        if (!onX64()) {
-          return mapValTokenBase(tb, i + d)
+        // (compiler/opttarget.bit), so x86-64 always leaves by `break`, and
+        // arm64 does for a zero value word only (`mapFastToken`).
+        let t = mapFastToken(loadWord(tb + baseVals) + i * 8, key)
+        if (t != 0) {
+          return t
         }
         break
       }
@@ -268,9 +299,9 @@ export @nosplit @symbol("bit_rt_map_slot") fn rtMapSlot(m: int, key: int): int {
     i = (i + 1) & mask
     steps = steps + 1
   }
-  // An x86-64 hit leaves the loop by `break`, so `steps < vcap` still holds.
+  // A hit that left the loop by `break`, so `steps < vcap` still holds.
   if (steps < vcap) {
-    return mapValToken(ctrl, i)
+    return mapHitTail(m, key, ctrl, i)
   }
   // Unreachable (the load factor guarantees an EMPTY slot); the shared path
   // gives the same answer.

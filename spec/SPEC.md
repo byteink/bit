@@ -174,7 +174,8 @@ unaffected, since only the root module's link names are left bare.
 - Types: `i8 i16 i32 i64  u8 u16 u32 u64  f32 f64  decimal  int uint  byte rune  bool string  error`
 - Constants: none beyond the `true`/`false`/`nil` literals.
 - Builtin functions: `len cap append delete close panic assert` (§16),
-  and `parseFloat` and `umulHi` (below).
+  and `parseFloat`, `umulHi` and the float bit casts `floatBits`,
+  `bitsToFloat`, `float32Bits` and `bitsToFloat32` (below).
 
 `int` is an alias for `i64`; `uint` for `u64`; `byte` for `u8`; `rune` for `i32`.
 Sizes are fixed on every target for deterministic behavior (this is not Go's
@@ -250,6 +251,17 @@ instruction - AArch64 `UMULH`, x86-64 one-operand `MUL` - with no call, no
 allocation and no safepoint, so it is admitted inside `@nosplit`. Both
 instructions take the same time for every operand value, which is what makes it
 usable in constant-time code.
+
+**`floatBits(x: f64) -> u64`**, **`bitsToFloat(b: u64) -> f64`**,
+**`float32Bits(x: f32) -> u32`** and **`bitsToFloat32(b: u32) -> f32`** reinterpret
+a float as the unsigned integer holding its IEEE 754 binary64 or binary32 bit
+pattern, and back. They move the bits verbatim and convert nothing: `-0.0` keeps
+its sign, a NaN keeps its payload (a signalling NaN is not quieted), and
+`bitsToFloat32(float32Bits(x))` and `float32Bits(bitsToFloat32(b))` are the
+identity on every value. Each compiles to one register move - AArch64 `FMOV`,
+x86-64 `movq`/`movd` - with no call, no allocation and no safepoint, so they are
+admitted inside `@nosplit`. `std/math` wraps them as `f64Bits`, `f64FromBits`,
+`f32Bits` and `f32FromBits`.
 
 ### 5.4 Integer Literals
 

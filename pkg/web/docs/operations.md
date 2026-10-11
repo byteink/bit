@@ -231,10 +231,55 @@ counter and `Config.sessions` both carry: an in-process store is invisible
 to a retry that lands on a different server behind a load balancer, and a
 duplicate request would run the handler again with nobody able to tell.
 `MemoryIdempotencyStore(maxKeys)` ships and is single-process only;
-`RedisIdempotencyStore` (`pkg/redis`) is shared across processes. Your own
+`RedisIdempotencyStore` (`pkg/webredis`, which depends on both `web` and
+`redis`) is shared across processes. Your own
 store implements `IdempotencyStore`
 (`begin`/`finish`/`abandon` - `begin` is the one call that must be atomic,
-the same requirement `RateStore.incr` answers for a counter).
+the same requirement `RateStore.incr` answers for a counter). `begin` hands
+the request that wins a key an `IdempotencyClaim` whose `token` names that
+reservation (a fresh `newReservationToken()`), and `finish`/`abandon` take the
+token back and act only while the key still holds that exact reservation. A
+handler that outlives `ttl` therefore cannot free or overwrite the
+reservation a later retry has since made: its late `finish` or `abandon` does
+nothing.
+
+A store of your own only has to keep that token with the reservation and
+compare it. This one counts the reservations it hands out, in front of the
+in-process store:
+
+```bit
+import {
+  CachedResponse,
+  IdempotencyClaim,
+  IdempotencyStore,
+  MemoryIdempotencyStore,
+} from "web"
+
+class CountingStore {
+  inner: MemoryIdempotencyStore
+  won: int
+
+  export begin(key: string, fingerprint: string, ttl: i64): IdempotencyClaim! {
+    let claim = this.inner.begin(key, fingerprint, ttl)?
+    if (claim.won()) {
+      this.won = this.won + 1
+    }
+    return claim
+  }
+
+  export finish(key: string, token: string, resp: CachedResponse, ttl: i64): ()! {
+    this.inner.finish(key, token, resp, ttl)?
+  }
+
+  export abandon(key: string, token: string): ()! {
+    this.inner.abandon(key, token)?
+  }
+}
+
+fn countingStore(): IdempotencyStore {
+  return CountingStore{ inner = MemoryIdempotencyStore(10_000), won = 0 }
+}
+```
 
 `ttl` is how long a key is remembered, in seconds, from whichever of
 `begin()`/`finish()` last touched it - there is no default, because how long

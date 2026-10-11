@@ -43,11 +43,11 @@
 // `IdempotencyStore.begin()` is the one operation that must be atomic: two
 // requests racing a never-seen key must not both be told to proceed, the
 // same requirement `RateStore.incr` answers for a counter. It reserves the
-// key `InFlight` and returns `Option.None` to the WINNER only; every other
-// caller — including one that raced it by a nanosecond — gets back the entry
-// the winner just wrote: `409` while `InFlight`, the cached response once
-// `finish()` moves it to `Done`, `422` if its own fingerprint disagrees with
-// what is stored.
+// key `InFlight` and hands the WINNER an `IdempotencyClaim` carrying a
+// reservation token; every other caller — including one that raced it by a
+// nanosecond — gets back the entry the winner just wrote: `409` while
+// `InFlight`, the cached response once `finish()` moves it to `Done`, `422`
+// if its own fingerprint disagrees with what is stored.
 //
 // A handler that raises releases its reservation (`abandon()`) so a retry
 // after a failed attempt is not stuck behind a dead `InFlight` marker for the
@@ -55,6 +55,20 @@
 // `recover`"), so it leaves the reservation `InFlight` until `ttl` passes —
 // the same direction `RateStore`'s store-outage case is wrong in, and
 // bounded by the same mechanism: time.
+//
+// ## Whose reservation is it? The token (#7832)
+//
+// A handler can outlive `ttl`. Its reservation expires, a retry B begins a
+// NEW reservation under the same key, and then the slow handler finishes or
+// fails. If `finish(key)` / `abandon(key)` named only the key, the late call
+// would overwrite or delete B's reservation, and a third retry would run the
+// handler again: the double execution this middleware exists to prevent.
+// So `begin()` returns a random 128-bit token with the reservation, and
+// `finish()` / `abandon()` take it back and act ONLY while the key still holds
+// an `InFlight` reservation with that exact token (the compare-and-delete of
+// the Redis distributed-lock pattern). A call whose reservation is gone or
+// belongs to someone else is a no-op, not an error: it has nothing left to
+// protect and nothing to report.
 //
 // ## Two store failures, two different answers
 //
@@ -119,6 +133,32 @@ export class IdempotencyEntry {
   export response: CachedResponse,
 }
 
+// What `IdempotencyStore.begin()` answers. Exactly one of two things:
+//
+//   - `token` is non-empty: this caller WON the reservation and is the one
+//     request that runs the handler. `token` names that reservation; it goes
+//     back to `finish()` / `abandon()`. `existing` is `Option.None`.
+//   - `token` is empty: the key was already claimed and `existing` holds the
+//     entry as it stands.
+export class IdempotencyClaim {
+  export token: string
+  export existing: Option<IdempotencyEntry>
+
+  export won(): bool {
+    return len(this.token) > 0
+  }
+}
+
+// A fresh reservation token: `reservationTokenBytes` (128 bits) from the OS
+// CSPRNG, hex-encoded. Unguessable on purpose: a client that could predict
+// the token could free or overwrite a reservation it does not own. Every
+// `IdempotencyStore` mints its tokens here, so no store invents its own.
+const reservationTokenBytes = 16
+
+export fn newReservationToken(): string {
+  return encodeHex(randomBytes(reservationTokenBytes))
+}
+
 // A store of idempotency reservations and cached responses, keyed by the
 // client-supplied `Idempotency-Key`. Structural (SPEC §14.3): a type
 // satisfies this by having the three methods, with no declaration anywhere —
@@ -127,21 +167,25 @@ export class IdempotencyEntry {
 export interface IdempotencyStore {
   // THE atomic step — see the file header. Absent or expired: creates the
   // reservation `InFlight` under `fingerprint`, valid for `ttl` seconds from
-  // now, and returns `Option.None` — the CALLER is now the one request that
-  // gets to run the handler. Already claimed: returns the existing
+  // now, and returns a claim with a fresh `newReservationToken()` — the
+  // CALLER is now the one request that gets to run the handler. Already
+  // claimed: returns a claim with an empty token and `existing` holding the
   // `IdempotencyEntry` UNCHANGED, whatever its state.
-  begin(key: string, fingerprint: string, ttl: i64): Option<IdempotencyEntry>!,
+  begin(key: string, fingerprint: string, ttl: i64): IdempotencyClaim!,
   // Moves `key` from `InFlight` to `Done`, storing `resp` for exactly `ttl`
   // seconds counted from THIS call — not extending whatever `begin()` set,
   // so a slow handler's cached answer lives the full window a fast one's
   // would (the same "does not extend on reuse" contract `RateStore.incr`'s
-  // `ttl` carries).
-  finish(key: string, resp: CachedResponse, ttl: i64): ()!,
+  // `ttl` carries). Acts only while `key` holds the `InFlight` reservation
+  // `token` names; otherwise it does nothing and succeeds (see the file
+  // header, "Whose reservation is it?").
+  finish(key: string, token: string, resp: CachedResponse, ttl: i64): ()!,
   // Releases `key`'s reservation with no response recorded, so a retry after
-  // a FAILED attempt is not stuck behind a dead `InFlight` marker. See the
-  // file header on when this runs and why it cannot be relied on to always
-  // run.
-  abandon(key: string): ()!,
+  // a FAILED attempt is not stuck behind a dead `InFlight` marker. Acts only
+  // while `key` holds the `InFlight` reservation `token` names; otherwise it
+  // does nothing and succeeds. See the file header on when this runs and why
+  // it cannot be relied on to always run.
+  abandon(key: string, token: string): ()!,
 }
 
 // One idempotency policy, as the app writes it down.
@@ -183,11 +227,11 @@ export fn idempotency(p: IdempotencyPolicy): Middleware {
     }
     let body = c.rawBody()?
     let fp = requestFingerprint(c.method(), c.path(), body)
-    let found = p.store.begin(key, fp, p.ttl)?
-    if (isSome(found)) {
-      return replayOrRefuse(unwrap(found), fp)
+    let claim = p.store.begin(key, fp, p.ttl)?
+    if (!claim.won()) {
+      return replayOrRefuse(unwrap(claim.existing), fp)
     }
-    return runOnce(p, c, next, key)
+    return runOnce(p, c, next, key, claim.token)
   }
 }
 
@@ -211,18 +255,18 @@ fn checkPolicy(p: IdempotencyPolicy) {
 }
 
 // This request WON the reservation `idempotency()` just created — it is the
-// one request that runs the handler. `key` was already returned by
-// `begin()`, so this never re-derives it.
-fn runOnce(p: IdempotencyPolicy, c: Ctx, next: Next, key: string): Res! {
+// one request that runs the handler. `token` is the reservation `begin()`
+// handed it: the only thing that lets `finish` / `abandon` act on it.
+fn runOnce(p: IdempotencyPolicy, c: Ctx, next: Next, key: string, token: string): Res! {
   let r = next(c) catch e {
-    p.store.abandon(key) catch ae {
+    p.store.abandon(key, token) catch ae {
       let rec = errorRecord(c.config).str("key", key).err(ae)
       rec.log("web: idempotency(): abandon failed after the handler itself failed")
     }
     fail e
   }
   let cached = CachedResponse{ status = r.statusCode(), body = r.body(), headers = r.headerList() }
-  p.store.finish(key, cached, p.ttl) catch e {
+  p.store.finish(key, token, cached, p.ttl) catch e {
     let rec = errorRecord(c.config).str("key", key).err(e)
     rec.log("web: idempotency(): finish failed, this response was NOT cached")
   }
@@ -286,6 +330,9 @@ const memoryIdempotencyCapMessage = "web: MemoryIdempotencyStore(maxKeys): the c
 class MemoryIdempotencyRecord {
   state: IdempotencyState,
   fingerprint: string,
+  // The reservation's token while `InFlight`; empty once `Done`, which no
+  // call owns any more.
+  token: string,
   response: CachedResponse,
   expiresAtSec: i64,
 }
@@ -326,16 +373,16 @@ export class MemoryIdempotencyStore {
     this.mu = Mutex()
   }
 
-  export begin(key: string, fingerprint: string, ttl: i64): Option<IdempotencyEntry>! {
+  export begin(key: string, fingerprint: string, ttl: i64): IdempotencyClaim! {
     return this.beginAt(key, fingerprint, ttl, now().ns / nsPerSecond)
   }
 
-  export finish(key: string, resp: CachedResponse, ttl: i64): ()! {
-    this.finishAt(key, resp, ttl, now().ns / nsPerSecond)
+  export finish(key: string, token: string, resp: CachedResponse, ttl: i64): ()! {
+    this.finishAt(key, token, resp, ttl, now().ns / nsPerSecond)
   }
 
-  export abandon(key: string): ()! {
-    this.abandonAt(key)
+  export abandon(key: string, token: string): ()! {
+    this.abandonAt(key, token)
   }
 
   // `begin` against a caller-supplied clock — `MemoryCounter.incrAt`'s
@@ -346,57 +393,70 @@ export class MemoryIdempotencyStore {
   // one `Mutex`, so two callers racing the same never-seen key cannot both
   // read "absent" — the same property `MemoryCounter.incrAt`'s single atomic
   // increment gives a counter, here for a whole reservation.
-  beginAt(key: string, fingerprint: string, ttl: i64, nowSec: i64): Option<IdempotencyEntry> {
+  beginAt(key: string, fingerprint: string, ttl: i64, nowSec: i64): IdempotencyClaim {
     this.mu.lock()
     defer this.mu.unlock()
     this.sweepIfDue(nowSec)
     let (e, ok) = this.entries[key]
     if (ok && e.expiresAtSec > nowSec) {
-      return Option.Some(
-        IdempotencyEntry{ state = e.state, fingerprint = e.fingerprint, response = e.response },
-      )
+      let entry = IdempotencyEntry{
+        state = e.state,
+        fingerprint = e.fingerprint,
+        response = e.response,
+      }
+      return IdempotencyClaim{ existing = Option.Some(entry) }
     }
     if (!ok && len(this.entries) >= this.maxKeys) {
       this.evictSoonestExpiring()
     }
+    let token = newReservationToken()
     this.entries[key] = MemoryIdempotencyRecord{
       state = IdempotencyState.InFlight,
       fingerprint = fingerprint,
+      token = token,
       response = CachedResponse{},
       expiresAtSec = nowSec + ttl,
     }
-    return Option.None
+    return IdempotencyClaim{ token = token }
   }
 
-  // `finish` against a caller-supplied clock. Unconditional: a handler whose
-  // reservation expired mid-flight still gets to cache its answer rather
-  // than losing it to a race with its own ttl — refusing a late finish would
-  // only lose a real, correctly computed response.
-  finishAt(key: string, resp: CachedResponse, ttl: i64, nowSec: i64) {
+  // `finish` against a caller-supplied clock. Acts only on the live
+  // `InFlight` reservation `token` names (#7832): a reservation that expired
+  // and was re-begun by a later request belongs to THAT request, and a late
+  // finish must not overwrite it. A reservation that merely expired with
+  // nobody after it is gone too — caching under it would store the response
+  // with no fingerprint, and every retry would then read as a mismatch.
+  finishAt(key: string, token: string, resp: CachedResponse, ttl: i64, nowSec: i64) {
     this.mu.lock()
     defer this.mu.unlock()
     let (e, ok) = this.entries[key]
-    let fp = ""
-    if (ok) {
-      fp = e.fingerprint
-    }
-    if (!ok && len(this.entries) >= this.maxKeys) {
-      this.evictSoonestExpiring()
+    if (!ok ||
+      e.expiresAtSec <= nowSec ||
+      e.state != IdempotencyState.InFlight ||
+      e.token != token) {
+      return
     }
     this.entries[key] = MemoryIdempotencyRecord{
       state = IdempotencyState.Done,
-      fingerprint = fp,
+      fingerprint = e.fingerprint,
+      token = "",
       response = resp,
       expiresAtSec = nowSec + ttl,
     }
   }
 
-  // Drops the reservation outright rather than merely marking it — an
-  // abandoned key must be immediately retryable, not merely "not `InFlight`
-  // for a little while longer" the way ttl expiry is for every other case.
-  abandonAt(key: string) {
+  // Drops the reservation `token` names outright rather than merely marking
+  // it — an abandoned key must be immediately retryable, not merely "not
+  // `InFlight` for a little while longer" the way ttl expiry is for every
+  // other case. A key holding a different token, or a `Done` entry (whose
+  // token is empty), is left alone.
+  abandonAt(key: string, token: string) {
     this.mu.lock()
     defer this.mu.unlock()
+    let (e, ok) = this.entries[key]
+    if (!ok || e.state != IdempotencyState.InFlight || e.token != token) {
+      return
+    }
     delete(this.entries, key)
   }
 

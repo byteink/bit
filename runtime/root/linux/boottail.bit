@@ -422,44 +422,15 @@ fn boot(): int {
   //    own header for all three orderings).
   let _ = pollWake(bootPollFd)
   let reapCount = schedFinalWorkerCount(sched)
-  let ji = 0
-  while (ji < reapCount) {
-    // The bool (finished-in-time vs timed-out) is discarded on purpose:
-    // `threadRelease` below does not take a timed-out join at its word either
-    // (runtime/thread/linux/spawn.bit, #1801) — it spins on the child's own
-    // on-stack flag and, if the child never gets off its stack, leaks the
-    // reservation and reports false rather than unmapping live memory. So a
-    // timeout here changes nothing this loop would do differently.
-    let _ = joinWorker(ptrOf(startDones) + ji, joinTimeoutNs)
-    // `threadRelease` is BOUNDED, so unlike ../darwin/boot.bit's `pthread_join`
-    // (#5930) it cannot hang on a child that never finishes: its on-stack spin
-    // stops at `onStackSpinBound` (1e6 loads, runtime/thread/linux/spawn.bit)
-    // and the rest is a handful of table stores and one `munmap`. It still
-    // runs with no safepoint reachable, so bracket it `blocked` like step 7's
-    // `bootWaitForMain`: a stop-the-world requested meanwhile passes this slot
-    // instead of burning its `stwSpinBound` on it (#5931). `boot` holds no
-    // live Bit reference here (file header), which `blocked` requires.
-    gcBlockingBegin()
-    threadRelease(*(ptrOf(startHandles) + ji))
-    gcBlockingEnd()
-    ji = ji + 1
-  }
+  //    One shared deadline for the whole join, see `bootJoinWorkers` below.
+  let allJoined = bootJoinWorkers(reapCount)
 
-  // 8b. Close the netpoller — `runtime/sched/`'s `NetPoller.deinit`, called from its
-  //     `Scheduler.deinit`. AFTER the join, because the worker calls `pollDrain`
-  //     on this descriptor from its own loop and closing it under a live poller
-  //     is a use-after-close, not a leak. The process is about to exit either way,
-  //     so this buys no resource back; it is here because the teardown ordering is
-  //     the part that has to be right if this boot is ever reused.
-  if (bootPollFd > 0) {
-    pollClose(bootPollFd)
-    bootPollFd = 0
-  }
-  // The write-interest descriptor, on the same terms (#1910): `pollDrain` reads
-  // both, so both must outlive the join and both must be closed here.
-  if (bootPollFdWrite > 0) {
-    pollClose(bootPollFdWrite)
-    bootPollFdWrite = 0
+  // 8b. Close the netpoller, only when every worker was joined: see
+  //     `bootClosePollers` below. A worker that was NOT joined is still running
+  //     (blocked in a call that polls nothing, or slow to wind down) and may yet
+  //     call `pollDrain`; `exit_group` closes the descriptors for it.
+  if (allJoined) {
+    bootClosePollers()
   }
 
   // 9. `BIT_GC_STATS`. After the join, so the worker cannot be mid-collection
@@ -469,6 +440,61 @@ fn boot(): int {
     statsReport()
   }
   return mainExitCode
+}
+
+// `boot()` step 8's worker join (#7836; ../windows/bootjoin.bit is the twin,
+// #7829). ONE DEADLINE FOR THE WHOLE JOIN, not one per worker. `main` has
+// returned, so the process ends at `exit_group` whatever a worker is doing; the
+// join is a courtesy that lets a worker which CAN wind down do so before the
+// stats line and the poller close. A worker parked in a call that polls nothing
+// (a raw `read`, a foreign call with no `gcBlockingBegin` bracket, ABI.md 8.5)
+// never sees `schedShutdown`, so the 15 s bound this used to take PER WORKER made
+// the process outlive `main` by 15 s for one such worker and N * 15 s for N.
+// True when every worker finished before `joinGraceNs` was spent.
+fn bootJoinWorkers(reapCount: int): bool {
+  let deadline = parkMonoNs(ptrOf(bootSleepReq)) + joinGraceNs
+  let allJoined = true
+  let ji = 0
+  while (ji < reapCount) {
+    let leftNs = deadline - parkMonoNs(ptrOf(bootSleepReq))
+    // `joinWorker` looks at the done word once even for a non-positive bound,
+    // so a worker that already finished is still counted joined after the
+    // deadline passed.
+    if (joinWorker(ptrOf(startDones) + ji, leftNs)) {
+      // `threadRelease` is BOUNDED, so unlike ../darwin/boot.bit's `pthread_join`
+      // (#5930) it cannot hang, but it runs with no safepoint reachable, so
+      // bracket it `blocked` like step 7's `bootWaitForMain`: a stop-the-world
+      // requested meanwhile passes this slot instead of burning its
+      // `stwSpinBound` on it (#5931). `boot` holds no live Bit reference here
+      // (file header), which `blocked` requires.
+      gcBlockingBegin()
+      threadRelease(*(ptrOf(startHandles) + ji))
+      gcBlockingEnd()
+    } else {
+      // NOT RELEASED: the worker is still on its stack, so `threadRelease`
+      // would only spin `onStackSpinBound` times (1e6 loads,
+      // runtime/thread/linux/spawn.bit) and then refuse to unmap (#1801): it
+      // added 110 to 150 ms to the exit on aarch64-linux (218 to 250 ms lag with
+      // the call, 101 to 112 ms without; `_tests_/stress/exitblocked`). The
+      // kernel reclaims the mapping at `exit_group`.
+      allJoined = false
+    }
+    ji = ji + 1
+  }
+  return allJoined
+}
+
+// Step 8b's two descriptor closes, a pure move out of `boot()`. `pollDrain` reads
+// both, so both must outlive the join (#1910) and both are closed here.
+fn bootClosePollers() {
+  if (bootPollFd > 0) {
+    pollClose(bootPollFd)
+    bootPollFd = 0
+  }
+  if (bootPollFdWrite > 0) {
+    pollClose(bootPollFdWrite)
+    bootPollFdWrite = 0
+  }
 }
 
 // `joinMaxPolls`/`joinWorker`/`mainTrampoline` moved here from ./boot.bit

@@ -1,0 +1,220 @@
+// pkg/redis/vset.test.bit - the wire arguments and reply decoding of
+// `vset.bit`, `vsetcmd.bit` and `vsetfilter.bit`, tested without a server.
+// `assertArgs` is `list.test.bit`s and `arr` `bloom.test.bit`s (same module).
+// `vset.live.test.bit` runs every command against a real server.
+
+import { f32FromBits } from "std/math"
+
+fn vbulk(s: string): Reply { return Reply.Bulk(Option.Some(s)) }
+
+fn vpair(k: Reply, v: Reply): MapEntry { return MapEntry{ key = k, value = v } }
+
+test "VADD puts REDUCE before the vector and the options after the element, in the docs' order" {
+  let v = Vec.Values([1.0, 0.5])
+  assertArgs(
+    vaddCmd("k", "a", v, VectorAddOptions{}).args,
+    ["VADD", "k", "FP32", "\x00\x00\x80\x3f\x00\x00\x00\x3f", "a"],
+  )
+  let all = VectorAddOptions{
+    reduce = Option.Some(2),
+    cas = true,
+    quant = VecQuant.Bin,
+    ef = Option.Some(200),
+    attrs = Option.Some("{\"x\":1}"),
+    m = Option.Some(8),
+  }
+  assertArgs(
+    vaddCmd("k", "a", v, all).args,
+    [
+      "VADD", "k", "REDUCE", "2", "FP32", "\x00\x00\x80\x3f\x00\x00\x00\x3f", "a", "CAS", "BIN", "EF", "200",
+      "SETATTR", "{\"x\":1}", "M", "8",
+    ],
+  )
+  assertArgs(
+    vaddCmd("k", "a", Vec.Fp32("xyzw"), VectorAddOptions{ quant = VecQuant.Q8 }).args,
+    ["VADD", "k", "FP32", "xyzw", "a", "Q8"],
+  )
+  assertArgs(
+    vaddCmd("k", "a", v, VectorAddOptions{ quant = VecQuant.NoQuant }).args,
+    ["VADD", "k", "FP32", "\x00\x00\x80\x3f\x00\x00\x00\x3f", "a", "NOQUANT"],
+  )
+}
+
+test "VSIM always asks for scores and sends the options in the docs' order" {
+  assertArgs(
+    vsimCmd("k", SimilarTo.Element("a"), SimilarOptions{}).args,
+    ["VSIM", "k", "ELE", "a", "WITHSCORES"],
+  )
+  let all = SimilarOptions{
+    count = Option.Some(5),
+    epsilon = Option.Some(0.25),
+    ef = Option.Some(100),
+    filter = Option.Some(vattr("team").is("red")),
+    filterEf = Option.Some(50),
+    truth = true,
+    noThread = true,
+    withAttrs = true,
+  }
+  assertArgs(
+    vsimCmd("k", SimilarTo.Values([1.0, 2.0]), all).args,
+    [
+      "VSIM", "k", "FP32", "\x00\x00\x80\x3f\x00\x00\x00\x40", "WITHSCORES", "WITHATTRIBS", "COUNT", "5", "EPSILON",
+      "0.25", "EF", "100", "FILTER", ".team == \"red\"", "FILTER-EF", "50", "TRUTH", "NOTHREAD",
+    ],
+  )
+  assertArgs(
+    vsimCmd("k", SimilarTo.Fp32("bb"), SimilarOptions{}).args,
+    ["VSIM", "k", "FP32", "bb", "WITHSCORES"],
+  )
+}
+
+test "the other V commands put the key first" {
+  assertArgs(vremCmd("k", "a").args, ["VREM", "k", "a"])
+  assertArgs(vcardCmd("k").args, ["VCARD", "k"])
+  assertArgs(vdimCmd("k").args, ["VDIM", "k"])
+  assertArgs(vismemberCmd("k", "a").args, ["VISMEMBER", "k", "a"])
+  assertArgs(vembCmd("k", "a").args, ["VEMB", "k", "a"])
+  assertArgs(vembRawCmd("k", "a").args, ["VEMB", "k", "a", "RAW"])
+  assertArgs(vgetattrCmd("k", "a").args, ["VGETATTR", "k", "a"])
+  assertArgs(vsetattrCmd("k", "a", "{}").args, ["VSETATTR", "k", "a", "{}"])
+  assertArgs(vinfoCmd("k").args, ["VINFO", "k"])
+  assertArgs(vlinksCmd("k", "a").args, ["VLINKS", "k", "a"])
+  assertArgs(vlinksScoredCmd("k", "a").args, ["VLINKS", "k", "a", "WITHSCORES"])
+  assertArgs(vrandmemberCmd("k").args, ["VRANDMEMBER", "k"])
+  assertArgs(vrandmembersCmd("k", -3).args, ["VRANDMEMBER", "k", "-3"])
+}
+
+test "filters quote strings, parenthesise combinations and escape quotes" {
+  assert(vattr("team").is("red").expr == ".team == \"red\"", "is")
+  assert(vattr("team").isNot("red").expr == ".team != \"red\"", "isNot")
+  assert(vattr("lvl").gt(3.0).expr == ".lvl > 3", "gt: ${vattr("lvl").gt(3.0).expr}")
+  assert(vattr("lvl").le(2.5).expr == ".lvl <= 2.5", "le")
+  assert(vattr("lvl").ge(1.0).expr == ".lvl >= 1", "ge")
+  assert(vattr("lvl").lt(1.0).expr == ".lvl < 1", "lt")
+  assert(vattr("lvl").eq(1.0).expr == ".lvl == 1", "eq")
+  assert(vattr("lvl").ne(1.0).expr == ".lvl != 1", "ne")
+  assert(vattr("team").oneOf("red", "blue").expr == ".team in [\"red\", \"blue\"]", "oneOf")
+  assert(vattr("tags").has("a\"b").expr == "\"a\\\"b\" in .tags", "has escapes the quote")
+  let f = vattr("team").is("red").and(vattr("lvl").gt(3.0)).or(vattr("vip").eq(1.0)).not()
+  assert(
+    f.expr == "not (((.team == \"red\") and (.lvl > 3)) or (.vip == 1))",
+    "combined: ${f.expr}",
+  )
+  assert(rawVFilter(".a % 2 == 0").expr == ".a % 2 == 0", "raw is verbatim")
+}
+
+test "VSIM reads RESP3's map and RESP2's flat array, with and without attributes" {
+  let m3 = Reply.Map(
+    [
+      vpair(vbulk("a"), Reply.Double(0.5)),
+      vpair(vbulk("b"), Reply.Double(0.25)),
+    ],
+  )
+  let got = asSimilar(m3, false) catch e {
+    panic("map: ${e.message()}")
+  }
+  assert(
+    len(got) == 2 && got[0].element == "a" && got[0].score == 0.5 && got[1].score == 0.25,
+    "map",
+  )
+
+  let withAttrs = Reply.Map(
+    [
+      vpair(vbulk("a"), arr([Reply.Double(0.5), vbulk("{\"x\":1}")])),
+      vpair(vbulk("b"), arr([Reply.Double(0.25), Reply.Null])),
+    ],
+  )
+  let ga = asSimilar(withAttrs, true) catch e {
+    panic("map attrs: ${e.message()}")
+  }
+  assert(ga[0].attrs == Option.Some("{\"x\":1}") && ga[1].attrs == Option.None, "attrs")
+
+  let flat = arr([vbulk("a"), vbulk("0.5"), vbulk("b"), vbulk("0.25")])
+  let gf = asSimilar(flat, false) catch e {
+    panic("flat: ${e.message()}")
+  }
+  assert(len(gf) == 2 && gf[1].element == "b" && gf[1].score == 0.25, "flat")
+
+  let flat3 = arr([vbulk("a"), vbulk("0.5"), vbulk("{}")])
+  let g3 = asSimilar(flat3, true) catch e {
+    panic("flat attrs: ${e.message()}")
+  }
+  assert(len(g3) == 1 && g3[0].attrs == Option.Some("{}"), "flat attrs")
+
+  let torn = arr([vbulk("a"), vbulk("0.5"), vbulk("b")])
+  let bad = asSimilar(torn, false) catch _ {
+    []Similar(0)
+  }
+  assert(len(bad) == 0, "an odd flat array is refused")
+}
+
+test "VEMB, VEMB RAW, VINFO and VLINKS decode their replies" {
+  let emb = asEmbedding(arr([Reply.Double(1.0), vbulk("0.5")])) catch e {
+    panic("emb: ${e.message()}")
+  }
+  match (emb) {
+    Some(v) => assert(len(v) == 2 && v[0] == 1.0 && v[1] == 0.5, "emb values")
+    None => panic("emb none")
+  }
+  let none = asEmbedding(Reply.Null) catch e {
+    panic("emb null: ${e.message()}")
+  }
+  assert(none == Option.None, "a missing element is None")
+
+  let raw = asVectorRaw(
+    arr([Reply.Simple("int8"), vbulk("xyz"), Reply.Double(2.0), Reply.Double(3.0)]),
+  ) catch e {
+    panic("raw: ${e.message()}")
+  }
+  match (raw) {
+    Some(r) => assert(
+      r.quant == "int8" && r.blob == "xyz" && r.norm == 2.0 && r.range == Option.Some(3.0),
+      "raw",
+    )
+    None => panic("raw none")
+  }
+
+  let info = asVectorSetInfo(
+    Reply.Map(
+      [
+        vpair(Reply.Simple("quant-type"), Reply.Simple("int8")),
+        vpair(Reply.Simple("vector-dim"), Reply.Int(3)),
+        vpair(Reply.Simple("size"), Reply.Int(2)),
+      ],
+    ),
+  ) catch e {
+    panic("info: ${e.message()}")
+  }
+  match (info) {
+    Some(i) => assert(
+      i.quantType == "int8" && i.vectorDim == 3 && i.size == 2 && i.hnswM == 0,
+      "info",
+    )
+    None => panic("info none")
+  }
+
+  let links = asLinks(arr([arr([vbulk("b"), vbulk("c")]), arr([vbulk("d")])])) catch e {
+    panic("links: ${e.message()}")
+  }
+  match (links) {
+    Some(l) => assert(len(l) == 2 && l[0][1] == "c" && l[1][0] == "d", "levels")
+    None => panic("links none")
+  }
+  let scored = asLinksScored(arr([Reply.Map([vpair(vbulk("b"), Reply.Double(0.5))])])) catch e {
+    panic("scored: ${e.message()}")
+  }
+  match (scored) {
+    Some(l) => assert(l[0][0].member == "b" && l[0][0].score == 0.5, "scored")
+    None => panic("scored none")
+  }
+}
+
+test "Vec.Values sends the exact bits: -0.0, an infinity and a signalling NaN" {
+  let v = Vec.Values(
+    [f32FromBits(u32(0x80000000)), f32FromBits(u32(0x7F800000)), f32FromBits(u32(0x7F800001))],
+  )
+  assertArgs(
+    vaddCmd("k", "a", v, VectorAddOptions{}).args,
+    ["VADD", "k", "FP32", "\x00\x00\x00\x80\x00\x00\x80\x7f\x01\x00\x80\x7f", "a"],
+  )
+}

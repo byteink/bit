@@ -1,17 +1,233 @@
-// pkg/redis/vset.bit — `r.vset(key)`: the vector-set handle. Epic
-// #6013, #6028: SCAFFOLD ONLY, no commands wired yet (`VADD, VSIM, VREM (Redis 8's vector sets)`, a
-// follow-up ticket) — this file exists so later family tickets touch only
-// their own file, never `client.bit`. `cmd.bit`'s header is the template:
-// one `Cmd<T>` factory per command, called from a method here.
-export class VectorSet {
-  client: Client,
-  key: string,
+// pkg/redis/vset.bit - `r.vset(key)`: a vector set, Redis's similarity-search
+// type (`VADD`, `VSIM` and the rest of the `V*` commands). Epic #6013, #6028,
+// #6040. Follows `cmd.bit`'s HOW-TO header and `counter.bit`'s shape: one
+// `Cmd<T>` factory per command (`vsetcmd.bit`), an immediate method on the
+// handle, a queued one on its `...Batch`. `vsetfilter.bit` holds the filter
+// builder `similar` takes.
+//
+// A vector set stores named elements, each with a vector, and answers "which
+// elements are closest to this one (or to this vector)?" with an approximate
+// HNSW search. An element may carry JSON attributes the search can filter on.
+//
+// ONE METHOD PER COMMAND, TYPED OPTIONS. `add` takes the vector as a `Vec`
+// (floats, or the raw FP32 blob for a caller that already has the bytes) and
+// the rest of `VADD`'s tokens as `VectorAddOptions`; `similar` takes the query
+// as a `SimilarTo` (an element, floats or a blob) and the rest of `VSIM` as
+// `SimilarOptions`. Vectors are `[]f32`, sent as the `FP32` blob (little-endian
+// binary32, `std/math.f32sToLe`): exact for every float and four bytes a
+// component, with no number to print here or parse there.
+//
+// ATTRIBUTES ARE JSON. `setAttr`/`attr<T>` take and give a `@json` class (or
+// any `Jsonable`); `setAttrJson`/`attrJson` are the same with the text, and
+// `jsonAttrs(value)` makes the text `VectorAddOptions.attrs` wants.
+//
+// `VectorSet` holds `runner: Runner` (`set.bit`'s `Set` does): `r.vset(key)`
+// runs over the pool, `tx.read.vset(key)` over a transaction attempt's pinned
+// connection, where a write is refused (#7738); `tx.vset(key)` queues it.
+
+import { jsonEncode } from "std/json"
+
+// How a vector set stores its vectors. `Default` leaves it to the server
+// (`Q8`, one signed byte per component); `NoQuant` keeps full floats (the most
+// exact and the most memory), `Bin` one bit per component. Fixed when the set
+// is created: a later `add` with another format is the server's error.
+export enum VecQuant {
+  Default,
+  NoQuant,
+  Q8,
+  Bin,
 }
 
-// The queued view `Pipeline.vset`/`Tx.vset` both return — `cmd.bit`'s
-// `Batch` is the ONE client-side queue the two executors share, so this
-// is the ONLY queued view VectorSet needs (`cmd.bit`'s header, point 2).
+// A vector to store: its floats (sent as an `FP32` blob), or `Fp32(blob)`, the
+// raw little-endian float32 bytes of them when the caller already has those.
+export enum Vec {
+  Values([]f32),
+  Fp32(string),
+}
+
+// What `similar` searches for: the neighbours of a stored `Element`, or of a
+// vector given as floats or as a raw FP32 blob.
+export enum SimilarTo {
+  Element(string),
+  Values([]f32),
+  Fp32(string),
+}
+
+// `VADD`'s optional arguments; unset leaves the server's default. `reduce`
+// projects the vector down to that many dimensions (random projection, only
+// when the set is created); `cas` runs the expensive part of the insert on a
+// background thread; `ef` is the build-time search effort (more is a better
+// graph, slower); `attrs` is a JSON object text (`jsonAttrs(value)`); `m` is
+// the number of links per HNSW node.
+export class VectorAddOptions {
+  export reduce: Option<i64> = Option.None,
+  export cas: bool = false,
+  export quant: VecQuant = VecQuant.Default,
+  export ef: Option<i64> = Option.None,
+  export attrs: Option<string> = Option.None,
+  export m: Option<i64> = Option.None,
+}
+
+// `VSIM`'s optional arguments; unset leaves the server's default. `count` is
+// how many hits (10 by default); `epsilon` drops hits whose distance exceeds
+// it (`0.2` keeps scores above `0.8`); `ef` is the search effort; `filter` an
+// expression over the attributes (`vattr("team").is("red")`); `filterEf` the
+// most candidates the filter may inspect; `truth` runs the exact linear scan
+// instead of the graph (to measure recall); `noThread` keeps the search on the
+// main thread; `withAttrs` fills `Similar.attrs`.
+export class SimilarOptions {
+  export count: Option<i64> = Option.None,
+  export epsilon: Option<f64> = Option.None,
+  export ef: Option<i64> = Option.None,
+  export filter: Option<VFilter> = Option.None,
+  export filterEf: Option<i64> = Option.None,
+  export truth: bool = false,
+  export noThread: bool = false,
+  export withAttrs: bool = false,
+}
+
+// `value` as the JSON object text `VectorAddOptions.attrs` and `setAttrJson`
+// take.
+export fn jsonAttrs<T: Jsonable>(value: T): string { return jsonEncode(value.toJson()) }
+
+export class VectorSet {
+  runner: Runner
+  key: string
+
+  // `VADD`: stores `vector` under `element`. True when the element is new,
+  // false when it existed and its vector was replaced.
+  export add(
+    element: string,
+    vector: Vec,
+    opts: VectorAddOptions = VectorAddOptions{},
+  ): bool!RedisError {
+    return this.runner.runCmd(vaddCmd(this.key, element, vector, opts))?
+  }
+  // `VSIM`: the elements closest to `to`, best first, each with its score.
+  // A missing `Element` is the server's error.
+  export similar(to: SimilarTo, opts: SimilarOptions = SimilarOptions{}): []Similar!RedisError {
+    return this.runner.runCmd(vsimCmd(this.key, to, opts))?
+  }
+  // `VREM`: true when the element was there.
+  export remove(element: string): bool!RedisError {
+    return this.runner.runCmd(vremCmd(this.key, element))?
+  }
+  // `VCARD`: how many elements the set holds; 0 for a missing key.
+  export card(): i64!RedisError { return this.runner.runCmd(vcardCmd(this.key))? }
+  // `VDIM`: the vectors' dimension (after `reduce`); the server's error for a
+  // missing key.
+  export dim(): i64!RedisError { return this.runner.runCmd(vdimCmd(this.key))? }
+  // `VISMEMBER`.
+  export isMember(element: string): bool!RedisError {
+    return this.runner.runCmd(vismemberCmd(this.key, element))?
+  }
+  // `VEMB`: the stored vector, de-quantized; `None` for a missing element.
+  export emb(element: string): Option<[]f32>!RedisError {
+    return this.runner.runCmd(vembCmd(this.key, element))?
+  }
+  // `VEMB ... RAW`: the vector as stored.
+  export embRaw(element: string): Option<VectorRaw>!RedisError {
+    return this.runner.runCmd(vembRawCmd(this.key, element))?
+  }
+  // `VGETATTR`, as the JSON text; `None` when the element has none.
+  export attrJson(element: string): Option<string>!RedisError {
+    return this.runner.runCmd(vgetattrCmd(this.key, element))?
+  }
+  // `VGETATTR` decoded into a `T`.
+  export attr<T>(element: string): Option<T>!RedisError {
+    return attrInto<T>(this.runner.runCmd(vgetattrCmd(this.key, element))?)?
+  }
+  // `VSETATTR`: replaces the element's attributes with `value`. False when the
+  // element is missing.
+  export setAttr<T: Jsonable>(element: string, value: T): bool!RedisError {
+    return this.runner.runCmd(vsetattrCmd(this.key, element, jsonAttrs(value)))?
+  }
+  // `VSETATTR` with the JSON text; an empty string clears the attributes.
+  export setAttrJson(element: string, json: string): bool!RedisError {
+    return this.runner.runCmd(vsetattrCmd(this.key, element, json))?
+  }
+  // `VINFO`; `None` for a missing key.
+  export info(): Option<VectorSetInfo>!RedisError { return this.runner.runCmd(vinfoCmd(this.key))? }
+  // `VLINKS`: the element's neighbours, one list per graph level (level 0
+  // first); `None` for a missing element.
+  export links(element: string): Option<[][]string>!RedisError {
+    return this.runner.runCmd(vlinksCmd(this.key, element))?
+  }
+  // `VLINKS ... WITHSCORES`: `links` with each neighbour's similarity.
+  export linksScored(element: string): Option<[][]Scored>!RedisError {
+    return this.runner.runCmd(vlinksScoredCmd(this.key, element))?
+  }
+  // `VRANDMEMBER`: one random element; `None` for an empty or missing set.
+  export randomMember(): Option<string>!RedisError {
+    return this.runner.runCmd(vrandmemberCmd(this.key))?
+  }
+  // `VRANDMEMBER key count`: up to `count` distinct elements; a negative
+  // `count` returns that many (absolute) and may repeat elements.
+  export randomMembers(count: i64): []string!RedisError {
+    return this.runner.runCmd(vrandmembersCmd(this.key, count))?
+  }
+}
+
+// The queued view `Pipeline.vset`/`Tx.vset` both return - `cmd.bit`'s `Batch`
+// is the ONE client-side queue the two executors share. `attr<T>` is not
+// queued: decode a queued `attrJson` result yourself.
 export class VectorSetBatch {
-  batch: Batch,
-  key: string,
+  batch: Batch
+  key: string
+
+  export add(
+    element: string,
+    vector: Vec,
+    opts: VectorAddOptions = VectorAddOptions{},
+  ): Future<bool> {
+    return this.batch.queue(vaddCmd(this.key, element, vector, opts))
+  }
+  export similar(to: SimilarTo, opts: SimilarOptions = SimilarOptions{}): Future<[]Similar> {
+    return this.batch.queue(vsimCmd(this.key, to, opts))
+  }
+  export remove(element: string): Future<bool> {
+    return this.batch.queue(vremCmd(this.key, element))
+  }
+  export card(): Future<i64> { return this.batch.queue(vcardCmd(this.key)) }
+  export dim(): Future<i64> { return this.batch.queue(vdimCmd(this.key)) }
+  export isMember(element: string): Future<bool> {
+    return this.batch.queue(vismemberCmd(this.key, element))
+  }
+  export emb(element: string): Future<Option<[]f32>> {
+    return this.batch.queue(vembCmd(this.key, element))
+  }
+  export embRaw(element: string): Future<Option<VectorRaw>> {
+    return this.batch.queue(vembRawCmd(this.key, element))
+  }
+  export attrJson(element: string): Future<Option<string>> {
+    return this.batch.queue(vgetattrCmd(this.key, element))
+  }
+  export setAttr<T: Jsonable>(element: string, value: T): Future<bool> {
+    return this.batch.queue(vsetattrCmd(this.key, element, jsonAttrs(value)))
+  }
+  export setAttrJson(element: string, json: string): Future<bool> {
+    return this.batch.queue(vsetattrCmd(this.key, element, json))
+  }
+  export info(): Future<Option<VectorSetInfo>> { return this.batch.queue(vinfoCmd(this.key)) }
+  export links(element: string): Future<Option<[][]string>> {
+    return this.batch.queue(vlinksCmd(this.key, element))
+  }
+  export linksScored(element: string): Future<Option<[][]Scored>> {
+    return this.batch.queue(vlinksScoredCmd(this.key, element))
+  }
+  export randomMember(): Future<Option<string>> {
+    return this.batch.queue(vrandmemberCmd(this.key))
+  }
+  export randomMembers(count: i64): Future<[]string> {
+    return this.batch.queue(vrandmembersCmd(this.key, count))
+  }
+}
+
+// The attributes text as a `T`; a document that does not fit `T` is the
+// caller's data disagreeing with its class.
+fn attrInto<T>(text: Option<string>): Option<T>!RedisError {
+  match (text) {
+    Some(s) => return Option.Some(jsonInto<T>(jsonTree(s, "VGETATTR")?, "VGETATTR")?)
+    None => return Option.None
+  }
 }
