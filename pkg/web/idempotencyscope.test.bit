@@ -1,0 +1,278 @@
+// pkg/web/idempotencyscope.test.bit — #7869's acceptance: an idempotency key
+// is scoped to WHO sent it. Two users sending the same key and body to the
+// same route each run their own handler and each get their own response; two
+// anonymous clients at different addresses likewise; an app-supplied scope
+// function replaces both; the store is handed a hash of (scope, key), never
+// the raw header; a scope that comes back empty is refused.
+//
+// Split out of idempotency.test.bit to stay under the 800-line ceiling. Every
+// request goes through `app.handle` (adapter.bit), as there. `App`, `Config`,
+// `Request`, `MemoryStore`, `freezeOrPanic`, `newSink`, `testLogger`, `contains`
+// and `newError` are already bound module-wide by sibling files (E0042); this
+// file imports nothing. `idemReq` is idempotency.test.bit's fixture.
+
+// A logged-in session is what pkg/auth's `bindSession` leaves behind: the
+// index key `auth:sub` holding the principal's id. `GET /login?u=A` stands in
+// for it here, since pkg/web cannot import pkg/auth.
+class RunLog {
+  runs: []string,
+}
+
+fn scopeApp(scope: IdempotencyScope, store: IdempotencyStore, log: RunLog): App {
+  let app = App(Config{ secret = "test-secret", sessions = MemoryStore(1000) })
+  app.get("/login", (c) => {
+    let s = c.session()?
+    s.set("user", c.query("u"))
+    s.index("auth:sub", c.query("u"))
+    return c.text("in")
+  })
+  let api = app.group("/api")
+  api.use(idempotency(IdempotencyPolicy{ store = store, ttl = 60, scope = scope }))
+  api.post("/articles", (c) => {
+    // Touches the session only when the request brought a cookie, so an
+    // anonymous request is not handed one by the handler itself.
+    let who = ""
+    if (len(c.header("Cookie")) > 0) {
+      who = c.session()?.get("user")
+    }
+    log.runs = append(log.runs, who)
+    return c.text("article for '${who}'").status(201)
+  })
+  freezeOrPanic(app)
+  return app
+}
+
+fn articleReq(key: string, cookie: string, peer: string): Request {
+  let headers = "Idempotency-Key: " + key
+  if (len(cookie) > 0) {
+    headers = headers + "\r\nCookie: " + cookie
+  }
+  return Request{
+    method = "POST",
+    path = "/api/articles",
+    headers = headers,
+    body = "{\"t\":1}",
+    peer = peer,
+  }
+}
+
+fn loginAs(app: App, user: string): string {
+  let r = app.handle(Request{ method = "GET", path = "/login?u=" + user, headers = "", body = "" })
+  return r.getHeader("Set-Cookie")
+}
+
+test "two users sending the same key and body each run their own handler" {
+  let log = RunLog{ runs = []string(0) }
+  let app = scopeApp(nil, MemoryIdempotencyStore(1000), log)
+  let alice = loginAs(app, "alice")
+  let bob = loginAs(app, "bob")
+
+  let a = app.handle(articleReq("k1", alice, "198.51.100.1"))
+  let b = app.handle(articleReq("k1", bob, "198.51.100.1"))
+
+  assert(a.body == "article for 'alice'", "alice's own response, got '${a.body}'")
+  assert(
+    b.body == "article for 'bob'",
+    "bob must get bob's response, not alice's replayed; got '${b.body}'",
+  )
+  assert(len(log.runs) == 2, "both handlers must run, got ${len(log.runs)} run(s)")
+}
+
+test "each user's own retry still replays, and does not run the handler again" {
+  let log = RunLog{ runs = []string(0) }
+  let app = scopeApp(nil, MemoryIdempotencyStore(1000), log)
+  let alice = loginAs(app, "alice")
+  let bob = loginAs(app, "bob")
+
+  let _ = app.handle(articleReq("k1", alice, "198.51.100.1"))
+  let _ = app.handle(articleReq("k1", bob, "198.51.100.1"))
+  let a2 = app.handle(articleReq("k1", alice, "198.51.100.1"))
+  let b2 = app.handle(articleReq("k1", bob, "198.51.100.1"))
+
+  assert(a2.body == "article for 'alice'", "alice's replay, got '${a2.body}'")
+  assert(b2.body == "article for 'bob'", "bob's replay, got '${b2.body}'")
+  assert(len(log.runs) == 2, "a retry must not run the handler, got ${len(log.runs)} run(s)")
+}
+
+test "a user's key does not collide with an anonymous client of the same name" {
+  let log = RunLog{ runs = []string(0) }
+  let app = scopeApp(nil, MemoryIdempotencyStore(1000), log)
+  let alice = loginAs(app, "alice")
+
+  let _ = app.handle(articleReq("k1", alice, "198.51.100.1"))
+  let anon = app.handle(articleReq("k1", "", "198.51.100.1"))
+
+  assert(anon.body == "article for ''", "the anonymous client runs its own, got '${anon.body}'")
+  assert(len(log.runs) == 2, "both must run, got ${len(log.runs)}")
+}
+
+test "two anonymous clients at different addresses each run their own handler" {
+  let log = RunLog{ runs = []string(0) }
+  let app = scopeApp(nil, MemoryIdempotencyStore(1000), log)
+
+  let _ = app.handle(articleReq("k1", "", "198.51.100.1"))
+  let _ = app.handle(articleReq("k1", "", "198.51.100.2"))
+  assert(
+    len(log.runs) == 2,
+    "a second address must not be replayed the first, got ${len(log.runs)}",
+  )
+
+  let _ = app.handle(articleReq("k1", "", "198.51.100.2"))
+  assert(len(log.runs) == 2, "the same address retrying must replay, got ${len(log.runs)}")
+}
+
+test "a forged session cookie is an anonymous client, scoped by address" {
+  let log = RunLog{ runs = []string(0) }
+  let app = scopeApp(nil, MemoryIdempotencyStore(1000), log)
+
+  let _ = app.handle(articleReq("k1", "sid=forged-one", "198.51.100.1"))
+  let _ = app.handle(articleReq("k1", "sid=forged-two", "198.51.100.2"))
+
+  assert(
+    len(log.runs) == 2,
+    "an unknown cookie must not select a shared scope, got ${len(log.runs)}",
+  )
+}
+
+test "an anonymous request is handed no session cookie, so none is cached and replayed" {
+  let log = RunLog{ runs = []string(0) }
+  let app = scopeApp(nil, MemoryIdempotencyStore(1000), log)
+
+  let first = app.handle(articleReq("k1", "", "198.51.100.1"))
+  let second = app.handle(articleReq("k1", "", "198.51.100.1"))
+
+  assert(
+    first.getHeader("Set-Cookie") == "",
+    "no cookie on the first, got '${first.getHeader("Set-Cookie")}'",
+  )
+  assert(
+    second.getHeader("Set-Cookie") == "",
+    "no cookie on the replay, got '${second.getHeader("Set-Cookie")}'",
+  )
+}
+
+test "an app without a session store scopes by address" {
+  let log = RunLog{ runs = []string(0) }
+  let app = App(Config{ secret = "test-secret" })
+  app.use(idempotency(IdempotencyPolicy{ store = MemoryIdempotencyStore(1000), ttl = 60 }))
+  app.post("/x", (c) => {
+    log.runs = append(log.runs, c.peer())
+    return c.text("ok")
+  })
+  freezeOrPanic(app)
+  let r = (peer: string) => Request{
+    method = "POST", path = "/x", headers = "Idempotency-Key: k", body = "", peer = peer,
+  }
+
+  let _ = app.handle(r("198.51.100.1"))
+  let _ = app.handle(r("198.51.100.2"))
+  let _ = app.handle(r("198.51.100.1"))
+
+  assert(len(log.runs) == 2, "two addresses run once each, got ${len(log.runs)}")
+}
+
+test "bySubject(byForwardedIp) scopes anonymous clients by the trusted hop" {
+  let log = RunLog{ runs = []string(0) }
+  let app = scopeApp(bySubject(byForwardedIp(1)), MemoryIdempotencyStore(1000), log)
+  let viaProxy = (client: string) => Request{
+    method = "POST", path = "/api/articles", body = "{\"t\":1}", peer = "10.0.0.1",
+    headers = "Idempotency-Key: k1\r\nX-Forwarded-For: " + client,
+  }
+
+  let _ = app.handle(viaProxy("203.0.113.1"))
+  let _ = app.handle(viaProxy("203.0.113.2"))
+  assert(
+    len(log.runs) == 2,
+    "two clients behind one proxy must not share a key, got ${len(log.runs)}",
+  )
+
+  let _ = app.handle(viaProxy("203.0.113.1"))
+  assert(len(log.runs) == 2, "the same client retrying must replay, got ${len(log.runs)}")
+}
+
+test "an app-supplied scope function replaces the default" {
+  let log = RunLog{ runs = []string(0) }
+  let tenant: IdempotencyScope = (c) => "tenant:" + c.header("X-Tenant")
+  let app = scopeApp(tenant, MemoryIdempotencyStore(1000), log)
+  let inTenant = (t: string) => Request{
+    method = "POST", path = "/api/articles", body = "{\"t\":1}", peer = "198.51.100.1",
+    headers = "Idempotency-Key: k1\r\nX-Tenant: " + t,
+  }
+
+  let _ = app.handle(inTenant("acme"))
+  let _ = app.handle(inTenant("globex"))
+  assert(len(log.runs) == 2, "two tenants run once each, got ${len(log.runs)}")
+
+  let _ = app.handle(inTenant("acme"))
+  assert(len(log.runs) == 2, "the same tenant retrying replays, got ${len(log.runs)}")
+}
+
+test "a scope function that returns an empty string refuses the request" {
+  let log = RunLog{ runs = []string(0) }
+  let empty: IdempotencyScope = (c) => ""
+  let app = scopeApp(empty, MemoryIdempotencyStore(1000), log)
+
+  let res = app.handle(articleReq("k1", "", "198.51.100.1"))
+
+  assert(res.status == 500, "an empty scope must fail closed, got ${res.status}")
+  assert(len(log.runs) == 0, "the handler must not run, got ${len(log.runs)}")
+}
+
+test "a scope function that fails refuses the request" {
+  let log = RunLog{ runs = []string(0) }
+  let broken: IdempotencyScope = (c) => {
+    fail newError("tenant lookup is down")
+  }
+  let app = scopeApp(broken, MemoryIdempotencyStore(1000), log)
+
+  let res = app.handle(articleReq("k1", "", "198.51.100.1"))
+
+  assert(res.status == 500, "a failing scope must not fall back to a shared one, got ${res.status}")
+  assert(len(log.runs) == 0, "the handler must not run, got ${len(log.runs)}")
+}
+
+// Records every key the middleware hands the store.
+class KeySpyStore {
+  inner: MemoryIdempotencyStore
+  keys: []string
+
+  export begin(key: string, fingerprint: string, ttl: i64): IdempotencyClaim! {
+    this.keys = append(this.keys, key)
+    return this.inner.begin(key, fingerprint, ttl)?
+  }
+  export finish(key: string, token: string, resp: CachedResponse, ttl: i64): ()! {
+    this.inner.finish(key, token, resp, ttl)?
+  }
+  export abandon(key: string, token: string): ()! {
+    this.inner.abandon(key, token)?
+  }
+}
+
+test "the store is handed a 64-character hash of (scope, key), never the raw header" {
+  let log = RunLog{ runs = []string(0) }
+  let spy = KeySpyStore{ inner = MemoryIdempotencyStore(1000), keys = []string(0) }
+  let app = scopeApp(nil, spy, log)
+
+  let _ = app.handle(articleReq("k1", "", "198.51.100.1"))
+  let _ = app.handle(articleReq("k1", "", "198.51.100.2"))
+  let _ = app.handle(articleReq("k1", "", "198.51.100.1"))
+
+  assert(len(spy.keys) == 3, "one begin per request, got ${len(spy.keys)}")
+  assert(len(spy.keys[0]) == 64 && !contains(spy.keys[0], "k1"), "a hash, got '${spy.keys[0]}'")
+  assert(spy.keys[0] != spy.keys[1], "two addresses must derive two store keys")
+  assert(spy.keys[0] == spy.keys[2], "the same address and key must derive the same store key")
+}
+
+test "idempotencyStoreKey cannot be made to spell another pair's key" {
+  assert(idempotencyStoreKey("ab", "c") != idempotencyStoreKey("a", "bc"), "scope/key boundary")
+  assert(
+    idempotencyStoreKey("1:a", "b") != idempotencyStoreKey("1", "a\nb"),
+    "the prefix is length, not text",
+  )
+  assert(idempotencyStoreKey("a", "b") == idempotencyStoreKey("a", "b"), "deterministic")
+}
+
+test "testpanic_bysubject_with_no_fallback_panics_at_registration" {
+  let _ = bySubject(nil)
+  print("unreachable: bySubject() accepted no fallback\n")
+}

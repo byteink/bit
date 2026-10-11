@@ -38,6 +38,47 @@
 // SAME endpoint with a different body is the case the ticket names
 // explicitly — 422, never a silent replay of stale data.
 //
+// ## Whose key is it? The scope (#7869)
+//
+// A key is a value the CLIENT invents, so on its own it names nothing about
+// WHO sent it. Two users who both send `Idempotency-Key: k1` with the same
+// body to the same route would be the same request to a store keyed by `k1`
+// alone: the second would be replayed the first user's stored response (their
+// data) and the second user's write would never happen. The IETF
+// Idempotency-Key draft (draft-ietf-httpapi-idempotency-key-header, "Security
+// Considerations") says the same from the other side: the key must be unique
+// per client, and the server must not let one client's key collide with
+// another's. Stripe scopes keys per account for the same reason.
+//
+// So the middleware never hands the store the raw header. The store key is
+// `idempotencyStoreKey(scope, key)`: SHA-256 over the length-prefixed scope
+// and the key, hex, so no pair of (scope, key) values can spell another's
+// key and a store only ever sees a 64-character ASCII string. The scope is
+// `IdempotencyPolicy.scope`, and when the app sets none it is `bySubject(byIp)`:
+//
+//   - the authenticated principal, when the request's session carries one.
+//     pkg/web has no principal of its own; pkg/auth's `bindSession` files the
+//     session under the index key `auth:sub` with the `Identity`'s `id` as the
+//     value (SessionStore's "Revoking by subject"), for the bearer, API-key,
+//     password and OIDC strategies alike, and that index is what is read here.
+//     The session is read without creating one, so an anonymous request is not
+//     handed a `Set-Cookie` that would then be cached and replayed. Mount
+//     `idempotency()` AFTER `requireAuth`, or the principal is not bound yet.
+//   - otherwise the socket address (`byIp`, `Ctx.peer()`), and never a
+//     forwarding header: behind a proxy that address is the proxy's, so an app
+//     there passes `scope: bySubject(byForwardedIp(hops))`, the one place the
+//     operator states how many proxies it trusts. Anonymous clients that share
+//     an address (one NAT) share a scope; an app that needs finer than that
+//     supplies its own function. A request with no socket (in-process
+//     `App.handle`) has an empty peer and shares one anonymous scope.
+//
+// A scope function that returns "" is refused with an error, never treated as
+// "no scope": that would silently restore the collision this section closes.
+//
+// Entries stored before this change were keyed by the raw header, so they
+// stop matching and age out with their `ttl`; a retry that spans the upgrade
+// runs once more, and nothing else changes.
+//
 // ## One atomic transition decides everything
 //
 // `IdempotencyStore.begin()` is the one operation that must be atomic: two
@@ -159,8 +200,10 @@ export fn newReservationToken(): string {
   return encodeHex(randomBytes(reservationTokenBytes))
 }
 
-// A store of idempotency reservations and cached responses, keyed by the
-// client-supplied `Idempotency-Key`. Structural (SPEC §14.3): a type
+// A store of idempotency reservations and cached responses. `key` is always
+// the opaque `idempotencyStoreKey(scope, header)` the middleware derived, never
+// the raw client header, so a store neither sees nor needs to namespace by user.
+// Structural (SPEC §14.3): a type
 // satisfies this by having the three methods, with no declaration anywhere —
 // `MemoryIdempotencyStore` below, a future Redis- or PostgreSQL-backed store
 // and an app's own all satisfy it the same way.
@@ -203,7 +246,17 @@ export class IdempotencyPolicy {
   export store: IdempotencyStore,
   // Seconds a key is remembered. At least 1. NO DEFAULT — see above.
   export ttl: i64,
+  // Whose keys these are — see the file header, "Whose key is it?". Left unset
+  // it is `bySubject(byIp)`: the authenticated principal, else the socket
+  // address. Set it for a trusted proxy (`bySubject(byForwardedIp(hops))`), a
+  // tenant, or an API client id.
+  export scope: IdempotencyScope,
 }
+
+// What produces the string a key is scoped to: a user id, a tenant, an
+// address. Fallible for `RateKey`'s reason (ratelimit.bit), and any `RateKey`
+// (`byIp`, `byForwardedIp(hops)`, `bySession`) is one. It must not return "".
+export type IdempotencyScope = (Ctx) => string!
 
 // The middleware. Registered like any other (`app.use(idempotency(p))` or
 // scoped with `group.use(...)`), so it wraps everything registered after it
@@ -227,12 +280,93 @@ export fn idempotency(p: IdempotencyPolicy): Middleware {
     }
     let body = c.rawBody()?
     let fp = requestFingerprint(c.method(), c.path(), body)
-    let claim = p.store.begin(key, fp, p.ttl)?
+    let keys = IdempotencyKeys{ client = key, store = storeKeyFor(p, c, key)? }
+    let claim = p.store.begin(keys.store, fp, p.ttl)?
     if (!claim.won()) {
       return replayOrRefuse(unwrap(claim.existing), fp)
     }
-    return runOnce(p, c, next, key, claim.token)
+    return runOnce(p, c, next, keys, claim.token)
   }
+}
+
+// The two names one request's key has: what the client sent (logged, so an
+// operator can find it) and what the store is given (`idempotencyStoreKey`).
+class IdempotencyKeys {
+  client: string,
+  store: string,
+}
+
+// The store key for this request: the policy's scope, or `bySubject(byIp)`
+// when it set none, folded with the client's key. A scope that is empty is
+// refused rather than accepted — see the file header.
+fn storeKeyFor(p: IdempotencyPolicy, c: Ctx, key: string): string! {
+  let scopeOf: IdempotencyScope = bySubject(byIp)
+  if (p.scope != nil) {
+    scopeOf = p.scope
+  }
+  let scope = scopeOf(c)?
+  if (len(scope) == 0) {
+    fail newError("web: idempotency(): the scope function returned an empty string, so this key would be shared by every client")
+  }
+  return idempotencyStoreKey(scope, key)
+}
+
+// The session index key pkg/auth files an authenticated session under, with
+// the `Identity`'s `id` as the value (`subjectIndexKey`, pkg/auth/strategy.bit).
+// pkg/auth imports this package, so the string cannot be shared; it is
+// documented on `SessionStore` as the key pkg/auth uses.
+const subjectIndexKey = "auth:sub"
+const subjectScopePrefix = "sub:"
+
+// Scopes a key to the authenticated principal when the request's session
+// carries one, and to `fallback` when it does not. See the file header.
+export fn bySubject(fallback: RateKey): IdempotencyScope {
+  if (fallback == nil) {
+    panic("web: bySubject(): no fallback — pass `byIp`, or `byForwardedIp(hops)` behind a proxy")
+  }
+  let scope: IdempotencyScope = (c) => {
+    let sub = sessionSubject(c)?
+    if (len(sub) > 0) {
+      return subjectScopePrefix + sub
+    }
+    return fallback(c)?
+  }
+  return scope
+}
+
+// The principal of this request's session, or "". Reads the session without
+// minting one: `Ctx.session()` would create a fresh session for an anonymous
+// request, and its `Set-Cookie` would be cached with the response. A request
+// with no session store, no cookie, or a cookie the store does not know has no
+// principal; an unknown cookie cannot pick another user's, since the lookup is
+// by the secret session id.
+fn sessionSubject(c: Ctx): string! {
+  if (isSome(c.sessionCache)) {
+    return indexedSubject(unwrap(c.sessionCache))
+  }
+  if (c.config.sessions == nil) {
+    return ""
+  }
+  let sid = sessionIdFromCookies(c.headers("cookie"))
+  if (len(sid) == 0) {
+    return ""
+  }
+  return indexedSubject(loadSession(c.config.sessions, sid)?)
+}
+
+fn indexedSubject(s: Session): string {
+  let (sub, ok) = s.indexes[subjectIndexKey]
+  if (!ok) {
+    return ""
+  }
+  return sub
+}
+
+// SHA-256, hex, of the scope's length, the scope and the key. The length
+// prefix is what makes the pair unambiguous: no scope/key split of one string
+// can equal another, whatever bytes either holds.
+fn idempotencyStoreKey(scope: string, key: string): string {
+  return encodeHex(digest(Sha256(), []byte("${len(scope)}:${scope}\n${key}")))
 }
 
 // Refuses an `IdempotencyPolicy` the framework cannot honour, naming the
@@ -257,17 +391,17 @@ fn checkPolicy(p: IdempotencyPolicy) {
 // This request WON the reservation `idempotency()` just created — it is the
 // one request that runs the handler. `token` is the reservation `begin()`
 // handed it: the only thing that lets `finish` / `abandon` act on it.
-fn runOnce(p: IdempotencyPolicy, c: Ctx, next: Next, key: string, token: string): Res! {
+fn runOnce(p: IdempotencyPolicy, c: Ctx, next: Next, keys: IdempotencyKeys, token: string): Res! {
   let r = next(c) catch e {
-    p.store.abandon(key, token) catch ae {
-      let rec = errorRecord(c.config).str("key", key).err(ae)
+    p.store.abandon(keys.store, token) catch ae {
+      let rec = errorRecord(c.config).str("key", keys.client).err(ae)
       rec.log("web: idempotency(): abandon failed after the handler itself failed")
     }
     fail e
   }
   let cached = CachedResponse{ status = r.statusCode(), body = r.body(), headers = r.headerList() }
-  p.store.finish(key, token, cached, p.ttl) catch e {
-    let rec = errorRecord(c.config).str("key", key).err(e)
+  p.store.finish(keys.store, token, cached, p.ttl) catch e {
+    let rec = errorRecord(c.config).str("key", keys.client).err(e)
     rec.log("web: idempotency(): finish failed, this response was NOT cached")
   }
   return r

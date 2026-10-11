@@ -330,10 +330,16 @@ $ bit test pkg/web/guides/inkwell
 
 ## Sharp edges
 
-- **Keys must be random.** A key names an action, and the store does not tie it
-  to a signed-in user. Use a UUID v4 made once per action (once per click of
-  "Publish"), never something guessable such as the article title, and reuse it
-  only when retrying that same action.
+- **Keys must be random.** A key names an action. Use a UUID v4 made once per
+  action (once per click of "Publish"), never something guessable such as the
+  article title, and reuse it only when retrying that same action.
+- **A key belongs to the user who sent it.** The middleware stores a hash of the
+  signed-in user and the key, so two users who send the same key and body each
+  get their own article, and neither is ever handed the other's response. A
+  caller with no session is told apart by the address the connection came from.
+  Behind a proxy that is the proxy's address, so name the hops you trust with
+  `scope = bySubject(byForwardedIp(hops))` on the policy; see "Whose key is it" in
+  the operational middleware chapter.
 - **A handler that outlives `ttl` can run twice.** Its reservation expires, a
   retry takes the key, and now two copies run. Keep `ttl` far longer than the
   slowest `POST /articles`.
@@ -358,10 +364,10 @@ new row each time, which is why they carry it.
 
 ## What we built
 
-Inkwell's two creating routes now take an `Idempotency-Key`. A retry with the
-same key and body returns the first answer and stores one row, a retry during the
-first request is a `409`, and the same key with a different body is a `422`. The
-keys live in PostgreSQL next to the data, in a table that `bit migrate` creates,
+Inkwell's two creating routes now take an `Idempotency-Key`, kept per signed-in
+user. A retry with the same key and body returns the first answer and stores one
+row, a retry during the first request is a `409`, and the same key with a
+different body is a `422`. The keys live in PostgreSQL next to the data, in a table that `bit migrate` creates,
 so every server behind the load balancer answers for all of them.
 
 Previous: [Operations](17-operations.md). This is the last chapter written so

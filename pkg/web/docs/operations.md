@@ -217,9 +217,10 @@ A request carrying an `Idempotency-Key` header runs its handler once. A
 retry with the same key and the same method, path and body gets back the
 exact response the first attempt produced, handler unrun. A retry with the
 same key and a different body is `422` - never a silent replay of someone
-else's answer. A second request racing the first while it is still running
-is `409`: the key is reserved the instant the first request arrives, not
-once it finishes.
+else's answer. Two different callers who happen to send the same key never
+meet at all ([Whose key is it](#whose-key-is-it)). A second request racing the
+first while it is still running is `409`: the key is reserved the instant the
+first request arrives, not once it finishes.
 
 A request with no `Idempotency-Key` header is untouched, so this is usually
 mounted on the write routes that need it rather than the whole app -
@@ -282,6 +283,74 @@ fn countingStore(): IdempotencyStore {
   return CountingStore{ inner = MemoryIdempotencyStore(10_000), won = 0 }
 }
 ```
+
+### Whose key is it
+
+A key is a string the client invents, so on its own it says nothing about who
+sent it. Two users who both send `Idempotency-Key: k1` with the same body to the
+same route would otherwise be one request, and the second would be handed the
+first user's stored response, with the second user's write never happening. The
+IETF Idempotency-Key draft asks for keys to be unique per client and leaves the
+scoping to the server; Stripe scopes them per account.
+
+So `idempotency()` never gives the store the raw header. It stores a SHA-256 of
+the caller's **scope** and the key, and the scope is:
+
+- the authenticated principal, when the request's session carries one - the
+  `Identity` that `requireAuth` in `pkg/auth` binds, for bearer, API key,
+  password and OIDC alike. Mount `idempotency()` after `requireAuth`;
+- otherwise the socket address (`Ctx.peer()`). A forwarding header is never read
+  by default, because any client can set one.
+
+Behind a reverse proxy the socket address is the proxy's. Say how many proxies you
+trust, with the same `byForwardedIp(hops)` the rate limiter uses, and keep the
+principal first with `bySubject`:
+
+```bit
+import {
+  App,
+  IdempotencyPolicy,
+  IdempotencyScope,
+  MemoryIdempotencyStore,
+  bySubject,
+  byForwardedIp,
+  idempotency,
+} from "web"
+
+fn mountBehindProxy(app: App) {
+  let scope: IdempotencyScope = bySubject(byForwardedIp(1))
+  let store = MemoryIdempotencyStore(10_000)
+  app.use(idempotency(IdempotencyPolicy{ store = store, ttl = 86400, scope = scope }))
+}
+```
+
+`scope` is any `(Ctx) => string!`, so a tenant or an API client id is one
+function. Whatever it returns, an empty string is refused with a `500` rather than
+treated as "no scope", since that would put every client back in one namespace:
+
+```bit
+import {
+  App,
+  Ctx,
+  IdempotencyPolicy,
+  IdempotencyScope,
+  MemoryIdempotencyStore,
+  idempotency,
+} from "web"
+
+fn mountPerTenant(app: App) {
+  let scope: IdempotencyScope = (c: Ctx) => "tenant:" + c.header("X-Tenant")
+  let store = MemoryIdempotencyStore(10_000)
+  app.use(idempotency(IdempotencyPolicy{ store = store, ttl = 86400, scope = scope }))
+}
+```
+
+Anonymous clients behind one NAT share an address and so a scope; give them a
+`scope` function that returns something finer if that matters.
+
+**Upgrading.** Entries written by an earlier version were keyed by the raw header,
+so they stop matching and expire with their `ttl`. A retry that straddles the
+upgrade runs once more; nothing else changes.
 
 `ttl` is how long a key is remembered, in seconds, from whichever of
 `begin()`/`finish()` last touched it - there is no default, because how long

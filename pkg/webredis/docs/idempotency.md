@@ -58,7 +58,7 @@ run the handler. `begin`, the store's first step, is therefore a single Redis
 command:
 
 ```text
-SET idem:<key> <reserved> PX <ttl in ms> NX GET
+SET idem:<scoped key> <reserved> PX <ttl in ms> NX GET
 ```
 
 `NX` writes only when the key is absent and `GET` returns whatever was there
@@ -76,7 +76,13 @@ carries a key.
 
 ## What Redis keeps
 
-One string per key, under `prefix + key` (the prefix defaults to `idem:`).
+One string per key, under `prefix + key` (the prefix defaults to `idem:`), where
+`key` is not the client's header but a 64-character hash of the caller's scope and
+the header, which `idempotency()` computes: the signed-in user, or the client
+address for an anonymous caller (see "Whose key is it" in the `pkg/web`
+operational middleware chapter). Two users who send the same header are two Redis
+keys, and each one's retry replays only their own response. Entries written by an
+earlier version used the raw header, no longer match, and expire with their `ttl`.
 The value starts with a state letter and the request fingerprint, and once
 the handler finishes it carries the response:
 
@@ -112,9 +118,9 @@ fn main(): ()! {
 }
 ```
 
-The client's `Idempotency-Key` is only ever appended to the prefix, so
-whatever characters it holds it names one key under it and cannot reach
-another part of the keyspace.
+The key is a hex hash, and is only ever appended to the prefix, so whatever
+characters the client's `Idempotency-Key` holds, it names one key under the
+prefix and cannot reach another part of the keyspace.
 
 ## Failures
 
