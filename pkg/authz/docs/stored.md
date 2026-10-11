@@ -253,9 +253,10 @@ the stored one is left out and `rolesOf` says so in `skipped`.
 ## Where they are kept
 
 A document is compiled to rules once, when it is saved, and the compiled form is
-what `can` reads: a check never parses a document. Saving, attaching or
-detaching drops every subject's cached rules, and each is rebuilt on its next
-check. Rebuilding a subject whose class no role in code names costs a full
+what `can` reads: a check never parses a document. Saving a policy or changing a
+global attachment drops every subject's cached rules, and each is rebuilt on its
+next check; an attachment written for one tenant drops that tenant's only
+([Tenants](tenants.md)). Rebuilding a subject whose class no role in code names costs a full
 resolution on every check, so a stored-only app registers the class once with
 `subject`:
 
@@ -289,9 +290,71 @@ the process, and a store holds `maxPolicies` documents and `maxAttachments`
 attachments (10,000 and 100,000 unless asked) before a write that would add one
 fails, so an endpoint cannot grow it without limit. `PolicyStore` is the
 interface a store satisfies: `putPolicy`, `policy`, `policies`, `attach`,
-`detach`, `attachments(tenant)` and `version`, with writes that are idempotent
-and a `version` that grows on every real one. It trusts what it is given;
+`detach`, `attachments(tenant)`, `version` and `scopeVersion(tenant)`, with
+writes that are idempotent and versions that grow on every real write. It
+trusts what it is given;
 `Authz` validates first. This program prints `policies: 0`.
+
+## Keeping servers in step
+
+Two servers share one store, and an admin saves a policy on server A. Server B
+compiled its policies at startup and answers from them: until something tells
+it, B keeps allowing what A just revoked. A check can't ask the store each
+time, since that is a network call per `can`. So a handle reads the store's
+versions in the background and reloads only what moved:
+
+```bit
+import { Authz, MemoryStore, PolicyStore, StoreOptions } from "authz"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+fn main(): ()! {
+  let shared = MemoryStore()
+  let options = StoreOptions(
+    policyStore = Option<PolicyStore>.Some(shared),
+    refreshEveryMs = 1000,
+  )
+  let authz = Authz<Action>(options = options)?
+  authz.refresh() catch e {
+    println("down: ${e.message()}")
+  }
+  authz.close()
+  println("closed")
+}
+```
+
+`refreshEveryMs` (5000 unless asked) is the longest another server's write can
+go unseen. `refresh()` is the same step on demand: call it once after you have
+registered your resources and roles, because a store that already holds
+policies cannot be compiled before then and the handle answers every request
+with a refusal until it has been. `close()` stops the poll; the handle keeps
+what it has loaded. A handle on its own in-memory store (`Authz()`) has no
+other writer and starts no poll.
+
+A write through the handle does not wait for the poll: it reloads before it
+returns, so the server that wrote is consistent at once. A save or a global
+attachment rebuilds every subject's rules everywhere; an attachment for one
+tenant rebuilds that tenant's only, and another tenant's cached rules stay
+warm.
+
+### When the store is down
+
+If the store cannot answer the poll, or a stored policy does not compile
+against what this server has registered, the handle fails closed: `can` is
+`false`, and `check` and `filterFor` fail with `StoreUnavailable` (a 503 in
+`web`), for everyone, until a later refresh succeeds. Allowing on the strength
+of a cache whose age is unknown would be the wrong default; OWASP's word for the
+right one is "fail securely". The cause is logged once at ERROR when the
+handle goes down and once at INFO when it comes back, not once per request. A
+store call that hangs rather than fails is caught too: two intervals without a
+successful refresh take the handle down the same way.
+
+Inside one interval a warm handle keeps serving what it has, which is the
+staleness window above. The first `forTenant("acme")` reads that tenant's
+attachments once (and is a `StoreUnavailable` if it cannot); after that the
+tenant is followed by the poll and a view costs no store call. At most
+`maxTenants` (10,000) are followed, so a tenant name invented by a client cannot
+grow the set: the next one is an `InvalidPolicy` naming the option.
 
 ## Sharp edges
 
@@ -302,7 +365,9 @@ and a `version` that grows on every real one. It trusts what it is given;
   list filter, and a stored `when` is bound to the subject with `$user.x`.
 - Names are 1 to 64 characters of `A-Z a-z 0-9 _ . -`, a document is at most 64
   KiB and 64 statements. `validateDoc` has the list.
-- A `MemoryStore` is per process. Two servers each hold their own.
+- A `MemoryStore` is per process. Two servers each hold their own unless you
+  hand both one with `StoreOptions(policyStore = ...)`, which is what a test of
+  two servers does.
 
 ## Next
 

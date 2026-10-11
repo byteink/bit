@@ -12,8 +12,11 @@
 // different key and the rules can hold nothing the caller can still mutate.
 //
 // WHEN IT IS DROPPED. Every `role` and `resource` registration, every
-// `logTo` and every write of a stored policy or attachment (stored.bit) bumps
-// `version` (a relation declaration does not: no rule reads it); an entry built under an older one is a miss. The table is
+// `logTo` and every change of a stored policy or a global attachment
+// (stored.bit, cache.bit) bumps `version` (a relation declaration does not: no
+// rule reads it); an entry built under an older one is a miss. A change of one
+// tenant's attachments bumps only that tenant's cell of `epochs` and the
+// entries stamped with the old value are misses: another tenant's stay warm. The table is
 // direct-mapped: `cacheSlots` entries, the slot is the hash modulo that, and a
 // miss overwrites whatever held its slot. At most `cacheSlots` subjects' rules
 // are kept, and a lookup is one slot, never a scan.
@@ -56,6 +59,7 @@
 import { Mutex } from "std/sync"
 import { Json } from "std/json"
 import { Logger, getDefault } from "std/log"
+import { xxhash64 } from "std/hash"
 
 // How many subjects' rules are kept at once.
 const cacheSlots: int = 512
@@ -144,6 +148,8 @@ class RuleSlot<A: ActionEnum> {
 // stored, and only under the cache's lock.
 class RuleSet<A: ActionEnum> {
   version: int,
+  epoch: int,
+  slot: int,
   hash: u64,
   kind: SubjectKind,
   held: Subject,
@@ -278,7 +284,10 @@ fn fillSlot<A: ActionEnum>(sl: RuleSlot<A>, wildcard: bool) {
 
 fn emptySet<A: ActionEnum>(): RuleSet<A> {
   return RuleSet<A>{
-    version = -1, hash = 0, kind = noKind(), held = Unheld{ id = "", roles = []string(0) }, reg = emptyRegistry<A>(),
+    version = -1, epoch = 0, slot = tenantSlots, hash = 0, kind = noKind(), held = Unheld{
+      id = "",
+      roles = []string(0),
+    }, reg = emptyRegistry<A>(),
     tenant = "", guest = false, built = false, rules = []Rule<A>(0), skipped = []string(0), clean = true,
     slots = []RuleSlot<A>(0),
   }
@@ -299,6 +308,7 @@ class RuleCache<A: ActionEnum> {
   miss: RuleSlot<A>
   noAllow: Decision
   kinds: []SubjectKind
+  epochs: []int
 
   init() {
     this.mu = Mutex()
@@ -325,6 +335,7 @@ class RuleCache<A: ActionEnum> {
     }
     this.guest = this.none
     this.kinds = []SubjectKind(0)
+    this.epochs = []int(tenantSlots + 1)
   }
 
   // What registration has published so far.
@@ -420,16 +431,25 @@ class RuleCache<A: ActionEnum> {
     this.mu.unlock()
   }
 
-  // Publishes the stored-policy index `ix` with a new version, in one
-  // section: every set built before it is a miss on its next check.
-  publishStored(ix: StoredIndex<A>) {
+  // Publishes the stored-policy index `ix` in one section. `global` (a
+  // policy or a global attachment changed) bumps the version, so every set
+  // built before is a miss on its next check; otherwise only the sets of the
+  // tenants in `changed` are (their epoch cell moves) and every other
+  // tenant's stay warm. Neither: the index is swapped and nothing goes stale.
+  publishStored(ix: StoredIndex<A>, global: bool, changed: []string) {
     this.mu.lock()
     let r = this.reg
     this.reg = Registry<A>{
       roles = r.roles, resources = r.resources, cols = r.cols, guest = r.guest,
       decls = r.decls, logger = r.logger, stored = ix,
     }
-    this.version = this.version + 1
+    if (global) {
+      this.version = this.version + 1
+    }
+    for t of changed {
+      let i = tenantSlotOf(xxhash64([]byte(t)))
+      this.epochs[i] = this.epochs[i] + 1
+    }
     this.mu.unlock()
   }
 
@@ -472,12 +492,16 @@ class RuleCache<A: ActionEnum> {
   // `tenant` comparison keeps one tenant's rules from answering another's.
   // Whether it holds the subject's value is the caller's `same`, outside the
   // lock.
-  entryAt(i: int, h: u64, tenant: string): RuleSet<A> {
+  entryAt(i: int, h: u64, tk: TenantKey): RuleSet<A> {
     if (i < 0) {
       return this.none
     }
     let e = this.table[int(h % u64(cacheSlots))]
-    if (e.version != this.version || e.hash != h || e.tenant != tenant || e.guest) {
+    if (e.version != this.version ||
+      e.epoch != this.epochs[tk.slot] ||
+      e.hash != h ||
+      e.tenant != tk.name ||
+      e.guest) {
       return this.none
     }
     return e
@@ -487,7 +511,7 @@ class RuleCache<A: ActionEnum> {
   find(s: Subject, tk: TenantKey): RuleSet<A> {
     this.mu.lock()
     let i = this.kindAt(s)
-    let e = this.entryAt(i, this.hashAt(i, s) ^ tk.hash, tk.name)
+    let e = this.entryAt(i, this.hashAt(i, s) ^ tk.hash, tk)
     this.mu.unlock()
     if (e.built && e.kind.same(e.held, s)) {
       return e
@@ -508,14 +532,15 @@ class RuleCache<A: ActionEnum> {
   // Under `mu`: an empty slot of a new, unbuilt set for a subject of kind
   // `i` with hash `h` in `tenant`, made under the current version and
   // registry.
-  fresh(i: int, h: u64, cls: string, action: A, tenant: string): RuleSlot<A> {
+  fresh(i: int, h: u64, cls: string, action: A, tk: TenantKey): RuleSlot<A> {
     let n = this.none
     let k = n.kind
     if (i >= 0) {
       k = this.kinds[i]
     }
     let set = RuleSet<A>{
-      version = this.version, hash = h, kind = k, held = n.held, reg = this.reg, tenant = tenant, guest = false, built = false,
+      version = this.version, epoch = this.epochs[tk.slot], slot = tk.slot, hash = h, kind = k, held = n.held,
+      reg = this.reg, tenant = tk.name, guest = false, built = false,
       rules = n.rules, skipped = n.skipped, clean = true, slots = []RuleSlot<A>(0, 1),
     }
     return this.emptySlot(set, cls, action)
@@ -529,12 +554,12 @@ class RuleCache<A: ActionEnum> {
     this.mu.lock()
     let i = this.kindAt(s)
     let h = this.hashAt(i, s) ^ tk.hash
-    let e = this.entryAt(i, h, tk.name)
+    let e = this.entryAt(i, h, tk)
     let sl = this.miss
     if (e.version >= 0) {
       sl = this.slotAt(e, cls, action, wildcard)
     } else {
-      sl = this.fresh(i, h, cls, action, tk.name)
+      sl = this.fresh(i, h, cls, action, tk)
     }
     this.mu.unlock()
     return sl
@@ -545,7 +570,7 @@ class RuleCache<A: ActionEnum> {
   missFor(s: Subject, cls: string, action: A, tk: TenantKey): RuleSlot<A> {
     this.mu.lock()
     let i = this.kindAt(s)
-    let sl = this.fresh(i, this.hashAt(i, s) ^ tk.hash, cls, action, tk.name)
+    let sl = this.fresh(i, this.hashAt(i, s) ^ tk.hash, cls, action, tk)
     this.mu.unlock()
     return sl
   }
@@ -570,10 +595,10 @@ class RuleCache<A: ActionEnum> {
     this.mu.lock()
     let sl = this.miss
     let e = this.guestEntry(tk)
-    if (e.version == this.version) {
+    if (e.version == this.version && e.epoch == this.epochs[tk.slot]) {
       sl = this.slotAt(e, cls, action, wildcard)
     } else {
-      sl = this.fresh(-1, tk.hash, cls, action, tk.name)
+      sl = this.fresh(-1, tk.hash, cls, action, tk)
       sl.set.guest = true
       sl.set.rules = guestWithStored<A>(this.reg, tk.name)
     }
@@ -594,10 +619,15 @@ class RuleCache<A: ActionEnum> {
     let set = sl.set
     this.mu.lock()
     this.addLocked(sl, st)
-    if (keep && set.version == this.version) {
+    if (keep && this.current(set)) {
       this.table[int(set.hash % u64(cacheSlots))] = set
     }
     this.mu.unlock()
+  }
+
+  // Under `mu`: whether no write has made `set` stale since it was made.
+  current(set: RuleSet<A>): bool {
+    return set.version == this.version && set.epoch == this.epochs[set.slot]
   }
 
   // `commit` for the guest's set.
@@ -605,9 +635,9 @@ class RuleCache<A: ActionEnum> {
     this.mu.lock()
     this.addLocked(sl, st)
     let set = sl.set
-    if (set.version == this.version && set.tenant == "") {
+    if (this.current(set) && set.tenant == "") {
       this.guest = set
-    } else if (set.version == this.version) {
+    } else if (this.current(set)) {
       this.table[int(set.hash % u64(cacheSlots))] = set
     }
     this.mu.unlock()

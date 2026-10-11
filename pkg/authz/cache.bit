@@ -1,0 +1,355 @@
+// pkg/authz/cache.bit — keeping the compiled stored policies true to the
+// store, across processes, without a check ever waiting on it.
+//
+// THE PICTURE. A process compiles the stored policies and attachments once
+// (stored.bit's `StoredIndex`) and every check reads that, never the store.
+// What keeps it true is the store's VERSIONS (store.bit): one global number
+// for what every tenant sees (a policy, a global attachment) and one per
+// tenant for that tenant's attachments, plus a total. A poll reads the total;
+// if it moved it reads the others and reloads only what changed:
+//
+//   global moved   -> recompile every policy, reload the global attachments;
+//                     every cached rule set is a miss (rulecache.bit `version`)
+//   tenant t moved -> reload t's attachments; only the rule sets of t are a
+//                     miss (rulecache.bit `epochs`); tenant u stays warm
+//
+// A write through this handle runs the same sync at once (under `admin`), so
+// the writing process is consistent before `savePolicy` returns, and there is
+// one way an index is built, not one for writes and one for polls.
+//
+// WHEN OTHER PROCESSES WRITE. `Authz(store = url)` (or `options =
+// StoreOptions(policyStore = Option<PolicyStore>.Some(s))`) starts a poller
+// that calls `refresh()` every `refreshEveryMs`, so another process's write is
+// seen within one interval (plus the reload). That interval is the only staleness window: a write made
+// elsewhere can be missed by this process for at most that long. A private
+// in-memory store (the default `Authz()`) has no other writer and no poller.
+// `refreshEveryMs = 0` turns the poller off; `refresh()` then still works and
+// is yours to call.
+//
+// NO I/O ON THE CHECK PATH. `can`, `check` and `filterFor` read the index and
+// one atomic flag; the poll, the reload and every store call run on the
+// poller's thread or in a write. The one exception is the FIRST view of a
+// tenant (`forTenant`): it reads that tenant's attachments, once, so it can be
+// polled from then on (a store has no list of tenants to poll). At most
+// `maxTenants` tenants are followed; the next is an InvalidPolicy naming the
+// option, so a client cannot grow the set by inventing tenant names.
+//
+// FAIL CLOSED. If the store cannot answer a poll, a reload or a version read,
+// or a stored policy does not compile against what is registered, the handle
+// goes DOWN: `can` is false, `check` and `filterFor` fail with
+// `StoreUnavailable` (503), for every subject and tenant, until a later
+// refresh succeeds. Nothing is allowed on the strength of a cache whose
+// freshness is unknown. The cause is logged once at ERROR when the handle goes
+// down and once at INFO when it comes back, not per request. A second thread
+// watches the clock: no successful refresh for two intervals (a store call
+// that hangs) takes the handle down the same way. This is OWASP's "fail
+// securely": "design systems to fail in a secure state, rather than exposing
+// vulnerabilities when they malfunction"
+// (https://cheatsheetseries.owasp.org/cheatsheets/Secure_Product_Design_Cheat_Sheet.html).
+//
+// STARTUP. A store that cannot be read is an error from `Authz(...)`. A store
+// that already holds policies cannot be compiled before the app has registered
+// its resources, so the handle starts DOWN and `refresh()`, called once after
+// the registrations, brings it up; the poller does it at the latest one
+// interval later.
+
+import { Mutex, WaitGroup, AtomicI64 } from "std/sync"
+import { after, monotonic } from "std/time"
+
+// The default poll interval and number of followed tenants.
+const defaultRefreshMs: int = 5000
+const defaultMaxTenants: int = 10_000
+
+const msNs: int = 1_000_000
+
+// How a handle follows its store (`Authz`'s `options`). `policyStore` is the
+// store to use in place of the `store` URL; `refreshEveryMs` and `maxTenants`
+// are in the file header.
+export class StoreOptions {
+  export policyStore: Option<PolicyStore>
+  export refreshEveryMs: int
+  export maxTenants: int
+
+  init(
+    policyStore: Option<PolicyStore> = Option<PolicyStore>.None,
+    refreshEveryMs: int = defaultRefreshMs,
+    maxTenants: int = defaultMaxTenants,
+  ) {
+    this.policyStore = policyStore
+    this.refreshEveryMs = refreshEveryMs
+    this.maxTenants = maxTenants
+  }
+
+  // An InvalidPolicy when a value is out of range.
+  check(): ()! {
+    if (this.refreshEveryMs < 0 || this.maxTenants < 1) {
+      fail InvalidPolicy{
+        detail = "refreshEveryMs is ${this.refreshEveryMs} and maxTenants is ${this.maxTenants}: refreshEveryMs must be at least 0 and maxTenants at least 1",
+      }
+    }
+  }
+}
+
+// What a handle (and every tenant view of it) shares about its store. The
+// versions are read and written under the handle's `admin` lock, except
+// `tenants`, which `forTenant` reads and so has its own short lock, never held
+// across a store call.
+class StoreSync {
+  interval: int
+  maxTenants: int
+  tmu: Mutex
+  tenants: map<string, i64>
+  total: i64
+  global: i64
+  down: AtomicI64
+  lastOk: AtomicI64
+  stopping: AtomicI64
+  stop: chan<bool>
+  wg: WaitGroup
+  polling: bool
+
+  init(refreshEveryMs: int, maxTenants: int) {
+    this.interval = refreshEveryMs * msNs
+    this.maxTenants = maxTenants
+    this.tmu = Mutex()
+    this.tenants = map<string, i64>()
+    this.total = -1
+    this.global = -1
+    this.down = AtomicI64(0)
+    this.lastOk = AtomicI64(i64(monotonic().ns))
+    this.stopping = AtomicI64(0)
+    this.stop = chan<bool>()
+    this.wg = WaitGroup()
+    this.polling = false
+  }
+
+  // The followed tenants, in no order.
+  followed(): []string {
+    this.tmu.lock()
+    defer this.tmu.unlock()
+    let out = []string(0, len(this.tenants))
+    for (t, _) of this.tenants {
+      out = append(out, t)
+    }
+    return out
+  }
+
+  // The version of `t`'s attachments last loaded, -1 when `t` is not followed.
+  versionOf(t: string): i64 {
+    this.tmu.lock()
+    defer this.tmu.unlock()
+    let (v, ok) = this.tenants[t]
+    if (!ok) {
+      return -1
+    }
+    return v
+  }
+
+  count(): int {
+    this.tmu.lock()
+    defer this.tmu.unlock()
+    return len(this.tenants)
+  }
+
+  // Records what a sync loaded: the total and global versions and the new
+  // version of each tenant it reloaded.
+  loaded(total: i64, global: i64, moved: map<string, i64>) {
+    this.tmu.lock()
+    defer this.tmu.unlock()
+    this.total = total
+    this.global = global
+    for (t, v) of moved {
+      this.tenants[t] = v
+    }
+  }
+
+  follow(t: string, v: i64) {
+    this.tmu.lock()
+    defer this.tmu.unlock()
+    this.tenants[t] = v
+  }
+
+  isDown(): bool {
+    return this.down.load() != 0
+  }
+}
+
+// A store failure as a client may see it: an InvalidPolicy (a stored policy
+// that does not compile) keeps its detail for the operator, anything else is
+// the same StoreUnavailable, the store's own words being the log's.
+fn typedFailure(e: error): error {
+  let (_, bad) = e.(InvalidPolicy)
+  if (bad) {
+    return e
+  }
+  return StoreUnavailable{}
+}
+
+// Every stored policy compiled against what is registered now.
+fn compiledPolicies<A: ActionEnum>(a: Authz<A>): map<string, CompiledPolicy<A>>! {
+  let reg = a.registered()
+  let out = map<string, CompiledPolicy<A>>()
+  for doc of a.store.policies()? {
+    let cp = compileDocIn<A>(reg.resources, reg.decls, doc)?
+    out[cp.name] = cp
+  }
+  return out
+}
+
+// Under `admin`: brings the index up to what the store holds, reading as
+// little as the versions allow, and publishes it in one step. Nothing is
+// published, and nothing recorded, when any read fails.
+fn syncLocked<A: ActionEnum>(a: Authz<A>): ()! {
+  let s = a.storeSync
+  let total = a.store.version()?
+  if (total == s.total) {
+    return
+  }
+  let g = a.store.scopeVersion("")?
+  let global = g != s.global
+  let ix = a.registered().stored
+  if (global) {
+    ix = storedWithPolicies<A>(ix, compiledPolicies<A>(a)?)
+    ix = storedWithTenant<A>(ix, "", a.store.attachments("")?)
+  }
+  let moved = map<string, i64>()
+  let changed = []string(0)
+  for t of s.followed() {
+    let v = a.store.scopeVersion(t)?
+    if (v != s.versionOf(t)) {
+      ix = storedWithTenant<A>(ix, t, a.store.attachments(t)?)
+      moved[t] = v
+      changed = append(changed, t)
+    }
+  }
+  a.state.cache.publishStored(ix, global, changed)
+  s.loaded(total, g, moved)
+}
+
+// The handle goes down because of `e`; the first time, that is one ERROR.
+fn goDown<A: ActionEnum>(a: Authz<A>, e: error) {
+  if (a.storeSync.down.swap(1) == 0) {
+    loggerOf<A>(a.registered()).error().err(e).log("policy store unavailable: authorization fails closed")
+  }
+}
+
+// A sync succeeded: the handle is up, and says so once if it was down.
+fn comeUp<A: ActionEnum>(a: Authz<A>) {
+  a.storeSync.lastOk.store(i64(monotonic().ns))
+  if (a.storeSync.down.swap(0) == 1) {
+    loggerOf<A>(a.registered()).info().log("policy store reachable again")
+  }
+}
+
+// Under `admin`: `syncLocked`, taking the handle down on a failure and up on
+// a success.
+fn syncMarked<A: ActionEnum>(a: Authz<A>): ()! {
+  syncLocked<A>(a) catch e {
+    goDown<A>(a, e)
+    fail typedFailure(e)
+  }
+  comeUp<A>(a)
+}
+
+// Starts following tenant `t`, reading its attachments, unless it is followed.
+fn followTenant<A: ActionEnum>(a: Authz<A>, t: string): ()! {
+  let s = a.storeSync
+  if (s.versionOf(t) >= 0) {
+    return
+  }
+  a.admin.lock()
+  defer a.admin.unlock()
+  if (s.versionOf(t) >= 0) {
+    return
+  }
+  if (s.count() >= s.maxTenants) {
+    fail InvalidPolicy{ detail = "tenant: more than ${s.maxTenants} tenants are followed; raise maxTenants" }
+  }
+  let v = a.store.scopeVersion(t) catch e {
+    fail typedFailure(e)
+  }
+  let atts = a.store.attachments(t) catch e {
+    fail typedFailure(e)
+  }
+  a.state.cache.publishStored(
+    storedWithTenant<A>(a.registered().stored, t, atts),
+    false,
+    []string(0),
+  )
+  s.follow(t, v)
+}
+
+// Takes the handle down when no sync has succeeded for two intervals as of
+// `nowNs` (monotonic): a store call that never returns cannot report itself.
+fn checkStale<A: ActionEnum>(a: Authz<A>, nowNs: int) {
+  let s = a.storeSync
+  if (nowNs - int(s.lastOk.load()) > 2 * s.interval) {
+    goDown<A>(
+      a,
+      newError("authz: no successful policy store refresh for ${2 * s.interval / msNs} ms"),
+    )
+  }
+}
+
+// Whether `s` was told to stop; waits `s.interval` for it.
+fn stoppedWithin(s: StoreSync): bool {
+  select {
+    case <- s.stop:
+      return true
+    case <- after(s.interval):
+      return false
+  }
+}
+
+fn pollLoop<A: ActionEnum>(a: Authz<A>) {
+  while (!stoppedWithin(a.storeSync)) {
+    a.refresh() catch _ {
+      // goDown logged it.
+      continue
+    }
+  }
+  a.storeSync.wg.done()
+}
+
+fn watchLoop<A: ActionEnum>(a: Authz<A>) {
+  while (!stoppedWithin(a.storeSync)) {
+    checkStale<A>(a, monotonic().ns)
+  }
+  a.storeSync.wg.done()
+}
+
+// Startup: reads the store's version (a store that cannot be read is a
+// StoreUnavailable). An empty store has nothing to compile; one with data
+// starts down until the first refresh (file header). `shared` is whether
+// another writer can exist, which is what the poller is for.
+fn startSync<A: ActionEnum>(a: Authz<A>, shared: bool): ()! {
+  let s = a.storeSync
+  let v = a.store.version() catch _ {
+    fail StoreUnavailable{}
+  }
+  if (v == 0) {
+    let g = a.store.scopeVersion("") catch _ {
+      fail StoreUnavailable{}
+    }
+    s.loaded(0, g, map<string, i64>())
+  } else {
+    s.down.store(1)
+  }
+  if (shared && s.interval > 0) {
+    s.polling = true
+    s.wg.add(2)
+    spawn pollLoop<A>(a)
+    spawn watchLoop<A>(a)
+  }
+}
+
+// Stops the poller and the watcher and waits for them. Safe to call twice.
+fn stopSync(s: StoreSync) {
+  if (!s.polling) {
+    return
+  }
+  if (s.stopping.compareAndSwap(0, 1)) {
+    close(s.stop)
+  }
+  s.wg.wait()
+}
