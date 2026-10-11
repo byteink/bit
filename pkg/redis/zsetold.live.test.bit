@@ -4,7 +4,10 @@
 // ZRANGE and ZRANGEBYSCORE before it. One checker runs against Redis 8.10.2
 // (RESP3, `REDIS_TEST_URL`) and Redis 5.0.14 (the RESP2 fallback,
 // `REDIS_TEST_V5_URL`) and compares both to the same literal answers, so the
-// two servers give identical results. Same module as `zset.live.test.bit`:
+// two servers give identical results. The second half (#7844) runs `rank`,
+// `union`, `inter` and `interCard` the same way (an EVAL on a server older than
+// 7.2/6.2/7.0) and asserts the commands with no older form fail naming 6.2 on
+// Redis 5 while they work on Redis 8. Same module as `zset.live.test.bit`:
 // `liveUrl`, `liveClient`, `legacyClient` and `delKey` are in scope.
 
 fn inc(v: f64): Bound<f64> { return Bound<f64>.Inclusive(v) }
@@ -178,6 +181,188 @@ fn checkVersionGatedReads(c: Client, key: string, modern: bool) {
   delKey(c, key)
 }
 
+fn seedPair(c: Client, a: string, b: string): Zset {
+  delKey(c, a)
+  delKey(c, b)
+  let za = c.zset(a)
+  za.addMany(
+    Scored{ member = "x", score = 1.0 },
+    Scored{ member = "y", score = 2.0 },
+    Scored{ member = "z", score = 3.0 },
+  ) catch e {
+    panic("seed a: ${e.message()}")
+  }
+  c.zset(b).addMany(
+    Scored{ member = "y", score = 10.0 },
+    Scored{ member = "z", score = 20.0 },
+    Scored{ member = "q", score = 5.0 },
+  ) catch e {
+    panic("seed b: ${e.message()}")
+  }
+  return za
+}
+
+fn showRank(r: Option<(i64, f64)>): string {
+  match (r) {
+    Some(t) => return "${t.0}:${t.1}"
+    None => return "-"
+  }
+}
+
+fn checkRank(z: Zset) {
+  let top = z.rank("z", true) catch e {
+    panic("rank top: ${e.message()}")
+  }
+  let bottom = z.rank("x", false) catch e {
+    panic("rank bottom: ${e.message()}")
+  }
+  let mid = z.rank("y", true) catch e {
+    panic("rank mid: ${e.message()}")
+  }
+  let none = z.rank("nobody", true) catch e {
+    panic("rank missing: ${e.message()}")
+  }
+  assert(showRank(top) == "0:3", "rank z top: ${showRank(top)}")
+  assert(showRank(bottom) == "0:1", "rank x bottom: ${showRank(bottom)}")
+  assert(showRank(mid) == "1:2", "rank y top: ${showRank(mid)}")
+  assert(showRank(none) == "-", "rank missing: ${showRank(none)}")
+}
+
+fn checkSetOps(c: Client, z: Zset, b: string, scratch: string) {
+  let other = [b]
+  expectRange("union sum", () => z.union(other, []f64(0), Aggregate.Sum), "x:1 q:5 y:12 z:23 ")
+  expectRange(
+    "union weights max",
+    () => z.union(other, [2.0, 1.0], Aggregate.Max),
+    "x:2 q:5 y:10 z:20 ",
+  )
+  expectRange(
+    "union missing key",
+    () => z.union(["bit:live:zset:nokey"], []f64(0), Aggregate.Sum),
+    "x:1 y:2 z:3 ",
+  )
+  expectRange("inter sum", () => z.inter(other, []f64(0), Aggregate.Sum), "y:12 z:23 ")
+  expectRange("inter min", () => z.inter(other, []f64(0), Aggregate.Min), "y:2 z:3 ")
+  expectRange(
+    "inter missing key",
+    () => z.inter(["bit:live:zset:nokey"], []f64(0), Aggregate.Sum),
+    "",
+  )
+  let all = z.interCard(other, 0) catch e {
+    panic("interCard: ${e.message()}")
+  }
+  let capped = z.interCard(other, 1) catch e {
+    panic("interCard limit: ${e.message()}")
+  }
+  let roomy = z.interCard(other, 9) catch e {
+    panic("interCard roomy: ${e.message()}")
+  }
+  assert(all == 2 && capped == 1 && roomy == 2, "interCard ${all} ${capped} ${roomy}")
+  let left = c.exists([scratch]) catch e {
+    panic("exists: ${e.message()}")
+  }
+  assert(left == 0, "the scratch key must not outlive the call")
+}
+
+fn expectTooOld<T>(label: string, run: () => T!RedisError) {
+  run() catch e {
+    assert(
+      contains(e.message(), "6.2") && contains(e.message(), "5.0"),
+      "${label}: ${e.message()}",
+    )
+    return
+  }
+  panic("${label} should fail on Redis 5")
+}
+
+fn checkNoOlderForm(c: Client, z: Zset, b: string) {
+  expectTooOld("diff", () => z.diff([b]))
+  expectTooOld("diffStore", () => z.diffStore("bit:live:zset:dst", [b]))
+  expectTooOld("randMember", () => z.randMember())
+  expectTooOld("randMembers", () => z.randMembers(2))
+  expectTooOld("storeTop", () => z.storeTop("bit:live:zset:dst", 2))
+  expectTooOld("storeBottom", () => z.storeBottom("bit:live:zset:dst", 2))
+  let n = c.exists(["bit:live:zset:dst"]) catch e {
+    panic("exists: ${e.message()}")
+  }
+  assert(n == 0, "a refused command must not have written")
+}
+
+fn checkNewForms(z: Zset, b: string) {
+  expectRange("diff", () => z.diff([b]), "x:1 ")
+  let stored = z.storeTop("bit:live:zset:dst", 2) catch e {
+    panic("storeTop: ${e.message()}")
+  }
+  assert(stored == 2, "storeTop stored ${stored}")
+  let one = z.randMember() catch e {
+    panic("randMember: ${e.message()}")
+  }
+  assert(isSome(one), "randMember of a non-empty set")
+}
+
+// The same four on a pipeline and on `tx.read`: each is one command.
+fn checkSetOpsQueued(c: Client, key: string, b: string) {
+  let p = c.pipeline()
+  let v = p.zset(key)
+  let rank = v.rank("z", true)
+  let union = v.union([b], []f64(0), Aggregate.Sum)
+  let card = v.interCard([b], 0)
+  p.exec() catch e {
+    panic("exec: ${e.message()}")
+  }
+  let r = rank.get() catch e {
+    panic("queued rank: ${e.message()}")
+  }
+  assert(showRank(r) == "0:3", "queued rank: ${showRank(r)}")
+  expectRange("queued union", () => union.get(), "x:1 q:5 y:12 z:23 ")
+  let n = card.get() catch e {
+    panic("queued interCard: ${e.message()}")
+  }
+  assert(n == 2, "queued interCard ${n}")
+  let out = c.transaction<string>([key], (tx) => {
+    let z = tx.read.zset(key)
+    let ranked = z.rank("y", false)?
+    let u = z.inter([b], []f64(0), Aggregate.Max)?
+    return showRank(ranked) + "| " + show(u)
+  }) catch e {
+    panic("transaction: ${e.message()}")
+  }
+  assert(out == "1:2| y:10 z:20 ", "tx.read: '${out}'")
+}
+
+fn checkScratchCollision(c: Client, z: Zset, b: string, scratch: string) {
+  c.zset(scratch).add("keep", 1.0) catch e {
+    panic("seed scratch: ${e.message()}")
+  }
+  z.union([b], []f64(0), Aggregate.Sum) catch e {
+    assert(contains(e.message(), "scratch key exists"), "collision: ${e.message()}")
+    let kept = c.zset(scratch).card() catch e2 {
+      panic("card: ${e2.message()}")
+    }
+    assert(kept == 1, "a user key that looks like the scratch key must survive")
+    delKey(c, scratch)
+    return
+  }
+  panic("union over an existing scratch key should fail")
+}
+
+fn checkSetOpsAndRank(c: Client, a: string, b: string, modern: bool) {
+  let z = seedPair(c, a, b)
+  let scratch = "bit:zsetop:" + a
+  checkRank(z)
+  checkSetOps(c, z, b, scratch)
+  checkSetOpsQueued(c, a, b)
+  if (modern) {
+    checkNewForms(z, b)
+  } else {
+    checkNoOlderForm(c, z, b)
+    checkScratchCollision(c, z, b, scratch)
+  }
+  delKey(c, a)
+  delKey(c, b)
+  delKey(c, "bit:live:zset:dst")
+}
+
 test "live: scores, top, bottom and byScore on RESP3 (Redis 8)" {
   let u = liveUrl("REDIS_TEST_URL")
   if (u == "") {
@@ -185,6 +370,7 @@ test "live: scores, top, bottom and byScore on RESP3 (Redis 8)" {
   }
   let c = liveClient(u)
   checkVersionGatedReads(c, "bit:live:zset:gated3", true)
+  checkSetOpsAndRank(c, "bit:live:zset:ops3a", "bit:live:zset:ops3b", true)
   c.close()
 }
 
@@ -195,5 +381,6 @@ test "live: scores, top, bottom and byScore give the same answers over the RESP2
   }
   let c = legacyClient(u)
   checkVersionGatedReads(c, "bit:live:zset:gated2", false)
+  checkSetOpsAndRank(c, "bit:live:zset:ops2a", "bit:live:zset:ops2b", false)
   c.close()
 }

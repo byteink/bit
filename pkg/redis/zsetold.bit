@@ -1,0 +1,135 @@
+// pkg/redis/zsetold.bit — what the sorted-set commands newer than Redis 5 do on
+// an older server (#7844). Same module as `zset.bit` and `zsetcmd.bit`.
+// `version.bit` (#7840) reads the server version at the handshake; a version
+// of 0 is "unknown" and gets the modern command, as everywhere else.
+//
+// Every command in the table below is decided once, here:
+//
+//   rank (ZRANK|ZREVRANK ... WITHSCORE, 7.2)  < 7.2: one EVAL, ZREVRANK/ZRANK
+//                                              then ZSCORE, atomic, same reply
+//   union, inter (ZUNION, ZINTER, 6.2)        < 6.2: one EVAL, ZUNIONSTORE or
+//                                              ZINTERSTORE into a scratch key,
+//                                              ZRANGE WITHSCORES, DEL
+//   interCard (ZINTERCARD, 7.0)               < 7.0: one EVAL, ZINTERSTORE into
+//                                              a scratch key, capped at LIMIT
+//   diff, diffStore (ZDIFF, ZDIFFSTORE, 6.2)  refused: no store form to borrow
+//   storeTop/Bottom/ByScore/ByLex (ZRANGESTORE, 6.2)   refused
+//   randMember, randMembers (ZRANDMEMBER, 6.2)         refused: no equivalent
+//
+// WHY EVAL. A `Batch` holds one command per reply (`cmd.bit`), and a
+// `WATCH`ed transaction attempt must not see an `EXEC` of our own, so a
+// MULTI/EXEC wrapper fits neither the queued forms nor `tx.read`. One EVAL is
+// one command, atomic on the server, and queues and pipelines like any other.
+// The scratch key is passed in `KEYS`, not invented inside the script, and
+// the script refuses to run when that key already exists, so it can never
+// delete data it did not create. The script writes, so it needs a master and
+// bumps keyspace events for the scratch key; both are the price of the
+// fallback and are in `docs/sorted-sets.md`.
+//
+// A REFUSAL NAMES THE MINIMUM VERSION: `oldServerError` in place of the
+// server's own "unknown command".
+
+// A `RedisError.Invalid` naming `minimum` when the server is known to be older
+// than it; none otherwise.
+fn oldServerError(version: int, minimum: int, what: string): Option<RedisError> {
+  if (!tooOld(version, minimum)) {
+    return Option.None
+  }
+  return Option.Some(
+    RedisError.Invalid("redis: ${what} needs Redis ${versionText(minimum)} or newer; the server is ${versionText(version)}"),
+  )
+}
+
+// `runner.runCmd(cmd)`, refused first on a server older than `minimum`.
+fn runSince<T>(runner: Runner, minimum: int, what: string, cmd: Cmd<T>): T!RedisError {
+  match (oldServerError(runner.version(), minimum, what)) {
+    Some(e) => fail e
+    None => return runner.runCmd(cmd)?
+  }
+}
+
+// `batch.queue(cmd)`, or a failed `Future` on a server older than `minimum`.
+fn queueSince<T>(batch: Batch, minimum: int, what: string, cmd: Cmd<T>): Future<T> {
+  match (oldServerError(batch.version, minimum, what)) {
+    Some(e) => return failedFuture<T>(e)
+    None => return batch.queue(cmd)
+  }
+}
+
+// Replies `[rank, score]`, or an empty array for a missing member: the shapes
+// `asRankScore` (`zsetcmd.bit`) reads from `WITHSCORE`. (A Lua `false` would
+// reach a RESP2 client as a nil bulk string, which `asRankScore` rejects.)
+fn rankOldScript(verb: string): string {
+  return "local r = redis.call('" +
+    verb +
+    "', KEYS[1], ARGV[1]) if not r then return {} end return {r, redis.call('ZSCORE', KEYS[1], ARGV[1])}"
+}
+
+fn rankOldCmd(name: string, key: string, member: string): Cmd<Option<(i64, f64)>> {
+  return Cmd<Option<(i64, f64)>>{
+    args = ["EVAL", rankOldScript(name), "1", key, member],
+    decode = (r) => asRankScore(r, name),
+    readOnly = true,
+  }
+}
+
+// The scratch key a set operation writes its result to: never an existing
+// key (the script checks), and named for the first source so it is easy to
+// recognise in MONITOR.
+fn scratchKey(key: string): string {
+  return "bit:zsetop:" + key
+}
+
+// Lua prologue shared by the set-operation scripts: refuse a scratch key that
+// exists, then `a` = {scratch, numkeys, source keys...}, the front of the
+// ZUNIONSTORE/ZINTERSTORE argument list.
+fn scratchPrologue(): string {
+  return "if redis.call('EXISTS', KEYS[1]) == 1 then return redis.error_reply('redis: scratch key exists') end local a = {KEYS[1], #KEYS - 1} for i = 2, #KEYS do a[#a + 1] = KEYS[i] end "
+}
+
+// `ZUNIONSTORE`/`ZINTERSTORE` with the caller's WEIGHTS/AGGREGATE tail
+// (`ARGV`), the result read with `ZRANGE ... WITHSCORES` (a sorted set's own
+// order, which is the order ZUNION/ZINTER return), the scratch key deleted.
+fn setOpOldScript(store: string): string {
+  return scratchPrologue() +
+    "for i = 1, #ARGV do a[#a + 1] = ARGV[i] end redis.call('" +
+    store +
+    "', unpack(a)) local r = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES') redis.call('DEL', KEYS[1]) return r"
+}
+
+// `ARGV[1]` is the LIMIT, 0 for none: the count ZINTERCARD would stop at.
+fn interCardOldScript(): string {
+  return scratchPrologue() +
+    "local n = redis.call('ZINTERSTORE', unpack(a)) redis.call('DEL', KEYS[1]) local limit = tonumber(ARGV[1]) if limit > 0 and n > limit then return limit end return n"
+}
+
+// `EVAL script numkeys scratch key [key ...] [arg ...]`.
+fn scratchEval(script: string, key: string, otherKeys: []string, tail: []string): []string {
+  let args = ["EVAL", script, "${len(otherKeys) + 2}", scratchKey(key), key]
+  args = appendKeys(args, otherKeys)
+  args = appendKeys(args, tail)
+  return args
+}
+
+fn setOpOldCmd(
+  name: string,
+  key: string,
+  otherKeys: []string,
+  weights: []f64,
+  aggregate: Aggregate,
+): Cmd<[]Scored> {
+  let tail = appendAggregate(appendWeights([]string(0), weights), aggregate)
+  return Cmd<[]Scored>{
+    args = scratchEval(setOpOldScript(name + "STORE"), key, otherKeys, tail),
+    decode = (r) => asScored(r, name),
+    readOnly = true,
+  }
+}
+
+fn interCardOldCmd(key: string, otherKeys: []string, limit: int): Cmd<i64> {
+  return Cmd<i64>{
+    args = scratchEval(interCardOldScript(), key, otherKeys, ["${limit}"]),
+    decode = (r) => asInt(r, "ZINTERCARD"),
+    readOnly = true,
+  }
+}
