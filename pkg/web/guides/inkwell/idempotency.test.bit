@@ -1,0 +1,226 @@
+// pkg/web/guides/inkwell/idempotency.test.bit — course part 40 (#6133): the
+// `Idempotency-Key` guard on `POST /articles` and `POST /articles/:id/comments`,
+// against the same real PostgreSQL as app.test.bit (`SqlIdempotencyStore`,
+// table `bit_idempotency`, created by the migration of the same name).
+//
+// Each route is held to the three answers the middleware gives:
+//   replay    the same key and request again: the first response, handler
+//             unrun, so exactly one row exists afterwards
+//   409       the same key while the first request is still running
+//   422       the same key with a different body: refused, nothing stored
+//
+// This is its own file, not more of app.test.bit, to keep both under the
+// 800-line ceiling. Helpers such as `testApp`, `registerAndLogin` and
+// `uniqueName` are app.test.bit's; the two files are one module.
+import { CachedResponse, IdempotencyClaim } from "web"
+import { sqlReqInt } from "std/sql"
+
+// POST with a JSON body, the caller's session cookie and an `Idempotency-Key`.
+fn keyedPost(path: string, cookie: string, key: string, body: string): Request {
+  let headers = "Content-Type: application/json\r\nCookie: ${cookie}\r\nIdempotency-Key: ${key}"
+  return Request{ method = "POST", path = path, headers = headers, body = body }
+}
+
+// How many rows `countSql` (a `select count(*) as n ... where col = $1`) finds
+// for `arg`: the proof that a replay did not run the handler a second time.
+fn countRows(countSql: string, arg: string): i64 {
+  let p = testPool() catch e {
+    panic("testPool: ${e.message()}")
+  }
+  let rows = p.query(countSql, [Value.Text(arg)]) catch e {
+    panic("count query: ${e.message()}")
+  }
+  defer rows.close()
+  let found = rows.next() catch e {
+    panic("rows.next: ${e.message()}")
+  }
+  assert(found, "count(*) returned no row")
+  return sqlReqInt(rows, rows.columns(), "n") catch e {
+    panic("sqlReqInt: ${e.message()}")
+  }
+}
+
+const articleCount = "select count(*) as n from articles where title = $1"
+const commentCount = "select count(*) as n from comments where body = $1"
+
+fn articleBody(title: string): string {
+  return "{\"title\":\"${title}\",\"body\":\"body text\",\"tags\":[]}"
+}
+
+fn commentBody(text: string): string {
+  return "{\"body\":\"${text}\"}"
+}
+
+// One route under test: the app, a signed-in writer's cookie, the path to
+// POST to, and the `select count(*)` that counts what that route stores.
+class Case {
+  app: App,
+  cookie: string,
+  path: string,
+  countSql: string,
+}
+
+fn articleCase(): Case {
+  let app = testApp()
+  let cookie = registerAndLogin(app, uniqueName("idem"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  return Case{ app = app, cookie = cookie, path = "/articles", countSql = articleCount }
+}
+
+// The same writer also owns the article the comments land on.
+fn commentCase(): Case {
+  let c = articleCase()
+  let articleId = postArticle(c.app, c.cookie, uniqueName("target"), "[]") catch e {
+    panic(e.message())
+  }
+  c.path = "/articles/${articleId}/comments"
+  c.countSql = commentCount
+  return c
+}
+
+// The same key and the same request twice: the second answer is the first,
+// and one row exists.
+fn expectReplay(c: Case, body: string, arg: string) {
+  let key = uniqueName("key")
+  let first = c.app.handle(keyedPost(c.path, c.cookie, key, body))
+  assert(first.status == 201, "want 201 from the first request, got ${first.status}: ${first.body}")
+  let second = c.app.handle(keyedPost(c.path, c.cookie, key, body))
+  assert(second.status == 201, "want the replayed 201, got ${second.status}: ${second.body}")
+  let location = first.getHeader("Location")
+  assert(len(location) > 0, "the first response carried no Location")
+  assert(
+    second.getHeader("Location") == location,
+    "the replay named ${second.getHeader("Location")}, the first response ${location}",
+  )
+  assert(countRows(c.countSql, arg) == 1, "a retried request must store exactly one row")
+}
+
+// The same key with a different body: 422, and the different body is not stored.
+fn expectMismatch(c: Case, body: string, other: string, otherArg: string) {
+  let key = uniqueName("key")
+  let first = c.app.handle(keyedPost(c.path, c.cookie, key, body))
+  assert(first.status == 201, "want 201 from the first request, got ${first.status}: ${first.body}")
+  let second = c.app.handle(keyedPost(c.path, c.cookie, key, other))
+  assert(second.status == 422, "want 422 for a reused key, got ${second.status}: ${second.body}")
+  assert(contains(second.body, "different request"), "unexpected 422 body: ${second.body}")
+  assert(countRows(c.countSql, otherArg) == 0, "a refused request must store nothing")
+}
+
+test "POST /articles: the same Idempotency-Key replays the first response and stores one article" {
+  let title = uniqueName("replay")
+  expectReplay(articleCase(), articleBody(title), title)
+}
+
+test "POST /articles: the same key with a different body is 422 and stores nothing" {
+  let other = uniqueName("other")
+  expectMismatch(articleCase(), articleBody(uniqueName("first")), articleBody(other), other)
+}
+
+test "POST /articles/:id/comments: the same Idempotency-Key replays the first response and stores one comment" {
+  let text = uniqueName("replay")
+  expectReplay(commentCase(), commentBody(text), text)
+}
+
+test "POST /articles/:id/comments: the same key with a different body is 422 and stores nothing" {
+  let other = uniqueName("other")
+  expectMismatch(commentCase(), commentBody(uniqueName("first")), commentBody(other), other)
+}
+
+// An `IdempotencyStore` that lets the handler run, then holds `finish` until
+// the test says go. The request is then still `InFlight` in the table, which
+// is the only state in which a duplicate can be told 409, and a test cannot
+// otherwise stop a handler mid-flight.
+class HeldStore {
+  inner: SqlIdempotencyStore
+  // `finish` sends here once the handler has run and it is about to wait.
+  reached: chan<bool>
+  // The test sends here to let that `finish` through.
+  release: chan<bool>
+
+  export begin(key: string, fingerprint: string, ttl: i64): IdempotencyClaim! {
+    return this.inner.begin(key, fingerprint, ttl)?
+  }
+
+  export finish(key: string, token: string, resp: CachedResponse, ttl: i64): ()! {
+    this.reached <- true
+    <- this.release
+    this.inner.finish(key, token, resp, ttl)?
+  }
+
+  export abandon(key: string, token: string): ()! {
+    this.inner.abandon(key, token)?
+  }
+}
+
+fn heldApp(): (App, HeldStore) {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let p = testPool() catch e {
+    panic(e.message())
+  }
+  let inner = SqlIdempotencyStore(p) catch e {
+    panic(e.message())
+  }
+  let held = HeldStore{ inner = inner, reached = chan<bool>(1), release = chan<bool>(1) }
+  let app = buildAppWith(cfg, held) catch e {
+    panic("buildAppWith: ${e.message()}")
+  }
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return (app, held)
+}
+
+fn sendInto(app: App, req: Request, out: chan<Response>) {
+  out <- app.handle(req)
+}
+
+// Starts `req`, waits until its handler has run and its `finish` is held,
+// sends the same request again (409), lets the first finish (201) and sends it
+// a third time (the replay, 201). One row exists at the end.
+fn expectInFlightConflict(
+  app: App,
+  held: HeldStore,
+  req: Request,
+  countSql: string,
+  arg: string,
+) {
+  let out = chan<Response>(1)
+  spawn sendInto(app, req, out)
+  <- held.reached
+  let duplicate = app.handle(req)
+  assert(duplicate.status == 409, "want 409 while the first is running, got ${duplicate.status}")
+  assert(contains(duplicate.body, "in progress"), "unexpected 409 body: ${duplicate.body}")
+  held.release <- true
+  let first = <- out
+  assert(first.status == 201, "want 201 from the first request, got ${first.status}: ${first.body}")
+  let after = app.handle(req)
+  assert(after.status == 201, "want the replayed 201, got ${after.status}: ${after.body}")
+  assert(countRows(countSql, arg) == 1, "exactly one row must exist")
+}
+
+test "POST /articles: a duplicate sent while the first is still running is 409" {
+  let (app, held) = heldApp()
+  let cookie = registerAndLogin(app, uniqueName("idem"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let title = uniqueName("inflight")
+  let req = keyedPost("/articles", cookie, uniqueName("key"), articleBody(title))
+  expectInFlightConflict(app, held, req, articleCount, title)
+}
+
+test "POST /articles/:id/comments: a duplicate sent while the first is still running is 409" {
+  let (app, held) = heldApp()
+  let cookie = registerAndLogin(app, uniqueName("idem"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let articleId = postArticle(app, cookie, uniqueName("target"), "[]") catch e {
+    panic(e.message())
+  }
+  let text = uniqueName("inflight")
+  let path = "/articles/${articleId}/comments"
+  let req = keyedPost(path, cookie, uniqueName("key"), commentBody(text))
+  expectInFlightConflict(app, held, req, commentCount, text)
+}

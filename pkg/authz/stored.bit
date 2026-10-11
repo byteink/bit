@@ -1,0 +1,253 @@
+// pkg/authz/stored.bit — stored policies as evaluation reads them. A document
+// is compiled to `Rule`s ONCE, when it is saved (`Authz.savePolicy`), and kept
+// here beside the attachments, so a check never parses a document: building a
+// subject's rules (rulecache.bit) looks up names in two maps, and a check on a
+// cached subject touches nothing here at all.
+//
+// WHICH STORED POLICIES A SUBJECT HAS, in the order they are listed:
+//
+//   1. the policies attached to each of its roles, in the order the roles list
+//      them;
+//   2. the policies attached to each group it is in. A group is a role named
+//      "group:<name>" in `Subject.roles` (a convention, so `Subject` gains no
+//      member); `to.group = "<name>"` attaches to it;
+//   3. the policies attached to the subject itself (`to.user == subject.id`).
+//
+// A role needs no definition in code to receive a stored policy. The guest
+// (`None`) has the stored policies attached to the role called "guest".
+//
+// PRECEDENCE. These rules join the ones the roles' code policies make, and
+// the decision is made over all of them as decide.bit says: an explicit deny
+// from ANY source beats any allow, an allow needs a matching rule, and no
+// match is a refusal. That is AWS IAM's evaluation logic (explicit deny, then
+// allow, then implicit deny; https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html),
+// and CASL's. The order above only picks which policy is named as the one
+// that decided. A name is one policy: a stored policy may not take the name
+// of a policy written in code (`savePolicy` refuses it), and one that does
+// after the fact (a role defined later) is left out with a line in `skipped`.
+//
+// TENANTS. An attachment is kept with its tenant ("" is global). A check made
+// through `Authz.forTenant(t)` (tenant.bit) sees the global attachments and
+// those written for `t`, and never another tenant's: both are read here, per
+// target, and a policy attached to the same target both ways counts once. A
+// check on the plain handle is made in the global tenant and sees only the
+// global ones.
+//
+// An index is never changed once published (rulecache.bit's `Registry`): a
+// write builds the next one.
+
+import { hasPrefix } from "std/strings"
+
+const groupPrefix: string = "group:"
+
+// The compiled policies by name and, per target, the names attached to it in
+// the order they were attached. The key of a target is `targetKey`.
+class StoredIndex<A: ActionEnum> {
+  policies: map<string, CompiledPolicy<A>>,
+  byTarget: map<string, []string>,
+}
+
+fn emptyStored<A: ActionEnum>(): StoredIndex<A> {
+  return StoredIndex<A>{
+    policies = map<string, CompiledPolicy<A>>(),
+    byTarget = map<string, []string>(),
+  }
+}
+
+// "tenant|kind|name": '|' occurs in none of tenant and kind and, in a
+// user id, only last (store.bit's `attachmentKey` has the same argument).
+fn targetKey(tenant: string, kind: string, name: string): string {
+  return "${tenant}|${kind}|${name}"
+}
+
+fn attachedKey(a: Attachment): string {
+  let (kind, who) = targetOf(a.to)
+  return targetKey(a.tenant, kind, who)
+}
+
+// The index with `cp` saved, replacing a policy of its name. Policies are
+// shared with the old index; only the map is copied.
+fn storedWithPolicy<A: ActionEnum>(ix: StoredIndex<A>, cp: CompiledPolicy<A>): StoredIndex<A> {
+  let policies = map<string, CompiledPolicy<A>>()
+  for (k, v) of ix.policies {
+    policies[k] = v
+  }
+  policies[cp.name] = cp
+  return StoredIndex<A>{ policies = policies, byTarget = ix.byTarget }
+}
+
+fn copyTargets(m: map<string, []string>): map<string, []string> {
+  let out = map<string, []string>()
+  for (k, v) of m {
+    out[k] = v
+  }
+  return out
+}
+
+// The index with `a` attached; attaching what is attached is no change.
+fn storedWithAttachment<A: ActionEnum>(ix: StoredIndex<A>, a: Attachment): StoredIndex<A> {
+  let key = attachedKey(a)
+  let (have, _) = ix.byTarget[key]
+  if (hasName(have, a.policy)) {
+    return ix
+  }
+  let targets = copyTargets(ix.byTarget)
+  targets[key] = grown<string>(have, a.policy)
+  return StoredIndex<A>{ policies = ix.policies, byTarget = targets }
+}
+
+// The index with `a` detached; detaching what is not attached is no change.
+fn storedWithoutAttachment<A: ActionEnum>(ix: StoredIndex<A>, a: Attachment): StoredIndex<A> {
+  let key = attachedKey(a)
+  let (have, _) = ix.byTarget[key]
+  if (!hasName(have, a.policy)) {
+    return ix
+  }
+  let kept = []string(0, len(have))
+  for n of have {
+    if (n != a.policy) {
+      kept = append(kept, n)
+    }
+  }
+  let targets = copyTargets(ix.byTarget)
+  targets[key] = kept
+  return StoredIndex<A>{ policies = ix.policies, byTarget = targets }
+}
+
+// Whether a policy WRITTEN IN CODE is called `name`.
+fn codePolicyNamed<A: ActionEnum>(roles: []RoleDef<A>, name: string): bool {
+  for r of roles {
+    for p of r.policies {
+      if (p.name == name) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// The kind and name a subject's role entry attaches under: "group:eng" is
+// the group "eng", anything else a role.
+fn roleTarget(entry: string): (string, string) {
+  if (hasPrefix(entry, groupPrefix)) {
+    return ("group", entry[len(groupPrefix):])
+  }
+  return ("role", entry)
+}
+
+// Whether a stored policy is attached to the role `entry` in `tenant` or
+// globally (or, for a group entry, whether it is one, which needs no
+// definition either).
+fn storedKnows<A: ActionEnum>(ix: StoredIndex<A>, entry: string, tenant: string): bool {
+  let (kind, name) = roleTarget(entry)
+  if (kind == "group") {
+    return true
+  }
+  let (global, _) = ix.byTarget[targetKey("", kind, name)]
+  if (len(global) > 0) {
+    return true
+  }
+  let (mine, _) = ix.byTarget[targetKey(tenant, kind, name)]
+  return tenant != "" && len(mine) > 0
+}
+
+// The policy names a resolution has: every one (`all`) and the ones that came
+// from the store (`stored`), so a stored policy met twice is quiet and one that
+// meets a code policy of its name is reported.
+class Seen {
+  all: []string,
+  stored: []string,
+}
+
+fn newSeen(): Seen {
+  return Seen{ all = []string(0), stored = []string(0) }
+}
+
+// Adds the stored policies attached under `key` to `out`, each once.
+fn addAttached<A: ActionEnum>(ix: StoredIndex<A>, key: string, out: Resolved<A>, seen: Seen) {
+  let (names, _) = ix.byTarget[key]
+  for n of names {
+    if (hasName(seen.stored, n)) {
+      continue
+    }
+    if (hasName(seen.all, n)) {
+      out.skipped = append(
+        out.skipped,
+        "stored policy ${n} is left out: a policy in code has its name",
+      )
+      continue
+    }
+    let (cp, found) = ix.policies[n]
+    if (!found) {
+      continue
+    }
+    seen.all = append(seen.all, n)
+    seen.stored = append(seen.stored, n)
+    for r of cp.rules {
+      out.rules = append(out.rules, r)
+    }
+  }
+}
+
+// The policies attached to `who`, a (kind, name) target: the global ones,
+// then those of `tenant` when it names one.
+fn addTarget<A: ActionEnum>(
+  ix: StoredIndex<A>,
+  tenant: string,
+  who: (string, string),
+  out: Resolved<A>,
+  seen: Seen,
+) {
+  let (kind, name) = who
+  addAttached<A>(ix, targetKey("", kind, name), out, seen)
+  if (tenant != "") {
+    addAttached<A>(ix, targetKey(tenant, kind, name), out, seen)
+  }
+}
+
+// `s`'s stored policies in `tenant`, after the code ones in `out`: its roles',
+// its groups', then its own (the file header has the order).
+fn addStored<A: ActionEnum>(
+  ix: StoredIndex<A>,
+  s: Subject,
+  out: Resolved<A>,
+  seen: Seen,
+  tenant: string,
+) {
+  if (len(ix.byTarget) == 0) {
+    return
+  }
+  for entry of s.roles {
+    addTarget<A>(ix, tenant, roleTarget(entry), out, seen)
+  }
+  addTarget<A>(ix, tenant, ("user", s.id), out, seen)
+}
+
+// The guest's rules in `tenant`: the ones its code role published, then the
+// stored policies attached to the role "guest", global and the tenant's. The
+// published slice itself when none is.
+fn guestWithStored<A: ActionEnum>(reg: Registry<A>, tenant: string): []Rule<A> {
+  let (names, _) = reg.stored.byTarget[targetKey("", "role", guestRole)]
+  let (mine, _) = reg.stored.byTarget[targetKey(tenant, "role", guestRole)]
+  if (len(names) == 0 && (tenant == "" || len(mine) == 0)) {
+    return reg.guest
+  }
+  let out = Resolved<A>{ rules = []Rule<A>(0), skipped = []string(0), live = false }
+  let seen = newSeen()
+  for r of reg.guest {
+    seen.all = append(seen.all, r.policy)
+  }
+  addTarget<A>(reg.stored, tenant, ("role", guestRole), out, seen)
+  return concatRules<A>(reg.guest, out.rules)
+}
+
+fn concatRules<A: ActionEnum>(a: []Rule<A>, b: []Rule<A>): []Rule<A> {
+  let out = []Rule<A>(0, len(a) + len(b))
+  for r of a {
+    out = append(out, r)
+  }
+  for r of b {
+    out = append(out, r)
+  }
+  return out
+}

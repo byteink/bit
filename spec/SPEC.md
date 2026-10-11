@@ -818,11 +818,13 @@ image, so it is opaque to every compiler pass and no proof about it is possible.
 counterpart to Linux's raw `syscall`), so requiring a second marker on the
 declaration would gate nothing an author willing to misuse it would not simply
 write. There is therefore **no `@nosplit` attribute on an `extern fn`
-declaration** - the grammar of §11.7 admits none, and the permission attaches to
+declaration** - the grammar of §11.7 admits only `@nonblocking`, and the permission attaches to
 the *call site*, which is the smaller surface.
 
 What the compiler emits for such a call *is* proved, and is what the rule rests
-on: a plain C-ABI call, with no allocation and no safepoint poll. The boundary
+on: a plain C-ABI call, with no allocation and no safepoint poll (a user `extern
+fn` is also wrapped in the syscall bracket of §11.7, two calls into `@nosplit`
+runtime functions that allocate nothing and poll nothing). The boundary
 is narrow by construction - §11.7 admits only scalars and raw pointers across
 it, so no `string`, slice, map, interface or closure can reach the callee, and
 the managed heap is unreachable from the other side except through an address
@@ -2714,7 +2716,7 @@ must reach the kernel through libSystem, because Apple does not guarantee stable
 syscall numbers and reserves the right to renumber them.
 
 ```
-extern_fn_decl = "extern" "fn" IDENT signature .
+extern_fn_decl = [ attr_list ] "extern" "fn" IDENT signature .
 ```
 
 - `extern` is a **contextual** keyword - an ordinary identifier everywhere else.
@@ -2724,6 +2726,8 @@ extern_fn_decl = "extern" "fn" IDENT signature .
   does not implement). **E0077** `extern_fn_invalid` otherwise.
 - The declaration may be `export`ed like any other, and calls to it type-check
   against the declared signature exactly like a normal function's.
+- The one attribute it takes is a bare `@nonblocking` (below). **E0077**
+  otherwise, naming the attribute.
 
 ```
 extern fn getpid(): i32
@@ -2745,6 +2749,55 @@ result may also be void. Every other Bit type is either GC-managed (`string`,
 slices, maps, interfaces, closures) or has a layout C does not share, and
 nothing on this path marshals - the value would be handed over raw and misread.
 **E0077** otherwise. `ptrOf` (§11.5) is the bridge from a slice to a `*T`.
+
+**A foreign call is bracketed by default (#7842).** A foreign function may hold
+its OS thread for as long as it likes - a C library `read`, a `sleep`, a lock -
+and nothing the compiler can see says which. So every call to a user `extern
+fn` lowers to `bit_rt_gc_syscall_begin()`, the C call, `bit_rt_gc_syscall_end()`
+(`runtime/ABI.md` §5 "The `syscall` contract"). While the call is out the
+collector scans the thread where it stands instead of waiting for it, and the
+monitor thread's retake (ABI.md §9) runs the tasks queued behind a blocked
+worker on a peer: with `BIT_WORKERS=1` a spawned task inside a foreign sleep no
+longer starves `main` (2005 ms behind a 2 s foreign sleep before, #7836; a few
+milliseconds after). This is Go's rule, where `runtime.cgocall` brackets every
+cgo call in `entersyscall`/`exitsyscall`, and the same shape as a JNI native
+method's thread-state transition and a .NET P/Invoke's GC transition; Rust
+brackets nothing because it has no scheduler to starve (an async runtime makes
+the author wrap a blocking FFI call in `spawn_blocking`). The default is the
+one that cannot freeze a program, and the cost is paid by the call:
+
+```text
+per-call cost of the bracket, a trivial extern in a 20M-iteration loop, best of 3
+target (hardware)                      bare call   bracketed   added
+aarch64-macos   (Apple M5 Max)         0.7 ns      8.5 ns      +7.8 ns   266 instructions
+aarch64-linux   (same host, VM)        0.5 ns      8.0 ns      +7.5 ns
+x86_64-linux    (Core i7-14700KF)      0.8 ns      28.4 ns     +27.6 ns  5+ locked xchg
+```
+
+The instruction count is `lldb` single-stepping `bit_rt_gc_syscall_begin` (106)
+and `_end` (160) in steady state; x86-64 exposes no counter on the box, so the
+row names what its code does instead (three locked `xchg` in `_begin`, at
+least two more in `_end`'s resume check and one in `worldEndSyscall`). So a foreign function that
+does real work, or blocks, never notices; one that returns in a few
+nanoseconds, called in a hot loop, pays 10x to 35x its own cost.
+
+**`@nonblocking` opts a declaration out.** `@nonblocking extern fn sqrt(x:
+f64): f64` is the author's assertion that the callee returns in bounded time
+without blocking in the kernel (a math routine, a getter, a `memcmp`). Every
+call to it is then the plain C call this section opened with, with no bracket.
+An assertion the callee breaks is the starvation the default prevents, so it is
+for proven hot calls, not for convenience. The attribute takes no arguments.
+
+Two kinds of extern are the runtime's own and are never bracketed, because the
+runtime calls them inside the scheduler and the collector, where a nested
+bracket would publish a second `syscall` state over the first: an `extern fn`
+declared in a module under the compiler tree's `runtime/` directory, and any
+symbol named `bit_rt_*`, wherever it is declared (the standard library reaches
+the runtime ABI that way; each such primitive brackets itself where it blocks).
+The rule reads the declaration, so every call to one extern agrees. A callee
+bracketed here must not call back into Bit code: the thread is published as
+frozen in the kernel, and Bit code running under that state is scanned from a
+stale bound.
 
 **The symbol is never module-qualified.** An ordinary function is emitted as
 `m<id>$name` so two modules cannot collide; an extern's name *is* the symbol the
@@ -7113,7 +7166,7 @@ attr          = "@" IDENT [ "(" [ const_expr { "," const_expr } ] ")" ] .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
 param         = [ "..." ] IDENT ( ":" type [ "=" expression ] | "=" expression ) .
-extern_fn_decl = "extern" "fn" IDENT signature .
+extern_fn_decl = [ attr_list ] "extern" "fn" IDENT signature .
 
 class_decl    = [ attr_list ] "class" IDENT [ generic_params ] "{" [ member { fsep member } [ fsep ] ] "}" .
 member        = field | method_decl | static_method_decl .
