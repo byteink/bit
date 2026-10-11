@@ -163,7 +163,9 @@ format changed) fails `begin` with `RedisError.Protocol` instead of reading as
 ## When not to use it
 
 On a single server, `MemoryIdempotencyStore` is enough and one fewer network
-hop. The store also does not make a handler's own side effects idempotent: a
+hop. If the app already has PostgreSQL or MySQL and no Redis, `web`'s
+`SqlIdempotencyStore` keeps the keys in a table instead and needs no extra
+package. The store also does not make a handler's own side effects idempotent: a
 payment provider call made before `finish` can still happen twice if the
 process dies in between. Pass the provider the same idempotency key.
 

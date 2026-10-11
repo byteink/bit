@@ -1,0 +1,326 @@
+// _tests_/bit/jobslive/webidem.bit - the live proof of pkg/web's
+// `SqlIdempotencyStore` (pkg/web/idempotencysql.bit, #6098) that `main.bit`
+// runs against every SQL engine `_tests_/bit/jobslive.bit` provisions
+// (PostgreSQL, MySQL 8, MariaDB 11). Every failure PANICS with a line starting
+// `WEB IDEMPOTENCY FAILED`, so `bit run` exits non-zero and the harness
+// reports it.
+//
+// THE POINT IS THE RACE: `raceOn` starts `racers` tasks, each on its own pool
+// and released together by one barrier, all calling `begin` on ONE never-seen
+// key. Exactly one may win a token; the other N-1 must get the winner's
+// `InFlight` entry. A non-atomic `begin` lets two of them read "absent" and
+// both win. The second proof is whose reservation is whose: a reservation that
+// expired and was re-begun by a later caller must survive the first caller's
+// late `finish` and `abandon` (#7832), which only the token predicate in
+// those statements provides.
+//
+// This file is copied beside `main.bit` into the scratch project
+// `_tests_/bit/jobslive.bit` generates and resolves "web" through that
+// project's `bit.lock`. `Pool`, `Value`, `asInt`, `sleep`, `Millisecond` and
+// `requirePool` are `main.bit`'s own imports and function (an import binds per
+// module, SPEC 17.1), so this file imports only what `web` adds.
+
+import {
+  CachedResponse,
+  Header,
+  IdempotencyClaim,
+  IdempotencyState,
+  SqlIdempotencyStore,
+  migrateSqlIdempotency,
+} from "web"
+
+const webRacers: int = 16
+const webRounds: int = 5
+// The shortest ttl `begin` accepts, and how long the cases sleep to be sure
+// the database's own clock has passed it.
+const webShortTtl: i64 = 1
+const webExpirySleep: int = 2300 * Millisecond
+
+fn webRefuse(label: string, what: string) {
+  panic("WEB IDEMPOTENCY FAILED: ${label}: ${what}")
+}
+
+fn webStore(db: Pool): SqlIdempotencyStore {
+  return SqlIdempotencyStore(db) catch e {
+    panic("SqlIdempotencyStore: ${e.message()}")
+  }
+}
+
+fn webBegin(s: SqlIdempotencyStore, key: string, fp: string, ttl: i64): IdempotencyClaim {
+  return s.begin(key, fp, ttl) catch e {
+    panic("WEB IDEMPOTENCY FAILED: begin(${key}): ${e.message()}")
+  }
+}
+
+fn webFinish(s: SqlIdempotencyStore, key: string, token: string, body: string) {
+  let resp = CachedResponse{ status = 201, body = body, headers = []Header(0) }
+  s.finish(key, token, resp, 60) catch e {
+    panic("WEB IDEMPOTENCY FAILED: finish(${key}): ${e.message()}")
+  }
+}
+
+fn webAbandon(s: SqlIdempotencyStore, key: string, token: string) {
+  s.abandon(key, token) catch e {
+    panic("WEB IDEMPOTENCY FAILED: abandon(${key}): ${e.message()}")
+  }
+}
+
+// 0 = created the reservation, 1 = saw InFlight, 2 = saw Done.
+fn webOutcome(got: IdempotencyClaim): int {
+  if (got.won()) {
+    return 0
+  }
+  if (unwrap(got.existing).state == IdempotencyState.InFlight) {
+    return 1
+  }
+  return 2
+}
+
+class WebRacer {
+  uri: string,
+  key: string,
+  fp: string,
+  start: chan<int>,
+  out: chan<int>,
+}
+
+fn webRacer(r: WebRacer) {
+  let db = requirePool(r.uri)
+  let s = SqlIdempotencyStore(db) catch _ {
+    db.close()
+    r.out <- 9
+    return
+  }
+  <- r.start
+  let got = s.begin(r.key, r.fp, 60) catch _ {
+    db.close()
+    r.out <- 9
+    return
+  }
+  db.close()
+  r.out <- webOutcome(got)
+}
+
+// The count of each outcome for `webRacers` racers on `key`, indexed 0, 1, 2;
+// slot 3 counts racers that failed.
+fn webRace(uri: string, key: string): []int {
+  let start = chan<int>(webRacers)
+  let out = chan<int>(webRacers)
+  let i = 0
+  while (i < webRacers) {
+    spawn webRacer(WebRacer{ uri = uri, key = key, fp = "fp-${i}", start = start, out = out })
+    i = i + 1
+  }
+  i = 0
+  while (i < webRacers) {
+    start <- 1
+    i = i + 1
+  }
+  let counts = [0, 0, 0, 0]
+  i = 0
+  while (i < webRacers) {
+    let o = <- out
+    if (o == 9) {
+      o = 3
+    }
+    counts[o] = counts[o] + 1
+    i = i + 1
+  }
+  return counts
+}
+
+fn proveWebRace(uri: string) {
+  let round = 0
+  while (round < webRounds) {
+    let counts = webRace(uri, "race-${round}")
+    let seen = "${counts[0]}/${counts[1]}/${counts[2]}/${counts[3]}"
+    if (counts[3] != 0 || counts[0] != 1 || counts[1] != webRacers - 1 || counts[2] != 0) {
+      webRefuse(
+        "race",
+        "round ${round}: winners/in-flight/done/failed = ${seen}, want 1/${webRacers - 1}/0/0",
+      )
+    }
+    round = round + 1
+  }
+}
+
+fn proveWebRaceAfterFinish(db: Pool, uri: string) {
+  let s = webStore(db)
+  let claim = webBegin(s, "racedone", "fp-0", 60)
+  if (!claim.won()) {
+    webRefuse("racedone", "the first begin must win")
+  }
+  webFinish(s, "racedone", claim.token, "made")
+  let counts = webRace(uri, "racedone")
+  if (counts[2] != webRacers) {
+    webRefuse(
+      "racedone",
+      "every racer must see Done, got ${counts[0]}/${counts[1]}/${counts[2]}/${counts[3]}",
+    )
+  }
+}
+
+// A body holding every byte value plus the characters that break naive SQL
+// and naive framing.
+fn webOddBody(): string {
+  let bytes = []byte(0)
+  let i = 0
+  while (i < 256) {
+    bytes = append(bytes, byte(i))
+    i = i + 1
+  }
+  return string(bytes) + "\r\n'\"\\;--" + string(bytes)
+}
+
+fn proveWebFinishReplay(db: Pool) {
+  let s = webStore(db)
+  let claim = webBegin(s, "replay", "f:p", 60)
+  if (!claim.won() || len(claim.token) != 32) {
+    webRefuse("replay", "begin must win with a 32-character token, got '${claim.token}'")
+  }
+  let other = webBegin(s, "replay", "someone-else", 60)
+  if (other.won() || other.token != "" || unwrap(other.existing).fingerprint != "f:p") {
+    webRefuse("replay", "a loser holds no token and sees the first fingerprint")
+  }
+  let resp = CachedResponse{
+    status = 201,
+    body = webOddBody(),
+    headers = [
+      Header{ name = "Content-Type", value = "application/json" },
+      Header{ name = "X-Odd", value = "a:b\nc" },
+    ],
+  }
+  s.finish("replay", claim.token, resp, 60) catch e {
+    panic("WEB IDEMPOTENCY FAILED: finish(replay): ${e.message()}")
+  }
+  expectWebReplay(webBegin(s, "replay", "x", 60), resp)
+}
+
+fn expectWebReplay(got: IdempotencyClaim, want: CachedResponse) {
+  let e = unwrap(got.existing)
+  if (got.won() || e.state != IdempotencyState.Done || e.fingerprint != "f:p") {
+    webRefuse("replay", "a finished key is Done and keeps the fingerprint")
+  }
+  if (e.response.status != want.status ||
+    e.response.body != want.body ||
+    len(e.response.headers) != 2) {
+    webRefuse(
+      "replay",
+      "status/body/headers differ: ${e.response.status}, ${len(e.response.body)} bytes",
+    )
+  }
+  if (e.response.headers[0].name != "Content-Type" || e.response.headers[1].value != "a:b\nc") {
+    webRefuse("replay", "headers lost their order or bytes")
+  }
+}
+
+fn proveWebAbandon(db: Pool) {
+  let s = webStore(db)
+  webAbandon(s, "abandon-missing", "no-such-token")
+  let claim = webBegin(s, "abandon", "fp", 60)
+  webAbandon(s, "abandon", "someone-elses-token")
+  if (webBegin(s, "abandon", "fp", 60).won()) {
+    webRefuse("abandon", "a foreign token must not free the key")
+  }
+  webAbandon(s, "abandon", claim.token)
+  if (!webBegin(s, "abandon", "fp", 60).won()) {
+    webRefuse("abandon", "the owner's abandon must free the key at once")
+  }
+}
+
+fn proveWebTtlExpiry(db: Pool) {
+  let s = webStore(db)
+  if (!webBegin(s, "ttl", "fp", webShortTtl).won()) {
+    webRefuse("ttl", "the first begin must win")
+  }
+  if (webBegin(s, "ttl", "fp", webShortTtl).won()) {
+    webRefuse("ttl", "a live reservation must not be won twice")
+  }
+  sleep(webExpirySleep)
+  if (!webBegin(s, "ttl", "fp", 60).won()) {
+    webRefuse("ttl", "an expired reservation must be re-won without a purge")
+  }
+}
+
+// A reservation that expired and was re-begun belongs to the later caller; the
+// first caller's late finish and abandon must change nothing (#7832).
+fn proveWebLateCalls(db: Pool) {
+  let s = webStore(db)
+  let a = webBegin(s, "late", "fp", webShortTtl)
+  sleep(webExpirySleep)
+  let b = webBegin(s, "late", "fp", 60)
+  if (!a.won() || !b.won() || a.token == b.token) {
+    webRefuse("late", "A and B must each win their own reservation, with different tokens")
+  }
+  webAbandon(s, "late", a.token)
+  if (webOutcome(webBegin(s, "late", "fp", 60)) != 1) {
+    webRefuse("late", "A's late abandon deleted B's reservation")
+  }
+  webFinish(s, "late", a.token, "stale")
+  if (webOutcome(webBegin(s, "late", "fp", 60)) != 1) {
+    webRefuse("late", "A's late finish overwrote B's reservation")
+  }
+  webFinish(s, "late", b.token, "fresh")
+  let done = webBegin(s, "late", "fp", 60)
+  if (webOutcome(done) != 2 || unwrap(done.existing).response.body != "fresh") {
+    webRefuse("late", "B's own finish must store its response")
+  }
+}
+
+fn webRowCount(db: Pool): int {
+  let rows = db.query("SELECT COUNT(*) FROM bit_idempotency", []Value(0)) catch e {
+    panic("WEB IDEMPOTENCY FAILED: count: ${e.message()}")
+  }
+  let has = rows.next() catch e {
+    panic("WEB IDEMPOTENCY FAILED: count next: ${e.message()}")
+  }
+  if (!has) {
+    webRefuse("count", "COUNT(*) returned no row")
+  }
+  let n = asInt(rows.value(0)) catch e {
+    panic("WEB IDEMPOTENCY FAILED: count value: ${e.message()}")
+  }
+  rows.close()
+  return n
+}
+
+fn proveWebPurge(db: Pool) {
+  let s = webStore(db)
+  let before = webRowCount(db)
+  let _ = webBegin(s, "purge-1", "fp", webShortTtl)
+  let _ = webBegin(s, "purge-2", "fp", webShortTtl)
+  let keep = webBegin(s, "purge-keep", "fp", 600)
+  if (!keep.won() || webRowCount(db) != before + 3) {
+    webRefuse("purge", "three fresh reservations must add three rows")
+  }
+  sleep(webExpirySleep)
+  let removed = s.purge() catch e {
+    panic("WEB IDEMPOTENCY FAILED: purge: ${e.message()}")
+  }
+  if (removed < 2 || webRowCount(db) != before + 1) {
+    webRefuse("purge", "removed ${removed}; the two expired rows must go and the live one stay")
+  }
+  if (webOutcome(webBegin(s, "purge-keep", "fp", 600)) != 1) {
+    webRefuse("purge", "purge must leave an unexpired reservation alone")
+  }
+}
+
+// Runs the whole proof against the database at `uri`.
+fn proveWebIdempotency(uri: string) {
+  let db = requirePool(uri)
+  migrateSqlIdempotency(db) catch e {
+    panic("migrateSqlIdempotency: ${e.message()}")
+  }
+  // A re-run against the same database must not inherit the last run's keys.
+  db.exec("DELETE FROM bit_idempotency", []Value(0)) catch e {
+    panic("WEB IDEMPOTENCY FAILED: clear: ${e.message()}")
+  }
+  proveWebRace(uri)
+  proveWebRaceAfterFinish(db, uri)
+  proveWebFinishReplay(db)
+  proveWebAbandon(db)
+  proveWebTtlExpiry(db)
+  proveWebLateCalls(db)
+  proveWebPurge(db)
+  db.close()
+}
