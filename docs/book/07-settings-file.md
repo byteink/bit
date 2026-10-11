@@ -45,7 +45,7 @@ fn defaultSettings(): Settings {
 fn field(entries: []TomlEntry, key: string): Option<Toml> {
   for e of entries {
     if (e.key == key) {
-      return Option.Some(e.value)
+      return e.value
     }
   }
   return Option.None
@@ -64,6 +64,10 @@ the one line Inkwell writes for itself to look a key up by name in a
 decoded table. `requireTable` turns the `Option` `tomlAsTable` hands back
 into a fallible result, naming the file when the document at the top level
 is not a table at all - an empty file, or one that is just a bare value.
+
+`field` promises an `Option<Toml>`, so returning a `Toml` value makes it
+present automatically. `Option.None` still marks a missing key; callers
+match on `Some` and `None` the same way.
 
 ## Reading each field, with its own default
 

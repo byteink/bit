@@ -5051,6 +5051,62 @@ A value of type `S` is assignable to a location of type `T` if:
 - `S` is an untyped constant (§15.4) representable in `T`; or
 - `S` is `nil` and `T` is a reference type.
 
+In four contexts, a non-`Option` value assignable to `T` is also accepted where
+`Option<T>` is expected: a class-literal field initializer, a call or constructor
+argument, a `return` operand, and a typed `let` initializer. The value becomes
+`Option.Some(value)` and is evaluated exactly once.
+
+A class-literal field initializer:
+
+```bit
+class Draft { title: Option<string> }
+fn main() {
+  let draft = Draft{ title = "First draft" }
+  println(unwrapOr(draft.title, "Untitled"))
+}
+```
+
+A call argument:
+
+```bit
+fn titleText(title: Option<string>): string {
+  return unwrapOr(title, "Untitled")
+}
+fn main() {
+  println(titleText("First draft"))
+}
+```
+
+A return operand:
+
+```bit
+fn draftTitle(found: bool): Option<string> {
+  if (found) {
+    return "First draft"
+  }
+  return Option.None
+}
+fn main() {
+  println(unwrapOr(draftTitle(true), "Untitled"))
+}
+```
+
+A typed `let` initializer:
+
+```bit
+fn main() {
+  let title: Option<string> = "First draft"
+  println(unwrapOr(title, "Untitled"))
+}
+```
+
+This rule applies only at those four contexts, not to reassignment of an existing
+binding. It does not wrap a value already typed as `Option`, and it does not apply
+when `T` is itself an `Option`: neither a bare `int` nor an `Option<int>` becomes
+an `Option<Option<int>>` implicitly. Existing `Option.None` and `nil`
+assignability is unchanged; `nil` never becomes `Some(nil)`. An `Option<T>` is
+never implicitly unwrapped to `T`.
+
 No implicit numeric conversions and no implicit interface-to-interface widening
 beyond structural satisfaction. Everything else needs an explicit conversion.
 
