@@ -1,0 +1,418 @@
+// stdlib/http2/connect.test.bit — extended CONNECT (RFC 8441, connect.bit).
+//
+// The first group drives the handlers directly against a hand-built
+// `h2connState` (`btState`, events.test.bit; `srNewPeer`/`srHeadersFrame`,
+// streams.test.bit — same flat `std/http2` module, so nothing is imported): the
+// SETTINGS exchange and the request validation, where the RFC names the error.
+// The last two run two real engines over an in-memory wire, because a tunnel
+// correct in the handlers and never carried across `Stream`/`H2Stream` would pass
+// every handler test.
+
+// --- the request a peer sends ------------------------------------------------
+
+// The pseudo-header set of an extended CONNECT for `/chat` (RFC 8441 §5.1),
+// before any mutation a test applies to break it.
+fn cnFields(): []HeaderField {
+  let fs = []HeaderField(0)
+  fs = append(fs, HeaderField{ name = ":method", value = "CONNECT", sensitive = false })
+  fs = append(fs, HeaderField{ name = ":protocol", value = "websocket", sensitive = false })
+  fs = append(fs, HeaderField{ name = ":scheme", value = "https", sensitive = false })
+  fs = append(fs, HeaderField{ name = ":path", value = "/chat", sensitive = false })
+  fs = append(fs, HeaderField{ name = ":authority", value = "example.com", sensitive = false })
+  fs = append(fs, HeaderField{ name = "sec-websocket-version", value = "13", sensitive = false })
+  return fs
+}
+
+// `cnFields()` without the field called `name`.
+fn cnWithout(name: string): []HeaderField {
+  let out = []HeaderField(0)
+  for f of cnFields() {
+    if (f.name != name) {
+      out = append(out, f)
+    }
+  }
+  return out
+}
+
+// `cnFields()` with `:method` replaced by `method`.
+fn cnWithMethod(method: string): []HeaderField {
+  let out = []HeaderField(0)
+  for f of cnFields() {
+    if (f.name == ":method") {
+      out = append(out, HeaderField{ name = ":method", value = method, sensitive = false })
+    } else {
+      out = append(out, f)
+    }
+  }
+  return out
+}
+
+// Feed `fields` as the opening HEADERS of stream 1 to a server state that
+// advertises extended CONNECT iff `enabled`, and return what the engine did: the
+// peer, and the RST_STREAM code it queued (-1 when it queued none).
+class cnOutcome { p: srPeer, rst: int, opened: bool }
+
+fn cnOpen(fields: []HeaderField, enabled: bool): cnOutcome {
+  let p = srNewPeer()
+  p.st.enableConnectProtocol = enabled
+  let f = srHeadersFrame(p.enc, 1, fields, false) catch e {
+    assert(false, "building the HEADERS frame failed: ${e.message()}")
+    return cnOutcome{ p = p, rst = 0 - 1, opened = false }
+  }
+  h2connHandleFrame(p.st, f)
+  let (_, has) = p.st.streams[1]
+  return cnOutcome{ p = p, rst = cnQueuedRst(p.st), opened = has }
+}
+
+// The error code of the RST_STREAM the loop queued, -1 when it queued nothing,
+// -2 when what it queued is not an RST_STREAM.
+fn cnQueuedRst(st: h2connState): int {
+  select {
+    case out = <- st.writeCh:
+      let fr = readFrame(out.data, maxMaxFrameSize) catch _ {
+        return 0 - 2
+      }
+      let rf = decodeRstStream(fr) catch _ {
+        return 0 - 2
+      }
+      return rf.errorCode
+    default:
+      return 0 - 1
+  }
+}
+
+// --- SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441 §3) --------------------------
+
+test "a server advertises SETTINGS_ENABLE_CONNECT_PROTOCOL = 1 only when configured" {
+  let cfg = defaultConfig()
+  cfg.enableConnectProtocol = true
+  let (w, _) = hbAcceptOn(cfg) catch e {
+    assert(false, "accept failed: ${e.message()}")
+    return
+  }
+  let first = hbNextFrame(w) catch e2 {
+    assert(false, "the engine wrote no opening frame: ${e2.message()}")
+    return
+  }
+  let sf = decodeSettings(first) catch e3 {
+    assert(false, "the opening frame is not SETTINGS: ${e3.message()}")
+    return
+  }
+  let value = 0 - 1
+  for s of sf.settings {
+    if (s.id == settingsEnableConnectProtocol) {
+      value = s.value
+    }
+  }
+  assert(value == 1, "SETTINGS_ENABLE_CONNECT_PROTOCOL = ${value}, want 1")
+  assert(settingsEnableConnectProtocol == 8, "the parameter id is 0x8 (RFC 8441 §3)")
+}
+
+test "the default configuration does not advertise extended CONNECT" {
+  let (w, _) = hbAcceptOn(defaultConfig()) catch e {
+    assert(false, "accept failed: ${e.message()}")
+    return
+  }
+  let first = hbNextFrame(w) catch e2 {
+    assert(false, "the engine wrote no opening frame: ${e2.message()}")
+    return
+  }
+  let sf = decodeSettings(first) catch e3 {
+    assert(false, "the opening frame is not SETTINGS: ${e3.message()}")
+    return
+  }
+  for s of sf.settings {
+    assert(s.id != settingsEnableConnectProtocol, "advertised the setting without being asked")
+  }
+}
+
+test "a peer's SETTINGS_ENABLE_CONNECT_PROTOCOL is recorded, and only 0 and 1 are legal" {
+  let st = btState(true, 1048576)
+  h2connApplySetting(st, settingsEnableConnectProtocol, 1)
+  assert(st.peerConnectProtocol, "value 1 was not recorded")
+  assert(st.running, "a legal value ended the connection")
+  // RFC 8441 §3: a sender MUST NOT send 0 after having sent 1.
+  h2connApplySetting(st, settingsEnableConnectProtocol, 0)
+  assert(!st.running, "1 followed by 0 did not raise a connection error")
+
+  let st2 = btState(true, 1048576)
+  h2connApplySetting(st2, settingsEnableConnectProtocol, 2)
+  assert(!st2.running, "the value 2 did not raise a connection error")
+}
+
+// --- the request (RFC 8441 §3, §4), malformed means PROTOCOL_ERROR ------------
+
+test "an extended CONNECT to a server that did not advertise it is a stream error" {
+  let o = cnOpen(cnFields(), false)
+  assert(!o.opened, "the stream was opened anyway")
+  assert(o.rst == errorProtocolError, "RST_STREAM code = ${o.rst}, want PROTOCOL_ERROR")
+  assert(o.p.st.running, "a malformed request must not end the connection")
+}
+
+test "an extended CONNECT to a server that advertised it opens a tunnel" {
+  let o = cnOpen(cnFields(), true)
+  assert(o.opened, "a valid extended CONNECT was refused (rst ${o.rst})")
+  assert(o.rst == 0 - 1, "a valid extended CONNECT drew an RST_STREAM (${o.rst})")
+  let a = <- o.p.st.acceptCh
+  assert(a.request.method == "CONNECT", "method = '${a.request.method}'")
+  assert(a.request.protocol == "websocket", "protocol = '${a.request.protocol}'")
+  assert(isExtendedConnect(a.request), "isExtendedConnect = false")
+  assert(a.request.path == "/chat", "path = '${a.request.path}'")
+  let (s, _) = o.p.st.streams[1]
+  assert(s.tunnel, "the stream is not marked a tunnel")
+  let (_, held) = o.p.st.tunnels[1]
+  assert(held, "the tunnel is not held by the loop")
+}
+
+test ":protocol on a method other than CONNECT is a stream error" {
+  let o = cnOpen(cnWithMethod("GET"), true)
+  assert(!o.opened, "the stream was opened anyway")
+  assert(o.rst == errorProtocolError, "RST_STREAM code = ${o.rst}, want PROTOCOL_ERROR")
+}
+
+test "an extended CONNECT missing :scheme, :path or :authority is a stream error" {
+  for name of [":scheme", ":path", ":authority"] {
+    let o = cnOpen(cnWithout(name), true)
+    assert(!o.opened, "opened without ${name}")
+    assert(o.rst == errorProtocolError, "without ${name}: RST_STREAM code = ${o.rst}, want 1")
+  }
+}
+
+test "a second :protocol is a stream error" {
+  let fs = cnFields()
+  fs = append(fs, HeaderField{ name = ":protocol", value = "websocket", sensitive = false })
+  let o = cnOpen(fs, true)
+  assert(!o.opened, "opened with two :protocol fields")
+  assert(o.rst == errorProtocolError, "RST_STREAM code = ${o.rst}, want PROTOCOL_ERROR")
+}
+
+test "a CONNECT with no :protocol is not an extended CONNECT" {
+  let o = cnOpen(cnWithout(":protocol"), true)
+  assert(o.opened, "an ordinary request was refused")
+  let a = <- o.p.st.acceptCh
+  assert(!isExtendedConnect(a.request), "isExtendedConnect = true without :protocol")
+  let (s, _) = o.p.st.streams[1]
+  assert(!s.tunnel, "an ordinary CONNECT was marked a tunnel")
+}
+
+test "a client does not send :protocol to a peer that did not advertise it" {
+  let st = btState(true, 1048576)
+  let replyCh = chan<h2connMsg>(1)
+  let req = Request("CONNECT", "example.com", "/chat")
+  req.protocol = "websocket"
+  h2connCmdOpen(
+    st,
+    h2connCmd{
+      kind = h2cmdOpen,
+      readCh = h2connDummyRead(),
+      request = req,
+      response = h2connZeroResponse(),
+      streamId = 0,
+      errorCode = 0,
+      replyCh = replyCh,
+    },
+  )
+  let m = <- replyCh
+  assert(!m.ok, "the request was sent")
+  assert(len(st.streams) == 0, "a stream was created for the refused request")
+  assert(m.errMsg == h2connConnectRefusal(st, req), "error = '${m.errMsg}'")
+}
+
+// --- the tunnel on the wire --------------------------------------------------
+
+test "accepting writes a 200 without END_STREAM, and the handler returning ends the tunnel" {
+  let o = cnOpen(cnFields(), true)
+  let p = o.p
+  let a = <- p.st.acceptCh
+  let replyCh = chan<h2connMsg>(1)
+  h2connCmdAccept(
+    p.st,
+    h2connCmd{
+      kind = h2cmdAccept,
+      readCh = h2connDummyRead(),
+      request = h2connZeroRequest(),
+      response = Response(200, []byte(0)),
+      streamId = a.streamId,
+      errorCode = 0,
+      replyCh = replyCh,
+    },
+  )
+  assert((<- replyCh).ok, "accept was refused")
+  let hf = btNextWritten(p.st) catch e {
+    assert(false, "no frame queued: ${e.message()}")
+    return
+  }
+  assert(hf.header.ftype == frameHeaders, "first frame type = ${hf.header.ftype}, want HEADERS")
+  assert((hf.header.flags & flagEndStream) == 0, "the 200 carried END_STREAM")
+
+  // A write goes out as DATA and is answered once it has left.
+  let wch = chan<h2connMsg>(1)
+  h2connCmdWrite(
+    p.st,
+    h2connCmd{
+      kind = h2cmdWrite,
+      readCh = h2connDummyRead(),
+      request = h2connZeroRequest(),
+      response = Response(0, btPattern(40)),
+      streamId = a.streamId,
+      errorCode = 0,
+      replyCh = wch,
+    },
+  )
+  assert((<- wch).ok, "the write was refused")
+  let df = btNextWritten(p.st) catch e2 {
+    assert(false, "no DATA queued: ${e2.message()}")
+    return
+  }
+  assert(df.header.ftype == frameData, "frame type = ${df.header.ftype}, want DATA")
+  assert(df.header.length == 40, "DATA length = ${df.header.length}, want 40")
+  assert((df.header.flags & flagEndStream) == 0, "a tunnel write carried END_STREAM")
+
+  // The handler returns: END_STREAM, then RST_STREAM(NO_ERROR) because the peer
+  // never ended its half.
+  srServeFinish(p, a.streamId, []byte(0))
+  let ef = btNextWritten(p.st) catch e3 {
+    assert(false, "no END_STREAM queued: ${e3.message()}")
+    return
+  }
+  assert(ef.header.ftype == frameData && ef.header.length == 0, "want an empty DATA frame")
+  assert((ef.header.flags & flagEndStream) != 0, "the closing DATA lacks END_STREAM")
+  let rf = btNextWritten(p.st) catch e4 {
+    assert(false, "no RST_STREAM queued: ${e4.message()}")
+    return
+  }
+  let rst = decodeRstStream(rf) catch e5 {
+    assert(false, "not RST_STREAM: ${e5.message()}")
+    return
+  }
+  assert(rst.errorCode == errorNoError, "RST_STREAM code = ${rst.errorCode}, want NO_ERROR")
+  assert(len(p.st.tunnels) == 0, "the tunnel is still held after the handler returned")
+  assert(p.st.activeStreams == 0, "the stream is still active")
+}
+
+test "a tunnel is not subject to the body budget" {
+  let o = cnOpen(cnFields(), true)
+  let p = o.p
+  p.st.maxBodyBytes = 64
+  let df = btDataFrame(1, btPattern(100), false) catch e {
+    assert(false, "building the DATA frame failed: ${e.message()}")
+    return
+  }
+  h2connOnData(p.st, df)
+  let (s, _) = p.st.streams[1]
+  assert(!s.reset, "the tunnel was reset for exceeding the body budget")
+  assert(len(s.recvBody) == 100, "recvBody = ${len(s.recvBody)}, want 100")
+}
+
+// --- two engines, a tunnel between them --------------------------------------
+
+// A wired pair: the server engine serving `handler` on one end, a connected
+// client on the other.
+fn cnPair(handler: (Request, Stream) => Response): Conn! {
+  let a = chan<btChunk>(256)
+  let b = chan<btChunk>(256)
+  let serverEnd = btEnd{ incoming = a, outgoing = b, leftover = []byte(0), closed = false }
+  let clientEnd = btEnd{ incoming = b, outgoing = a, leftover = []byte(0), closed = false }
+  let cfg = defaultConfig()
+  cfg.enableConnectProtocol = true
+  spawn btRunServer(
+    Transport(btRead(serverEnd), btWrite(serverEnd), btShutdown(serverEnd)),
+    cfg,
+    handler,
+  )
+  return connect(
+    Transport(btRead(clientEnd), btWrite(clientEnd), btShutdown(clientEnd)),
+    defaultConfig(),
+    0,
+  )?
+}
+
+// Accept the tunnel and echo each read back until the peer ends its half.
+fn cnEcho(req: Request, s: Stream): Response {
+  if (!isExtendedConnect(req)) {
+    return Response(400, []byte("not a tunnel"))
+  }
+  let h = s.acceptExtendedConnect() catch _ {
+    return Response(500, []byte(0))
+  }
+  while (true) {
+    let chunk = h.read(4096) catch _ {
+      return Response(0, []byte(0))
+    }
+    if (len(chunk) == 0) {
+      return Response(0, []byte(0))
+    }
+    h.write(chunk) catch _ {
+      return Response(0, []byte(0))
+    }
+  }
+}
+
+// `t.write(data)` on its own green thread; `done` receives "" or the failure.
+fn cnWriteAll(t: H2Stream, data: string, done: chan<string>) {
+  t.write(data) catch e {
+    done <- e.message()
+    return
+  }
+  done <- ""
+}
+
+fn cnTunnelRequest(): Request {
+  let req = Request("CONNECT", "example.com", "/chat")
+  req.protocol = "websocket"
+  return req
+}
+
+test "bytes cross an extended CONNECT tunnel in both directions" {
+  let conn = cnPair(cnEcho) catch e {
+    assert(false, "setup failed: ${e.message()}")
+    return
+  }
+  let (res, t) = conn.openTunnel(cnTunnelRequest()) catch e2 {
+    assert(false, "openTunnel failed: ${e2.message()}")
+    return
+  }
+  assert(res.status == 200, "status = ${res.status}")
+  t.write("hello") catch e3 {
+    assert(false, "write failed: ${e3.message()}")
+    return
+  }
+  let got = t.read(64) catch e4 {
+    assert(false, "read failed: ${e4.message()}")
+    return
+  }
+  assert(got == "hello", "echo = '${got}', want 'hello'")
+  // A write larger than one frame (16384) and than the initial window (65535)
+  // crosses under flow control and arrives whole.
+  let big = string(btPattern(200000))
+  // The write runs on its own thread: the echo handler writes each chunk back
+  // before it reads the next, so a writer that is not also being read blocks both
+  // ends at the window (neither can make progress), exactly as it would on a socket.
+  let wrote = chan<string>(1)
+  spawn cnWriteAll(t, big, wrote)
+  let back = ""
+  while (len(back) < len(big)) {
+    let piece = t.read(70000) catch e6 {
+      assert(false, "read failed at ${len(back)}: ${e6.message()}")
+      return
+    }
+    assert(len(piece) > 0, "the tunnel ended after ${len(back)} of ${len(big)} bytes")
+    back = back + piece
+  }
+  assert(back == big, "the echoed bytes differ from the written ones")
+  let werr = <- wrote
+  assert(werr == "", "big write failed: ${werr}")
+  t.close()
+}
+
+test "an extended CONNECT the handler declines is answered like any request" {
+  let conn = cnPair((req, s) => Response(403, []byte("no"))) catch e {
+    assert(false, "setup failed: ${e.message()}")
+    return
+  }
+  conn.openTunnel(cnTunnelRequest()) catch e2 {
+    assert(e2.message() == "http2: extended CONNECT refused with status 403", e2.message())
+    return
+  }
+  assert(false, "openTunnel succeeded against a refusing handler")
+}

@@ -1,0 +1,413 @@
+// Bit standard library — http2 module, extended CONNECT (RFC 8441): the tunnel a
+// CONNECT request bearing `:protocol` opens on one HTTP/2 stream, which the
+// WebSocket layer (std/websocket, `upgradeH2`) runs RFC 6455 framing over.
+//
+// What the engine owns here, and why:
+//
+//   - SETTINGS_ENABLE_CONNECT_PROTOCOL (§3). Advertised by a server that set
+//     `Config.enableConnectProtocol`, recorded from the peer (`peerConnectProtocol`)
+//     before a client sends `:protocol`. A request bearing `:protocol` to an
+//     endpoint that did not advertise it is malformed (§3, RFC 9113 §8.1.1): a
+//     stream error PROTOCOL_ERROR (`h2connConnectOk`).
+//   - The request shape (§4): `:protocol` only on CONNECT, once, with `:scheme`,
+//     `:path` and `:authority` all present.
+//   - The tunnel (§5): after a 2xx the stream's DATA frames are the byte stream,
+//     under the ordinary per-stream and connection flow control. END_STREAM is an
+//     orderly close; RST_STREAM(CANCEL) is the abnormal one. `H2Stream` below is
+//     the application's handle on it.
+//
+// The loop, not the application, owns every piece of mutable state, as for every
+// other stream: `H2Stream` talks to it over `cmdCh` exactly as `Stream.read`
+// does. Same flat `std/http2` module and namespace as `conn.bit`.
+
+// Whether `req` is an extended CONNECT (RFC 8441 §4): the CONNECT method with a
+// `:protocol` pseudo-header. Any protocol value counts; the caller (std/websocket
+// for "websocket", §5) decides which values it serves.
+export fn isExtendedConnect(req: Request): bool {
+  return req.method == "CONNECT" && req.protocol != ""
+}
+
+// The application's handle on an accepted extended-CONNECT tunnel: the h2
+// equivalent of a hijacked connection. `read` and `write` move the tunnel's
+// bytes and nothing else — no HTTP framing is visible above this.
+//
+// Built by `Stream.acceptExtendedConnect` (server) and `Conn.openTunnel`
+// (client); one thread reads and one writes, as for a socket. `close` must be
+// called when the tunnel is done: the connection's loop is kept alive for a tunnel
+// that has not been closed so a write is always answered (`h2connTunnelRelease`).
+// A server handler need not: returning from it closes the tunnel.
+export class H2Stream {
+  s: Stream
+  // Bytes `read` took from the engine beyond what its caller asked for.
+  pending: []byte
+  eof: bool
+  // Absolute `std/time.monotonic().ns` deadline bounding `read`; 0 = none.
+  deadlineNs: int
+
+  // Up to `n` bytes of the tunnel, blocking until at least one has arrived.
+  // "" means the peer ended its half (END_STREAM) and nothing is left; fails when
+  // the stream is reset, the connection dies, or `setDeadline`'s deadline passes.
+  // Taking the bytes is what renews the receive windows (`Stream.read`), so a
+  // slow caller is the backpressure on a fast peer.
+  export read(n: int): string! {
+    if (n <= 0) {
+      return ""
+    }
+    if (len(this.pending) == 0) {
+      if (this.eof) {
+        return ""
+      }
+      let r = h2connTunnelTake(this.s, this.deadlineNs)?
+      this.eof = r.eof
+      this.pending = r.data
+    }
+    let k = len(this.pending)
+    if (k > n) {
+      k = n
+    }
+    let out = string(this.pending[0:k])
+    this.pending = this.pending[k:len(this.pending)]
+    return out
+  }
+
+  // Send `data` as DATA frames, split to the peer's frame size, and return once
+  // every byte has left under flow control — so a peer that stops reading
+  // blocks the writer here rather than growing a buffer. Fails when the stream is
+  // closed, reset or the connection is gone.
+  export write(data: string): ()! {
+    if (len(data) == 0) {
+      return
+    }
+    let replyCh = chan<h2connMsg>(1)
+    this.s.cmdCh <- h2connCmd{
+      kind = h2cmdWrite,
+      readCh = h2connDummyRead(),
+      request = h2connZeroRequest(),
+      response = Response(0, []byte(data)),
+      streamId = this.s.id,
+      errorCode = 0,
+      replyCh = replyCh,
+    }
+    let m = <- replyCh
+    if (!m.ok) {
+      fail newError(m.errMsg)
+    }
+  }
+
+  // Bound `read` by an absolute monotonic deadline in nanoseconds; 0 clears it.
+  export setDeadline(deadlineNs: int) {
+    this.deadlineNs = deadlineNs
+  }
+
+  // End our half of the tunnel (END_STREAM, an orderly close, RFC 8441 §5) and
+  // release the loop's hold on it. Idempotent. The peer's half is left to the
+  // peer; `reset` is the abnormal close.
+  export close() {
+    this.s.cmdCh <- h2connCmd{
+      kind = h2cmdEnd,
+      readCh = h2connDummyRead(),
+      request = h2connZeroRequest(),
+      response = h2connZeroResponse(),
+      streamId = this.s.id,
+      errorCode = 0,
+      replyCh = h2connDummyReply(),
+    }
+  }
+
+  // Abort the tunnel with RST_STREAM carrying `errorCode` (RFC 8441 §5 uses
+  // CANCEL for an abnormal close), then release it.
+  export reset(errorCode: int) {
+    this.s.reset(errorCode)
+    this.close()
+  }
+}
+
+// One take of the tunnel's next bytes, bounded by `deadlineNs` (0 = none). A
+// deadline races the parked read against a timer thread, as `h2connAwaitReply`
+// does for a round trip; a read left parked by the timeout is replaced by the
+// next one (`h2connCmdRead` overwrites the parked channel), and the caller closes
+// the tunnel after a timeout anyway.
+fn h2connTunnelTake(s: Stream, deadlineNs: int): BodyChunk! {
+  if (deadlineNs == 0) {
+    return s.read()?
+  }
+  let timeoutCh = chan<int>(1)
+  spawn h2connArmDeadline(deadlineNs, timeoutCh)
+  select {
+    case r = <- h2connSendRead(s.cmdCh, s.id):
+      if (r.errMsg != "") {
+        fail newError(r.errMsg)
+      }
+      return BodyChunk{ data = r.data, eof = r.eof }
+    case _ = <- timeoutCh:
+      fail newError("http2: tunnel read timed out")
+  }
+}
+
+// --- the loop's side ---------------------------------------------------------
+
+// The request pseudo-headers `h2connConnectOk` judges, with how many `:protocol`
+// fields there were (the field is single valued, RFC 8441 §4).
+class h2connPseudo {
+  protocols: int,
+  protocol: string,
+  method: string,
+  scheme: string,
+  authority: string,
+  path: string,
+}
+
+fn h2connPseudoOf(fields: []HeaderField): h2connPseudo {
+  let p = h2connPseudo{
+    protocols = 0,
+    protocol = "",
+    method = "",
+    scheme = "",
+    authority = "",
+    path = "",
+  }
+  for f of fields {
+    if (f.name == ":protocol") {
+      p.protocols = p.protocols + 1
+      p.protocol = f.value
+    } else if (f.name == ":method") {
+      p.method = f.value
+    } else if (f.name == ":scheme") {
+      p.scheme = f.value
+    } else if (f.name == ":authority") {
+      p.authority = f.value
+    } else if (f.name == ":path") {
+      p.path = f.value
+    }
+  }
+  return p
+}
+
+// Whether the header list of a peer-initiated request is a valid use of
+// `:protocol` (RFC 8441 §3, §4), ignoring requests that carry none. False means a
+// malformed request: the caller resets the stream with PROTOCOL_ERROR.
+fn h2connConnectOk(st: h2connState, fields: []HeaderField): bool {
+  let p = h2connPseudoOf(fields)
+  if (p.protocols == 0) {
+    return true
+  }
+  if (p.protocols > 1 || !st.enableConnectProtocol || p.method != "CONNECT") {
+    return false
+  }
+  return p.scheme != "" && p.authority != "" && p.path != "" && p.protocol != ""
+}
+
+// The peer's SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441 §3): only 0 and 1 are
+// legal, and a sender MUST NOT go from 1 back to 0. Either is a connection error
+// PROTOCOL_ERROR.
+fn h2connApplyConnectSetting(st: h2connState, value: int) {
+  if (value > 1 || (value == 0 && st.peerConnectProtocol)) {
+    h2connConnError(st, errorProtocolError, "http2: bad SETTINGS_ENABLE_CONNECT_PROTOCOL")
+    return
+  }
+  st.peerConnectProtocol = value == 1
+}
+
+// `dst` followed by `src`, taking `src` itself when `dst` is empty: a stream whose
+// application keeps up has an empty `recvBody` at every DATA frame, so the common
+// case is a hand-over instead of a per-byte copy. Safe because `src` is the payload
+// slice of a frame the reader built with `h2connReadExact` — a fresh copy nothing
+// else holds — and `recvBody` is replaced, never written through, by its readers.
+fn h2connTakeBytes(dst: []byte, src: []byte): []byte {
+  if (len(dst) == 0) {
+    return src
+  }
+  return h2connAppendBytes(dst, src)
+}
+
+// The state of a client stream whose HEADERS have just been sent: open while we
+// still owe it DATA (a body, or a tunnel), else half-closed(local).
+fn h2connOpenState(sending: bool): int {
+  if (sending) {
+    return h2stOpen
+  }
+  return h2stHCLocal
+}
+
+fn h2connMarkTunnelIf(st: h2connState, s: h2connStream, tunnel: bool) {
+  if (tunnel) {
+    h2connMarkTunnel(st, s)
+  }
+}
+
+// A peer-initiated stream whose request bore `:protocol` is a tunnel from the
+// moment it opens: marked, counted, and exempt from the body budget.
+fn h2connMarkTunnel(st: h2connState, s: h2connStream) {
+  s.tunnel = true
+  st.tunnels[s.id] = true
+}
+
+// The loop stays alive while any tunnel is held (`h2connLoop`, loop.bit), so a
+// `write` or `close` from the application is always answered even after the
+// connection died. Released by the handler's answer (server) or `H2Stream.close`
+// (client). Safe to call for an id that was never a tunnel.
+fn h2connTunnelRelease(st: h2connState, id: int) {
+  if (len(st.tunnels) == 0) {
+    return
+  }
+  delete(st.tunnels, id)
+}
+
+// A tunnel `write` has fully left: answer the parked writer.
+fn h2connWriteDone(s: h2connStream) {
+  if (!s.writing) {
+    return
+  }
+  s.writing = false
+  s.writeCh <- h2connMsg{
+    ok = true, response = h2connZeroResponse(), errMsg = "", streamId = s.id, hasBody = false,
+  }
+}
+
+// The stream died under a parked tunnel `write`.
+fn h2connWriteFail(s: h2connStream, msg: string) {
+  if (!s.writing) {
+    return
+  }
+  s.writing = false
+  s.pendingData = []byte(0)
+  s.hasPending = false
+  s.writeCh <- h2connMsg{
+    ok = false, response = h2connZeroResponse(), errMsg = msg, streamId = s.id, hasBody = false,
+  }
+}
+
+fn h2connFailMsg(replyCh: chan<h2connMsg>, msg: string) {
+  replyCh <- h2connMsg{
+    ok = false, response = h2connZeroResponse(), errMsg = msg, streamId = 0, hasBody = false,
+  }
+}
+
+// Answer a server tunnel request 2xx (RFC 8441 §5): HEADERS without END_STREAM,
+// after which the stream carries the tunnel. Refused when the stream is not a live
+// extended CONNECT, or already answered.
+fn h2connCmdAccept(st: h2connState, cmd: h2connCmd) {
+  let (s, ok) = st.streams[cmd.streamId]
+  if (!ok || s.state == h2stClosed || s.reset) {
+    h2connFailMsg(cmd.replyCh, "http2: tunnel stream is closed")
+    return
+  }
+  if (!s.tunnel || s.replied) {
+    h2connFailMsg(cmd.replyCh, "http2: stream is not an unanswered extended CONNECT")
+    return
+  }
+  let fields = h2connResponseFields(cmd.response)
+  let listSize = h2connHeaderListSize(fields)
+  if (listSize > st.peerMaxHeaderListBytes) {
+    h2connFailMsg(cmd.replyCh, h2connHeaderListMsg(listSize, st.peerMaxHeaderListBytes))
+    return
+  }
+  s.replied = true
+  h2connSendHeaderBlock(st, s.id, st.enc.encode(fields), false)
+  cmd.replyCh <- h2connMsg{
+    ok = true, response = h2connZeroResponse(), errMsg = "", streamId = s.id, hasBody = false,
+  }
+}
+
+// Queue a tunnel write. One writer at a time (the application's single writing
+// thread), so `pendingData` is empty here; the reply is parked on the stream until
+// `h2connFlushStream` has sent every byte.
+fn h2connCmdWrite(st: h2connState, cmd: h2connCmd) {
+  let (s, ok) = st.streams[cmd.streamId]
+  if (!ok ||
+    !s.tunnel ||
+    !s.replied ||
+    s.reset ||
+    s.state == h2stClosed ||
+    s.state == h2stHCLocal) {
+    h2connFailMsg(cmd.replyCh, "http2: write on a tunnel stream that is not open")
+    return
+  }
+  if (s.writing) {
+    h2connFailMsg(cmd.replyCh, "http2: concurrent writes on one tunnel stream")
+    return
+  }
+  s.pendingData = cmd.response.body
+  s.pendingEnd = false
+  s.hasPending = true
+  s.writing = true
+  s.writeCh = cmd.replyCh
+  h2connFlushStream(st, s)
+}
+
+// End our half of a tunnel: an empty DATA frame carrying END_STREAM (RFC 8441
+// §5, an orderly close), and release the loop's hold.
+fn h2connCmdEnd(st: h2connState, cmd: h2connCmd) {
+  h2connTunnelRelease(st, cmd.streamId)
+  let (s, ok) = st.streams[cmd.streamId]
+  if (!ok || !s.tunnel || !s.replied || s.reset) {
+    return
+  }
+  if (s.state == h2stClosed || s.state == h2stHCLocal) {
+    return
+  }
+  h2connSendData(
+    st,
+    DataFrame{ streamId = s.id, data = []byte(0), endStream = true, padLength = 0 - 1 },
+  )
+  h2connLocalEnd(st, s)
+}
+
+// The handler that owned an accepted tunnel returned: end our half, and if the
+// peer has not ended its own, reset the stream with NO_ERROR so the entry and the
+// peer's credit are released (RFC 9113 §8.1 allows exactly this after a complete
+// response). The response the handler returned is discarded.
+fn h2connTunnelEnd(st: h2connState, s: h2connStream) {
+  h2connReleaseBody(st, s)
+  if (s.state != h2stHCLocal) {
+    h2connSendData(
+      st,
+      DataFrame{ streamId = s.id, data = []byte(0), endStream = true, padLength = 0 - 1 },
+    )
+    h2connLocalEnd(st, s)
+  }
+  if (s.state == h2stClosed) {
+    return
+  }
+  h2connSendRstStream(st, RstStreamFrame{ streamId = s.id, errorCode = errorNoError })
+  h2connCloseStream(st, s)
+}
+
+// A tunnel request the handler answered with an ordinary response instead of
+// accepting (a refusal): the response is complete but the peer's half is still
+// open, so reset it with NO_ERROR (RFC 9113 §8.1) rather than leave the stream
+// waiting for an END_STREAM that a refused client has no reason to send.
+fn h2connDeclinedTunnelEnd(st: h2connState, s: h2connStream) {
+  if (!s.tunnel || s.recvEnded || s.state == h2stClosed) {
+    return
+  }
+  h2connReleaseBody(st, s)
+  h2connSendRstStream(st, RstStreamFrame{ streamId = s.id, errorCode = errorNoError })
+  h2connCloseStream(st, s)
+}
+
+// Why a client request may not be sent, or "" when it may: the peer's header-list
+// limit (RFC 9113 §6.5.2, #4607) and the `:protocol` rules below, in that order.
+fn h2connOpenRefusal(st: h2connState, req: Request, fields: []HeaderField): string {
+  let listSize = h2connHeaderListSize(fields)
+  if (listSize > st.peerMaxHeaderListBytes) {
+    return h2connHeaderListMsg(listSize, st.peerMaxHeaderListBytes)
+  }
+  return h2connConnectRefusal(st, req)
+}
+
+// The client's checks before it sends `:protocol` (RFC 8441 §3, §4): the peer
+// must have advertised the setting, and the request must have the shape a server
+// accepts. The message, or "" when the request may go.
+fn h2connConnectRefusal(st: h2connState, req: Request): string {
+  if (req.protocol == "") {
+    return ""
+  }
+  if (!st.peerConnectProtocol) {
+    return "http2: peer did not advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441 §3)"
+  }
+  if (req.method != "CONNECT" || req.scheme == "" || req.authority == "" || req.path == "") {
+    return "http2: extended CONNECT needs :method CONNECT with :scheme, :authority and :path (RFC 8441 §4)"
+  }
+  return ""
+}
