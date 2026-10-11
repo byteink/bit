@@ -2485,8 +2485,16 @@ and nothing queued behind it, `main` included, runs until the call returns. That
 is the contract, not a gap to retake around: Go's `sysmon` hands a P off only from
 `_Psyscall` (`retake` / `handoffp` in `runtime/proc.go`), a state its cgo and
 syscall paths enter themselves (`cgocall` -> `entersyscall`), so a foreign call
-Go does not bracket cannot occur there; here the compiler emits no bracket around an `extern fn` call (SPEC
-section 11.7), so the caller brackets it. Teardown does not depend on
+Go does not bracket cannot occur there. Bit's compiler does the same for a user
+`extern fn` (#7842, SPEC section 11.7): every call is emitted as
+`bit_rt_gc_syscall_begin`, the call, `bit_rt_gc_syscall_end`, so the caller of an
+extern writes no bracket. Three things are not bracketed and keep the contract
+by hand: an extern declared in a module under `runtime/`, any `bit_rt_*` symbol
+wherever it is declared (the primitive brackets itself where it blocks), and a
+call to a declaration marked `@nonblocking`. The bracket costs +7.5 to +7.8 ns
+per call on aarch64 (macOS and Linux, Apple M5 Max) and +27.6 ns on x86-64
+(Core i7-14700KF); SPEC section 11.7 has the table. A callee under the bracket
+must not run Bit code. Teardown does not depend on
 it: a returned `main` joins the workers under ONE 100 ms deadline (`boot`, step 8)
 and the process exits with a worker still blocked.
 
