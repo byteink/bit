@@ -412,7 +412,8 @@ newline-sensitivity in the grammar.
 
 **Rule.** When a newline is about to be consumed as whitespace, the lexer inserts
 a `";"` token into the stream **if and only if** the last non-whitespace,
-non-comment token emitted on the line is one of the **terminator tokens**:
+non-comment token emitted on the line is one of the **terminator tokens** (listed
+below) **and** the next token is not a member dot (§7.1):
 
 - an `IDENT`;
 - any literal (`INT_LIT`, `FLOAT_LIT`, `STRING_LIT`, `RAW_STRING_LIT`, `RUNE_LIT`,
@@ -442,19 +443,25 @@ close needs no explicit separator: `type Ids = map<string, int>`, a
 `Opt<T>` all end their line naturally.
 
 **Consequence - line continuation.** A line that must continue onto the next line
-must end with a token that is **not** a terminator. In practice: leave a binary
-operator, a comma, an opening bracket, `=`, `=>`, `.`, or `<-` at the end of the
-line. Examples:
+must end with a token that is **not** a terminator, or the next line must start
+with a member dot (§7.1). In practice: leave a binary operator, a comma, an
+opening bracket, `=`, `=>`, `.`, or `<-` at the end of the line, or start the
+next line with `.name`. Examples:
 
 ```
 // Continues: line ends with '+', not a terminator.
 let total = a +
             b + c
 
-// Continues: line ends with '.', not a terminator.
+// Continues: the next line starts with a member dot (§7.1).
 let n = items
           .filter(isActive)
           .length()
+
+// Continues: line ends with '.', not a terminator.
+let m = items.
+          filter(isActive).
+          length()
 
 // Does NOT continue: 'x' is an IDENT (terminator) -> ';' inserted after it.
 let x = 1
@@ -507,8 +514,56 @@ restriction is deliberate, and identical to the one §17.2 documents for a wrapp
 since the offending token appears nowhere in the source.
 
 A conforming lexer implements this with one token of state (the previously emitted
-token kind) and a per-line "saw newline" flag. No lookahead beyond the current
-character is required.
+token kind) and a per-line "saw newline" flag, plus, at a newline that follows a
+terminator, a scan over the whitespace and comments ahead for the member dot of
+§7.1.
+
+### 7.1 Leading-dot continuation
+
+**Rule.** A line break after a terminator token does not end the statement when the
+next token is a **member dot**: after skipping any run of whitespace, blank lines,
+line comments and block comments, the next byte is a `.` that is not followed by
+another `.` and not followed by a decimal digit. No `";"` is synthesized, so the
+`.` continues the expression that the previous line left open:
+
+```text
+let n = items       // the dot below continues `items`
+  .filter(isActive) // a comment between the lines changes nothing
+  // another one
+  .map(double)
+  .length()
+```
+
+is the same token stream, apart from positions, as
+`let n = items.filter(isActive).map(double).length()`. The same holds after any
+terminator, so `f()?` followed by `.g()` continues too, and after `this`, a literal
+or a closing `)`/`]`/`}`. A trailing dot (`items.` at the end of a line, §7) remains
+valid and is unchanged.
+
+**Resolutions.** Every other token that can start with a `.` keeps its meaning,
+because the lexer's maximal munch already decides which token a `.` begins and the
+rule only fires when that token is the single-byte member dot:
+
+- `...` (variadic marker, spread, §6): a line starting `...` is not a member dot,
+  so the previous line still ends the statement.
+- `..`: there is no range operator. A line starting `..` is not a member dot, so the
+  previous line still ends the statement and the `..` is then a parse error as before.
+- `.5`, `.25e3`: a `.` followed by a digit begins a float literal (§5.5). A line
+  starting with one is a new statement, exactly as before; it is never read as a
+  tuple index on the previous line. Write `t.0` on one line.
+- `?.`: Bit has no optional chaining; `?` is error propagation or the conditional
+  (§12), and a leading-dot line after it continues the postfix chain.
+- A line holding only `.` continues the statement exactly as a trailing `.` does
+  (§7): the member name is the next token, and when that token is `}` the parser
+  reports "expected an identifier, found '}'".
+- A block comment that is never closed is not skipped over; the line break ends the
+  statement as before and the lexer reports the comment (E0003).
+- Inside a string, rune or raw string a newline is never a token boundary, and
+  JSX text is not tokenized, so a text line that starts with `.` is unaffected.
+
+The continuation is the only exception to §7: it does not make the lexer track
+bracket depth, and a statement that was valid before (one where no line starts with
+a member dot) lexes identically, because such a line was a parse error.
 
 ---
 
