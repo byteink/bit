@@ -1,0 +1,212 @@
+// pkg/redis/searchagg.bit - `FT.AGGREGATE`: the pipeline builder, its options
+// and the typed rows. Epic #6013, #6044. A pipeline is the ordered, repeatable
+// steps the command takes (`LOAD`, `GROUPBY`, `APPLY`, `SORTBY`, `FILTER`,
+// `LIMIT`), so it is a list built with one method per step:
+//
+//   agg().groupBy(["brand"], [Reducer{ reduce = Reduce.Avg("price"), alias = "avg" }])
+//     .sortBy("avg", desc = true).limit(0, 5)
+//
+// A field is written with or without its `@`. `FT.AGGREGATE index query
+// [VERBATIM] [LOAD ..] [TIMEOUT ms] steps.. [WITHCURSOR [COUNT n] [MAXIDLE ms]]
+// [PARAMS ..] [DIALECT d]`.
+
+// A `REDUCE` function. Fields are named with or without `@`.
+export enum Reduce {
+  Count,
+  CountDistinct(string),
+  CountDistinctIsh(string),
+  Sum(string),
+  Min(string),
+  Max(string),
+  Avg(string),
+  StdDev(string),
+  Quantile(string, f64),
+  ToList(string),
+  FirstValue(string),
+  FirstValueBy(string, string, bool),
+  RandomSample(string, i64),
+}
+
+// One `REDUCE`: the function and the name its result has in the row (`AS`);
+// the server names it after the function when `alias` is empty.
+export class Reducer {
+  export reduce: Reduce,
+  export alias: string = "",
+}
+
+// The steps of an `FT.AGGREGATE`, in order.
+export class AggPipeline {
+  steps: [][]string
+
+  // `LOAD n field..`: fields not in the index's sortable set, read from the
+  // documents.
+  export load(...fields: string): AggPipeline {
+    return this.plus(append(["LOAD", "${len(fields)}"], ...fields))
+  }
+  // `LOAD *`: every field of the document.
+  export loadAll(): AggPipeline { return this.plus(["LOAD", "*"]) }
+  // `GROUPBY n @field..` with a `REDUCE` for each reducer; no fields groups
+  // every row into one.
+  export groupBy(by: []string, reducers: []Reducer = []Reducer(0)): AggPipeline {
+    let t = ["GROUPBY", "${len(by)}"]
+    for f of by {
+      t = append(t, atField(f))
+    }
+    for r of reducers {
+      t = append(t, ...reduceArgs(r))
+    }
+    return this.plus(t)
+  }
+  // `APPLY expr AS alias`: a computed field (`@price * 1.2`).
+  export apply(expr: string, alias: string): AggPipeline {
+    return this.plus(["APPLY", expr, "AS", alias])
+  }
+  // `SORTBY 2 @field [DESC] [MAX n]`.
+  export sortBy(field: string, desc: bool = false, max: i64 = 0): AggPipeline {
+    let t = ["SORTBY", "2", atField(field), "ASC"]
+    if (desc) {
+      t = ["SORTBY", "2", atField(field), "DESC"]
+    }
+    return this.plus(append(t, ...optPos("MAX", max)))
+  }
+  // `FILTER expr`: keeps the rows the expression holds for.
+  export filter(expr: string): AggPipeline { return this.plus(["FILTER", expr]) }
+  // `LIMIT offset num`.
+  export limit(offset: i64, num: i64): AggPipeline {
+    return this.plus(["LIMIT", "${offset}", "${num}"])
+  }
+
+  plus(step: []string): AggPipeline { return AggPipeline{ steps = append(this.steps, step) } }
+}
+
+// An empty pipeline: the rows as the query matched them.
+export fn agg(): AggPipeline { return AggPipeline{ steps = [][]string(0) } }
+
+// `WITHCURSOR [COUNT n] [MAXIDLE ms]`: the first `count` rows now (the
+// server's default when 0), the rest through `Search.cursorRead`, which the
+// server forgets after `maxIdle` milliseconds without one (default when 0).
+export class CursorOptions {
+  export count: i64 = 0,
+  export maxIdle: i64 = 0,
+}
+
+// `FT.AGGREGATE`'s arguments besides the pipeline; unset leaves the default.
+// `params` adds `$name` values (name, value) to the ones the query carries; `dialect`
+// defaults to 2 for a query that carries params.
+export class AggregateOptions {
+  export verbatim: bool = false,
+  export timeout: Option<i64> = Option.None,
+  export cursor: Option<CursorOptions> = Option.None,
+  export params: []Field = []Field(0),
+  export dialect: Option<i64> = Option.None,
+}
+
+// One output row: the fields the pipeline produced, as the server sent them.
+export class AggRow {
+  export fields: []Field
+
+  // The field `name`; `None` when the row has none.
+  export field(name: string): Option<string> {
+    for f of this.fields {
+      if (f.name == name) {
+        return Option.Some(f.value)
+      }
+    }
+    return Option.None
+  }
+  // The field `name` as a number; `None` when absent or not one.
+  export num(name: string): Option<f64> {
+    match (this.field(name)) {
+      Some(s) => return readDouble(s)
+      None => return Option.None
+    }
+  }
+}
+
+// `FT.AGGREGATE`'s (and `FT.CURSOR READ`'s) answer: the rows, how many the
+// whole query produced, and the cursor id when `WITHCURSOR` was asked and rows
+// remain (0 once the cursor is exhausted).
+export class AggResult {
+  export total: i64,
+  export rows: []AggRow,
+  export cursor: i64,
+}
+
+fn atField(f: string): string {
+  if (len(f) > 0 && f[0:1] == "@") {
+    return f
+  }
+  return "@${f}"
+}
+
+fn reduceCall(r: Reduce): []string {
+  match (r) {
+    Count => return ["COUNT", "0"]
+    Quantile(f, q) => return ["QUANTILE", "2", atField(f), "${q}"]
+    FirstValueBy(f, by, desc) => return firstValueBy(f, by, desc)
+    RandomSample(f, n) => return ["RANDOM_SAMPLE", "2", atField(f), "${n}"]
+    ToList(f) => return ["TOLIST", "1", atField(f)]
+    FirstValue(f) => return ["FIRST_VALUE", "1", atField(f)]
+    _ => return reduceOne(r)
+  }
+}
+
+// The reducers that take exactly one field.
+fn reduceOne(r: Reduce): []string {
+  match (r) {
+    CountDistinct(f) => return ["COUNT_DISTINCT", "1", atField(f)]
+    CountDistinctIsh(f) => return ["COUNT_DISTINCTISH", "1", atField(f)]
+    Sum(f) => return ["SUM", "1", atField(f)]
+    Min(f) => return ["MIN", "1", atField(f)]
+    Max(f) => return ["MAX", "1", atField(f)]
+    Avg(f) => return ["AVG", "1", atField(f)]
+    StdDev(f) => return ["STDDEV", "1", atField(f)]
+    _ => panic("reduceOne: not a one-field reducer")
+  }
+}
+
+fn firstValueBy(f: string, by: string, desc: bool): []string {
+  if (desc) {
+    return ["FIRST_VALUE", "4", atField(f), "BY", atField(by), "DESC"]
+  }
+  return ["FIRST_VALUE", "3", atField(f), "BY", atField(by)]
+}
+
+fn reduceArgs(r: Reducer): []string {
+  let t = append(["REDUCE"], ...reduceCall(r.reduce))
+  if (r.alias != "") {
+    t = append(t, "AS", r.alias)
+  }
+  return t
+}
+
+fn cursorArgs(c: Option<CursorOptions>): []string {
+  match (c) {
+    None => return []string(0)
+    Some(v) => {
+      let args = optPos("COUNT", v.count)
+      args = append(args, ...optPos("MAXIDLE", v.maxIdle))
+      return append(["WITHCURSOR"], ...args)
+    }
+  }
+}
+
+fn aggregateArgs(index: string, q: Query, p: AggPipeline, o: AggregateOptions): []string {
+  let args = append(["FT.AGGREGATE", index, q.expr], ...flagIf(o.verbatim, "VERBATIM"))
+  // `LOAD` is the one step the docs list before `TIMEOUT`; the rest follow it.
+  let rest = [][]string(0)
+  for s of p.steps {
+    if (s[0] == "LOAD") {
+      args = append(args, ...s)
+    } else {
+      rest = append(rest, s)
+    }
+  }
+  args = append(args, ...optInt("TIMEOUT", o.timeout))
+  for s of rest {
+    args = append(args, ...s)
+  }
+  args = append(args, ...cursorArgs(o.cursor))
+  args = append(args, ...paramArgs(q, o.params))
+  return append(args, ...dialectArgs(q, o.params, o.dialect))
+}

@@ -76,3 +76,5 @@ TLS these methods run over.
 [Requests per minute: time series](timeseries.md) covers the `TS.*` commands behind `r.timeseries(key)`.
 
 [Similar players and per-round scores](vectors-and-arrays.md) covers the `V*` commands behind `r.vset(key)` and the `AR*` commands behind `r.array(key)`.
+
+[Searching articles](search.md) covers the `FT.*` commands behind `r.search(index)`.

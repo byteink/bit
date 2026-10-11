@@ -1,0 +1,253 @@
+// pkg/redis/searchquery.bit - the typed half of `FT.SEARCH`'s query: a
+// builder for the common cases and `rawQuery` for the rest. Epic #6013, #6044.
+//
+//   qfield("name").text("red shoe")                   @name:(red shoe)
+//     .and(qfield("brand").anyOf("acme", "zeta"))      @brand:{acme|zeta}
+//     .and(qfield("price").between(10.0, 50.0))        @price:[10 50]
+//
+// Every term a caller passes is escaped, so a customer's search box can go
+// into `text(..)` as typed. `knn(..)` and `vectorRange(..)` add the vector
+// clause and carry the `PARAMS` the blob travels in: a `Query` is its text
+// plus those parameters, and `and`/`or` merge both. Pure functions of their
+// inputs, so `search.test.bit` checks every expression without a server.
+
+import { f32sToLe } from "std/math"
+
+// How a `GEOSHAPE` field relates to the shape a query gives: its documents lie
+// `Within` it, `Contain` it, `Intersect` it, or are `Disjoint` from it.
+export enum ShapeOp {
+  Within,
+  Contain,
+  Intersect,
+  Disjoint,
+}
+
+// A query: the text `FT.SEARCH` takes and the `PARAMS` it refers to (name,
+// value, name, value, ...). Pass it to `Search.find`.
+export class Query {
+  export expr: string
+  export params: []string = []string(0)
+
+  // `(a) (b)`: both match.
+  export and(other: Query): Query { return this.join(" ", other) }
+  // `(a)|(b)`: either matches.
+  export or(other: Query): Query { return this.join("|", other) }
+  // `-(a)`: matches what `a` does not.
+  export not(): Query { return Query{ expr = "-(${this.expr})", params = this.params } }
+  // `~(a)`: a match raises the score, no match does not exclude.
+  export optional(): Query { return Query{ expr = "~(${this.expr})", params = this.params } }
+  // `(a) => { $weight: w; }`: scales this clause's share of the score.
+  export weighted(w: f64): Query {
+    return Query{ expr = "(${this.expr}) => { $weight: ${w}; }", params = this.params }
+  }
+
+  join(sep: string, other: Query): Query {
+    return Query{
+      expr = "(${this.expr})${sep}(${other.expr})",
+      params = append(this.params, ...other.params),
+    }
+  }
+}
+
+// `*`: every document.
+export fn everything(): Query { return Query{ expr = "*" } }
+
+// `expr` as written, for anything the builder leaves out. Escape it yourself.
+export fn rawQuery(expr: string): Query { return Query{ expr = expr } }
+
+// Free text over every text field: each word of `text` must be present.
+export fn freeText(text: string): Query { return Query{ expr = escapeText(text) } }
+
+// `qfield(name)`: what to test a field against; the method says which kind
+// of field the query is for.
+export class QField {
+  export name: string
+
+  // `@name:(w1 w2 ..)`: every word is present.
+  export text(text: string): Query {
+    return Query{ expr = "@${this.name}:(${escapeText(text)})" }
+  }
+  // `@name:"a phrase"`: the words, in this order, next to each other.
+  export phrase(text: string): Query {
+    return Query{ expr = "@${this.name}:\"${escapePhrase(text)}\"" }
+  }
+  // `@name:(w1|w2|..)`: any of the words is present.
+  export anyWord(...terms: string): Query {
+    return Query{ expr = "@${this.name}:(${joinWith(escapeAll(terms), "|")})" }
+  }
+  // `@name:term*`.
+  export prefix(term: string): Query {
+    return Query{ expr = "@${this.name}:${escapeText(term)}*" }
+  }
+  // `@name:*term` (needs `suffixTrie` on the field for speed).
+  export suffix(term: string): Query {
+    return Query{ expr = "@${this.name}:*${escapeText(term)}" }
+  }
+  // `@name:*term*`.
+  export infix(term: string): Query {
+    return Query{ expr = "@${this.name}:*${escapeText(term)}*" }
+  }
+  // `@name:%term%`: within `distance` (1 to 3) edits of `term`.
+  export fuzzy(term: string, distance: i64 = 1): Query {
+    let q = repeatText("%", distance)
+    return Query{ expr = "@${this.name}:${q}${escapeText(term)}${q}" }
+  }
+  // `@name:{a|b}`: the tag is one of `values`.
+  export anyOf(...values: string): Query {
+    return Query{ expr = "@${this.name}:{${joinWith(escapeTags(values), "|")}}" }
+  }
+  // `@name:[min max]`: `min <= value <= max`.
+  export between(lo: f64, hi: f64): Query {
+    return Query{ expr = "@${this.name}:[${lo} ${hi}]" }
+  }
+  // `@name:[n n]`.
+  export eq(n: f64): Query { return Query{ expr = "@${this.name}:[${n} ${n}]" } }
+  // `@name:[(n +inf]`.
+  export gt(n: f64): Query { return Query{ expr = "@${this.name}:[(${n} +inf]" } }
+  // `@name:[n +inf]`.
+  export ge(n: f64): Query { return Query{ expr = "@${this.name}:[${n} +inf]" } }
+  // `@name:[-inf (n]`.
+  export lt(n: f64): Query { return Query{ expr = "@${this.name}:[-inf (${n}]" } }
+  // `@name:[-inf n]`.
+  export le(n: f64): Query { return Query{ expr = "@${this.name}:[-inf ${n}]" } }
+  // `@name:[lon lat radius unit]`: a geo field within `radius` of a point.
+  export near(lon: f64, lat: f64, radius: f64, unit: GeoUnit = GeoUnit.Kilometers): Query {
+    return Query{ expr = "@${this.name}:[${lon} ${lat} ${radius} ${unit.text()}]" }
+  }
+  // `@name:[WITHIN $shape]` (or `CONTAINS`, `INTERSECTS`, `DISJOINT`): a
+  // geometry field against `wkt`, a WKT point or polygon, which travels as a
+  // param (so the query needs dialect 2 or later; `find` sends it).
+  export shape(op: ShapeOp, wkt: string): Query {
+    let key = "shape_${this.name}"
+    return Query{
+      expr = "@${this.name}:[${shapeWord(op)} $${key}]",
+      params = [key, wkt],
+    }
+  }
+  // `ismissing(@name)`: the document has no such field (needs `indexMissing`).
+  export missing(): Query { return Query{ expr = "ismissing(@${this.name})" } }
+}
+
+export fn qfield(name: string): QField { return QField{ name = name } }
+
+// `(filter)=>[KNN k @field $vec AS score]`: the `k` documents whose `field`
+// vector is nearest `vector`, among those matching `filter` (every document
+// by default); each hit's distance is in the `score` field (`__<field>_score`
+// when `score` is empty). The vector goes as a `PARAMS` FP32 blob, which
+// needs dialect 2 or later (`Search.find` sends 2 for a query with params).
+export fn knn(
+  field: string,
+  vector: []f32,
+  k: i64,
+  filter: Query = everything(),
+  score: string = "",
+): Query {
+  let tail = ""
+  if (score != "") {
+    tail = " AS ${score}"
+  }
+  let head = filter.expr
+  if (head != "*") {
+    head = "(${head})"
+  }
+  return Query{
+    expr = "${head}=>[KNN ${k} @${field} $knnvec${tail}]",
+    params = append(filter.params, "knnvec", string(f32sToLe(vector))),
+  }
+}
+
+// `@field:[VECTOR_RANGE radius $vrvec]`: every document whose `field` vector
+// is within `radius` of `vector`.
+export fn vectorRange(field: string, vector: []f32, radius: f64): Query {
+  return Query{
+    expr = "@${field}:[VECTOR_RANGE ${radius} $vrvec]",
+    params = ["vrvec", string(f32sToLe(vector))],
+  }
+}
+
+// ------------------------------------------------------------------ escaping
+
+fn shapeWord(op: ShapeOp): string {
+  match (op) {
+    Within => return "WITHIN"
+    Contain => return "CONTAINS"
+    Intersect => return "INTERSECTS"
+    Disjoint => return "DISJOINT"
+  }
+}
+
+fn isWordByte(c: byte): bool {
+  let n = int(c)
+  if (n >= 128 || n == 95) {
+    return true
+  }
+  return (n >= 48 && n <= 57) || (n >= 65 && n <= 90) || (n >= 97 && n <= 122)
+}
+
+// `s` with every ASCII punctuation byte backslash-escaped; spaces are kept
+// when `keepSpace` (words stay separate terms), escaped otherwise (a tag
+// value holding a space stays one value).
+fn escapeWith(s: string, keepSpace: bool): string {
+  let src = []byte(s)
+  let out = []byte(0)
+  for c of src {
+    if (!isWordByte(c) && !(keepSpace && c == byte(32))) {
+      out = append(out, byte(92))
+    }
+    out = append(out, c)
+  }
+  return string(out)
+}
+
+fn escapeText(s: string): string { return escapeWith(s, true) }
+
+// Inside a `"phrase"` only the quote and the backslash are special.
+fn escapePhrase(s: string): string {
+  let out = []byte(0)
+  for c of []byte(s) {
+    if (c == byte(34) || c == byte(92)) {
+      out = append(out, byte(92))
+    }
+    out = append(out, c)
+  }
+  return string(out)
+}
+
+fn escapeAll(values: []string): []string {
+  let out = []string(0)
+  for v of values {
+    out = append(out, escapeText(v))
+  }
+  return out
+}
+
+fn escapeTags(values: []string): []string {
+  let out = []string(0)
+  for v of values {
+    out = append(out, escapeWith(v, false))
+  }
+  return out
+}
+
+fn joinWith(values: []string, sep: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(values)) {
+    if (i > 0) {
+      out = out + sep
+    }
+    out = out + values[i]
+    i = i + 1
+  }
+  return out
+}
+
+fn repeatText(s: string, n: i64): string {
+  let out = ""
+  let i = 0
+  while (i < n && i < 3) {
+    out = out + s
+    i = i + 1
+  }
+  return out
+}
