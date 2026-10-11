@@ -48,6 +48,7 @@ export class Authz<A: ActionEnum> {
   relations: RelationStore
   limits: Limits
   state: DecideState<A>
+  tenant: TenantKey
 
   // One handle per app, built at startup. Empty `store` means in-memory.
   // A class's `init` is the constructor (SPEC §10.4): `Authz<Action>(...)`.
@@ -69,12 +70,33 @@ export class Authz<A: ActionEnum> {
     }
     this.relations = MemoryRelationStore()
     this.state = DecideState<A>()
+    this.tenant = globalTenant()
     this.wildcard = hasName(names, "Manage")
     this.crud = CrudActions{
       read = hasName(names, "Read"),
       create = hasName(names, "Create"),
       update = hasName(names, "Update"),
       delete = hasName(names, "Delete"),
+    }
+  }
+
+  // The view of this handle for `tenant` (tenant.bit has what a tenant sees
+  // and may write): `authz.forTenant(currentTenant(c))?.check(user, ...)`.
+  // It shares everything with this handle, so it is cheap enough to make per
+  // request, and policies registered or saved later show in it. An empty
+  // tenant is the global one; otherwise 1 to 64 characters of `[A-Za-z0-9_.-]`,
+  // else an InvalidPolicy.
+  export forTenant(tenant: string): Authz<A>! {
+    let k = tenantKeyOf(tenant)?
+    return Authz<A>{
+      store = this.store,
+      admin = this.admin,
+      wildcard = this.wildcard,
+      crud = this.crud,
+      relations = this.relations,
+      limits = this.limits,
+      state = this.state,
+      tenant = k,
     }
   }
 
@@ -119,21 +141,30 @@ export class Authz<A: ActionEnum> {
   // already exists is a no-op.
   export relate(subject: string, relation: string, object: string): ()! {
     let reg = this.registered()
-    this.relations.write(checkTuple(reg.resources, reg.decls, subject, relation, object)?)?
+    this.relations.write(
+      this.tenant.name,
+      checkTuple(reg.resources, reg.decls, subject, relation, object)?,
+    )?
   }
 
   // Removes the tuple `relate` wrote; removing one that is not there is a
   // no-op. The same validation applies.
   export unrelate(subject: string, relation: string, object: string): ()! {
     let reg = this.registered()
-    this.relations.delete(checkTuple(reg.resources, reg.decls, subject, relation, object)?)?
+    this.relations.delete(
+      this.tenant.name,
+      checkTuple(reg.resources, reg.decls, subject, relation, object)?,
+    )?
   }
 
   // Whether that exact tuple was written. Direct only: a userset subject is
   // matched as the literal "team:eng#member", never expanded.
   export related(subject: string, relation: string, object: string): bool! {
     let reg = this.registered()
-    return this.relations.has(checkTuple(reg.resources, reg.decls, subject, relation, object)?)?
+    return this.relations.has(
+      this.tenant.name,
+      checkTuple(reg.resources, reg.decls, subject, relation, object)?,
+    )?
   }
 
   // Whether `subject` holds `relation` on `object` through any chain of
@@ -144,7 +175,7 @@ export class Authz<A: ActionEnum> {
   export hasRelation(subject: string, relation: string, object: string): bool! {
     let reg = this.registered()
     let t = checkTuple(reg.resources, reg.decls, subject, relation, object)?
-    return walk(this.relations, reg.decls, this.limits, t) catch e {
+    return walk(this.relations, this.tenant.name, reg.decls, this.limits, t) catch e {
       logStoreDown(loggerOf<A>(reg), e)
       fail e
     }
@@ -224,6 +255,9 @@ export class Authz<A: ActionEnum> {
   // Safe behind an admin endpoint: input is bounded (doc.bit) and nothing here
   // panics.
   export savePolicy(doc: PolicyDoc): ()! {
+    if (this.tenant.name != "") {
+      fail InvalidPolicy{ detail = "a policy is global: save it on the handle, not on the view for tenant '${this.tenant.name}'" }
+    }
     let cp = this.validateDoc(doc)?
     if (codePolicyNamed<A>(this.registered().roles, doc.name)) {
       fail InvalidPolicy{ detail = "/name: a policy written in code is called '${doc.name}'" }
@@ -241,34 +275,38 @@ export class Authz<A: ActionEnum> {
   // (doc.bit has the document): `attach(Attachment{ policy = "PublishOwnTeam",
   // to = Target{ role = Option<string>.Some("author") }, tenant = "" })`.
   // Checked as `validateAttachment` checks it, and the policy must be saved
-  // already, else an InvalidPolicy. Attaching what is attached is a no-op.
+  // already, else an InvalidPolicy. Attaching what is attached is a no-op. On
+  // a tenant's view the attachment is written for that tenant (tenant.bit).
   export attach(a: Attachment): ()! {
     checkAttachment(a)?
+    let at = attachmentIn(this.tenant.name, a)?
     this.admin.lock()
     defer this.admin.unlock()
-    if (!isSome(this.store.policy(a.policy)?)) {
-      fail InvalidPolicy{ detail = "/policy: no stored policy is called '${a.policy}'" }
+    if (!isSome(this.store.policy(at.policy)?)) {
+      fail InvalidPolicy{ detail = "/policy: no stored policy is called '${at.policy}'" }
     }
     let before = this.store.version()?
-    this.store.attach(a)?
+    this.store.attach(at)?
     if (this.store.version()? == before) {
       return
     }
-    this.state.cache.publishStored(storedWithAttachment<A>(this.registered().stored, a))
+    this.state.cache.publishStored(storedWithAttachment<A>(this.registered().stored, at))
   }
 
   // Undoes `attach`: from the target's next check the policy no longer
-  // applies to it. Detaching what is not attached is a no-op.
+  // applies to it. Detaching what is not attached is a no-op. On a tenant's
+  // view it detaches that tenant's attachment (tenant.bit).
   export detach(a: Attachment): ()! {
     checkAttachment(a)?
+    let at = attachmentIn(this.tenant.name, a)?
     this.admin.lock()
     defer this.admin.unlock()
     let before = this.store.version()?
-    this.store.detach(a)?
+    this.store.detach(at)?
     if (this.store.version()? == before) {
       return
     }
-    this.state.cache.publishStored(storedWithoutAttachment<A>(this.registered().stored, a))
+    this.state.cache.publishStored(storedWithoutAttachment<A>(this.registered().stored, at))
   }
 
   // The stored policy called `name`, as it was saved, or None.
@@ -328,7 +366,13 @@ export class Authz<A: ActionEnum> {
   // policy written for another subject class add no rules and a line to
   // `skipped`, so a subject can only lose access to a mistake.
   export rolesOf(s: Subject): Resolved<A> {
-    return resolveRoles<A>(this.registered(), s, this.state.cache.none.held, false)
+    return resolveRoles<A>(
+      this.registered(),
+      s,
+      this.state.cache.none.held,
+      false,
+      this.tenant.name,
+    )
   }
 
   // Fails with a `NotFilterable` naming the policy and label when a rule that

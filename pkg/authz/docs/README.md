@@ -10,3 +10,4 @@
 | [Policies](policies.md) | `Policy`, `Rules`, `Rule` and `Effect`: `can`, `cannot`, `canAll`, `cannotAll`, `rulesFor`, and `validatePolicy` at startup; roles that bundle them: `role`, `roleNames`, `checkRoles`, `rolesOf` and `Resolved` |
 | [Deciding](decisions.md) | `can` and `check` on `Authz`: deny wins, default deny, `Manage`, the guest as `None`, `logTo`, the decision log and `Denied`, rules that are wrong at request time |
 | [Stored policies](stored.md) | Policies an admin saves at runtime: `savePolicy` with a `PolicyDoc`, `attach` and `detach` to a role, a group or one `Target` user, `policy`, how they combine with code policies, `subject`, and `PolicyStore` with `MemoryStore` |
+| [Tenants](tenants.md) | `forTenant` views for multi-tenant apps: global and per-tenant attachments, what a view may write, per-tenant relationship tuples and the tenant argument of `RelationStore` |
