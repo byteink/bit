@@ -1,0 +1,503 @@
+// pkg/web/idempotencysql.bit - `SqlIdempotencyStore`: `IdempotencyStore`
+// (idempotency.bit) over a `std/sql` `Pool`, for an app that runs on more than
+// one process and already has PostgreSQL or MySQL. Epic #6061, #6098.
+//
+//     let db = pool(postgresAdapter(), Datasource{ uri = env("DATABASE_URL") })?
+//     migrateSqlIdempotency(db)?
+//     let store = SqlIdempotencyStore(db)?
+//     app.use(idempotency(IdempotencyPolicy{ store = store, ttl = 86400 }))
+//
+// WHY THIS LIVES IN `web` AND THE REDIS STORE DOES NOT. `std/sql` is
+// standard library, so this file adds no package dependency to `web`; the
+// application builds the `Pool` with whichever driver package it already
+// uses (`postgres`, `mysql`) and hands it in, as `jobs`' `SqlStore` takes one.
+// A Redis client is a package, so its store is `webredis` (#7861).
+//
+// ONE TABLE, ONE ROW PER KEY (`sqlIdempotencyMigration`). The primary key is
+// the SHA-256 of the client-supplied `Idempotency-Key`, hex: a header value has
+// no length limit and no character set, and a table column has both, so
+// hashing makes every key one fixed-width, collation-free ASCII value on both
+// engines. `fingerprint`, `headers` and `body` are binary columns (`BYTEA`,
+// `LONGBLOB`) because a response body is bytes, not text.
+//
+// `begin` IS ONE ATOMIC INSERT, THEN A READ. The insert only ever creates the
+// row when the key is absent: PostgreSQL `INSERT ... ON CONFLICT (key_hash) DO
+// NOTHING` (https://www.postgresql.org/docs/current/sql-insert.html, "ON
+// CONFLICT Clause"), MySQL `INSERT ... ON DUPLICATE KEY UPDATE key_hash =
+// key_hash`, a no-op update that swallows only a duplicate-key error where
+// `INSERT IGNORE` would also swallow truncation and conversion errors
+// (https://dev.mysql.com/doc/refman/8.4/en/insert-on-duplicate.html). The
+// primary key serializes concurrent inserts of one key, so of N racing
+// callers exactly one inserts. Neither engine says reliably which caller that
+// was (MySQL's affected-row count depends on a client flag), so the caller
+// READS the row back: it won iff the stored token is the one it just minted.
+// A 128-bit token nobody else has seen cannot be there by accident. Both
+// statements run on one pinned writer connection (`Pool.pinned`), so a read
+// replica's lag cannot hide the row just written.
+//
+// EXPIRY IS THE DATABASE'S CLOCK. `expires_at` is written and compared with
+// the server's own `NOW()` (PostgreSQL) or `UTC_TIMESTAMP(6)` (MySQL), never a
+// time the application computed, so servers with skewed clocks agree on when a
+// key lapses. An expired row is not treated as a claim: `begin` finds it,
+// deletes it with a statement that is itself conditional on `expires_at`, and
+// inserts again, so a key whose window ended is immediately reusable without
+// `purge()`. The loop is bounded (`claimAttempts`); a row that keeps changing
+// under it is an error, not a spin.
+//
+// `finish` AND `abandon` ARE ONE CONDITIONAL STATEMENT EACH (#7832):
+// `WHERE key_hash = ? AND token = ? AND state = 0` (and, for `finish`, not yet
+// expired). A handler that outlived `ttl` no longer holds the row, a retry may
+// have inserted its own reservation under the same key, and a statement that
+// named only the key would overwrite or delete that one. Zero rows changed is
+// success: the caller has nothing left to protect. A finished row carries an
+// empty token, so no caller's token matches it.
+//
+// A FAILED `begin` IS NEVER RETRIED HERE. If the insert committed and its
+// reply was lost, the row stays reserved until `ttl` ends and a retry sees
+// `InFlight` (409), the safe direction.
+//
+// `purge()` deletes every expired row. Expired rows are harmless to
+// correctness, since `begin` ignores them, so `purge()` is table hygiene: run
+// it on a schedule (a `jobs` cron entry, a cron job calling the app).
+//
+// Names bound module-wide by other files here and so not imported again: `now`,
+// `Sha256`/`digest`/`encodeHex`, `Header`, `Option`/`isSome`/`unwrap`. `Pool`,
+// `Executor`, `Value`, `Rows` and `asInt` are this file's own `std/sql`
+// imports.
+
+import { Pool, Executor, Value, Rows, asInt } from "std/sql"
+
+// The engines `SqlIdempotencyStore` speaks. `MySql` is the dialect of MySQL
+// 8.0+ and MariaDB 10.6+.
+export enum IdempotencyDialect { Postgres, MySql }
+
+// Longest `ttl` accepted, seconds (about 63 years). It keeps `NOW() + ttl`
+// inside every engine's timestamp range, so an absurd value is refused instead
+// of becoming a database error.
+const maxSqlIdempotencyTtl: i64 = 2_000_000_000
+
+// How many times `begin` re-runs its insert after finding the row gone or
+// expired. One pass is the norm; each extra pass means another caller changed
+// the same key between this caller's two statements.
+const claimAttempts: int = 4
+
+const stateInFlight: int = 0
+const stateDone: int = 1
+
+// The oldest releases the statements below are verified on.
+const mysqlMinMajor: int = 8
+const mariadbMinMajor: int = 10
+const mariadbMinMinor: int = 6
+
+// --- dialect ---------------------------------------------------------------
+
+// What `SELECT version()` said, as the dialect it names. PostgreSQL reports
+// `PostgreSQL 18.6 ...`, MySQL `8.4.0`, MariaDB `11.4.2-MariaDB`: the one
+// statement both engines answer (`jobs` detects its dialect the same way).
+fn idempotencyDialectOf(version: string): IdempotencyDialect! {
+  if (hasVersionPrefix(version, "PostgreSQL ")) {
+    return IdempotencyDialect.Postgres
+  }
+  let major = leadingNumber(version, 0)
+  let minor = leadingNumber(version, afterDot(version))
+  if (indexOf(version, "MariaDB") >= 0) {
+    if (major > mariadbMinMajor || (major == mariadbMinMajor && minor >= mariadbMinMinor)) {
+      return IdempotencyDialect.MySql
+    }
+  } else if (major >= mysqlMinMajor) {
+    return IdempotencyDialect.MySql
+  }
+  fail newError("web: SqlIdempotencyStore supports PostgreSQL, MySQL 8 or newer and MariaDB 10.6 or newer; the server reported '${version}'")
+}
+
+fn hasVersionPrefix(s: string, prefix: string): bool {
+  return len(s) >= len(prefix) && s[0:len(prefix)] == prefix
+}
+
+// The decimal number starting at byte `from`, or -1 when there is none.
+fn leadingNumber(s: string, from: int): int {
+  let n = 0
+  let digits = 0
+  let i = from
+  while (i >= 0 && i < len(s) && s[i] >= u8(48) && s[i] <= u8(57) && digits < 9) {
+    n = n * 10 + int(s[i]) - 48
+    digits = digits + 1
+    i = i + 1
+  }
+  if (digits == 0) {
+    return -1
+  }
+  return n
+}
+
+// The byte after the first '.', or -1 when there is none.
+fn afterDot(s: string): int {
+  let at = indexOf(s, ".")
+  if (at < 0) {
+    return -1
+  }
+  return at + 1
+}
+
+fn detectIdempotencyDialect(db: Pool): IdempotencyDialect! {
+  let rows = db.query("SELECT version()", []Value(0))?
+  let has = rows.next() catch e {
+    rows.close()
+    fail e
+  }
+  if (!has) {
+    rows.close()
+    fail newError("web: SqlIdempotencyStore: the database returned no version")
+  }
+  let version = cellText(rows.value(0)) catch e {
+    rows.close()
+    fail e
+  }
+  rows.close()
+  return idempotencyDialectOf(version)?
+}
+
+// --- schema ----------------------------------------------------------------
+
+// The statements that create the table, one per entry: the extended protocol
+// every `std/sql` driver speaks refuses more than one command per statement.
+// Not run by `SqlIdempotencyStore` itself; the application owns its migration
+// tool, or calls `migrateSqlIdempotency`. `state` is 0 while the handler runs
+// and 1 once its response is stored.
+//
+// MySQL keeps `key_hash` and `token` in `ascii_bin`: the default collation is
+// case-insensitive, which would make two tokens that differ in case one.
+export fn sqlIdempotencyMigration(dialect: IdempotencyDialect): []string {
+  match (dialect) {
+    Postgres => return [
+        "CREATE TABLE IF NOT EXISTS bit_idempotency (\n" +
+        "  key_hash TEXT PRIMARY KEY,\n" +
+        "  fingerprint BYTEA NOT NULL,\n" +
+        "  token TEXT NOT NULL,\n" +
+        "  state SMALLINT NOT NULL,\n" +
+        "  status INTEGER NOT NULL,\n" +
+        "  headers BYTEA NOT NULL,\n" +
+        "  body BYTEA NOT NULL,\n" +
+        "  expires_at TIMESTAMPTZ NOT NULL\n" +
+        ")",
+      "CREATE INDEX IF NOT EXISTS bit_idempotency_expires ON bit_idempotency (expires_at)",
+    ]
+    MySql => return [
+        "CREATE TABLE IF NOT EXISTS bit_idempotency (\n" +
+        "  key_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,\n" +
+        "  fingerprint LONGBLOB NOT NULL,\n" +
+        "  token VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n" +
+        "  state TINYINT NOT NULL,\n" +
+        "  status INT NOT NULL,\n" +
+        "  headers LONGBLOB NOT NULL,\n" +
+        "  body LONGBLOB NOT NULL,\n" +
+        "  expires_at DATETIME(6) NOT NULL,\n" +
+        "  INDEX bit_idempotency_expires (expires_at)\n" +
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    ]
+  }
+}
+
+// Creates the table for the dialect `db`'s server speaks. Safe to run again.
+export fn migrateSqlIdempotency(db: Pool): ()! {
+  let dialect = detectIdempotencyDialect(db)?
+  for stmt of sqlIdempotencyMigration(dialect) {
+    db.exec(stmt, []Value(0))?
+  }
+}
+
+// --- statements ------------------------------------------------------------
+
+// Every statement the store sends, built once per dialect. They differ in
+// the clock expression and in the insert-if-absent spelling, nothing else.
+class idemSql {
+  insert: string,
+  read: string,
+  deleteStale: string,
+  finish: string,
+  abandon: string,
+  purge: string,
+}
+
+fn idempotencyStatements(dialect: IdempotencyDialect): idemSql {
+  let nowExpr = sqlNow(dialect)
+  let ttlInsert = sqlNowPlus(dialect, "$4")
+  let ttlFinish = sqlNowPlus(dialect, "$6")
+  return idemSql{
+    insert = "INSERT INTO bit_idempotency (key_hash, fingerprint, token, state, status, headers, body, expires_at) " +
+      "VALUES ($1, $2, $3, 0, 0, '', '', ${ttlInsert})" +
+      insertTail(dialect),
+    read = "SELECT fingerprint, token, state, status, headers, body, " +
+      "CASE WHEN expires_at <= ${nowExpr} THEN 1 ELSE 0 END FROM bit_idempotency WHERE key_hash = $1",
+    deleteStale = "DELETE FROM bit_idempotency WHERE key_hash = $1 AND expires_at <= ${nowExpr}",
+    finish = "UPDATE bit_idempotency SET state = 1, token = '', status = $3, headers = $4, body = $5, " +
+      "expires_at = ${ttlFinish} WHERE key_hash = $1 AND token = $2 AND state = 0 AND expires_at > ${nowExpr}",
+    abandon = "DELETE FROM bit_idempotency WHERE key_hash = $1 AND token = $2 AND state = 0",
+    purge = "DELETE FROM bit_idempotency WHERE expires_at <= ${nowExpr}",
+  }
+}
+
+fn sqlNow(dialect: IdempotencyDialect): string {
+  match (dialect) {
+    Postgres => return "NOW()"
+    MySql => return "UTC_TIMESTAMP(6)"
+  }
+}
+
+// The clock plus the seconds in placeholder `n`. The PostgreSQL cast is
+// explicit: `bigint * interval` has no operator, `double precision * interval`
+// does, and the parameter's own type is the driver's business.
+fn sqlNowPlus(dialect: IdempotencyDialect, n: string): string {
+  match (dialect) {
+    Postgres => return "NOW() + ${n}::float8 * INTERVAL '1 second'"
+    MySql => return "UTC_TIMESTAMP(6) + INTERVAL ${n} SECOND"
+  }
+}
+
+fn insertTail(dialect: IdempotencyDialect): string {
+  match (dialect) {
+    Postgres => return " ON CONFLICT (key_hash) DO NOTHING"
+    MySql => return " ON DUPLICATE KEY UPDATE key_hash = key_hash"
+  }
+}
+
+// --- the store -------------------------------------------------------------
+
+// The store. One per `Pool`; a `Pool` is safe for concurrent callers, so one
+// store backs every request.
+export class SqlIdempotencyStore {
+  db: Pool
+  sql: idemSql
+
+  // Fails when the server is not PostgreSQL, MySQL 8+ or MariaDB 10.6+, so a
+  // store the server cannot serve never exists.
+  init(db: Pool)! {
+    this.db = db
+    this.sql = idempotencyStatements(detectIdempotencyDialect(db)?)
+  }
+
+  // Reserves `key` for `ttl` seconds and returns the reservation token to the
+  // one caller that created it; every other caller gets the entry as it
+  // stands, with an empty token.
+  export begin(key: string, fingerprint: string, ttl: i64): IdempotencyClaim! {
+    checkSqlTtl(ttl)?
+    let args = [
+      Value.Text(keyHash(key)),
+      Value.Blob([]byte(fingerprint)),
+      Value.Text(newReservationToken()),
+      Value.Int(ttl),
+    ]
+    return this.db.pinned<IdempotencyClaim>((ex) => {
+      return claimOn(ex, this.sql, args)?
+    })?
+  }
+
+  // Stores `resp` under `key` for `ttl` seconds counted from this call, but
+  // only while the key still holds the unexpired reservation `token` names.
+  // Anything else is left alone and the call succeeds.
+  export finish(key: string, token: string, resp: CachedResponse, ttl: i64): ()! {
+    checkSqlTtl(ttl)?
+    if (len(token) > 0) {
+      let args = [
+        Value.Text(keyHash(key)),
+        Value.Text(token),
+        Value.Int(resp.status),
+        Value.Blob([]byte(encodeHeaders(resp.headers))),
+        Value.Blob([]byte(resp.body)),
+        Value.Int(ttl),
+      ]
+      this.db.exec(this.sql.finish, args)?
+    }
+  }
+
+  // Deletes the reservation `token` names so a retry can run at once; a key
+  // holding anyone else's reservation, or a finished response, is left alone.
+  export abandon(key: string, token: string): ()! {
+    if (len(token) > 0) {
+      this.db.exec(this.sql.abandon, [Value.Text(keyHash(key)), Value.Text(token)])?
+    }
+  }
+
+  // Deletes every row whose window has ended and returns how many. See the
+  // file header: this is hygiene, `begin` is correct without it.
+  export purge(): int! {
+    let r = this.db.exec(this.sql.purge, []Value(0))?
+    return r.rowsAffected
+  }
+}
+
+fn checkSqlTtl(ttl: i64): ()! {
+  if (ttl < 1 || ttl > maxSqlIdempotencyTtl) {
+    fail newError("web: SqlIdempotencyStore: ttl is ${ttl} second(s), want 1..${maxSqlIdempotencyTtl}")
+  }
+}
+
+fn keyHash(key: string): string {
+  return encodeHex(digest(Sha256(), []byte(key)))
+}
+
+// One stored row as `idemSql.read` returns it.
+class idemRow {
+  fingerprint: string
+  token: string
+  state: int
+  status: int
+  headers: string
+  body: string
+  expired: bool
+
+  entry(): IdempotencyEntry! {
+    if (this.state == stateInFlight) {
+      return IdempotencyEntry{
+        state = IdempotencyState.InFlight,
+        fingerprint = this.fingerprint,
+        response = CachedResponse{},
+      }
+    }
+    return IdempotencyEntry{
+      state = IdempotencyState.Done,
+      fingerprint = this.fingerprint,
+      response = CachedResponse{
+        status = this.status,
+        body = this.body,
+        headers = decodeHeaders(this.headers)?,
+      },
+    }
+  }
+}
+
+// `begin` on one pinned connection. `args` is [key_hash, fingerprint, token,
+// ttl].
+fn claimOn(ex: Executor, s: idemSql, args: []Value): IdempotencyClaim! {
+  let token = cellText(args[2])?
+  let attempt = 0
+  while (attempt < claimAttempts) {
+    attempt = attempt + 1
+    ex.exec(s.insert, args)?
+    let found = readRow(ex, s, args[0])?
+    if (!isSome(found)) {
+      continue
+    }
+    let row = unwrap(found)
+    if (row.token == token) {
+      return IdempotencyClaim{ token = token }
+    }
+    if (!row.expired) {
+      return IdempotencyClaim{ existing = Option.Some(row.entry()?) }
+    }
+    ex.exec(s.deleteStale, [args[0]])?
+  }
+  fail newError("web: SqlIdempotencyStore: begin could not settle the key after ${claimAttempts} attempts, other callers kept changing it")
+}
+
+fn readRow(ex: Executor, s: idemSql, hash: Value): Option<idemRow>! {
+  let rows = ex.query(s.read, [hash])?
+  let has = rows.next() catch e {
+    rows.close()
+    fail e
+  }
+  if (!has) {
+    rows.close()
+    return Option.None
+  }
+  let row = decodeRow(rows) catch e {
+    rows.close()
+    fail e
+  }
+  rows.close()
+  return Option.Some(row)
+}
+
+fn decodeRow(rows: Rows): idemRow! {
+  return idemRow{
+    fingerprint = cellText(rows.value(0))?,
+    token = cellText(rows.value(1))?,
+    state = asInt(rows.value(2))?,
+    status = asInt(rows.value(3))?,
+    headers = cellText(rows.value(4))?,
+    body = cellText(rows.value(5))?,
+    expired = asInt(rows.value(6))? != 0,
+  }
+}
+
+// A text or binary column as a string. Drivers hand `ascii_bin` and binary
+// columns back as either `Text` or `Blob`.
+fn cellText(v: Value): string! {
+  match (v) {
+    Text(s) => return s
+    Blob(b) => return string(b)
+    _ => fail newError("web: SqlIdempotencyStore: a column held neither text nor bytes")
+  }
+}
+
+// --- headers ---------------------------------------------------------------
+
+// `<count>\n` then each header as `<nlen>:<name><vlen>:<value>`: length
+// prefixed, so a name or value holding ':' or '\n' needs no escaping.
+fn encodeHeaders(headers: []Header): string {
+  let out = "${len(headers)}\n"
+  for h of headers {
+    out = out + "${len(h.name)}:${h.name}${len(h.value)}:${h.value}"
+  }
+  return out
+}
+
+fn badHeaders(why: string): error {
+  return newError("web: SqlIdempotencyStore: stored headers are corrupt: ${why}")
+}
+
+// A cursor over the stored header block; every read is bounds-checked, so a
+// truncated or foreign value is an error, never a panic.
+class headerReader {
+  src: string
+  pos: int
+
+  // A decimal number ended by `stop`, at most nine digits.
+  num(stop: int): int! {
+    let n = 0
+    let digits = 0
+    while (this.pos < len(this.src)) {
+      let b = int(this.src[this.pos])
+      this.pos = this.pos + 1
+      if (b == stop && digits > 0) {
+        return n
+      }
+      if (b < 48 || b > 57 || digits >= 9) {
+        fail badHeaders("bad number")
+      }
+      n = n * 10 + (b - 48)
+      digits = digits + 1
+    }
+    fail badHeaders("truncated number")
+  }
+
+  // One `<len>:<text>` field.
+  field(): string! {
+    let n = this.num(58)?
+    if (n > len(this.src) - this.pos) {
+      fail badHeaders("truncated text")
+    }
+    let s = this.src[this.pos:this.pos + n]
+    this.pos = this.pos + n
+    return s
+  }
+}
+
+fn decodeHeaders(stored: string): []Header! {
+  let rd = headerReader{ src = stored, pos = 0 }
+  let count = rd.num(10)?
+  // A header takes at least 4 bytes (`0:0:`), so a count the rest cannot hold
+  // is corruption caught before it drives a loop.
+  if (count > (len(stored) - rd.pos) / 4) {
+    fail badHeaders("header count")
+  }
+  let headers = []Header(0)
+  let i = 0
+  while (i < count) {
+    let name = rd.field()?
+    let value = rd.field()?
+    headers = append(headers, Header{ name = name, value = value })
+    i = i + 1
+  }
+  return headers
+}

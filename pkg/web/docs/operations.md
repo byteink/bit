@@ -231,8 +231,10 @@ counter and `Config.sessions` both carry: an in-process store is invisible
 to a retry that lands on a different server behind a load balancer, and a
 duplicate request would run the handler again with nobody able to tell.
 `MemoryIdempotencyStore(maxKeys)` ships and is single-process only;
-`RedisIdempotencyStore` (`pkg/webredis`, which depends on both `web` and
-`redis`) is shared across processes. Your own
+`SqlIdempotencyStore(pool)` keeps the keys in PostgreSQL, MySQL 8 or MariaDB
+and is shared across processes ([Idempotency keys in PostgreSQL and
+MySQL](idempotency-sql.md)); `RedisIdempotencyStore` (`pkg/webredis`, which
+depends on both `web` and `redis`) is shared across processes too. Your own
 store implements `IdempotencyStore`
 (`begin`/`finish`/`abandon` - `begin` is the one call that must be atomic,
 the same requirement `RateStore.incr` answers for a counter). `begin` hands

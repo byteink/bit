@@ -1,0 +1,446 @@
+// pkg/web/idempotencysql.test.bit - `SqlIdempotencyStore`
+// (idempotencysql.bit) without a database: which dialect a version string
+// names, the statements each engine is sent, the header codec, and the flow of
+// `begin` against a scripted fake server. That the insert is really atomic and
+// that a late `finish` cannot touch a later reservation needs a real server:
+// `_tests_/bit/jobslive/webidem.bit` proves both on PostgreSQL, MySQL 8 and
+// MariaDB 11 (`./make test-package-jobs-live`).
+//
+// `idemSqlFake` answers `SELECT version()` with a configurable string, records
+// every statement in arrival order, and answers a read of the table from a
+// script of rows; a script row whose token is "@mine" carries the token the
+// last INSERT was sent, which is how a test plays "this caller won".
+//
+// `Pool`, `Value`, `Rows` and `Executor` are `idempotencysql.bit`'s imports
+// (an import binds per module, SPEC 17.1); this file adds the rest it names.
+
+import { ExecResult, Conn as SqlConn, Stmt, Tx, TxOptions, Datasource, pool } from "std/sql"
+
+class idemSqlFake {
+  mu: Mutex
+  version: string
+  log: []string
+  // One entry per read of the table, in order. An empty entry is "no row".
+  script: [][]Value
+  reads: int
+  lastToken: string
+  lastParams: []Value
+
+  connect(cfg: Datasource): SqlConn! {
+    return idemSqlConn{ s = this }
+  }
+
+  record(sqlText: string, params: []Value) {
+    this.mu.lock()
+    this.log = append(this.log, sqlText)
+    this.lastParams = params
+    if (hasPrefix(sqlText, "INSERT") && len(params) > 2) {
+      this.lastToken = cellText(params[2]) catch _ {
+        ""
+      }
+    }
+    this.mu.unlock()
+  }
+
+  statements(): []string {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.log
+  }
+
+  rowsFor(sqlText: string): idemSqlRows {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (sqlText == "SELECT version()") {
+      return idemSqlRows{ cells = [Value.Text(this.version)], pos = -1 }
+    }
+    if (this.reads >= len(this.script)) {
+      return idemSqlRows{ cells = []Value(0), pos = -1 }
+    }
+    let cells = this.script[this.reads]
+    this.reads = this.reads + 1
+    if (len(cells) > 1 && isMineMarker(cells[1])) {
+      cells[1] = Value.Text(this.lastToken)
+    }
+    return idemSqlRows{ cells = cells, pos = -1 }
+  }
+}
+
+// A text or binary parameter as a string, for asserts.
+fn idemSqlText(v: Value): string {
+  return cellText(v) catch e {
+    panic("cellText: ${e.message()}")
+  }
+}
+
+fn idemSqlInt(v: Value): int {
+  return asInt(v) catch e {
+    panic("asInt: ${e.message()}")
+  }
+}
+
+fn isMineMarker(v: Value): bool {
+  let t = cellText(v) catch _ {
+    ""
+  }
+  return t == "@mine"
+}
+
+class idemSqlRows {
+  cells: []Value
+  pos: int
+
+  next(): bool! {
+    this.pos = this.pos + 1
+    return len(this.cells) > 0 && this.pos < 1
+  }
+
+  columns(): []string {
+    return []string(0)
+  }
+
+  value(col: int): Value {
+    if (col < len(this.cells)) {
+      return this.cells[col]
+    }
+    return Value.Null
+  }
+
+  close() {}
+}
+
+class idemSqlConn {
+  s: idemSqlFake
+
+  query(sqlText: string, params: []Value): Rows! {
+    this.s.record(sqlText, params)
+    return this.s.rowsFor(sqlText)
+  }
+
+  exec(sqlText: string, params: []Value): ExecResult! {
+    this.s.record(sqlText, params)
+    return ExecResult{ rowsAffected = 1 }
+  }
+
+  prepare(sqlText: string): Stmt! {
+    fail newError("idemSqlFake: prepare is not used")
+  }
+
+  begin(opts: TxOptions): Tx! {
+    fail newError("idemSqlFake: begin is not used")
+  }
+
+  close() {}
+}
+
+fn idemSqlServer(version: string, script: [][]Value): idemSqlFake {
+  return idemSqlFake{
+    mu = Mutex(),
+    version = version,
+    log = []string(0),
+    script = script,
+    reads = 0,
+    lastToken = "",
+    lastParams = []Value(0),
+  }
+}
+
+fn idemSqlStore(s: idemSqlFake): SqlIdempotencyStore {
+  let db = pool(s, Datasource{ uri = "fake://web" }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  return SqlIdempotencyStore(db) catch e {
+    panic("SqlIdempotencyStore: ${e.message()}")
+  }
+}
+
+// A row as `idemSql.read` returns it: fingerprint, token, state, status,
+// headers, body, expired.
+fn idemSqlRow(fp: string, token: string, state: int, expired: int): []Value {
+  return [
+    Value.Blob([]byte(fp)),
+    Value.Text(token),
+    Value.Int(state),
+    Value.Int(200),
+    Value.Blob([]byte("1\n12:Content-Type16:application/json")),
+    Value.Blob([]byte("ok")),
+    Value.Int(expired),
+  ]
+}
+
+fn idemSqlDialectName(version: string): string {
+  let d = idempotencyDialectOf(version) catch _ {
+    return "refused"
+  }
+  match (d) {
+    Postgres => return "postgres"
+    MySql => return "mysql"
+  }
+}
+
+fn idemSqlConstructorError(s: idemSqlFake): string {
+  let db = pool(s, Datasource{ uri = "fake://web" }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  SqlIdempotencyStore(db) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+test "idempotencyDialectOf names PostgreSQL, MySQL 8 and later, and MariaDB 10.6 and later" {
+  let cases = [
+    ["PostgreSQL 18.6 (Debian 18.6-1.pgdg13+1) on aarch64-unknown-linux-gnu", "postgres"],
+    ["PostgreSQL 9.5.0", "postgres"],
+    ["8.0.36-0ubuntu0.22.04.1", "mysql"],
+    ["8.4.0", "mysql"],
+    ["9.1.0", "mysql"],
+    ["10.6.0-MariaDB", "mysql"],
+    ["11.4.2-MariaDB", "mysql"],
+    ["5.7.44-log", "refused"],
+    ["10.5.27-MariaDB", "refused"],
+    ["", "refused"],
+    ["SQLite 3.45", "refused"],
+  ]
+  for c of cases {
+    let got = idemSqlDialectName(c[0])
+    assert(got == c[1], "'${c[0]}' -> ${got}, want ${c[1]}")
+  }
+}
+
+test "the constructor refuses a server it cannot serve, naming what the server said" {
+  let refused = idemSqlConstructorError(idemSqlServer("5.7.44-log", []))
+  assert(contains(refused, "5.7.44-log"), "the message names the version: '${refused}'")
+}
+
+test "each dialect has a migration that creates bit_idempotency with binary body columns" {
+  let pg = sqlIdempotencyMigration(IdempotencyDialect.Postgres)
+  let my = sqlIdempotencyMigration(IdempotencyDialect.MySql)
+  assert(contains(pg[0], "bit_idempotency") && contains(pg[0], "BYTEA"), "postgres table: ${pg[0]}")
+  assert(contains(my[0], "bit_idempotency") && contains(my[0], "LONGBLOB"), "mysql table: ${my[0]}")
+  assert(contains(my[0], "ascii_bin"), "mysql keeps key_hash and token case-sensitive")
+  assert(len(pg) == 2 && contains(pg[1], "CREATE INDEX"), "postgres index is its own statement")
+}
+
+test "finish and abandon are conditional on the reservation token, on both engines" {
+  for d of [IdempotencyDialect.Postgres, IdempotencyDialect.MySql] {
+    let s = idempotencyStatements(d)
+    assert(
+      contains(s.abandon, "key_hash = $1 AND token = $2 AND state = 0"),
+      "abandon: ${s.abandon}",
+    )
+    assert(!contains(s.abandon, "expires_at"), "abandon has no clock: ${s.abandon}")
+    assert(
+      contains(s.finish, "WHERE key_hash = $1 AND token = $2 AND state = 0 AND expires_at > "),
+      "finish: ${s.finish}",
+    )
+    assert(
+      contains(s.deleteStale, "expires_at <= "),
+      "deleteStale is conditional: ${s.deleteStale}",
+    )
+  }
+}
+
+test "the clock is the database's and the insert-if-absent is each engine's own" {
+  let pg = idempotencyStatements(IdempotencyDialect.Postgres)
+  let my = idempotencyStatements(IdempotencyDialect.MySql)
+  assert(contains(pg.insert, "ON CONFLICT (key_hash) DO NOTHING"), "postgres: ${pg.insert}")
+  assert(
+    contains(pg.insert, "NOW() + $4::float8 * INTERVAL '1 second'"),
+    "postgres expiry: ${pg.insert}",
+  )
+  assert(contains(my.insert, "ON DUPLICATE KEY UPDATE key_hash = key_hash"), "mysql: ${my.insert}")
+  assert(contains(my.insert, "UTC_TIMESTAMP(6) + INTERVAL $4 SECOND"), "mysql expiry: ${my.insert}")
+  assert(!contains(my.insert, "IGNORE"), "INSERT IGNORE would swallow more than a duplicate")
+  assert(
+      contains(pg.purge, "expires_at <= NOW()") &&
+      contains(my.purge, "expires_at <= UTC_TIMESTAMP(6)"),
+    "purge",
+  )
+}
+
+test "headers round-trip, including a name or value holding a colon or a newline" {
+  let hs = [
+    Header{ name = "Content-Type", value = "application/json" },
+    Header{ name = "A:B", value = "x\ny:" },
+    Header{ name = "Empty", value = "" },
+  ]
+  let got = decodeHeaders(encodeHeaders(hs)) catch e {
+    panic("decode: ${e.message()}")
+  }
+  assert(len(got) == 3, "headers = ${len(got)}")
+  assert(got[1].name == "A:B" && got[1].value == "x\ny:", "colon and newline survive")
+  assert(got[2].name == "Empty" && got[2].value == "", "empty value")
+  let none = decodeHeaders(encodeHeaders([]Header(0))) catch e {
+    panic("decode: ${e.message()}")
+  }
+  assert(len(none) == 0, "no headers")
+}
+
+test "headers that do not parse are an error, never a panic" {
+  for bad of ["", "x", "1", "1\n", "1\n3:abc", "1\n3:abc9:xy", "99999\n", "-1\n", "1\n3:abc3:de"] {
+    let failed = false
+    let _ = decodeHeaders(bad) catch _ {
+      failed = true
+      []Header(0)
+    }
+    assert(failed, "'${bad}' must be refused")
+  }
+}
+
+test "begin on a never-seen key inserts, reads the row back and wins with the token it sent" {
+  let s = idemSqlServer("PostgreSQL 18.6", [idemSqlRow("fp1", "@mine", 0, 0)])
+  let store = idemSqlStore(s)
+  let got = store.begin("k1", "fp1", 86400) catch e {
+    panic("begin: ${e.message()}")
+  }
+  let log = s.statements()
+  assert(got.won(), "the stored token is the one this caller minted")
+  assert(len(got.token) == 32, "a 128-bit hex token, got '${got.token}'")
+  assert(len(log) == 3, "version, INSERT, SELECT: ${len(log)} statements")
+  assert(
+    hasPrefix(log[1], "INSERT INTO bit_idempotency") && hasPrefix(log[2], "SELECT"),
+    "order: ${log[1]} / ${log[2]}",
+  )
+  assert(idemSqlText(s.lastParams[0]) == keyHash("k1"), "the key is stored hashed")
+}
+
+test "begin on a claimed key returns the stored entry unchanged and no token" {
+  let s = idemSqlServer("8.4.0", [idemSqlRow("abc", "someone-elses", 0, 0)])
+  let got = idemSqlStore(s).begin("k", "other", 60) catch e {
+    panic("begin: ${e.message()}")
+  }
+  assert(!got.won() && got.token == "", "a loser holds no token")
+  let e = unwrap(got.existing)
+  assert(e.state == IdempotencyState.InFlight && e.fingerprint == "abc", "entry = ${e.fingerprint}")
+}
+
+test "begin on a finished key returns the stored response" {
+  let s = idemSqlServer("8.4.0", [idemSqlRow("abc", "", 1, 0)])
+  let got = idemSqlStore(s).begin("k", "abc", 60) catch e {
+    panic("begin: ${e.message()}")
+  }
+  let e = unwrap(got.existing)
+  assert(e.state == IdempotencyState.Done, "state")
+  assert(
+    e.response.status == 200 && e.response.body == "ok",
+    "response = ${e.response.status} '${e.response.body}'",
+  )
+  assert(len(e.response.headers) == 1 && e.response.headers[0].name == "Content-Type", "headers")
+}
+
+test "begin finds an expired row, deletes it conditionally and inserts again" {
+  let s = idemSqlServer(
+    "PostgreSQL 18.6",
+    [idemSqlRow("old", "stale", 0, 1), idemSqlRow("fp", "@mine", 0, 0)],
+  )
+  let got = idemSqlStore(s).begin("k", "fp", 60) catch e {
+    panic("begin: ${e.message()}")
+  }
+  let log = s.statements()
+  assert(got.won(), "the second insert wins")
+  assert(len(log) == 6, "version, INSERT, SELECT, DELETE, INSERT, SELECT: ${len(log)}")
+  assert(
+    hasPrefix(log[3], "DELETE") && contains(log[3], "expires_at <= NOW()"),
+    "the delete is conditional: ${log[3]}",
+  )
+}
+
+test "begin whose row vanishes between its statements inserts again" {
+  let s = idemSqlServer("8.4.0", [[], idemSqlRow("fp", "@mine", 0, 0)])
+  let got = idemSqlStore(s).begin("k", "fp", 60) catch e {
+    panic("begin: ${e.message()}")
+  }
+  assert(got.won(), "a row deleted by someone else is simply claimed")
+}
+
+test "begin gives up after four passes instead of spinning" {
+  let stale = idemSqlRow("old", "stale", 0, 1)
+  let s = idemSqlServer("8.4.0", [stale, stale, stale, stale, stale])
+  let msg = ""
+  let _ = idemSqlStore(s).begin("k", "fp", 60) catch e {
+    msg = e.message()
+    IdempotencyClaim{}
+  }
+  assert(contains(msg, "could not settle"), "message = '${msg}'")
+  assert(
+    len(s.statements()) == 1 + 4 * 3,
+    "four passes of INSERT, SELECT, DELETE: ${len(s.statements())}",
+  )
+}
+
+test "a ttl outside 1..2000000000 is refused before anything is sent" {
+  let s = idemSqlServer("8.4.0", [])
+  let store = idemSqlStore(s)
+  let bad = 0
+  for ttl of [0, -5, 2_000_000_001] {
+    let _ = store.begin("k", "fp", ttl) catch _ {
+      bad = bad + 1
+      IdempotencyClaim{}
+    }
+    store.finish("k", "tok", CachedResponse{ status = 200, body = "", headers = []Header(0) }, ttl) catch _ {
+      bad = bad + 1
+    }
+  }
+  assert(bad == 6, "begin and finish refuse all three, got ${bad}")
+  assert(len(s.statements()) == 1, "only the version query went out: ${len(s.statements())}")
+}
+
+test "finish and abandon with no token send nothing, and with a token send one statement" {
+  let s = idemSqlServer("8.4.0", [])
+  let store = idemSqlStore(s)
+  let resp = CachedResponse{
+    status = 201,
+    body = "made",
+    headers = [Header{ name = "X", value = "1" }],
+  }
+  store.finish("k", "", resp, 60) catch e {
+    panic("finish: ${e.message()}")
+  }
+  store.abandon("k", "") catch e {
+    panic("abandon: ${e.message()}")
+  }
+  assert(
+    len(s.statements()) == 1,
+    "an empty token is a reservation nobody holds: ${len(s.statements())}",
+  )
+  store.finish("k", "tok-1", resp, 90) catch e {
+    panic("finish: ${e.message()}")
+  }
+  assert(
+    len(s.statements()) == 2 && hasPrefix(s.statements()[1], "UPDATE bit_idempotency"),
+    "finish is one UPDATE",
+  )
+  assert(
+    len(s.lastParams) == 6 && idemSqlText(s.lastParams[1]) == "tok-1",
+    "the token is parameter $2",
+  )
+  assert(
+    idemSqlText(s.lastParams[4]) == "made" && idemSqlInt(s.lastParams[5]) == 90,
+    "body and ttl",
+  )
+  store.abandon("k", "tok-1") catch e {
+    panic("abandon: ${e.message()}")
+  }
+  assert(
+    hasPrefix(s.statements()[2], "DELETE FROM bit_idempotency WHERE key_hash = $1 AND token = $2"),
+    "abandon is one DELETE",
+  )
+}
+
+test "purge deletes by the database clock and reports the rows it removed" {
+  let s = idemSqlServer("PostgreSQL 18.6", [])
+  let n = idemSqlStore(s).purge() catch e {
+    panic("purge: ${e.message()}")
+  }
+  assert(n == 1, "rowsAffected of the fake is 1, got ${n}")
+  assert(
+    s.statements()[1] == "DELETE FROM bit_idempotency WHERE expires_at <= NOW()",
+    "purge: ${s.statements()[1]}",
+  )
+}
+
+test "SqlIdempotencyStore satisfies IdempotencyStore" {
+  let store: IdempotencyStore = idemSqlStore(idemSqlServer("8.4.0", []))
+  assert(store != nil, "the store converts to the interface")
+}
