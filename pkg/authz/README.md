@@ -31,4 +31,5 @@ The [chapters](docs/README.md) start with [Actions](docs/actions.md), then
 [Conditions](docs/conditions.md).
 [Relationships](docs/relationships.md).
 [Policies](docs/policies.md), then
-[Deciding](docs/decisions.md).
+[Deciding](docs/decisions.md), then
+[Stored policies](docs/stored.md).
