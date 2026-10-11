@@ -529,11 +529,12 @@ genuinely wanted.
 | `Timestamp` | `2026-09-01T05:00:00Z` | `parseRfc3339(s): Timestamp!`, see [RFC 3339 and epoch timestamps](#rfc-3339-and-epoch-timestamps) |
 | any | whatever `pattern` describes | `parseWith(pattern, s): NaiveDateTime!` |
 
-Parsing is **strict**: the input must match exactly and reach the end of
-the string. Leading or trailing whitespace, a lowercase `t` or `z`, a
-missing colon in an offset, and a `:60` leap second are all failures rather
-than best-effort guesses - silent acceptance of nearly-right input is how a
-wrong date reaches a ledger. `parseDateTime` recovers only the **offset**,
+The input must match exactly and reach the end of the string. No parser
+skips whitespace or trailing characters. The local forms `parseTime` and
+`parseNaiveDateTime` require at most nine fraction digits and refuse `:60`;
+the latter requires uppercase `T`. `parseDateTime` reads
+[RFC 3339](#rfc-3339-and-epoch-timestamps), including lowercase `t`/`z`,
+longer fractions and valid leap seconds. It recovers only the **offset**,
 not the zone identity, since `+04:00` does not say which zone it came from;
 the result's `zone()` is a fixed-offset zone, so call `.withZone(z)` when
 the real zone is known from elsewhere.
@@ -601,16 +602,21 @@ response's own timestamp to read it as it was read then.
 A feed that Inkwell imports articles from stamps each one `published`
 with whatever its server writes: `2024-01-02T03:04:05.5+05:30` from one,
 `2024-01-02t03:04:05z` from another, `1704164645.5` as a JSON number from a
-third. `parseDateTime` reads only the exact shape `toString()` writes, so none
-of them parse with it. `parseRfc3339` reads everything RFC 3339 section 5.6
-allows, and `parseEpochSeconds` reads a number of seconds since the epoch.
-Both return the instant as a `Timestamp`.
+third. `parseDateTime` reads the RFC 3339 forms and keeps their written offset
+in a `DateTime`. `parseRfc3339` reads the same forms to the instant as a
+`Timestamp`. `parseEpochSeconds` reads a number of seconds since the epoch
+and also returns a `Timestamp`.
 
 ```bit
 import {
-  Timestamp, TimestampParseCause, TimestampParseError,
-  parseEpochSeconds, parseRfc3339,
+  DateTime, Timestamp, TimestampParseCause, TimestampParseError,
+  parseDateTime, parseEpochSeconds, parseRfc3339,
 } from "std/time"
+
+fn publishedWall(field: string): DateTime! {
+  return parseDateTime(field)?
+  // "1996-12-19T16:39:57-08:00" keeps its -08:00 offset
+}
 
 fn publishedAt(field: string): Timestamp! {
   return parseRfc3339(field)?
@@ -634,7 +640,7 @@ fn explain(field: string): string {
 }
 ```
 
-What `parseRfc3339` takes, exactly as the RFC's grammar has it:
+What `parseDateTime` and `parseRfc3339` take:
 
 | Part | Accepted |
 |---|---|
@@ -648,8 +654,8 @@ A fraction is stored as nanoseconds, so digits past the ninth are
 **truncated**, never rounded: `.9999999999` is `.999999999`, the same
 direction `formatHttpDate` drops a fraction.
 
-A `Timestamp` has no second 60. `parseRfc3339` accepts `:60` only where a leap
-second can exist, 23:59:60 UTC on the last day of a month once the offset is
+A `Timestamp` has no second 60. Both RFC 3339 readers accept `:60` only where
+a leap second can exist, 23:59:60 UTC on the last day of a month once the offset is
 applied, and reads it as the second after it: `1990-12-31T23:59:60Z` is the
 same instant as `1991-01-01T00:00:00Z`, and so is `1990-12-31T15:59:60-08:00`.
 Any other `:60` fails with `Range`.
@@ -661,11 +667,13 @@ seconds before the epoch. Digits past the ninth fractional one are truncated
 toward the past: `-0.0000000001` is one nanosecond before the epoch. A
 leading `+`, `.5`, `5.`, `NaN` and surrounding space fail with `Syntax`.
 
-Both functions fail with a `TimestampParseError`: `Syntax` when the text is
-not the grammar, `Range` for a field no calendar has (month 13, `2023-02-29`,
-offset `+25:00`, an invalid leap second) and for an instant outside a
-`Timestamp`'s roughly 1677 to 2262 span, such as `9999-12-31T23:59:59Z` or an
-epoch value of `1e12`. Nothing wraps: the bound is checked before the seconds
+These three functions fail with a `TimestampParseError`: `Syntax` when the text
+is not the grammar, `Range` for a field no calendar has (month 13,
+`2023-02-29`, offset `+25:00`, an invalid leap second). `parseRfc3339` and
+`parseEpochSeconds` also refuse instants outside a `Timestamp`'s roughly
+1677 to 2262 span, such as `9999-12-31T23:59:59Z` or an epoch value of `1e12`.
+`parseDateTime` keeps the `DateTime` year range of 1 to 9999.
+Nothing wraps: the instant bound is checked before the seconds
 are turned into nanoseconds, down to the last nanosecond
 (`9223372036.854775807` fits, `9223372036.854775808` fails). The error's
 `input` is the refused text.
@@ -896,7 +904,7 @@ run so a daylight saving transition is absorbed.
 | `differenceInDays` across a DST transition | 1, calendar days, not 23 or 25 hours |
 | `isBetween` with `lo` after `hi` | `false`, an empty range |
 | comparing two `DateTime` in different zones | compares instants, not wall clocks |
-| `parseDateTime` on `2026-09-01t09:00:00z` | fails, lowercase `t`/`z` |
+| `parseDateTime` on `2026-09-01t09:00:00z` | succeeds, prints `2026-09-01T09:00:00+00:00` |
 | `parseDateTime` on `...+0400` | fails, offset needs a colon |
 | `Date.toTimestamp()` on year 1600 | fails, outside the instant range |
 | `zone("Asia/Dubai")` with no host zone data | fails - see [Zones](#zones) |
@@ -2030,7 +2038,7 @@ Reads back a `NaiveDateTime.toString()` result, `YYYY-MM-DDTHH:MM:SS` with an op
 
 ### `parseDateTime(s: string): DateTime!`
 
-Reads back a `DateTime.toString()` result: a wall clock plus `Z` or a `+HH:MM`/`-HH:MM` offset. The result's zone is a fixed offset, not a named zone, since an offset does not say which zone produced it; call `.withZone(z)` once the real zone is known.
+Reads an [RFC 3339 date-time](#rfc-3339-and-epoch-timestamps), keeping its offset. Lowercase `t`/`z` is accepted, fractions past nine digits are truncated, and valid leap seconds become the following second. A numeric offset gives a fixed zone; `Z` or `z` gives `utc()`. Call `.withZone(z)` once the real zone is known.
 
 ### `parseWith(pattern: string, s: string): NaiveDateTime!`
 
@@ -2070,7 +2078,7 @@ Which of the two things went wrong: `Syntax` or `Range`.
 
 ### `TimestampParseError`
 
-The error `parseRfc3339` and `parseEpochSeconds` produce: `cause`, and `input`, the text that was refused. Reach the fields with `e.(TimestampParseError)`.
+The error `parseDateTime`, `parseRfc3339` and `parseEpochSeconds` produce: `cause`, and `input`, the text that was refused. Reach the fields with `e.(TimestampParseError)`.
 
 ### `TimestampParseError.message`
 
