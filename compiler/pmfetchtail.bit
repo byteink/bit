@@ -14,40 +14,12 @@
 
 // --- subprocess plumbing --------------------------------------------------
 
-// Runs `[gitBin, ...args]` with a hard wall-clock deadline, capturing
-// combined stdout+stderr. Builds a throwaway `/bin/sh` script and runs it
-// THROUGH `/bin/sh` (`osRun("/bin/sh", [scriptPath])`) rather than calling
-// `osRun(gitBin, args)` directly (#2399 gave `osRun` a real argv — see
-// runtime/root/os.bit's `osBuildRunArgv` header), because `osRun` still has
-// no timeout, and a shell is the only way this language can express "kill
-// this child if it outruns a deadline" today (see the module header).
-//
-// The script is run via `/bin/sh <scriptPath>`, never exec'd as `scriptPath`
-// itself (#3663, #3680): on macOS the first execution of a newly written
-// executable file costs ~15-26s (a first-exec security scan keyed on the
-// file, not its content) while a second exec of the same file is ~0.06s.
-// Because `scratchBase()` mints a fresh uuid per call, direct exec paid that
-// penalty on every single `runGit` call — ~87 times in one `bit selfcheck`
-// run, accounting for essentially its entire wall clock. A file `/bin/sh`
-// only *reads* is never exec'd, so it never triggers the scan; the script
-// also no longer needs the execute bit.
-//
-// Every dynamic value (`gitBin`, each of `args`, the output path) is
-// single-quoted with `shQuote` before it reaches the script text, so a
-// hostile URL or ref — this all ultimately traces back to a fetched
-// `bit.json` — can shell-quote-break out of its own argument but never out of
-// the script into a second command.
-//
-// The watcher race: a naive "watcher kills child, then touches a flag file"
-// design has a real bug — `kill -9` on an already-exited-but-not-yet-reaped
-// zombie still reports success, so a child that finishes microseconds before
-// the deadline can still look "killed by the deadline" to a racing watcher.
-// This avoids that by ordering on the WATCHER's own liveness instead: after
-// the main `wait` on the child returns, `kill -0 "$watcher"` distinguishes
-// "the watcher is still sleeping" (the child finished on its own; take its
-// real status) from "the watcher already ran" (it must have fired the kill;
-// report timeout) — no zombie-pid ambiguity, because the watcher itself is
-// never waited on until this check has already resolved which happened.
+import { output as processOutput } from "std/process"
+
+// Capture git's combined streams to disk so the process module's per-stream
+// memory cap cannot truncate a fetch result. Its native deadline owns and
+// reaps the child; a shell watchdog cannot safely retain a PID across wait.
+// Run through /bin/sh to avoid the first-execution scan on a fresh script.
 fn runGit(gitBin: string, args: []string, timeoutMs: int): GitRun! {
   let base = scratchBase()
   let scriptPath = base + ".sh"
@@ -67,36 +39,20 @@ fn runGit(gitBin: string, args: []string, timeoutMs: int): GitRun! {
     i = i + 1
   }
 
-  let script = "#!/bin/sh\n" +
-    cmd +
-    " > " +
-    shQuote(outPath) +
-    " 2>&1 &\n" +
-    "child=$!\n" +
-    "( sleep ${timeoutSecs}; kill -9 \"$child\" 2>/dev/null ) &\n" +
-    "watcher=$!\n" +
-    "wait \"$child\" 2>/dev/null\n" +
-    "status=$?\n" +
-    "if kill -0 \"$watcher\" 2>/dev/null; then\n" +
-    "  kill \"$watcher\" 2>/dev/null\n" +
-    "  wait \"$watcher\" 2>/dev/null\n" +
-    "  exit \"$status\"\n" +
-    "fi\n" +
-    "wait \"$watcher\" 2>/dev/null\n" +
-    "exit 124\n"
-
+  let script = "#!/bin/sh\n" + cmd + " > " + shQuote(outPath) + " 2>&1\n"
   writeFile(scriptPath, script)?
+  let run = processOutput("/bin/sh", [scriptPath], timeoutSecs * 1000)
+  if (run.truncated) {
+    fail newError("pmfetch: git wrapper output exceeded the process capture limit")
+  }
+  print(run.stdout)
+  eprint(run.stderr)
+  let code = run.exitCode
 
-  // Run through `/bin/sh` rather than exec the fresh file directly (see the
-  // function header) — no `fsChmod` needed, since `/bin/sh` reads the script
-  // rather than executing it. `gitBin` and every `args` element are already
-  // embedded in the script text above, shell-quoted, so `/bin/sh` needs no
-  // further argv beyond the script's own path.
-  let code = osRun("/bin/sh", [scriptPath])
   let output = readFile(outPath) catch _ {
     ""
   }
-  if (code == 124) {
+  if (code == -2 || code == 124) {
     return GitRun{ exitCode = -1, timedOut = true, output = output }
   }
   if (code < 0) {

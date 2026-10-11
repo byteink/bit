@@ -49,6 +49,7 @@ import { envOr, exit } from "std/os"
 import { base as pathBase, dir as pathDir } from "std/path"
 import { uuidV4, format as uuidFormat } from "std/uuid"
 import { Json, jsonGet, jsonAsString, jsonParse } from "std/json"
+import { output as processOutput } from "std/process"
 
 const subprocessTimeoutMs: int = 120000
 
@@ -64,9 +65,8 @@ const subprocessTimeoutMs: int = 120000
 let runNonce: i64 = 0
 
 // Wrapper-reserved exit codes — a harness break, never the compiler under
-// test disagreeing. 124 is this file's own timeout sentinel (`runScript`'s
-// script body), matching `runGit`'s convention now that wrapper scripts run
-// through unbounded `osRun` with their own embedded deadline.
+// test disagreeing. 124 is this file's timeout sentinel: `runScript` maps
+// the native process deadline to it, matching `runGit`'s convention.
 const rcCdFailed: int = 111
 const rcBitNotExecutable: int = 112
 const rcStdlibUnresolvable: int = 113
@@ -433,36 +433,103 @@ fn rejectWrapperFailure(name: string, code: int) {
 
 // ---- shell/timeout plumbing ------------------------------------------------
 
-// Runs `body` under a wall-clock deadline by backgrounding it as one subshell
-// job and racing a `sleep`-then-`kill -9` watcher against it — the same
-// shape compiler/pmfetchtail.bit's `runGit` uses, invoked through
-// `osRun("/bin/sh", [scriptPath])` rather than exec'd directly (see this
-// file's own header for why). Returns the body's own exit code, or
-// `rcTimedOut` (124) if the watcher fired first.
+// Native bounded execution owns and reaps the shell child. CLI bodies already
+// capture their own streams to disk; replay fixture output without silent loss.
 fn runScript(name: string, body: string): int {
+  return runScriptBounded(name, body, subprocessTimeoutMs)
+}
+
+fn runScriptBounded(name: string, body: string, timeoutMs: int): int {
   let path = envOr("TMPDIR", "/tmp") + "/bit-pmrangegate-" + uuidFormat(uuidV4()) + ".sh"
-  let secs = subprocessTimeoutMs / 1000
-  let script = "#!/bin/sh\n(\n" +
-    body +
-    "\n) &\n" +
-    "child=$!\n" +
-    "( sleep ${secs}; kill -9 \"$child\" 2>/dev/null ) &\n" +
-    "watcher=$!\n" +
-    "wait \"$child\" 2>/dev/null\n" +
-    "status=$?\n" +
-    "if kill -0 \"$watcher\" 2>/dev/null; then\n" +
-    "  kill \"$watcher\" 2>/dev/null\n" +
-    "  wait \"$watcher\" 2>/dev/null\n" +
-    "  exit \"$status\"\n" +
-    "fi\n" +
-    "wait \"$watcher\" 2>/dev/null\n" +
-    "exit ${rcTimedOut}\n"
-  writeFile(path, script) catch e {
+  writeFile(path, "#!/bin/sh\n" + body + "\n") catch e {
     fatal(name, "cannot write the wrapper script: " + e.message())
   }
-  let code = osRun("/bin/sh", [path])
+  let run = processOutput("/bin/sh", [path], timeoutMs)
   removeQuiet(path)
-  return code
+  if (run.truncated) {
+    fatal(name, "wrapper output exceeded the process capture limit")
+  }
+  print(run.stdout)
+  eprint(run.stderr)
+  if (run.exitCode == -2) {
+    return rcTimedOut
+  }
+  if (run.exitCode < 0) {
+    fatal(name, "cannot launch the wrapper script (exit ${run.exitCode})")
+  }
+  return run.exitCode
+}
+
+// The control records the native-owned body PID before it can exit. No shell
+// timer exists, and the body must have been reaped when bounded execution returns.
+class ScriptControl { body: string, secs: int, want: int, boundary: bool }
+
+fn checkScriptLifecycle() {
+  let root = scratchRoot("watchdog")
+  mkdirp("watchdog", root)
+  checkScriptControl(
+    root,
+    ScriptControl{
+      body = "sleep 0.05; exit 0", secs = 120, want = 0, boundary = false,
+    },
+  )
+  let i = 0
+  while (i < 20) {
+    checkScriptControl(
+      root,
+      ScriptControl{
+        body = "exit ${i % 2 * 37}", secs = 120, want = i % 2 * 37, boundary = false,
+      },
+    )
+    i = i + 1
+  }
+  checkScriptControl(
+    root,
+    ScriptControl{
+      body = "sleep 1.5; exit 37", secs = 2, want = 37, boundary = false,
+    },
+  )
+  checkScriptControl(
+    root,
+    ScriptControl{
+      body = "exec sleep 2.5", secs = 2, want = rcTimedOut, boundary = false,
+    },
+  )
+  let n = 0
+  while (n < 3) {
+    checkScriptControl(
+      root,
+      ScriptControl{
+        body = "exec sleep 2", secs = 2, want = 0, boundary = true,
+      },
+    )
+    n = n + 1
+  }
+  print("PASS: pmrangegate — native deadline preserves 0/37/124, cleans 20 immediate completions and 6 deadline/cancellation controls\n")
+}
+
+fn checkScriptControl(root: string, control: ScriptControl) {
+  let path = root + "/" + uuidFormat(uuidV4())
+  let ownedPath = path + ".pids"
+  let body = "printf '%s\\n' $$ > " + shQuote(ownedPath) + "\n" + control.body
+  let code = runScriptBounded("watchdog", body, control.secs * 1000)
+  if (code != control.want && !(control.boundary && code == rcTimedOut)) {
+    fatal("watchdog", "body '${control.body}' exited ${code}, want ${control.want}")
+  }
+  let inspect = "n=0\nwhile IFS= read -r pid; do\n" +
+    "  n=$((n + 1)); [ \"$n\" -le 1 ] || exit 2\n" +
+    "  case \"$pid\" in ''|*[!0-9]*) exit 2;; esac\n" +
+    "  if kill -0 \"$pid\" 2>/dev/null; then exit 1; fi\n" +
+    "done < " +
+    shQuote(ownedPath) +
+    "\n[ \"$n\" -eq 1 ]\n"
+  let inspected = osRun("/bin/sh", ["-c", inspect])
+  if (inspected != 0) {
+    fatal(
+      "watchdog",
+      "owned body remains at '${ownedPath}' (inspection ${inspected})",
+    )
+  }
 }
 
 // A fixture-setup script that must exit 0 — a `git` absence gets its own
