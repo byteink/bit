@@ -108,6 +108,76 @@ fn streamingConfig(): Config {
 }
 ```
 
+## Tunnels: WebSocket over one HTTP/2 stream
+
+A WebSocket over HTTP/1.1 takes the whole connection. HTTP/2 multiplexes many
+requests on one, so it cannot hand a connection over; RFC 8441 instead turns one
+stream into the tunnel. The client sends a `CONNECT` request carrying a
+`:protocol` pseudo-header (`websocket`), the server answers 200, and from then on
+the stream's DATA frames are the byte stream - RFC 6455 framing, with no Upgrade
+handshake. The other streams keep serving requests.
+
+A server opts in with `Config.enableConnectProtocol`, which advertises
+`SETTINGS_ENABLE_CONNECT_PROTOCOL`. Without it a request bearing `:protocol` is a
+malformed request and the engine resets that stream with `PROTOCOL_ERROR`; a
+client's `openTunnel` refuses to send one to a peer that did not advertise it.
+Ask `isExtendedConnect(req)` inside the handler, then accept the stream:
+
+```bit
+import {
+  accept, Config, defaultConfig, isExtendedConnect, Request, Response, Stream, Transport,
+} from "std/http2"
+
+// Echo every byte of the tunnel back until the peer ends its half. A handler that
+// does not accept returns an ordinary `Response`, which refuses the tunnel.
+fn echo(req: Request, s: Stream): Response {
+  if (!isExtendedConnect(req)) {
+    return Response(400, []byte("tunnels only"))
+  }
+  let t = s.acceptExtendedConnect() catch e {
+    return Response(500, []byte(e.message()))
+  }
+  while (true) {
+    let chunk = t.read(4096) catch e {
+      break
+    }
+    if (len(chunk) == 0) {
+      break
+    }
+    t.write(chunk) catch e {
+      break
+    }
+  }
+  return Response(0, []byte(0))
+}
+
+fn serveTunnels(t: Transport) {
+  let cfg = defaultConfig()
+  cfg.enableConnectProtocol = true
+  let conn = accept(t, cfg, 0) catch e {
+    return
+  }
+  conn.serve(echo) catch e2 {
+    return
+  }
+}
+```
+
+Returning from the handler ends the tunnel: the engine sends END_STREAM and, if the
+peer has not ended its own half, `RST_STREAM(NO_ERROR)` (RFC 9113 section 8.1). The
+`Response` an accepting handler returns is discarded.
+
+A tunnel is not a message body, so `Config.maxBodyBytes` does not apply to it: a
+WebSocket lives for as long as it likes. Flow control still does. `H2Stream.read`
+renews the receive window by exactly the bytes it takes, and `H2Stream.write`
+returns only once its bytes have left under the peer's window, so a slow peer
+blocks the writer instead of growing a buffer.
+
+The client side is `Conn.openTunnel`. In practice you reach for `std/websocket`
+(`dialH2`, `upgradeH2`) or [`pkg/web`](/packages/web)'s `wsUpgrade`, which run the
+WebSocket protocol over this and need no code change from a route written for
+HTTP/1.1.
+
 ## Sharp edges
 
 **Tearing down a `Conn` has a required order.** `connect`/`accept` spawn a reader
@@ -358,6 +428,12 @@ The largest frame payload the sender accepts.
 ### `settingsMaxHeaderListSize: int`
 
 The largest header list the sender accepts.
+
+### `settingsEnableConnectProtocol: int`
+
+Whether the sender accepts extended CONNECT requests (RFC 8441): `1` allows them.
+Only `0` and `1` are legal, and a sender must not go from `1` back to `0`; the
+engine treats either as a connection error.
 
 ## Frame-size bounds
 
@@ -611,8 +687,9 @@ fn silent(): Transport {
 
 The connection limits a `Conn` advertises: `initialWindowSize`,
 `maxFrameSize`, `headerTableSize`, `maxHeaderListBytes`,
-`maxConcurrentStreams`, `maxBodyBytes`, and `streamBodies`. See "Tuning
-limits" above.
+`maxConcurrentStreams`, `maxBodyBytes`, and `streamBodies`, plus
+`enableConnectProtocol`, which advertises extended CONNECT (RFC 8441) and is off
+by default. See "Tuning limits" and "Tunnels" above.
 
 ### `defaultConfig(): Config`
 
@@ -621,8 +698,9 @@ exact numbers.
 
 ### `Request(method: string, authority: string, path: string)`
 
-An HTTP/2 request: `method`, `scheme`, `authority`, `path`, `headers`, and
-`body`. The constructor makes one with the `https` scheme, no extra headers,
+An HTTP/2 request: `method`, `scheme`, `authority`, `path`, `protocol`,
+`headers`, and `body`. `protocol` is the `:protocol` pseudo-header of an extended
+CONNECT, `""` on every other request. The constructor makes one with the `https` scheme, no extra headers,
 and no body; set `headers` and `body` afterwards when the request needs them.
 
 ### `Response(status: int, body: []byte)`
@@ -686,6 +764,14 @@ still to come on the returned `Stream`. Use this for a large response you
 want to read a chunk at a time instead of holding whole. `deadlineNs` bounds the
 wait exactly as it does for `roundTrip`.
 
+### `Conn.openTunnel(req: Request, deadlineNs: int = 0): (Response, H2Stream)!`
+
+Opens an extended CONNECT tunnel (RFC 8441): `req` must be a `CONNECT` with
+`protocol`, `scheme`, `authority` and `path` set. Returns the server's answer and
+the tunnel once the status is 2xx. Fails without sending anything when the peer did
+not advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL`; on any other status the stream is
+reset and the error names it. Close the `H2Stream` when you are done.
+
 ### `Conn.peerMaxStreams(): int`
 
 The most streams the peer will let this side keep open at once: its
@@ -731,6 +817,50 @@ to read a streamed request body or to abort the stream.
 ### `Stream.reset(errorCode: int)`
 
 Aborts this stream by sending RST_STREAM with `errorCode`.
+
+### `Stream.acceptExtendedConnect(headers: []HeaderField = []HeaderField(0)): H2Stream!`
+
+Accepts this stream as an extended CONNECT: answers 200 with `headers` and no
+END_STREAM, and returns the tunnel. Fails unless the engine admitted the stream as
+one (`Config.enableConnectProtocol` is set and the request was well formed), or when
+the stream was already answered or is closed. To refuse, return an ordinary
+`Response` instead.
+
+### `isExtendedConnect(req: Request): bool`
+
+Whether `req` is an extended CONNECT: method `CONNECT` with a `:protocol`. Any
+protocol counts; the caller decides which it serves (`std/websocket` serves
+`websocket`).
+
+### `H2Stream`
+
+The handle on an accepted tunnel: raw bidirectional bytes over the stream's DATA
+frames, under flow control. One green thread reads and one writes.
+
+### `H2Stream.read(n: int): string!`
+
+Up to `n` bytes of the tunnel, blocking until at least one has arrived. `""` means
+the peer ended its half. Fails when the stream is reset, the connection dies, or the
+deadline from `setDeadline` passes.
+
+### `H2Stream.write(data: string): ()!`
+
+Sends `data` as DATA frames and returns once every byte has left under flow control.
+Fails when the stream is closed or reset or the connection is gone.
+
+### `H2Stream.setDeadline(deadlineNs: int)`
+
+Bounds `read` by an absolute `monotonic` deadline in nanoseconds; `0` clears it.
+
+### `H2Stream.close()`
+
+Ends this side of the tunnel with END_STREAM, the orderly close (RFC 8441 section 5),
+and releases the connection's hold on it. Call it when done; a server handler need
+not, since returning ends the tunnel.
+
+### `H2Stream.reset(errorCode: int)`
+
+The abnormal close: RST_STREAM carrying `errorCode` (RFC 8441 uses `errorCancel`).
 
 ### `Stream.read(): BodyChunk!`
 

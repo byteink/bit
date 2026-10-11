@@ -1284,13 +1284,20 @@ As `Exchange.respondKeepAlive`, for a TLS connection.
 Blocks until the next TLS connection arrives and returns it, without
 reading anything off it yet.
 
-### `serveHijackableTlsOn(ts: TlsServer, hijackHandler: (Request, TlsExchange) => HijackOutcome, plainHandler: (Request) => Response): ()!`
+### `serveHijackableTlsOn(ts: TlsServer, hijackHandler: (Request, TlsExchange) => HijackOutcome, plainHandler: (Request) => Response, tunnel: Option<(Request, Stream) => Response> = Option.None): ()!`
 
 The hijack-capable sibling of `serveTlsServerOn`. `hijackHandler` serves
-HTTP/1.1 connections and may take one over; `plainHandler` serves every
-HTTP/2 connection, which cannot be hijacked.
+HTTP/1.1 connections and may take one over; `plainHandler` serves the ordinary
+requests of every HTTP/2 connection, which cannot be hijacked.
 
-### `serveHijackableTlsBackground(ts: TlsServer, hijackHandler: (Request, TlsExchange) => HijackOutcome, plainHandler: (Request) => Response): ()`
+`tunnel` takes the HTTP/2 streams that arrive as RFC 8441 extended CONNECT. Give it
+and the server advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`; leave it out and no
+client can open one. A WebSocket request (`:protocol websocket`) reaches `tunnel` as
+the GET its HTTP/1.1 Upgrade replaces, with the `std/http2` `Stream` it may accept
+(`Stream.acceptExtendedConnect`) or leave unanswered by returning an ordinary
+`Response`. `std/websocket`'s `upgradeH2` does both checks and the accept.
+
+### `serveHijackableTlsBackground(ts: TlsServer, hijackHandler: (Request, TlsExchange) => HijackOutcome, plainHandler: (Request) => Response, tunnel: Option<(Request, Stream) => Response> = Option.None): ()`
 
 As `serveHijackableTlsOn`, run in the background.
 
@@ -1299,13 +1306,14 @@ As `serveHijackableTlsOn`, run in the background.
 The transport-agnostic read/write interface a hijacked connection speaks,
 whether it came from a plain or a TLS connection.
 
-### `ByteStream(conn: Option<Conn> = None, tls: Option<TlsConn> = None): ByteStream!`
+### `ByteStream(conn: Option<Conn> = None, tls: Option<TlsConn> = None, h2: Option<H2Stream> = None): ByteStream!`
 
 Wraps a connection you already hold as a `byteStream`, for code that has no
 `Exchange` to ask for one. `ByteStream(conn = Option.Some(c))?` takes a plain
-[`std/net`](net.md) connection and `ByteStream(tls = Option.Some(t))?` a
-`std/tls` one. Give exactly one: passing both, or neither, fails with an error
-instead of picking one for you.
+[`std/net`](net.md) connection, `ByteStream(tls = Option.Some(t))?` a
+`std/tls` one, and `ByteStream(h2 = Option.Some(t))?` an accepted
+[`std/http2`](http2.md) extended CONNECT tunnel (RFC 8441). Give exactly one:
+passing more than one, or none, fails with an error instead of picking one for you.
 
 ```bit
 import { ByteStream, byteStream } from "std/http"
