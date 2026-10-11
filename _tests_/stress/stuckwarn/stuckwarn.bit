@@ -1,0 +1,165 @@
+// A worker that holds one task past a budget outside any blocking bracket and
+// without reaching a safepoint says so once on stderr (#7841). The case #7836
+// found: a task in a kernel wait or foreign call with no `bit_rt_gc_syscall_begin`/
+// `_end` around it leaves its worker's registry slot `running`, so at
+// `BIT_WORKERS=1` nothing else runs until the call returns and nothing used to
+// say why. The monitor thread (`rootRetakeScan`, runtime/root/retake.bit) counts
+// consecutive scans in which a worker is `running` with a preempt request
+// outstanding and writes one line when the count reaches `BIT_STUCK_MS`.
+//
+// SELF-CHECKING BY RE-EXEC. The parent (no argument) runs this same binary as a
+// child, once per case, and counts the `[bit-rt] worker ` lines on the child's
+// stderr:
+//   park     a task in an UNBRACKETED `bit_rt_port_park_sleep_ns`      exactly 1
+//   poll     two compute tasks that poll at every back edge            0
+//   bracket  a task in a BRACKETED `bit_rt_port_park_sleep_ns`         0
+// each at BIT_WORKERS=1 and 4. Then the default budget (1000 ms, an unbracketed
+// 2 s sleep), `BIT_STUCK_MS=0` (off, no line) and a malformed value (fatal 64).
+// The budget is lowered to 200 ms for the repeated cases to keep the fixture
+// short; the line states the budget it fired at, so a wrong budget fails too.
+import { args } from "std/os"
+import { output } from "std/process"
+import { contains, count } from "std/strings"
+import { monotonic, Millisecond } from "std/time"
+
+extern fn bit_rt_gc_syscall_begin()
+extern fn bit_rt_gc_syscall_end()
+extern fn bit_rt_port_park_sleep_ns(ns: int, scratch: *i64)
+
+const shortBudgetMs: int = 200
+const holdNs: int = 1000 * Millisecond
+const defaultHoldNs: int = 2000 * Millisecond
+const childTimeoutMs: int = 60000
+const runs: int = 2
+const usageExit: int = 64
+const marker: string = "[bit-rt] worker "
+
+let sleepScratch: [2]i64
+
+fn parkFor(ns: int) {
+  bit_rt_port_park_sleep_ns(ns, ptrOf(sleepScratch))
+}
+
+fn unbracketed(done: chan<int>, ns: int) {
+  parkFor(ns)
+  done <- 1
+}
+
+fn bracketed(done: chan<int>, ns: int) {
+  bit_rt_gc_syscall_begin()
+  parkFor(ns)
+  bit_rt_gc_syscall_end()
+  done <- 1
+}
+
+// Polls at every back edge, so each preempt request is consumed within
+// microseconds and the task never reads as held.
+fn compute(done: chan<int>, ns: int) {
+  let end = monotonic().ns + ns
+  let x = 0
+  while (monotonic().ns < end) {
+    x = x + 1
+  }
+  done <- x
+}
+
+fn child(mode: string): int {
+  let done = chan<int>(2)
+  if (mode == "park") {
+    spawn unbracketed(done, holdNs)
+  } else if (mode == "park2s") {
+    spawn unbracketed(done, defaultHoldNs)
+  } else if (mode == "bracket") {
+    spawn bracketed(done, holdNs)
+  } else if (mode == "poll") {
+    spawn compute(done, holdNs)
+    spawn compute(done, holdNs)
+    let _ = <- done
+  } else {
+    print("stuckwarn child: unknown mode ${mode}\n")
+    return 1
+  }
+  let _ = <- done
+  return 0
+}
+
+class Case {
+  mode: string,
+  workers: int,
+  budget: string,
+  want: int,
+  wantMs: int,
+}
+
+fn envArgs(c: Case, self: string): []string {
+  let a = ["BIT_WORKERS=${c.workers}"]
+  if (c.budget != "") {
+    a = append(a, "BIT_STUCK_MS=${c.budget}")
+  }
+  a = append(a, self)
+  return append(a, c.mode)
+}
+
+fn lineOk(c: Case, err: string): bool {
+  let want = "for over ${c.wantMs} ms without reaching a safepoint or a blocking bracket"
+  return c.want == 0 || (contains(err, want) && contains(err, "gcBlockingBegin/gcBlockingEnd"))
+}
+
+fn runCase(c: Case, self: string, n: int): bool {
+  let r = output("/usr/bin/env", envArgs(c, self), childTimeoutMs)
+  let lines = count(r.stderr, marker)
+  if (r.exitCode != 0 || lines != c.want || !lineOk(c, r.stderr)) {
+    print("stuckwarn FAIL ${c.mode} workers=${c.workers} budget='${c.budget}' run ${n}: exit ${r.exitCode}, ${lines} lines (want ${c.want}), stderr '${r.stderr}'\n")
+    return false
+  }
+  return true
+}
+
+// The malformed budget is refused at boot with status 64 and the knob's name.
+fn runBad(self: string): bool {
+  let r = output("/usr/bin/env", ["BIT_STUCK_MS=abc", self, "poll"], childTimeoutMs)
+  if (r.exitCode != usageExit || !contains(r.stderr, "bit: invalid BIT_STUCK_MS=\"abc\"")) {
+    print("stuckwarn FAIL bad budget: exit ${r.exitCode}, stderr '${r.stderr}'\n")
+    return false
+  }
+  return true
+}
+
+fn main(): int {
+  let a = args()
+  if (len(a) > 1) {
+    return child(a[1])
+  }
+  let short = "${shortBudgetMs}"
+  let cases = [
+    Case{ mode = "park", workers = 1, budget = short, want = 1, wantMs = shortBudgetMs },
+    Case{ mode = "park", workers = 4, budget = short, want = 1, wantMs = shortBudgetMs },
+    Case{ mode = "poll", workers = 1, budget = short, want = 0, wantMs = 0 },
+    Case{ mode = "poll", workers = 4, budget = short, want = 0, wantMs = 0 },
+    Case{ mode = "bracket", workers = 1, budget = short, want = 0, wantMs = 0 },
+    Case{ mode = "bracket", workers = 4, budget = short, want = 0, wantMs = 0 },
+    Case{ mode = "park2s", workers = 1, budget = "", want = 1, wantMs = 1000 },
+    Case{ mode = "park", workers = 1, budget = "0", want = 0, wantMs = 0 },
+  ]
+  let ci = 0
+  while (ci < len(cases)) {
+    let c = cases[ci]
+    ci = ci + 1
+    let reps = runs
+    if (c.budget == "" || c.budget == "0") {
+      reps = 1
+    }
+    let n = 0
+    while (n < reps) {
+      if (!runCase(c, a[0], n)) {
+        return 1
+      }
+      n = n + 1
+    }
+  }
+  if (!runBad(a[0])) {
+    return 1
+  }
+  print("stuckwarn: ok\n")
+  return 0
+}

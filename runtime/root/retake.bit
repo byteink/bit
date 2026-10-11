@@ -13,8 +13,10 @@
 
 // `wordAt`, `worldBlockAddr` and `schedMaxWorkers` are already imported by
 // `./root.bit` and `./fs.bit`: a second import of any of them is E0042.
-import { worldSlotState, worldFence, mSyscall, mBlocked } from "../gc"
-import { schedRetakeScan, schedWorkerAt, scNWorkers, wkSlot } from "../sched"
+import { worldSlotState, worldFence, worldStopRequested, mRunning, mSyscall, mBlocked } from "../gc"
+import {
+  schedRetakeScan, schedWorkerAt, scNWorkers, wkSlot, preemptRequested, sysmonPeriodNs,
+} from "../sched"
 
 // The monitor's half of the `mapPeers` handshake (`mapCtrlPublish`,
 // ./maptable.bit, #7784), run between `schedGrowArm` and `threadStart` with
@@ -38,6 +40,165 @@ export @nosplit @symbol("bit_rt_port_root_retake_confirm") fn rootRetakeConfirm(
   return st == mSyscall || st == mBlocked
 }
 
+// ---------------------------------------------------------------------------
+// The unbracketed long-run warning (#7841)
+// ---------------------------------------------------------------------------
+//
+// THE CASE. A task blocked in a kernel wait or foreign call with no
+// `gcBlockingBegin`/`gcSyscallBegin` bracket (ABI.md section 5) leaves its
+// worker's registry slot `running`, so the retake above cannot see it and, at
+// `BIT_WORKERS=1`, nothing else runs until the call returns (#7836 measured a
+// spawned task in an unbracketed 2 s park sleep: main resumed 2005 ms later).
+// The same shape is a CPU-bound run with no safepoint. Unsupported by
+// contract, but it used to be silent.
+//
+// THE TEST. One scan per sysmon tick, per worker with a registered slot: the
+// worker is "held" when its registry state is `running` AND a preempt request
+// is outstanding (`preemptRequested`: set once a task has held the worker past
+// `preemptBudgetNs`, cleared at the task's next safepoint or at its exit). A
+// task that polls consumes the request within microseconds, so it is never
+// held for more than a few ticks; a task in a bracket reads `syscall` or
+// `blocked`. The CONSECUTIVE count matters: a task leaving a long bracket
+// still has the request it never consumed, and is `running` for the few
+// instructions before its first poll, which one scan can catch and 500 cannot.
+// While a stop-the-world is pending the count is left alone: the collecting
+// thread is `running` and poll-free for the whole collection, and a thread
+// that never answers a stop already has its own line (`worldStuckNote`,
+// ../gc/gcworldstuck.bit).
+//
+// THE LINE. Written once per episode, when the count first reaches the budget,
+// and never again until the count has been reset by a poll or a bracket.
+// Episodes are at least the budget apart per worker, so the output is bounded
+// by workers per budget and never a flood. The elapsed figure is the budget, a
+// lower bound: the registry keeps no per-slot timestamp and a clock read would
+// cost every bracket. Whether the task is in a foreign call is not knowable
+// here; that is the point of the contract. The writer is the monitor thread,
+// which is permanently `blocked` and holds no heap reference, so a stalled
+// stderr pipe cannot delay a collection.
+//
+// ZERO HOT-PATH COST: nothing outside the monitor thread runs this. The budget
+// is `BIT_STUCK_MS` (default 1000, 0 disables; ABI.md section 7), set once at
+// boot by `rootStuckSetBudget` before any worker exists.
+
+// The budget in monitor scans (0: disabled) and in milliseconds (for the line).
+let stuckBudget: i64 = 500
+let stuckBudgetMs: i64 = 1000
+
+// Consecutive scans worker `w` was seen held. Written only by the monitor.
+let stuckStreak: [32]i64
+
+// The line: 232 fixed bytes plus two decimals of at most 20 each is 272; 40
+// words is 320. `storeByte` writes through a raw address, so an undersized
+// block would run off the end in silence (#1682).
+let stuckBuf: [40]i64
+
+// Set the budget from `BIT_STUCK_MS`. Called once by `rootconfig.bit`'s boot
+// validation, before any worker thread exists. Rounds up to a whole scan so a
+// small non-zero value never reads as "disabled".
+fn rootStuckSetBudget(ms: int) {
+  stuckBudgetMs = ms
+  stuckBudget = (ms * 1000000 + sysmonPeriodNs - 1) / sysmonPeriodNs
+}
+
+@nosplit fn stuckConst(at: int, word: int, nbytes: int): int {
+  let base = int(ptrOf(stuckBuf))
+  let w = word
+  let i = 0
+  while (i < nbytes) {
+    storeByte(base + at + i, w & 255)
+    w = w >> 8
+    i = i + 1
+  }
+  return at + nbytes
+}
+
+@nosplit fn stuckNum(at: int, v: int): int {
+  return at + osWriteDecimal(int(ptrOf(stuckBuf)) + at, v)
+}
+
+// "[bit-rt] worker <w> has run one task for over <ms> ms ", 43 bytes of text.
+@nosplit fn stuckHead(w: int, ms: int): int {
+  let at = 0
+  at = stuckConst(at, 6734132882377892443, 8) // "[bit-rt]"
+  at = stuckConst(at, 2338042668714522400, 8) // " worker "
+  at = stuckNum(at, w)
+  at = stuckConst(at, 7959393400147503136, 8) // " has run"
+  at = stuckConst(at, 8314054069592157984, 8) // " one tas"
+  at = stuckConst(at, 8534075494757703787, 8) // "k for ov"
+  at = stuckConst(at, 2126437, 3)             // "er "
+  at = stuckNum(at, ms)
+  return at
+}
+
+// "ms without reaching ... (ABI.md section 5; budget BIT_STUCK_MS)\n".
+@nosplit fn stuckTail(start: int): int {
+  let at = start
+  at = stuckConst(at, 7526756837609401632, 8) // " ms with"
+  at = stuckConst(at, 7161116423340979567, 8) // "out reac"
+  at = stuckConst(at, 8295737305418590568, 8) // "hing a s"
+  at = stuckConst(at, 8389759083185792609, 8) // "afepoint"
+  at = stuckConst(at, 7809840305342148384, 8) // " or a bl"
+  at = stuckConst(at, 7070765138884387695, 8) // "ocking b"
+  at = stuckConst(at, 2891438939714052466, 8) // "racket ("
+  at = stuckConst(at, 8751185064972739954, 8) // "registry"
+  at = stuckConst(at, 8223684470104159008, 8) // " state r"
+  at = stuckConst(at, 4263052246195793525, 8) // "unning);"
+  at = stuckConst(at, 8387227955628237344, 8) // " bracket"
+  at = stuckConst(at, 2336353831738501920, 8) // " kernel "
+  at = stuckConst(at, 7310027629596536417, 8) // "and fore"
+  at = stuckConst(at, 7812726531954730857, 8) // "ign call"
+  at = stuckConst(at, 7431054234356228211, 8) // "s with g"
+  at = stuckConst(at, 7956008291541992035, 8) // "cBlockin"
+  at = stuckConst(at, 7435282908797289063, 8) // "gBegin/g"
+  at = stuckConst(at, 7956008291541992035, 8) // "cBlockin"
+  at = stuckConst(at, 4774141199578449255, 8) // "gEnd (AB"
+  at = stuckConst(at, 7162257365363666505, 8) // "I.md sec"
+  at = stuckConst(at, 2322508446247643508, 8) // "tion 5; "
+  at = stuckConst(at, 4764936384633140578, 8) // "budget B"
+  at = stuckConst(at, 5423272196948579401, 8) // "IT_STUCK"
+  at = stuckConst(at, 43642998111, 5)         // "_MS)\n"
+  return at
+}
+
+// Count worker `w` for one scan: held (registry state `st` is `running` and a
+// preempt request is outstanding) extends its run, anything else ends it. The
+// scan that reaches the budget writes the line.
+@nosplit fn stuckObserve(world: *i64, w: int, st: int) {
+  if (worldStopRequested(world)) {
+    return
+  }
+  let streak = ptrOf(stuckStreak) + w
+  if (st != mRunning || !preemptRequested(w)) {
+    *streak = 0
+    return
+  }
+  *streak = *streak + 1
+  if (*streak == stuckBudget) {
+    let n = stuckTail(stuckHead(w, stuckBudgetMs))
+    bit_rt_port_root_io_write_all(2, int(ptrOf(stuckBuf)), n)
+  }
+}
+
+// The monitor thread's warning-only scan, for a platform with no retake (the
+// Windows monitor, ../windows/sysmon.bit); `rootRetakeScan` below folds the same
+// observation into its own pass.
+export @nosplit @symbol("bit_rt_port_root_stuck_scan") fn rootStuckScan(s: *i64) {
+  let wa = worldBlockAddr()
+  if (wa == 0) {
+    return
+  }
+  let world = wordAt(wa)
+  let n = atomicLoad(s + scNWorkers)
+  let w = 0
+  while (w < n && w < schedMaxWorkers) {
+    let slot = atomicLoad(schedWorkerAt(s, w) + wkSlot)
+    if (slot > 0) {
+      stuckObserve(world, w, worldSlotState(world, slot - 1))
+    }
+    w = w + 1
+  }
+}
+
 // The per-tick scan the monitor thread runs after `sysmonTick`. Returns 0 when
 // no worker should be started, else the number of retake-eligible workers.
 export @nosplit @symbol("bit_rt_port_root_retake_scan") fn rootRetakeScan(s: *i64): int {
@@ -56,6 +217,7 @@ export @nosplit @symbol("bit_rt_port_root_retake_scan") fn rootRetakeScan(s: *i6
       if (st == mSyscall || st == mBlocked) {
         mask = mask | (1 << w)
       }
+      stuckObserve(world, w, st)
     }
     w = w + 1
   }
