@@ -676,7 +676,7 @@ case "${BUCKET}" in
     # closed it by adding `test-package-tags` to the `selfhost`, `runtime`
     # and `stdlib` buckets too (see each bucket's own comment above).
     #
-    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations test-package-tags test-no-warnings)
+    BUILD_STEPS=(test-packages test-gens3 test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations test-package-tags test-no-warnings)
     ;;
   spec)
     # test-fmt-citations (#5615) is spec's second gate. test-spec alone is a
