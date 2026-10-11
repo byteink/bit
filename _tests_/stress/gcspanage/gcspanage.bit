@@ -1,0 +1,136 @@
+// The #3045 span cache gives an idle span back (#6050). Before this, a burst
+// left up to `allocSpanCache` reclaimed spans resident in the cache for the
+// life of the process; a pkg/web soak's RSS stepped up twice and never came
+// down. `heapSpanCacheAgeLocked` (runtime/alloc/spancache.bit) now releases a
+// span no refill took for `allocSpanCacheAge` collections, at most
+// `allocSpanCacheTrim` per collection, onto the reserve's span free list.
+//
+// WHAT THIS ASSERTS, on a private heap driven by hand like
+// `../gcspanfreelist`:
+//
+//   (a) FULL. One burst reclaims well over 64 spans of one class, so the
+//       cache ends it holding exactly `allocSpanCache`.
+//   (b) KEPT WHILE YOUNG. `allocSpanCacheAge` idle collections later the cache
+//       still holds all of them: a heap that swings for a few cycles keeps
+//       its spans.
+//   (c) RELEASED WHEN OLD. `allocSpanCache / allocSpanCacheTrim` collections
+//       after that, the cache is empty.
+//   (d) ADDRESS KEPT. A second, identical burst maps at most two more chunks
+//       than the first: the released spans went to the span free list, not
+//       back to the OS with their addresses.
+//   (e) SOUND and (f) NO LEAK, as in `../gcspanfreelist`.
+//
+// Mutation: drop the `gcSpanCacheAgeLocked(g)` call from `sweep`
+// (runtime/gc/gcmark.bit) and (c) reads 64 instead of 0.
+
+import { spinUnlocked } from "../../../runtime"
+import {
+  heapInit, heapWords, heapSpanCacheLen, allocSpanCache, allocSpanCacheAge,
+  allocSpanCacheTrim,
+} from "../../../runtime/alloc"
+import {
+  gcInit, gcConfigure, gcBindMemory, gcAlloc, gcCollectRoots, gcDeinit,
+  gcWords, gcSpanViolations, gcLiveBytes, gcSpanChunks,
+} from "../../../runtime/gc"
+
+// Two spans of caller-bound arena, so the burst's spans are reserve-owned and
+// therefore cacheable (`../gcspanfreelist` has the full argument).
+const ARENA_WORDS: int = 32768
+const INDEX_WORDS: int = 8192
+const META_WORDS: int = 8
+
+// ~140 spans of one 128-byte class: more than double the cache.
+const OBJS: int = 150000
+
+fn burst(g: *i64, metaAddr: int, roots: *i64): int {
+  let i = 0
+  let allocOk = 1
+  while (i < OBJS) { // bounded: OBJS iterations
+    let p = gcAlloc(g, metaAddr)
+    if (p == 0) {
+      allocOk = 0
+    }
+    *(roots + i) = p
+    i = i + 1
+  }
+  gcCollectRoots(g, int(roots), OBJS) // every root live: nothing swept
+  let d = 0
+  while (d < OBJS) { // bounded: OBJS iterations
+    *(roots + d) = 0
+    d = d + 1
+  }
+  gcCollectRoots(g, int(roots), OBJS) // now all garbage: reclaim fires
+  return allocOk
+}
+
+// `n` collections that allocate nothing, so no refill can take a cached span.
+fn idle(g: *i64, roots: *i64, n: int) {
+  let k = 0
+  while (k < n) { // bounded: n iterations
+    gcCollectRoots(g, int(roots), OBJS)
+    k = k + 1
+  }
+}
+
+fn main() {
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let lock = []i32(1)
+  let state = []i64(gcWords)
+  let meta = []i64(META_WORDS)
+  let roots = []i64(OBJS)
+
+  let metaAddr = int(ptrOf(meta))
+  meta[0] = 128 // body size: a small-path object
+  meta[1] = 0   // no pointer fields
+  meta[2] = 0
+  meta[3] = 0
+  meta[4] = 0
+  meta[5] = 0
+  meta[6] = 0
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+  let lp = ptrOf(lock)
+  atomicStore(lp, spinUnlocked)
+
+  let g = ptrOf(state)
+  let rootsAddr = ptrOf(roots)
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  // The worklist sized from the root set, as `../gcspanfreelist` explains.
+  if (!gcInit(g, int(hp), int(hlk), int(lp), metaAddr, OBJS)) {
+    print("gcInit failed\n")
+    return
+  }
+  gcConfigure(g, true, true, 4096, 200, false)
+
+  let allocOk1 = burst(g, metaAddr, rootsAddr)
+  let chunks1 = gcSpanChunks(g)
+  let full = heapSpanCacheLen(hp)
+  idle(g, rootsAddr, allocSpanCacheAge)
+  let young = heapSpanCacheLen(hp)
+  idle(g, rootsAddr, allocSpanCache / allocSpanCacheTrim)
+  let old = heapSpanCacheLen(hp)
+
+  let allocOk2 = burst(g, metaAddr, rootsAddr)
+  let chunks2 = gcSpanChunks(g)
+  let kept = 0
+  if (chunks2 <= chunks1 + 2) {
+    kept = 1
+  }
+
+  let spanBad = gcSpanViolations(g) // read before teardown frees every span
+  gcDeinit(g)
+  let leaked = gcLiveBytes(g)
+
+  let rooted = 0
+  if (len(arena) == ARENA_WORDS && len(roots) == OBJS) {
+    rooted = 1
+  }
+
+  print("gcspanage ${allocOk1} ${allocOk2} ${full} ${young} ${old} ${kept} ${spanBad} ${leaked} ${rooted}\n")
+}
