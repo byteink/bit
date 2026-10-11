@@ -43,7 +43,13 @@ fn main(): ()! {
   let piece = Article{ id = 1, team = "news", status = "review" }
   println("before: ${authz.can<Article>(mira, Action.Publish, piece)}")
   authz.savePolicy(jsonDecodeText<PolicyDoc>(publishOwnTeam)?)?
-  authz.attach(Attachment{ policy = "PublishOwnTeam", to = Target{ role = Option<string>.Some("author") }, tenant = "" })?
+  authz.attach(
+    Attachment{
+      policy = "PublishOwnTeam",
+      to = Target{ role = Option<string>.Some("author") },
+      tenant = "",
+    },
+  )?
   println("after: ${authz.can<Article>(mira, Action.Publish, piece)}")
 }
 ```
@@ -84,13 +90,22 @@ fn main(): ()! {
   let typo = PolicyDoc{
     name = "PublishReviewed",
     statements = [
-      Statement{ effect = "allow", actions = ["Publsh"], resource = "Article", when = jsonParse("null")? },
+      Statement{
+        effect = "allow",
+        actions = ["Publsh"],
+        resource = "Article",
+        when = jsonParse("null")?,
+      },
     ],
   }
   authz.savePolicy(typo) catch e {
     println(e.message())
   }
-  let ghost = Attachment{ policy = "PublishReviewed", to = Target{ role = Option<string>.Some("author") }, tenant = "" }
+  let ghost = Attachment{
+    policy = "PublishReviewed",
+    to = Target{ role = Option<string>.Some("author") },
+    tenant = "",
+  }
   authz.attach(ghost) catch e {
     println(e.message())
   }
@@ -136,7 +151,12 @@ fn grant(authz: Authz<Action>, to: Target): ()! {
 fn main(): ()! {
   let authz = Authz<Action>()?
   authz.resource<Article>()?
-  let any = Statement{ effect = "allow", actions = ["Publish"], resource = "Article", when = jsonParse("null")? }
+  let any = Statement{
+    effect = "allow",
+    actions = ["Publish"],
+    resource = "Article",
+    when = jsonParse("null")?,
+  }
   authz.savePolicy(PolicyDoc{ name = "PublishAny", statements = [any] })?
   grant(authz, Target{ group = Option<string>.Some("editors") })?
   grant(authz, Target{ user = Option<string>.Some("sara") })?
@@ -144,7 +164,13 @@ fn main(): ()! {
   let eve = Option<Subject>.Some(User{ id = "eve", roles = ["group:editors"] })
   let sara = Option<Subject>.Some(User{ id = "sara", roles = [] })
   let zed = Option<Subject>.Some(User{ id = "zed", roles = ["editors"] })
-  println("${authz.can<Article>(eve, Action.Publish, piece)} ${authz.can<Article>(sara, Action.Publish, piece)} ${authz.can<Article>(zed, Action.Publish, piece)}")
+  println(
+    "${authz.can<Article>(eve, Action.Publish, piece)} ${authz.can<Article>(
+      sara,
+      Action.Publish,
+      piece,
+    )} ${authz.can<Article>(zed, Action.Publish, piece)}",
+  )
 }
 ```
 
@@ -180,9 +206,18 @@ class User {
 fn main(): ()! {
   let authz = Authz<Action>()?
   authz.resource<Article>()?
-  let any = Statement{ effect = "allow", actions = ["Publish"], resource = "Article", when = jsonParse("null")? }
+  let any = Statement{
+    effect = "allow",
+    actions = ["Publish"],
+    resource = "Article",
+    when = jsonParse("null")?,
+  }
   authz.savePolicy(PolicyDoc{ name = "PublishAny", statements = [any] })?
-  let att = Attachment{ policy = "PublishAny", to = Target{ role = Option<string>.Some("author") }, tenant = "" }
+  let att = Attachment{
+    policy = "PublishAny",
+    to = Target{ role = Option<string>.Some("author") },
+    tenant = "",
+  }
   authz.attach(att)?
   let mira = Option<Subject>.Some(User{ id = "mira", roles = ["author"] })
   let piece = Article{ id = 1, status = "review" }
