@@ -251,9 +251,12 @@ This prints `acme: true`, `borealis: false` and `no tenant: false`. A
 
 ## Sharp edges
 
-- Any attachment or save moves one version for all tenants, so every tenant's
-  cached rules are rebuilt on their next check, not only the tenant that
-  changed.
+- A save, or an attachment with `tenant = ""`, rebuilds every tenant's cached
+  rules on their next check. An attachment for one tenant rebuilds that
+  tenant's only; the others stay warm ([Stored policies](stored.md) has how a
+  second server learns of it).
+- The first `forTenant` of a tenant reads its attachments from the store once;
+  after that a view makes no store call.
 - `rolesOf` on a view lists the rules of that tenant.
 - A `MemoryStore` and a `MemoryRelationStore` are per process, tenants or not.
 

@@ -11,6 +11,11 @@
 // `MemoryStore`): they last as long as the process. A non-empty one opens the
 // policy store, and a store that cannot be reached is a StoreUnavailable, so
 // the app stops at startup instead of refusing every request later.
+// `options = StoreOptions(policyStore = Option<PolicyStore>.Some(s))` brings a
+// `PolicyStore` of your own (or one `MemoryStore` shared by two handles, in a
+// test). A shared or opened store is polled every `options.refreshEveryMs` for
+// another process's writes and the handle fails closed when it cannot be read
+// (cache.bit has the whole contract); `close()` stops the poll.
 
 import { Logger } from "std/log"
 import { Mutex } from "std/sync"
@@ -48,22 +53,33 @@ export class Authz<A: ActionEnum> {
   relations: RelationStore
   limits: Limits
   state: DecideState<A>
+  storeSync: StoreSync
   tenant: TenantKey
 
   // One handle per app, built at startup. Empty `store` means in-memory.
   // A class's `init` is the constructor (SPEC §10.4): `Authz<Action>(...)`.
   // `maxDepth`, `maxVisited` and `maxFanout` bound `hasRelation` (rebac.bit);
-  // one below 1 is an InvalidPolicy.
+  // one below 1 is an InvalidPolicy. `options` (cache.bit's `StoreOptions`)
+  // sets the store to use instead of `store`, how long another process's write
+  // can go unseen (`refreshEveryMs`, default 5000, 0 turns the poll off) and
+  // how many tenants `forTenant` follows (`maxTenants`, default 10000); a
+  // value out of range is an InvalidPolicy.
   init(
     store: string = "",
     maxDepth: int = defaultMaxDepth,
     maxVisited: int = defaultMaxVisited,
     maxFanout: int = defaultMaxFanout,
+    options: StoreOptions = StoreOptions(),
   )! {
     let names = A.__variants()
     this.limits = newLimits(maxDepth, maxVisited, maxFanout)?
+    options.check()?
     this.admin = Mutex()
-    if (store == "") {
+    this.storeSync = StoreSync(options.refreshEveryMs, options.maxTenants)
+    let shared = store != "" || isSome(options.policyStore)
+    if (isSome(options.policyStore)) {
+      this.store = unwrap(options.policyStore)
+    } else if (store == "") {
       this.store = MemoryStore()
     } else {
       this.store = openStore(store)?
@@ -78,6 +94,7 @@ export class Authz<A: ActionEnum> {
       update = hasName(names, "Update"),
       delete = hasName(names, "Delete"),
     }
+    startSync<A>(this, shared)?
   }
 
   // The view of this handle for `tenant` (tenant.bit has what a tenant sees
@@ -85,9 +102,15 @@ export class Authz<A: ActionEnum> {
   // It shares everything with this handle, so it is cheap enough to make per
   // request, and policies registered or saved later show in it. An empty
   // tenant is the global one; otherwise 1 to 64 characters of `[A-Za-z0-9_.-]`,
-  // else an InvalidPolicy.
+  // else an InvalidPolicy. The first view of a tenant reads its attachments
+  // from the store (a StoreUnavailable when it cannot) and the handle follows
+  // the tenant from then on; a view of a followed tenant touches no store
+  // (cache.bit).
   export forTenant(tenant: string): Authz<A>! {
     let k = tenantKeyOf(tenant)?
+    if (tenant != "") {
+      followTenant<A>(this, tenant)?
+    }
     return Authz<A>{
       store = this.store,
       admin = this.admin,
@@ -96,6 +119,7 @@ export class Authz<A: ActionEnum> {
       relations = this.relations,
       limits = this.limits,
       state = this.state,
+      storeSync = this.storeSync,
       tenant = k,
     }
   }
@@ -258,17 +282,14 @@ export class Authz<A: ActionEnum> {
     if (this.tenant.name != "") {
       fail InvalidPolicy{ detail = "a policy is global: save it on the handle, not on the view for tenant '${this.tenant.name}'" }
     }
-    let cp = this.validateDoc(doc)?
+    this.validateDoc(doc)?
     if (codePolicyNamed<A>(this.registered().roles, doc.name)) {
       fail InvalidPolicy{ detail = "/name: a policy written in code is called '${doc.name}'" }
     }
     this.admin.lock()
     defer this.admin.unlock()
-    let before = this.store.version()?
-    if (this.store.putPolicy(doc)? == before) {
-      return
-    }
-    this.state.cache.publishStored(storedWithPolicy<A>(this.registered().stored, cp))
+    let _ = this.store.putPolicy(doc)?
+    syncMarked<A>(this)?
   }
 
   // Attaches a saved policy to a role, a group or one user, for a tenant
@@ -285,12 +306,8 @@ export class Authz<A: ActionEnum> {
     if (!isSome(this.store.policy(at.policy)?)) {
       fail InvalidPolicy{ detail = "/policy: no stored policy is called '${at.policy}'" }
     }
-    let before = this.store.version()?
     this.store.attach(at)?
-    if (this.store.version()? == before) {
-      return
-    }
-    this.state.cache.publishStored(storedWithAttachment<A>(this.registered().stored, at))
+    syncMarked<A>(this)?
   }
 
   // Undoes `attach`: from the target's next check the policy no longer
@@ -301,12 +318,27 @@ export class Authz<A: ActionEnum> {
     let at = attachmentIn(this.tenant.name, a)?
     this.admin.lock()
     defer this.admin.unlock()
-    let before = this.store.version()?
     this.store.detach(at)?
-    if (this.store.version()? == before) {
-      return
-    }
-    this.state.cache.publishStored(storedWithoutAttachment<A>(this.registered().stored, at))
+    syncMarked<A>(this)?
+  }
+
+  // Reads the store's versions and reloads what moved, now: the poll's own
+  // step, for an app to call once after it has registered its resources and
+  // roles (a store that already holds policies starts down until then), and
+  // in tests. Fails with the StoreUnavailable the handle is failing closed
+  // with, or an InvalidPolicy when a stored policy does not compile; it
+  // succeeds, and the handle is up again, once the store answers and every
+  // policy compiles. Calling it when nothing moved costs two store reads.
+  export refresh(): ()! {
+    this.admin.lock()
+    defer this.admin.unlock()
+    syncMarked<A>(this)?
+  }
+
+  // Stops the store poll and waits for it to finish. The handle keeps working
+  // on what it has loaded; nothing refreshes it. Safe to call twice.
+  export close() {
+    stopSync(this.storeSync)
   }
 
   // The stored policy called `name`, as it was saved, or None.

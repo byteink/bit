@@ -1,0 +1,338 @@
+// pkg/authz/cache.test.bit — the compiled stored policies against the store's
+// versions (cache.bit): a second handle sees the first's writes after a
+// refresh or a poll, a write in one tenant leaves another's rules warm (counted
+// by how often a policy closure runs), and an unreachable store makes every
+// kind of request fail closed.
+//
+// `st*` (store.test.bit) build the documents and handles, `tn*`
+// (tenant.test.bit) the tenant views, `LogLines` (decide.test.bit) the log.
+
+import { sleep, Millisecond } from "std/time"
+import { xxhash64 } from "std/hash"
+import { contains } from "std/strings"
+
+// A PolicyStore over a MemoryStore that can be switched off and counts every
+// call, so a test can say how often a check reached the store (0).
+class FlakyStore {
+  inner: MemoryStore
+  off: bool
+  calls: int
+
+  init(inner: MemoryStore) {
+    this.inner = inner
+    this.off = false
+    this.calls = 0
+  }
+
+  gate(): ()! {
+    this.calls = this.calls + 1
+    if (this.off) {
+      fail newError("connection refused")
+    }
+  }
+
+  export putPolicy(doc: PolicyDoc): i64! {
+    this.gate()?
+    return this.inner.putPolicy(doc)?
+  }
+
+  export policy(name: string): Option<PolicyDoc>! {
+    this.gate()?
+    return this.inner.policy(name)?
+  }
+
+  export policies(): []PolicyDoc! {
+    this.gate()?
+    return this.inner.policies()?
+  }
+
+  export attach(a: Attachment): ()! {
+    this.gate()?
+    this.inner.attach(a)?
+  }
+
+  export detach(a: Attachment): ()! {
+    this.gate()?
+    this.inner.detach(a)?
+  }
+
+  export attachments(tenant: string): []Attachment! {
+    this.gate()?
+    return this.inner.attachments(tenant)?
+  }
+
+  export version(): i64! {
+    this.gate()?
+    return this.inner.version()?
+  }
+
+  export scopeVersion(tenant: string): i64! {
+    this.gate()?
+    return this.inner.scopeVersion(tenant)?
+  }
+}
+
+class Runs {
+  n: int,
+}
+
+fn cxOptions(store: PolicyStore, ms: int, tenants: int): StoreOptions {
+  return StoreOptions(
+    policyStore = Option<PolicyStore>.Some(store),
+    refreshEveryMs = ms,
+    maxTenants = tenants,
+  )
+}
+
+// A handle over `store`, with Article registered and no poller (the test
+// calls `refresh()` itself) unless `ms` says otherwise.
+fn cxAuthz(store: PolicyStore, ms: int): Authz<Action> {
+  let a = Authz<Action>(options = cxOptions(store, ms, 10_000)) catch e {
+    panic("Authz: ${e.message()}")
+  }
+  let _ = a.resource<Article>() catch e {
+    panic("resource: ${e.message()}")
+  }
+  return a
+}
+
+fn cxRefresh(a: Authz<Action>) {
+  a.refresh() catch e {
+    panic("refresh: ${e.message()}")
+  }
+}
+
+fn cxSub(): Option<Subject> {
+  return stWho("sara", ["author"], "x")
+}
+
+fn cxCan(a: Authz<Action>): bool {
+  return stCan(a, cxSub(), stRow("x", "draft"))
+}
+
+// Saves PubAll (Publish on any Article) and attaches it to the role author.
+fn cxGrant(a: Authz<Action>) {
+  stSave(a, stDoc("PubAll", "allow", ["Publish"], "null"))
+  stAttach(a, stRole("PubAll", "author"))
+}
+
+fn cxCheckErr(a: Authz<Action>): string {
+  a.check<Article>(cxSub(), Action.Publish, stRow("x", "draft")) catch e {
+    return e.message()
+  }
+  return "OK"
+}
+
+fn cxFilterErr(a: Authz<Action>): string {
+  let _ = a.filterFor<Article>(cxSub(), Action.Publish) catch e {
+    return e.message()
+  }
+  return "OK"
+}
+
+test "a second handle on the same store sees the first's writes after a refresh, and its revocations" {
+  let shared = MemoryStore()
+  let first = cxAuthz(shared, 0)
+  let second = cxAuthz(shared, 0)
+  cxGrant(first)
+  assert(cxCan(first), "the writer is consistent at once")
+  assert(!cxCan(second), "the other handle has not looked yet")
+  cxRefresh(second)
+  assert(cxCan(second), "it sees the grant after one refresh")
+  first.detach(stRole("PubAll", "author")) catch e {
+    panic("detach: ${e.message()}")
+  }
+  assert(cxCan(second), "still the old answer until the next refresh")
+  cxRefresh(second)
+  assert(!cxCan(second), "the revocation is seen after the next refresh")
+}
+
+test "the background poll brings another handle's write in within a few intervals, and close stops it" {
+  let shared = MemoryStore()
+  let writer = cxAuthz(shared, 0)
+  let reader = cxAuthz(shared, 10)
+  cxGrant(writer)
+  let tries = 0
+  while (!cxCan(reader) && tries < 300) {
+    sleep(10 * Millisecond)
+    tries = tries + 1
+  }
+  assert(cxCan(reader), "not seen after ${tries} tries of 10 ms")
+  reader.close()
+  reader.close()
+  writer.detach(stRole("PubAll", "author")) catch e {
+    panic("detach: ${e.message()}")
+  }
+  sleep(100 * Millisecond)
+  assert(cxCan(reader), "a closed handle is not refreshed")
+}
+
+test "100 checks reach the store 0 times" {
+  let flaky = FlakyStore(MemoryStore())
+  let a = cxAuthz(flaky, 0)
+  cxGrant(a)
+  assert(cxCan(a), "warm")
+  let before = flaky.calls
+  let i = 0
+  while (i < 100) {
+    assert(cxCan(a), "check ${i}")
+    i = i + 1
+  }
+  assert(flaky.calls == before, "${flaky.calls - before} store calls on the check path")
+}
+
+test "an unreachable store fails closed for can, check and filterFor, once logged, and heals" {
+  let flaky = FlakyStore(MemoryStore())
+  let a = cxAuthz(flaky, 0)
+  let sink = newLogLines()
+  let _ = a.logTo(linesLogger(sink, LevelDebug))
+  cxGrant(a)
+  assert(cxCan(a) && cxCheckErr(a) == "OK" && cxFilterErr(a) == "OK", "up")
+  flaky.off = true
+  assert(cxCan(a), "inside the interval the warm cache still serves")
+  let failed = false
+  a.refresh() catch _ {
+    failed = true
+  }
+  assert(failed, "refresh must fail while the store is off")
+  assert(!cxCan(a), "can: false")
+  assert(cxCheckErr(a) == "authorization unavailable", "check: ${cxCheckErr(a)}")
+  assert(cxFilterErr(a) == "authorization unavailable", "filterFor: ${cxFilterErr(a)}")
+  let again = false
+  a.refresh() catch _ {
+    again = true
+  }
+  assert(again, "still failing")
+  let errors = 0
+  for line of sink.lines {
+    if (contains(line, "level=ERROR") && contains(line, "policy store unavailable")) {
+      errors = errors + 1
+    }
+  }
+  assert(errors == 1, "the outage is logged once, got ${errors}")
+  flaky.off = false
+  cxRefresh(a)
+  assert(cxCan(a) && cxCheckErr(a) == "OK" && cxFilterErr(a) == "OK", "recovered")
+}
+
+test "a handle whose refresh has stalled for two intervals is down" {
+  let a = cxAuthz(MemoryStore(), 1000)
+  assert(cxCan(a) == false, "no grant yet")
+  checkStale<Action>(a, 0)
+  assert(!a.storeSync.isDown(), "inside the window")
+  checkStale<Action>(a, 3 * 1000 * msNs + int(a.storeSync.lastOk.load()))
+  assert(a.storeSync.isDown(), "three intervals without a refresh")
+  assert(cxCheckErr(a) == "authorization unavailable", "check fails closed")
+  cxRefresh(a)
+  assert(!a.storeSync.isDown(), "a refresh brings it back")
+  a.close()
+}
+
+test "a store that cannot be read at startup is an error" {
+  let flaky = FlakyStore(MemoryStore())
+  flaky.off = true
+  let _ = Authz<Action>(options = cxOptions(flaky, 0, 10_000)) catch e {
+    assert(e.message() == "authorization unavailable", e.message())
+    return
+  }
+  assert(false, "opened an unreadable store")
+}
+
+test "a handle started on a store that already holds policies denies until it has refreshed" {
+  let shared = MemoryStore()
+  cxGrant(cxAuthz(shared, 0))
+  let late = cxAuthz(shared, 0)
+  assert(!cxCan(late), "down before the first refresh")
+  assert(cxCheckErr(late) == "authorization unavailable", cxCheckErr(late))
+  cxRefresh(late)
+  assert(cxCan(late), "loaded")
+}
+
+test "a stored policy that does not compile here keeps the handle down with an InvalidPolicy" {
+  let shared = MemoryStore()
+  cxGrant(cxAuthz(shared, 0))
+  let bare = Authz<Action>(options = cxOptions(shared, 0, 10_000)) catch e {
+    panic("Authz: ${e.message()}")
+  }
+  let why = ""
+  bare.refresh() catch e {
+    why = e.message()
+  }
+  assert(contains(why, "invalid policy"), "refresh: ${why}")
+  assert(!cxCan(bare), "down")
+}
+
+test "a write in tenant a leaves tenant b's rules warm; a global write rebuilds both" {
+  let a = stAuthz()
+  let runs = Runs{ n = 0 }
+  let counted = Policy<StUser, Action>("Counted", (p, user) => {
+    runs.n = runs.n + 1
+  })
+  let _ = a.role<StUser>("member", [counted]) catch e {
+    panic("role: ${e.message()}")
+  }
+  assert(
+    tenantSlotOf(xxhash64([]byte("a"))) != tenantSlotOf(xxhash64([]byte("b"))),
+    "a and b share a cell",
+  )
+  stSave(a, stDoc("PubAll", "allow", ["Publish"], "null"))
+  stSave(a, stDoc("PubB", "allow", ["Publish"], "null"))
+  let va = tnView(a, "a")
+  let vb = tnView(a, "b")
+  let who = stWho("sara", ["member", "author"], "x")
+  let row = stRow("x", "draft")
+  assert(!stCan(va, who, row) && !stCan(vb, who, row), "nothing attached yet")
+  let warm = runs.n
+  assert(!stCan(va, who, row) && !stCan(vb, who, row), "still nothing")
+  assert(runs.n == warm, "both tenants are warm: ${runs.n - warm} rebuilds")
+  stAttach(va, stRole("PubAll", "author"))
+  assert(!stCan(vb, who, row), "b does not see a's attachment")
+  assert(runs.n == warm, "a's write rebuilt b's rules: ${runs.n - warm}")
+  assert(stCan(va, who, row), "a sees its own")
+  assert(runs.n == warm + 1, "a rebuilt once: ${runs.n - warm}")
+  stSave(a, stDoc("PubB", "allow", ["Read"], "null"))
+  let before = runs.n
+  assert(stCan(va, who, row), "a again")
+  assert(!stCan(vb, who, row), "b again")
+  assert(runs.n == before + 2, "a global write rebuilds both: ${runs.n - before}")
+}
+
+test "a first view of a tenant reads the store once; later views and checks do not" {
+  let flaky = FlakyStore(MemoryStore())
+  let a = cxAuthz(flaky, 0)
+  let v1 = tnView(a, "a")
+  let after = flaky.calls
+  let v2 = tnView(a, "a")
+  assert(stCan(v2, cxSub(), stRow("x", "draft")) == false, "no grant")
+  assert(stCan(v1, cxSub(), stRow("x", "draft")) == false, "no grant")
+  assert(flaky.calls == after, "${flaky.calls - after} store calls after the first view")
+  flaky.off = true
+  assert(tnForErr(a, "b") == "authorization unavailable", "a new tenant needs the store")
+  assert(tnForErr(a, "a") == "OK", "a followed tenant does not")
+}
+
+test "a handle follows at most maxTenants tenants" {
+  let a = Authz<Action>(options = cxOptions(MemoryStore(), 0, 2)) catch e {
+    panic("Authz: ${e.message()}")
+  }
+  assert(tnForErr(a, "t1") == "OK" && tnForErr(a, "t2") == "OK", "two are fine")
+  assert(tnForErr(a, "t1") == "OK", "a followed one is fine again")
+  let m = tnForErr(a, "t3")
+  assert(contains(m, "raise maxTenants"), m)
+}
+
+test "a negative refreshEveryMs is refused" {
+  let _ = Authz<Action>(options = StoreOptions(refreshEveryMs = -1)) catch e {
+    assert(contains(e.message(), "refreshEveryMs"), e.message())
+    return
+  }
+  assert(false, "refreshEveryMs -1 accepted")
+}
+
+test "a maxTenants below 1 is refused" {
+  let _ = Authz<Action>(options = StoreOptions(maxTenants = 0)) catch e {
+    assert(contains(e.message(), "maxTenants"), e.message())
+    return
+  }
+  assert(false, "maxTenants 0 accepted")
+}
