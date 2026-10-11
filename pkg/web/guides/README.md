@@ -39,6 +39,11 @@ whenever you want to see where a chapter's trimmed example is headed.
 28. [Transactions](15-transactions.md)
 29. [Testing the API](16-testing-the-api.md)
 30. [Operations: health, graceful shutdown](17-operations.md)
+40. [Idempotency keys: retry a write without doing it twice](40-idempotency-keys.md)
+
+Chapter 40 goes back to the finished app and makes its two creating routes safe
+to retry. The chapters numbered 31 to 39 are not written yet, so it follows
+chapter 30 for now.
 
 Part 4 ends there; [Shipping](../../../docs/book/33-shipping.md) covers
 building and running the finished binary, for the ink CLI and this server
