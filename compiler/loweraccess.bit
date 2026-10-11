@@ -214,8 +214,8 @@ fn fieldAccessType(fc: FnCtx, oc: Checker, field: int, node: int): int {
 }
 
 // The element address of an inline `xs[i]`, once the bounds test has passed:
-// `buf` is the buffer base and `slot` the element's WORD INDEX within it
-// (`off + index`), so the element lives at `buf + slot * 8`.
+// `buf` is the buffer base and `slot` the element index within it
+// (`off + index`); the load or store scales it by the element's stride.
 class SliceElem {
   buf: int,
   slot: int,
@@ -445,46 +445,13 @@ fn emitInlineSliceGet(fc: FnCtx, recv: int, idx: int, ty: int): int {
 // The LOAD half of `emitInlineSliceGet`, over an element address a caller
 // already has (#4354): `lowerForOfSliceElem` supplies `emitSliceElemAddr`'s.
 fn emitSliceElemLoad(fc: FnCtx, e: SliceElem, ty: int): int {
-  let buf = e.buf
-  let slot = e.slot
-  let i64ty = primType(fc.c.ctx, 3)
-  // A slice buffer stores ONE 8-BYTE WORD PER ELEMENT for every element type
-  // EXCEPT a packed scalar (`packedPrimStride`, lowerlayout.bit: every prim
-  // narrower than a word, #7562/#7574), whose buffer is packed at the
-  // element's own width instead (`rtSliceGet`'s `loadPacked` arm).
-  //
-  // `index_get` scales by `ty`'s own width, so it is the right op exactly when
-  // that width matches the buffer's real stride: 8 for every reference type
-  // (`widthOf` gives 8 to everything that is not a prim) plus i64/u64/int/f64,
-  // and the packed scalar's own width — one scaled load (`ldrh`/`ldrsh`,
-  // `movzx`/`movsx`) on both backends, sign- or zero-extended by `ty`.
-  //
-  // A narrow element on a word-strided buffer would make `index_get` scale
-  // wrong; that arm computes the byte address and loads at offset 0 instead.
-  // Reading the low bytes of the stored word is exact for the same
-  // width-canonical reason the compare above is, and only prims reach that
-  // arm, so `field_get`'s fixed-array case (which yields an interior ADDRESS,
-  // not a load) is unreachable from here. Since #7574 packs every narrow prim,
-  // no element type takes it.
-  let w = widthOf(fc.c.ctx, ty)
-  if (w.bytes == 8 || sliceElemSizeFor(fc, ty) == w.bytes) {
-    let ig = mkInstr(Op.IndexGet, ty)
-    ig.lhs = buf
-    ig.rhs = slot
-    return builderEmit(fc.b, ig)
-  }
-  let three = mkInstr(Op.ConstInt, i64ty)
-  three.ival = 3
-  let shl = mkInstr(Op.Shl, i64ty)
-  shl.lhs = slot
-  shl.rhs = builderEmit(fc.b, three)
-  let addr = mkInstr(Op.Add, i64ty)
-  addr.lhs = buf
-  addr.rhs = builderEmit(fc.b, shl)
-  let load = mkInstr(Op.FieldGet, ty)
-  load.lhs = builderEmit(fc.b, addr)
-  load.ival = 0
-  return builderEmit(fc.b, load)
+  // `packedPrimStride` (lowerlayout.bit) packs every narrow scalar at its
+  // own width. All other values reaching this load occupy one word, so
+  // `index_get` scales by the buffer's actual stride.
+  let ig = mkInstr(Op.IndexGet, ty)
+  ig.lhs = e.buf
+  ig.rhs = e.slot
+  return builderEmit(fc.b, ig)
 }
 
 // Whether `xs[i] = v` may be emitted inline (#3108). Two conditions, the element
@@ -502,59 +469,40 @@ fn emitSliceElemLoad(fc: FnCtx, e: SliceElem, ty: int): int {
 // and register class (`str s` for an `f32`), byte for byte what `rtSliceSet`'s
 // packed arm does (`storePacked`, runtime/root/slices.bit).
 //
-// A narrow Int element on a WORD-strided buffer qualifies only because
-// `sliceStoreValue` (lowerlayout.bit) WIDENS the value to the canonical word
-// `rtSliceSet` stores (#7173). The slot is read WHOLE — `readLvalue`
-// (lowerassign.bit) reaches `rtSliceGet` for `xs[i] op= v` — so a store of the
-// low bytes alone would leave the rest stale. Since #7574 packs every narrow
-// prim, that arm has no element type left.
-//
-// The VALUE's own IR type is checked as well as the declared element type —
-// NOT because the store width comes from it (#4396: `index_set`'s width is
-// `ins.ival2`, the element type recorded once at construction, immune to
-// whatever the value operand's defining instruction says), but because the
-// widening extends from `val`'s OWN width and signedness: a word slot takes an
-// 8-byte value or one whose width IS the element's, never a narrower register
-// whose high bits nothing defines.
+// The VALUE's own IR width and register class must match the packed
+// element, or its width must be a word for a word-strided element. The
+// store width itself comes from `index_set`'s element type (`ins.ival2`,
+// #4396), independently of the value operand's defining instruction.
 fn canInlineSliceStore(fc: FnCtx, ty: int, idx: int, val: int): bool {
   if (regClassOf(fc.c.ctx, fc.b.instrs[idx].ty) != RegClass.Int) {
     return false
   }
   let vw = widthOf(fc.c.ctx, fc.b.instrs[val].ty)
   let ew = widthOf(fc.c.ctx, ty)
-  if (ew.bytes < 8 && sliceElemSizeFor(fc, ty) == ew.bytes) {
+  if (ew.bytes < 8) {
     return vw.bytes == ew.bytes && vw.regClass == ew.regClass
   }
-  if (ew.bytes == 8) {
-    return vw.bytes == 8
-  }
-  return sliceStoreType(fc, ty) != ty &&
-    vw.regClass == RegClass.Int &&
-    vw.bytes == ew.bytes &&
-    vw.signed == ew.signed
+  return ew.bytes == 8 && vw.bytes == 8
 }
 
 // `xs[i] = v` on a slice, stored INLINE instead of through `rt_call slice_set`
 // (#3108) — the mirror of `emitInlineSliceGet`, sharing its bounds test and its
 // address. Only ever called when `canInlineSliceStore` holds, so the stored
-// value (widened by `sliceStoreValue` first, #7173) has the buffer's stride as
-// its width and `index_set` scales by exactly that: one store, on the same
-// address and over the same bytes `rtSliceSet` would.
+// value has the buffer's stride as its width and `index_set` scales by exactly
+// that: one store, on the same address and over the same bytes `rtSliceSet` would.
 //
 // `recv`, `idx` and `val` must ALL be lowered before this runs. Evaluating the
 // stored value can allocate or call, and keeping it ahead of the sequence is
 // what stops a safepoint landing between the bounds test and the store — a
 // scheduling property, not the GC argument, which the header above now states
-// in terms of the collector rather than the schedule. The widening is ahead of
-// it too.
+// in terms of the collector rather than the schedule.
 fn emitInlineSliceSet(fc: FnCtx, recv: int, idx: int, val: int, elemTy: int) {
-  let v = sliceStoreValue(fc, val, elemTy)
   let e = emitInlineSliceElem(fc, recv, idx)
   let is = mkInstr(Op.IndexSet, fc.c.ctx.voidId)
   is.lhs = e.buf
   is.rhs = e.slot
-  is.ival = v
-  is.ival2 = sliceStoreType(fc, elemTy)
+  is.ival = val
+  is.ival2 = elemTy
   builderEmit(fc.b, is)
 }
 
