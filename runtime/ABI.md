@@ -2112,6 +2112,7 @@ Read once at startup by `configFromEnv`. Knobs tune policy, never correctness.
 | `BIT_WORKERS`       | 1       | integer 1 to 32                                    | Boot worker thread count (§9 step 2)               |
 | `BIT_VDSO`          | on      | `1`, `on`, `0`, `off`                              | `0`/`off` keeps the Linux clock on the raw syscall |
 | `BIT_HASH_SEED`     | drawn   | integer 0 to 1099511627776                         | Fixes the map hash seed, to reproduce a run whose behaviour followed map slot order |
+| `BIT_STUCK_MS`      | 1000    | integer 0 to 86400000                              | Budget for the monitor's "worker held a task outside any bracket" warning (§8.5); `0` turns it off |
 
 **A set value outside its valid values is fatal, never clamped and never
 ignored** (#6060). At startup, before the first allocation-bearing boot step,
@@ -2498,6 +2499,35 @@ must not run Bit code. Teardown does not depend on
 it: a returned `main` joins the workers under ONE 100 ms deadline (`boot`, step 8)
 and the process exits with a worker still blocked.
 
+**The monitor names that worker too (#7841).** On every tick the monitor thread
+(`rootRetakeScan`, `runtime/root/retake.bit`; on Windows `rootStuckScan` from
+`runtime/root/windows/sysmon.bit`, which has no retake) counts, per worker with a
+registered slot, the consecutive scans in which the slot reads `running` and a
+preempt request is outstanding (`preemptRequested`: set once a task has held the
+worker past `preemptBudgetNs`, cleared at the task's next safepoint or exit). When
+the count reaches `BIT_STUCK_MS` (default 1000 ms, which is 500 scans at
+`sysmonPeriodNs`; `0` disables) it writes one line to stderr:
+
+```text
+[bit-rt] worker 0 has run one task for over 1000 ms without reaching a safepoint or a blocking bracket (registry state running); bracket kernel and foreign calls with gcBlockingBegin/gcBlockingEnd (ABI.md section 5; budget BIT_STUCK_MS)
+```
+
+One line per episode: the count restarts after a safepoint, a bracket or the
+task's exit, so one worker prints at most one line per budget. The figure is the
+budget, a lower bound, because the registry keeps no per-slot clock. The
+registry cannot tell a blocking foreign call from a loop with no back-edge poll,
+so the line says neither. The count is left alone while a stop-the-world is
+pending (the collecting thread is `running` and poll-free for the whole
+collection; a thread that never answers a stop has the `[bit-gc]` line above). A
+task in a bracket reads `syscall` or `blocked` and a task that polls consumes its
+request within microseconds, so neither counts; the consecutive-scan requirement
+keeps a task that has just left a long bracket, still holding the request it
+never consumed, from being caught in the instructions before its first poll.
+The cost is on the monitor thread only: a load of the worker's slot word, its
+registry state and its request flag per tick, and nothing on spawn, dispatch or
+any safepoint. `_tests_/stress/stuckwarn` pins one line for an unbracketed
+sleep and none for a polling loop or a bracketed one, at `BIT_WORKERS=1` and 4.
+
 `BIT_GC_STATS=1` adds a field, `stuck=<n>`: how many abandoned
 rendezvous named a slot, over the whole run. The line itself is printed once
 per process, after the world is restarted (a blocked stderr must never hold the
@@ -2789,8 +2819,8 @@ worker 0's state (`rootRetakeConfirm`), and abandons the start unless worker 0
 is still in its bracket: the other half of the plain-store map publish
 (`mapCtrlPublish`, `runtime/root/maptable.bit`, #7784). Measured on darwin arm64 at 23af4e0ca: stranded tasks start 7.1-7.6 ms after spawn
 at the default pool and at `BIT_WORKERS=1` (500 ms before). A syscall that
-is not bracketed is not seen: the collector would already be waiting on that
-thread. The spawn and dispatch paths are unchanged; the monitor's extra work is
+is not bracketed is not seen (the collector would already be waiting on that
+thread), and the monitor prints a warning for it instead (§8.5, #7841). The spawn and dispatch paths are unchanged; the monitor's extra work is
 one pass over the started workers per tick (at most 32), and the monitor still
 parks when no task is in flight.
 
