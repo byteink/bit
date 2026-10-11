@@ -7,12 +7,13 @@
 //   let authz = Authz<Action>(store = env("AUTHZ_URL"))?  // plus stored policies
 //   let authz = Authz<Action>(maxDepth = 12)?          // relationship check bounds
 //
-// An empty `store` keeps everything in memory: only policies written in code
-// apply. A non-empty one opens the policy store, and a store that cannot be
-// reached is a StoreUnavailable, so the app stops at startup instead of
-// refusing every request later.
+// An empty `store` keeps stored policies in memory (store.bit's
+// `MemoryStore`): they last as long as the process. A non-empty one opens the
+// policy store, and a store that cannot be reached is a StoreUnavailable, so
+// the app stops at startup instead of refusing every request later.
 
 import { Logger } from "std/log"
+import { Mutex } from "std/sync"
 
 // The CRUD variants the ORM bridge maps a query onto (CASL's names). Which
 // of them the app's enum declares; a missing one is an error only when an
@@ -24,13 +25,7 @@ export class CrudActions {
   export delete: bool,
 }
 
-// A connection to stored policies. The store tickets give it fields and
-// methods; today only `openStore` below builds one, and it never succeeds.
-class PolicyStore {
-  url: string,
-}
-
-// The seam the store tickets fill in. Until they land, no URL names a
+// The seam the store tickets fill in (#7030). Until they land, no URL names a
 // reachable store.
 fn openStore(url: string): PolicyStore! {
   fail StoreUnavailable{}
@@ -46,7 +41,8 @@ fn hasName(names: []string, want: string): bool {
 }
 
 export class Authz<A: ActionEnum> {
-  store: Option<PolicyStore>
+  store: PolicyStore
+  admin: Mutex
   wildcard: bool
   export crud: CrudActions
   relations: RelationStore
@@ -65,9 +61,11 @@ export class Authz<A: ActionEnum> {
   )! {
     let names = A.__variants()
     this.limits = newLimits(maxDepth, maxVisited, maxFanout)?
-    this.store = Option<PolicyStore>.None
-    if (store != "") {
-      this.store = Option<PolicyStore>.Some(openStore(store)?)
+    this.admin = Mutex()
+    if (store == "") {
+      this.store = MemoryStore()
+    } else {
+      this.store = openStore(store)?
     }
     this.relations = MemoryRelationStore()
     this.state = DecideState<A>()
@@ -206,6 +204,78 @@ export class Authz<A: ActionEnum> {
     return checkAttachment(a)?
   }
 
+  // Registers `S`, the app's user class, so the rules of its subjects are
+  // built once per subject value and reused (rulecache.bit). `role<S>` does it
+  // already; call this when every role of `S` is defined by stored policies
+  // only (nothing in code names the class), or each check rebuilds the
+  // subject's rules. Calling it again, or after `role<S>`, changes nothing.
+  export subject<S: Subject>(): Authz<A> {
+    let empty: S
+    this.state.cache.addKind(kindFor<S>(), empty)
+    return this
+  }
+
+  // Saves the stored policy `doc`: checked as `validateDoc` checks it (an
+  // InvalidPolicy with the JSON Pointer of the fault), refused when a policy
+  // written in code has its name, then handed to the store and compiled, so no
+  // check ever reads the document again. A document equal to the stored one is
+  // a no-op that leaves every cache as it was; any other replaces the policy
+  // of that name for every subject it is attached to, from their next check.
+  // Safe behind an admin endpoint: input is bounded (doc.bit) and nothing here
+  // panics.
+  export savePolicy(doc: PolicyDoc): ()! {
+    let cp = this.validateDoc(doc)?
+    if (codePolicyNamed<A>(this.registered().roles, doc.name)) {
+      fail InvalidPolicy{ detail = "/name: a policy written in code is called '${doc.name}'" }
+    }
+    this.admin.lock()
+    defer this.admin.unlock()
+    let before = this.store.version()?
+    if (this.store.putPolicy(doc)? == before) {
+      return
+    }
+    this.state.cache.publishStored(storedWithPolicy<A>(this.registered().stored, cp))
+  }
+
+  // Attaches a saved policy to a role, a group or one user, for a tenant
+  // (doc.bit has the document): `attach(Attachment{ policy = "PublishOwnTeam",
+  // to = Target{ role = Option<string>.Some("author") }, tenant = "" })`.
+  // Checked as `validateAttachment` checks it, and the policy must be saved
+  // already, else an InvalidPolicy. Attaching what is attached is a no-op.
+  export attach(a: Attachment): ()! {
+    checkAttachment(a)?
+    this.admin.lock()
+    defer this.admin.unlock()
+    if (!isSome(this.store.policy(a.policy)?)) {
+      fail InvalidPolicy{ detail = "/policy: no stored policy is called '${a.policy}'" }
+    }
+    let before = this.store.version()?
+    this.store.attach(a)?
+    if (this.store.version()? == before) {
+      return
+    }
+    this.state.cache.publishStored(storedWithAttachment<A>(this.registered().stored, a))
+  }
+
+  // Undoes `attach`: from the target's next check the policy no longer
+  // applies to it. Detaching what is not attached is a no-op.
+  export detach(a: Attachment): ()! {
+    checkAttachment(a)?
+    this.admin.lock()
+    defer this.admin.unlock()
+    let before = this.store.version()?
+    this.store.detach(a)?
+    if (this.store.version()? == before) {
+      return
+    }
+    this.state.cache.publishStored(storedWithoutAttachment<A>(this.registered().stored, a))
+  }
+
+  // The stored policy called `name`, as it was saved, or None.
+  export policy(name: string): Option<PolicyDoc>! {
+    return this.store.policy(name)?
+  }
+
   // Defines role `name` as the policies listed, in that order:
   // `authz.role("author", [readPublished, editOwn])?`. Returns the handle, so
   // roles chain. Every policy is checked as `validatePolicy` checks it, so
@@ -258,7 +328,7 @@ export class Authz<A: ActionEnum> {
   // policy written for another subject class add no rules and a line to
   // `skipped`, so a subject can only lose access to a mistake.
   export rolesOf(s: Subject): Resolved<A> {
-    return resolveRoles<A>(this.registered().roles, s, this.state.cache.none.held, false)
+    return resolveRoles<A>(this.registered(), s, this.state.cache.none.held, false)
   }
 
   // Fails with a `NotFilterable` naming the policy and label when a rule that

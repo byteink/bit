@@ -1,0 +1,206 @@
+// pkg/authz/store.bit — where stored policies live. A `PolicyStore` keeps the
+// documents an admin saved (doc.bit) and the attachments that say who they
+// are for; `Authz` validates both BEFORE a store sees them and compiles them
+// itself, so a store is a plain keeper of validated data and never parses a
+// condition:
+//
+//   authz.savePolicy(doc)?       // validate, then store.putPolicy(doc)
+//   authz.attach(attachment)?    // validate, the policy must exist, then store.attach
+//   authz.detach(attachment)?
+//
+// The interface is structural (SPEC §14.3), the way pkg/web's
+// `IdempotencyStore` and pkg/jobs' `Store` are: any type with these methods is
+// a store, and the SQL, Redis and kv stores (#7027 to #7029) are three more.
+// `MemoryStore` is the one that ships here, for tests, development and a
+// single-process app.
+
+import { Mutex } from "std/sync"
+import { jsonDecodeText, jsonEncode } from "std/json"
+
+// The default number of policies and of attachments a `MemoryStore` holds.
+const memoryPolicyCapacity: int = 10_000
+const memoryAttachmentCapacity: int = 100_000
+
+// Where policies and attachments are kept. Writes are idempotent: saving a
+// document equal to the stored one, attaching what is attached and detaching
+// what is not change nothing and keep `version`. `version` grows on every
+// effective write, which is how a cache of compiled policies knows it is
+// stale (#7024). Implementations may assume `Authz` validated every document
+// and attachment.
+//
+// `putPolicy` stores `doc` under its name, replacing a document of that name,
+// and returns the store's version after the write. `policy` answers one
+// document and `policies` all of them, oldest first. `attachments(tenant)`
+// answers the attachments written for exactly that tenant, oldest first ("" is
+// the global ones).
+export interface PolicyStore {
+  putPolicy(doc: PolicyDoc): i64!,
+  policy(name: string): Option<PolicyDoc>!,
+  policies(): []PolicyDoc!,
+  attach(a: Attachment): ()!,
+  detach(a: Attachment): ()!,
+  attachments(tenant: string): []Attachment!,
+  version(): i64!,
+}
+
+// The key that makes two attachments the same one. A policy name and a tenant
+// are `[A-Za-z0-9_.-]`, so the '|' cannot occur in them, and the target, the
+// only free text (a user id), comes last.
+fn attachmentKey(a: Attachment): string {
+  let (kind, who) = targetOf(a.to)
+  return "${a.policy}|${a.tenant}|${kind}|${who}"
+}
+
+// The target's kind ("role", "group" or "user") and name; an attachment with
+// none set (which `validateAttachment` refuses) reads as ("", "").
+fn targetOf(t: Target): (string, string) {
+  if (isSome(t.role)) {
+    return ("role", unwrap(t.role))
+  }
+  if (isSome(t.group)) {
+    return ("group", unwrap(t.group))
+  }
+  if (isSome(t.user)) {
+    return ("user", unwrap(t.user))
+  }
+  return ("", "")
+}
+
+// A copy of `a` the caller cannot reach into the store through.
+fn copyAttachment(a: Attachment): Attachment {
+  return Attachment{
+    policy = a.policy,
+    to = Target{ role = a.to.role, group = a.to.group, user = a.to.user },
+    tenant = a.tenant,
+  }
+}
+
+// `list` without the attachment whose key is `key`.
+fn withoutAttachment(list: []Attachment, key: string): []Attachment {
+  let out = []Attachment(0, len(list))
+  for a of list {
+    if (attachmentKey(a) != key) {
+      out = append(out, a)
+    }
+  }
+  return out
+}
+
+// An in-process store for tests, development and a single-process app. Its
+// contents die with the process. Bounded: when full, a write that would add
+// one fails rather than growing without limit. Documents are kept as their
+// JSON text, so a caller who keeps editing the `PolicyDoc` it saved changes
+// nothing stored, and a document read back is a fresh one.
+export class MemoryStore {
+  docs: map<string, string>
+  names: []string
+  atts: []Attachment
+  keys: map<string, bool>
+  maxPolicies: int
+  maxAttachments: int
+  ver: i64
+  mu: Mutex
+
+  // A capacity below 1 could hold nothing, so it panics: a mistake at
+  // startup, and it keeps `MemoryStore()` infallible.
+  init(maxPolicies: int = memoryPolicyCapacity, maxAttachments: int = memoryAttachmentCapacity) {
+    if (maxPolicies < 1 || maxAttachments < 1) {
+      panic("authz: MemoryStore(): `maxPolicies` is ${maxPolicies} and `maxAttachments` is ${maxAttachments} — each must be at least 1")
+    }
+    this.docs = map<string, string>()
+    this.names = []string(0)
+    this.atts = []Attachment(0)
+    this.keys = map<string, bool>()
+    this.maxPolicies = maxPolicies
+    this.maxAttachments = maxAttachments
+    this.ver = 0
+    this.mu = Mutex()
+  }
+
+  export putPolicy(doc: PolicyDoc): i64! {
+    let text = jsonEncode(doc.toJson())
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (old, present) = this.docs[doc.name]
+    if (present && old == text) {
+      return this.ver
+    }
+    if (!present) {
+      if (len(this.names) >= this.maxPolicies) {
+        fail newError("authz: MemoryStore.putPolicy(): the store is full at ${this.maxPolicies} policies")
+      }
+      this.names = append(this.names, doc.name)
+    }
+    this.docs[doc.name] = text
+    this.ver = this.ver + 1
+    return this.ver
+  }
+
+  export policy(name: string): Option<PolicyDoc>! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (text, present) = this.docs[name]
+    if (!present) {
+      return Option<PolicyDoc>.None
+    }
+    return Option<PolicyDoc>.Some(jsonDecodeText<PolicyDoc>(text)?)
+  }
+
+  export policies(): []PolicyDoc! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let out = []PolicyDoc(0, len(this.names))
+    for name of this.names {
+      let (text, _) = this.docs[name]
+      out = append(out, jsonDecodeText<PolicyDoc>(text)?)
+    }
+    return out
+  }
+
+  export attach(a: Attachment): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let key = attachmentKey(a)
+    let (_, present) = this.keys[key]
+    if (present) {
+      return
+    }
+    if (len(this.atts) >= this.maxAttachments) {
+      fail newError("authz: MemoryStore.attach(): the store is full at ${this.maxAttachments} attachments")
+    }
+    this.keys[key] = true
+    this.atts = append(this.atts, copyAttachment(a))
+    this.ver = this.ver + 1
+  }
+
+  export detach(a: Attachment): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let key = attachmentKey(a)
+    let (_, present) = this.keys[key]
+    if (!present) {
+      return
+    }
+    delete(this.keys, key)
+    this.atts = withoutAttachment(this.atts, key)
+    this.ver = this.ver + 1
+  }
+
+  export attachments(tenant: string): []Attachment! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let out = []Attachment(0)
+    for a of this.atts {
+      if (a.tenant == tenant) {
+        out = append(out, copyAttachment(a))
+      }
+    }
+    return out
+  }
+
+  export version(): i64! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.ver
+  }
+}
