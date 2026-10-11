@@ -216,20 +216,31 @@ compression, request logging, all of it wraps the ordinary response path.
 A route that needs a check before it upgrades (an auth cookie, an
 `Origin` allowlist) makes that check itself, before calling `wsUpgrade`.
 
-**WebSocket, SSE and Stream all work over TLS+HTTP/1.1, and none of the
-three work over HTTP/2 or HTTP/3.** `App.listenTls()`/`App.serveTls()` (ALPN
-"http/1.1") give `wsUpgrade`/`SSE`/`Stream` the same
-keep-alive-or-hijack behavior `listen()`/`serve()` give them in plaintext -
-only the one connection that actually hijacks stops answering further
-requests; an ordinary route on the same app keeps its keep-alive connections
-either way. A request negotiated over HTTP/2 or HTTP/3 still cannot hijack at
-all - `c.hijack()`/`wsUpgrade`/`SSE`/`Stream` on one of those fail,
-naming why (a WebSocket over HTTP/2 needs RFC 8441, a separate mechanism; SSE
-and Stream over HTTP/2 and HTTP/3 need no hijack at all, being
-stream-multiplexed protocols, but this package does not implement either).
-Either needs plain `App.listen()`/`App.serve()` or
-TLS+HTTP/1.1 today, behind a TLS-terminating proxy if HTTP/2 or HTTP/3
-specifically is what the deployment needs.
+**A WebSocket works over TLS+HTTP/1.1 and over HTTP/2; SSE and Stream work
+over TLS+HTTP/1.1 only; none of the three work over HTTP/3.**
+`App.listenTls()`/`App.serveTls()` (ALPN "http/1.1") give
+`wsUpgrade`/`SSE`/`Stream` the same keep-alive-or-hijack behavior
+`listen()`/`serve()` give them in plaintext - only the one connection that
+actually hijacks stops answering further requests; an ordinary route on the
+same app keeps its keep-alive connections either way.
+
+A WebSocket over HTTP/2 needs no change to the route. Browsers and clients that
+negotiate `h2` open it with RFC 8441's extended CONNECT instead of an Upgrade; an
+app with a `.hijackable()` route advertises support for it, and `wsUpgrade(c,
+limits)` returns the same `Conn` whichever way the client arrived. Everything the
+route sees is the same too: the matched route, `c.param`, your middleware chain, the
+request headers (`c.header("Origin")` included). The one wire-level difference is
+that nothing is hijacked - the WebSocket is one stream of the HTTP/2 connection, so
+the client's other requests keep being served on it, and returning from the route
+ends just that stream. An app with no `.hijackable()` route does not advertise
+extended CONNECT, and a client that sends one anyway has its stream reset.
+
+`c.hijack()`, `SSE` and `Stream` on an HTTP/2 or HTTP/3 request still fail naming
+why (SSE and Stream over a stream-multiplexed protocol need no hijack at all, but
+this package does not implement them there), and a WebSocket over HTTP/3 (RFC
+9220) is not implemented. Either needs `App.listen()`/`App.serve()` or
+TLS+HTTP/1.1, behind a TLS-terminating proxy if HTTP/3 specifically is what the
+deployment needs.
 
 ## When not to use this
 

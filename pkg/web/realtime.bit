@@ -23,7 +23,11 @@
 // this file used to translate back into one itself.
 // `HijackOutcome` (std/http) is already bound module-wide by app.bit's own
 // import (SPEC §19) — importing it again here would be E0042.
-import { Conn as WsConn, upgrade, upgradeTls, Limits } from "std/websocket"
+import { Conn as WsConn, upgrade, upgradeTls, upgradeH2, Limits } from "std/websocket"
+// `H2StreamHandle` (#6153): `Ctx.h2Stream`'s type and the tunnel handler's
+// argument — std/http2's per-stream handle, aliased because this module has its
+// own `Stream` (below).
+import { Stream as H2StreamHandle } from "std/http2"
 // `TlsConn` (#6152): `tlsWire`'s field type, below — `std/http`'s own
 // `TlsExchange.hijack()` returns it, but naming the type here needs its own
 // import (`TlsServer`, app.bit's import, does not re-export it).
@@ -122,6 +126,48 @@ fn dispatchHijackableTls(app: App, ex: TlsExchange, req: Request): HijackOutcome
   return runHijackable(app, c, m.handler)
 }
 
+// #6153: the RFC 8441 mirror of `dispatchHijackableTls` — the router lookup and
+// `Ctx` construction for a WebSocket that arrived as an extended CONNECT on an
+// h2 connection (`serveHijackableTlsOn`'s `tunnel` handler). std/http presents
+// the request as the GET its HTTP/1.1 Upgrade replaces, so the SAME route, the
+// same middleware and the same handler serve it; the `Ctx` carries the
+// unaccepted stream (`c.h2Stream`) for `wsUpgrade` instead of an exchange. The
+// result is a `Response` because the h2 engine always wants one: an accepted
+// tunnel's is discarded (the tunnel ends when this returns), a refusal's is sent.
+fn dispatchTunnel(app: App, s: H2StreamHandle, req: Request): Response {
+  let split = splitTarget(req.path)
+  let m = app.root.router.lookup(req.method, split.0) catch e {
+    let c = Ctx(req, nil, app.root.registry, app.config, "") catch ce {
+      return frame(app, failureRes(app, requestFailure(req, ce)))
+    }
+    c.h2Stream = Option.Some(s)
+    c.routeMiss = e
+    return tunnelResponse(runHijackable(app, c, app.missHandler))
+  }
+  let c = Ctx(req, m.params, app.root.registry, app.config, m.pattern) catch ce {
+    return frame(app, failureRes(app, requestFailure(req, ce)))
+  }
+  c.h2Stream = Option.Some(s)
+  return tunnelResponse(runHijackable(app, c, m.handler))
+}
+
+// An accepted tunnel (`Hijacked`) has no response left to send; the engine ends it
+// when the handler returns and discards whatever is returned here.
+fn tunnelResponse(o: HijackOutcome): Response {
+  match (o) {
+    Hijacked => { return respond(200, "") }
+    Answer(res) => { return res }
+  }
+}
+
+// `App.listenTls()`/`serveTls()`'s `tunnel` argument for `serveHijackableTlsOn`:
+// the dispatcher above, as the `Option` that also switches on
+// SETTINGS_ENABLE_CONNECT_PROTOCOL.
+fn tunnelHandler(app: App): Option<(Request, H2StreamHandle) => Response> {
+  let h: (Request, H2StreamHandle) => Response = (req, s) => dispatchTunnel(app, s, req)
+  return Option.Some(h)
+}
+
 // --- WebSocket (#6072, part 41) ------------------------------------------
 //
 // The route-handler DX this ticket was filed under:
@@ -149,12 +195,32 @@ fn dispatchHijackableTls(app: App, ex: TlsExchange, req: Request): HijackOutcome
 // `Conn` no longer cares which one ran, since both hand it the same
 // `byteStream` (`Exchange.hijackStream`/`TlsExchange.hijackStream`,
 // std/http).
+//
+// #6153: an h2-served request (`c.h2Stream`) takes `upgradeH2` — RFC 8441's
+// extended CONNECT, no 101, no Sec-WebSocket-Key — and returns the same `Conn`,
+// so the route above is the same code over HTTP/1.1 and HTTP/2. A failure (a bad
+// Sec-WebSocket-Version, say) leaves the stream unanswered and `c` un-hijacked,
+// so the route may return an ordinary response and it is sent.
 export fn wsUpgrade(c: Ctx, limits: Limits): WsConn! {
+  if (isSome(c.h2Stream)) {
+    return upgradeTunnel(c, limits)?
+  }
   if (isSome(c.tlsExchange)) {
     return upgradeTls(takeTlsExchange(c)?, c.req, limits)?
   }
   let ex = c.takeExchange()?
   return upgrade(ex, c.req, limits)?
+}
+
+// `wsUpgrade`'s h2 branch. `c.hijacked` flips only after the 200 is sent:
+// `runHijackable` reads it to tell a taken stream from a refusal.
+fn upgradeTunnel(c: Ctx, limits: Limits): WsConn! {
+  if (c.hijacked) {
+    fail newError("web: this request's connection was already hijacked")
+  }
+  let conn = upgradeH2(unwrap(c.h2Stream), c.req, limits)?
+  c.hijacked = true
+  return conn
 }
 
 // --- server-sent events and streaming responses (#6072, parts 42 and 45;

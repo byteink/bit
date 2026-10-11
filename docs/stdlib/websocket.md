@@ -84,6 +84,35 @@ fn acceptTls(ex: TlsExchange, req: Request): Conn! {
 }
 ```
 
+### `upgradeH2(s: Stream, req: Request, limits: Limits): Conn!`
+
+The handshake for a request that arrived as an HTTP/2 extended CONNECT (RFC 8441):
+the same `Conn` as `upgrade`, over one HTTP/2 stream instead of a connection. There
+is no `101` and no `Sec-WebSocket-Key`/`-Accept` - the `:protocol websocket`
+pseudo-header superseded them - so the only RFC 6455 check left is
+`Sec-WebSocket-Version: 13`. `s` is the unaccepted `std/http2` `Stream` that
+`std/http`'s `serveHijackableTlsOn` hands its `tunnel` handler, with `req` the
+request presented as the GET it replaces. Validates, answers 200 and returns the
+`Conn`. A failure leaves `s` unanswered, so the caller can still return an ordinary
+`Response` to refuse. Returning from the handler after success ends the stream.
+
+```bit
+import { Request } from "std/http"
+import { Stream } from "std/http2"
+import { upgradeH2, defaultLimits, Conn } from "std/websocket"
+
+fn acceptH2(s: Stream, req: Request): Conn! {
+  return upgradeH2(s, req, defaultLimits())?
+}
+```
+
+### `dialH2(hc: Conn, authority: string, path: string, origin: string, limits: Limits): Conn!`
+
+The client side: opens a WebSocket tunnel on the `std/http2` connection `hc`, whose
+peer must have advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL`, with a `CONNECT`
+request carrying `:protocol websocket`. `origin` is sent as the Origin header when
+non-empty. Frames are masked, as RFC 6455 requires of a client.
+
 ### `dial(host: string, port: int, path: string, limits: Limits): Conn!`
 
 Opens a plain-TCP client connection to `host:port`, performs the client

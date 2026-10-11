@@ -27,6 +27,23 @@ fn h2connHandleCmd(st: h2connState, cmd: h2connCmd) {
     h2connCmdAbort(st, cmd)
     return
   }
+  h2connHandleTunnelCmd(st, cmd)
+}
+
+// The extended-CONNECT commands (connect.bit), split from `h2connHandleCmd` to
+// keep its branch count down.
+fn h2connHandleTunnelCmd(st: h2connState, cmd: h2connCmd) {
+  if (cmd.kind == h2cmdAccept) {
+    h2connCmdAccept(st, cmd)
+    return
+  }
+  if (cmd.kind == h2cmdWrite) {
+    h2connCmdWrite(st, cmd)
+    return
+  }
+  if (cmd.kind == h2cmdEnd) {
+    h2connCmdEnd(st, cmd)
+  }
 }
 
 // Take the next of a stream's body for the thread consuming it (#4624), which is
@@ -103,32 +120,26 @@ fn h2connCmdOpen(st: h2connState, cmd: h2connCmd) {
   // `peerMaxHeaderListBytes` is 2^32-1 until the peer names a limit, which
   // keeps this one comparison rather than a branch on whether a limit exists.
   let fields = h2connRequestFields(cmd.request)
-  let listSize = h2connHeaderListSize(fields)
-  if (listSize > st.peerMaxHeaderListBytes) {
-    cmd.replyCh <- h2connMsg{
-      ok = false,
-      response = h2connZeroResponse(),
-      streamId = 0,
-      hasBody = false,
-      errMsg = h2connHeaderListMsg(listSize, st.peerMaxHeaderListBytes),
-    }
+  let refusal = h2connOpenRefusal(st, cmd.request, fields)
+  if (refusal != "") {
+    h2connFailMsg(cmd.replyCh, refusal)
     return
   }
   let id = st.nextStreamId
   st.nextStreamId = st.nextStreamId + 2
   let hasBody = len(cmd.request.body) > 0
+  // An extended CONNECT keeps the stream open for the tunnel (RFC 8441 §5), so
+  // its HEADERS do not carry END_STREAM whatever the (empty) body says.
+  let tunnel = cmd.request.protocol != ""
   let s = h2connNewStream(id, st.peerInitialWindow, st.ourInitialWindow, cmd.replyCh)
-  if (hasBody) {
-    s.state = h2stOpen
-  } else {
-    s.state = h2stHCLocal
-  }
+  s.state = h2connOpenState(hasBody || tunnel)
   st.streams[id] = s
   st.activeStreams = st.activeStreams + 1
+  h2connMarkTunnelIf(st, s, tunnel)
   h2connNoteOpened(cmd, id)
 
   let block = st.enc.encode(fields)
-  h2connSendHeaderBlock(st, id, block, !hasBody)
+  h2connSendHeaderBlock(st, id, block, !hasBody && !tunnel)
   if (hasBody) {
     s.pendingData = cmd.request.body
     s.pendingEnd = true
@@ -139,11 +150,18 @@ fn h2connCmdOpen(st: h2connState, cmd: h2connCmd) {
 
 // Answer a server stream. A zero status is the handler's request to abort.
 fn h2connCmdRespond(st: h2connState, cmd: h2connCmd) {
+  h2connTunnelRelease(st, cmd.streamId)
   let (s, ok) = st.streams[cmd.streamId]
   if (!ok) {
     return
   }
   if (s.state == h2stClosed || s.reset) {
+    return
+  }
+  // The handler of an accepted extended CONNECT returned (connect.bit): its
+  // answer is the 2xx already sent, so end the tunnel instead of answering.
+  if (s.tunnel && s.replied) {
+    h2connTunnelEnd(st, s)
     return
   }
   // The handler has answered, so any body bytes it left unread will never be
@@ -184,9 +202,13 @@ fn h2connCmdRespond(st: h2connState, cmd: h2connCmd) {
     s.pendingEnd = true
     s.hasPending = true
     h2connFlushStream(st, s)
+    if (!s.hasPending) {
+      h2connDeclinedTunnelEnd(st, s)
+    }
     return
   }
   h2connLocalEnd(st, s)
+  h2connDeclinedTunnelEnd(st, s)
 }
 
 fn h2connCmdGoaway(st: h2connState, cmd: h2connCmd) {

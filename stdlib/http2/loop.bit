@@ -48,6 +48,17 @@ class h2connStream {
   delivered: bool,
   reset: bool,
   errorCode: int,
+  // Extended CONNECT (RFC 8441, connect.bit). `tunnel` marks a stream whose
+  // DATA frames are an opaque byte stream rather than a message body: the
+  // server side set it by answering 2xx (`h2connCmdAccept`), the client side
+  // when it opened a CONNECT bearing `:protocol` (`h2connCmdOpen`). A tunnel
+  // stream is never ended by a response and is torn down with the handler that
+  // owns it (`h2connTunnelEnd`). `writing`/`writeCh` hold the one parked
+  // `H2Stream.write`, answered when its bytes have all left under flow control
+  // (`h2connWriteDone`, streams.bit) or when the stream dies.
+  tunnel: bool,
+  writing: bool,
+  writeCh: chan<h2connMsg>,
 }
 
 // The whole connection state, owned exclusively by the loop thread.
@@ -137,6 +148,16 @@ class h2connState {
   // closed: an endpoint MUST ignore frames on a stream it sent RST_STREAM on).
   // Bounded by `h2connAbortedMax`; see `h2connNoteAborted` (abort.bit).
   aborted: map<int, bool>,
+  // Extended CONNECT (RFC 8441 §3): `enableConnectProtocol` is what WE advertise
+  // (`Config.enableConnectProtocol`), checked against an inbound `:protocol`;
+  // `peerConnectProtocol` is what the PEER advertised, checked before we send
+  // one. Neither is ever lowered once set (a sender MUST NOT go 1 -> 0).
+  enableConnectProtocol: bool,
+  peerConnectProtocol: bool,
+  // Ids of the extended-CONNECT tunnels the application still holds (connect.bit,
+  // `h2connTunnelRelease`). Keeps the loop answering commands after the
+  // connection died, so a tunnel write or close is never left parked.
+  tunnels: map<int, bool>,
 }
 
 // The peer's SETTINGS_MAX_CONCURRENT_STREAMS before it has sent one: 2^32-1, the
@@ -184,6 +205,9 @@ fn h2connNewStream(
     delivered = false,
     reset = false,
     errorCode = 0,
+    tunnel = false,
+    writing = false,
+    writeCh = h2connDummyReply(),
   }
 }
 
@@ -210,6 +234,16 @@ const h2cmdRead: int = 5
 // it with CANCEL, drop what it buffered and hand its connection credit back.
 // Names the stream by the mailbox its open left, `h2connCmd.idCh`.
 const h2cmdAbort: int = 6
+// Answer a server stream as an accepted extended CONNECT (`Stream.
+// acceptExtendedConnect`, connect.bit): 2xx HEADERS without END_STREAM, the
+// stream becomes a tunnel. `response.headers` carries the extra fields,
+// answered on `replyCh`.
+const h2cmdAccept: int = 7
+// Queue `response.body` as DATA on a tunnel stream (`H2Stream.write`), answered
+// on `replyCh` once every byte has been sent under flow control.
+const h2cmdWrite: int = 8
+// End our half of a tunnel stream (`H2Stream.close`): empty DATA + END_STREAM.
+const h2cmdEnd: int = 9
 
 // A command to the loop: open a client stream, answer a server stream, send a
 // GOAWAY, or reset a stream. Unused fields carry zero values.
@@ -323,13 +357,13 @@ fn h2connWriter(t: Transport, ch: chan<h2connOut>, doneCh: chan<int>) {
 // Loop thread: the sole owner of `st`. Serially fold in one inbound frame or one
 // command at a time until the transport closes.
 // A terminated connection keeps answering until every body reader has taken its
-// final answer (#4624): `h2connTerminate` fails the streams, which answers every
+// final answer and every tunnel has been released (#4624, connect.bit): `h2connTerminate` fails the streams, which answers every
 // PARKED reader, but a reader that was between reads when the connection died
 // has an `h2cmdRead` still to send and nothing else can answer it. `openBodies`
 // counts exactly the readers that are owed one, and reaches 0 only once each has
 // received an `errMsg` — after which, by that contract, none of them reads again.
 fn h2connLoop(st: h2connState) {
-  while (st.running || st.openBodies > 0) {
+  while (st.running || st.openBodies > 0 || len(st.tunnels) > 0) {
     select {
       case ev = <- st.inCh:
         h2connHandleEvent(st, ev)
