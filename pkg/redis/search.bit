@@ -1,0 +1,186 @@
+// pkg/redis/search.bit - `r.search(index)`: the Redis Query Engine, built into
+// Redis 8 (`FT.CREATE`, `FT.SEARCH`, `FT.AGGREGATE` and the rest of `FT.*`).
+// Epic #6013, #6044. Follows `cmd.bit`'s HOW-TO header: one `Cmd<T>` factory
+// per command (`searchcmd.bit`), an immediate method on the handle, a queued
+// one on its `...Batch`.
+//
+// An index makes hashes or JSON documents searchable by text, tag, number,
+// position and vector similarity. The handle is the INDEX NAME; the rest of
+// the package is split by concern:
+//   searchschema.bit  `schema().text(..).tag(..).vector(..)` and `CreateOptions`
+//   searchquery.bit   `qfield("price").between(..)`, `knn(..)`: the typed query
+//   searchfind.bit    `SearchOptions` and the typed `SearchResult`/`Hit`
+//   searchagg.bit     `agg().groupBy(..)` and `AggResult`
+//   searchreply.bit   the `FT.SEARCH`/`FT.AGGREGATE` reply decoders
+//
+// ONE METHOD PER COMMAND, TYPED OPTIONS. `find` takes a `Query` (the typed
+// builder, or `rawQuery("..")` for the server's own syntax) and
+// `SearchOptions`; `aggregate` takes a pipeline and `AggregateOptions`.
+// `Hit.doc<T>()` decodes an `ON JSON` document into a `@json` class.
+//
+// THE NAME IS ALSO THE SUGGESTION KEY. `FT.SUGADD`/`SUGGET`/`SUGDEL`/`SUGLEN`
+// work on an autocomplete dictionary, a key of its own, not on an index:
+// `r.search("titles").sugAdd(..)`. `list()` is server-wide, whatever the name.
+//
+// `Search` holds `runner: Runner`: `r.search(name)` runs over the pool,
+// `tx.read.search(name)` over a transaction attempt's pinned connection, where
+// a write is refused (#7738); `tx.search(name)` queues it.
+
+export class Search {
+  runner: Runner
+  name: string
+
+  // `FT.CREATE`: defines this index over `fields`. Fails if it exists.
+  export create(fields: Schema, opts: CreateOptions = CreateOptions{}): ()!RedisError {
+    return this.runner.runCmd(createCmd(this.name, fields, opts))?
+  }
+  // `FT.ALTER ... SCHEMA ADD`: adds `fields` to the index.
+  export alter(fields: Schema, skipInitialScan: bool = false): ()!RedisError {
+    return this.runner.runCmd(alterCmd(this.name, fields, skipInitialScan))?
+  }
+  // `FT.DROPINDEX`: removes the index; `deleteDocs` also deletes the
+  // documents it indexed (`DD`).
+  export drop(deleteDocs: bool = false): ()!RedisError {
+    return this.runner.runCmd(dropCmd(this.name, deleteDocs))?
+  }
+  // `FT.INFO`.
+  export info(): SearchInfo!RedisError { return this.runner.runCmd(ftInfoCmd(this.name))? }
+  // `FT._LIST`: every index on the server.
+  export list(): []string!RedisError { return this.runner.runCmd(listCmd())? }
+  // `FT.SEARCH`: the documents matching `query`, best first.
+  export find(query: Query, opts: SearchOptions = SearchOptions{}): SearchResult!RedisError {
+    return this.runner.runCmd(findCmd(this.name, query, opts))?
+  }
+  // `FT.AGGREGATE`: `steps` run over the documents matching `query`.
+  export aggregate(
+    query: Query,
+    steps: AggPipeline = agg(),
+    opts: AggregateOptions = AggregateOptions{},
+  ): AggResult!RedisError {
+    return this.runner.runCmd(aggregateCmd(this.name, query, steps, opts))?
+  }
+  // `FT.CURSOR READ`: the next `count` rows (the cursor's own size when 0).
+  export cursorRead(cursor: i64, count: i64 = 0): AggResult!RedisError {
+    return this.runner.runCmd(cursorReadCmd(this.name, cursor, count))?
+  }
+  // `FT.CURSOR DEL`.
+  export cursorDel(cursor: i64): ()!RedisError {
+    return this.runner.runCmd(cursorDelCmd(this.name, cursor))?
+  }
+  // `FT.ALIASADD`: `alias` names this index too.
+  export addAlias(alias: string): ()!RedisError {
+    return this.runner.runCmd(aliasCmd("FT.ALIASADD", alias, this.name))?
+  }
+  // `FT.ALIASUPDATE`: `alias` now names this index, wherever it pointed.
+  export moveAlias(alias: string): ()!RedisError {
+    return this.runner.runCmd(aliasCmd("FT.ALIASUPDATE", alias, this.name))?
+  }
+  // `FT.ALIASDEL`: server-wide, whatever this handle's name.
+  export removeAlias(alias: string): ()!RedisError {
+    return this.runner.runCmd(aliasDelCmd(alias))?
+  }
+  // `FT.EXPLAIN`: how the server parses `query`.
+  export explain(query: Query, dialect: Option<i64> = Option.None): string!RedisError {
+    return this.runner.runCmd(explainCmd(this.name, query, dialect))?
+  }
+  // `FT.SPELLCHECK`: suggestions for each misspelled term of `query`.
+  export spellcheck(query: string, opts: SpellOptions = SpellOptions{}): []Misspelled!RedisError {
+    return this.runner.runCmd(spellcheckCmd(this.name, query, opts))?
+  }
+  // `FT.SUGADD`: adds `text` to the suggestion dictionary; its size.
+  export sugAdd(
+    text: string,
+    score: f64 = 1.0,
+    incr: bool = false,
+    payload: Option<string> = Option.None,
+  ): i64!RedisError {
+    return this.runner.runCmd(sugAddCmd(this.name, text, score, incr, payload))?
+  }
+  // `FT.SUGGET`: the suggestions starting with `prefix`, best first.
+  export sugGet(prefix: string, opts: SuggestOptions = SuggestOptions{}): []Suggestion!RedisError {
+    return this.runner.runCmd(sugGetCmd(this.name, prefix, opts))?
+  }
+  // `FT.SUGDEL`: true when `text` was there.
+  export sugDel(text: string): bool!RedisError {
+    return this.runner.runCmd(sugDelCmd(this.name, text))?
+  }
+  // `FT.SUGLEN`.
+  export sugLen(): i64!RedisError { return this.runner.runCmd(sugLenCmd(this.name))? }
+  // `FT.SYNUPDATE`: makes `terms` synonyms in group `group` (adds to it).
+  export synonyms(group: string, terms: []string, skipInitialScan: bool = false): ()!RedisError {
+    return this.runner.runCmd(synUpdateCmd(this.name, group, terms, skipInitialScan))?
+  }
+  // `FT.SYNDUMP`: every term and the groups it is in.
+  export synonymGroups(): []Synonym!RedisError { return this.runner.runCmd(synDumpCmd(this.name))? }
+  // `FT.TAGVALS`: the distinct values a tag field holds.
+  export tagValues(field: string): []string!RedisError {
+    return this.runner.runCmd(tagValsCmd(this.name, field))?
+  }
+}
+
+// The queued view `Pipeline.search`/`Tx.search` both return.
+export class SearchBatch {
+  batch: Batch
+  name: string
+
+  export create(fields: Schema, opts: CreateOptions = CreateOptions{}): Future<()> {
+    return this.batch.queue(createCmd(this.name, fields, opts))
+  }
+  export alter(fields: Schema, skipInitialScan: bool = false): Future<()> {
+    return this.batch.queue(alterCmd(this.name, fields, skipInitialScan))
+  }
+  export drop(deleteDocs: bool = false): Future<()> {
+    return this.batch.queue(dropCmd(this.name, deleteDocs))
+  }
+  export info(): Future<SearchInfo> { return this.batch.queue(ftInfoCmd(this.name)) }
+  export list(): Future<[]string> { return this.batch.queue(listCmd()) }
+  export find(query: Query, opts: SearchOptions = SearchOptions{}): Future<SearchResult> {
+    return this.batch.queue(findCmd(this.name, query, opts))
+  }
+  export aggregate(
+    query: Query,
+    steps: AggPipeline = agg(),
+    opts: AggregateOptions = AggregateOptions{},
+  ): Future<AggResult> {
+    return this.batch.queue(aggregateCmd(this.name, query, steps, opts))
+  }
+  export cursorRead(cursor: i64, count: i64 = 0): Future<AggResult> {
+    return this.batch.queue(cursorReadCmd(this.name, cursor, count))
+  }
+  export cursorDel(cursor: i64): Future<()> {
+    return this.batch.queue(cursorDelCmd(this.name, cursor))
+  }
+  export addAlias(alias: string): Future<()> {
+    return this.batch.queue(aliasCmd("FT.ALIASADD", alias, this.name))
+  }
+  export moveAlias(alias: string): Future<()> {
+    return this.batch.queue(aliasCmd("FT.ALIASUPDATE", alias, this.name))
+  }
+  export removeAlias(alias: string): Future<()> { return this.batch.queue(aliasDelCmd(alias)) }
+  export explain(query: Query, dialect: Option<i64> = Option.None): Future<string> {
+    return this.batch.queue(explainCmd(this.name, query, dialect))
+  }
+  export spellcheck(query: string, opts: SpellOptions = SpellOptions{}): Future<[]Misspelled> {
+    return this.batch.queue(spellcheckCmd(this.name, query, opts))
+  }
+  export sugAdd(
+    text: string,
+    score: f64 = 1.0,
+    incr: bool = false,
+    payload: Option<string> = Option.None,
+  ): Future<i64> {
+    return this.batch.queue(sugAddCmd(this.name, text, score, incr, payload))
+  }
+  export sugGet(prefix: string, opts: SuggestOptions = SuggestOptions{}): Future<[]Suggestion> {
+    return this.batch.queue(sugGetCmd(this.name, prefix, opts))
+  }
+  export sugDel(text: string): Future<bool> { return this.batch.queue(sugDelCmd(this.name, text)) }
+  export sugLen(): Future<i64> { return this.batch.queue(sugLenCmd(this.name)) }
+  export synonyms(group: string, terms: []string, skipInitialScan: bool = false): Future<()> {
+    return this.batch.queue(synUpdateCmd(this.name, group, terms, skipInitialScan))
+  }
+  export synonymGroups(): Future<[]Synonym> { return this.batch.queue(synDumpCmd(this.name)) }
+  export tagValues(field: string): Future<[]string> {
+    return this.batch.queue(tagValsCmd(this.name, field))
+  }
+}

@@ -1,0 +1,470 @@
+// pkg/redis/search.live.test.bit - the Query Engine handle against a real
+// server. `liveUrl`/`liveClient` are `client.live.test.bit`'s own (same
+// module, no import); every test is skipped, and says so, when
+// `REDIS_TEST_URL` is unset. `./make test-package-redis-live`
+// (`_tests_/bit/redislive.bit`) supplies it, against `redis:8.10.2`, which
+// carries the Query Engine built in.
+
+import { f32sToLe } from "std/math"
+import { sleep, Millisecond } from "std/time"
+
+@json class Gadget {
+  name: string,
+  price: f64,
+}
+
+fn searchClean(c: Client, index: string, keys: []string) {
+  let s = c.search(index)
+  s.drop() catch _ {}
+  c.del(keys) catch e {
+    panic("del: ${e.message()}")
+  }
+}
+
+// Waits for the initial scan of an index over pre-existing keys.
+fn searchWait(s: Search) {
+  let i = 0
+  while (i < 100) {
+    let info = s.info() catch e {
+      panic("info: ${e.message()}")
+    }
+    if (!info.indexing) {
+      return
+    }
+    sleep(50 * Millisecond)
+    i = i + 1
+  }
+  panic("index still scanning")
+}
+
+fn searchKeys(prefix: string, n: int): []string {
+  let out = []string(0)
+  let i = 1
+  while (i <= n) {
+    out = append(out, "${prefix}${i}")
+    i = i + 1
+  }
+  return out
+}
+
+// Four products on a plane: two shoes and a boot close together, a lamp apart.
+fn searchSeed(c: Client, prefix: string) {
+  let names = ["red running shoe", "blue running shoe", "leather boot", "desk lamp"]
+  let brands = ["acme", "acme", "zeta", "zeta"]
+  let prices = ["50", "70", "120", "30"]
+  let xs: []f32 = [1.0, 0.9, 0.7, -1.0]
+  let ys: []f32 = [0.0, 0.1, 0.6, 0.0]
+  let i = 0
+  while (i < 4) {
+    let fields = map<string, string>{
+      "name": names[i],
+      "brand": brands[i],
+      "price": prices[i],
+      "embedding": string(f32sToLe([xs[i], ys[i]])),
+    }
+    c.hash("${prefix}${i + 1}").set(fields) catch e {
+      panic("hset: ${e.message()}")
+    }
+    i = i + 1
+  }
+}
+
+fn searchProducts(): Schema {
+  return schema().text("name", TextOptions{ weight = 2.0 }).tag("brand").numeric(
+    "price",
+    sortable = true,
+  ).vector(
+    "embedding",
+    dim = 2,
+  )
+}
+
+fn searchSetup(c: Client, index: string, prefix: string): Search {
+  searchClean(c, index, searchKeys(prefix, 4))
+  searchSeed(c, prefix)
+  let s = c.search(index)
+  s.create(searchProducts(), CreateOptions{ prefixes = [prefix] }) catch e {
+    panic("create: ${e.message()}")
+  }
+  searchWait(s)
+  return s
+}
+
+test "live: create, info, list, find with the typed query and options, drop" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = searchSetup(c, "bit:live:ft:a", "bit:live:ft:a:")
+  let info = s.info() catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(
+    info.name == "bit:live:ft:a" && info.keyType == "HASH" && info.numDocs == 4,
+    "info ${info.numDocs}",
+  )
+  assert(
+    len(info.fields) == 4 && info.fields[0].kind == "TEXT" && info.fields[3].kind == "VECTOR",
+    "fields",
+  )
+  assert(info.prefixes[0] == "bit:live:ft:a:", "prefix")
+  let names = s.list() catch e {
+    panic("list: ${e.message()}")
+  }
+  let seen = false
+  for n of names {
+    if (n == "bit:live:ft:a") {
+      seen = true
+    }
+  }
+  assert(seen, "listed")
+
+  let q = qfield("name").text("running").and(qfield("price").between(0.0, 60.0))
+  let r = s.find(q) catch e {
+    panic("find: ${e.message()}")
+  }
+  assert(r.total == 1 && r.hits[0].id == "bit:live:ft:a:1", "typed query: ${r.total}")
+  assert(r.hits[0].field("brand") == Option.Some("acme"), "fields come back")
+
+  let sorted = s.find(
+    qfield("brand").anyOf("zeta", "acme"),
+    SearchOptions{
+      sortBy = Option.Some(SortBy{ field = "price", desc = true }),
+      returns = [Returned{ field = "name" }, Returned{ field = "price", alias = "cost" }],
+      page = Option.Some(Page{ offset = 1, num = 2 }),
+      withScores = true,
+    },
+  ) catch e {
+    panic("sorted: ${e.message()}")
+  }
+  assert(sorted.total == 4 && len(sorted.hits) == 2, "page of two")
+  assert(
+    sorted.hits[0].field("cost") == Option.Some("70") && isSome(sorted.hits[0].score),
+    "second most expensive",
+  )
+  assert(sorted.hits[0].field("brand") == Option.None, "RETURN limits the fields")
+
+  let ids = s.find(everything(), SearchOptions{ noContent = true }) catch e {
+    panic("nocontent: ${e.message()}")
+  }
+  assert(ids.total == 4 && len(ids.hits[0].fields) == 0, "ids only")
+
+  let hl = s.find(
+    qfield("name").text("boot"),
+    SearchOptions{ highlight = Option.Some(Highlight{ fields = ["name"] }) },
+  ) catch e {
+    panic("highlight: ${e.message()}")
+  }
+  assert(hl.hits[0].field("name") == Option.Some("leather <b>boot</b>"), "highlighted")
+
+  let plan = s.explain(qfield("name").text("boot")) catch e {
+    panic("explain: ${e.message()}")
+  }
+  assert(len(plan) > 0, "explain")
+  s.drop() catch e {
+    panic("drop: ${e.message()}")
+  }
+  let gone = false
+  let _ = s.info() catch _ {
+    gone = true
+    SearchInfo{
+      name = "",
+      keyType = "",
+      prefixes = []string(0),
+      fields = []IndexField(0),
+      numDocs = 0,
+      maxDocId = 0,
+      numTerms = 0,
+      numRecords = 0,
+      indexingFailures = 0,
+      indexing = false,
+      percentIndexed = 0.0,
+    }
+  }
+  assert(gone, "a dropped index has no info")
+  searchClean(c, "bit:live:ft:a", searchKeys("bit:live:ft:a:", 4))
+  c.close()
+}
+
+test "live: KNN with and without a filter, and a vector range" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = searchSetup(c, "bit:live:ft:knn", "bit:live:ft:knn:")
+  let near = s.find(
+    knn("embedding", [1.0, 0.0], 2, score = "dist"),
+    SearchOptions{
+      sortBy = Option.Some(SortBy{ field = "dist" }),
+      returns = [Returned{ field = "name" }, Returned{ field = "dist" }],
+    },
+  ) catch e {
+    panic("knn: ${e.message()}")
+  }
+  assert(
+    near.total == 2 && near.hits[0].id == "bit:live:ft:knn:1",
+    "nearest first: ${near.hits[0].id}",
+  )
+  assert(isSome(near.hits[0].field("dist")), "distance returned")
+
+  let filtered = s.find(
+    knn("embedding", [1.0, 0.0], 1, filter = qfield("brand").anyOf("zeta")),
+    SearchOptions{ noContent = true },
+  ) catch e {
+    panic("filtered knn: ${e.message()}")
+  }
+  assert(
+    filtered.hits[0].id == "bit:live:ft:knn:3",
+    "nearest zeta is the boot: ${filtered.hits[0].id}",
+  )
+
+  let ranged = s.find(vectorRange("embedding", [1.0, 0.0], 0.05), SearchOptions{ noContent = true }) catch e {
+    panic("range: ${e.message()}")
+  }
+  assert(ranged.total >= 1, "range finds the identical one")
+  searchClean(c, "bit:live:ft:knn", searchKeys("bit:live:ft:knn:", 4))
+  c.close()
+}
+
+test "live: an ON JSON index decodes documents into a @json class" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let index = "bit:live:ft:json"
+  let keys = ["bit:live:ft:json:1", "bit:live:ft:json:2"]
+  searchClean(c, index, keys)
+  c.json(keys[0]).set(Gadget{ name = "phone", price = 300.0 }) catch e {
+    panic("json set: ${e.message()}")
+  }
+  c.json(keys[1]).set(Gadget{ name = "phone case", price = 15.0 }) catch e {
+    panic("json set: ${e.message()}")
+  }
+  let s = c.search(index)
+  let fields = schema().text("$.name", TextOptions{ alias = "name" }).numeric(
+    "$.price",
+    alias = "price",
+    sortable = true,
+  )
+  s.create(fields, CreateOptions{ over = IndexOn.Json, prefixes = ["bit:live:ft:json:"] }) catch e {
+    panic("create: ${e.message()}")
+  }
+  searchWait(s)
+  let r = s.find(
+    qfield("name").text("phone"),
+    SearchOptions{ sortBy = Option.Some(SortBy{ field = "price", desc = true }) },
+  ) catch e {
+    panic("find: ${e.message()}")
+  }
+  assert(r.total == 2, "two phones")
+  let top = r.hits[0].doc<Gadget>() catch e {
+    panic("doc: ${e.message()}")
+  }
+  assert(top.name == "phone" && top.price == 300.0, "decoded ${top.name}")
+  searchClean(c, index, keys)
+  c.close()
+}
+
+test "live: aggregate groups, reduces, sorts, and reads through a cursor" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = searchSetup(c, "bit:live:ft:agg", "bit:live:ft:agg:")
+  let steps = agg().groupBy(
+    ["brand"],
+    [
+      Reducer{ reduce = Reduce.Avg("price"), alias = "avg" },
+      Reducer{ reduce = Reduce.Count, alias = "n" },
+    ],
+  ).sortBy("avg", desc = true)
+  let r = s.aggregate(everything(), steps) catch e {
+    panic("aggregate: ${e.message()}")
+  }
+  assert(len(r.rows) == 2, "two brands")
+  assert(
+    r.rows[0].field("brand") == Option.Some("zeta") && r.rows[0].num("avg") == Option.Some(75.0),
+    "zeta avg 75",
+  )
+  assert(r.rows[1].num("n") == Option.Some(2.0), "acme count")
+
+  let cur = s.aggregate(
+    everything(),
+    agg().load("name").sortBy("price"),
+    AggregateOptions{ cursor = Option.Some(CursorOptions{ count = 1 }) },
+  ) catch e {
+    panic("cursor aggregate: ${e.message()}")
+  }
+  assert(len(cur.rows) == 1 && cur.cursor != 0, "first row and a cursor")
+  let next = s.cursorRead(cur.cursor, 10) catch e {
+    panic("cursor read: ${e.message()}")
+  }
+  assert(len(next.rows) == 3, "the rest: ${len(next.rows)}")
+  let more = s.aggregate(
+    everything(),
+    agg(),
+    AggregateOptions{ cursor = Option.Some(CursorOptions{ count = 1 }) },
+  ) catch e {
+    panic("second cursor: ${e.message()}")
+  }
+  s.cursorDel(more.cursor) catch e {
+    panic("cursor del: ${e.message()}")
+  }
+  searchClean(c, "bit:live:ft:agg", searchKeys("bit:live:ft:agg:", 4))
+  c.close()
+}
+
+test "live: aliases, alter, tagValues, synonyms, spellcheck and suggestions" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = searchSetup(c, "bit:live:ft:misc", "bit:live:ft:misc:")
+  s.addAlias("bit:live:ft:alias") catch e {
+    panic("alias add: ${e.message()}")
+  }
+  let viaAlias = c.search("bit:live:ft:alias").find(everything(), SearchOptions{ noContent = true }) catch e {
+    panic("find via alias: ${e.message()}")
+  }
+  assert(viaAlias.total == 4, "the alias searches the index")
+  s.moveAlias("bit:live:ft:alias") catch e {
+    panic("alias update: ${e.message()}")
+  }
+  s.removeAlias("bit:live:ft:alias") catch e {
+    panic("alias del: ${e.message()}")
+  }
+
+  s.alter(schema().tag("color")) catch e {
+    panic("alter: ${e.message()}")
+  }
+  let info = s.info() catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(len(info.fields) == 5 && info.fields[4].attribute == "color", "alter added a field")
+
+  let brands = s.tagValues("brand") catch e {
+    panic("tagvals: ${e.message()}")
+  }
+  assert(len(brands) == 2, "two brands: ${len(brands)}")
+
+  s.synonyms("g1", ["boot", "shoe"]) catch e {
+    panic("synupdate: ${e.message()}")
+  }
+  let groups = s.synonymGroups() catch e {
+    panic("syndump: ${e.message()}")
+  }
+  assert(len(groups) == 2 && groups[0].groups[0] == "g1", "two terms in g1")
+  let boots = s.find(qfield("name").text("boot"), SearchOptions{ noContent = true }) catch e {
+    panic("synonym find: ${e.message()}")
+  }
+  assert(boots.total >= 1, "boot finds the boot")
+
+  let fixed = s.spellcheck("runing") catch e {
+    panic("spellcheck: ${e.message()}")
+  }
+  assert(len(fixed) == 1 && fixed[0].term == "runing", "one misspelled term")
+  assert(
+    len(fixed[0].suggestions) >= 1 && fixed[0].suggestions[0].member == "running",
+    "running suggested",
+  )
+
+  searchClean(c, "bit:live:ft:misc", searchKeys("bit:live:ft:misc:", 4))
+  c.close()
+}
+
+test "live: suggestions add, get with scores and payloads, delete and count" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let key = "bit:live:ft:sug"
+  c.del([key]) catch e {
+    panic("del: ${e.message()}")
+  }
+  let s = c.search(key)
+  let n1 = s.sugAdd("hello", 1.0) catch e {
+    panic("sugadd: ${e.message()}")
+  }
+  let n2 = s.sugAdd("help", 2.0, payload = Option.Some("p1")) catch e {
+    panic("sugadd: ${e.message()}")
+  }
+  assert(n1 == 1 && n2 == 2, "sizes ${n1} ${n2}")
+  let got = s.sugGet("hel", SuggestOptions{ withScores = true, withPayloads = true }) catch e {
+    panic("sugget: ${e.message()}")
+  }
+  assert(
+    len(got) == 2 && got[0].text == "help" && got[0].payload == Option.Some("p1"),
+    "best first",
+  )
+  assert(isSome(got[0].score) && got[1].payload == Option.None, "scores and payloads")
+  let fuzzy = s.sugGet("hellp", SuggestOptions{ fuzzy = true }) catch e {
+    panic("fuzzy: ${e.message()}")
+  }
+  assert(len(fuzzy) >= 1, "fuzzy finds hello")
+  let was = s.sugDel("hello") catch e {
+    panic("sugdel: ${e.message()}")
+  }
+  let len1 = s.sugLen() catch e {
+    panic("suglen: ${e.message()}")
+  }
+  assert(was && len1 == 1, "deleted, one left")
+  c.del([key]) catch e {
+    panic("del: ${e.message()}")
+  }
+  c.close()
+}
+
+test "live: search in a pipeline and in tx.read" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let s = searchSetup(c, "bit:live:ft:batch", "bit:live:ft:batch:")
+  let p = c.pipeline()
+  let found = p.search("bit:live:ft:batch").find(
+    qfield("brand").anyOf("acme"),
+    SearchOptions{ noContent = true },
+  )
+  let info = p.search("bit:live:ft:batch").info()
+  p.exec() catch e {
+    panic("exec: ${e.message()}")
+  }
+  let f = found.get() catch e {
+    panic("found: ${e.message()}")
+  }
+  let i = info.get() catch e {
+    panic("info: ${e.message()}")
+  }
+  assert(f.total == 2 && i.numDocs == 4, "pipelined: ${f.total} ${i.numDocs}")
+
+  let total = c.transaction<Future<i64>>(["bit:live:ft:batch:1"], (tx) => {
+    let queued = tx.search("bit:live:ft:batch").sugLen()
+    let r = tx.read.search("bit:live:ft:batch")
+    let hits = r.find(everything(), SearchOptions{ noContent = true })?
+    assert(hits.total == 4, "tx.read searches")
+    let refused = false
+    r.drop() catch _ {
+      refused = true
+    }
+    assert(refused, "a write through tx.read is refused")
+    return queued
+  }) catch e {
+    panic("transaction: ${e.message()}")
+  }
+  let _ = total.get() catch e {
+    panic("tx future: ${e.message()}")
+  }
+  let alive = s.info() catch e {
+    panic("the index survived: ${e.message()}")
+  }
+  assert(alive.numDocs == 4, "the index survived")
+  searchClean(c, "bit:live:ft:batch", searchKeys("bit:live:ft:batch:", 4))
+  c.close()
+}
