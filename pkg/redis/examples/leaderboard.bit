@@ -1,0 +1,142 @@
+// Run with REDIS_URL set to your Redis connection URL (#7916).
+import { Client, Scored, Script, luaBool, open } from "../"
+import { env } from "std/os"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// The server-clock sliding window from ../docs/scripting.md. The sequence
+// distinguishes submissions that Redis timestamps in the same millisecond.
+const limiterSource: string = `
+local t = redis.call('TIME')
+local now = t[1] * 1000 + math.floor(t[2] / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - tonumber(ARGV[2]))
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[1]) then
+  return 0
+end
+local seq = redis.call('INCR', KEYS[2])
+redis.call('ZADD', KEYS[1], now, now .. '-' .. seq)
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+redis.call('PEXPIRE', KEYS[2], ARGV[2])
+return 1
+`
+
+class Board {
+  client: Client,
+  limiter: Script,
+  keys: []string,
+}
+
+fn ownedKeys(): []string {
+  let tag = "{leaderboard:${uuidFormat(uuidV4())}}"
+  let keys = []string(24)
+  keys[0] = "${tag}:scores"
+  keys[1] = "${tag}:names"
+  let i = 0
+  while (i < 11) {
+    keys[2 + 2 * i] = "${tag}:p${i}:hits"
+    keys[3 + 2 * i] = "${tag}:p${i}:seq"
+    i = i + 1
+  }
+  return keys
+}
+
+fn require(ok: bool, message: string): ()! {
+  if (!ok) {
+    fail newError(message)
+  }
+  return
+}
+
+fn submit(board: Board, player: int, name: string, points: f64): bool! {
+  require(player >= 0 && player < 11, "player outside this finite demonstration")?
+  let accepted = board.limiter.run(
+    board.client, luaBool,
+    keys = [board.keys[2 + 2 * player], board.keys[3 + 2 * player]],
+    args = ["2", "60000"],
+  )?
+  if (!accepted) {
+    return false
+  }
+  let member = "p${player}"
+  board.client.zset(board.keys[0]).incrBy(member, points)?
+  board.client.hash(board.keys[1]).set(map<string, string>{ member: name })?
+  return true
+}
+
+fn score(board: Board, member: string): f64! {
+  match (board.client.zset(board.keys[0]).score(member)?) {
+    Some(value) => return value
+    None => fail newError("missing score for ${member}")
+  }
+}
+
+fn displayName(board: Board, member: string): string! {
+  match (board.client.hash(board.keys[1]).get(member)?) {
+    Some(value) => return value
+    None => fail newError("missing name for ${member}")
+  }
+}
+
+fn demonstrate(board: Board): []Scored! {
+  let i = 0
+  while (i < 11) {
+    require(submit(board, i, "Player ${i}", f64(i + 1))?, "initial submission refused")?
+    i = i + 1
+  }
+  require(submit(board, 10, "Player 10", 2)?, "second submission refused")?
+  let beforeScore = score(board, "p10")?
+  let beforeName = displayName(board, "p10")?
+  require(!submit(board, 10, "Refused name", 1000)?, "third submission accepted")?
+  require(score(board, "p10")? == beforeScore, "refusal changed the score")?
+  require(displayName(board, "p10")? == beforeName, "refusal changed the name")?
+  println("accepted two submissions; refused third without changing score or name")
+  let top = board.client.zset(board.keys[0]).top(10)?
+  require(len(top) == 10, "top ten must exclude the eleventh player")?
+  i = 0
+  while (i < 10) {
+    let name = displayName(board, top[i].member)?
+    require(name == "Player ${10 - i}", "ranking resolved the wrong name")?
+    println("${i + 1}. ${name}: ${top[i].score}")
+    i = i + 1
+  }
+  return top
+}
+
+fn checkRanking(top: []Scored) {
+  assert(len(top) == 10, "expected ten ranked players")
+  let i = 0
+  while (i < 10) {
+    let expected = f64(11 - i)
+    if (i == 0) {
+      expected = 13
+    }
+    assert(top[i].member == "p${10 - i}" && top[i].score == expected, "wrong ranked entry")
+    if (i > 0) {
+      assert(top[i - 1].score > top[i].score, "scores must descend")
+    }
+    i = i + 1
+  }
+}
+
+fn main(): ()! {
+  let url = env("REDIS_URL")
+  require(url != "", "leaderboard: REDIS_URL is required")?
+  let keys = ownedKeys()
+  let client = open(url)?
+  let board = Board{ client = client, limiter = Script(limiterSource), keys = keys }
+  let top = demonstrate(board) catch err {
+    client.del(keys) catch cleanupErr {
+      client.close()
+      fail newError("${err.message()}; cleanup: ${cleanupErr.message()}")
+    }
+    client.close()
+    fail err
+  }
+  client.del(keys) catch err {
+    client.close()
+    fail err
+  }
+  client.close()
+  checkRanking(top)
+  println("leaderboard: ranking verified; owned keys removed")
+  return
+}
