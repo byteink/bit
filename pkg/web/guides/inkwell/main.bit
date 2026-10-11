@@ -3,13 +3,19 @@
 // one PostgreSQL connection, mounts every resource's routes behind the
 // operational middleware, and serves.
 //
-// ONE CONNECTION (O6, #6315): `db` (`orm.open`) is the only connection this
-// file ever opens — `Db.table<T>()`/`db.tx(...)`, never a second `db: Data`
-// parameter, per rule 2. Schema setup no longer runs here: `bit migrate`
-// (pkg/orm/cmd/migrate) applies `migrations/*.bit` before this binary
-// starts, so main.bit never opens a second, raw `std/sql` connection just
-// to run it — `Db.exec` (pkg/orm/rawsql.bit) is enough for the one raw
+// ONE ORM CONNECTION (O6, #6315): `db` (`orm.open`) is the only connection
+// the app's tables go through — `Db.table<T>()`/`db.tx(...)`, never a second
+// `db: Data` parameter, per rule 2. Schema setup no longer runs here: `bit
+// migrate` (pkg/orm/cmd/migrate) applies `migrations/*.bit` before this
+// binary starts, so main.bit never opens a raw `std/sql` connection just to
+// run it — `Db.exec` (pkg/orm/rawsql.bit) is enough for the one raw
 // statement `/ready` still needs.
+//
+// THE ONE EXCEPTION IS THE IDEMPOTENCY STORE (course part 40, #6133).
+// pkg/web's `SqlIdempotencyStore` takes a `std/sql` `Pool`, and `Db` does
+// not hand its own out, so `openIdempotencyStore` opens a second pool for
+// it. It touches only the `bit_idempotency` table, which has its own
+// migration; no entity ever reads or writes through it.
 //
 // GRACEFUL SHUTDOWN (course part 17, second half): NOT implemented here,
 // and not faked. `App.listen()` (pkg/web/app.bit) calls `std/http`'s
@@ -21,14 +27,18 @@
 // `listen()` and blocks until a bind/accept error, same as every other
 // pkg/web example in its own docs.
 import {
-  Config, MemoryCounter, MemoryStore, Limit, Cors, Headers, byIp, cors, envelope, logger,
-  rateLimit, recover, secureHeaders,
+  Config, MemoryCounter, MemoryStore, Limit, Cors, Headers, IdempotencyPolicy, IdempotencyStore,
+  Middleware, SqlIdempotencyStore, byIp, cors, envelope, idempotency, logger, rateLimit, recover,
+  secureHeaders,
 } from "web"
 import { Db, Repo, TxHandle, open } from "orm"
 
 const sessionCap = 10_000
 const rateLimitPerMinute = 120
 const rateLimitCounterCap = 10_000
+
+// How long a client may retry a write and get the first answer back: one day.
+const idempotencyTtlSeconds: i64 = 86400
 
 fn probeDb(db: Db): bool {
   db.exec("select 1") catch _ {
@@ -79,8 +89,25 @@ fn mountMiddleware(app: App) {
   app.use(envelope())
 }
 
+// The keys live in PostgreSQL, next to the data they protect, so every server
+// behind a load balancer answers for all of them. Expired rows are harmless
+// (`begin` ignores them) but never leave the table by themselves, so each
+// start sweeps them once.
+fn openIdempotencyStore(cfg: AppConfig): SqlIdempotencyStore! {
+  let store = SqlIdempotencyStore(openPool(cfg)?)?
+  store.purge()?
+  return store
+}
+
 export fn buildApp(cfg: AppConfig): App! {
+  return buildAppWith(cfg, openIdempotencyStore(cfg)?)?
+}
+
+// `buildApp` with the idempotency store chosen by the caller: a test hands in
+// a store it can hold still to catch a request in flight.
+export fn buildAppWith(cfg: AppConfig, keys: IdempotencyStore): App! {
   let db = open(cfg.databaseUrl)?
+  let once = idempotency(IdempotencyPolicy{ store = keys, ttl = idempotencyTtlSeconds })
   let app = App(
     Config{
       secret = cfg.secret, host = cfg.host, port = cfg.port, sessions = MemoryStore(sessionCap),
@@ -90,9 +117,9 @@ export fn buildApp(cfg: AppConfig): App! {
   mountOperations(app, db)
   mountUsers(app, db)
   mountAuth(app, db, cfg)?
-  mountArticles(app, db)
+  mountArticles(app, db, once)
   mountTags(app, db)
-  mountComments(app, db)
+  mountComments(app, db, once)
   return app
 }
 
