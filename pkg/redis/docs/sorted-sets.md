@@ -379,10 +379,39 @@ queue a single command, so on a server before 6.2 their `Future` fails with a
 `RedisError.Invalid` naming Redis 6.2. Call `scores` on the handle (`r.zset(key)`
 or `tx.read.zset(key)`) there.
 
-The commands Redis added in 6.2 or later and that have no older form (`rank`'s
-`WITHSCORE` in 7.2, `union`, `inter`, `diff`, `randMember`, `randMembers`,
-`interCard` and the `store*` methods) are sent unchanged, so an older server
-answers with its own error.
+Four more commands have an older form, sent as one `EVAL` (so they queue,
+pipeline and run on `tx.read` like any single command, and run atomically on
+the server):
+
+- `rank` before 7.2 (no `WITHSCORE`): `ZREVRANK` or `ZRANK`, then `ZSCORE`.
+  Same `(rank, score)` result.
+- `union` and `inter` before 6.2 (no `ZUNION`, `ZINTER`): `ZUNIONSTORE` or
+  `ZINTERSTORE` into a scratch key named `bit:zsetop:<key>`, `ZRANGE ...
+  WITHSCORES`, then `DEL`. Same members, scores and order. The scratch key
+  exists only inside the script, and the script fails with `scratch key
+  exists` rather than touch a key you already own.
+- `interCard` before 7.0 (no `ZINTERCARD`): `ZINTERSTORE` into the same kind
+  of scratch key, `DEL`, and the count capped at `limit`.
+
+Because these write a scratch key for an instant, they need a master (not a
+read replica) and they raise keyspace notifications for that key. The server
+must also allow `EVAL`.
+
+The rest have no older form, so on a server that predates them they fail with a
+`RedisError.Invalid` naming the minimum version, for example `redis: ZDIFF
+needs Redis 6.2 or newer; the server is 5.0`, instead of the server's own
+"unknown command":
+
+```text
+method                                              minimum
+diff, diffStore                                     6.2
+randMember, randMembers                             6.2
+storeTop, storeBottom, storeByScore, storeByLex     6.2
+```
+
+A queued call (`p.zset(key)`, `tx.zset(key)`) reports the same error through
+its `Future`, and nothing is sent. On a current server every method sends the
+command it always did.
 
 ## Sharp edges
 
