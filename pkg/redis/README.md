@@ -1,8 +1,10 @@
 # pkg/redis
 
-A Redis client, written in Bit over `std/net`/`std/tls`. RESP3 by default
-(`HELLO 3`), falling back to RESP2 automatically against a server that does
-not know `HELLO`.
+Your leaderboard needs player names, changing scores and a quick top ten.
+Redis stores names in a hash and keeps scores ordered in a sorted set, so
+you can read the board without sorting every player yourself.
+
+This client uses RESP3 by default and falls back to RESP2 for older servers.
 
 ## Install
 
@@ -16,27 +18,37 @@ not know `HELLO`.
 }
 ```
 
-## Usage
+## Start a leaderboard
 
 ```bit
 import { open } from "redis"
+import { Hour } from "std/time"
 
 fn main(): ()! {
-  let c = open("redis://:secret@127.0.0.1:6379/0")?
-  c.set("greeting", "hello")?
-  let v = c.get("greeting")?
-  match (v) {
-    Some(s) => println(s)
-    None => println("(nil)")
+  let r = open("redis://localhost:6379")?
+  r.set("leaderboard:season", "autumn", ttl = 24 * Hour, ifAbsent = false, ifExists = false)?
+  let p = r.pipeline()
+  let names = p.hash("leaderboard:names").set(map<string, string>{ "ada": "Ada" })
+  let score = p.zset("leaderboard:scores").add("ada", 1200.0)
+  p.exec()?
+  names.get()?
+  score.get()?
+  for entry of r.zset("leaderboard:scores").top(10)? {
+    let name = r.hash("leaderboard:names").get(entry.member)?
+    println("${unwrapOr(name, entry.member)}: ${entry.score}")
   }
-  c.close()
+  r.close()
   return
 }
 ```
 
-The full method surface, the connection URL and `Options`, and what this
-package does not implement (cluster) are in
-[`docs/`](docs/README.md).
+Run the example against a local Redis server. `set` takes a duration in
+nanoseconds; `Hour` supplies that unit. The pipeline queues the two writes,
+then `exec` makes their results available through `get`.
+
+Continue with the [leaderboard guide](docs/README.md). It covers connections,
+names, scores, [pipelines and transactions](docs/pipelines-and-transactions.md)
+and [handling errors](docs/errors.md). Cluster routing is not supported.
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
