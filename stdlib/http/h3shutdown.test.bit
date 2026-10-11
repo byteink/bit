@@ -14,9 +14,9 @@
 // shared throwaway test PKI every h3 loopback fixture in this repo already
 // uses — `dialQuic`'s default now verifies (#6235), so this leaf's untrusted
 // CA needs `tls5916ClientConfig`'s `insecureSkipVerify: true` the same way
-// the TLS-over-TCP fixtures in this file already do. `since` (std/time) is
-// new to this module.
-import { since } from "std/time"
+// the TLS-over-TCP fixtures in this file already do. `since`, `Timer` and
+// `Ticker` (std/time) are new to this module.
+import { since, Timer, Ticker } from "std/time"
 
 fn h3sdCertPem(): string {
   return tls5916Pem("CERTIFICATE", tls5916LeafHex)
@@ -128,50 +128,246 @@ fn h3sdRelease(releaseCh: chan<bool>) {
   releaseCh <- true
 }
 
-// A second request on a connection that closed right after finishing its
-// one in-flight request (RFC 9114 §5.2: "once all accepted requests... have
-// been processed, the endpoint... MAY initiate an immediate closure") fails
-// locally — proving the server never answered it — and does not extend how
-// long `shutdown` waits.
+class h3sdCheckedResult { status: int, body: string, errMsg: string, aborted: bool }
+
+class h3sdJob {
+  out: chan<h3sdCheckedResult>
+  done: chan<bool>
+
+  init() {
+    this.out = chan<h3sdCheckedResult>(1)
+    this.done = chan<bool>(1)
+  }
+}
+
+// One budget covers every event. Closed expiry broadcasts; Cancel gives each
+// transport operation its own wake, so none consumes another operation's signal.
+class h3sdScope {
+  hs: H3Server
+  conn: Option<H3Conn>
+  deadline: int
+  timer: Timer
+  expired: chan<bool>
+  stop: chan<bool>
+  stopped: chan<bool>
+  cancel: Cancel
+  release: chan<bool>
+  released: bool
+  // Stopper, two requests, shutdown and one drain barrier: at most five joins.
+  jobs: []chan<bool>
+
+  init(hs: H3Server) {
+    this.hs = hs
+    this.conn = Option.None
+    this.deadline = monotonic().ns + 20 * Second
+    this.timer = Timer(20 * Second)
+    this.expired = chan<bool>(1)
+    this.stop = chan<bool>(1)
+    this.stopped = chan<bool>(1)
+    this.cancel = Cancel()
+    this.release = chan<bool>(1)
+    this.released = false
+    this.jobs = [this.stopped]
+  }
+}
+
+fn h3sdDone(ch: chan<bool>) {
+  close(ch)
+}
+
+fn h3sdBudget(s: h3sdScope) {
+  defer h3sdDone(s.stopped)
+  select {
+    case <- s.timer.c:
+      close(s.expired)
+      s.cancel.cancel()
+    case <- s.stop:
+  }
+}
+
+fn h3sdAwait<T>(ch: chan<T>, s: h3sdScope, phase: string): T! {
+  if (monotonic().ns >= s.deadline) {
+    fail newError("shutdown test deadline: ${phase}")
+  }
+  select {
+    case value = <- ch:
+      if (monotonic().ns >= s.deadline) {
+        fail newError("shutdown test deadline: ${phase}")
+      }
+      return value
+    case <- s.expired:
+      fail newError("shutdown test deadline: ${phase}")
+  }
+}
+
+fn h3sdCheckedRequest(conn: H3Conn, path: string, out: chan<h3sdCheckedResult>, wake: chan<int>) {
+  let res = conn.request(
+    H3Request{
+      method = "GET", scheme = "https", authority = "localhost", path = path,
+      headers = []HeaderField(0), body = []byte(0),
+    },
+    Option.Some(wake),
+  ) catch e {
+    let (_, aborted) = e.(H3Aborted)
+    out <- h3sdCheckedResult{ status = 0, body = "", errMsg = e.message(), aborted = aborted }
+    return
+  }
+  out <- h3sdCheckedResult{
+    status = res.status,
+    body = string(res.body),
+    errMsg = "",
+    aborted = false,
+  }
+}
+
+fn h3sdRequestJob(conn: H3Conn, path: string, s: h3sdScope, job: h3sdJob) {
+  defer h3sdDone(job.done)
+  let wake = chan<int>(1)
+  let id = s.cancel.wait(wake)
+  defer s.cancel.unwait(id)
+  h3sdCheckedRequest(conn, path, job.out, wake)
+}
+
+fn h3sdStartRequest(conn: H3Conn, path: string, s: h3sdScope, job: h3sdJob) {
+  s.jobs = append(s.jobs, job.done)
+  spawn h3sdRequestJob(conn, path, s, job)
+}
+
+fn h3sdShutdownJob(hs: H3Server, out: chan<h3sdShutdownResult>, done: chan<bool>) {
+  defer h3sdDone(done)
+  h3sdBackgroundShutdown(hs, 5000, out)
+}
+
+// drainSignalActive holds this lock through goAway, which publishes its local
+// draining flag after its control write. Peer observation alone can precede it.
+fn h3sdDrainBarrier(hs: H3Server, done: chan<bool>) {
+  hs.drain.mu.lock()
+  hs.drain.mu.unlock()
+  close(done)
+}
+
+// reusable also reports transport failure. The first response and shutdown
+// must both succeed before this observation can support the refusal assertion.
+fn h3sdPeerShutdown(conn: H3Conn, s: h3sdScope): ()! {
+  let poll = Ticker(Millisecond)
+  defer poll.stop()
+  let guard = 0
+  while (guard < 20000) {
+    guard = guard + 1
+    if (!conn.reusable()) {
+      let barrier = chan<bool>(1)
+      s.jobs = append(s.jobs, barrier)
+      spawn h3sdDrainBarrier(s.hs, barrier)
+      let _ = h3sdAwait(barrier, s, "drain callback")?
+      return
+    }
+    let _ = h3sdAwait(poll.c, s, "peer shutdown")?
+  }
+  fail newError("shutdown test peer observation bound")
+}
+
+fn h3sdReleaseOnce(s: h3sdScope) {
+  if (!s.released) {
+    s.released = true
+    close(s.release)
+  }
+}
+
+fn h3sdJoin(ch: chan<bool>, expired: chan<bool>): bool {
+  select {
+    case <- ch:
+      return true
+    case <- expired:
+      return false
+  }
+}
+
+// Release the handler even on failure. Transport close is best-effort; owned
+// task completion is checked separately with one cleanup budget.
+fn h3sdCleanup(s: h3sdScope): bool {
+  s.cancel.cancel()
+  h3sdReleaseOnce(s)
+  match (s.conn) {
+    Some(c) => { c.close() }
+    None => {}
+  }
+  s.hs.sock.close()
+  let _ = s.timer.stop()
+  select {
+    case s.stop <- true:
+    default:
+  }
+  let cleanup = Timer(2 * Second)
+  defer cleanup.stop()
+  for ch of s.jobs {
+    if (!h3sdJoin(ch, cleanup.c)) {
+      return false
+    }
+  }
+  return true
+}
+
+fn h3sdRefusalEvents(s: h3sdScope): ()! {
+  let port = s.hs.port()?
+  let started = chan<bool>(1)
+  spawn h3sdServe(s.hs, h3sdSlowHandler(started, s.release))
+  let wake = chan<int>(1)
+  let id = s.cancel.wait(wake)
+  let conn = h3DialTlsBounded(
+    "127.0.0.1", port, "localhost", tls5916ClientConfig(),
+    H3Bound{ deadlineNs = s.deadline, wake = wake },
+  ) catch e {
+    s.cancel.unwait(id)
+    fail e
+  }
+  s.cancel.unwait(id)
+  s.conn = Option.Some(conn)
+  conn.watchPeer()
+  let firstJob = h3sdJob()
+  h3sdStartRequest(conn, "/first", s, firstJob)
+  let _ = h3sdAwait(started, s, "handler entry")?
+  let shutdown = chan<h3sdShutdownResult>(1)
+  let done = chan<bool>(1)
+  s.jobs = append(s.jobs, done)
+  spawn h3sdShutdownJob(s.hs, shutdown, done)
+  h3sdPeerShutdown(conn, s)?
+  h3sdReleaseOnce(s)
+  let out = h3sdAwait(shutdown, s, "shutdown finished")?
+  if (len(out.errMsg) > 0) {
+    fail newError("shutdown: ${out.errMsg}")
+  }
+  let first = h3sdAwait(firstJob.out, s, "first response")?
+  if (first.status != 200 || first.body != "slow-done" || first.aborted) {
+    fail newError("first response: ${first.status} '${first.body}' ${first.errMsg}")
+  }
+  let secondJob = h3sdJob()
+  h3sdStartRequest(conn, "/second", s, secondJob)
+  let second = h3sdAwait(secondJob.out, s, "second refusal")?
+  if (second.status != 0 || second.aborted) {
+    fail newError("second request was answered or aborted: ${second.status} ${second.errMsg}")
+  }
+  if (second.errMsg != "quic: connection closed" &&
+    second.errMsg != "quic: connection closed before the stream drained") {
+    fail newError("second request failed without connection refusal: ${second.errMsg}")
+  }
+}
+
+// RFC 9114 §5.2 permits closing once accepted requests finish. Require that
+// response before treating a natural connection-close error as refusal.
 test "a second request on a connection shutdown already finished draining fails" {
   let hs = h3Serve("127.0.0.1", 0, h3sdCertPem(), h3sdKeyPem()) catch e {
     assert(false, "h3Serve: ${e.message()}")
     return
   }
-  let port = hs.port() catch e {
-    assert(false, "port: ${e.message()}")
-    return
+  let s = h3sdScope(hs)
+  spawn h3sdBudget(s)
+  let msg = ""
+  h3sdRefusalEvents(s) catch e {
+    msg = e.message()
   }
-  let startedCh = chan<bool>(1)
-  let releaseCh = chan<bool>(1)
-  spawn h3sdServe(hs, h3sdSlowHandler(startedCh, releaseCh))
-
-  let conn = h3DialTls("127.0.0.1", port, "localhost", tls5916ClientConfig()) catch e {
-    assert(false, "h3Dial: ${e.message()}")
-    return
-  }
-  let firstCh = chan<h3sdRequestResult>(1)
-  spawn h3sdDoRequest(conn, "/first", firstCh)
-  <- startedCh
-
-  spawn h3sdRelease(releaseCh)
-  let out = h3sdDoShutdown(hs, 5000)
-  assert(len(out.errMsg) == 0, "shutdown reported an error: ${out.errMsg}")
-
-  let first = <- firstCh
-  assert(first.status == 200, "the in-flight request did not complete: status=${first.status}")
-
-  // The connection itself is force-closed once shutdown finishes draining
-  // it (`H3Conn.close`), so a second request now fails locally — proving the
-  // server never answered it, which is what "refused" means here.
-  let secondCh = chan<h3sdRequestResult>(1)
-  spawn h3sdDoRequest(conn, "/second", secondCh)
-  let second = <- secondCh
-  assert(
-    second.status == 0 && len(second.errMsg) > 0,
-    "a request after GOAWAY was answered: status=${second.status} body='${second.body}'",
-  )
-  conn.close()
+  let cleaned = h3sdCleanup(s)
+  assert(cleaned, "shutdown test cleanup deadline: ${msg}")
+  assert(len(msg) == 0, msg)
 }
 
 // A connection whose in-flight request never finishes is force-closed once
