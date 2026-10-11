@@ -18,6 +18,14 @@
 // miss overwrites whatever held its slot. At most `cacheSlots` subjects' rules
 // are kept, and a lookup is one slot, never a scan.
 //
+// TENANTS. The rules of a subject depend on the tenant it asks in (stored
+// attachments are per tenant, tenant.bit), so the tenant is part of the key:
+// its hash is mixed into the subject's, so one subject in two tenants has two
+// slots and does not evict itself, and the tenant's name is compared on every
+// hit, so a hash collision cannot hand one tenant another's rules. A tenant's
+// guest shares the table, keyed by the tenant's hash alone. The global tenant
+// "" has hash 0 and the plain handle's keys are as they were.
+//
 // NOT EVERY SUBJECT IS KEPT. A class with a field that has no value semantics
 // (a function, an interface, a generic class, a tuple; E0313) has none of the
 // three members: its rules are built on every call, as before this cache.
@@ -140,6 +148,8 @@ class RuleSet<A: ActionEnum> {
   kind: SubjectKind,
   held: Subject,
   reg: Registry<A>,
+  tenant: string,
+  guest: bool,
   built: bool,
   rules: []Rule<A>,
   skipped: []string,
@@ -269,7 +279,7 @@ fn fillSlot<A: ActionEnum>(sl: RuleSlot<A>, wildcard: bool) {
 fn emptySet<A: ActionEnum>(): RuleSet<A> {
   return RuleSet<A>{
     version = -1, hash = 0, kind = noKind(), held = Unheld{ id = "", roles = []string(0) }, reg = emptyRegistry<A>(),
-    built = false, rules = []Rule<A>(0), skipped = []string(0), clean = true,
+    tenant = "", guest = false, built = false, rules = []Rule<A>(0), skipped = []string(0), clean = true,
     slots = []RuleSlot<A>(0),
   }
 }
@@ -456,25 +466,28 @@ class RuleCache<A: ActionEnum> {
     return this.kinds[i].hash(s)
   }
 
-  // Under `mu`: the current entry with hash `h` for a subject of kind `i`,
-  // or `none`. Whether it holds the subject's value is the caller's `same`,
-  // outside the lock.
-  entryAt(i: int, h: u64): RuleSet<A> {
+  // Under `mu`: the current entry with hash `h` for a subject of kind `i`
+  // in `tenant`, or `none`. The hash already mixes the tenant in (so two
+  // tenants' entries for one subject sit in different slots), but only the
+  // `tenant` comparison keeps one tenant's rules from answering another's.
+  // Whether it holds the subject's value is the caller's `same`, outside the
+  // lock.
+  entryAt(i: int, h: u64, tenant: string): RuleSet<A> {
     if (i < 0) {
       return this.none
     }
     let e = this.table[int(h % u64(cacheSlots))]
-    if (e.version != this.version || e.hash != h) {
+    if (e.version != this.version || e.hash != h || e.tenant != tenant || e.guest) {
       return this.none
     }
     return e
   }
 
-  // The current entry for `s`, or `none`.
-  find(s: Subject): RuleSet<A> {
+  // The current entry for `s` in tenant `tk`, or `none`.
+  find(s: Subject, tk: TenantKey): RuleSet<A> {
     this.mu.lock()
     let i = this.kindAt(s)
-    let e = this.entryAt(i, this.hashAt(i, s))
+    let e = this.entryAt(i, this.hashAt(i, s) ^ tk.hash, tk.name)
     this.mu.unlock()
     if (e.built && e.kind.same(e.held, s)) {
       return e
@@ -493,34 +506,35 @@ class RuleCache<A: ActionEnum> {
   }
 
   // Under `mu`: an empty slot of a new, unbuilt set for a subject of kind
-  // `i` with hash `h`, made under the current version and registry.
-  fresh(i: int, h: u64, cls: string, action: A): RuleSlot<A> {
+  // `i` with hash `h` in `tenant`, made under the current version and
+  // registry.
+  fresh(i: int, h: u64, cls: string, action: A, tenant: string): RuleSlot<A> {
     let n = this.none
     let k = n.kind
     if (i >= 0) {
       k = this.kinds[i]
     }
     let set = RuleSet<A>{
-      version = this.version, hash = h, kind = k, held = n.held, reg = this.reg, built = false,
+      version = this.version, hash = h, kind = k, held = n.held, reg = this.reg, tenant = tenant, guest = false, built = false,
       rules = n.rules, skipped = n.skipped, clean = true, slots = []RuleSlot<A>(0, 1),
     }
     return this.emptySlot(set, cls, action)
   }
 
   // A check's first locked section: the slot for (`cls`, `action`) in the
-  // current entry with `s`'s hash, built on first use, else an empty slot of
-  // a new set for `s` (`built` false). The caller confirms a built entry
-  // holds `s`'s value with `same`.
-  lookup(s: Subject, cls: string, action: A, wildcard: bool): RuleSlot<A> {
+  // current entry with `s`'s hash in tenant `tk`, built on first use, else an
+  // empty slot of a new set for `s` (`built` false). The caller confirms a
+  // built entry holds `s`'s value with `same`.
+  lookup(s: Subject, cls: string, action: A, wildcard: bool, tk: TenantKey): RuleSlot<A> {
     this.mu.lock()
     let i = this.kindAt(s)
-    let h = this.hashAt(i, s)
-    let e = this.entryAt(i, h)
+    let h = this.hashAt(i, s) ^ tk.hash
+    let e = this.entryAt(i, h, tk.name)
     let sl = this.miss
     if (e.version >= 0) {
       sl = this.slotAt(e, cls, action, wildcard)
     } else {
-      sl = this.fresh(i, h, cls, action)
+      sl = this.fresh(i, h, cls, action, tk.name)
     }
     this.mu.unlock()
     return sl
@@ -528,24 +542,40 @@ class RuleCache<A: ActionEnum> {
 
   // `lookup`'s miss alone, for a subject whose hash an entry of another
   // value holds.
-  missFor(s: Subject, cls: string, action: A): RuleSlot<A> {
+  missFor(s: Subject, cls: string, action: A, tk: TenantKey): RuleSlot<A> {
     this.mu.lock()
     let i = this.kindAt(s)
-    let sl = this.fresh(i, this.hashAt(i, s), cls, action)
+    let sl = this.fresh(i, this.hashAt(i, s) ^ tk.hash, cls, action, tk.name)
     this.mu.unlock()
     return sl
   }
 
+  // Under `mu`: the guest's current set in tenant `tk`, or `none`. The global
+  // guest has a field of its own; a tenant's guest shares the table with the
+  // subjects, keyed by the tenant's hash alone.
+  guestEntry(tk: TenantKey): RuleSet<A> {
+    if (tk.name == "") {
+      return this.guest
+    }
+    let e = this.table[int(tk.hash % u64(cacheSlots))]
+    if (e.guest && e.hash == tk.hash && e.tenant == tk.name) {
+      return e
+    }
+    return this.none
+  }
+
   // `lookup` for the guest: its slot while its set is current, else an empty
   // slot of a new set holding the published guest rules.
-  guestSlot(cls: string, action: A, wildcard: bool): RuleSlot<A> {
+  guestSlot(cls: string, action: A, wildcard: bool, tk: TenantKey): RuleSlot<A> {
     this.mu.lock()
     let sl = this.miss
-    if (this.guest.version == this.version) {
-      sl = this.slotAt(this.guest, cls, action, wildcard)
+    let e = this.guestEntry(tk)
+    if (e.version == this.version) {
+      sl = this.slotAt(e, cls, action, wildcard)
     } else {
-      sl = this.fresh(-1, 0, cls, action)
-      sl.set.rules = guestWithStored<A>(this.reg)
+      sl = this.fresh(-1, tk.hash, cls, action, tk.name)
+      sl.set.guest = true
+      sl.set.rules = guestWithStored<A>(this.reg, tk.name)
     }
     this.mu.unlock()
     return sl
@@ -574,8 +604,11 @@ class RuleCache<A: ActionEnum> {
   commitGuest(sl: RuleSlot<A>, st: DecideState<A>) {
     this.mu.lock()
     this.addLocked(sl, st)
-    if (sl.set.version == this.version) {
-      this.guest = sl.set
+    let set = sl.set
+    if (set.version == this.version && set.tenant == "") {
+      this.guest = set
+    } else if (set.version == this.version) {
+      this.table[int(set.hash % u64(cacheSlots))] = set
     }
     this.mu.unlock()
   }
@@ -605,7 +638,7 @@ fn buildFor<A: ActionEnum>(a: Authz<A>, sl: RuleSlot<A>, s: Subject): RuleSlot<A
   if (keep) {
     set.held = set.kind.freeze(s)
   }
-  let got = resolveRoles<A>(set.reg, s, set.held, keep)
+  let got = resolveRoles<A>(set.reg, s, set.held, keep, set.tenant)
   set.rules = got.rules
   set.skipped = got.skipped
   set.built = true
@@ -620,7 +653,7 @@ fn buildFor<A: ActionEnum>(a: Authz<A>, sl: RuleSlot<A>, s: Subject): RuleSlot<A
 fn slotFor<A: ActionEnum>(a: Authz<A>, user: Option<Subject>, cls: string, action: A): RuleSlot<A> {
   let c = a.state.cache
   if (!isSome(user)) {
-    let g = c.guestSlot(cls, action, a.wildcard)
+    let g = c.guestSlot(cls, action, a.wildcard, a.tenant)
     if (!g.set.built) {
       g.set.built = true
       fillSlot<A>(g, a.wildcard)
@@ -629,7 +662,7 @@ fn slotFor<A: ActionEnum>(a: Authz<A>, user: Option<Subject>, cls: string, actio
     return g
   }
   let s = unwrap(user)
-  let sl = c.lookup(s, cls, action, a.wildcard)
+  let sl = c.lookup(s, cls, action, a.wildcard, a.tenant)
   let e = sl.set
   if (!e.built) {
     return buildFor<A>(a, sl, s)
@@ -637,14 +670,14 @@ fn slotFor<A: ActionEnum>(a: Authz<A>, user: Option<Subject>, cls: string, actio
   if (e.kind.same(e.held, s)) {
     return sl
   }
-  return buildFor<A>(a, c.missFor(s, cls, action), s)
+  return buildFor<A>(a, c.missFor(s, cls, action, a.tenant), s)
 }
 
 // The rules of `user`: the cached set for a subject of the same value, else
 // the set a check of (no class, the first action) builds.
 fn ruleSetOf<A: ActionEnum>(a: Authz<A>, user: Option<Subject>): RuleSet<A> {
   if (isSome(user)) {
-    let hit = a.state.cache.find(unwrap(user))
+    let hit = a.state.cache.find(unwrap(user), a.tenant)
     if (hit.built) {
       return hit
     }

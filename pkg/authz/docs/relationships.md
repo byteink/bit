@@ -271,7 +271,9 @@ with the store's own error: the answer is never guessed.
 
 `Authz` keeps tuples in a `MemoryRelationStore`, which dies with the process.
 A `RelationStore` is anything with `write`, `delete`, `has`, `direct`, `list`
-and `version`, so a database can stand in. Writes are idempotent, and
+and `version`, so a database can stand in. Every method but `version` takes the
+tenant (see [Tenants](tenants.md)) as its first argument; `""` is the one
+namespace an app without tenants uses. Writes are idempotent, and
 `version` moves only when something really changed, which is what lets a cache
 of answers know it went stale:
 
@@ -280,7 +282,7 @@ import { MemoryRelationStore, RelationStore, Tuple } from "authz"
 import { join } from "std/strings"
 
 fn grant(store: RelationStore, who: string, folder: string): ()! {
-  store.write(Tuple{ subject = who, relation = "editor", object = folder })?
+  store.write("", Tuple{ subject = who, relation = "editor", object = folder })?
 }
 
 fn main(): ()! {
@@ -290,11 +292,11 @@ fn main(): ()! {
   grant(store, "user:ada", "folder:launch")?
   grant(store, "user:bob", "folder:launch")?
   println("version ${store.version()?}")
-  println(join(store.direct("folder:launch", "editor", 0, 2)?, ", "))
-  println(join(store.direct("folder:launch", "editor", 2, 2)?, ", "))
+  println(join(store.direct("", "folder:launch", "editor", 0, 2)?, ", "))
+  println(join(store.direct("", "folder:launch", "editor", 2, 2)?, ", "))
   let sara = Tuple{ subject = "user:sara", relation = "editor", object = "folder:launch" }
-  println("${store.has(sara)?}")
-  for t of store.list("user:sara")? {
+  println("${store.has("", sara)?}")
+  for t of store.list("", "user:sara")? {
     println("${t.subject} is ${t.relation} of ${t.object}")
   }
 }

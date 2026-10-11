@@ -295,8 +295,9 @@ and a `version` that grows on every real one. It trusts what it is given;
 
 ## Sharp edges
 
-- An attachment with a `tenant` is stored, and applies to nobody until a
-  tenant view exists; only the global ones (`tenant = ""`) apply today.
+- An attachment with a `tenant` applies inside `authz.forTenant(tenant)` only;
+  the plain handle sees the global ones (`tenant = ""`). [Tenants](tenants.md)
+  has the views.
 - The stored rules are rules like any other: `filterFor` folds them into the
   list filter, and a stored `when` is bound to the subject with `$user.x`.
 - Names are 1 to 64 characters of `A-Z a-z 0-9 _ . -`, a document is at most 64
