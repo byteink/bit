@@ -1,0 +1,239 @@
+// compiler/regalloclend.bit — #7781: a caller-saved register LENT for the
+// length of an interval its holder is dead across. Same module as
+// regalloc.bit; the scan asks `lentRegs` before `chooseReg`.
+//
+// A linear interval holds its register from definition to last read in
+// layout order. Once #7771 let a value whose only call sits in a cold block
+// take a caller-saved register, that register stayed taken across the cold
+// block too, although nothing there reads the value: a call result or
+// argument there took the next register and paid a move (x86-64
+// `businessDifference` +2, `jsonTextItem` +3). Two holes are lent:
+//
+//   - a CFG HOLE: no read of the holder is reachable from any position the
+//     borrower covers (Wimmer & Mossenbock's lifetime holes, decided per
+//     borrower rather than kept as range lists);
+//   - a CALL TAIL: the holder's last read is the plain call defining the
+//     borrower, whose operands every backend marshals before the branch, so
+//     the result is written after the holder's last read. A non-reference
+//     result only: a reference result is named by the call's own stack map
+//     (`rootedAtPoint`), where the register still holds the holder. A hole
+//     that opens at that call counts too (#7826, `deadAcross`).
+//
+// SOUNDNESS. Only a caller-saved register held by exactly one active interval
+// is lent, and only by a non-reference holder: no stack map names it inside
+// the hole, #7716's register clears and #7759's save drop read callee-saved
+// registers only, and a second borrower cannot nest. A shared register is no
+// eviction candidate (`sharedReg`) and no tie (`tieReg`), so neither interval
+// leaves it while the other still holds it, and `expireClass` keeps it marked
+// while its holder lives. A holder whose interval runs past its last read
+// (#4467's keep-alive, a call's word run, a block's param group) lends
+// nothing: those positions hold the register for a reason no read shows.
+
+// `AllocPoints`' block facts for `deadAcross`, from `f` and its `reachHulls`.
+fn fillHoleCfg(p: AllocPoints, f: IrFunc, hulls: []int) {
+  let n = len(f.instrs)
+  p.blockOf = []int(n)
+  p.blockLast = []int(len(f.blocks))
+  p.blockSuccs = []int(4 * len(f.blocks))
+  p.isCall = []bool(n)
+  let b = 0
+  while (b < len(f.blocks)) {
+    let blk = f.blocks[b]
+    assert(b == 0 || blk.instsStart == p.blockLast[b - 1] + 1, "#7781: blocks out of layout order")
+    p.blockLast[b] = blk.instsStart + blk.instsLen - 1
+    let i = blk.instsStart
+    while (i <= p.blockLast[b]) {
+      p.blockOf[i] = b
+      i = i + 1
+    }
+    noteSuccHulls(p.blockSuccs, f.instrs[p.blockLast[b]], b, hulls)
+    b = b + 1
+  }
+  for c of p.calls {
+    p.isCall[c] = true
+  }
+}
+
+fn noteSuccHulls(out: []int, t: IrInstr, b: int, hulls: []int) {
+  let first = -1
+  if (t.op == Op.Jump || t.op == Op.Br) {
+    first = t.ival
+  }
+  let second = -1
+  if (t.op == Op.Br) {
+    second = t.ival2
+  }
+  putHull(out, 4 * b, hulls, first)
+  putHull(out, 4 * b + 2, hulls, second)
+}
+
+fn putHull(out: []int, i: int, hulls: []int, s: int) {
+  out[i] = -1
+  out[i + 1] = -1
+  if (s >= 0) {
+    out[i] = hulls[2 * s]
+    out[i + 1] = hulls[2 * s + 1]
+  }
+}
+
+// The caller-saved registers of `allowed` that `scan[idx]` may share with
+// their one active holder for its whole interval.
+//
+// #7826: none for a free-remat constant, which every read recomputes in one
+// instruction straight into the register it is read in. A lent register held
+// it from its definition and paid a move at the read: x86-64
+// `quicfrEncodeFrameMid` kept a 0 in a lent rcx and moved it to rdx at a call.
+fn lentRegs(s: ClassState, scan: []LiveInterval, idx: int, allowed: int, points: AllocPoints): int {
+  let lend = allowed & ~s.regFile.calleeSaved
+  let out = 0
+  if (lend == 0 || len(points.blockOf) == 0 || isFreeRemat(scan[idx])) {
+    return out
+  }
+  let k = 0
+  while (k < s.len) {
+    let e = s.active[k]
+    if (admits(lend, e.reg) && !sharedReg(s, e.reg) && lends(scan[e.idx], scan[idx], points)) {
+      out = out | (1 << e.reg)
+    }
+    k = k + 1
+  }
+  return out
+}
+
+fn lends(a: LiveInterval, iv: LiveInterval, points: AllocPoints): bool {
+  if (a.isRef || a.start >= iv.start) {
+    return false
+  }
+  let tail = !iv.isRef && iv.start == iv.vreg && points.isCall[iv.start]
+  if (a.end == iv.start) {
+    return tail
+  }
+  return a.end > iv.end && a.last1 == a.end && deadAcross(a, iv, points, tail)
+}
+
+// No read of `a` lies at or after any position of `iv` along the CFG: none
+// inside `iv`, none later in a block `iv` overlaps, none in what such a block
+// branches to. Hulls over-cover, so this only ever says dead too rarely.
+//
+// #7826: a `tail` borrower is a plain call's result, written once the call
+// has read every operand, so a read of `a` at the call is no read inside
+// `iv`. A param read by each branch's call held its argument register over
+// all of them, and the first call's result words took the next three
+// registers and a six-move rotation into the return registers (arm64
+// `reason4xx`, +4).
+fn deadAcross(a: LiveInterval, iv: LiveInterval, points: AllocPoints, tail: bool): bool {
+  let from = iv.start
+  if (tail) {
+    from = from + 1
+  }
+  if (readWithin(points, a.vreg, from, iv.end)) {
+    return false
+  }
+  let last = points.blockLast
+  let s = points.blockSuccs
+  let b = points.blockOf[iv.start]
+  while (b < len(last) && (b == 0 || last[b - 1] < iv.end)) {
+    if (readWithin(points, a.vreg, iv.end + 1, last[b]) ||
+      readWithin(points, a.vreg, s[4 * b], s[4 * b + 1]) ||
+      readWithin(points, a.vreg, s[4 * b + 2], s[4 * b + 3])) {
+      return false
+    }
+    b = b + 1
+  }
+  return true
+}
+
+// Whether more than one active interval holds `reg`.
+fn sharedReg(s: ClassState, reg: int): bool {
+  let n = 0
+  let k = 0
+  while (k < s.len) {
+    if (s.active[k].reg == reg) {
+      n = n + 1
+    }
+    k = k + 1
+  }
+  return n > 1
+}
+
+// The registers of `lentRegs` the scan counts free for `scan[idx]`: all of
+// them when no free caller-saved register is allowed, else only its hint. A
+// free register is taken first because the next holder may need the lent one:
+// a panic message bound for rdi took a lent rax and paid a move (x86-64
+// `fe25519Copy`). Each stays marked afterwards, its holder still holding it.
+fn lendFor(s: ClassState, scan: []LiveInterval, idx: int, allowed: int, points: AllocPoints): int {
+  let lent = lentRegs(s, scan, idx, allowed, points)
+  if (lent == 0 || firstFreeReg(s, allowed & ~s.regFile.calleeSaved) < 0) {
+    return lent
+  }
+  let h = scan[idx].hint
+  if (h >= 0 && admits(lent, h)) {
+    return 1 << h
+  }
+  return 0
+}
+
+// #7781: a plain call's result prefers the register it is returned in, `ret`
+// naming the int one and the float one. Mostly what lowest-free already gave
+// it; it matters when that register is lent (`lendFor`).
+fn hintCallResults(f: IrFunc, intervals: []LiveInterval, files: HintFiles, ret: []int) {
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (isPlainCallOp(f.instrs[i].op)) {
+      let k = 1
+      if (intervals[i].regClass == RegClass.Int) {
+        k = 0
+      }
+      hintTo(intervals[i], files, ret[k])
+    }
+    i = i + 1
+  }
+}
+
+// #7826: each argument of a plain call that dies at the call, as (value,
+// position, class ordinal) triples: what both marshals (`xMarshalArgs`,
+// `marshalArgs`) number its argument register by. A cold call's arguments
+// otherwise took the lowest free registers and paid a permutation at the call
+// (x86-64 `jsonTextItem`'s posError arguments). One read after the call puts
+// the value across it, in a register no argument is.
+fn dyingCallArgs(f: IrFunc, intervals: []LiveInterval): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (isPlainCallOp(f.instrs[i].op)) {
+      out = noteDyingArgs(out, f.instrs[i].args, intervals, i)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn noteDyingArgs(out: []int, args: []int, intervals: []LiveInterval, at: int): []int {
+  let counts = [0, 0]
+  let k = 0
+  while (k < len(args)) {
+    let iv = intervals[args[k]]
+    let c = 1
+    if (iv.regClass == RegClass.Int) {
+      c = 0
+    }
+    if (iv.end == at) {
+      out = append(out, args[k])
+      out = append(out, k)
+      out = append(out, counts[c])
+    }
+    counts[c] = counts[c] + 1
+    k = k + 1
+  }
+  return out
+}
+
+fn markRegs(s: ClassState, mask: int, used: bool) {
+  let r = 0
+  while (r < len(s.used)) {
+    if (admits(mask, r)) {
+      s.used[r] = used
+    }
+    r = r + 1
+  }
+}

@@ -1,0 +1,273 @@
+// #7830/#7843/#7867's selfcheck arm: an arm64 loop header moves to the next
+// 32-byte boundary within 16 bytes of NOPs, else to the next 16-byte one,
+// and a pad runs only before an innermost loop (a64BlockStart,
+// arm64layout.bit). Same module as selfcheck.bit (#1503).
+
+// `mov xzr, xzr`: filler that is not the NOP a pad is made of.
+fn a64FillerWord(): int { return 0xAA1F03FF }
+
+// Where a header whose code would start at `u` belongs, written out per
+// residue mod 32 rather than computed the way a64HeaderPad computes it: 0
+// stays, 16..28 go up to 32 (4..1 NOPs), 4..12 go up to 16 (3..1 NOPs).
+fn a64WantHeaderAt(u: int): int {
+  let words = [0, 3, 2, 1, 4, 3, 2, 1]
+  return u + words[u / 4 % 8] * 4
+}
+
+// a64HeaderPad against the table for every residue, as NOPs; a64Quiet
+// against the words that do and do not end a fall-through.
+fn checkArm64LoopHeaderAlign() {
+  for n of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] {
+    let at = n * 4
+    let pad = a64HeaderPad(at)
+    assert(
+      at + pad == a64WantHeaderAt(at),
+      "#7843: a loop header must start on 32 within 16 bytes, else 16",
+    )
+    let b = newByteBuf()
+    a64EmitNops(b, pad)
+    assert(len(b.bytes) == pad, "#7830: a header pad is its bytes")
+    let k = 0
+    while (k < pad) {
+      assert(wordAt(b, k) == a64NopWord(), "#7830: a header pad is NOPs")
+      k = k + 4
+    }
+  }
+  // b, br x16, ret, udf #0, brk #1: quiet. bl, b.ne, cbz x0, mov xzr, xzr: not.
+  for w of [0x14000010, 0xD61F0200, 0xD65F03C0, 0x00000000, 0xD4200020] {
+    assert(a64Quiet(a64OneWord(w), 4), "#7867: nothing falls past this word")
+  }
+  for w of [0x94000010, 0x54000081, 0xB4000080, a64FillerWord()] {
+    assert(!a64Quiet(a64OneWord(w), 4), "#7867: this word falls through")
+  }
+  checkArm64CompiledLoopAligned()
+  checkArm64PadsOffHotPath()
+}
+
+fn a64OneWord(w: int): ByteBuf {
+  let b = newByteBuf()
+  emitWord(b, w)
+  return b
+}
+
+// bb0(%0): asm <`fill` filler words>; jump bb1
+// bb1:     br %0, bb1, bb2      <- the back edge
+// bb2:     ret
+//
+// Compiled whole for fill = 1..8, so the header's unpadded offset takes all
+// eight residues mod 32: what is checked is the emitted branch words, not the
+// emitter's own record of where the header is. The NOPs right before a back
+// edge's target are its pad, so the target less them is where it would have
+// started, and a64WantHeaderAt says where it must start.
+fn checkArm64CompiledLoopAligned() {
+  let seen = []bool(8)
+  let fill = 1
+  while (fill <= 8) {
+    let ctx = newTypeContext()
+    let i64t = primType(ctx, 3)
+    let words = []int(0)
+    while (len(words) < fill) {
+      words = append(words, a64FillerWord())
+    }
+    let jmp = mkInstr(Op.Jump, ctx.voidId)
+    jmp.ival = 1
+    let br = mkInstr(Op.Br, ctx.voidId)
+    br.lhs = 0
+    br.ival = 1
+    br.ival2 = 2
+    let f = irFuncOf(
+      "loop", [i64t], ctx.voidId,
+      [
+        IrBlock{ instsStart = 0, paramCount = 1, instsLen = 3 },
+        IrBlock{ instsStart = 3, paramCount = 0, instsLen = 1 },
+        IrBlock{ instsStart = 4, paramCount = 0, instsLen = 1 },
+      ],
+      [
+        mkInstr(Op.BlockParam, i64t), mkInstr(Op.Asm, ctx.voidId), jmp, br,
+        mkInstr(Op.Ret, ctx.voidId),
+      ],
+    )
+    let blk = AsmBlock{
+      x64Bytes = [0x90], arm64Words = words, hasResult = false,
+      resultX64 = 0, resultArm64 = 0, inX64 = []int(0), inArm64 = []int(0),
+      clobX64 = []int(0), clobArm64 = []int(0),
+    }
+    let m = IrModule{
+      funcs = [f], ctx = ctx, asmBlocks = [blk], stringPool = []string(0),
+      sm = newSourceManager(),
+    }
+    let fc = a64FixtureCompile(m, f)
+    let targets = a64BackBranchTargets(fc.code)
+    assert(len(targets) > 0, "#7830: the fixture has a back edge")
+    for t of targets {
+      let u = a64UnpaddedAt(fc.code, t)
+      assert(t == a64WantHeaderAt(u), "#7843: a back edge must land on its header's boundary")
+      seen[u / 4 % 8] = true
+    }
+    fill = fill + 1
+  }
+  for r of seen {
+    assert(r, "#7843: the fixture reaches every residue mod 32")
+  }
+}
+
+// `at` less the NOP words right before it.
+fn a64UnpaddedAt(code: []u8, at: int): int {
+  let buf = ByteBuf{ bytes = code }
+  let u = at
+  while (u >= 4 && wordAt(buf, u - 4) == a64NopWord()) {
+    u = u - 4
+  }
+  return u
+}
+
+// The code offsets the backward branches in `code` name: `b`, `b.cond`,
+// `cbz`/`cbnz` and `tbz`/`tbnz`, the forms the backend writes.
+fn a64BackBranchTargets(code: []u8): []int {
+  let buf = ByteBuf{ bytes = code }
+  let out = []int(0)
+  let at = 0
+  while (at < len(code)) {
+    let d = a64BranchDisp(wordAt(buf, at))
+    if (d < 0) {
+      out = append(out, at + d)
+    }
+    at = at + 4
+  }
+  return out
+}
+
+// A branch word's signed byte displacement; 0 for any other word, and for a
+// `bl` the linker has yet to patch.
+fn a64BranchDisp(w: int): int {
+  if ((w & 0x7C000000) == 0x14000000) {
+    return signExtend(w & 0x03FFFFFF, 26) * 4
+  }
+  if ((w & 0xFF000010) == 0x54000000 || (w & 0x7E000000) == 0x34000000) {
+    return signExtend((w >> 5) & 0x7FFFF, 19) * 4
+  }
+  if ((w & 0x7E000000) == 0x36000000) {
+    return signExtend((w >> 5) & 0x3FFF, 14) * 4
+  }
+  return 0
+}
+
+// matrix's shape: a strip-mined loop (optstrip.bit) inside another, behind
+// `fill` filler words for fill = 1..8, so the inner header's unpadded offset
+// takes every residue mod 32. On the emitted words: a NOP run either never
+// runs or sits right before an innermost header, every innermost header is
+// on its boundary, and the strip arm that falls into the inner header has its
+// pad hoisted behind the branch before it at least once.
+fn checkArm64PadsOffHotPath() {
+  let hoists = 0
+  let fill = 1
+  while (fill <= 8) {
+    let words = "0xAA1F03FF"
+    let k = 1
+    while (k < fill) {
+      words = words + ", 0xAA1F03FF"
+      k = k + 1
+    }
+    let src = "fn main() {\n" +
+      "  asm { arm64 { ${words} } x64 { 0x90 } }\n" +
+      "  let n = 512\n  let c = []f64(n)\n  let t = 0\n" +
+      "  while (t < n) {\n    let j = 0\n" +
+      "    while (j < n) {\n      c[j] = c[j] + 1.0\n      j = j + 1\n    }\n" +
+      "    t = t + 1\n  }\n  assert(c[0] >= 0.0)\n}\n"
+    let m = lowerSourceModule(src)
+    optimizeModule(m, false)
+    for f of m.funcs {
+      if (f.name == "main") {
+        hoists = hoists + a64CheckPads(a64FixtureCompile(m, f).code)
+      }
+    }
+    fill = fill + 1
+  }
+  assert(hoists > 0, "#7867: a pad is hoisted behind a branch")
+}
+
+// For each word of `code`, the furthest backward branch to it as a word
+// index; -1 where none branches back to it.
+fn a64LoopEnds(code: []u8): []int {
+  let buf = ByteBuf{ bytes = code }
+  let ends = []int(len(code) / 4)
+  let w = 0
+  while (w < len(ends)) {
+    ends[w] = -1
+    w = w + 1
+  }
+  w = 0
+  while (w < len(ends)) {
+    let d = a64BranchDisp(wordAt(buf, w * 4))
+    if (d < 0) {
+      ends[w + d / 4] = w
+    }
+    w = w + 1
+  }
+  return ends
+}
+
+// Does the loop headed at word `h` hold no other header?
+fn a64InnermostAt(ends: []int, h: int): bool {
+  let k = h + 1
+  while (k <= ends[h]) {
+    if (ends[k] >= 0) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+// Asserts the pad rules over `code`; returns how many pads were hoisted.
+fn a64CheckPads(code: []u8): int {
+  let buf = ByteBuf{ bytes = code }
+  let ends = a64LoopEnds(code)
+  let hoists = 0
+  let w = 0
+  while (w < len(ends)) {
+    if (ends[w] >= 0 && a64InnermostAt(ends, w)) {
+      assert(w * 4 % a64LoopMinAlign() == 0, "#7867: an innermost header is on its boundary")
+    }
+    let nop = wordAt(buf, w * 4) == a64NopWord()
+    if (nop && (w == 0 || wordAt(buf, w * 4 - 4) != a64NopWord())) {
+      hoists = hoists + a64CheckNopRun(buf, ends, w)
+    }
+    w = w + 1
+  }
+  return hoists
+}
+
+// The NOP run from word `r`. 1 when it is a hoisted pad: nothing falls into
+// it, and the code after it falls into an innermost header.
+fn a64CheckNopRun(buf: ByteBuf, ends: []int, r: int): int {
+  let e = r
+  while (e < len(ends) && wordAt(buf, e * 4) == a64NopWord()) {
+    e = e + 1
+  }
+  let quiet = a64Quiet(buf, r * 4)
+  let before = e < len(ends) && ends[e] >= 0
+  assert(
+    quiet || (before && a64InnermostAt(ends, e)),
+    "#7867: a pad that runs is before an innermost loop header",
+  )
+  if (!quiet || before) {
+    return 0
+  }
+  return a64FallsIntoInner(buf, ends, e)
+}
+
+// 1 when the code from word `e` falls into an innermost header.
+fn a64FallsIntoInner(buf: ByteBuf, ends: []int, e: int): int {
+  let k = e
+  while (k < len(ends) && ends[k] < 0) {
+    if (a64Quiet(buf, k * 4 + 4)) {
+      return 0
+    }
+    k = k + 1
+  }
+  if (k < len(ends) && a64InnermostAt(ends, k)) {
+    return 1
+  }
+  return 0
+}

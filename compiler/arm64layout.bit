@@ -190,3 +190,253 @@ fn computeSafepointEmissionOrder(f: IrFunc, layout: []int, points: []int): []int
   }
   return out
 }
+
+// ===========================================================================
+// #7830, #7843, #7867: loop headers on 32 (or 16) bytes, never behind a pad
+// that runs on a hot path; function entries on 32
+// ===========================================================================
+//
+// A loop's cycles followed the size of unrelated code before it. On an Apple
+// M-series core bench/cases/strings ran 5.5% slower when 12 fewer
+// instructions ahead of `_main`'s inner loop moved its header from 0x...510 to
+// 0x...504, the loop's own instructions unchanged; three NOPs at entry put
+// the header back at 0x...510 and gave the cycles back. x86-64 pads its
+// headers already (xAlignBlockStart, x64align.bit, #6442).
+//
+// The boundary is the one LLVM uses on the Neoverse N1/N2/N3/V1/V2/V3
+// tunings (AArch64Subtarget::initializeProperties: loops to 32 within 16
+// bytes of padding) and GCC's default tuning uses (generic-armv8-a:
+// `-falign-loops=32:16`), with 16 as the floor a header always reaches: a
+// header moves to the next 32-byte boundary when that costs at most 16 bytes
+// of NOPs, otherwise to the next 16-byte one (at most 12). LLVM sets no loop
+// alignment for the Apple A7-M5 tunings.
+//
+// WHERE THE PAD GOES is #7867. NOPs that run cost more than their issue
+// slots here: bench/cases/matrix lost 0.8% to 3 NOPs per pass of its `k`
+// loop (1.57M passes), 2 before the strip-mined `j` loop's outer header and 1
+// before its inner header. Patching the binary so that no NOP runs, every
+// inner header where it was, measured equal to main (paired 1.0000 against a
+// null of 1.0003 over 22 rounds); the same layout with 3 NOPs running per
+// pass measured 1.0045. So a pad follows LLVM's rule
+// (MachineBlockPlacement::alignBlocks, llvm-project 611eee02d8a7): a block
+// its layout predecessor does not fall into is always aligned, and one it
+// does is aligned only when that edge is cold against the block. Without a
+// profile the fall-through edge is judged by shape, in this order:
+//
+// 1. The code before the header cannot fall into it (a64Quiet): the pad
+//    there never runs.
+// 2. The code since the last point nothing falls into holds no header and
+//    recorded nothing but its own words (a64Hoist): the pad goes there, and
+//    that code moves past it. matrix's inner header is reached so: its
+//    fall-through predecessor is a strip arm entered only by a branch.
+// 3. The header heads an innermost loop: the pad runs once per entry, and a
+//    loop with no loop inside it is what iterates against it. strings' inner
+//    header is reached so.
+// 4. Otherwise no pad. An outer loop's header runs once per pass of a
+//    whole inner loop, so its alignment buys little against a pad paid on
+//    every entry; the strip-mined outer loop iterates twice per entry in
+//    matrix.
+//
+// A header can only be placed relative to its function's entry, so entries
+// are 32-aligned: emitmacho.bit's `__text` and emitelf.bit's emElfTextAlign
+// give the section a64FuncAlign(), and the linker gives every function atom
+// in it that alignment. The entry fill is linker padding, never executed.
+fn a64FuncAlign(): int { return 32 }
+
+// The preferred header boundary, the most padding it may cost, and the
+// boundary a header reaches when the preferred one costs more.
+fn a64LoopAlign(): int { return 32 }
+fn a64LoopMaxPad(): int { return 16 }
+fn a64LoopMinAlign(): int { return 16 }
+
+// `hint #0`, the AArch64 NOP.
+fn a64NopWord(): int { return 0xD503201F }
+
+// Bytes of NOPs that move a header at function offset `at` onto its boundary.
+fn a64HeaderPad(at: int): int {
+  let pad = (a64LoopAlign() - at % a64LoopAlign()) % a64LoopAlign()
+  if (pad <= a64LoopMaxPad()) {
+    return pad
+  }
+  return (a64LoopMinAlign() - at % a64LoopMinAlign()) % a64LoopMinAlign()
+}
+
+fn a64EmitNops(code: ByteBuf, pad: int) {
+  let k = 0
+  while (k < pad) {
+    emitWord(code, a64NopWord())
+    k = k + 4
+  }
+}
+
+// Is the word before `at` one execution never continues past: `b`, `br`,
+// `ret`, `udf` or `brk`? Then nothing falls into `at`.
+fn a64Quiet(code: ByteBuf, at: int): bool {
+  if (at < 4) {
+    return false
+  }
+  let w = readWordAt(code, at - 4)
+  let jump = (w & 0xFC000000) == 0x14000000
+  let ind = (w & 0xFFFFFC1F) == 0xD61F0000 || (w & 0xFFFFFC1F) == 0xD65F0000
+  let trap = (w & 0xFFFF0000) == 0 || (w & 0xFFE0001F) == 0xD4200000
+  return jump || ind || trap
+}
+
+// One function's padding state across its block loop. `inner` marks the
+// headers of innermost loops. The run is the code since the last point
+// nothing falls into, with no header in it: where it starts, its first
+// block's layout position (-1 for none), what the context had recorded
+// then (a64Marks) and how many debug rows.
+class A64Pads {
+  heads: []bool,
+  inner: []bool,
+  runAt: int,
+  runLi: int,
+  marks: []int,
+  rows: int,
+}
+
+fn a64Pads(f: IrFunc): A64Pads {
+  let heads = loopHeaders(f)
+  return A64Pads{
+    heads = heads, inner = a64InnermostHeads(f, heads), runAt = 0, runLi = -1,
+    marks = []int(0), rows = 0,
+  }
+}
+
+// Every list emission records a code offset into, and the safepoint
+// counter. A run that moved any of them cannot move.
+fn a64Marks(cx: A64Ctx): []int {
+  return [len(cx.jumpFixups), len(cx.relocs), len(cx.clearStubs), cx.nextSafepointIdx]
+}
+
+// Which loop headers head an innermost loop: no other header lies after it
+// and at or before its last back edge, in block index order, the order
+// isBackEdge (codegen.bit) and loopHeaders (jumpchain.bit) read loops in.
+fn a64InnermostHeads(f: IrFunc, heads: []bool): []bool {
+  let n = len(f.blocks)
+  let last = []int(n)
+  let bi = 0
+  while (bi < n) {
+    a64NoteLatch(f, bi, last)
+    bi = bi + 1
+  }
+  let inner = []bool(n)
+  let next = n
+  bi = n - 1
+  while (bi >= 0) {
+    if (heads[bi]) {
+      assert(last[bi] >= bi, "#7867: a loop header has a back edge")
+      inner[bi] = next > last[bi]
+      next = bi
+    }
+    bi = bi - 1
+  }
+  return inner
+}
+
+// Records block `bi` as the last back edge of each header it branches back
+// to, as markBackTargets (jumpchain.bit) finds them. Blocks come in index
+// order, so the last write is the furthest latch.
+fn a64NoteLatch(f: IrFunc, bi: int, last: []int) {
+  let b = f.blocks[bi]
+  if (b.instsLen <= b.paramCount) {
+    return
+  }
+  let t = f.instrs[b.instsStart + b.instsLen - 1]
+  if (t.op != Op.Jump && t.op != Op.Br) {
+    return
+  }
+  if (isBackEdge(bi, t.ival)) {
+    last[t.ival] = bi
+  }
+  if (t.op == Op.Br && isBackEdge(bi, t.ival2)) {
+    last[t.ival2] = bi
+  }
+}
+
+// Where block `layout[li]`, about to be emitted, starts. A loop header moves
+// onto its boundary (a64HeaderPad) by the first of the four rules above that
+// applies; any other block starts where the code ends and may start a run.
+fn a64BlockStart(cx: A64Ctx, ps: A64Pads, layout: []int, li: int): int {
+  let at = codeLen(cx)
+  assert(at % 4 == 0, "#7867: arm64 code is whole words")
+  let bi = layout[li]
+  if (!ps.heads[bi]) {
+    a64NoteRun(cx, ps, li, at)
+    return at
+  }
+  let pad = a64HeaderPad(at)
+  let quiet = a64Quiet(cx.code, at)
+  let hoisted = pad > 0 && !quiet && a64Hoist(cx, ps, layout, li, pad)
+  ps.runLi = -1
+  if (pad > 0 && !hoisted && (quiet || ps.inner[bi])) {
+    a64EmitNops(cx.code, pad)
+  }
+  return codeLen(cx)
+}
+
+// A block nothing falls into starts a new run; any other continues the run
+// there is.
+fn a64NoteRun(cx: A64Ctx, ps: A64Pads, li: int, at: int) {
+  if (!a64Quiet(cx.code, at)) {
+    return
+  }
+  ps.runAt = at
+  ps.runLi = li
+  ps.marks = a64Marks(cx)
+  ps.rows = len(cx.dbgRows)
+}
+
+// Rule 2: puts `pad` NOP bytes where the run starts, moving the run's code
+// past them, when the run recorded no offset but its blocks' and its debug
+// rows', which move with it. False, and nothing touched, otherwise.
+fn a64Hoist(cx: A64Ctx, ps: A64Pads, layout: []int, li: int, pad: int): bool {
+  if (ps.runLi < 0 || !a64SameInts(a64Marks(cx), ps.marks)) {
+    return false
+  }
+  let s = ps.runAt
+  let k = codeLen(cx) - s - 4
+  a64EmitNops(cx.code, pad)
+  while (k >= 0) {
+    writeWordAt(cx.code, s + pad + k, readWordAt(cx.code, s + k))
+    k = k - 4
+  }
+  k = 0
+  while (k < pad) {
+    writeWordAt(cx.code, s + k, a64NopWord())
+    k = k + 4
+  }
+  k = ps.runLi
+  while (k < li) {
+    assert(cx.blockOffsets[layout[k]] >= s, "#7867: a run's block starts in the run")
+    cx.blockOffsets[layout[k]] = cx.blockOffsets[layout[k]] + pad
+    k = k + 1
+  }
+  a64ShiftRows(cx.dbgRows, ps.rows, s, pad)
+  return true
+}
+
+// The debug rows a moved run recorded, from index `from`, move with it.
+fn a64ShiftRows(rows: []DebugLineRow, from: int, s: int, pad: int) {
+  let r = from
+  while (r < len(rows)) {
+    assert(rows[r].pcOffset >= s, "#7867: a run's debug row lies in the run")
+    rows[r].pcOffset = rows[r].pcOffset + pad
+    r = r + 1
+  }
+}
+
+fn a64SameInts(a: []int, b: []int): bool {
+  if (len(a) != len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}

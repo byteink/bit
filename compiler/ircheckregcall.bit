@@ -1,0 +1,486 @@
+// compiler/ircheckregcall.bit — #7771's selfcheck arm: a plain call crosses a
+// value only where the value is needed once the call returns; #7778's, the
+// same for an allocation, a closure and a value call; #7781's lent registers;
+// #7826's argument hints and reference ties at a call. A sibling of
+// ircheckregalloc.bit, which sits too close to the 800-line ceiling to hold it.
+//
+// Every case runs the production path on hand-built IR: `buildIntervals`, then
+// `withCallCfg`, then the root's interval merged over its aliases exactly as
+// `allocateCoalesced` merges it, then `intervalRegMask`. Register 0 is
+// caller-saved and register 1 callee-saved, so bit 0 of the mask says whether
+// %0 may sit in a register the call destroys.
+
+// bb0: %0 = 7; %1 = true; br %1, bb2, bb1
+// bb1: %3 = <call>; <term>
+// bb2: %5 = %0 + %0; jump bb3(%5)
+// bb3(%7): ret %7
+//
+// bb1 is the cold `fail` block, laid out inside %0's interval [0, 5]; `call`
+// is its call, or (#7778) its allocation or closure.
+fn coldCallIr(ctx: TypeContext, call: IrInstr, term: IrInstr): IrFunc {
+  let i64t = primType(ctx, 3)
+  let k = mkInstr(Op.ConstInt, i64t)
+  k.ival = 7
+  let br = mkInstr(Op.Br, ctx.voidId)
+  br.lhs = 1
+  br.ival = 2
+  br.ival2 = 1
+  let add = mkInstr(Op.Add, i64t)
+  let jmp = mkInstr(Op.Jump, ctx.voidId)
+  jmp.ival = 3
+  jmp.args = [5]
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [7]
+  return irFuncOf(
+    "cold", []int(0), i64t,
+    [
+      IrBlock{ instsStart = 0, paramCount = 0, instsLen = 3 },
+      IrBlock{ instsStart = 3, paramCount = 0, instsLen = 2 },
+      IrBlock{ instsStart = 5, paramCount = 0, instsLen = 2 },
+      IrBlock{ instsStart = 7, paramCount = 1, instsLen = 2 },
+    ],
+    [
+      k, mkInstr(Op.ConstBool, i64t), br, call, term, add, jmp,
+      mkInstr(Op.BlockParam, i64t), ret,
+    ],
+  )
+}
+
+// bb1's terminator: 0 returns nothing, 1 returns %0, 2 jumps to bb2, 3 passes
+// %0 to bb3, whose param bb2 also feeds (with %5), so it is no alias of %0.
+fn coldTerm(ctx: TypeContext, kind: int): IrInstr {
+  if (kind <= 1) {
+    let ret = mkInstr(Op.Ret, ctx.voidId)
+    if (kind == 1) {
+      ret.args = [0]
+    }
+    return ret
+  }
+  let jmp = mkInstr(Op.Jump, ctx.voidId)
+  jmp.ival = 2
+  if (kind == 3) {
+    jmp.ival = 3
+    jmp.args = [0]
+  }
+  return jmp
+}
+
+// The mask %0 gets in `f` whose only plain call sits at `call`, with the CFG
+// facts when `cfg`, on the linear test alone when not.
+fn callMask(ctx: TypeContext, f: IrFunc, call: int, cfg: bool): int {
+  let points = AllocPoints{
+    safepoints = [call], calleeSafepoints = [call], polls = []int(0),
+    clobbers = []int(0), calls = [call], pins = []AsmPin(0),
+  }
+  return pointsMask(ctx, f, points, cfg)
+}
+
+fn pointsMask(ctx: TypeContext, f: IrFunc, points: AllocPoints, cfg: bool): int {
+  let built = buildIntervals(ctx, f)
+  let p = points
+  if (cfg) {
+    p = withCallCfg(f, built, points)
+  }
+  let scan = copyIntervals(built.intervals)
+  mergeAliases(scan, vregPositions(scan), built.roots)
+  return intervalRegMask(scan[0], p, mkRegsCs(2, 2, 0, 0))
+}
+
+fn coldMask(kind: int, cfg: bool): int {
+  let ctx = newTypeContext()
+  let call = mkInstr(Op.Call, ctx.voidId)
+  call.name = "g"
+  return callMask(ctx, coldCallIr(ctx, call, coldTerm(ctx, kind)), 3, cfg)
+}
+
+// #7778: the cold block holds `op` at position 3, a call safepoint the backends
+// list in `clobbers`, here once more for each of `extra` (the poll-cache
+// prefetch sharing its position). `op`'s operand is %0.
+fn coldClobberMask(op: Op, kind: int, extra: int, cfg: bool): int {
+  let ctx = newTypeContext()
+  let mid = mkInstr(op, ctx.voidId)
+  let clobbers = [3]
+  let i = 0
+  while (i < extra) {
+    clobbers = append(clobbers, 3)
+    i = i + 1
+  }
+  let points = AllocPoints{
+    safepoints = [3], calleeSafepoints = [3], polls = []int(0),
+    clobbers = clobbers, calls = []int(0), pins = []AsmPin(0),
+  }
+  return pointsMask(ctx, coldCallIr(ctx, mid, coldTerm(ctx, kind)), points, cfg)
+}
+
+// bb0: %0 = 7; %1 = true; br %1, bb1(%0), bb2
+// bb1(%3): %4 = call g; %5 = %3 + %3; ret %5
+// bb2: ret
+//
+// %3 is an alias of %0 (its one predecessor passes %0), so the read after the
+// call is a read of %0's register although %0 itself is read only by the br.
+fn aliasCallIr(ctx: TypeContext): IrFunc {
+  let i64t = primType(ctx, 3)
+  let br = mkInstr(Op.Br, ctx.voidId)
+  br.lhs = 1
+  br.ival = 1
+  br.ival2 = 2
+  br.thenArgs = [0]
+  let call = mkInstr(Op.Call, ctx.voidId)
+  call.name = "g"
+  let add = mkInstr(Op.Add, i64t)
+  add.lhs = 3
+  add.rhs = 3
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [5]
+  return irFuncOf(
+    "alias", []int(0), i64t,
+    [
+      IrBlock{ instsStart = 0, paramCount = 0, instsLen = 3 },
+      IrBlock{ instsStart = 3, paramCount = 1, instsLen = 4 },
+      IrBlock{ instsStart = 7, paramCount = 0, instsLen = 1 },
+    ],
+    [
+      mkInstr(Op.ConstInt, i64t), mkInstr(Op.ConstBool, i64t), br,
+      mkInstr(Op.BlockParam, i64t), call, add, ret, mkInstr(Op.Ret, ctx.voidId),
+    ],
+  )
+}
+
+fn checkCallCrossingCfg() {
+  assert(
+    (coldMask(0, true) & 1) == 1,
+    "#7771: a value the cold call's block never reads stays caller-saved",
+  )
+  assert((coldMask(0, false) & 1) == 0, "#7771: without CFG facts the linear test stands")
+  assert((coldMask(1, true) & 1) == 0, "#7771: a read after the call in its own block crosses it")
+  assert((coldMask(2, true) & 1) == 0, "#7771: a successor inside the interval crosses the call")
+  assert((coldMask(3, true) & 1) == 0, "#7771: an edge argument after the call crosses it")
+  let ctx = newTypeContext()
+  let f = aliasCallIr(ctx)
+  assert(buildIntervals(ctx, f).roots[3] == 0, "#7771: the alias case lost its alias")
+  assert((callMask(ctx, f, 4, true) & 1) == 0, "#7771: an alias's read after the call crosses it")
+  checkClobberCrossingCfg()
+  checkLentRegs()
+  checkDyingArgHints()
+  checkRefCallTie()
+  checkRematForHint()
+}
+
+// bb0: %0 = 7; %1 = true; br %1, bb5, bb1
+// bb1: %3 = gc_alloc; br %1, bb2, bb3
+// bb2: jump bb4
+// bb3: %6 = gc_alloc; jump bb4
+// bb4: ret, or ret %0 when `reads`
+// bb5: %9 = %0 + %0; ret %9
+//
+// #7778: a cold region of four blocks inside %0's interval: bb1's successors
+// start inside it, yet only `reads` puts a read of %0 within their reach.
+fn coldRegionIr(ctx: TypeContext, reads: bool): IrFunc {
+  let i64t = primType(ctx, 3)
+  let exit = mkInstr(Op.Ret, ctx.voidId)
+  if (reads) {
+    exit.args = [0]
+  }
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [9]
+  return irFuncOf(
+    "region", []int(0), i64t,
+    [
+      IrBlock{ instsStart = 0, paramCount = 0, instsLen = 3 },
+      IrBlock{ instsStart = 3, paramCount = 0, instsLen = 2 },
+      IrBlock{ instsStart = 5, paramCount = 0, instsLen = 1 },
+      IrBlock{ instsStart = 6, paramCount = 0, instsLen = 2 },
+      IrBlock{ instsStart = 8, paramCount = 0, instsLen = 1 },
+      IrBlock{ instsStart = 9, paramCount = 0, instsLen = 2 },
+    ],
+    [
+      mkInstr(Op.ConstInt, i64t), mkInstr(Op.ConstBool, i64t), regionBr(ctx, 5, 1),
+      mkInstr(Op.GcAlloc, ctx.voidId), regionBr(ctx, 2, 3), regionJump(ctx),
+      mkInstr(Op.GcAlloc, ctx.voidId), regionJump(ctx), exit, mkInstr(Op.Add, i64t), ret,
+    ],
+  )
+}
+
+fn regionBr(ctx: TypeContext, then: int, other: int): IrInstr {
+  let br = mkInstr(Op.Br, ctx.voidId)
+  br.lhs = 1
+  br.ival = then
+  br.ival2 = other
+  return br
+}
+
+fn regionJump(ctx: TypeContext): IrInstr {
+  let jmp = mkInstr(Op.Jump, ctx.voidId)
+  jmp.ival = 4
+  return jmp
+}
+
+fn regionMask(reads: bool): int {
+  let ctx = newTypeContext()
+  let points = AllocPoints{
+    safepoints = [3, 6], calleeSafepoints = [3, 6], polls = []int(0),
+    clobbers = [3, 6], calls = []int(0), pins = []AsmPin(0),
+  }
+  return pointsMask(ctx, coldRegionIr(ctx, reads), points, true)
+}
+
+fn checkClobberCrossingCfg() {
+  assert(
+    (regionMask(false) & 1) == 1,
+    "#7778: a successor reaching no read of the value is not live on entry",
+  )
+  assert((regionMask(true) & 1) == 0, "#7778: a read the successor reaches crosses the allocation")
+  assert(
+    (coldClobberMask(Op.GcAlloc, 0, 0, true) & 1) == 1,
+    "#7778: a value the cold allocation's block never reads stays caller-saved",
+  )
+  assert(
+    (coldClobberMask(Op.GcAlloc, 0, 0, false) & 1) == 0,
+    "#7778: without CFG facts an allocation is a linear clobber",
+  )
+  assert(
+    (coldClobberMask(Op.GcAlloc, 1, 0, true) & 1) == 0,
+    "#7778: a read after the allocation in its own block crosses it",
+  )
+  assert(
+    (coldClobberMask(Op.GcAlloc, 2, 0, true) & 1) == 0,
+    "#7778: a successor inside the interval crosses the allocation",
+  )
+  assert(
+    (coldClobberMask(Op.MakeClosure, 0, 0, true) & 1) == 0,
+    "#7778: a closure's operand is read after its allocation, so it crosses",
+  )
+  assert(
+    (coldClobberMask(Op.GcAlloc, 0, 1, true) & 1) == 0,
+    "#7778: the poll-cache prefetch at an allocation's position stays linear",
+  )
+}
+
+// The register `coldCallIr` gives %3, a constant in bb1, while %0 holds the
+// one caller-saved register: lent when nothing bb1 reaches reads %0. Its
+// terminator returns %3 (0), returns %3 and %0 (1), or jumps to bb2 (2).
+// `remat` marks %3 free to rematerialize, as the backends mark a constant.
+fn lentResultReg(kind: int, remat: bool): int {
+  let ctx = newTypeContext()
+  let k = mkInstr(Op.ConstInt, primType(ctx, 3))
+  k.ival = 9
+  let term = coldTerm(ctx, kind)
+  if (kind <= 1) {
+    term.args = [3]
+  }
+  if (kind == 1) {
+    term.args = [3, 0]
+  }
+  return allocReg(ctx, coldCallIr(ctx, k, term), []int(0), 3, remat)
+}
+
+// The register `v` gets in `f` over two int registers, 0 caller-saved, with
+// the CFG facts and `calls` its only plain calls; `remat` marks `v` free to
+// rematerialize.
+fn allocReg(ctx: TypeContext, f: IrFunc, calls: []int, v: int, remat: bool): int {
+  let built = buildIntervals(ctx, f)
+  built.intervals[v].remat = remat
+  let points = AllocPoints{
+    safepoints = calls, calleeSafepoints = calls, polls = []int(0),
+    clobbers = []int(0), calls = calls, pins = []AsmPin(0),
+  }
+  let r = allocateCoalesced(
+    mkRegsCs(2, 2, 0, 0), built.intervals, withCallCfg(f, built, points), built.roots, built.edges,
+  )
+  assert(
+    !r.locations[0].isSpill && r.locations[0].index == 0,
+    "#7781: %0 lost the caller-saved register",
+  )
+  assert(!r.locations[v].isSpill, "#7781: the borrower spilled")
+  return r.locations[v].index
+}
+
+// The register bb1's `%3 = call g(%0)` in `coldCallIr` takes while %0, read
+// again only in bb2, holds the one caller-saved register.
+fn lentCallReg(): int {
+  let ctx = newTypeContext()
+  let call = mkInstr(Op.Call, primType(ctx, 3))
+  call.name = "g"
+  call.args = [0]
+  let term = coldTerm(ctx, 0)
+  term.args = [3]
+  return allocReg(ctx, coldCallIr(ctx, call, term), [3], 3, false)
+}
+
+// bb0: %0 = 7; %1 = call g(%0); ret %1. The call's operand dies at it.
+fn callTailIr(ctx: TypeContext): IrFunc {
+  let i64t = primType(ctx, 3)
+  let call = mkInstr(Op.Call, i64t)
+  call.name = "g"
+  call.args = [0]
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [1]
+  return irFuncOf(
+    "tail", []int(0), i64t,
+    [IrBlock{ instsStart = 0, paramCount = 0, instsLen = 3 }],
+    [mkInstr(Op.ConstInt, i64t), call, ret],
+  )
+}
+
+fn checkLentRegs() {
+  assert(
+    lentResultReg(0, false) == 0,
+    "#7781: a cold call's result borrows a register its holder is dead across",
+  )
+  assert(
+    lentResultReg(1, false) == 1,
+    "#7781: a read later in the borrower's block keeps the register",
+  )
+  assert(
+    lentResultReg(2, false) == 1,
+    "#7781: a read the borrower's block branches to keeps the register",
+  )
+  assert(lentResultReg(0, true) == 1, "#7826: a free-remat constant borrows no register")
+  assert(
+    lentCallReg() == 0,
+    "#7826: a call's result borrows the register of an operand read later only off its path",
+  )
+  let ctx = newTypeContext()
+  assert(
+    allocReg(ctx, callTailIr(ctx), [1], 1, false) == 0,
+    "#7781: a call's result takes its dying operand's register",
+  )
+}
+
+// bb0: %0 = 7; %1 = 1.5; %2 = 9; %3 = call g(%1, %0, %2); %4 = %3 + %2; ret %4
+//
+// #7826: %1 and %0 die at the call and %2 is read after it. The float comes
+// first, so Win64 (by position) and SysV or AAPCS64 (by class) number %0 apart.
+fn dyingArgsIr(ctx: TypeContext): IrFunc {
+  let i64t = primType(ctx, 3)
+  let call = mkInstr(Op.Call, i64t)
+  call.name = "g"
+  call.args = [1, 0, 2]
+  let add = mkInstr(Op.Add, i64t)
+  add.lhs = 3
+  add.rhs = 2
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [4]
+  return irFuncOf(
+    "args", []int(0), i64t,
+    [IrBlock{ instsStart = 0, paramCount = 0, instsLen = 6 }],
+    [
+      mkInstr(Op.ConstInt, i64t), mkInstr(Op.ConstFloat, primType(ctx, 9)),
+      mkInstr(Op.ConstInt, i64t), call, add, ret,
+    ],
+  )
+}
+
+// The hints `dyingArgsIr`'s %0, %1 and %2 get from arm64 (`cc` absent) or
+// x86-64 under `cc`, over files whose position k is register k.
+fn dyingArgHints(x64: bool, cc: XCallConv): []int {
+  let ctx = newTypeContext()
+  let f = dyingArgsIr(ctx)
+  let ivs = buildIntervals(ctx, f).intervals
+  let regs = []int(0)
+  while (len(regs) < 16) {
+    regs = append(regs, len(regs))
+  }
+  let files = HintFiles{ ints = regs, floats = regs }
+  if (x64) {
+    xHintCallArgs(cc, f, ivs, files)
+  } else {
+    hintCallArgs(f, ivs, files)
+  }
+  return [ivs[0].hint, ivs[1].hint, ivs[2].hint]
+}
+
+fn checkDyingArgHints() {
+  let a = dyingArgHints(false, XCallConv.SysV)
+  assert(a[0] == 0 && a[1] == 0, "#7826: a dying argument prefers its AAPCS64 register")
+  assert(a[2] == -1, "#7826: an argument read after the call prefers no argument register")
+  let s = dyingArgHints(true, XCallConv.SysV)
+  assert(s[0] == xRegNum(XReg64.Rdi) && s[1] == 0, "#7826: SysV numbers an argument by class")
+  let w = dyingArgHints(true, XCallConv.Win64)
+  assert(w[0] == xRegNum(XReg64.Rdx) && w[1] == 0, "#7826: Win64 numbers an argument by position")
+}
+
+// bb0(%0: string): %1 = call g(%0); %2 = call h(%1); ret %2
+//
+// #7826: %0 dies at the call defining %1, whose stack map names both.
+fn refTieIr(ctx: TypeContext): IrFunc {
+  let strt = primType(ctx, 11)
+  let g = mkInstr(Op.Call, strt)
+  g.name = "g"
+  g.args = [0]
+  let h = mkInstr(Op.Call, strt)
+  h.name = "h"
+  h.args = [1]
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [2]
+  return irFuncOf(
+    "reftie", [strt], strt,
+    [IrBlock{ instsStart = 0, paramCount = 1, instsLen = 4 }],
+    [mkInstr(Op.BlockParam, strt), g, h, ret],
+  )
+}
+
+// The registers `refTieIr`'s %0 and %1 take over three int registers, 1 and 2
+// callee-saved, ties marked as the backends mark them.
+fn refTieRegs(): []int {
+  let ctx = newTypeContext()
+  let f = refTieIr(ctx)
+  let built = buildIntervals(ctx, f)
+  markTies(f, built.intervals)
+  let points = AllocPoints{
+    safepoints = [1, 2], calleeSafepoints = [1, 2], polls = []int(0),
+    clobbers = []int(0), calls = [1, 2], pins = []AsmPin(0),
+  }
+  let r = allocateCoalesced(
+    mkRegsCs(3, 6, 0, 0), built.intervals, withCallCfg(f, built, points), built.roots, built.edges,
+  )
+  assert(!r.locations[0].isSpill && !r.locations[1].isSpill, "#7826: a reference spilled")
+  return [r.locations[0].index, r.locations[1].index]
+}
+
+fn checkRefCallTie() {
+  let t = refTieRegs()
+  assert(t[0] == 1, "#7826: the reference argument left the first callee-saved register")
+  assert(
+    t[1] == 1,
+    "#7826: a call's reference result takes its dying reference argument's register",
+  )
+}
+
+// bb0: %0 = 7; %1 = 9; %2 = %0 + %0; %3 = call g(%1); ret %3
+//
+// #7826: %1, free to rematerialize and read once by the call, prefers
+// register 0, which %0 holds until %2.
+fn hintRematIr(ctx: TypeContext): IrFunc {
+  let i64t = primType(ctx, 3)
+  let call = mkInstr(Op.Call, i64t)
+  call.name = "g"
+  call.args = [1]
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [3]
+  return irFuncOf(
+    "hintremat", []int(0), i64t,
+    [IrBlock{ instsStart = 0, paramCount = 0, instsLen = 5 }],
+    [mkInstr(Op.ConstInt, i64t), mkInstr(Op.ConstInt, i64t), mkInstr(Op.Add, i64t), call, ret],
+  )
+}
+
+fn checkRematForHint() {
+  let ctx = newTypeContext()
+  let f = hintRematIr(ctx)
+  let built = buildIntervals(ctx, f)
+  built.intervals[1].remat = true
+  built.intervals[1].hint = 0
+  let points = AllocPoints{
+    safepoints = [3], calleeSafepoints = [3], polls = []int(0),
+    clobbers = []int(0), calls = [3], pins = []AsmPin(0),
+  }
+  let r = allocateCoalesced(
+    mkRegsCs(2, 2, 0, 0), built.intervals, withCallCfg(f, built, points), built.roots, built.edges,
+  )
+  assert(!r.locations[0].isSpill && r.locations[0].index == 0, "#7826: %0 lost register 0")
+  assert(
+    r.locations[1].isSpill && r.locations[1].index == -1,
+    "#7826: a constant read once into its taken hint is recomputed there",
+  )
+}

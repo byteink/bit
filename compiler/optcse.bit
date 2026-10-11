@@ -96,6 +96,23 @@
 // `%off` has been forwarded to the earlier `field_get` and `%idx` to the
 // earlier `add`. Neither half finds it alone.
 //
+// A BLOCK PARAM of a block that inherits its predecessor's sets is keyed as the
+// argument that one edge passes (#7770). The block is entered only along that
+// edge, so the param holds that argument's value on every execution, and the
+// argument is defined above the predecessor's terminator, so it dominates every
+// use of the param. An if body is such a block: `c < '0' || c > '9'` fails out,
+// the body receives the loop's locals as params, and its `c - '0'` keyed on the
+// param missed the range test's `sub` on the argument. The param itself is
+// left alone; only the key changes, so a use the key does not reach still reads
+// the param.
+//
+// Only a param with exactly ONE use is keyed this way. Forwarding that use
+// swaps the param's live range for the earlier value's, one for one, and the
+// param dies; forwarding one use of a param that stays live keeps both values
+// live across the edge. Keying every param measured that cost: 70 of the 256
+// x86_64 functions it changed in the pkg/web bench server grew, a cold `fail`
+// block between the two blocks holding the longer range across its call.
+//
 // ## What this does NOT do
 //
 // No code motion of any kind — no LICM, no hoisting, no sinking. Every value
@@ -119,7 +136,8 @@
 // `slice[v]` is whether value `v` of the function this arena serves is
 // slice-typed: the one type fact the store rule in the header reads. `elem[v]`
 // is whether instruction `v` is an element load the load chain forwards
-// (`cseScalarType`).
+// (`cseScalarType`). `alias[v]` is, for a block param, the edge argument it is
+// keyed as (`cseAliasParams`), and -1 for every other value.
 class AvailArena {
   op: []int,
   a: []int,
@@ -129,6 +147,7 @@ class AvailArena {
   next: []int,
   slice: []bool,
   elem: []bool,
+  alias: []int,
 }
 
 fn newAvailArena(ctx: TypeContext, f: IrFunc): AvailArena {
@@ -144,6 +163,7 @@ fn newAvailArena(ctx: TypeContext, f: IrFunc): AvailArena {
   return AvailArena{
     op = []int(0), a = []int(0), b = []int(0), ty = []int(0),
     val = []int(0), next = []int(0), slice = slice, elem = elem,
+    alias = emptyHeads(len(f.instrs)),
   }
 }
 
@@ -190,15 +210,23 @@ fn availFind(ar: AvailArena, head: int, k: AvailKey): int {
   return -1
 }
 
-// The value `id` has already been forwarded to, following the chain to its
-// representative so two uses that differ only by an eliminated intermediate
-// key the same. Bounded by the instruction count: `fwd` only ever points at a
-// strictly lower index.
-fn cseResolve(fwd: []int, id: int): int {
+// The value `id` stands for in a key: through `fwd` to the computation that
+// already answered it and through `alias` from a param to its edge argument,
+// following both to the representative so two uses that differ only by an
+// eliminated intermediate or a single-edge param key the same. Every step lands
+// on a definition that strictly dominates the last, so the walk cannot cycle;
+// the step count bounds it by the instruction count regardless.
+fn cseResolve(ar: AvailArena, fwd: []int, id: int): int {
   let cur = id
   let steps = 0
-  while (steps < len(fwd) && fwd[cur] >= 0) {
-    cur = fwd[cur]
+  while (steps < len(fwd)) {
+    if (fwd[cur] >= 0) {
+      cur = fwd[cur]
+    } else if (ar.alias[cur] >= 0) {
+      cur = ar.alias[cur]
+    } else {
+      return cur
+    }
     steps = steps + 1
   }
   return cur
@@ -238,7 +266,7 @@ fn cseWritesSliceBuf(f: IrFunc, ar: AvailArena, fwd: []int, ins: IrInstr): bool 
   if (ins.op != Op.IndexSet) {
     return false
   }
-  let b = f.instrs[cseResolve(fwd, ins.lhs)]
+  let b = f.instrs[cseResolve(ar, fwd, ins.lhs)]
   return b.op == Op.FieldGet && b.ival == 0 && ar.slice[b.lhs]
 }
 
@@ -305,22 +333,22 @@ class CseHeads {
 // hold no operand for it, so resolving them would key the constant on whatever
 // value id happens to sit in those unused fields — 0 for every constant this
 // IR builds, which would make every `const_int` of one type answer every other.
-fn cseKeyOf(f: IrFunc, fwd: []int, idx: int): AvailKey {
+fn cseKeyOf(f: IrFunc, ar: AvailArena, fwd: []int, idx: int): AvailKey {
   let ins = f.instrs[idx]
   if (opIsCseConst(ins.op)) {
     return AvailKey{ op = int(ins.op), a = cseConstValue(ins), b = 0, ty = ins.ty }
   }
   let b = ins.ival
   if (!opIsCseLoad(ins.op)) {
-    b = cseResolve(fwd, ins.rhs)
+    b = cseResolve(ar, fwd, ins.rhs)
   }
-  return AvailKey{ op = int(ins.op), a = cseResolve(fwd, ins.lhs), b = b, ty = ins.ty }
+  return AvailKey{ op = int(ins.op), a = cseResolve(ar, fwd, ins.lhs), b = b, ty = ins.ty }
 }
 
 // `idx` against one chain: forward it to an earlier equal computation, or
 // record it as the one that answers the next. Returns that chain's new head.
 fn cseTry(f: IrFunc, ar: AvailArena, fwd: []int, head: int, idx: int): int {
-  let k = cseKeyOf(f, fwd, idx)
+  let k = cseKeyOf(f, ar, fwd, idx)
   let hit = availFind(ar, head, k)
   if (hit >= 0) {
     fwd[idx] = hit
@@ -402,17 +430,65 @@ fn notePred(cur: int, src: int): int {
   return -2
 }
 
-// The head to start block `bi` from: its predecessor's exit set when that
-// predecessor is its only one AND the edge runs forwards. Forwards means both
-// a lower block id — `isBackEdge` is `target <= curBlock` by id, so this is
-// exactly "the edge carries no safepoint poll" — and an earlier position in
-// emission order, so the predecessor's exit head is already computed.
-fn cseInheritHead(pred: []int, pos: []int, exitHead: []int, bi: int, at: int): int {
+// Whether block `bi`, at emission position `at`, starts from its
+// predecessor's exit sets: that predecessor is its only one AND the edge runs
+// forwards. Forwards means both a lower block id — `isBackEdge` is
+// `target <= curBlock` by id, so this is exactly "the edge carries no safepoint
+// poll" — and an earlier position in emission order, so the predecessor's exit
+// heads are already computed.
+fn cseInherits(pred: []int, pos: []int, bi: int, at: int): bool {
   let p = pred[bi]
-  if (p < 0 || p >= bi || pos[p] >= at) {
+  return p >= 0 && p < bi && pos[p] < at
+}
+
+// The head to start block `bi` from: its only predecessor's exit set when
+// `cseInherits`, else empty.
+fn cseInheritHead(pred: []int, pos: []int, exitHead: []int, bi: int, at: int): int {
+  if (!cseInherits(pred, pos, bi, at)) {
     return -1
   }
-  return exitHead[p]
+  return exitHead[pred[bi]]
+}
+
+// The arguments block `p`'s terminator passes along its one edge to `bi`, or
+// none when it names `bi` on no edge or on both of a `br`'s (two edges, which
+// `singlePredecessors` already refuses).
+fn cseEdgeArgs(f: IrFunc, p: int, bi: int): []int {
+  let blk = f.blocks[p]
+  if (blk.instsLen == 0) {
+    return []int(0)
+  }
+  let t = f.instrs[blk.instsStart + blk.instsLen - 1]
+  if (t.op == Op.Jump && t.ival == bi) {
+    return t.args
+  }
+  if (t.op != Op.Br || t.ival == t.ival2) {
+    return []int(0)
+  }
+  if (t.ival == bi) {
+    return t.thenArgs
+  }
+  if (t.ival2 == bi) {
+    return t.elseArgs
+  }
+  return []int(0)
+}
+
+// Keys each single-use param of block `bi` as the argument its only
+// predecessor `p` passes (see the header; `uses` is `useCounts`). Only a param
+// whose type is the argument's: the key carries the result type, not the
+// operands', so a retyping edge must not let two operand widths meet.
+fn cseAliasParams(f: IrFunc, ar: AvailArena, uses: []int, p: int, bi: int) {
+  let blk = f.blocks[bi]
+  let args = cseEdgeArgs(f, p, bi)
+  let k = 0
+  while (k < blk.paramCount && k < len(args)) {
+    let param = blk.instsStart + k
+    if (uses[param] == 1 && f.instrs[param].ty == f.instrs[args[k]].ty) {
+      ar.alias[param] = args[k]
+    }
+    k = k + 1
+  }
 }
 
 // The emission-order position of each block, so `cseInheritHead` can tell
@@ -432,7 +508,7 @@ fn blockOrderPositions(f: IrFunc, order: []int): []int {
   return pos
 }
 
-// `n` entries of -1: an empty chain for every block, before the walk fills in
+// `n` entries of -1: an empty chain for every block before the walk fills in
 // the real exit heads.
 fn emptyHeads(n: int): []int {
   let h = []int(0)
@@ -450,6 +526,7 @@ fn emptyHeads(n: int): []int {
 fn cseAvailableValues(ctx: TypeContext, f: IrFunc, fwd: []int) {
   let ar = newAvailArena(ctx, f)
   let pred = singlePredecessors(f)
+  let uses = useCounts(f)
   let order = blockEmissionOrder(f)
   let pos = blockOrderPositions(f, order)
   let exitLoad = emptyHeads(len(f.blocks))
@@ -459,6 +536,9 @@ fn cseAvailableValues(ctx: TypeContext, f: IrFunc, fwd: []int) {
   let i = 0
   while (i < len(order)) {
     let bi = order[i]
+    if (cseInherits(pred, pos, bi, i)) {
+      cseAliasParams(f, ar, uses, pred[bi], bi)
+    }
     h.load = cseInheritHead(pred, pos, exitLoad, bi, i)
     h.hdr = cseInheritHead(pred, pos, exitHdr, bi, i)
     h.pure = cseInheritHead(pred, pos, exitPure, bi, i)

@@ -11,8 +11,8 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 
 # Self-check: run directly (not sourced) to assert explainMismatch explains
 # only what scripts/selfhost-ir-signatures.sh declares (7745-loop-defer-stack on
-# ir/iropt, 7766-synth-json-helper-column-shift on types; the retired ones
-# are in its Retirement history), and that
+# ir/iropt, 7761-range-chain-cse on iropt, 7766-synth-json-helper-column-shift
+# on types; the retired ones are in its Retirement history), and that
 # declaredSignatureNames() stays in sync with it.
 # `bash scripts/selfhost-ir-signatures-selfcheck.sh`. Same pattern as
 # scripts/selfhost-ir-canon.sh's self-check.
@@ -161,6 +161,130 @@ bb8():
   expect "" "$(explainLoopDeferPolls "$ld_o" "${ld_p/icmp_sgt/icmp_slt}" 1 2)" "polls: a pop loop with no header comparison"
   expect "" "$(explainLoopDeferPolls "$ld_o" "${ld_p/= call_value %25() void/= const_nil}" 1 2)" "polls: a pop loop that makes no deferred call"
   expect "" "$(explainLoopDeferPolls "$ld_o" "${ld_o/rt_call print/rt_call eprint}" 1 2)" "polls: no stack-mode function at all"
+
+  # 7761-range-chain-cse: f's `c < '0' || c > '9'` is fused into one `icmp_ule` on `c - '0'` (one block and
+  # one `br` gone, the `||` mirror: edges swapped), and the body's `c - '0'` on the if body's param is
+  # forwarded to that `sub` (#7770). h is #7770 alone: an `add` on a single-edge param forwarded to its
+  # twin. g does not move.
+  rc_o='func f(%0: u8) i64 {
+bb0(%0: u8):
+  %1 = const_int u8 48
+  %2 = icmp_ult bool %0, %1
+  br %2, bb2(), bb1()
+bb1():
+  %4 = const_int u8 57
+  %5 = icmp_ugt bool %0, %4
+  br %5, bb2(), bb3(%0)
+bb2():
+  %7 = const_int i64 -1
+  ret %7
+bb3(%9: u8):
+  %10 = sub u8 %9, %1
+  %11 = convert i64 %10
+  ret %11
+}
+
+func h(%0: i64, %1: bool) i64 {
+bb0(%0: i64, %1: bool):
+  %2 = const_int i64 1
+  %3 = add i64 %0, %2
+  br %1, bb1(%0), bb2()
+bb1(%5: i64):
+  %6 = add i64 %5, %2
+  ret %6
+bb2():
+  ret %3
+}
+
+func g() void {
+bb0():
+  ret
+}'
+  rc_t='func f(%0: u8) i64 {
+bb0(%0: u8):
+  %1 = const_int u8 48
+  %2 = sub u8 %0, %1
+  %3 = const_int u8 9
+  %4 = icmp_ule bool %2, %3
+  br %4, bb2(%0), bb1()
+bb1():
+  %6 = const_int i64 -1
+  ret %6
+bb2(%8: u8):
+  %9 = convert i64 %2
+  ret %9
+}
+
+func h(%0: i64, %1: bool) i64 {
+bb0(%0: i64, %1: bool):
+  %2 = const_int i64 1
+  %3 = add i64 %0, %2
+  br %1, bb1(), bb2()
+bb1():
+  ret %3
+bb2():
+  ret %3
+}
+
+func g() void {
+bb0():
+  ret
+}'
+  rc_h=${rc_t%%"func h"*}${rc_o#*"}
+
+"}
+  # Each variant is built by a bare assignment: bash 3.2 keeps the quotes of a `${v/"a"/"b"}` that sits
+  # inside a double-quoted word, so the pattern never matches and the "variant" would be the base.
+  rc_sub=${rc_t/"  %9 = convert"/"  %12 = sub u8 %8, %1
+  %13 = sub u8 %12, %1
+  %9 = convert"}
+  rc_ugt=${rc_t/"  %9 = convert"/"  %12 = icmp_ugt bool %8, %1
+  %9 = convert"}
+  rc_ule=${rc_t/"  %9 = convert"/"  %12 = icmp_ule bool %8, %1
+  %9 = convert"}
+  rc_add=${rc_t/"  %9 = convert"/"  %12 = add u8 %8, %1
+  %9 = convert"}
+  rc_ren=${rc_t/"func g()"/"func k()"}
+  rc_jmp=${rc_t/"bb2(%8: u8):"/"bb3():
+  jump bb2(%0)
+bb2(%8: u8):"}
+  rc_ret=${rc_t/"  %9 = convert i64 %2
+  ret %9
+}"/"  %9 = convert i64 %2
+}"}
+  rc_conv=${rc_t/"  %9 = convert i64 %2
+  ret %9"/"  ret %2"}
+  rc_blk=${rc_t/"bb2(%8: u8):"/"bb3():
+bb2(%8: u8):"}
+  rc_opnd=${rc_o/"bb2():
+  ret %3"/"bb2():
+  ret %0"}
+  rc_slt=${rc_o/icmp_ult/icmp_slt}
+  rc_nog=${rc_t%%"func g"*}
+  rc_pre="global @g i64
+$rc_t"
+  for v in "$rc_h" "$rc_sub" "$rc_ugt" "$rc_ule" "$rc_add" "$rc_ren" "$rc_jmp" "$rc_ret" "$rc_conv" "$rc_blk" "$rc_nog" "$rc_pre"; do
+    [ "$v" != "$rc_t" ] || { echo "FAIL: a 7761 fixture variant equals its base"; fail=1; }
+  done
+  [ "$rc_opnd" != "$rc_o" ] && [ "$rc_slt" != "$rc_o" ] || { echo "FAIL: a 7761 oracle variant equals its base"; fail=1; }
+  expect "7761-range-chain-cse" "$(explainMismatch "$rc_o" "$rc_t" iropt)" "iropt: a fused range check and a param-keyed CSE"
+  expect "7761-range-chain-cse" "$(explainMismatch "$rc_o" "$rc_h" iropt)" "iropt: a fused range check alone"
+  expect "" "$(explainMismatch "$rc_o" "$rc_t" ir)" "ir: both transforms are post-opt, the pre-opt dump never moves"
+  expect "" "$(explainMismatch "$rc_t" "$rc_o" iropt)" "iropt: the direction is fixed, an unfused tree is not explained"
+  expect "" "$(explainMismatch "$rc_o" "$rc_sub" iropt)" "iropt: two more subs than fused sites"
+  expect "" "$(explainMismatch "$rc_o" "$rc_ugt" iropt)" "iropt: a fused || that kept its icmp_ugt"
+  expect "" "$(explainMismatch "$rc_o" "$rc_ule" iropt)" "iropt: one icmp_ule more than fused || sites"
+  expect "" "$(explainMismatch "$rc_o" "$rc_add" iropt)" "iropt: an op neither transform adds (add)"
+  expect "" "$(explainMismatch "$rc_o" "$rc_ren" iropt)" "iropt: a function renamed"
+  expect "" "$(explainMismatch "$rc_o" "$rc_jmp" iropt)" "iropt: a block added behind a jump"
+  expect "" "$(explainMismatch "$rc_o" "$rc_ret" iropt)" "iropt: a ret dropped"
+  expect "" "$(explainMismatch "$rc_o" "$rc_conv" iropt)" "iropt: a dropped op CSE never forwards (convert)"
+  expect "" "$(explainMismatch "$rc_o" "$rc_blk" iropt)" "iropt: an emptied block kept for a fused site"
+  expect "" "$(explainMismatch "$rc_slt" "$rc_t" iropt)" "iropt: a signed compare is never fused"
+  expect "" "$(explainMismatch "$rc_o" "$rc_opnd" iropt)" "iropt: an operand changed with no op removed"
+  expect "" "$(explainMismatch "$rc_o" "$rc_nog" iropt)" "iropt: a function went missing"
+  expect "" "$(explainMismatch "$rc_o" "$rc_pre" iropt)" "iropt: the text ahead of the first function differs"
+  expect "" "$(explainMismatch "$rc_o" "$rc_o" iropt)" "iropt: nothing differs"
 
   # 7766-synth-json-helper-column-shift: only a column moves, on a line that carries a synthesized
   # `__json_` row, and only a synthesized name moves there; the file declares a `@json` class.
