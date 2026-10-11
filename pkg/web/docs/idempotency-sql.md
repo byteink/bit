@@ -98,10 +98,13 @@ MySQL 8 and MariaDB 11, and require exactly one winner each time.
 
 ## What the table keeps
 
-One row per key, in `bit_idempotency`. The primary key is the SHA-256 of the
-`Idempotency-Key`, hex: a header has no length limit and no character set while a
-column has both, so hashing gives every key one fixed-width value on both
-engines. The request fingerprint, the response headers and the response body are
+One row per key, in `bit_idempotency`. The primary key is the SHA-256 of the key
+`idempotency()` hands the store, hex, and that key is itself a hash of the caller's
+scope and the `Idempotency-Key` (see [Whose key is it](operations.md#whose-key-is-it)),
+so two users sending one header value are two rows. A header has no length limit
+and no character set while a column has both, so hashing gives every key one
+fixed-width value on both engines. Rows written before keys were scoped used the
+raw header, no longer match, and are removed by `purge` once their `ttl` ends. The request fingerprint, the response headers and the response body are
 binary columns, so a body of any bytes comes back identical.
 
 `migrateSqlIdempotency` runs `sqlIdempotencyMigration(dialect)`, a plain

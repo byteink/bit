@@ -13,11 +13,11 @@
 // `Client` comes from `idempotency.bit`'s import of `redis` (an import binds per
 // module, SPEC 17.1); this file adds the rest it names.
 
-import { App, Config, IdempotencyPolicy, idempotency } from "web"
+import { App, Config, IdempotencyPolicy, IdempotencyScope, idempotency } from "web"
 import { Request } from "std/http"
 import { asInt, open as redisOpen } from "redis"
 import { env } from "std/os"
-import { Millisecond, sleep } from "std/time"
+import { Millisecond, now, sleep } from "std/time"
 
 // The value of `name`, or "": printed once so a skipped run reads as a skip
 // and not as a silent pass.
@@ -533,14 +533,14 @@ test "live: two app instances sharing Redis run a retried request once" {
   }
   let c1 = liveClient(u)
   let c2 = liveClient(u)
-  idemClear(c1, "app", "pay-1")
+  let key = "pay-${now().ns}"
   let calls = IdemCalls{ n = 0 }
   let a = idemChargeApp(idemStore(c1, "app"), calls)
   let b = idemChargeApp(idemStore(c2, "app"), calls)
   let req = Request{
     method = "POST",
     path = "/charge",
-    headers = "Idempotency-Key: pay-1",
+    headers = "Idempotency-Key: ${key}",
     body = "{\"amount\":10}",
   }
   let r1 = a.handle(req)
@@ -549,7 +549,7 @@ test "live: two app instances sharing Redis run a retried request once" {
     Request{
       method = "POST",
       path = "/charge",
-      headers = "Idempotency-Key: pay-1",
+      headers = "Idempotency-Key: ${key}",
       body = "{\"amount\":99}",
     },
   )
@@ -560,7 +560,76 @@ test "live: two app instances sharing Redis run a retried request once" {
   )
   assert(other.status == 422, "the same key with another body is 422, got ${other.status}")
   assert(calls.n == 1, "the handler ran ${calls.n} times, want 1")
-  idemClear(c1, "app", "pay-1")
   c1.close()
   c2.close()
+}
+
+fn idemScopedApp(store: RedisIdempotencyStore, scope: IdempotencyScope, calls: IdemCalls): App {
+  let app = App(Config{ secret = "test-secret" })
+  app.use(idempotency(IdempotencyPolicy{ store = store, ttl = 60, scope = scope }))
+  app.post("/articles", (c) => {
+    calls.n = calls.n + 1
+    return c.text("article for ${c.header("X-User")}").status(201)
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+// The key is unique per run: the stored key is a hash of (scope, key), which
+// this file cannot recompute to clear, so it ages out with its ttl instead.
+test "live: two users sending one key and body through Redis each run their own handler (#7869)" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c1 = liveClient(u)
+  let c2 = liveClient(u)
+  let key = "article-${now().ns}"
+  let calls = IdemCalls{ n = 0 }
+  let byUser: IdempotencyScope = (c) => "user:" + c.header("X-User")
+  let a = idemScopedApp(idemStore(c1, "scope"), byUser, calls)
+  let b = idemScopedApp(idemStore(c2, "scope"), byUser, calls)
+  let asUser = (user: string) => Request{
+    method = "POST",
+    path = "/articles",
+    headers = "Idempotency-Key: ${key}\r\nX-User: ${user}",
+    body = "{\"t\":1}",
+  }
+  let alice = a.handle(asUser("alice"))
+  let bob = b.handle(asUser("bob"))
+  let aliceAgain = b.handle(asUser("alice"))
+  assert(alice.body == "article for alice", "alice, got '${alice.body}'")
+  assert(bob.body == "article for bob", "bob must get his own response, got '${bob.body}'")
+  assert(
+    aliceAgain.body == "article for alice",
+    "alice's retry replays hers, got '${aliceAgain.body}'",
+  )
+  assert(calls.n == 2, "two users run once each, got ${calls.n}")
+  c1.close()
+  c2.close()
+}
+
+test "live: two anonymous clients at different addresses sharing one key each run their own handler (#7869)" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let key = "anon-${now().ns}"
+  let calls = IdemCalls{ n = 0 }
+  let app = idemChargeApp(idemStore(c, "anon"), calls)
+  let from = (peer: string) => Request{
+    method = "POST",
+    path = "/charge",
+    headers = "Idempotency-Key: ${key}",
+    body = "{}",
+    peer = peer,
+  }
+  let _ = app.handle(from("198.51.100.1"))
+  let _ = app.handle(from("198.51.100.2"))
+  let _ = app.handle(from("198.51.100.1"))
+  assert(calls.n == 2, "two addresses run once each and a retry replays, got ${calls.n}")
+  c.close()
 }
