@@ -6183,7 +6183,7 @@ Per resolved dependency it records:
 
 - `url` - the git URL the module was fetched from.
 - `commit` - the exact resolved commit SHA (a tag or branch ref is dereferenced
-  to its commit before being recorded; `bit.lock` never stores a mutable ref).
+  to its commit before being recorded; `commit` never stores a mutable ref).
 - `version` - the resolved `MAJOR.MINOR.PATCH`, no `v` prefix, present only
   when the manifest's ref was a version constraint (bare, `^`, or `~`) and
   resolution matched it to a git tag; omitted for a branch pin, a bare commit
@@ -6200,6 +6200,14 @@ Per resolved dependency it records:
   `version`: both the `v` and the namespace are choices the remote made, and
   a repository may tag either way. Optional on read, on the same terms as
   `version`.
+- `spec` - the full requirement spelling that selected a transitive branch
+  or bare commit SHA, including its repository and ref. This is requirement
+  metadata; `commit` still pins the exact bytes. `bit add` and `bit remove`
+  preserve the locked commit when this requirement is unchanged; a changed
+  requirement resolves again. `bit up` resolves the requirement again even
+  when it is unchanged. Optional: older lock files without this key resolve
+  once and record it on the next resolution. Omitted for version constraints
+  and local-path dependencies.
 - `requires` - that dependency's own transitive requirement list, verbatim
   from its `bit.json`, so resolution can re-run from the lockfile alone
   without re-fetching every transitive dependency's manifest.
