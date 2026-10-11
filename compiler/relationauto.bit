@@ -164,27 +164,24 @@ fn relationAutoSourceCall(c: Checker, callNode: int): RelationAutoSource {
 // One tracked local: the class/query pair it carries, and whether it holds
 // a whole slice of rows (`isSlice`, e.g. a `let`-bound `.all()` result) or
 // one row — a `for-of` binder and an indexed/`?`/`.unwrap()`-resolved value
-// are never slices. `afterOffset`: a read only counts past the binding's
-// own source position, so a `let`'s initializer expression is never
-// mistaken for a later read of itself.
+// are never slices. The resolver supplies lexical symbol identity; the
+// initializer is walked before its binding is installed.
 //
 // `queryCall`/`paramName` are mutually exclusive origins (R2, #6305): a
 // REAL query call node (`queryCall > 0`, `paramName == ""`) as R1 always
 // had, or the CURRENT function's own parameter of that name (`queryCall ==
 // 0`, `paramName != ""`) — synthesized by
 // `compiler/relationautocalls.bit`'s `relationAutoSeedParamBindings` before
-// a function's body is walked, with `afterOffset = -1` since a parameter is
-// in scope for the whole body. Every read this walk finds through a
+// a function's body is walked. Every read this walk finds through a
 // parameter-origin binding is recorded against the PARAMETER's own name
 // (`relationAutoRecordRead`), not a call node — resolved back to whichever
 // real query reaches it only at that parameter's own call sites.
 class RelationAutoBinding {
-  varName: string,
+  symbol: int,
   cls: RelationAutoClass,
   queryCall: int,
   paramName: string,
   isSlice: bool,
-  afterOffset: int,
   // Mirrors `RelationAutoFlow.ownerModule` (R2b, #6322): the module that
   // owns `queryCall`'s own node index, carried through a `let`/`for-of`
   // binding exactly as every other flow field is.
@@ -206,8 +203,8 @@ class RelationAutoBinding {
 // `paramReads`/`returnSeen`/`returnCandidate` accumulate THIS ONE walk's own
 // function's parameter-read and return-source findings, merged into
 // `summaries` by the caller once the walk finishes. `assigned` (#6352): the
-// `x.f = ...` stores on the path to the current statement — scoped to their
-// block like `bindings` — so a later read of `x.f` is the assigned value, not
+// `x.f = ...` stores definitely established on the current path, keyed by
+// lexical symbol — so a later read of `x.f` is the assigned value, not
 // a load anyone owes.
 class RelationAutoState {
   bindings: []RelationAutoBinding,
@@ -257,22 +254,16 @@ fn relationAutoNoFlow(c: Checker): RelationAutoFlow {
   }
 }
 
-// The most recent binding named `name` whose own `let`/binder position is
-// strictly before `atOffset` — shadowing resolves to the nearest enclosing
-// one, scanned back to front the same way `lintCheckRelationMemberRead`
-// scans `bindings` forward but keeps only the first match; back-to-front
-// here because `st.bindings` is a stack a block/loop pushes onto and pops
-// from (`relationAutoWalkBlock`/`relationAutoWalkForOf`, below).
+// Resolve by lexical symbol; an inner local cannot borrow an outer query.
 fn relationAutoLookupBinding(
   c: Checker,
   st: RelationAutoState,
-  name: string,
-  atOffset: int,
+  node: int,
 ): RelationAutoFlow {
   let i = len(st.bindings) - 1
   while (i >= 0) {
     let b = st.bindings[i]
-    if (b.varName == name && atOffset > b.afterOffset) {
+    if (b.symbol == relationAutoSymbol(c, node) && b.symbol != 0) {
       return RelationAutoFlow{
         found = true,
         cls = b.cls,
@@ -304,8 +295,7 @@ fn relationAutoResolve(c: Checker, node: int, st: RelationAutoState): RelationAu
     return relationAutoResolveCall(c, n, st)
   }
   if (tag == Tag.Ident) {
-    let name = identText(c.tree, c.source, n)
-    let bound = relationAutoLookupBinding(c, st, name, getNode(c.tree, n).span.start)
+    let bound = relationAutoLookupBinding(c, st, n)
     if (bound.found) {
       return bound
     }
@@ -510,7 +500,7 @@ fn relationAutoCheckMemberRead(c: Checker, node: int, st: RelationAutoState) {
   if (!lintFieldIsRelation(flow.cls.oc.tree, flow.cls.oc.source, flow.cls.decl, fieldName)) {
     return
   }
-  if (relationAutoErrLoadedByAssignment(c, recv, fieldName, node, st.assigned)) {
+  if (relationAutoErrLoadedByAssignment(c, recv, fieldName, st.assigned)) {
     return
   }
   relationAutoRecordRead(c, st, flow, relationAutoJoinPath(flow.path, fieldName))
@@ -529,16 +519,15 @@ fn relationAutoWalkLet(c: Checker, node: int, st: RelationAutoState) {
       relationAutoWalk(c, bk[2], st)
     }
     for pair of relationAutoLetPairs(c, bk[0], bk[2]) {
-      relationAutoBindLet(c, pair, getNode(c.tree, node).span.end, st)
+      relationAutoBindLet(c, pair, st)
     }
   }
 }
 
-// `pair.pat` (an Ident) bound to what `pair.init` resolves to, from `afterOffset` on.
+// The resolved lexical binding carries its initializer's origin.
 fn relationAutoBindLet(
   c: Checker,
   pair: RelationAutoLetPair,
-  afterOffset: int,
   st: RelationAutoState,
 ) {
   let flow = relationAutoResolve(c, pair.init, st)
@@ -548,9 +537,9 @@ fn relationAutoBindLet(
   st.bindings = append(
     st.bindings,
     RelationAutoBinding{
-      varName = identText(c.tree, c.source, pair.pat), cls = flow.cls, queryCall = flow.queryCall,
+      symbol = relationAutoSymbol(c, pair.pat), cls = flow.cls, queryCall = flow.queryCall,
       paramName = flow.paramName, isSlice = flow.isSlice,
-      afterOffset = afterOffset, ownerModule = flow.ownerModule, path = flow.path,
+      ownerModule = flow.ownerModule, path = flow.path,
     },
   )
 }
@@ -568,9 +557,8 @@ fn relationAutoWalkForOf(c: Checker, node: int, st: RelationAutoState) {
     st.bindings = append(
       st.bindings,
       RelationAutoBinding{
-        varName = identText(c.tree, c.source, k[0]), cls = flow.cls, queryCall = flow.queryCall,
-        paramName = flow.paramName, isSlice = false, afterOffset = getNode(c.tree, k[0]).span.start,
-        ownerModule = flow.ownerModule, path = flow.path,
+        symbol = relationAutoSymbol(c, k[0]), cls = flow.cls, queryCall = flow.queryCall,
+        paramName = flow.paramName, isSlice = false, ownerModule = flow.ownerModule, path = flow.path,
       },
     )
   }
@@ -578,20 +566,6 @@ fn relationAutoWalkForOf(c: Checker, node: int, st: RelationAutoState) {
   if (pushed) {
     st.bindings = st.bindings[0:len(st.bindings) - 1]
   }
-}
-
-// A `Block`'s own lexical scope: every binding a statement inside it pushes
-// (a `let`, or a nested `for-of`'s own loop var for ITS body only) is
-// popped again once the block ends, so it is never visible to a sibling
-// statement after this block closes.
-fn relationAutoWalkBlock(c: Checker, node: int, st: RelationAutoState) {
-  let save = len(st.bindings)
-  let saveAssigned = len(st.assigned)
-  for k of kidsOf(c.tree, node) {
-    relationAutoWalk(c, k, st)
-  }
-  st.bindings = st.bindings[0:save]
-  st.assigned = st.assigned[0:saveAssigned]
 }
 
 // Merges one `return`'s resolved flow into this function's own single
@@ -649,69 +623,6 @@ fn relationAutoWalkReturn(c: Checker, node: int, st: RelationAutoState) {
     return
   }
   relationAutoMergeReturn(st, relationAutoResolve(c, kids[0], st))
-}
-
-// The five constructs that own their own binding scope (a `let`, a
-// `for-of`/`match` binder, a `Block`'s own push/pop, or an assignment's own
-// `assigned` record) — split out of
-// `relationAutoWalk` (below) to keep its own complexity under the ceiling
-// (spec/LINT.md). Returns whether `tag` was one of them: the caller must
-// stop rather than fall through to its own recursive kids walk when it was,
-// since each of these has already walked its own children itself.
-fn relationAutoWalkScoped(c: Checker, node: int, tag: Tag, st: RelationAutoState): bool {
-  if (tag == Tag.Block) {
-    relationAutoWalkBlock(c, node, st)
-    return true
-  }
-  if (tag == Tag.LetDecl) {
-    relationAutoWalkLet(c, node, st)
-    return true
-  }
-  if (tag == Tag.ForOf) {
-    relationAutoWalkForOf(c, node, st)
-    return true
-  }
-  if (tag == Tag.MatchStmt) {
-    relationAutoWalkMatch(c, node, st)
-    return true
-  }
-  if (tag == Tag.Assign) {
-    relationAutoWalkAssign(c, node, st)
-    return true
-  }
-  return false
-}
-
-// The generic recursive walk: a nested `FuncDecl`/`ArrowFn` is its own
-// scope (`lintIsNestedFuncBoundary`, compiler/relationfieldread.bit) — never
-// descended into from here, since `relationautocalls.bit`'s round loop
-// already visits it as its own separate entry with its own fresh
-// `RelationAutoState`. `Tag.Call`'s own check (R2) never short-circuits the
-// child walk below it: an argument expression can itself contain a member
-// read (`show(post.author)`) that still needs recording on its own account.
-fn relationAutoWalk(c: Checker, node: int, st: RelationAutoState) {
-  if (node == 0) {
-    return
-  }
-  let tag = getNode(c.tree, node).tag
-  if (lintIsNestedFuncBoundary(tag)) {
-    return
-  }
-  if (relationAutoWalkScoped(c, node, tag, st)) {
-    return
-  }
-  if (tag == Tag.Member) {
-    relationAutoCheckMemberRead(c, node, st)
-  }
-  if (tag == Tag.Call) {
-    relationAutoCheckCallArgs(c, node, st)
-  }
-  if (tag == Tag.ReturnStmt) {
-    relationAutoWalkReturn(c, node, st)
-  }
-  for k of kidsOf(c.tree, node) {
-    relationAutoWalk(c, k, st)
-  }
 }
 
 // Entry point, called from `checkResolved` (compiler/checkproject.bit) once
