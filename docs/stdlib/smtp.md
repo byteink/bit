@@ -674,6 +674,34 @@ See [the connection guide](smtp/connecting.md#clientstarttlso-options-smtperror)
 
 See [the connection guide](smtp/connecting.md#clientsupportsext-string-bool).
 
+### `Client.maxSize(): int`
+
+After the latest `ehlo`, the server's maximum message size in octets, or `0`
+when it offers no readable fixed limit. A bare `SIZE` or `SIZE 0` sets no
+limit. STARTTLS discards this value until the required new `ehlo`.
+
+```bit
+import { Client, Message, Raw, SmtpError } from "std/smtp"
+
+// Render once so the preflight and the delivery use the same message bytes.
+fn submitWithinLimit(c: Client, m: Message): ()!SmtpError {
+  let data = m.render()?
+  let max = c.maxSize()
+  if (max > 0 && len(data) > max) {
+    println("The attachment exceeds the relay's ${max}-octet limit.")
+    return
+  }
+  c.send(Raw(m.envelope(), data))?
+}
+```
+
+`send` enforces the same limit before `MAIL FROM`, failing permanently with
+`smtp: message is <n> octets, the server accepts at most <max>`. When `SIZE`
+is advertised it adds `SIZE=<n>` to `MAIL FROM`. The count includes headers,
+body and CRLF pairs, excluding DATA's extra quoting dots and terminating dot
+([RFC 1870 §5](https://www.rfc-editor.org/rfc/rfc1870.html#section-5)).
+Malformed or overflowing advertisements supply no usable maximum.
+
 ### `Client.limits`
 
 See [the connection guide](smtp/connecting.md#clientlimits-limits).
