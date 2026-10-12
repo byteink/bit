@@ -139,7 +139,8 @@ fn onPostmarkWebhook(
     if (ev.kind == EventKind.Subscribe) {
       setSuppressed(ev.recipient, false)
     }
-    if (ev.kind == EventKind.Unsubscribed || ev.kind == EventKind.Complained ||
+    if (ev.kind == EventKind.Unsubscribed ||
+      ev.kind == EventKind.Complained ||
       (ev.kind == EventKind.Bounced && ev.permanent)) {
       setSuppressed(ev.recipient, true)
     }
