@@ -622,10 +622,22 @@ while ($ast =~ /\G\s*(\(|\)|"(?:\\.|[^"\\])*"|[^()\s]+)/gc) {
 }
 exit 1 if @stack || !$tree || $tree->[0] ne 'program' || $ast !~ /\G\s*\z/gc;
 my (%decl, %count, %bound);
+# Resolver pattern binders can shadow a declaration without a binding node.
+sub addBound {
+  my @pending = ($_[0]);
+  while (@pending) {
+    my $p = pop @pending;
+    if (ref($p)) {
+      exit 1 unless $p->[0] =~ /^(tuple_pat|field_pat|expr_list)$/;
+      push @pending, @$p[1..$#$p];
+    } else { $bound{$p}++ if $p ne '_' }
+  }
+}
 for my $n (@nodes) {
   next unless @$n > 1;
   $count{$n->[2]}++ if $n->[0] eq 'func_decl' && !ref($n->[2]);
-  $bound{$n->[1]}++ if $n->[0] =~ /^(binding|param|param_rest|arrow_p)$/ && !ref($n->[1]);
+  addBound($n->[1]) if $n->[0] =~ /^(binding|param|param_rest|arrow_p|receiver|generic_param|for_of|for_in|recv_bind)$/;
+  addBound($n->[2]) if $n->[0] =~ /^(catch_bind|variant_pat)$/;
 }
 my %prim = map { $_ => $_ } qw(bool i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 string);
 @prim{qw(int byte)} = qw(i64 u8);

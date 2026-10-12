@@ -478,6 +478,29 @@ BIT
   expect "" "$(explainMismatch "$vt_old" "$vt_new" types "$vt_dir/unrelated.bit")" 'variadic unrelated source'
   printf 'fn ordinary(x: int): int { return x }\nfn variadic(...xs: int): int { return len(xs) }\nfn main() { let variadic = ordinary; let b = variadic }\n' > "$vt_dir/shadow.bit"
   expect "" "$(explainMismatch "$vt_old" "$vt_new" types "$vt_dir/shadow.bit")" 'variadic shadowed source'
+  # Each accepted binder shadows the variadic declaration with an ordinary callback.
+  for vt_pattern in loop tuple match catch; do
+    vt_shadow="$vt_dir/$vt_pattern.bit"
+    printf 'fn ordinary(x: int): int { return x }\nfn variadic(...xs: int): int { return len(xs) }\n' > "$vt_shadow"
+    case "$vt_pattern" in
+      loop) printf 'fn main() { for variadic of [](int) => int{ ordinary } { let b = variadic; } }\n' ;;
+      tuple) printf 'fn main() { let (variadic, n) = (ordinary, 3); let b = variadic; }\n' ;;
+      match) printf 'enum Callback { One((int) => int) }\nfn main() { match (Callback.One(ordinary)) { One(variadic) => { let b = variadic; } } }\n' ;;
+      catch) printf 'type Callback = (int) => int\nfn failure(): int!Callback { fail ordinary }\nfn main() { let n = failure() catch variadic { let b = variadic; return } }\n' ;;
+    esac >> "$vt_shadow"
+    vt_shadow_old=$(alarmrun "$ORACLE" --dump-types "$vt_shadow"); vt_rc=$?
+    expect 0 "$vt_rc" "variadic $vt_pattern shadow: oracle dump succeeds"
+    vt_shadow_new=$(alarmrun "$BIT2" --dump-types "$vt_shadow"); vt_rc=$?
+    expect 0 "$vt_rc" "variadic $vt_pattern shadow: current dump succeeds"
+    for vt_binary in "$ORACLE" "$BIT2"; do
+      alarmrun "$vt_binary" check "$vt_shadow" > "$vt_dir/check"; vt_rc=$?
+      expect 0 "$vt_rc" "variadic $vt_pattern shadow: accepted source"
+    done
+    expect "$vt_shadow_old" "$vt_shadow_new" "variadic $vt_pattern shadow: unchanged ordinary type"
+    vt_forged=${vt_shadow_new/b: (i64) => i64/b: (...i64) => i64}
+    expect no "$([ "$vt_forged" = "$vt_shadow_new" ] && printf yes || printf no)" "variadic $vt_pattern shadow: forged row differs"
+    expect "" "$(explainMismatch "$vt_shadow_old" "$vt_forged" types "$vt_shadow")" "variadic rejects $vt_pattern binder shadow"
+  done
   VT_REAL_ORACLE=$ORACLE; export VT_REAL_ORACLE
   cat > "$vt_dir/failed" <<'PROBE'
 #!/bin/sh

@@ -101,7 +101,9 @@ The variadic function marker repair (#7929) has a separate strict `types`
 identity (#7933). It applies to direct inferred bindings of unique, unshadowed
 top-level variadic functions with primitive parameters and results. Both
 compilers must accept the unchanged source and produce identical AST and token
-dumps. The AST proves the final rest parameter and exact signature; token
+dumps. AST binder metadata rejects names shadowed by parameters, destructuring,
+loops, match/catch patterns, receivers or receive bindings. The AST proves the
+final rest parameter and exact signature; token
 offsets tie it to the binding's line, column and name. Only that final
 parameter gains `...`; every other dump byte must agree. Unsupported nested,
 imported or generic captures, changed rows/types/positions and failed witnesses
