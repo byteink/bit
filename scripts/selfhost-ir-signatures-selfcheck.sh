@@ -44,6 +44,12 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     fi
   }
 
+  # The owner signature needs native evidence, even for plausible root text.
+  fnv_old='func fnvalue$trampoline$9(%0: fn(i64) i64, %1: i64) i64 {'
+  fnv_new='  %0 = global_addr @__bitfnv_8'
+  expect "" "$(explainMismatch "$fnv_old" "$fnv_new" ir)" "fnvalue: missing source stays unexplained"
+  expect "" "$(explainMismatch "$fnv_old" "$fnv_new" iropt /no/such/source.bit)" "fnvalue: unavailable evidence stays unexplained"
+
   # 7745-loop-defer-stack: the oracle keeps a flag and replays the deferred call at the exit; the tree
   # pushes a thunk (a function of its own, numbered in the closures' id space) and pops the stack. `g`
   # is not stack-mode and must come out byte-equal once the closure after the thunk is renumbered.

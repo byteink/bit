@@ -569,6 +569,34 @@ END {
 }'
 }
 
+# #7925: whole-project O0 ELF proves owner/ABI evidence absent from root IR.
+# The native checker keeps every other root IR byte unchanged.
+explainFnvalueOwners() (
+  [ -f "${3:-}" ] || return 1
+  printf '%s\n' "$1" | grep -q '^func fnvalue\$trampoline\$' || return 1
+  printf '%s\n' "$2" | grep -q '@__bitfnv_' || return 1
+  [ -x "${ORACLE:-}" ] && [ -x "${BIT2:-}" ] || return 1
+  command -v alarmrun >/dev/null || return 1
+  local witness_dir rc
+  witness_dir=$(mktemp -d "${TMPDIR:-/tmp}/t7925-witness-XXXXXX") || return 1
+  trap 'rm -rf "${witness_dir:?}"' EXIT
+  printf '%s\n' "$1" > "$witness_dir/old.ir" || return 1
+  printf '%s\n' "$2" > "$witness_dir/new.ir" || return 1
+  alarmrun "$ORACLE" build "$3" --emit-obj --no-optimize --target x86_64-linux -o "$witness_dir/old.o" > "$witness_dir/old.log" 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  alarmrun "$BIT2" build "$3" --emit-obj --no-optimize --target x86_64-linux -o "$witness_dir/new.o" > "$witness_dir/new.log" 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  alarmrun "$BIT2" build _tests_/bit/fnvalueir -o "$witness_dir/check" > "$witness_dir/helper.log" 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  alarmrun "$witness_dir/check" "$witness_dir/old.ir" "$witness_dir/new.ir" "$witness_dir/old.o" "$witness_dir/new.o" > "$witness_dir/check.log" 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  awk 'BEGIN { print "7925-fnvalue-owner-reuse" }'
+)
+
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. 7745-loop-defer-stack is registered
@@ -576,8 +604,8 @@ END {
 # on `types`.
 explainMismatch() {
   case "$3" in
-    ir) explainLoopDeferStack "$1" "$2"; return ;;
-    iropt) explainLoopDeferStack "$1" "$2" || explainRangeChainCse "$1" "$2"; return ;;
+    ir) explainLoopDeferStack "$1" "$2" || explainFnvalueOwners "$1" "$2" "${4:-}"; return ;;
+    iropt) explainLoopDeferStack "$1" "$2" || explainRangeChainCse "$1" "$2" || explainFnvalueOwners "$1" "$2" "${4:-}"; return ;;
     types) explainJsonHelperShift "$1" "$2" "${4:-}"; return ;;
   esac
   return 1
@@ -594,8 +622,8 @@ explainMismatch() {
 # `ir`, `iropt` and `types`.
 declaredSignatureNames() {
   case "${1:-}" in
-    ir) printf '%s\n' 7745-loop-defer-stack ;;
-    iropt|"") printf '%s\n' 7745-loop-defer-stack 7761-range-chain-cse ;;
+    ir) printf '%s\n' 7745-loop-defer-stack 7925-fnvalue-owner-reuse ;;
+    iropt|"") printf '%s\n' 7745-loop-defer-stack 7761-range-chain-cse 7925-fnvalue-owner-reuse ;;
   esac
   case "${1:-}" in
     types|"") printf '%s\n' 7766-synth-json-helper-column-shift ;;

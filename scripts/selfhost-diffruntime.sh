@@ -433,7 +433,7 @@ for f in $(find runtime -name '*.bit' | sort); do
     # A raw mismatch is not automatically a regression (#3132, same fix as
     # #3125 one level up): check it against the declared-transform-signature
     # table before scoring it. Only an UNEXPLAINED divergence fails the gate.
-    sig=$(explainMismatch "$a" "$b" ir)
+    sig=$(explainMismatch "$a" "$b" ir "$f")
     if [ -n "$sig" ]; then
       echo "$f${sep}explained by declared signature '$sig'" >>"$work/explained"
     else
