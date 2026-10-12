@@ -124,5 +124,73 @@ fn main(): ()! {
 }
 ```
 
+## Observe committed changes
+
+A second process can update the task tracker while a cache still holds its
+old entries. `store.version()` reads the durable commit number, including
+commits from other processes. It leaves an active transaction's root alone.
+Every successful `tx` advances this number once, including a read-only block;
+a failed or panicked block does not advance it.
+
+Watch a raw key prefix when you need to invalidate only one part of a cache:
+
+```bit
+import { Change, Watcher, open } from "kv"
+
+fn report(change: Change) {
+  println("commit ${change.version}, resync everything: ${change.overflow}")
+}
+
+fn poll(watcher: Watcher): ()! {
+  let change = watcher.next(100)?
+  match (change) {
+    Some(value) => report(value)
+    None => println("no change")
+  }
+}
+
+fn main(): ()! {
+  let store = open("tasks.kv")?
+  defer store.close()
+  let watcher = store.watch([]byte("tasks/"), 10)?
+  defer watcher.close()
+  store.tx((t) => {
+    t.put([]byte("tasks/1"), []byte("Pack for the trip"))?
+  })?
+  println("${store.version()?}")
+  poll(watcher)?
+}
+```
+
+On a new file this prints commit `1`, then reports that version with
+`overflow = false`. The watcher copies the prefix, owns its reader handle,
+and starts at the version captured when `watch` returns. Close it separately
+from the store. Opening the reader or capturing its cursor can fail, so
+`watch` is fallible. A positive polling interval and a nonnegative timeout
+are required; both must fit the nanosecond clock range. A zero timeout makes
+one attempt. No background thread runs: `next` polls until a match or its
+timeout. If a writer owns the file lock, that attempt waits for the next poll.
+An ordinary `version` read reports a busy-writer error instead of blocking.
+
+Each change reports the newest observed version, rather than one event per
+key. A successful put or a delete that removes a key records that key.
+Writes outside the prefix advance the cursor without returning a change.
+All commits since the cursor are checked, so later prefix misses cannot hide
+an earlier matching write. A journal retains the last 1024 commits. Falling
+further behind returns `overflow = true`, even if the retained keys do not
+match: clear the whole cache and read its contents again.
+
+The journal and tree share one durable meta-page flip. Its CRC-covered
+format-1 extension uses previously reserved meta bytes; old data files stay
+readable. Older writers clear this extension. A lost history range therefore
+returns overflow, and the next current writer recovers obsolete journal
+pages into its deferred free list. Live tree and free-list pages have
+different first-byte tags from journal pages; embedded journal-looking user
+values remain ordinary values. Recovery never reuses those pages before the
+meta flip. No reserved application keys or side files hold the history.
+Corrupt metadata or journal pages fail instead of reporting no change.
+Versions through the largest signed 64-bit value remain readable; further
+transactions fail before their block runs, rather than wrapping the counter.
+
 Next: [Indexes](indexes.md), for looking tasks up by something other than
 their id.
