@@ -4,13 +4,14 @@
 // module siblings (SPEC §17.2). `dial` (std/net) is already bound
 // module-wide (adapterhead.test.bit) — `std/tls`'s own `dial` needs an
 // alias to avoid E0042.
-import { dial as tlsRawDial } from "std/tls"
-import { encodeBase64 } from "std/crypto"
+import { dial as tlsRawDial, listen as wsTlsListen, TlsListener, TlsServerConfig } from "std/tls"
+import { acceptKey as wsAcceptKey } from "std/websocket"
 
 fn tlsMixedApp(): App {
   let app = App(
     Config{
       secret = "test-secret",
+      port = 0,
       certPem = webTlsPem("CERTIFICATE", webTlsLeafHex),
       keyPem = webTlsPem("PRIVATE KEY", webTlsKeyHex),
     },
@@ -146,71 +147,152 @@ test "a mixed app over TLS keeps an ordinary route's connection open for a secon
   ts.shutdown(2000) catch _ {}
 }
 
-// #6172: a WebSocket over TLS+HTTP/1.1, driven by hand (`std/websocket`'s
-// own client `dial` does not support `wss://` yet — a separate gap, this
-// test's own header comment) rather than a WS client library: the RFC 6455
-// handshake request/response, then one masked client text frame (§5.2) with
-// an all-zero mask key so the masked bytes equal the payload unchanged (a
-// zero mask is a valid mask, just not one a real client would pick), echoed
-// back unmasked by the server per this app's own `/ws/echo` route
-// (`tlsMixedApp`, above).
-test "a WebSocket handshake and echo work end to end over TLS+HTTP/1.1" {
-  let app = tlsMixedApp()
-  let ts = app.serveTls() catch e {
-    assert(false, "serveTls: ${e.message()}")
+test "WebSocket dial authenticates TLS and echoes both ways" {
+  let cfg = verifiedWebSocketConfig() catch e {
+    assert(false, e.message())
+    return
+  }
+  cfg.alpn = ["h2"]
+  let ts = tlsMixedApp().serveTls() catch e {
+    assert(false, e.message())
     return
   }
   let port = ts.port() catch e {
-    assert(false, "port: ${e.message()}")
-    return
-  }
-  let conn = tlsRawDial("127.0.0.1", port, clientCfg(["http/1.1"])) catch e {
     ts.shutdown(2000) catch _ {}
-    assert(false, "tlsRawDial: ${e.message()}")
+    assert(false, e.message())
     return
   }
-  let key = encodeBase64([]byte("0123456789abcdef"))
-  conn.write(
-    []byte(
-        "GET /ws/echo HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n" +
-        "Connection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\n" +
-        "Sec-WebSocket-Version: 13\r\n\r\n",
-    ),
-  ) catch e {
-    conn.close()
+  let conn = wsDial("wss://127.0.0.1:${port}/ws/echo", config = Option.Some(cfg)) catch e {
     ts.shutdown(2000) catch _ {}
-    assert(false, "write handshake: ${e.message()}")
+    assert(false, e.message())
     return
   }
-  let resp = string(
-    conn.read(4096) catch e {
-      conn.close()
-      ts.shutdown(2000) catch _ {}
-      assert(false, "read handshake response: ${e.message()}")
-      return
-    },
-  )
-  assert(contains(resp, "101"), "want a 101 Switching Protocols, got:\n${resp}")
-  assert(contains(resp, "Upgrade: websocket"), "want Upgrade: websocket, got:\n${resp}")
+  conn.sendText("hi") catch e {
+    conn.close(1000, "") catch _ {}
+    ts.shutdown(2000) catch _ {}
+    assert(false, e.message())
+    return
+  }
+  let echoed = conn.receive() catch e {
+    conn.close(1000, "") catch _ {}
+    ts.shutdown(2000) catch _ {}
+    assert(false, e.message())
+    return
+  }
+  conn.close(1000, "") catch e {
+    assert(false, e.message())
+  }
+  ts.shutdown(2000) catch e {
+    assert(false, e.message())
+  }
+  assert(echoed.kind == MessageText && echoed.data == "hi", "authenticated echo")
+  assert(cfg.alpn[0] == "h2", "dial must not mutate caller ALPN")
+}
 
-  conn.write([]byte("\x81\x82\x00\x00\x00\x00hi")) catch e {
-    conn.close()
-    ts.shutdown(2000) catch _ {}
-    assert(false, "write frame: ${e.message()}")
+fn rejectedWebSocketTls(cfg: TlsConfig, needle: string) {
+  let ts = tlsMixedApp().serveTls() catch e {
+    assert(false, e.message())
     return
   }
-  let echoed = string(
-    conn.read(64) catch e {
-      conn.close()
-      ts.shutdown(2000) catch _ {}
-      assert(false, "read frame: ${e.message()}")
-      return
-    },
-  )
-  conn.close()
+  let port = ts.port() catch e {
+    ts.shutdown(2000) catch _ {}
+    assert(false, e.message())
+    return
+  }
+  let conn = wsDial("wss://127.0.0.1:${port}/ws/echo", config = Option.Some(cfg)) catch e {
+    let message = e.message()
+    ts.shutdown(2000) catch cleanupError {
+      assert(false, cleanupError.message())
+    }
+    assert(contains(message, needle), message)
+    return
+  }
+  conn.close(1000, "") catch _ {}
   ts.shutdown(2000) catch _ {}
-  assert(
-    echoed == "\x81\x02hi",
-    "want the server's unmasked echo frame, got ${len(echoed)} byte(s)",
-  )
+  assert(false, "untrusted TLS accepted")
+}
+
+test "WebSocket dial rejects an empty trust store and wrong server name" {
+  let empty = TlsConfig(emptyTrustStore(), serverName = "localhost", nowUnix = 1800000000)
+  rejectedWebSocketTls(empty, "trusted root")
+  let wrong = verifiedWebSocketConfig() catch e {
+    assert(false, e.message())
+    return
+  }
+  wrong.serverName = "wrong.example"
+  rejectedWebSocketTls(wrong, "hostname")
+}
+
+fn serveWebSocketWithoutAlpn(listener: TlsListener) {
+  let c = listener.accept() catch _ {
+    return
+  }
+  let request = readWebSocketTlsRequest(c) catch _ {
+    c.close()
+    return
+  }
+  assert(c.alpnProtocol() == "", "server must omit ALPN")
+  let key = wsAcceptKey(rawHeader(request, "Sec-WebSocket-Key"))
+  c.write(
+    []byte(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" +
+        "Connection: Upgrade\r\nSec-WebSocket-Accept: ${key}\r\n\r\n\x88\x02\x03\xe8",
+    ),
+  ) catch _ {}
+  c.close()
+}
+
+fn readWebSocketTlsRequest(c: TlsConn): string! {
+  let request = ""
+  while (len(request) <= 65536) {
+    let part = string(c.read(4096)?)
+    if (part == "") {
+      fail newError("EOF in test handshake")
+    }
+    request = request + part
+    if (indexOf(request, "\r\n\r\n") >= 0) {
+      return request
+    }
+  }
+  fail newError("test handshake too large")
+}
+
+test "WebSocket dial accepts a TLS server that omits ALPN" {
+  let serverCfg = TlsServerConfig(
+    webTlsPem("CERTIFICATE", webTlsLeafHex),
+    webTlsPem("PRIVATE KEY", webTlsKeyHex), []string(0),
+  ) catch e {
+    assert(false, e.message())
+    return
+  }
+  let cfg = verifiedWebSocketConfig() catch e {
+    assert(false, e.message())
+    return
+  }
+  let listener = wsTlsListen("127.0.0.1", 0, serverCfg) catch e {
+    assert(false, e.message())
+    return
+  }
+  let port = listener.port() catch e {
+    listener.close()
+    assert(false, e.message())
+    return
+  }
+  spawn serveWebSocketWithoutAlpn(listener)
+  let c = wsDial("wss://127.0.0.1:${port}/notes", config = Option.Some(cfg)) catch e {
+    listener.close()
+    assert(false, e.message())
+    return
+  }
+  let closed = c.receive() catch e {
+    c.close(1000, "") catch _ {}
+    listener.close()
+    assert(false, e.message())
+    return
+  }
+  c.close(1000, "") catch e {
+    assert(false, e.message())
+  }
+  listener.close()
+  assert(closed.kind == MessageClose && closed.code == 1000, "peer close over TLS without ALPN")
 }

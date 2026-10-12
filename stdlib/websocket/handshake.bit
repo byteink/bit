@@ -3,22 +3,20 @@
 //
 // Server side (`upgrade`/`upgradeTls`, #6172) takes an already-read std/http
 // `Request` and the `Exchange`/`TlsExchange` it came from; client side
-// (`dial`) opens the TCP connection itself and speaks the client half.
+// (`dial`) opens the TCP or TLS connection and speaks the client half.
 // Neither touches framing — that starts only once a `Conn` exists (conn.bit).
 
-import { Exchange, TlsExchange, Request, header, ByteStream } from "std/http"
+import { Exchange, TlsExchange, Request, header, ByteStream, parseWebSocketUrl } from "std/http"
 // RFC 8441 (#6153): the HTTP/2 side. `Conn` is this module's own class
 // (conn.bit), so std/http2's is aliased, as are its `Request`/`Stream`.
 import {
   Conn as H2Conn, Request as H2Request, HeaderField as H2HeaderField, Stream as H2StreamHandle,
 } from "std/http2"
-// `NetConn` (#6172, moved here from conn.bit — that file's own `Conn.nc` is
-// `byteStream` now): the client-side handshake reads/writes the raw socket
-// directly, before a `Conn` (this module's own) exists to wrap in
-// `ByteStream`.
-import { dial as tcpDial, Conn as NetConn } from "std/net"
+import { dial as tcpDial } from "std/net"
+import { dial as tlsDial, TlsConfig } from "std/tls"
+import { systemRoots, bundled } from "std/crypto"
 import { digest, encodeBase64, decodeBase64, Sha1 } from "std/crypto"
-import { toLower, trimSpace, split, indexOf, contains } from "std/strings"
+import { toLower, trimSpace, split, indexOf, contains, hasPrefix } from "std/strings"
 
 // RFC 6455 §1.3's fixed GUID, concatenated onto the client's key before
 // hashing. Exact by construction: this file's own accept-key test pins the
@@ -195,15 +193,19 @@ const maxHandshakeBytes = 65536
 // none). Bounded by `maxHandshakeBytes`; a peer that never completes the
 // response, or sends an implausibly large one, fails rather than growing
 // this buffer forever (Power of 10 rule 2).
-fn readHandshakeResponse(nc: NetConn): string! {
+fn readHandshakeResponse(nc: byteStream): string! {
   let buf = ""
   while (len(buf) <= maxHandshakeBytes) {
-    let chunk = nc.read(4096)
+    let chunk = nc.readUp(4096)?
     if (len(chunk) == 0) {
       fail newError("websocket: connection closed during the handshake")
     }
     buf = buf + chunk
-    if (indexOf(buf, "\r\n\r\n") >= 0) {
+    let end = indexOf(buf, "\r\n\r\n")
+    if (end >= 0) {
+      if (end + 4 > maxHandshakeBytes) {
+        fail newError("websocket: handshake response exceeds ${maxHandshakeBytes} bytes")
+      }
       return buf
     }
   }
@@ -245,38 +247,111 @@ fn leftoverAfterHeaders(raw: string): string {
   return raw[idx + 4:len(raw)]
 }
 
-// Opens a plain-TCP client connection to `host:port`, performs the client
-// handshake for `path`, and returns a `Conn` ready for
-// `sendText`/`sendBinary`/`receive`. Takes a bare host/port the same way
-// std/net's own `dial` does — no URL parsing here; a caller with a `ws://`
-// URL splits it first. TLS (`wss://`) is not supported in this version, the
-// same intentional limit std/net documents for itself.
-export fn dial(host: string, port: int, path: string, limits: Limits): Conn! {
-  let nc = tcpDial(host, port)?
+// URL options must agree before any connection opens; bare-host calls retain
+// their existing port/path positions (#6178).
+export fn dial(
+  host: string,
+  port: int = -1,
+  path: string = "",
+  limits: Limits = defaultLimits(),
+  config: Option<TlsConfig> = Option.None,
+): Conn! {
+  let (name, targetPort, resource, secure, authority) = dialTarget(host, port, path)?
+  if (!secure && isSome(config)) {
+    fail newError("websocket: TLS config requires wss")
+  }
+  let nc = dialStream(name, targetPort, secure, config)?
+  return finishDial(nc, authority, resource, limits)?
+}
+
+fn dialTarget(host: string, port: int, path: string): (string, int, string, bool, string)! {
+  let url = host
+  if (indexOf(host, "://") < 0) {
+    url = bareWebSocketUrl(host, port, path)?
+  }
+  let target = parseWebSocketUrl(url)?
+  let (_, targetPort, resource, _, _) = target
+  if (port != -1 && port != targetPort) {
+    fail newError("websocket: port conflicts with URL")
+  }
+  if (path != "" && path != resource) {
+    fail newError("websocket: path conflicts with URL")
+  }
+  return target
+}
+
+fn freshTlsConfig(config: Option<TlsConfig>): TlsConfig {
+  if (isSome(config)) {
+    let cfg = unwrap(config)
+    return TlsConfig(cfg.roots, cfg.serverName, ["http/1.1"], cfg.insecureSkipVerify, cfg.nowUnix)
+  }
+  let roots = systemRoots() catch _ {
+    bundled()
+  }
+  return TlsConfig(roots, alpn = ["http/1.1"])
+}
+
+fn dialStream(host: string, port: int, secure: bool, config: Option<TlsConfig>): byteStream! {
+  if (!secure) {
+    let c = tcpDial(host, port)?
+    return ByteStream(conn = Option.Some(c)) catch e {
+      c.close()
+      fail e
+    }
+  }
+  let c = tlsDial(host, port, freshTlsConfig(config))?
+  if (c.alpnProtocol() != "" && c.alpnProtocol() != "http/1.1") {
+    c.close()
+    fail newError("websocket: unexpected negotiated ALPN")
+  }
+  return ByteStream(tls = Option.Some(c)) catch e {
+    c.close()
+    fail e
+  }
+}
+
+fn finishDial(nc: byteStream, authority: string, path: string, limits: Limits): Conn! {
   let key = encodeBase64(randomBytes(16))
   let reqText = "GET ${path} HTTP/1.1\r\n" +
-    "Host: ${host}:${port}\r\n" +
+    "Host: ${authority}\r\n" +
     "Upgrade: websocket\r\n" +
     "Connection: Upgrade\r\n" +
     "Sec-WebSocket-Key: ${key}\r\n" +
     "Sec-WebSocket-Version: 13\r\n\r\n"
   let raw = dialHandshake(nc, reqText, key) catch e {
-    nc.close()
+    nc.shut()
     fail e
   }
   return Conn{
-    nc = ByteStream(conn = Option.Some(nc))?,
-    isServer = false,
-    limits = limits,
-    buf = leftoverAfterHeaders(raw),
-    closed = false,
-    sentClose = false,
+    nc = nc, isServer = false, limits = limits,
+    buf = leftoverAfterHeaders(raw), closed = false, sentClose = false,
   }
 }
 
-fn dialHandshake(nc: NetConn, reqText: string, key: string): string! {
-  nc.write(reqText)?
+fn dialHandshake(nc: byteStream, reqText: string, key: string): string! {
+  nc.writeStr(reqText)?
   let raw = readHandshakeResponse(nc)?
   validateHandshakeResponse(raw, key)?
   return raw
+}
+
+fn bareWebSocketUrl(host: string, port: int, path: string): string! {
+  if (indexOf(host, "/") >= 0 || indexOf(host, "?") >= 0) {
+    fail newError("websocket: bare host must not contain a resource")
+  }
+  if (port < 1 || port > 65535) {
+    fail newError("websocket: bare host requires a valid port")
+  }
+  let name = host
+  if (indexOf(name, ":") >= 0 && !hasPrefix(name, "[")) {
+    name = "[${name}]"
+  }
+  let resource = path
+  if (resource == "") {
+    resource = "/"
+  }
+  if (!hasPrefix(resource, "/")) {
+    fail newError("websocket: path must start with /")
+  }
+  return "ws://${name}:${port}${resource}"
 }

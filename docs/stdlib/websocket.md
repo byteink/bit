@@ -14,9 +14,8 @@ request line itself. Either takes ownership of the exchange's connection
 (`Exchange.hijackStream`/`TlsExchange.hijackStream`, `std/http`) and returns
 a `Conn` for framing from then on; `Exchange.respond`/`TlsExchange.respond`
 must not be called on the same exchange afterward. The client side is
-symmetric: `dial` opens a plain TCP connection and performs the client
-handshake itself, given a bare host/port/path the same way `std/net`'s own
-`dial` takes a bare host/port - no URL parsing here.
+symmetric: `dial` accepts a `ws://` or `wss://` URL, or a bare host/port/path,
+and performs the client handshake on the shared byte stream.
 
 Origin policy is the caller's decision, not this module's (RFC 6455 section 4.2.1
 makes checking it optional and application-specific): call `upgrade` only
@@ -30,8 +29,7 @@ length in a frame header is attacker controlled and, unmasked, unbounded up to
 2^63.
 
 Per-message compression (permessage-deflate, RFC 7692) is out of scope. The
-server side supports TLS (`upgradeTls`); the client side's `dial` is
-plain-TCP only - a `wss://` client dial is not supported in this version.
+client and server support TLS: use `dial("wss://host/path")` and `upgradeTls`.
 
 Outgoing messages are never fragmented by this module - every
 `sendText`/`sendBinary` call is a single, unfragmented frame, which is a fully
@@ -113,13 +111,13 @@ peer must have advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL`, with a `CONNECT`
 request carrying `:protocol websocket`. `origin` is sent as the Origin header when
 non-empty. Frames are masked, as RFC 6455 requires of a client.
 
-### `dial(host: string, port: int, path: string, limits: Limits): Conn!`
+### `dial(host: string, port: int = -1, path: string = "", limits: Limits = defaultLimits(), config: Option<TlsConfig> = Option.None): Conn!`
 
-Opens a plain-TCP client connection to `host:port`, performs the client
-handshake for `path`, and returns a `Conn` ready for
-`sendText`/`sendBinary`/`receive`. Takes a bare host/port the same way
-`std/net`'s own `dial` does - no URL parsing here; a caller with a `ws://` URL
-splits it first.
+Connect to Inkwell's notes stream with a `ws://` or `wss://` URL. The URL
+supplies the host, port and resource; omitted ports use 80 or 443 and an empty
+resource becomes `/`. IPv6 addresses use brackets. A query-only resource
+becomes `/?query`. Escaped bytes stay unchanged; raw fragments, userinfo,
+spaces and control bytes fail before any connection opens.
 
 Fails when the TCP connection cannot be opened, the handshake response is not
 `101 Switching Protocols`, or `Sec-WebSocket-Accept` does not match what
@@ -128,11 +126,37 @@ the peer ran the real handshake rather than echoing headers back.
 
 ```bit
 import { dial, defaultLimits, Conn } from "std/websocket"
+import { TlsConfig } from "std/tls"
 
-fn connect(host: string, port: int): Conn! {
-  return dial(host, port, "/chat", defaultLimits())?
+fn connectNotes(url: string): Conn! {
+  return dial(url)?
+}
+
+fn connectPrivateNotes(url: string, config: TlsConfig): Conn! {
+  return dial(url, config = Option.Some(config))?
+}
+
+fn connectLocalNotes(host: string, port: int): Conn! {
+  return dial(host, port, "/notes", defaultLimits())?
 }
 ```
+
+The existing four-argument bare-host call keeps its positions. A bare host
+requires a port and defaults an empty path to `/`. An explicit URL port or path
+argument must match the URL. Port zero fails; `-1` means omitted. A TLS config
+requires `wss://`.
+
+The function-value type of `dial` now has five parameters, including the optional
+TLS config. Update an explicitly typed four-parameter function binding; ordinary
+four-argument calls continue to work.
+
+TLS verifies the server with system roots by default, falling back to the
+bundled roots if the system store cannot be loaded. An explicit config retains
+its roots, server name, clock and verification setting. The connection offers
+only `http/1.1`; it does not change the caller's config. An unexpected negotiated
+ALPN fails, while a server that omits ALPN remains compatible. Use `dialH2` for
+an HTTP/2 tunnel. Failed handshakes close their stream; a returned `Conn` owns
+it and keeps any first frame bytes that arrived with the headers.
 
 ### `acceptKey(clientKey: string): string`
 

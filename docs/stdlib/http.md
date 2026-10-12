@@ -1136,6 +1136,28 @@ As `listenAndServe`, on a `Server` you already bound with `serve`. Use this
 when you need to know the bound port, such as a kernel-chosen one, before
 serving starts.
 
+## Parse a WebSocket endpoint
+
+### `parseWebSocketUrl(url: string): (string, int, string, bool, string)!`
+
+When an Inkwell client needs to inspect a WebSocket endpoint before it connects,
+`parseWebSocketUrl(url)` returns `(host, port, resource, secure, authority)`.
+The host is bare for dialing; the authority keeps IPv6 brackets and includes
+the port for the Host header. `ws` and `wss` are case-insensitive, default to
+ports 80 and 443, and default an empty resource to `/`. Query-only resources
+start with `/?`. Userinfo, raw fragments, control bytes, spaces and invalid
+hosts or ports fail. This parser does not change HTTP URL parsing.
+
+```bit
+import { parseWebSocketUrl } from "std/http"
+
+fn main(): ()! {
+  let (host, port, resource, secure, authority) = parseWebSocketUrl("wss://[::1]:9443/notes?draft=1")?
+  assert(host == "::1" && port == 9443 && resource == "/notes?draft=1", "notes endpoint")
+  assert(secure && authority == "[::1]:9443", "TLS authority")
+}
+```
+
 ## TLS (HTTPS) server
 
 ### `serveTls(host: string, port: int, certPem: string, keyPem: string, handler: (Request) => Response): ()!`
