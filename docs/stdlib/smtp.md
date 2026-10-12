@@ -10,6 +10,14 @@ Sending only. There is no IMAP, no POP3 and no server here.
 
 ## The session
 
+### International addresses
+
+UTF-8 mailbox addresses stay unchanged in the envelope and address headers.
+`send` requires the relay's current `SMTPUTF8` and `8BITMIME` offers before
+opening the transaction. Raw eight-bit bodies require `8BITMIME` alone.
+See [Send mail to international addresses](smtp/international-addresses.md)
+for complete examples, local refusals and signed-message behavior.
+
 A session is `dial` (or `dialTls`), `ehlo`, optionally `startTls` and an `auth`
 mechanism, then one `send` per message, then `quit`.
 
