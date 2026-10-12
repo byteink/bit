@@ -86,13 +86,6 @@ import { pdWake, pdDirRead, pdDirWrite, pdEmpty, pdEofMark } from "../../sched"
 // only used to walk the kernel's answer, so a wrong one silently reads garbage
 // as task pointers and unparks whatever it finds. Both values are asserted
 // against the running kernel by _tests_/stress/schedpolllinux.
-fn eventStride(): int {
-  if (hostTarget() == 0) {
-    return 12
-  }
-  return 16
-}
-
 fn eventDataOff(): int {
   if (hostTarget() == 0) {
     return 4
@@ -100,21 +93,9 @@ fn eventDataOff(): int {
   return 8
 }
 
-// `eventDataOff`'s answer, cached once a poll descriptor exists so
-// `pollRegister` (#5438, `@nosplit`) can read it without calling
-// `hostTarget()` — a real `bit_rt_host_target` runtime call, not (unlike
-// `syscall`, an inline trap) on the compiler's `@nosplit` allowlist, so
-// calling it from a `@nosplit` body is E0075. `eventDataOff` above stays the
-// source of truth for `pollDrainOne`, which is not `@nosplit`; this is a
-// one-word cache of its answer for the one caller that needs it nosplit-safe.
-//
-// SAFE TO CACHE, BECAUSE THE ARCHITECTURE CANNOT CHANGE MID-PROCESS: every
-// `pollFd` a caller can ever pass to `pollRegister` was handed out by
-// `pollCreate`, which fills this cache before returning it, so no nosplit
-// caller can reach `pollRegister` with a valid descriptor before the cache is
-// filled. `pollCreate` may run more than once (one poll descriptor per
-// worker); re-deriving the identical value each time is redundant, never
-// wrong.
+// The kernel architecture is immutable. Cache its data offset before publishing
+// a poll descriptor so registration and drain stay poll-free inside GC brackets.
+// The event stride is this offset plus the eight-byte data field on both targets.
 let eventDataOffCache: [1]i64
 
 @nosplit fn layoutBytes(): *u8 {
@@ -461,14 +442,13 @@ export @symbol("bit_rt_port_sched_poll_unregister") @nosplit fn pollUnregister(
 // now happens, once, at the one syscall boundary that still counts in
 // milliseconds.
 //
-// THE RUN LOOP CALLS THIS WITH `timeoutNs` 0 TODAY — a non-blocking drain,
-// which is what `runtime/sched/` passes too. That is what keeps the poller
-// compatible with stop-the-world: a worker never blocks in `epoll_pwait`, so
-// it is never sitting in a syscall where it is neither `running` nor
-// `parked` and cannot answer the collector's rendezvous. A caller wiring in
-// a genuinely blocking `timeoutNs` (the dependent ticket this one unblocks)
-// takes on that obligation — nothing here relaxes it.
-export @symbol("bit_rt_port_sched_poll_drain") fn pollDrain(schedAddr: int, timeoutNs: int): int {
+// A blocking drain runs inside the worker's GC blocking bracket. Keep the
+// entire subtree poll-free: a safepoint would restore the slot to running before
+// the kernel wait and invalidate that bracket (#7879).
+export @symbol("bit_rt_port_sched_poll_drain") @nosplit fn pollDrain(
+  schedAddr: int,
+  timeoutNs: int,
+): int {
   let s = taskAt(schedAddr)
   let pollFd = *(s + scPollFd)
   if (pollDrainSkippable(pollFd, timeoutNs)) {
@@ -570,7 +550,7 @@ let pwait2Latch: [1]i64
 
 // The `struct __kernel_timespec` `epoll_pwait2` reads: `tv_sec` then
 // `tv_nsec`, two 64-bit words on both architectures — unlike `epoll_event`
-// above, which really does differ (see `eventStride`), this one does not, so
+// above, which really does differ (see `eventDataOff`), this one does not, so
 // it is written as two plain word stores rather than through a byte cursor.
 //
 // MODULE-LEVEL AND SHARED, on exactly the argument `evBuf` above makes:
@@ -697,7 +677,7 @@ export @nosplit fn pollDisablePwait2() {
 // verbatim rather than keeping a copy each that could drift — the two differ
 // only in which descriptor and which timeout they are handed. The caller holds
 // the poll try-lock across both.
-fn pollDrainOne(s: *i64, pollFd: int, timeoutNs: int): int {
+@nosplit fn pollDrainOne(s: *i64, pollFd: int, timeoutNs: int): int {
   if (pollFd <= 0) {
     return 0
   }
@@ -715,8 +695,9 @@ fn pollDrainOne(s: *i64, pollFd: int, timeoutNs: int): int {
     let base = bytesOf()
     let i = 0
     while (i < n) {
-      let off = i * eventStride()
-      let data = readU64(base, off + eventDataOff())
+      let dataOff = eventDataOffNosplit()
+      let off = i * (dataOff + 8)
+      let data = readU64(base, off + dataOff)
       if (data == nestSentinel()) {
         // The nested write descriptor became readable (#5736): it ended the
         // wait, and `pollDrain` owes it a drain (#5884). Nothing to
