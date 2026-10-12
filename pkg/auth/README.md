@@ -167,7 +167,8 @@ protected route that is not itself doing the authenticating just reads
   challenge in the session, `finishRegistration` spends it first, then checks the
   client data, `rpIdHash`, flags, algorithm and credential id, accepts attestation
   `none` and stores the `Credential`; see
-  [Let an author sign in with a passkey](docs/passkeys.md).
+  [Let an author sign in with a passkey](docs/passkeys.md), including the
+  [complete browser page](docs/passkeys.md#the-browser-page) for registration.
 - `WebAuthnStrategy`, `PasskeyLoginOptions`, `CloneAction` - passkey login, a
   first-factor `Strategy` named `passkey`: `beginLogin(c, userId)` returns the
   request options (`allowCredentials` for a known user, an empty list for a
@@ -180,7 +181,9 @@ protected route that is not itself doing the authenticating just reads
   default), stores the new counter, regenerates the session id and binds the
   session through `bindFirstFactor`, so `PasskeyLoginOptions.second` works as on
   every other strategy; every refusal is one `unauthorized()`; see
-  [Let an author sign in with a passkey](docs/passkeys.md).
+  [Let an author sign in with a passkey](docs/passkeys.md), including the
+  [browser client](docs/passkeys.md#the-browser-page) for explicit sign-in,
+  autofill, password fallback and cancellation.
 - `OneTimeTokens`, `OneTimeStore`, `OneTimeRecord`, `OneTimeOptions`,
   `Live`, `MemoryOneTimeStore`, `InvalidToken`, `Deliver` - the one-time token behind
   password reset, email verification and magic links: 256 random bits stored
