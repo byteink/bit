@@ -12,6 +12,8 @@ import {
   netNsTimeoutOff, netNsPortOff, netNsPortStepOff, netNsAttemptsOff, netNsConfOff,
   netNsConfLenOff, netAdapterDnsStride, dnsBytes, getU64Le, netAdapterDnsServers,
   netMaxAdapterDns, netAdapterEntryScopeOff, netSa6ScopeOff,
+  netParseTxt, netTypeTxt, netTxtTransient, netTxtMalformed, netTxtTruncated,
+  netReadU16Be, netWriteU16Be,
 } from "../../net"
 
 // ---------------------------------------------------------------------------
@@ -245,4 +247,159 @@ fn nameserversFromAdapters(list: *u8, capacity: int): int {
     attempt = attempt + 1
   }
   return 0
+}
+
+// TXT scratch is rooted by netAbiLookupTxtW across allocation and deadline polls.
+const netTxtHostOff: int = 520
+const netTxtNsTextOff: int = 784
+const netTxtNsOff: int = 896
+const netTxtEntryOff: int = 960
+const netTxtReplyOff: int = 1024
+const netTxtWorkBytes: int = netTxtReplyOff + 65535 + 8
+const netTxtMaxNsText: int = 64
+const netTxtHeaderBytes: int = 16
+
+@nosplit fn netTxtReadOnce(fd: int, work: *u8, out: *u8): int {
+  let reply = work + netTxtReplyOff
+  let noneAddr: *u8 = nil
+  let noneLen: *i32 = nil
+  let got = wsaRc(int(recvfrom(i64(fd), reply, i32(netMaxDnsMsg), i32(0), noneAddr, noneLen)))
+  if (got < 0) {
+    return 0 - lastErr()
+  }
+  return netParseTxt(reply, got, netDnsId, out)
+}
+
+fn netTxtUdp(fd: int, work: *u8, qlen: int, deadline: int, out: *u8): int {
+  let salen = netEntrySockAddr(work + netTxtEntryOff, getU64Le(work + netTxtNsOff, netNsPortOff))
+  if (wsaRc(int(sendto(i64(fd), work + 2, i32(qlen), i32(0), sa6Bytes(), i32(salen)))) != qlen) {
+    return netTxtTransient
+  }
+  let schedAddr = currentSchedAddr()
+  let polls = 0
+  while (polls < netDeadlineMaxPolls) {
+    polls = polls + 1
+    let got = netTxtReadOnce(fd, work, out)
+    if (got != 0 - wsaEwouldblock()) {
+      return got
+    }
+    if (netClockNowNs() >= deadline) {
+      return netTxtTransient
+    }
+    netDeadlinePoll(schedAddr)
+  }
+  return netTxtTransient
+}
+
+fn netTxtReadFull(fd: int, buf: *u8, want: int, deadline: int): bool {
+  let got = 0
+  while (got < want) {
+    let n = netReadSockDeadline(fd, buf + got, want - got, deadline)
+    if (n <= 0) {
+      return false
+    }
+    got = got + n
+  }
+  return true
+}
+
+fn netTxtTcpAsk(fd: int, work: *u8, qn: int, deadline: int, out: *u8): int {
+  let reply = work + netTxtReplyOff
+  if (netWriteSockDeadline(fd, work, qn, deadline) != qn) {
+    return netTxtTransient
+  }
+  if (!netTxtReadFull(fd, reply, 2, deadline)) {
+    return netTxtTransient
+  }
+  let mlen = netReadU16Be(reply, 0)
+  if (mlen < 12) {
+    return netTxtMalformed
+  }
+  if (!netTxtReadFull(fd, reply, mlen, deadline)) {
+    return netTxtTransient
+  }
+  let r = netParseTxt(reply, mlen, netDnsId, out)
+  if (r == netTxtTruncated) {
+    return netTxtTransient
+  }
+  return r
+}
+
+fn netTxtTcp(work: *u8, qlen: int, deadline: int, out: *u8): int {
+  let target = []i64(4)
+  let sa = u8At(int(ptrOf(target)))
+  let entry = work + netTxtEntryOff
+  let salen = netEntrySockAddr(entry, getU64Le(work + netTxtNsOff, netNsPortOff))
+  netTxtCopy(sa, sa6Bytes(), salen)
+  let fd = netDialAddrDeadline(sa, !netEntryIsV4(entry), deadline)
+  keepAlive(target)
+  if (fd < 0) {
+    return netTxtTransient
+  }
+  let r = netTxtTcpAsk(fd, work, qlen + 2, deadline, out)
+  netClose(fd)
+  return r
+}
+
+fn netTxtServer(work: *u8, hostLen: int, out: *u8): int {
+  let ns = work + netTxtNsOff
+  let deadline = netClockNowNs() + getU64Le(ns, netNsTimeoutOff) * 1000000
+  let family = afInet6()
+  if (netEntryIsV4(work + netTxtEntryOff)) {
+    family = afInet()
+  }
+  let fd = netDnsSocket(family, getU64Le(ns, netNsTimeoutOff))
+  if (fd < 0) {
+    return netTxtTransient
+  }
+  let qlen = netBuildQuery(work + 2, netMaxDnsMsg, work + netTxtHostOff, hostLen, netDnsId)
+  if (qlen < 0) {
+    netClose(fd)
+    return netTxtTransient
+  }
+  netWriteU16Be(work + 2, qlen - 4, netTypeTxt)
+  netWriteU16Be(work, 0, qlen)
+  let r = netTxtUdp(fd, work, qlen, deadline, out)
+  netClose(fd)
+  if (r != netTxtTruncated) {
+    return r
+  }
+  return netTxtTcp(work, qlen, deadline, out)
+}
+
+@nosplit fn netTxtCopy(dst: *u8, src: *u8, size: int) {
+  let i = 0
+  while (i < size) {
+    putU8(dst, i, getU8(src, i))
+    i = i + 1
+  }
+}
+
+// Walk all servers once per attempt, retaining malformed replies if none answers.
+fn netTxtWalk(work: *u8, hostLen: int, out: *u8): int {
+  let ns = work + netTxtNsOff
+  let list = u8At(getU64Le(ns, netNsConfOff))
+  let count = getU64Le(ns, netNsConfLenOff) / netAdapterDnsStride
+  let passes = getU64Le(ns, netNsAttemptsOff)
+  let firstPort = getU64Le(ns, netNsPortOff)
+  let step = getU64Le(ns, netNsPortStepOff)
+  let failure = netTxtTransient
+  let pass = 0
+  while (pass < passes) {
+    pass = pass + 1
+    let at = 0
+    while (at < count) {
+      netTxtCopy(work + netTxtEntryOff, list + at * netAdapterDnsStride, netAdapterDnsStride)
+      putU64Le(ns, netNsPortOff, firstPort + at * step)
+      let r = netTxtServer(work, hostLen, out)
+      if (r >= 0) {
+        return r
+      }
+      if (r == netTxtMalformed) {
+        failure = r
+      }
+      at = at + 1
+    }
+  }
+  return failure
 }
