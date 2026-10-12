@@ -153,7 +153,48 @@ part and the domain, as `Zoë <zoë@bücher.example>`. The domain stays as
 written. Turning it into its ASCII form for the wire happens when a message
 is sent, not here.
 
+## Send an international address
+
+Sara signs up with an international domain. Store the spelling she supplied;
+the mailer converts only the domain when it renders an envelope, a header,
+a provider request or a calendar address:
+
+```bit
+import { Mailer, Message, Options, Outbox, parseAddress } from "mail"
+
+fn main(): ()! {
+  let who = parseAddress("Sara <sara@Bücher.example>")?
+  let box = Outbox()
+  let mailer = Mailer(box, Options{ from = "hello@example.com" })?
+  defer mailer.close()
+  let receipt = mailer.send(Message{
+    to = [who.toString()],
+    subject = "Welcome to Inkwell",
+    text = "Hello Sara.",
+  })?
+  println(who.email)
+  println(receipt.accepted[0])
+  return
+}
+```
+
+This prints `sara@Bücher.example`, then `sara@xn--bcher-kva.example`.
+The To header carries that same A-label domain. From, Cc, Bcc, Reply-To,
+mailer defaults and staging redirects use the same conversion. The caller's
+message, settings and parsed Address keep their original spelling. A domain
+that fails IDNA or an address that expands past 254 octets fails `Invalid`
+before delivery; its message names the field, domain and reason.
+
+The local part stays as supplied: `josé@example.com` needs both SMTPUTF8 and
+8BITMIME on an SMTP connection, even with an ASCII body. If either is absent,
+the send returns `Rejected` naming the address before MAIL, RCPT or DATA.
+It is a permanent refusal, so retries and fallback transports are not tried.
+An international domain alone needs neither extension after conversion.
+Resend, Postmark and SendGrid receive the UTF-8 local part and decide whether
+to accept it; Mailgun receives the rendered MIME and its envelope recipients.
+Conversion happens before signing, and SMTP and Mailgun keep those signed
+bytes unchanged.
+
 ## Where to go next
 
-The package front page is [README](../README.md). The sending API, built on
-these addresses, arrives in the next chapters of this documentation.
+Continue with [messages](messages.md) or [opening a mailer](open.md).
