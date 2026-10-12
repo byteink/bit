@@ -49,6 +49,8 @@ set -uo pipefail
 . "$(dirname -- "$0")/alarmrun.sh"
 # shellcheck source=scripts/diffexit.sh
 . "$(dirname -- "$0")/diffexit.sh"
+# shellcheck source=scripts/selfhost-ir-signatures.sh
+. "$(dirname -- "$0")/selfhost-ir-signatures.sh"
 
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
@@ -119,6 +121,7 @@ fi
 
 : >"$work/mismatch"
 : >"$work/timeout"
+: >"$work/explained"
 match=0 skip=0 nonempty=0
 
 # doc_surface_nonempty <json-file> -- true iff the ORACLE's `doc --json` array
@@ -247,6 +250,8 @@ for d in stdlib/*/ examples/*/ _tests_/imports/*/; do
 
   if cmp -s "$work/seed.plain.out" "$work/bit.plain.out" && cmp -s "$work/seed.json.out" "$work/bit.json.out"; then
     match=$((match + 1))
+  elif signature=$(explainVariadicDocMarker "$work/seed.plain.out" "$work/bit.plain.out" "$work/seed.json.out" "$work/bit.json.out" "$d"); then
+    printf '%s %s\n' "$d" "$signature" >> "$work/explained"
   else
     echo "$d" >>"$work/mismatch"
   fi
@@ -255,8 +260,18 @@ done
 
 mismatch=$(wc -l <"$work/mismatch" | tr -d ' ')
 timeouts=$(wc -l <"$work/timeout" | tr -d ' ')
-compared=$((match + mismatch))
-echo "doc differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts SKIP(not a module)=$skip ($nonempty of $compared compared module(s) have a non-empty exported surface)"
+explained=$(wc -l <"$work/explained" | tr -d ' ')
+compared=$((match + mismatch + explained))
+echo "doc differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch EXPLAINED=$explained TIMEOUT=$timeouts SKIP(not a module)=$skip ($nonempty of $compared compared module(s) have a non-empty exported surface)"
+while read -r d signature; do printf 'EXPLAINED: %s (%s)\n' "$d" "$signature"; done < "$work/explained"
+retired=0
+for signature in $(declaredSignatureNames doc); do
+  hits=$(awk -v name="$signature" '$2 == name {n++} END {print n+0}' "$work/explained")
+  if [ "$hits" -eq 0 ]; then
+    echo "RETIRED: $signature explained no module; remove it at the stage0 repin."
+    retired=$((retired + 1))
+  fi
+done
 
 # Corpus floor (#1516): comparing nothing is not agreement.
 if [ "$compared" -eq 0 ]; then
@@ -312,7 +327,7 @@ fi
 # A timeout used to set the same status=1 a real mismatch does (#3382 sibling
 # finding, same shape as #3351/#3377/#3378/#3379/#3380): diffexit restores the
 # could-not-decide (2) distinction.
-if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ]; then
+if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && [ "$retired" -eq 0 ]; then
   if [ "$surface_collapsed" -eq 1 ]; then
     # Would otherwise be the clean exit-0 "agree" path below -- refuse
     # instead of printing it. A collapsed surface is not evidence of
@@ -327,6 +342,6 @@ if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ]; then
     exit 2
   fi
   echo
-  echo "diffdoc: the two doc surfaces agree on every compared module."
+  echo "diffdoc: every compared module agrees or has a witnessed declared difference."
 fi
-diffexit "doc" -f "$mismatch" -t "module(s)=$timeouts"
+diffexit "doc" -f "$((mismatch + retired))" -t "module(s)=$timeouts"

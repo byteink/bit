@@ -18,7 +18,7 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 # Self-check: run directly (not sourced) to assert explainMismatch explains
 # only what scripts/selfhost-ir-signatures.sh declares (7745-loop-defer-stack on
 # ir/iropt, 7761-range-chain-cse on iropt, 7766-synth-json-helper-column-shift
-# on types; the retired ones are in its Retirement history), and that
+# on types; the retired ones are in dump-differential.md), and that
 # declaredSignatureNames() stays in sync with it.
 # `bash scripts/selfhost-ir-signatures-selfcheck.sh`. Same pattern as
 # scripts/selfhost-ir-canon.sh's self-check.
@@ -28,7 +28,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 
   # Every signature this check once carried a fixture for is RETIRED; the
   # list, and the repin that retired each, is in scripts/selfhost-ir-
-  # signatures.sh's Retirement history, and the fixtures are in git history at
+  # signatures registry's history in dump-differential.md, and fixtures are in git history at
   # this file's state before #6527. An unrelated divergence of any shape must
   # stay unexplained on every kind.
   oracle_unrelated='%1 = sub %2, %3'
@@ -524,6 +524,131 @@ PROBE
   expect "" "$(explainMismatch "$vt_old" "$vt_new" types "$vt_dir/missing.bit")" 'variadic missing source'
   unset ORACLE BIT2 VT_WITNESS_FAILURE VT_REAL_ORACLE
   rm -rf "${vt_dir:?}"
+
+  # #7936: real SQL module captures, with one shared same-source AST parser.
+  vd_dir=$(mktemp -d "${TMPDIR:-/tmp}/t7936-selfcheck-XXXXXX") || exit 2
+  ORACLE="${ROOT}/bit-out/stage0/bit-oracle"; BIT2="${ROOT}/bit-out/bin/bit"
+  vd_module="${ROOT}/stdlib/sql"
+  for vd_side in old new; do
+    vd_binary=$ORACLE; [ "$vd_side" = new ] && vd_binary=$BIT2
+    alarmrun "$vd_binary" doc "$vd_module" > "$vd_dir/$vd_side"; vd_rc=$?
+    expect 0 "$vd_rc" "doc variadic $vd_side plain capture"
+    alarmrun "$vd_binary" doc --json "$vd_module" > "$vd_dir/${vd_side}json"; vd_rc=$?
+    expect 0 "$vd_rc" "doc variadic $vd_side JSON capture"
+  done
+  vd_sig=7936-variadic-doc-marker
+  expect "$vd_sig" "$(explainVariadicDocMarker "$vd_dir/old" "$vd_dir/new" "$vd_dir/oldjson" "$vd_dir/newjson" "$vd_module")" 'doc variadic native SQL identity'
+  variadicDocWitness "$vd_dir" "$vd_module"; vd_rc=$?
+  expect 0 "$vd_rc" 'doc variadic accepted SQL metadata'
+  variadicMarkerParse "$vd_dir" doc; vd_rc=$?
+  expect 0 "$vd_rc" 'doc variadic shared parser positive'
+  perl - "$vd_dir" <<'PERL'
+use strict; use warnings; use File::Path qw(make_path);
+my $d = shift;
+sub readall { open my $f, '<:raw', $_[0] or die; local $/; return <$f> }
+my @files = qw(old new oldjson newjson source 0--dump-ast);
+my %base = map { $_ => readall("$d/$_") } @files;
+my @deltas = (
+  ['name','new',qr/function find<T>/,'function other<T>'],
+  ['generic','new',qr/function find<T>/,'function find<U>'],
+  ['type','new',qr/Executor, string, \.\.\.Value/,'Executor, string, ...string'],
+  ['count','new',qr/Executor, string, \.\.\.Value/,'Executor, ...Value'],
+  ['slot','new',qr/Executor, string, \.\.\.Value/,'...Executor, string, Value'],
+  ['return','new',qr/=> \[\]T!/,'=> T!'],
+  ['other','new',qr/interface Executor/,'interface Different'],
+  ['json-name','newjson',qr/"name": "find"/,'"name": "other"'],
+  ['json-generic','newjson',qr/"params": "<T>"/,'"params": "<U>"'],
+  ['json-type','newjson',qr/Executor, string, \.\.\.Value/,'Executor, string, ...string'],
+  ['json-doc','newjson',qr/"doc": "/,'"doc": "changed'],
+  ['no-rest','0--dump-ast',qr/param_rest args Value/,'param args Value'],
+  ['ast-return','0--dump-ast',qr/\(func_decl _ find \(generic_params \(generic_param T _\)\) \(params \(param db Executor\) \(param sqlText string\) \(param_rest args Value\)\) \(fallible \(slice_type T\) _\)/,'(func_decl _ find (generic_params (generic_param T _)) (params (param db Executor) (param sqlText string) (param_rest args Value)) (fallible T _)'],
+  ['ambiguous','0--dump-ast',qr/\)\s*\z/,' (func_decl _ find _ (params (param_rest args Value)) T (block)))'],
+);
+for my $delta (@deltas) {
+  my ($label,$file,$from,$to) = @$delta; my %case = %base;
+  die unless $case{$file} =~ s/$from/$to/;
+  make_path("$d/$label");
+  for my $f (@files) { open my $out, '>:raw', "$d/$label/$f" or die; print {$out} $case{$f} or die; close $out or die }
+}
+for my $label (qw(added removed order duplicate)) {
+  my %case = %base; my @rows = split /\n/, $case{new};
+  if ($label eq 'added') { push @rows, 'function extra () => i64' }
+  if ($label eq 'removed') { pop @rows }
+  if ($label eq 'order') { @rows[0,1] = @rows[1,0] }
+  if ($label eq 'duplicate') {
+    push @rows, (grep { /^function find</ } @rows)[0];
+    $case{old} .= (grep { /^function find</ } split /\n/, $case{old})[0] . "\n";
+  }
+  $case{new} = join("\n", @rows) . "\n"; make_path("$d/$label");
+  for my $f (@files) { open my $out, '>:raw', "$d/$label/$f" or die; print {$out} $case{$f} or die; close $out or die }
+}
+PERL
+  vd_rc=$?; expect 0 "$vd_rc" 'doc variadic adversarial controls are real deltas'
+  for vd_control in name generic type count slot return other json-name json-generic json-type json-doc no-rest ast-return ambiguous added removed order duplicate; do
+    variadicMarkerParse "$vd_dir/$vd_control" doc > "$vd_dir/reject" 2>&1; vd_rc=$?
+    expect no "$([ "$vd_rc" -eq 0 ] && printf yes || printf no)" "doc variadic rejects $vd_control"
+  done
+  mkdir "$vd_dir/module"
+  printf 'export fn sum(xs: int): int { return xs }\n' > "$vd_dir/module/m.bit"
+  for vd_side in old new; do
+    vd_binary=$ORACLE; [ "$vd_side" = new ] && vd_binary=$BIT2
+    alarmrun "$vd_binary" check "$vd_dir/module" > "$vd_dir/check"; vd_rc=$?
+    expect 0 "$vd_rc" "doc ordinary $vd_side accepted"
+    alarmrun "$vd_binary" doc "$vd_dir/module" > "$vd_dir/${vd_side}ordinary"
+    vd_rc=$?; expect 0 "$vd_rc" "doc ordinary $vd_side plain"
+    alarmrun "$vd_binary" doc --json "$vd_dir/module" > "$vd_dir/${vd_side}ordinaryjson"
+    vd_rc=$?; expect 0 "$vd_rc" "doc ordinary $vd_side JSON"
+  done
+  sed 's/(i64)/(...i64)/' "$vd_dir/newordinary" > "$vd_dir/forgedordinary"
+  sed 's/(i64)/(...i64)/' "$vd_dir/newordinaryjson" > "$vd_dir/forgedordinaryjson"
+  expect "" "$(explainVariadicDocMarker "$vd_dir/oldordinary" "$vd_dir/forgedordinary" "$vd_dir/oldordinaryjson" "$vd_dir/forgedordinaryjson" "$vd_dir/module")" 'doc ordinary native marker forgery'
+  printf 'export fn sum(...xs: int): int { return len(xs) }\nfn main() { let sum = (x: int) => x; let b = sum; }\n' > "$vd_dir/module/m.bit"
+  for vd_side in old new; do
+    vd_binary=$ORACLE; [ "$vd_side" = new ] && vd_binary=$BIT2
+    alarmrun "$vd_binary" check "$vd_dir/module" > "$vd_dir/check"; vd_rc=$?
+    expect 0 "$vd_rc" "doc shadow $vd_side accepted"
+    alarmrun "$vd_binary" doc "$vd_dir/module" > "$vd_dir/${vd_side}shadow"
+    vd_rc=$?; expect 0 "$vd_rc" "doc shadow $vd_side plain"
+    alarmrun "$vd_binary" doc --json "$vd_dir/module" > "$vd_dir/${vd_side}shadowjson"
+    vd_rc=$?; expect 0 "$vd_rc" "doc shadow $vd_side JSON"
+  done
+  expect "" "$(explainVariadicDocMarker "$vd_dir/oldshadow" "$vd_dir/newshadow" "$vd_dir/oldshadowjson" "$vd_dir/newshadowjson" "$vd_dir/module")" 'doc native shadow metadata declines'
+  VD_REAL_ORACLE=$ORACLE; export VD_REAL_ORACLE
+  cat > "$vd_dir/failed" <<'PROBE'
+#!/bin/sh
+case "$VD_FAILURE:$1" in
+  check:check|doc:doc) exit 1 ;;
+  json:doc) [ "${2:-}" != --json ] || exit 1 ;;
+  timeout:doc|timeout-check:check) exit 142 ;;
+  crash:check|crash-doc:doc) exit 139 ;;
+  ast:--dump-ast) printf '(program)\n'; exit 0 ;;
+  tokens:--dump-tokens) printf 'ident 0..1\n'; exit 0 ;;
+  source:doc) printf '// changed during witness\n' >> "$VD_MODULE/m.bit" ;;
+esac
+exec "$VD_REAL_ORACLE" "$@"
+PROBE
+  chmod +x "$vd_dir/failed"
+  VD_REAL_BIT2=$BIT2
+  ORACLE="$vd_dir/failed"
+  for VD_FAILURE in check doc json timeout timeout-check crash crash-doc ast tokens; do
+    export VD_FAILURE
+    expect "" "$(explainVariadicDocMarker "$vd_dir/old" "$vd_dir/new" "$vd_dir/oldjson" "$vd_dir/newjson" "$vd_module")" "doc variadic failed $VD_FAILURE witness"
+  done
+  ORACLE=$VD_REAL_ORACLE
+  VD_REAL_ORACLE=$VD_REAL_BIT2; export VD_REAL_ORACLE
+  BIT2="$vd_dir/failed"; VD_FAILURE=ast; export VD_FAILURE
+  expect "" "$(explainVariadicDocMarker "$vd_dir/old" "$vd_dir/new" "$vd_dir/oldjson" "$vd_dir/newjson" "$vd_module")" 'doc variadic current AST differs'
+  BIT2=$VD_REAL_BIT2
+  printf 'export fn sum(...xs: int): int { return len(xs) }\n' > "$vd_dir/module/m.bit"
+  expect "$vd_sig" "$(explainVariadicDocMarker "$vd_dir/oldshadow" "$vd_dir/newshadow" "$vd_dir/oldshadowjson" "$vd_dir/newshadowjson" "$vd_dir/module")" 'doc source-change control begins with a live witness'
+  VD_REAL_ORACLE=$ORACLE; VD_MODULE="$vd_dir/module"; VD_FAILURE=source
+  export VD_REAL_ORACLE VD_MODULE VD_FAILURE
+  ORACLE="$vd_dir/failed"
+  expect "" "$(explainVariadicDocMarker "$vd_dir/oldshadow" "$vd_dir/newshadow" "$vd_dir/oldshadowjson" "$vd_dir/newshadowjson" "$vd_dir/module")" 'doc module bytes changed during witness'
+  ORACLE=$VD_REAL_ORACLE
+  expect "" "$(explainVariadicDocMarker "$vd_dir/old" "$vd_dir/new" "$vd_dir/oldjson" "$vd_dir/newjson" "${ROOT}/stdlib/strings")" 'doc variadic different module source'
+  unset ORACLE BIT2 VD_REAL_ORACLE VD_REAL_BIT2 VD_FAILURE VD_MODULE
+  rm -rf "${vd_dir:?}"
 
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
