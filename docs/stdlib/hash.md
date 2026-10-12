@@ -25,6 +25,46 @@ checksum algorithm use. Slicing-by-8, software only. It is the CRC RevEng
 catalogue's CRC-64/NVME, not CRC-64/XZ or CRC-64/ECMA-182, which give
 different values.
 
+## Join independently checksummed chunks
+
+When Inkwell uploads an article in parts, each part can arrive with its own
+checksum. Combine those checksums in byte order to get the checksum of the
+whole article without reading the parts again or joining their buffers.
+
+```bit
+import { crc32, crc32c, crc64nvme, crc32Combine, crc32cCombine, crc64nvmeCombine } from "std/hash"
+
+fn main() {
+  let first = []byte("Inkwell: ")
+  let rest = []byte("a draft")
+  let whole = []byte("Inkwell: a draft")
+  let n = u64(len(rest))
+  assert(crc32Combine(crc32(first), crc32(rest), n) == crc32(whole))
+  assert(crc32cCombine(crc32c(first), crc32c(rest), n) == crc32c(whole))
+  assert(crc64nvmeCombine(crc64nvme(first), crc64nvme(rest), n) == crc64nvme(whole))
+}
+```
+
+### `crc32Combine(a: u32, b: u32, lenB: u64): u32`
+
+Returns the CRC-32 of A followed by B from their independently computed
+checksums `a` and `b`. `lenB` is B's length in **bytes**. Both checksums must
+come from `crc32`, with its normal initial value, rather than a custom seed.
+
+### `crc32cCombine(a: u32, b: u32, lenB: u64): u32`
+
+The same operation for checksums from `crc32c`.
+
+### `crc64nvmeCombine(a: u64, b: u64, lenB: u64): u64`
+
+The same operation for checksums from `crc64nvme`.
+
+All three return `a` when `lenB` is zero, regardless of `b`. They accept the
+full `u64` byte-length range and take work proportional to the number of
+bits in the length, using fixed-size temporary storage. A wrong length,
+reversed part order or mixed checksum algorithms gives the wrong checksum;
+these functions cannot verify the parts or their lengths for you.
+
 ### `crc32(data: []byte): u32`
 
 The CRC-32 of `data`, seeded fresh. Matches the published CRC-32/ISO-HDLC
