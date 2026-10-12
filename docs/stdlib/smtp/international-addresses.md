@@ -14,7 +14,7 @@ and mailbox addresses with yours, then run it against a relay that accepts
 your sender. Add authentication to the session when your relay requires it.
 
 ```bit
-import { Address, Message, dialTls } from "std/smtp"
+import { Address, Message, Options, dialTls } from "std/smtp"
 
 fn main(): ()! {
   let message = Message(Address{ name = "Inkwell", email = "notes@example.com" })
@@ -22,7 +22,7 @@ fn main(): ()! {
   message.setSubject("Your draft is ready")
   message.setText("Open Inkwell to review your draft.")
 
-  let client = dialTls("smtp.example.com", 465)?
+  let client = dialTls("smtp.example.com", 465, Options())?
   defer client.close()
   client.ehlo("inkwell.example.com")?
   client.send(message)?
