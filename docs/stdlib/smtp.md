@@ -10,6 +10,14 @@ Sending only. There is no IMAP, no POP3 and no server here.
 
 ## The session
 
+### International addresses
+
+UTF-8 mailbox addresses stay unchanged in the envelope and address headers.
+`send` requires the relay's current `SMTPUTF8` and `8BITMIME` offers before
+opening the transaction. Raw eight-bit bodies require `8BITMIME` alone.
+See [Send mail to international addresses](smtp/international-addresses.md)
+for complete examples, local refusals and signed-message behavior.
+
 A session is `dial` (or `dialTls`), `ehlo`, optionally `startTls` and an `auth`
 mechanism, then one `send` per message, then `quit`.
 
@@ -606,12 +614,15 @@ does not offer DSN`, a permanent `SmtpError` with no code: a request for
 reports is never quietly dropped. Check `Client.supports("DSN")` first to fall
 back instead. A `Raw` carries its `Dsn` in its `Envelope`.
 
-A request also puts `ORCPT=rfc822;<recipient>` on every `RCPT TO`, which names
+A request also puts `ORCPT` on every `RCPT TO`, using `rfc822` for ASCII
+recipients or `utf-8` for international recipients, which names
 the recipient as you gave it, so a report can say who it is about even after a
-server rewrote the address. Every value that goes on the wire is xtext
-(RFC 3461 section 4): a byte from 33 to 126 stands for itself except `+` and
-`=`, and any other byte is `+` and two upper-case hex digits, so `msg 42`
-becomes `msg+2042`.
+server rewrote the address. Envelope identifiers and ASCII recipient values
+use xtext: a byte from 33 to 126 stands for itself except `+` and `=`, and
+any other byte is `+` and two upper-case hex digits, so `msg 42` becomes
+`msg+2042`. International recipient values keep Unicode bytes and escape
+ASCII special characters with unitext. See
+[International addresses](smtp/international-addresses.md).
 
 A `Dsn` that contradicts itself is refused before anything is sent, with an
 error naming the field: `Never` listed with another value, a value listed
