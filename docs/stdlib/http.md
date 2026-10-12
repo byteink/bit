@@ -1138,6 +1138,8 @@ serving starts.
 
 ## Parse a WebSocket endpoint
 
+### `parseWebSocketUrl(url: string): (string, int, string, bool, string)!`
+
 When an Inkwell client needs to inspect a WebSocket endpoint before it connects,
 `parseWebSocketUrl(url)` returns `(host, port, resource, secure, authority)`.
 The host is bare for dialing; the authority keeps IPv6 brackets and includes
