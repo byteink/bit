@@ -2286,7 +2286,9 @@ array_type   = "[" const_expr "]" type .        (* [N]T  fixed, value *)
 const_expr   = expression .                     (* folded at compile time; see below *)
 map_type     = "map" "<" type "," type ">" .    (* map<K,V> reference *)
 tuple_type   = "(" type "," type { "," type } ")" .   (* at least 2 elements *)
-func_type    = "(" [ type { "," type } ] ")" "=>" result_type .
+func_type    = "(" [ func_type_params ] ")" "=>" result_type .
+func_type_params = type { "," type } | named_type_param { "," named_type_param } .
+named_type_param = IDENT ":" type .
 chan_type    = "chan" "<" type ">" .
 generic_inst = IDENT "<" type { "," type } ">" .      (* Foo<T,U> *)
 result_type  = type [ "!" [ type ] ] .          (* fallible marker, §18 *)
@@ -2297,6 +2299,12 @@ more** elements. The **void (unit) result** is normally written as an omitted
 result type; the one place it must be spelled is when it carries `!` and so
 cannot be omitted, written `()` - chiefly `()!`, "returns nothing or an error"
 (§18.2). A bare `()` is thus a valid type only in result position.
+
+Function-type parameters may all have documentation names, as in
+`(input: string, count: i64) => ()!`, or all omit names. Names do not bind
+values or change type identity. Mixed lists, defaults, rest parameters, and
+named tuple elements are rejected. Calls through function values remain
+positional (§12.8).
 
 `(a, b)` in expression position is a **tuple literal** (§12.10), constructing a
 tuple value directly - the third spelling of one representation, alongside this
@@ -4087,8 +4095,9 @@ let f = serve
 f(port = 3000)        // error: named arguments need a named callee
 ```
 
-`func_type` (§11) is `"(" [ type { "," type } ] ")" "=>" result_type` - types
-only, no parameter names - so there is nothing a name could resolve against.
+`func_type` (§11) can include documentation names. These names do not declare
+a callable signature and do not enter the canonical function type. They cannot
+bind named arguments.
 The same holds for a func-typed class field, which is a function value reached
 through its owner. A builtin (§5.3) and a type conversion (§12.9) are
 positional only for the same reason: neither declares a parameter list at all.
