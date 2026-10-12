@@ -68,8 +68,20 @@ round.
 
 ### UPDATE
 
-The above is still the whole story for `types`, and for any `ir`/`iropt`
-divergence that is a genuine gap rather than an intentional improvement. But
+A mismatching IR dump can hide a refusal by the pinned oracle: its checker
+and dump succeed even when object emission cannot lower the program. The
+shared pre-opt/post-opt driver probes only mismatches, first with `check`,
+then with bounded O0 object emission if checking succeeds. An actual exit 1,
+no emitted object, and only E0092 diagnostics attributed to that source
+qualify as `SKIP(lower/check-err)`. This reports lost oracle coverage;
+independent native and golden success must establish the current feature.
+Successful object emission leaves the difference subject to the existing
+signature or regression verdict. Missing compilers, timeout, signal, panic,
+unrelated diagnostics and incomplete probes remain non-green. The probe
+uses the same alarm bound and clears its object before each attempt (#7931).
+
+The above repin rule applies to genuine differences between programs both
+compilers can lower. But
 repin-and-wait made every future lowering IMPROVEMENT (opcode count going
 DOWN, not a coverage gap) block on a release cycle by construction -- the
 inline slice-index lowering change was the first to hit it. `ir`/`iropt` now

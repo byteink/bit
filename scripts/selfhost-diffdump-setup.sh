@@ -21,6 +21,61 @@
 # shellcheck source=scripts/diffexit.sh
 . "${ROOT}/scripts/diffexit.sh"
 
+# A successful IR dump can hide failed lowering; only this source's E0092
+# object refusal is coverage missing from the immutable oracle (#7931).
+oracle_lowering_declined() {
+  awk -v source="$2" '
+    NR == 1 { if ($0 != "bit: " source ": refusing to emit an object") bad = 1; next }
+    /^error\[E0092\]: / { if (pending) bad = 1; errors++; pending = 1; next }
+    /^note: while emitting .*\047, instantiated here$/ { if (pending || !errors) bad = 1; pending = 1; next }
+    /^[[:space:]]*--> / {
+      location = $0; sub(/^[[:space:]]*--> /, "", location)
+      if (location !~ /:[0-9]+:[0-9]+$/) bad = 1
+      sub(/:[0-9]+:[0-9]+$/, "", location)
+      if (!pending || location != source) bad = 1
+      pending = 0; next
+    }
+    /^[[:space:]]*([0-9]+[[:space:]]*)?\|/ { next }
+    /^[[:space:]]*$/ { next }
+    { bad = 1 }
+    END { exit (bad || pending || !errors) }
+  ' "$1"
+}
+
+# Prints decline, ok, or undecided; failed execution never means coverage.
+oracle_check_coverage() {
+  local rc cap=$2
+  alarmrun_retry_cap ORACLECHECK "" "$cap" "$ORACLE" check "$1"
+  rc=$?
+  case "$rc" in
+    0) if grep -q '^panic: ' "$cap"; then echo undecided; else echo ok; fi ;;
+    1) if grep -q '^panic: ' "$cap"; then echo undecided; else echo decline; fi ;;
+    *) echo undecided ;;
+  esac
+}
+
+oracle_object_coverage() {
+  local source=$1 dir=$2 rc cap object
+  cap="${dir:?}/oracle-object.cap"
+  object="${dir:?}/oracle-object.o"
+  alarmrun_retry_cap ORACLEOBJECT "$object" "$cap" "$ORACLE" build "$source" \
+    --emit-obj --no-optimize --target x86_64-linux -o "$object"
+  rc=$?
+  case "$rc" in
+    0) [ -s "$object" ] && ! grep -q '^panic: ' "$cap" && echo ok || echo undecided ;;
+    1) if [ ! -e "$object" ] && oracle_lowering_declined "$cap" "$source"; then echo decline; else echo undecided; fi ;;
+    *) echo undecided ;;
+  esac
+}
+
+oracle_ir_coverage() {
+  local source=$1 dir=$2 status
+  [ -x "$ORACLE" ] || { echo undecided; return; }
+  status=$(oracle_check_coverage "$source" "${dir:?}/oracle-check.cap")
+  [ "$status" = ok ] || { echo "$status"; return; }
+  oracle_object_coverage "$source" "$dir"
+}
+
 diffdump_setup() {
   local name=$1
   # name    | flag           | verdict label   | skip label        | verb (ir only) | kind  | timeout (env, default)

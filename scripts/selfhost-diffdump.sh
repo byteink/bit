@@ -572,13 +572,11 @@ run_ir() {
       # decimal_align_overflow.bit) and a single oracle `check` call measured
       # ~0.4s, which is ~8min added to a 300s-per-file-bound gate if run for
       # every one of ~1250 corpus files instead.
-      ccap="$work/oracle-check.cap"
-      alarmrun_retry_cap ORACLECHECK "" "$ccap" "$ORACLE" check "$f"
-      crc=$?
-      if [ "$(classify_rc "$crc" "$ccap")" = decline ]; then
-        skip=$((skip + 1))
-        continue
-      fi
+      # Object emission also exposes swallowed lowering refusals (#7931).
+      case "$(oracle_ir_coverage "$f" "$work")" in
+        decline) skip=$((skip + 1)); continue ;;
+        undecided) echo "$f${sep}oracle check/object probe produced no verdict" >>"$work/timeout"; continue ;;
+      esac
       # A raw/canon mismatch that the oracle's own check does NOT explain is
       # not automatically a regression either: check it against the
       # declared-transform-signature table first (see the block comment

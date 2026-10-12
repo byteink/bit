@@ -8,6 +8,12 @@
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 # shellcheck source=scripts/selfhost-ir-signatures.sh
 . "${ROOT}/scripts/selfhost-ir-signatures.sh"
+# shellcheck source=scripts/alarmrun.sh
+. "${ROOT}/scripts/alarmrun.sh"
+# shellcheck source=scripts/selfhost-diffdump-setup.sh
+. "${ROOT}/scripts/selfhost-diffdump-setup.sh"
+# shellcheck source=scripts/diffexit.sh
+. "${ROOT}/scripts/diffexit.sh"
 
 # Self-check: run directly (not sourced) to assert explainMismatch explains
 # only what scripts/selfhost-ir-signatures.sh declares (7745-loop-defer-stack on
@@ -43,6 +49,88 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       fail=1
     fi
   }
+
+  # #7931: the shared IR probe must distinguish unsupported lowering from
+  # absent tools, failed execution, stale objects and unrelated diagnostics.
+  probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/t7931-probe.XXXXXX") || exit 2
+  trap 'rm -rf "${probe_dir:?}"' EXIT
+  ORACLE="$probe_dir/compiler"
+  TIMEOUT=300
+  cat > "$ORACLE" <<'PROBE'
+#!/usr/bin/env bash
+source=$2
+refusal() {
+  printf 'bit: %s: refusing to emit an object\n' "$source"
+  printf 'error[E0092]: unsupported lowering\n --> %s:1:1\n  |\n1 | source\n  | ^\n' "$source"
+}
+if [ "$1" = check ]; then
+  case "$PROBE_CASE" in
+    check-decline) echo 'error[E0053]: rejected'; exit 1 ;;
+    check-panic) echo 'panic: failed'; exit 2 ;;
+    check-timeout) exit 142 ;;
+    check-signal) kill -TERM "$$" ;;
+    check-127) exit 127 ;;
+    check-warning) echo 'warning: accepted' ;;
+    check-success-panic) echo 'panic: failed'; exit 0 ;;
+  esac
+  exit 0
+fi
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -o ]; then object=$2; break; fi
+  shift
+done
+case "$PROBE_CASE" in
+  success|check-warning) printf object > "$object"; exit 0 ;;
+  object-warning) printf object > "$object"; echo 'warning: accepted'; exit 0 ;;
+  object-success-panic) printf object > "$object"; echo 'panic: failed'; exit 0 ;;
+  no-object) exit 0 ;;
+  refusal|stale) refusal; exit 1 ;;
+  notes) refusal; printf "note: while emitting 'f<i64>', instantiated here\n --> %s:2:1\n" "$source"; exit 1 ;;
+  mixed) refusal; echo 'error[E0053]: unrelated'; exit 1 ;;
+  wrong-source) source=wrong.bit; refusal; exit 1 ;;
+  wrong-location) printf 'bit: %s: refusing to emit an object\nerror[E0092]: unsupported\n --> wrong.bit:1:1\n' "$source"; exit 1 ;;
+  malformed-location) printf 'bit: %s: refusing to emit an object\nerror[E0092]: unsupported\n --> %s\n' "$source" "$source"; exit 1 ;;
+  missing-location) printf 'bit: %s: refusing to emit an object\nerror[E0092]: unsupported\n' "$source"; exit 1 ;;
+  panic) refusal; echo 'panic: failed'; exit 1 ;;
+  object-refusal) printf object > "$object"; refusal; exit 1 ;;
+  other-error) echo 'error[E0053]: unrelated'; exit 1 ;;
+  status-126) exit 126 ;;
+  status-127) exit 127 ;;
+  timeout) exit 142 ;;
+  signal) kill -TERM "$$" ;;
+esac
+PROBE
+  chmod +x "$ORACLE"
+  for row in 'success:ok' 'no-object:undecided' 'refusal:decline' 'notes:decline' \
+    'stale:decline' 'mixed:undecided' 'wrong-source:undecided' 'wrong-location:undecided' \
+    'malformed-location:undecided' 'missing-location:undecided' \
+    'panic:undecided' 'object-refusal:undecided' 'other-error:undecided' \
+    'status-126:undecided' 'status-127:undecided' 'timeout:undecided' 'signal:undecided' \
+    'check-decline:decline' 'check-panic:undecided' 'check-timeout:undecided' \
+    'check-signal:undecided' 'check-127:undecided' 'check-warning:ok' 'object-warning:ok' \
+    'check-success-panic:undecided' 'object-success-panic:undecided'; do
+    PROBE_CASE=${row%%:*}; export PROBE_CASE
+    printf stale > "$probe_dir/oracle-object.o"
+    status=$(oracle_ir_coverage "$probe_dir/input.bit" "$probe_dir")
+    expect "${row#*:}" "$status" "oracle coverage: $PROBE_CASE"
+    case "$status" in
+      ok) mismatch=1; undecided=0 ;;
+      decline) mismatch=0; undecided=0 ;;
+      *) mismatch=0; undecided=1 ;;
+    esac
+    (diffexit probe -f "$mismatch" -t "probe=$undecided") >/dev/null
+    rc=$?
+    case "${row#*:}" in
+      ok) expect 1 "$rc" 'lowerable unexplained difference stays red' ;;
+      decline) expect 0 "$rc" 'actual refusal is coverage' ;;
+      *) expect 2 "$rc" 'failed probe never passes' ;;
+    esac
+  done
+  chmod -x "$ORACLE"
+  expect undecided "$(oracle_ir_coverage input.bit "$probe_dir")" 'nonexecutable oracle'
+  ORACLE="$probe_dir/missing"
+  expect undecided "$(oracle_ir_coverage input.bit "$probe_dir")" 'missing oracle'
+  unset ORACLE PROBE_CASE
 
   # The owner signature needs native evidence, even for plausible root text.
   fnv_old='func fnvalue$trampoline$9(%0: fn(i64) i64, %1: i64) i64 {'
