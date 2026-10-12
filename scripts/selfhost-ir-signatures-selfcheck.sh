@@ -75,6 +75,11 @@ if [ "$1" = check ]; then
   esac
   exit 0
 fi
+if [ "$PROBE_CASE" = host-target ]; then
+  for arg in "$@"; do
+    case "$arg" in --target|--target=*) exit 86 ;; esac
+  done
+fi
 while [ "$#" -gt 0 ]; do
   if [ "$1" = -o ]; then object=$2; break; fi
   shift
@@ -84,7 +89,7 @@ case "$PROBE_CASE" in
   object-warning) printf object > "$object"; echo 'warning: accepted'; exit 0 ;;
   object-success-panic) printf object > "$object"; echo 'panic: failed'; exit 0 ;;
   no-object) exit 0 ;;
-  refusal|stale) refusal; exit 1 ;;
+  refusal|stale|host-target) refusal; exit 1 ;;
   notes) refusal; printf "note: while emitting 'f<i64>', instantiated here\n --> %s:2:1\n" "$source"; exit 1 ;;
   mixed) refusal; echo 'error[E0053]: unrelated'; exit 1 ;;
   wrong-source) source=wrong.bit; refusal; exit 1 ;;
@@ -101,7 +106,7 @@ case "$PROBE_CASE" in
 esac
 PROBE
   chmod +x "$ORACLE"
-  for row in 'success:ok' 'no-object:undecided' 'refusal:decline' 'notes:decline' \
+  for row in 'success:ok' 'no-object:undecided' 'refusal:decline' 'host-target:decline' 'notes:decline' \
     'stale:decline' 'mixed:undecided' 'wrong-source:undecided' 'wrong-location:undecided' \
     'malformed-location:undecided' 'missing-location:undecided' \
     'panic:undecided' 'object-refusal:undecided' 'other-error:undecided' \

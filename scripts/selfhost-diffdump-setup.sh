@@ -59,7 +59,7 @@ oracle_object_coverage() {
   cap="${dir:?}/oracle-object.cap"
   object="${dir:?}/oracle-object.o"
   alarmrun_retry_cap ORACLEOBJECT "$object" "$cap" "$ORACLE" build "$source" \
-    --emit-obj --no-optimize --target x86_64-linux -o "$object"
+    --emit-obj --no-optimize -o "$object"
   rc=$?
   case "$rc" in
     0) [ -s "$object" ] && ! grep -q '^panic: ' "$cap" && echo ok || echo undecided ;;

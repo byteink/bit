@@ -79,6 +79,9 @@ Successful object emission leaves the difference subject to the existing
 signature or regression verdict. Missing compilers, timeout, signal, panic,
 unrelated diagnostics and incomplete probes remain non-green. The probe
 uses the same alarm bound and clears its object before each attempt (#7931).
+It keeps the compiler's native default target, matching the IR dump's
+architecture and operating system; a cross-target refusal cannot establish
+missing native lowering coverage.
 
 The above repin rule applies to genuine differences between programs both
 compilers can lower. But
