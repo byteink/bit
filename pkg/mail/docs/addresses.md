@@ -167,11 +167,13 @@ fn main(): ()! {
   let box = Outbox()
   let mailer = Mailer(box, Options{ from = "hello@example.com" })?
   defer mailer.close()
-  let receipt = mailer.send(Message{
-    to = [who.toString()],
-    subject = "Welcome to Inkwell",
-    text = "Hello Sara.",
-  })?
+  let receipt = mailer.send(
+    Message{
+      to = [who.toString()],
+      subject = "Welcome to Inkwell",
+      text = "Hello Sara.",
+    },
+  )?
   println(who.email)
   println(receipt.accepted[0])
   return
