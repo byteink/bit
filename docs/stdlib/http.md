@@ -510,9 +510,15 @@ See the [full section](http/upgrades.md#servehijackabletlsbackground-ts-tlsserve
 ### `byteStream`
 
 See the [full section](http/upgrades.md#bytestream).
-### `ByteStream(conn: Option<Conn> = None, tls: Option<TlsConn> = None, h2: Option<H2Stream> = None): ByteStream!`
+### `StreamSource`
 
-See the [full section](http/upgrades.md#bytestream-conn-option-conn-none-tls-option-tlsconn-none-h2-option-h2stream-none-bytestream).
+See the [full section](http/upgrades.md#streamsource).
+
+<a id="bytestream-conn-option-conn-none-tls-option-tlsconn-none-h2-option-h2stream-none-bytestream"></a>
+
+### `ByteStream(source: StreamSource): ByteStream`
+
+See the [full section](http/upgrades.md#bytestream-source-streamsource-bytestream).
 ### `ByteStream.readUp(n: int): string!`
 
 See the [full section](http/upgrades.md#bytestream-readup-n-int-string).

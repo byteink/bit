@@ -97,20 +97,25 @@ As `serveHijackableTlsOn`, run in the background.
 ### `byteStream`
 
 The transport-agnostic read/write interface a hijacked connection speaks,
-whether it came from a plain or a TLS connection.
+whether it came from a plain connection, TLS, or an HTTP/2 tunnel.
 
-### `ByteStream(conn: Option<Conn> = None, tls: Option<TlsConn> = None, h2: Option<H2Stream> = None): ByteStream!`
+### `StreamSource`
 
-Wraps a connection you already hold as a `byteStream`, for code that has no
-`Exchange` to ask for one. `ByteStream(conn = Option.Some(c))?` takes a plain
-[`std/net`](../net.md) connection, `ByteStream(tls = Option.Some(t))?` a
-`std/tls` one, and `ByteStream(h2 = Option.Some(t))?` an accepted
-[`std/http2`](../http2.md) extended CONNECT tunnel (RFC 8441). Give exactly one:
-passing more than one, or none, fails with an error instead of picking one for you.
+Choose the connection already in hand: `Plain(Conn)`, `Tls(TlsConn)`, or
+`H2(H2Stream)` for an accepted HTTP/2 extended CONNECT tunnel.
+
+<a id="bytestream-conn-option-conn-none-tls-option-tlsconn-none-h2-option-h2stream-none-bytestream"></a>
+
+### `ByteStream(source: StreamSource): ByteStream`
+
+Wraps that one source as a `byteStream`, for code with no `Exchange` to ask.
+Construction cannot fail; missing sources, conflicting named arguments and
+incorrect variant payloads are rejected by the checker.
 
 ```bit
-import { ByteStream, byteStream } from "std/http"
+import { ByteStream, StreamSource, byteStream } from "std/http"
 import { dial } from "std/net"
+import { H2Stream } from "std/http2"
 import { TlsConn } from "std/tls"
 
 fn ping(s: byteStream): string! {
@@ -119,13 +124,19 @@ fn ping(s: byteStream): string! {
 }
 
 fn pingPlain(host: string, port: int): string! {
-  let s = ByteStream(conn = Option.Some(dial(host, port)?))?
+  let s = ByteStream(StreamSource.Plain(dial(host, port)?))
   defer s.shut()
   return ping(s)?
 }
 
 fn pingTls(c: TlsConn): string! {
-  let s = ByteStream(tls = Option.Some(c))?
+  let s = ByteStream(StreamSource.Tls(c))
+  defer s.shut()
+  return ping(s)?
+}
+
+fn pingTunnel(t: H2Stream): string! {
+  let s = ByteStream(StreamSource.H2(t))
   defer s.shut()
   return ping(s)?
 }
