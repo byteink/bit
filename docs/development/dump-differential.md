@@ -287,7 +287,7 @@ Historical registry comments, moved unchanged from the signature registry.
 # A declared signature goes dead without anyone removing it: the oracle is
 # the pinned stage0, release N-1 (docs/release/bootstrap.md), and it moves
 # every release, so a transform that landed before release N is back IN the
-# oracle by N+1 — the two compilers agree again on every site the signature
+# oracle by N+1 - the two compilers agree again on every site the signature
 # used to explain. The retirement check in scripts/selfhost-diffdump.sh's
 # run_ir() (`declaredSignatureNames` below) is what catches the next one
 # instead of leaving it to a manual audit.
@@ -311,16 +311,16 @@ Historical registry comments, moved unchanged from the signature registry.
 # `bash scripts/selfhost-diffiropt.sh` against the 0.27.0 pin (this tree at
 # d1c6a09f4, aarch64-macos, the only host this repin was built on):
 # MATCH=961 MISMATCH=0 EXPLAINED=0 on both arms, and both scripts' own
-# RETIRED lines named exactly these eight — six under `ir`, nine under
+# RETIRED lines named exactly these eight - six under `ir`, nine under
 # `iropt` (the `iropt`-only branch-fold variant makes it nine, not eight).
 # Not independently confirmed on x86_64-linux or aarch64-linux the way
 # #5509's four were; the two prior repins to 0.26.0 and 0.26.1 (dist/stage0/
 # SHA256SUMS) folded runtime/compiler fixes affecting all three targets
 # identically and neither needed a per-arch re-check, and none of these
 # eight identities keys on anything target-ISA-shaped (see WHICH HOSTS
-# above — `--dump-ir`/`--dump-ir-pre` do not vary by ISA at all). Their
+# above - `--dump-ir`/`--dump-ir-pre` do not vary by ISA at all). Their
 # per-opcode derivations are preserved in git history at this file's state
-# before #5914 — a dead identity's math is not load-bearing for anything
+# before #5914 - a dead identity's math is not load-bearing for anything
 # still declared.
 #
 # #5921-ptrof-string-type was retired by the stage0 0.28.0 repin (#5957):
@@ -331,7 +331,7 @@ Historical registry comments, moved unchanged from the signature registry.
 # repin was built on): MATCH=1412 MISMATCH=0 EXPLAINED=0, and the script's
 # own RETIRED line named exactly this one signature. `selfhost-diffir.sh`
 # and `selfhost-diffiropt.sh` both report MATCH=963 MISMATCH=0 EXPLAINED=0
-# against the same pin — no `ir`/`iropt` signature was declared going in, so
+# against the same pin - no `ir`/`iropt` signature was declared going in, so
 # neither RETIRED anything. Its opcode-free line-diff derivation (the
 # ptrofStringType/lastColonSpace functions) is preserved in git history at
 # this file's state before #5957.
