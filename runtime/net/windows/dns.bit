@@ -3,19 +3,9 @@
 // same module, so the constants, buffers and helpers there (and in
 // ./sock.bit, ./udp.bit) are in scope unchanged.
 //
-// TWO HALVES, AND ONLY ONE OF THEM IS NEW. `netDnsSocket`/`netResolveHost`
-// below are the identical shape as ../linux/udp.bit's and
-// ../darwin/dns.bit's own twins: a blocking UDP socket with a receive
-// timeout, speaking ../../net's already platform-free DNS wire codec
-// (`netBuildQuery`/`netParseAnswer`) to a nameserver passed in as a
-// parameter. NONE of that is touched or reimplemented here.
-//
-// `nameserversFromAdapters` is what is actually new (#3589's whole point):
-// Windows has no `/etc/resolv.conf` for ../linux/netabi.bit's
-// `readResolvConf` + ../../net's `netFirstNameserver` to read. The
-// equivalent is `GetAdaptersAddresses` (iphlpapi.dll) -- a linked list of
-// Windows-specific structures, not a text file, so this is genuinely new
-// provider code rather than a file-read swap.
+// DNS uses nonblocking UDP and the existing bounded Windows deadline poll
+// (#6351). Its GC-safe wait posts no overlapped DNS operation. Adapter
+// discovery retains the ordered IPv4/IPv6 nameserver list below.
 
 import {
   netDnsId, netBuildQuery, netParseAnswer, netMaxDnsMsg,
@@ -25,33 +15,11 @@ import {
 } from "../../net"
 
 // ---------------------------------------------------------------------------
-// The DNS socket and resolver (unchanged shape from ../darwin/dns.bit)
+// The DNS socket and resolver
 // ---------------------------------------------------------------------------
 
-// SOL_SOCKET/SO_RCVTIMEO (winsock2.h). WINDOWS-SPECIFIC SHAPE: `optval` is a
-// raw DWORD of MILLISECONDS here, NOT a `struct timeval` -- the BSD shape
-// ../linux and ../darwin's `class timeval`/`tvBytes` machinery builds.
-// Getting this wrong does not fail to compile or fail loudly: it reads a
-// timeval-shaped buffer's first four bytes as a millisecond count, which for
-// the caller's `timeoutMs` (a small number of milliseconds, written as
-// the timeval's SECONDS field by mistake) would silently install a timeout
-// of a few milliseconds instead of a few seconds -- so the value is written
-// with `putU32Le` directly, never through `tvBytes()`.
-@nosplit fn soRcvTimeo(): int { return 0x1006 }
-
-// WSAETIMEDOUT (winerror.h) -- what a BLOCKING socket's SO_RCVTIMEO
-// expiring actually reports on Windows. `wsaEwouldblock` (./udp.bit) is
-// the NON-blocking-socket "try again" error and does not apply to this
-// socket, which is never put into non-blocking mode; both are accepted
-// below purely as defence in depth.
-@nosplit fn wsaEtimedout(): int { return 10060 }
-
-// A BLOCKING UDP socket of address `family` (`afInet()` or `afInet6()`) with
-// SO_RCVTIMEO, matching ../darwin/dns.bit's own rationale exactly: DNS is an
-// occasional millisecond cost, so a bounded receive timeout buys a real error on
-// packet loss without putting timer-driven wakes on the poller. Blocks the
-// calling worker for up to `timeoutMs` on a lost packet.
-export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(
+// A nonblocking UDP socket. netDnsReceive owns the per-attempt deadline.
+export @symbol("bit_rt_port_net_dns_socket") fn netDnsSocket(
   family: int,
   timeoutMs: int,
 ): int {
@@ -59,16 +27,7 @@ export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(
   if (fd < 0) {
     return 0 - 1
   }
-  putU32Le(optBytes(), 0, timeoutMs)
-  if (wsaRc(
-      int(
-        setsockopt(
-          i64(fd), i32(solSocket()), i32(soRcvTimeo()),
-          optBytes(), i32(4),
-        ),
-      ),
-    ) <
-    0) {
+  if (timeoutMs <= 0 || !netSetNonBlockUdp(fd)) {
     netClose(fd)
     return 0 - 1
   }
@@ -106,16 +65,45 @@ export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(
 // one reply on `fd`. True when an answer carries an A record, written to `out`.
 // A timeout, a hard error, a malformed answer and one with no A record all leave
 // it false: the caller's next pass is the retry.
-@nosplit fn netDnsExchange(fd: int, qlen: int, salen: int, out: *u8): bool {
-  let query = dnsBytes()
-  if (wsaRc(int(sendto(i64(fd), query, i32(qlen), i32(0), sa6Bytes(), i32(salen)))) < 0) {
+fn netDnsExchange(fd: int, qlen: int, salen: int, out: *u8, timeoutMs: int): bool {
+  if (wsaRc(int(sendto(i64(fd), dnsBytes(), i32(qlen), i32(0), sa6Bytes(), i32(salen)))) != qlen) {
     return false
   }
+  return netDnsReceive(fd, timeoutMs, out)
+}
+
+// The caller roots the output. Acquire and parse worker scratch without a poll.
+@nosplit fn netDnsReadOnce(fd: int, out: *u8): int {
   let reply = dnsBytes() + netMaxDnsMsg
   let noneAddr: *u8 = nil
   let noneLen: *i32 = nil
   let got = wsaRc(int(recvfrom(i64(fd), reply, i32(netMaxDnsMsg), i32(0), noneAddr, noneLen)))
-  return got >= 0 && netParseAnswer(reply, got, netDnsId, out)
+  if (got < 0) {
+    return 0 - lastErr()
+  }
+  if (netParseAnswer(reply, got, netDnsId, out)) {
+    return 1
+  }
+  return 0
+}
+
+// No worker scratch survives the GC-safe wait. Each retry acquires it again.
+fn netDnsReceive(fd: int, timeoutMs: int, out: *u8): bool {
+  let deadline = netClockNowNs() + timeoutMs * 1000000
+  let schedAddr = currentSchedAddr()
+  let polls = 0
+  while (polls < netDeadlineMaxPolls) {
+    polls = polls + 1
+    let got = netDnsReadOnce(fd, out)
+    if (got >= 0) {
+      return got == 1
+    }
+    if (got != 0 - wsaEwouldblock() || netClockNowNs() >= deadline) {
+      return false
+    }
+    netDeadlinePoll(schedAddr)
+  }
+  return false
 }
 
 // Resolve `host` to an IPv4 address, written to `out`. A dotted quad passes
@@ -133,7 +121,7 @@ export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(
 // this function so it can be pointed at an in-process fake nameserver on an
 // ephemeral port for testing without depending on the real network
 // (`_tests_/bit/windowssmoke/windowssmoke.bit` does).
-export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(
+export @symbol("bit_rt_port_net_resolve") fn netResolveHost(
   host: *u8,
   hostLen: int,
   ns: *u8,
@@ -143,10 +131,6 @@ export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(
   if (netParseIpv4(host, hostLen, out)) {
     return true
   }
-  let qlen = netBuildQuery(dnsBytes(), netMaxDnsMsg, host, hostLen, netDnsId)
-  if (qlen < 0) {
-    return false
-  }
   let family = afInet6()
   if (netEntryIsV4(entry)) {
     family = afInet()
@@ -155,8 +139,13 @@ export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(
   if (fd < 0) {
     return false
   }
+  let qlen = netBuildQuery(dnsBytes(), netMaxDnsMsg, host, hostLen, netDnsId)
+  if (qlen < 0) {
+    netClose(fd)
+    return false
+  }
   let salen = netEntrySockAddr(entry, getU64Le(ns, netNsPortOff))
-  let ok = netDnsExchange(fd, qlen, salen, out)
+  let ok = netDnsExchange(fd, qlen, salen, out, getU64Le(ns, netNsTimeoutOff))
   netClose(fd)
   return ok
 }
