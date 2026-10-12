@@ -474,3 +474,29 @@ The failure as one line, in the module's wording: `smtp: <command> got <code>:
 <enhanced> <text>` for a reply, `smtp: <reason>` without one.
 
 Next: [prepare the message and its envelope](../smtp.md#the-envelope-and-pre-rendered-mail).
+
+## Validate an envelope before queueing it
+
+A durable sender should reject malformed recipients or notification requests
+before storing a job. `checkEnvelope` uses the same validation as `Client.send`:
+addresses, at least one recipient, and DSN combinations and identifier limits.
+It sends no bytes and changes no data. It does not test server capabilities or
+validate a rendered MIME message.
+
+```bit
+import { Dsn, Envelope, Notify, checkEnvelope } from "std/smtp"
+
+fn main(): ()! {
+  let envelope = Envelope{
+    from = "", to = ["sara@example.com"], dsn = Dsn{ notify = [Notify.Failure] },
+  }
+  checkEnvelope(envelope)?
+  println("envelope accepted")
+  return
+}
+```
+
+An empty sender is the valid null reverse-path for a bounce; it prevents a bounce
+from generating another bounce. This example prints `envelope accepted`.
+A bad address or malformed DSN fails `SmtpError` with `command = "validate"`.
+TLS and DSN support are checked later by `Client.send`, before MAIL.

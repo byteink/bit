@@ -179,3 +179,15 @@ else, a welcome, a receipt, a digest, a notification, belongs on the queue.
 
 Next: [Retries and pace](retry.md) for what inline sends do, and
 [the jobs docs](../../jobs/docs/getting-started.md) for the worker side.
+
+## Keep the request when the worker sends it
+
+When a welcome mail asks for DSN or onward TLS, its queued row retains the
+captured envelope's sender, recipients, notification kinds, return-content
+choice, envelope identifier and TLS requirement. Workers restore and validate
+that request before calling a transport; they never replace it with the
+worker's current defaults. Signed bytes and Message-ID stay exact across tries.
+Old rows without these fields request neither DSN nor REQUIRETLS.
+[The envelope example](mailer.md#keep-delivery-guarantees-on-the-envelope) sets
+the same fields for a queued mailer. A permanent capability refusal is
+dead-lettered on its first attempt and never switches to a weaker fallback.

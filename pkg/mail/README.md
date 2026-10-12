@@ -78,3 +78,8 @@ The [documentation index](docs/README.md) lists every chapter.
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
+
+For onward TLS, delivery notifications and a strictly aligned bounce sender,
+read [Keep delivery guarantees on the envelope](docs/mailer.md#keep-delivery-guarantees-on-the-envelope).
+The request survives recipient batching and durable queue restoration; an
+unsupported transport refuses it before sending.

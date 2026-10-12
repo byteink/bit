@@ -242,3 +242,14 @@ else `localhost`.
 
 The [Mailer](mailer.md) chapter has `Options` and the errors; [Messages](messages.md)
 has what a message may hold.
+
+## Refuse an insecure delivery configuration
+
+For a welcome email that must remain encrypted onward, pass
+`Options{ requireTls = true }` to `open` or directly to `Mailer`.
+A `tls=off` SMTP URL is refused before a connection; Resend, Postmark and
+SendGrid are also refused because their API cannot request that guarantee.
+Mailgun accepts it and sends its required-TLS option. Every fallback is checked
+at startup, so a chain cannot silently weaken the configured requirement.
+See [the complete envelope example](mailer.md#keep-delivery-guarantees-on-the-envelope)
+for the bounce address and per-message delivery notifications.

@@ -115,3 +115,12 @@ The package front page is [README](../README.md). Addresses are in
 [Addresses](addresses.md); the mailer that sends a `Message` is in
 [The Mailer](mailer.md); files and inline images are in
 [Attachments](attachments.md).
+
+## Ask for a delivery notification
+
+The welcome mail can ask the SMTP relay to return a failure report. Set
+`Message.dsn` to std/smtp's `Dsn`, with `Notify.Failure` and optionally
+`Ret.Headers` and an `envid` identifying the mail; there is no mail-package alias.
+[The envelope example](mailer.md#keep-delivery-guarantees-on-the-envelope) sends
+that request. Its default, `Dsn{}`, requests no parameter. Invalid notification
+combinations fail before a send or enqueue; unsupported providers fail `Invalid`.

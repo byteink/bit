@@ -786,3 +786,7 @@ See [the connection guide](smtp/connecting.md#smtperrortransient-bool).
 ### `SmtpError.message`
 
 See [the connection guide](smtp/connecting.md#smtperrormessage-string).
+
+### `checkEnvelope`
+
+See [envelope validation](smtp/connecting.md#validate-an-envelope-before-queueing-it).
