@@ -293,7 +293,34 @@ failure. Fails if `oldPath` does not exist.
 
 ### `readDir(path: string): []string!`
 
-The names directly inside `path`, without `.` or `..`, in no guaranteed order.
+The sorted names directly inside `path`, without `.` or `..`.
+
+### `readDirBounded(path: string, maxBytes: int): []string!`
+
+When a directory can grow, bound its listing before allocating all its names.
+Import this function from `std/fs/secure`. The limit counts UTF-8 name bytes
+plus one NUL separator per name. It returns every name, sorted, or an error;
+an oversized directory never returns a partial listing. The path itself can
+follow links, as with `readDir`; this function does not promise containment.
+
+```bit
+import { readDirBounded } from "std/fs/secure"
+
+fn main() {
+  let names = readDirBounded(".", 1048576) catch e {
+    eprint("${e.message()}\n")
+    return
+  }
+  for name of names {
+    println(name)
+  }
+}
+```
+
+The byte limit must be between 1 and 4294967296 (4 GiB), inclusive. This follows
+the runtime's preallocation sanity bound and is checked before allocating.
+Invalid paths, enumeration failures, and close failures
+also return errors. The directory handle is closed on overflow.
 
 ### `syncDir(path: string): ()!`
 

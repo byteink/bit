@@ -3931,6 +3931,16 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   filename cannot contain (a newline can). `.` and `..` are omitted. An empty
   result means either an empty directory or an unreadable one; `std/fs` calls
   `is_dir` first to tell them apart.
+- `fs_list_dir_bounded_w(words, n, out, cap)` lists into a caller-owned
+  packed-byte buffer in one pass. The path uses the existing `_w` convention.
+  It returns the complete NUL-separated byte count, `-1` for invalid inputs,
+  enumeration or close failures, and `-2` when the next name exceeds `cap`.
+  A partial buffer is never a successful result. `cap` must be positive and
+  at most `9223372036854775804`, so the `cap + 3` iteration bound cannot overflow.
+  Each non-dot entry consumes at least two bytes. Linux uses the existing
+  fixed-size getdents buffer; Darwin and Windows inspect one entry at a time.
+  Every outcome closes the directory handle. `std/fs/secure` owns the wrapper,
+  keeping this new extern outside the pinned compiler's bootstrap import graph.
 - `exists` opens `path` rather than probing directory-ness — Darwin via
   `access(F_OK)`, Linux via an `open` immediately closed again on success — so
   a mode-000 file, or a directory hit by an fd-exhausted process, still
