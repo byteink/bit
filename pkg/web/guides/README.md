@@ -20,6 +20,18 @@ The finished app, including its integration tests against real PostgreSQL,
 lives at [`guides/inkwell/`](inkwell/) in this package's source - read it
 whenever you want to see where a chapter's trimmed example is headed.
 
+## Run the finished app
+
+Set `DATABASE_URL` to your PostgreSQL database and `APP_SECRET` to the
+session-cookie secret. Access tokens use a separate `JWT_SECRET` of at least
+32 bytes, plus required `JWT_ISSUER` and `JWT_AUDIENCE` values. Choose an issuer
+that identifies your deployment and an audience that identifies this API.
+Missing token settings or a short signing key stop startup.
+
+The finished app uses [`pkg/auth` bearer tokens](../../auth/docs/bearer-tokens.md)
+for login and refresh. Older access tokens without the required issuer,
+audience and access-token header are rejected; sign in again to get a new one.
+
 ## Chapters
 
 14. [First endpoint](01-first-endpoint.md)
