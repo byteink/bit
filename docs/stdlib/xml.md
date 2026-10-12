@@ -483,12 +483,13 @@ The rules, in the order a verifier trips over them:
 - Processing instructions are kept (`<?pi data?>`). Comments are dropped,
   unless `withComments` is set.
 
-Two things in a signature profile change the result, and both are options.
+Three things in a signature profile change the result, and all are options.
 `C14nOptions.withComments` is the `#WithComments` variant of the algorithm.
 `C14nOptions.inclusivePrefixes` is the `PrefixList` of the `InclusiveNamespaces`
 element: namespaces your signature profile wants written whether or not they
 are used, because a value inside the document (a QName in text, an XPath in an
-attribute) depends on them.
+attribute) depends on them. `wholeDocument` includes leading and trailing PIs
+and, with `withComments`, comments around the document root.
 
 ```bit
 import { parse, C14nOptions, canonicalizeExclusive } from "std/xml"
@@ -498,6 +499,7 @@ fn withPayloadPrefixes(doc: []byte): string! {
   let opts = C14nOptions{
     inclusivePrefixes = ["xs", "#default"],
     withComments = true,
+    wholeDocument = true,
   }
   return string(canonicalizeExclusive(root, opts)?)
 }
@@ -508,10 +510,9 @@ element is skipped there, and a name that cannot be a prefix is an error.
 
 ### Sharp edges
 
-- Only the element is written. A comment or processing instruction before or
-  after the root of the document is not inside any element, and `parse` drops
-  it, so a signature profile that covers the whole document (an enveloped
-  signature over `""`) has to be handled with the element in hand.
+- By default only the element is written. `wholeDocument = true` requires the
+  document root and keeps its leading/trailing PIs and optional comments, with
+  LF after each leading node and before each trailing node. A child is refused.
 - A relative namespace URI (`xmlns:a="../x"`) fails: Canonical XML 1.0 requires
   an implementation to refuse it, because its meaning would depend on a base
   URI the canonical form does not carry.
@@ -750,15 +751,17 @@ no namespace.
 `canonicalizeExclusive(root: Element, opts: C14nOptions = C14nOptions{}):
 []byte!` is `root` and its content in Exclusive XML Canonicalization 1.0 form,
 as UTF-8. Fails for a relative namespace URI in the subtree and for an
-`inclusivePrefixes` entry that is not `#default` or a prefix. Never panics on
-an `Element` that `parse` returned.
+`inclusivePrefixes` entry that is not `#default` or a prefix, or `wholeDocument`
+on a child. Never panics on an `Element` that `parse` returned.
 
 ### `C14nOptions`
 
-`C14nOptions{ inclusivePrefixes, withComments }`: `inclusivePrefixes` is a
+`C14nOptions{ inclusivePrefixes, withComments, wholeDocument }`:
+`inclusivePrefixes` is a
 `[]string` of prefixes (`#default` for the default namespace) whose declarations
 in scope are written on every element; empty by default. `withComments` is a
-`bool`, false by default, that keeps comments.
+`bool`, false by default, that keeps comments. `wholeDocument` is a `bool`, false
+by default, that includes the root's leading/trailing misc with LF separators.
 
 ### `verifySignature`
 
