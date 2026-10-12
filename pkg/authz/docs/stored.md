@@ -63,6 +63,51 @@ definition to receive a stored policy.
 The next answers, for the same Mira, are `false` for an article of another team
 and `false` for one that is still a draft: the document says both.
 
+## Save a condition built in code
+
+Inkwell can let an editor build the same condition with CEL before saving it.
+`condToJson` turns that resource-valid `Cond` into the JSON value a statement's
+`when` field stores; `condFromJson` reads it back against the same resource.
+
+```bit
+import { Authz, condFromCel, condFromJson, condToJson } from "authz"
+import { Tabled } from "orm"
+import { jsonEncode } from "std/json"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+  team: string
+  status: string
+}
+
+fn main(): ()! {
+  let authz = Authz<Action>()?
+  authz.resource<Article>()?
+  let article = unwrap(authz.resourceByName("Article"))
+  let condition = condFromCel(article, "resource.team == user.team && resource.status == 'review'")?
+  let stored = condToJson(condition)?
+  println(jsonEncode(stored))
+  let _ = condFromJson(article, stored)?
+}
+```
+
+This prints `{"status":"review","team":"$user.team"}`. Distinct field names
+are merged and sorted, so the same condition produces stable JSON bytes.
+Repeated fields stay in `$and`; `$or` and `$not` keep their child order.
+A literal string starting with `$` gets one extra `$`, while a user placeholder
+keeps its `$user.` prefix. Null predicates keep their `null` form. Relationship
+targets come from the resource metadata when the document is read back.
+
+The input must already fit its resource, as a condition parsed from CEL does.
+`condToJson` has no resource argument and cannot validate column names or the
+relationship target. It refuses `Known`, code-bearing `Custom`, byte literals,
+literal `Value.Null`, non-finite floats and malformed operands with
+`InvalidPolicy`. The tree is limited to 16 levels and 256 nodes; the emitted
+JSON also stays within the decoder's 256-node budget.
+
 ## What save refuses
 
 `savePolicy` and `attach` are meant to sit behind an admin endpoint, so their
