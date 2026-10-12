@@ -1,0 +1,232 @@
+// #7961: declaration-owned names through native doc and JSON-RPC hover.
+import { env, envOr, exit } from "std/os"
+import { writeFile, readFile, mkdir } from "std/fs"
+import { indexOf, indexOfFrom, parseInt, contains, trimSpace } from "std/strings"
+import { jsonParse, jsonAsInt, jsonGet } from "std/json"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { frame, jsonEscape, runLsp, teardown, timeoutMs } from "../lspresolvehelpers"
+
+class Harness { bin: string, root: string, failures: int }
+class Hover { anchor: string, offset: int, text: string }
+
+fn quote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) {
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn fixtureWrite(path: string, text: string) {
+  writeFile(path, text) catch e {
+    panic(e.message())
+  }
+}
+
+fn fixtureRead(path: string): string {
+  return readFile(path) catch e {
+    panic(e.message())
+  }
+}
+
+fn expect(h: Harness, name: string, ok: bool, detail: string) {
+  if (ok) {
+    return
+  }
+  h.failures = h.failures + 1
+  eprint("fntypepresentation: ${name}\n${detail}\n")
+}
+
+fn command(h: Harness, args: string): (int, string) {
+  let sh = h.root + "/run.sh"
+  fixtureWrite(sh, "#!/bin/sh\nexec ${quote(h.bin)} ${args} > ${quote(h.root + "/out")} 2>&1\n")
+  assert(fsChmod(sh, 448) == 0)
+  let code = osRunBounded(sh, timeoutMs())
+  return code, fixtureRead(h.root + "/out")
+}
+
+fn library(): string {
+  return "export type First = (input: i64) => i64\n" +
+    "export type Second = (value: i64) => i64\n" +
+    "export type Nested = (callback: (nested: i64) => i64) => i64\n" +
+    "export type Plain = (i64) => i64\n" +
+    "export class Box { export inline: (field: i64) => i64, export alias: First }\n" +
+    "export fn use(f: (param: i64) => i64): i64 { return f(41) }\n" +
+    "export fn legacy(f: (i64) => i64): i64 { return f(41) }\n"
+}
+
+fn program(): string {
+  return "import { First as Renamed, Second, Box, use } from \"./lib\"\n" +
+    "type Local = (own: i64) => i64\n" +
+    "fn id(x: i64): i64 { return x + 1 }\n" +
+    "fn main() {\n" +
+    "  let first: Local = id\n" +
+    "  let second: (other: i64) => i64 = first\n" +
+    "  let imported: Renamed = second\n" +
+    "  let equivalent: Second = imported\n" +
+    "  let plain: (i64) => i64 = equivalent\n" +
+    "  let box = Box{ inline = id, alias = plain }\n" +
+    "  assert(box.inline(41) == 42)\n" +
+    "  assert(box.alias(41) == 42)\n" +
+    "  assert(use(imported) == 42)\n" +
+    "  { let Renamed: (shadow: i64) => i64 = id\n" +
+    "  assert(Renamed(41) == 42) }\n" +
+    "}\n"
+}
+
+fn checkDocs(h: Harness, expected: string) {
+  let (code, plain) = command(h, "doc --fields ${quote(h.root + "/lib")}")
+  expect(h, "doc exit", code == 0, plain)
+  for text of [
+    expected, "Second = (value: i64) => i64", "Nested = (callback: (nested: i64) => i64) => i64",
+    "field Box.inline (field: i64) => i64", "field Box.alias (input: i64) => i64", "function use ((param: i64) => i64) => i64",
+    "function legacy ((i64) => i64) => i64", "type Plain",
+  ] {
+    expect(h, "doc " + text, contains(plain, text), plain)
+  }
+  let (jsonCode, text) = command(h, "doc --json --fields ${quote(h.root + "/lib")}")
+  expect(h, "JSON doc exit", jsonCode == 0, text)
+  jsonParse(text) catch e {
+    panic(e.message())
+  }
+  expect(h, "JSON doc labels", contains(text, jsonEscape(expected)), text)
+}
+
+fn hoverControls(): []Hover {
+  return [
+    Hover{ anchor = "let first", offset = 4, text = "let first: (own: i64) => i64" },
+    Hover{ anchor = "let second", offset = 4, text = "let second: (other: i64) => i64" },
+    Hover{ anchor = "let imported", offset = 4, text = "let imported: (input: i64) => i64" },
+    Hover{ anchor = "let equivalent", offset = 4, text = "let equivalent: (value: i64) => i64" },
+    Hover{ anchor = "let plain", offset = 4, text = "let plain: (i64) => i64" },
+    Hover{ anchor = "box.inline", offset = 4, text = "inline: (field: i64) => i64" },
+    Hover{ anchor = "box.alias", offset = 4, text = "alias: (input: i64) => i64" },
+    Hover{ anchor = "let Renamed", offset = 4, text = "let Renamed: (shadow: i64) => i64" },
+    Hover{
+      anchor = "use(imported)",
+      offset = 0,
+      text = "import use: ((param: i64) => i64) => i64",
+    },
+  ]
+}
+
+fn position(source: string, anchor: string, offset: int): (int, int) {
+  let target = int(indexOf(source, anchor)) + offset
+  assert(target >= offset)
+  let line = 0
+  let column = 0
+  let i = 0
+  while (i < target) {
+    if (source[i] == 10) {
+      line = line + 1
+      column = 0
+    } else {
+      column = column + 1
+    }
+    i = i + 1
+  }
+  return line, column
+}
+
+fn hoverPayload(path: string, source: string, controls: []Hover): string {
+  let uri = "file://" + path
+  let out = frame("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}") +
+    frame("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}") +
+    frame("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"bit\",\"version\":1,\"text\":\"${jsonEscape(source)}\"}}}")
+  let i = 0
+  while (i < len(controls)) {
+    let (line, col) = position(source, controls[i].anchor, controls[i].offset)
+    out = out +
+      frame("{\"jsonrpc\":\"2.0\",\"id\":${i + 10},\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":${line},\"character\":${col}}}}")
+    i = i + 1
+  }
+  return out +
+    frame("{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"shutdown\",\"params\":null}") +
+    frame("{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}")
+}
+
+fn response(out: string, wanted: int): string {
+  let cursor = 0
+  while (cursor < len(out)) {
+    let end = int(indexOfFrom(out, "\r\n\r\n", cursor))
+    assert(end >= cursor)
+    let size = parseInt(out[cursor + 16:end]) catch e {
+      panic(e.message())
+    }
+    let start = end + 4
+    assert(size > 0 && start + size <= len(out))
+    let body = out[start:start + size]
+    let doc = jsonParse(body) catch e {
+      panic(e.message())
+    }
+    let id = jsonGet(doc, "id")
+    if (isSome(id)) {
+      let value = jsonAsInt(unwrap(id))
+      if (isSome(value) && unwrap(value) == wanted) {
+        return body
+      }
+    }
+    cursor = start + int(size)
+  }
+  return ""
+}
+
+fn checkHover(h: Harness, path: string, source: string, controls: []Hover, suffix: string) {
+  let payload = hoverPayload(path, source, controls)
+  let (code, out, ok) = runLsp(h.bin, h.root + "/lsp-" + suffix, h.root, payload)
+  expect(h, "LSP shutdown", ok && code == 0, out)
+  let i = 0
+  while (i < len(controls)) {
+    let body = response(out, i + 10)
+    expect(h, "hover " + controls[i].anchor, contains(body, jsonEscape(controls[i].text)), body)
+    i = i + 1
+  }
+}
+
+fn main() {
+  let repo = env("BIT_REPO")
+  let bin = env("BIT_BIN")
+  assert(repo != "" && bin != "")
+  let root = envOr("TMPDIR", "/tmp") + "/t7961-" + uuidFormat(uuidV4())
+  mkdir(root) catch e {
+    panic(e.message())
+  }
+  mkdir(root + "/lib") catch e {
+    panic(e.message())
+  }
+  let h = Harness{ bin = bin, root = root }
+  let source = program()
+  fixtureWrite(root + "/lib/api.bit", library())
+  fixtureWrite(root + "/main.bit", source)
+  let (code, out) = command(h, "run ${quote(root + "/main.bit")}")
+  expect(h, "bidirectional assignment runtime", code == 0, out)
+  checkDocs(h, trimSpace(fixtureRead(repo + "/_tests_/bit/fntypepresentation/labels.expected")))
+  checkHover(h, root + "/main.bit", source, hoverControls(), "main")
+  checkHover(
+    h,
+    root + "/lib/api.bit",
+    library(),
+    [
+      Hover{ anchor = "First =", offset = 0, text = "type First: (input: i64) => i64" },
+      Hover{ anchor = "Second =", offset = 0, text = "type Second: (value: i64) => i64" },
+      Hover{
+        anchor = "Nested =",
+        offset = 0,
+        text = "type Nested: (callback: (nested: i64) => i64) => i64",
+      },
+      Hover{ anchor = "return f(41)", offset = 7, text = "param f: (param: i64) => i64" },
+    ],
+    "lib",
+  )
+  teardown(root, timeoutMs())
+  if (h.failures != 0) {
+    exit(1)
+  }
+  println("fntypepresentation: runtime, plain/JSON docs, 13 bound-symbol hover controls: OK")
+}
