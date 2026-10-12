@@ -248,7 +248,6 @@ import {
 } from "std/sql"
 import { Timestamp } from "std/time"
 import { UUID } from "std/uuid"
-import { Json } from "std/json"
 
 @json class DraftMeta {
   editor: string,

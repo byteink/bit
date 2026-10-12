@@ -11,7 +11,6 @@ in-memory queue silently loses every pending job on deploy.
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
 import { SqlStore, migrate, open, Options } from "jobs"
-import { Json } from "std/json"
 
 @job("send-welcome") @json class SendWelcome {
   userId: i64,

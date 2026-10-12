@@ -37,7 +37,6 @@ ships it as one function:
 
 ```bit
 import { hashPassword } from "auth"
-import { Json } from "std/json"
 
 fn onRegister(password: string): string {
   return hashPassword(password)

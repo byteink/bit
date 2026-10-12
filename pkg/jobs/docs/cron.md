@@ -23,7 +23,6 @@ Both go on the same `Queue` as `register`, before `run`:
 import { pool, Pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
 import { SqlStore, migrate, open, Options, Missed, Queue } from "jobs"
-import { Json } from "std/json"
 import { Minute } from "std/time"
 
 @job("nightly-digest") @json class NightlyDigest {

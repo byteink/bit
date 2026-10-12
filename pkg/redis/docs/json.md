@@ -16,7 +16,6 @@ not work on a string.
 
 ```bit
 import { open } from "redis"
-import { Json, JsonEntry } from "std/json"
 
 @json class Author {
   name: string,
@@ -69,8 +68,8 @@ fn main(): ()! {
 `set(value)` takes any class marked `@json`, and `get<T>()` reads the whole
 document back into a `T`, which must be a `@json` class: nested classes,
 arrays of classes, `Option` fields, enums and floats come back as `std/json`
-defines them. The `@json` mark needs `Json` and `JsonEntry` imported from
-`std/json`; the compiler says so (`E0142`) when they are missing.
+defines them. The compiler builds the JSON methods for an `@json` class
+automatically; import from `std/json` when your code names its types or functions.
 
 `get<T>()` is `None` when the key does not exist. A document that does not
 fit `T` fails `RedisError.Unexpected`, and the message carries the decoder's
@@ -103,7 +102,7 @@ the trees, a `JsonMatch` per path in the order you asked, each with its
 
 ```bit
 import { open } from "redis"
-import { Json, JsonEntry, jsonEncode } from "std/json"
+import { jsonEncode } from "std/json"
 
 @json class Section {
   heading: string,
@@ -157,7 +156,7 @@ the rest are `JsonTarget`s.
 
 ```bit
 import { open, JsonSetOptions, JsonTarget } from "redis"
-import { Json, JsonEntry, jsonParse } from "std/json"
+import { Json, jsonParse } from "std/json"
 
 @json class Author {
   name: string,
@@ -242,7 +241,7 @@ start, stop)` keeps only that range.
 
 ```bit
 import { open } from "redis"
-import { Json, JsonEntry } from "std/json"
+import { Json } from "std/json"
 
 @json class Section {
   heading: string,
@@ -323,7 +322,6 @@ twenty articles in one call.
 
 ```bit
 import { open } from "redis"
-import { Json, JsonEntry } from "std/json"
 
 @json class Author {
   name: string,

@@ -36,7 +36,6 @@ itself returns.
 
 ```bit
 import { Ctx, Res } from "web"
-import { Json } from "std/json"
 
 fn showUser(c: Ctx): Res! {
   let id = c.param("id")
