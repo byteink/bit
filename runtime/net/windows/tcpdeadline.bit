@@ -14,6 +14,7 @@
 // ---------------------------------------------------------------------------
 import { schedPollerArm, schedPollerDisarm, schedPollerHandoff } from "../../sched"
 import { gcBlockingBegin, gcBlockingEnd } from "../../gc"
+import { pollOpCompleted } from "../../sched/windows"
 
 extern fn Sleep(milliseconds: i32)
 extern fn bit_rt_port_sched_poll_drain(schedAddr: int, timeoutMs: int): int
@@ -33,9 +34,8 @@ extern fn bit_rt_port_sched_poll_drain(schedAddr: int, timeoutMs: int): int
 // the three entry points below never call `schedParkArm`/`schedPark` at all,
 // so they never enter that arm/park state machine and there is nothing to
 // race. Each drives the poller through `netDeadlinePoll` in a bounded loop,
-// reading completion straight off the claimed slot's own OVERLAPPED
-// (`Internal`, the same field the documented `HasOverlappedIoCompleted`
-// macro checks) instead of waiting to be woken — a completion racing this
+// reading the claimed slot's IOCP publication marker instead of waiting to
+// be woken — a completion racing this
 // loop is simply observed on the next iteration, never lost, because nothing
 // here depends on a one-shot wake edge. Once the deadline elapses with the
 // op still pending, `CancelIoEx` cancels exactly that OVERLAPPED, and the
@@ -63,21 +63,9 @@ fn netClockNowNs(): int {
   return parkMonoNs(ptrOf(scratch))
 }
 
-// STATUS_PENDING (ntstatus.h) — the value Windows writes into an OVERLAPPED's
-// `Internal` field the moment an async op is accepted, and the only value
-// the documented `HasOverlappedIoCompleted` macro treats as "still
-// outstanding" (`((DWORD)(lpOverlapped)->Internal) != STATUS_PENDING`).
-// `pollClaimOp` zeroes the slot's OVERLAPPED before the real Win32 call is
-// issued; the OS overwrites word 0 with this sentinel as part of accepting
-// the op, before ever returning `WSA_IO_PENDING` to the caller.
-const winStatusPending: int = 0x103
-
-// True while `slot`'s op is still outstanding — read directly off its own
-// OVERLAPPED rather than through `pollOpStatus`, which is meaningless until
-// the op is known complete (a genuine `STATUS_SUCCESS` completion and "not
-// completed yet" both read as `0` there).
+// IOCP must publish results before a deadline reader releases its slot (#8002).
 fn opPending(slot: int): bool {
-  return *i64PtrAt(int(pollOpOverlapped(slot))) == i64(winStatusPending)
+  return !pollOpCompleted(slot)
 }
 
 // The scheduler-struct address `pollDrain` expects — the same raw address
@@ -205,17 +193,10 @@ fn awaitSlotDeadline(slot: int, sock: int, deadlineNs: int): int {
   return awaitTimedOutUnsafe
 }
 
-// Issue ConnectEx and wait, bounded by `deadline` — the deadline twin of
-// `dialConnect` above, sharing its exact shape except step 4. Derives
-// `pollFd`/`taskAddr` itself (E0202: a 6th param over the limit) rather than
-// taking them from the caller, which already re-derives them once anyway
-// for its own precondition check — cheap and idempotent, same as
-// `netReadSockDeadline` already does inline.
-fn dialConnectDeadline(fd: int, host: *u8, hostLen: int, port: int, deadline: int): int {
+// TXT adapter addresses retain their IPv6 scope instead of a text round trip.
+fn dialConnectAddrDeadline(fd: int, target: *u8, salen: int, deadline: int): int {
   let pollFd = currentPollFd()
   let taskAddr = currentTaskAddr()
-  let target = []i64(4)
-  let salen = netHostAddr(host, hostLen, port, bytesAtI64(ptrOf(target)))
   let sentBytes = []i64(1)
   let args = []i64(3)
 
@@ -229,7 +210,7 @@ fn dialConnectDeadline(fd: int, host: *u8, hostLen: int, port: int, deadline: in
   let rc = connectExCall(
     int(connectExPtr),
     fd,
-    int(bytesAtI64(ptrOf(target))),
+    int(target),
     salen,
     int(ptrOf(args)),
   )
@@ -268,21 +249,36 @@ export @symbol("bit_rt_port_net_dial_tcp_deadline") fn netDialTcpDeadline(
   if (netHostAddr(host, hostLen, port, bytesAtI64(ptrOf(sa))) == 0) {
     return 0 - 1
   }
+  let r = netDialAddrDeadline(bytesAtI64(ptrOf(sa)), netHostIsV6(host, hostLen), deadline)
+  keepAlive(sa)
+  return r
+}
+
+fn netDialAddrDeadline(sa: *u8, v6: bool, deadline: int): int {
+  if (netClockNowNs() >= deadline) {
+    return netDeadlineTimedOut
+  }
   let pollFd = currentPollFd()
   let taskAddr = currentTaskAddr()
   if (pollFd == 0 || taskAddr == 0) {
     return 0 - 2
   }
-  let fd = netSysSocketFamily(netHostFamily(host, hostLen), false)
+  let family = afInet()
+  let salen = saLen
+  if (v6) {
+    family = afInet6()
+    salen = sa6Len
+  }
+  let fd = netSysSocketFamily(family, false)
   if (fd < 0) {
     return 0 - (6000 + lastErr())
   }
-  let prepRc = dialPrep(fd, netHostIsV6(host, hostLen))
+  let prepRc = dialPrep(fd, v6)
   if (prepRc != 0) {
     netClose(fd)
     return prepRc
   }
-  let connectRc = dialConnectDeadline(fd, host, hostLen, port, deadline)
+  let connectRc = dialConnectAddrDeadline(fd, sa, salen, deadline)
   if (connectRc != 0) {
     netClose(fd)
     return connectRc
@@ -342,7 +338,7 @@ export @symbol("bit_rt_port_net_read_sock_deadline") fn netReadSockDeadline(
 
 // One WSASend op bounded by `deadline` — the deadline twin of `writeOnce`
 // above, sharing its exact shape except step 4. Derives `pollFd`/`taskAddr`
-// itself, same reason as `dialConnectDeadline`'s own header note (E0202).
+// itself, keeping the call within the parameter ceiling (E0202).
 fn writeOnceDeadline(fd: int, buf: *u8, want: int, deadline: int): int {
   let pollFd = currentPollFd()
   let taskAddr = currentTaskAddr()

@@ -2563,6 +2563,16 @@ initial stack pointer (the standard libc-free `_start` shape, matching
 glibc/musl `crt1`) and calls `rtStartMain(sp: usize)`, which extracts `envp`,
 calls `boot`, and exits the process with `boot`'s returned code.
 
+**Work discovery (#8004).** Each worker probes the global queue before local
+work every 64 find-work calls. Other calls take the local ring, the worker's
+next-run slot, the global queue, then a bounded pass stealing from peers. This
+keeps globally woken tasks eligible while local work stays runnable, with the
+ring still preceding the next-run slot on ordinary turns. The owner-only probe
+counter ranges from 0 through 63 and is initialized for every worker slot. It
+occupies word 292, making the worker stride 293 words; the deque still starts
+at word 34. Each platform's boot storage holds 32 such blocks (9376 words).
+This phase counter does not reset or extend the finite worker lifetime limit.
+
 ### Boot sequence (`boot(main_fn, environ) !i32`)
 
 1. Init the heap (`runtime/alloc/alloc.bit`) and collector (`runtime/gc/gc.bit`, config from
@@ -3110,7 +3120,7 @@ defined exactly once).
 | `bit_rt_net_write_deadline_w` | `(fd: i64, words: usize, n: i64, deadlineNs: i64) -> i64` (§20, same deadline shape; the body crosses as packed `words`/`n` and the kernel reads it straight from the caller's buffer, with no runtime copy, so the caller keeps that buffer live across the call with `keepAlive`. Bytes written, `-1` hard error, `-2` timed out) |
 | `bit_rt_net_write_bytes_w` | `(fd: i64, words: usize, n: i64) -> i64` (§20, #5928: `bit_rt_net_write`'s byte-taking sibling — same `words`/`n` packed-buffer shape `bit_rt_net_write_deadline_w` uses, but calls the SAME true-blocking, never-give-up engine `bit_rt_net_write` does, not the deadline-bounded one, so `std/net`'s `Conn.writeBytes` with no deadline armed behaves exactly like `Conn.write(s: string)`'s own no-deadline fast path. Bytes written, `-1` hard error) |
 | `bit_rt_net_shutdown_sock_w` | `(fd: i64) -> bool` (§20, shuts BOTH directions of `fd` down without releasing it for reuse — see `netShutdownSock` in runtime/net/{darwin,linux,windows}/tcp.bit for why this exists alongside plain close. No buffer, so unlike its `_w` siblings it needs no packed-byte scratch; `true` on success) |
-| `bit_rt_net_lookup_txt_w` | `(inWords: usize, hostLen: i64, nsLen: i64, port: i64, outWords: usize) -> i64` (§20, #6882: the TXT records of a host, written into the caller's own `outWords` buffer (65537 bytes) as entries of a two-byte big-endian length then that many bytes, one per TXT RR with its character-strings concatenated in order. `in` holds a 16-byte budget header (#6350: the per-attempt window in milliseconds, then the attempt count, each a little-endian 64-bit word; it rides in the buffer because the entry is at the five-parameter ceiling), then the host (`hostLen` bytes), then, when `nsLen > 0`, one nameserver's IPv4 or IPv6 text (at most 64 bytes) that is asked on `port`; `nsLen == 0` asks every nameserver in `/etc/resolv.conf` on port 53. A budget outside 1..1000000 for either word returns `-1`. Returns the bytes written (`0`: no TXT record, NXDOMAIN included), `-1` timeout or server failure, `-2` malformed reply, `-3` unsupported (Windows, which has no TXT lookup). A reply with TC set is repeated over TCP (IPv4 nameservers only) inside the same per-server budget as `bit_rt_net_resolve_w`. Both buffers cross as packed `[]byte` backings the caller holds live with `keepAlive`) |
+| `bit_rt_net_lookup_txt_w` | `(inWords: usize, hostLen: i64, nsLen: i64, port: i64, outWords: usize) -> i64` (§20, #6882: the TXT records of a host, written into the caller's own `outWords` buffer (65537 bytes) as entries of a two-byte big-endian length then that many bytes, one per TXT RR with its character-strings concatenated in order. `in` holds a 16-byte budget header (#6350: the per-attempt window in milliseconds, then the attempt count, each a little-endian 64-bit word; it rides in the buffer because the entry is at the five-parameter ceiling), then the host (`hostLen` bytes), then, when `nsLen > 0`, one nameserver's IPv4 or IPv6 text (at most 64 bytes) that is asked on `port`; `nsLen == 0` asks the configured nameservers on port 53: `/etc/resolv.conf` on POSIX, UP-adapter DNS addresses on Windows. A budget outside 1..1000000 for either word returns `-1`. Returns the bytes written (`0`: no TXT record, NXDOMAIN included), `-1` timeout or server failure, `-2` malformed reply, `-3` unsupported provider. A reply with TC set is repeated over TCP inside the same per-server budget: IPv4 nameservers on POSIX, IPv4 or IPv6 nameservers on Windows. Windows retains adapter-provided IPv6 scope IDs for both transports (#7153). Both buffers cross as packed `[]byte` backings the caller holds live with `keepAlive`) |
 | `bit_rt_net_udp_bind` | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_udp_send` | `(fd: i64, host: *const RtBytes, port: i64, data: *const RtBytes) -> i64` (§20) |
 | `bit_rt_net_udp_recv_from_w` | `(fd: i64, outWords: usize, cap: i64, peerWords: usize) -> i64` (§20, #7746: the next datagram into the caller's own packed `outWords` buffer (up to `cap` bytes) and the sender's raw 16-byte `sockaddr_in` into the caller's own `peerWords` buffer, in ONE call, as recvfrom(2) does; the runtime keeps no last-sender state. The caller keeps both buffers live across the call with `keepAlive`. Byte count (`0` for a zero-length datagram, which has a valid sender), `-1` on error. A plain `extern fn` in `stdlib/net/net.bit`; it replaced the `netUdpRecv`, `netUdpSenderHost` and `netUdpSenderPort` compiler primitives and their three `bit_rt_net_udp_*` entries) |
@@ -4726,6 +4736,16 @@ statically bounded either way. No
 sockets, so each returns immediately rather than holding the OS thread in
 the kernel — exactly as the unbounded `bit_rt_net_read`/`_dial` above do with
 no bracket either.
+
+Windows deadline operations wait for IOCP result publication (#8002).
+`bit_rt_port_sched_poll_op_completed(slot: i64) -> bool` acquires the completion
+marker for a slot in `[0, 512)`; an invalid slot returns false. Claiming a slot
+clears its marker before issuing the operation. The completion drain copies
+its byte count and status, decrements the pending count, then release-publishes
+the marker before waking the cached task. It reads no slot state after
+publication. The caller reads results before releasing the slot. A deadline
+cancellation uses the same marker and retains the slot when its separately
+bounded drain expires, so an outstanding kernel operation cannot reuse it.
 
 ---
 
