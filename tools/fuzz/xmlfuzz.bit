@@ -1,0 +1,220 @@
+// #6611: bounded XML smoke fuzzing; every input is saved before either API runs.
+import { Attr, Tokenizer, Element, XmlError, parse } from "std/xml"
+import { clone } from "std/seq"
+import { readFile, writeFile } from "std/fs"
+import { envOr } from "std/os"
+import { indexOf, indexOfFrom, repeat, parseInt } from "std/strings"
+import { monotonic, since, Second } from "std/time"
+
+class Limits {
+  depth: int = 8,
+  attrs: int = 8,
+  input: int = 4096,
+  name: int = 32,
+}
+
+class Frame {
+  el: Element,
+  depth: int,
+}
+
+fn xmlError(err: error, size: int) {
+  let (e, ok) = err.(XmlError)
+  assert(ok, "xml-fuzz: unexpected error ${err.message()}")
+  assert(e.offset >= 0 && e.offset <= size, "xml-fuzz: error offset outside input")
+  assert(e.line >= 1 && e.column >= 1, "xml-fuzz: invalid error location")
+}
+
+fn checkTag(name: string, attrs: []Attr, lim: Limits) {
+  assert(len(name) <= lim.name, "xml-fuzz: name limit exceeded")
+  assert(len(attrs) <= lim.attrs, "xml-fuzz: attribute limit exceeded")
+  for a of attrs {
+    assert(len(a.name) <= lim.name, "xml-fuzz: attribute name limit exceeded")
+  }
+}
+
+fn tokens(src: []byte, lim: Limits): bool {
+  let tz = Tokenizer(src, lim.depth, lim.attrs, lim.input, lim.name) catch e {
+    xmlError(e, len(src))
+    return false
+  }
+  let depth = 0
+  let calls = 0
+  while (calls <= len(src)) {
+    let tok = tz.next() catch e {
+      xmlError(e, len(src))
+      return false
+    }
+    match (tok) {
+      Start(t) => {
+        checkTag(t.name, t.attrs, lim)
+        depth = depth + 1
+        assert(depth <= lim.depth, "xml-fuzz: tokenizer depth limit exceeded")
+      }
+      Empty(t) => {
+        checkTag(t.name, t.attrs, lim)
+        assert(depth + 1 <= lim.depth, "xml-fuzz: tokenizer empty depth limit exceeded")
+      }
+      End(name) => {
+        assert(len(name) <= lim.name && depth > 0, "xml-fuzz: invalid end tag")
+        depth = depth - 1
+      }
+      Eof => {
+        assert(depth == 0, "xml-fuzz: invalid accepted depth")
+        assert(len(src) <= lim.input, "xml-fuzz: invalid accepted input")
+        return true
+      }
+      _ => {}
+    }
+    calls = calls + 1
+  }
+  panic("xml-fuzz: tokenizer exceeded input-length + 1 calls")
+}
+
+fn tree(src: []byte, lim: Limits): bool {
+  let root = parse(src, lim.depth, lim.attrs, lim.input, lim.name) catch e {
+    xmlError(e, len(src))
+    return false
+  }
+  assert(len(src) <= lim.input, "xml-fuzz: accepted input exceeds limit")
+  let todo = [Frame{ el = root, depth = 1 }]
+  let at = 0
+  let nodes = 0
+  while (at < len(todo) && at <= len(src)) {
+    let f = todo[at]
+    assert(f.depth <= lim.depth, "xml-fuzz: tree depth limit exceeded")
+    checkTag(f.el.name, f.el.attrs, lim)
+    for n of f.el.nodes {
+      nodes = nodes + 1
+      assert(nodes <= len(src), "xml-fuzz: tree node count exceeds input")
+      match (n) {
+        Elem(e) => todo = append(todo, Frame{ el = e, depth = f.depth + 1 })
+        Text(s) => assert(len(s) <= len(src), "xml-fuzz: text grows beyond input")
+      }
+    }
+    at = at + 1
+  }
+  assert(at == len(todo), "xml-fuzz: tree traversal exceeded input bound")
+  return true
+}
+
+fn check(src: []byte, lim: Limits, work: string): bool {
+  writeFile(work, string(src)) catch e {
+    panic("xml-fuzz: save input: ${e.message()}")
+  }
+  let acceptedTokens = tokens(src, lim)
+  let acceptedTree = tree(src, lim)
+  assert(!acceptedTree || acceptedTokens, "xml-fuzz: tree accepted a tokenizer refusal")
+  return acceptedTree
+}
+
+// Read the four pinned S3 bodies from their existing authoritative fixture.
+fn seeds(path: string): []string {
+  let source = readFile(path) catch e {
+    panic("xml-fuzz: seed corpus: ${e.message()}")
+  }
+  let out = []string(0)
+  for name of ["sampleList", "sampleError", "sampleDone", "sampleRules"] {
+    let marker = "const ${name} = `"
+    let at = indexOf(source, marker)
+    assert(at >= 0, "xml-fuzz: missing S3 seed ${name}")
+    let start = at + len(marker)
+    let end = indexOfFrom(source, "`", start)
+    assert(end > start, "xml-fuzz: unterminated S3 seed ${name}")
+    out = append(out, source[start:end])
+  }
+  return out
+}
+
+fn boundaries(work: string) {
+  let lim = Limits{}
+  let deep = "${repeat("<a>", 8)}${repeat("</a>", 8)}"
+  assert(check([]byte(deep), lim, work), "xml-fuzz: depth boundary refused")
+  assert(!check([]byte("<a>${deep}</a>"), lim, work), "xml-fuzz: excess depth accepted")
+  let name = repeat("a", 32)
+  assert(check([]byte("<${name}/>"), lim, work), "xml-fuzz: name boundary refused")
+  assert(!check([]byte("<${name}a/>"), lim, work), "xml-fuzz: excess name accepted")
+  let attrs = ""
+  let i = 0
+  while (i < 8) {
+    attrs = "${attrs} a${i}=\"v\""
+    i = i + 1
+  }
+  assert(check([]byte("<a${attrs}/>"), lim, work), "xml-fuzz: attribute boundary refused")
+  assert(
+    !check([]byte("<a${attrs} extra=\"v\"/>"), lim, work),
+    "xml-fuzz: excess attributes accepted",
+  )
+  assert(check([]byte("<a/>"), Limits{ input = 4 }, work), "xml-fuzz: input boundary refused")
+  assert(!check([]byte("<a/>"), Limits{ input = 3 }, work), "xml-fuzz: excess input accepted")
+}
+
+fn next(st: []u64): u64 {
+  let x = st[0]
+  x = x ^ (x << 13)
+  x = x ^ (x >> 7)
+  x = x ^ (x << 17)
+  st[0] = x
+  return x
+}
+
+fn mutant(src: string, st: []u64): []byte {
+  if (next(st) % 4 == 0) {
+    let out = []byte(int(next(st) % 4097))
+    let at = 0
+    while (at < len(out)) {
+      out[at] = byte(next(st) & 255)
+      at = at + 1
+    }
+    return out
+  }
+  let out = clone([]byte(src))
+  let count = 1 + int(next(st) % 8)
+  let i = 0
+  while (i < count) {
+    let pos = int(next(st) % u64(len(out) + 1))
+    let value = byte(next(st) & 255)
+    if (pos == len(out)) {
+      out = append(out, value)
+    } else {
+      out[pos] = value
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn main() {
+  let seconds = parseInt(envOr("BIT_XML_FUZZ_SECONDS", "5")) catch e {
+    panic("xml-fuzz: budget: ${e.message()}")
+  }
+  assert(seconds > 0 && seconds <= 60, "xml-fuzz: budget must be 1..60 seconds")
+  let work = envOr("BIT_XML_FUZZ_WORK", "${envOr("TMPDIR", "/tmp")}/bit-xml-fuzz-input")
+  let corpus = seeds(envOr("BIT_XML_FUZZ_CORPUS", "stdlib/xml/tree.test.bit"))
+  let full = Limits{ depth = 256, attrs = 256, input = 65536, name = 1024 }
+  for src of corpus {
+    assert(check([]byte(src), full, work), "xml-fuzz: S3 seed refused")
+  }
+  let bad = [
+    "<a><b></a>", "<a>", "<a>&nbsp;</a>", "<a x=\"1\" x=\"2\"/>",
+    "<a x=1/>", "<a><!-- a -- b --></a>", "<a/><b/>", "<a>x]]>y</a>",
+  ]
+  for src of bad {
+    assert(!check([]byte(src), full, work), "xml-fuzz: malformed seed accepted")
+  }
+  boundaries(work)
+  let all = corpus
+  for src of bad {
+    all = append(all, src)
+  }
+  let st = [u64(1)]
+  let start = monotonic()
+  let iterations = 0
+  while (iterations < 100000 && since(start) < seconds * Second) {
+    let source = all[int(next(st) % u64(len(all)))]
+    let _ = check(mutant(source, st), Limits{}, work)
+    iterations = iterations + 1
+  }
+  assert(iterations > 0, "xml-fuzz: no mutated inputs executed")
+  print("PASS xml-fuzz: ${iterations} arbitrary-byte inputs, 4 S3 + 8 malformed seeds, 0 crashes, 0 limit violations (seed=1)\n")
+}
