@@ -1,0 +1,145 @@
+// RFC 2920: replies make progress while the one grouped write is pending.
+// The caller alone owns Wire's parser and session state. Shutdown interrupts
+// transport I/O; the writer's terminal acknowledgement precedes every close.
+class pipelineReplies {
+  delivery: Delivery,
+  failed: bool,
+  problem: SmtpError,
+}
+
+fn recordRecipient(d: Delivery, address: string, r: Reply): ()!SmtpError {
+  if (r.code == 421) {
+    fail replyError("RCPT TO", r)
+  }
+  if (r.code == 250 || r.code == 251) {
+    d.accepted = append(d.accepted, address)
+    return
+  }
+  d.rejected = append(d.rejected, Rejection{ address = address, error = replyError("RCPT TO", r) })
+}
+
+fn pipelineCommands(e: Envelope, mail: string): string!SmtpError {
+  let out = Builder()
+  let _ = out.write(mail).write("\r\n")
+  let i = 0
+  while (i < len(e.to)) {
+    let line = "RCPT TO:<${e.to[i]}>${rcptParams(e.dsn, e.to[i])}"
+    checkCommand(line)?
+    let _ = out.write(line).write("\r\n")
+    i = i + 1
+  }
+  let _ = out.write("DATA\r\n")
+  return out.toString()
+}
+
+fn pipelineWrite(s: Stream, tcp: TcpConn, group: string, done: chan<error>) {
+  s.send(group) catch e {
+    tcp.shutdown()
+    done <- e
+    return
+  }
+  done <- nil
+}
+
+fn pipelineRead(c: Client, e: Envelope, state: pipelineReplies): Reply!SmtpError {
+  let mail = c.w.readReply("MAIL FROM", false)?
+  if (mail.code != 250) {
+    state.failed = true
+    state.problem = replyError("MAIL FROM", mail)
+  }
+  if (mail.code == 421) {
+    fail state.problem
+  }
+  let i = 0
+  while (i < len(e.to)) {
+    let r = c.w.readReply("RCPT TO", false)?
+    recordRecipient(state.delivery, e.to[i], r)?
+    i = i + 1
+  }
+  if (!state.failed && len(state.delivery.accepted) == 0) {
+    state.failed = true
+    state.problem = allRefused(state.delivery.rejected)
+  }
+  let data = c.w.readReply("DATA", false)?
+  if (data.code == 421) {
+    fail replyError("DATA", data)
+  }
+  return data
+}
+
+fn pipelineBroken(c: Client, state: pipelineReplies, problem: SmtpError): SmtpError {
+  c.lost = true
+  let why = "a failed pipeline"
+  if (len(c.w.closed) > 0) {
+    why = c.w.closed
+  }
+  c.w.hangup(why)
+  if (state.failed) {
+    return state.problem
+  }
+  return problem
+}
+
+fn pipelineWriteError(c: Client, e: error): SmtpError {
+  if (isTimeout(e)) {
+    return c.w.expired("MAIL FROM", e, false)
+  }
+  return ioError("MAIL FROM", e)
+}
+
+fn pipelineEmpty(c: Client): ()!SmtpError {
+  c.w.begin()?
+  c.w.put("end of DATA", ".\r\n")?
+  let r = c.w.readReply("end of DATA")?
+  if (r.code == 421) {
+    fail replyError("end of DATA", r)
+  }
+  if (r.code < 200 || (r.code >= 300 && r.code < 400)) {
+    fail protoError("end of DATA", "empty DATA did not draw a completion reply")
+  }
+}
+
+fn pipelineFinish(
+  c: Client,
+  state: pipelineReplies,
+  data: Reply,
+  rendered: string,
+): Delivery!SmtpError {
+  if (state.failed) {
+    if (data.code == 354) {
+      pipelineEmpty(c) catch e {
+        fail pipelineBroken(c, state, e)
+      }
+    }
+    fail c.abort(state.problem)
+  }
+  expect("DATA", data, 354, 354) catch e {
+    fail c.abort(e)
+  }
+  c.transmitBody(state.delivery, rendered)?
+  return state.delivery
+}
+
+fn pipelineSend(c: Client, e: Envelope, mail: string, rendered: string): Delivery!SmtpError {
+  let group = pipelineCommands(e, mail)?
+  let state = pipelineReplies{
+    delivery = Delivery{ accepted = []string(0), rejected = []Rejection(0), queueId = "" },
+    failed = false, problem = localError(""),
+  }
+  c.w.begin()?
+  let done = chan<error>(1)
+  spawn pipelineWrite(c.w.s, c.tcp, group, done)
+  let data = pipelineRead(c, e, state) catch problem {
+    c.tcp.shutdown()
+    let written = <- done
+    if (written != nil) {
+      fail pipelineBroken(c, state, pipelineWriteError(c, written))
+    }
+    fail pipelineBroken(c, state, problem)
+  }
+  let written = <- done
+  if (written != nil) {
+    fail pipelineBroken(c, state, pipelineWriteError(c, written))
+  }
+  return pipelineFinish(c, state, data, rendered)?
+}

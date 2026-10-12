@@ -743,6 +743,13 @@ See [the connection guide](smtp/connecting.md#auth).
 
 See [the connection guide](smtp/connecting.md#clientsendm-sendable-deliverysmtperror).
 
+When the relay advertises `PIPELINING`, send groups `MAIL FROM`, every `RCPT TO`
+and `DATA` into one write, reading ordered replies concurrently under one
+exchange deadline. All capability and size checks happen first. Rejections
+remain per recipient; no accepted recipients means no message payload, with
+an empty dot completing an unexpected `354` before reset. Other relays use
+the sequential command/reply exchange.
+
 ### `Delivery`
 
 See [the connection guide](smtp/connecting.md#delivery).

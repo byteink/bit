@@ -1,0 +1,376 @@
+// Command boundaries come from CRLF, never the kernel's read boundaries.
+fn runScript(s: Stream, replies: []string, greet: bool = true): string! {
+  if (greet) {
+    s.send("220 fake.example.com ESMTP\r\n")?
+  }
+  let seen = ""
+  let pending = ""
+  let step = 0
+  let inData = false
+  let turns = 0
+  while (turns < maxTurns + len(replies) && step < len(replies)) {
+    turns = turns + 1
+    let chunk = s.recv(65536)?
+    if (len(chunk) == 0) {
+      return seen
+    }
+    seen = seen + chunk
+    pending = pending + chunk
+    let lines = 0
+    while (lines <= len(chunk) && step < len(replies)) {
+      lines = lines + 1
+      let at = strIndexOf(pending, "\r\n")
+      if (at < 0) {
+        break
+      }
+      let line = pending[0:at]
+      pending = pending[at + 2:]
+      if (inData && line != ".") {
+        continue
+      }
+      s.send(replies[step])?
+      inData = replyStartsData(replies[step])
+      step = step + 1
+    }
+  }
+  return seen
+}
+
+// A real transport with recorded call boundaries. The optional rendezvous
+// holds the grouped writer until the caller starts receiving, independently
+// of kernel buffer sizes; payload writes must follow its terminal return.
+class pipelineRecorder {
+  inner: Stream
+  writes: []string
+  receive: chan<bool>
+  duplex: bool
+  opened: bool
+  active: bool
+  failWrite: bool
+  groupDone: chan<bool>
+  complete: bool
+  pendingReplies: int
+
+  export send(s: string): ()! {
+    this.active = true
+    this.writes = append(this.writes, s)
+    if (this.duplex && hasPrefix(s, "MAIL FROM:")) {
+      let _ = <- this.receive
+    }
+    if (this.failWrite) {
+      this.active = false
+      fail newError("scripted grouped write failed")
+    }
+    this.inner.send(s) catch e {
+      this.active = false
+      fail e
+    }
+    this.active = false
+    if (this.duplex && hasPrefix(s, "MAIL FROM:")) {
+      this.groupDone <- true
+    }
+  }
+  export recv(max: int): string! {
+    if (this.duplex && !this.opened) {
+      this.opened = true
+      this.receive <- true
+    }
+    let reply = this.inner.recv(max)?
+    if (this.duplex && !this.complete) {
+      select {
+        case _ = <- this.groupDone:
+          this.complete = true
+        default:
+          this.pendingReplies = this.pendingReplies + 1
+      }
+    }
+    return reply
+  }
+  export deadline(ns: int) { this.inner.deadline(ns) }
+  export timedOut(): bool { return this.inner.timedOut() }
+  export shut() {
+    assert(!this.active, "stream closed before writer acknowledged")
+    this.inner.shut()
+  }
+}
+
+fn recordPipeline(c: Client, duplex: bool = false): pipelineRecorder {
+  let r = pipelineRecorder{
+    inner = c.w.s, writes = []string(0), receive = chan<bool>(1), duplex = duplex, opened = false,
+    active = false, failWrite = false,
+    groupDone = chan<bool>(1), complete = false, pendingReplies = 0,
+  }
+  c.w.s = r
+  return r
+}
+
+fn successfulReplies(n: int): []string {
+  let replies = []string(0)
+  let i = 0
+  while (i <= n) {
+    replies = append(replies, "250 OK\r\n")
+    i = i + 1
+  }
+  return append(replies, "354 Go\r\n", "250 Queued\r\n", "221 Bye\r\n")
+}
+
+fn assertPipelineGroup(r: pipelineRecorder, raw: Raw) {
+  assert(len(r.writes) == 3, "group, payload and QUIT: ${len(r.writes)} sends")
+  let group = pipelineCommands(raw.env, "MAIL FROM:<${raw.env.from}> SIZE=${len(raw.data)}") catch e {
+    panic(e.message())
+  }
+  assert(r.writes[0] == group, "MAIL/all RCPT/DATA were not one send")
+  assert(unstuffed(r.writes[0] + r.writes[1]) == raw.data, "payload changed")
+  assert(r.writes[2] == "QUIT\r\n", "QUIT raced the group")
+}
+
+test "PIPELINING records exactly one send for MAIL three RCPT and DATA" {
+  let (c, log) = fakeClient(successfulReplies(3))
+  let r = recordPipeline(c)
+  let raw = threeRecipients()
+  let d = c.send(raw) catch e {
+    panic(e.message())
+  }
+  c.quit() catch e {
+    panic(e.message())
+  }
+  let _ = <- log
+  assert(len(d.accepted) == 3, "recipients lost")
+  assertPipelineGroup(r, raw)
+}
+
+test "PIPELINING receives while its grouped writer waits and joins before DATA" {
+  let (c, log) = fakeClient(successfulReplies(3))
+  let r = recordPipeline(c, true)
+  let raw = threeRecipients()
+  let _ = c.send(raw) catch e {
+    panic(e.message())
+  }
+  c.quit() catch e {
+    panic(e.message())
+  }
+  let _ = <- log
+  assert(r.opened, "receive never released the blocked writer")
+  assertPipelineGroup(r, raw)
+}
+
+test "PIPELINING absent retains sequential command reply writes" {
+  let (c, log) = fakeClientEhlo("250-fake\r\n250 SIZE 35882577\r\n", successfulReplies(3))
+  let r = recordPipeline(c)
+  let _ = c.send(threeRecipients()) catch e {
+    panic(e.message())
+  }
+  c.quit() catch e {
+    panic(e.message())
+  }
+  let _ = <- log
+  assert(len(r.writes) == 7, "MAIL, three RCPT, DATA, payload, QUIT: ${len(r.writes)}")
+  assert(r.writes[4] == "DATA\r\n", "sequential DATA boundary lost")
+}
+
+test "PIPELINING all recipients rejected with 354 sends only empty dot before RSET" {
+  let (c, log) = fakeClient(
+    [
+      "250 OK\r\n", "550 No user\r\n", "354 Go\r\n", "554 Empty refused\r\n", "250 Reset\r\n", "221 Bye\r\n",
+    ],
+  )
+  let r = recordPipeline(c)
+  let raw = Raw(Envelope{ from = "me@x.com", to = ["a@x.com"] }, rawMessage())
+  let e = refusal(c, raw)
+  assert(e.code == 550 && e.command == "RCPT TO", e.message())
+  assert(c.reusable(), "empty DATA and reset did not restore the session")
+  c.quit() catch err {
+    panic(err.message())
+  }
+  let sent = <- log
+  assert(contains(sent, "DATA\r\n.\r\nRSET\r\n"), sent)
+  assert(r.writes[1] == ".\r\n" && r.writes[2] == "RSET\r\n", "reset became message content")
+}
+
+test "PIPELINING MAIL 452 drains multiline replies then resets and reuses" {
+  let (c, log) = fakeClient(
+    append(
+      [
+        "452 4.3.1 Try later\r\n", "503-No sender\r\n503 No sender\r\n", "503 No sender\r\n", "250 Reset\r\n",
+      ],
+      ...successfulReplies(1),
+    ),
+  )
+  let r = recordPipeline(c)
+  let raw = Raw(Envelope{ from = "me@x.com", to = ["a@x.com"] }, rawMessage())
+  let e = refusal(c, raw)
+  assert(e.code == 452 && e.transient() && e.command == "MAIL FROM", e.message())
+  assert(c.reusable(), "outstanding replies or reset lost session")
+  let _ = c.send(raw) catch err {
+    panic(err.message())
+  }
+  c.quit() catch err {
+    panic(err.message())
+  }
+  let _ = <- log
+  assert(r.writes[1] == "RSET\r\n", "reset raced grouped writer")
+}
+
+test "PIPELINING MAIL refusal with unexpected 354 sends empty dot and preserves MAIL" {
+  let (c, log) = fakeClient(
+    [
+      "452 4.3.1 Try later\r\n", "250 OK\r\n", "354 Go\r\n", "554 Empty refused\r\n", "250 Reset\r\n", "221 Bye\r\n",
+    ],
+  )
+  let r = recordPipeline(c)
+  let e = refusal(c, Raw(Envelope{ from = "me@x.com", to = ["a@x.com"] }, rawMessage()))
+  assert(e.code == 452 && e.command == "MAIL FROM", e.message())
+  assert(c.reusable(), "MAIL refusal was not reset after empty dot")
+  c.quit() catch err {
+    panic(err.message())
+  }
+  let sent = <- log
+  assert(contains(sent, "DATA\r\n.\r\nRSET\r\n"), sent)
+  assert(r.writes[1] == ".\r\n", "MAIL refusal transmitted real message")
+}
+
+test "PIPELINING refused recipients with DATA 554 drain and reset without payload" {
+  let (c, log) = fakeClient(
+    [
+      "250 OK\r\n", "550 No user\r\n", "554 No recipients\r\n", "250 Reset\r\n", "221 Bye\r\n",
+    ],
+  )
+  let r = recordPipeline(c)
+  let e = refusal(c, Raw(Envelope{ from = "me@x.com", to = ["a@x.com"] }, rawMessage()))
+  assert(e.code == 550 && e.command == "RCPT TO", e.message())
+  c.quit() catch err {
+    panic(err.message())
+  }
+  let _ = <- log
+  assert(r.writes[1] == "RSET\r\n", "payload sent after DATA refusal")
+}
+
+test "PIPELINING malformed empty DATA completion prevents reset and reuse" {
+  let (c, log) = fakeClient(["250 OK\r\n", "550 No user\r\n", "354 Go\r\n", "354 More data\r\n"])
+  let r = recordPipeline(c)
+  let e = refusal(c, Raw(Envelope{ from = "me@x.com", to = ["a@x.com"] }, rawMessage()))
+  assert(e.code == 550 && !c.reusable(), e.message())
+  c.close()
+  let _ = <- log
+  assert(len(r.writes) == 2 && r.writes[1] == ".\r\n", "RSET became message content")
+}
+
+test "PIPELINING actual writer error wins synthetic EOF and joins before close" {
+  let (c, log) = fakeClient([]string(0))
+  let r = recordPipeline(c)
+  r.failWrite = true
+  let e = refusal(c, threeRecipients())
+  assert(e.command == "MAIL FROM", e.message())
+  assert(e.cause.message() == "scripted grouped write failed", "writer cause replaced by EOF")
+  assert(!r.active && !c.reusable(), "writer not joined or session retained")
+  c.close()
+  let _ = <- log
+  assert(len(r.writes) == 1, "cleanup sent a second command after failed write")
+}
+
+test "PIPELINING original MAIL refusal survives truncated drain and closes after join" {
+  let (c, log) = fakeClient(["452 4.3.1 Try later\r\n", "250 truncated"])
+  let r = recordPipeline(c)
+  let e = refusal(c, threeRecipients())
+  assert(e.code == 452 && e.command == "MAIL FROM", e.message())
+  assert(!c.reusable() && !r.active, "drain failure retained session or writer")
+  c.close()
+  let _ = <- log
+  assert(len(r.writes) == 1, "RSET raced a failed drain")
+}
+
+test "PIPELINING 421 and malformed multiline replies join before closing" {
+  let scripts = [
+    ["250 OK\r\n", "421 Closing\r\n"],
+    ["250 OK\r\n", "250-first\r\n550 wrong-code\r\n"],
+  ]
+  let i = 0
+  while (i < len(scripts)) {
+    let (c, log) = fakeClient(scripts[i])
+    let r = recordPipeline(c, true)
+    let e = refusal(c, threeRecipients())
+    assert(e.command == "RCPT TO", e.message())
+    assert(!c.reusable() && !r.active, "bad reply retained session or writer")
+    c.close()
+    let _ = <- log
+    assert(len(r.writes) == 1, "RSET after terminal reply")
+    i = i + 1
+  }
+}
+
+// This is an explicit test bound, not a production recipient limit. The group
+// exceeds four MiB, and the peer replies with over eight MiB while consuming it.
+fn largePipelineRaw(): Raw {
+  let address = repeat("a", 60) +
+    "@" +
+    repeat("b", 60) +
+    "." +
+    repeat("c", 60) +
+    "." +
+    repeat("d", 60)
+  let to = []string(0)
+  let i = 0
+  while (i < 18000) {
+    to = append(to, address)
+    i = i + 1
+  }
+  return Raw(Envelope{ from = "me@x.com", to = to }, rawMessage())
+}
+
+fn largePipelineReplies(n: int): []string {
+  let replies = []string(0)
+  let reply = "250-" + repeat("r", 512) + "\r\n250 OK\r\n"
+  let i = 0
+  while (i <= n) {
+    replies = append(replies, reply)
+    i = i + 1
+  }
+  return append([ehloPlain()], ...append(replies, "354 Go\r\n", "250 Queued\r\n", "221 Bye\r\n"))
+}
+
+fn proveLargePipeline(c: Client, log: chan<string>, raw: Raw) {
+  c.ehlo("client.example.com") catch e {
+    panic(e.message())
+  }
+  let r = recordPipeline(c, true)
+  let d = c.send(raw) catch e {
+    panic(e.message())
+  }
+  c.quit() catch e {
+    panic(e.message())
+  }
+  let sent = <- log
+  assert(len(d.accepted) == len(raw.env.to), "large group lost replies")
+  assert(len(r.writes[0]) > 4 * 1024 * 1024, "group too small: ${len(r.writes[0])}")
+  assert(r.opened && !r.active, "no receive progress or writer not joined")
+  assert(r.pendingReplies > 0, "no real reply arrived while the grouped write was pending")
+  assert(sent == "EHLO client.example.com\r\n" + join(r.writes, ""), "large transcript truncated")
+  assertPipelineGroup(r, raw)
+  println("group bytes=${len(r.writes[0])}, replies=${len(raw.env.to) + 2}, accepted=${len(d.accepted)}, pending receives=${r.pendingReplies}")
+}
+
+test "PIPELINING large real TCP group receives while writing" {
+  let raw = largePipelineRaw()
+  let (port, log) = startFake(largePipelineReplies(len(raw.env.to))) catch e {
+    panic(e.message())
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    panic(e.message())
+  }
+  proveLargePipeline(c, log, raw)
+}
+
+test "PIPELINING large verified TLS group receives while writing" {
+  let raw = largePipelineRaw()
+  let (port, log) = startTlsFake(largePipelineReplies(len(raw.env.to))) catch e {
+    panic(e.message())
+  }
+  let o = pinnedOptions() catch e {
+    panic(e.message())
+  }
+  let c = dialTls("127.0.0.1", port, o) catch e {
+    panic(e.message())
+  }
+  assert(c.verifiedTls, "test TLS was not verified")
+  proveLargePipeline(c, log, raw)
+}
