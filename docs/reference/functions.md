@@ -80,6 +80,10 @@ own `return`. A function can also return more than one value as a tuple:
 `fn range(): (int, int) { return 0, 10 }`, unpacked with
 `let (lo, hi) = range()`.
 
+A named function can also be stored or passed as a callback. For a generic
+function, its expected function type determines the type arguments; see
+[Keeping a generic function as a callback](generics.md#keeping-a-generic-function-as-a-callback).
+
 ## Control flow
 
 ```bit
