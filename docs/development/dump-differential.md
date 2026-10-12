@@ -94,8 +94,22 @@ used from `run_ir` in `selfhost-diffdump.sh`) first: a divergence that
 matches a registered signature is EXPLAINED immediately, no repin needed.
 This is deliberately NOT the deleted expected-mismatch list reborn -- see
 that function's header for why a signature checked against an identity is a
-different, narrower thing than a file checked against nothing. `types` is
-unchanged; it has no signature table.
+different, narrower thing than a file checked against nothing. `types` also
+checks declared signatures, including synthesized JSON helper column shifts.
+
+The variadic function marker repair (#7929) has a separate strict `types`
+identity (#7933). It applies to direct inferred bindings of unique, unshadowed
+top-level variadic functions with primitive parameters and results. Both
+compilers must accept the unchanged source and produce identical AST and token
+dumps. AST binder metadata rejects names shadowed by parameters, destructuring,
+loops, match/catch patterns, receivers or receive bindings. The AST proves the
+final rest parameter and exact signature; token
+offsets tie it to the binding's line, column and name. Only that final
+parameter gains `...`; every other dump byte must agree. Unsupported nested,
+imported or generic captures, changed rows/types/positions and failed witnesses
+remain unexplained. The existing function-value corpus exercises the identity,
+and the self-check includes real paired compiler evidence and negative controls.
+Retire this signature when stage0 contains the renderer repair.
 
 ## AST differential
 

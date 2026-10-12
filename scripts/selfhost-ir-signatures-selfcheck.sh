@@ -427,6 +427,104 @@ $rc_t"
   rm -f "${jt_json:?}" "${jt_plain:?}"
   rmdir "${jt_dir:?}"
 
+  # #7933: the registered types identity must fire on a real swept source.
+  vt_dir=$(mktemp -d "${TMPDIR:-/tmp}/t7933-selfcheck-XXXXXX") || exit 2
+  ORACLE="${ROOT}/bit-out/stage0/bit-oracle"; BIT2="${ROOT}/bit-out/bin/bit"
+  BIT_STDLIB="${ROOT}/stdlib"; export BIT_STDLIB
+  TIMEOUT=20
+  vt_sig=7933-variadic-type-marker
+  vt_corpus="${ROOT}/_tests_/cases/run_func_value_args_ok.bit"
+  vt_old=$(alarmrun "$ORACLE" --dump-types "$vt_corpus"); vt_rc=$?
+  expect 0 "$vt_rc" 'variadic corpus: oracle dump succeeds'
+  vt_new=$(alarmrun "$BIT2" --dump-types "$vt_corpus"); vt_rc=$?
+  expect 0 "$vt_rc" 'variadic corpus: current dump succeeds'
+  expect "$vt_sig" "$(explainMismatch "$vt_old" "$vt_new" types "$vt_corpus")" 'variadic corpus: live registered identity'
+  vt_source="$vt_dir/input.bit"
+  cat > "$vt_source" <<'BIT'
+fn ordinary(x: int): int { return x }
+fn variadic(prefix: string, ...xs: int): int { return len(xs) }
+fn main() {
+  let a = ordinary
+  let b = variadic
+  let nested = [](int) => int{ ordinary }
+  println("${a(3)} ${b("x", 4, 5)} ${nested[0](7)}")
+}
+BIT
+  vt_old=$(alarmrun "$ORACLE" --dump-types "$vt_source"); vt_rc=$?
+  expect 0 "$vt_rc" 'variadic fixture: oracle dump succeeds'
+  vt_new=$(alarmrun "$BIT2" --dump-types "$vt_source"); vt_rc=$?
+  expect 0 "$vt_rc" 'variadic fixture: current dump succeeds'
+  expect "$vt_sig" "$(explainMismatch "$vt_old" "$vt_new" types "$vt_source")" 'variadic fixed prefix, ordinary and nested rows preserved'
+  expect "" "$(explainMismatch "$vt_old" "$vt_old" types "$vt_source")" 'variadic marker removed'
+  expect "" "$(explainMismatch "$vt_new" "$vt_old" types "$vt_source")" 'variadic marker direction reversed'
+  expect "" "$(explainMismatch "$vt_old" "$vt_new" ir "$vt_source")" 'variadic identity does not widen IR'
+  for vt_delta in ordinary return param slot position name nested; do
+    case "$vt_delta" in
+      ordinary) vt_bad=${vt_new/a: (i64) => i64/a: (...i64) => i64} ;;
+      return) vt_bad=${vt_new/b: (string, ...i64) => i64/b: (string, ...i64) => string} ;;
+      param) vt_bad=${vt_new/b: (string, ...i64)/b: (string, ...u64)} ;;
+      slot) vt_bad=${vt_new/b: (string, ...i64)/b: (...string, i64)} ;;
+      position) vt_bad=${vt_new/5:7: b:/5:8: b:} ;;
+      name) vt_bad=${vt_new/b: (/other: (} ;;
+      nested) vt_bad=${vt_new/nested: [](/nested: [](...} ;;
+    esac
+    expect "" "$(explainMismatch "$vt_old" "$vt_bad" types "$vt_source")" "variadic rejects $vt_delta delta"
+  done
+  expect "" "$(explainMismatch "$vt_old" "$(printf '%s\n' "$vt_new" | sed '2d')" types "$vt_source")" 'variadic removed row'
+  expect "" "$(explainMismatch "$vt_old" "$vt_new
+9:1: extra: i64" types "$vt_source")" 'variadic added row'
+  expect "" "$(explainMismatch "$vt_old" "$(printf '%s\n' "$vt_new" | sed '1h;1d;2G')" types "$vt_source")" 'variadic reordered rows'
+  printf 'fn main() { let b = 3 }\n' > "$vt_dir/unrelated.bit"
+  expect "" "$(explainMismatch "$vt_old" "$vt_new" types "$vt_dir/unrelated.bit")" 'variadic unrelated source'
+  printf 'fn ordinary(x: int): int { return x }\nfn variadic(...xs: int): int { return len(xs) }\nfn main() { let variadic = ordinary; let b = variadic }\n' > "$vt_dir/shadow.bit"
+  expect "" "$(explainMismatch "$vt_old" "$vt_new" types "$vt_dir/shadow.bit")" 'variadic shadowed source'
+  # Each accepted binder shadows the variadic declaration with an ordinary callback.
+  for vt_pattern in loop tuple match catch; do
+    vt_shadow="$vt_dir/$vt_pattern.bit"
+    printf 'fn ordinary(x: int): int { return x }\nfn variadic(...xs: int): int { return len(xs) }\n' > "$vt_shadow"
+    case "$vt_pattern" in
+      loop) printf 'fn main() { for variadic of [](int) => int{ ordinary } { let b = variadic; } }\n' ;;
+      tuple) printf 'fn main() { let (variadic, n) = (ordinary, 3); let b = variadic; }\n' ;;
+      match) printf 'enum Callback { One((int) => int) }\nfn main() { match (Callback.One(ordinary)) { One(variadic) => { let b = variadic; } } }\n' ;;
+      catch) printf 'type Callback = (int) => int\nfn failure(): int!Callback { fail ordinary }\nfn main() { let n = failure() catch variadic { let b = variadic; return } }\n' ;;
+    esac >> "$vt_shadow"
+    vt_shadow_old=$(alarmrun "$ORACLE" --dump-types "$vt_shadow"); vt_rc=$?
+    expect 0 "$vt_rc" "variadic $vt_pattern shadow: oracle dump succeeds"
+    vt_shadow_new=$(alarmrun "$BIT2" --dump-types "$vt_shadow"); vt_rc=$?
+    expect 0 "$vt_rc" "variadic $vt_pattern shadow: current dump succeeds"
+    for vt_binary in "$ORACLE" "$BIT2"; do
+      alarmrun "$vt_binary" check "$vt_shadow" > "$vt_dir/check"; vt_rc=$?
+      expect 0 "$vt_rc" "variadic $vt_pattern shadow: accepted source"
+    done
+    expect "$vt_shadow_old" "$vt_shadow_new" "variadic $vt_pattern shadow: unchanged ordinary type"
+    vt_forged=${vt_shadow_new/b: (i64) => i64/b: (...i64) => i64}
+    expect no "$([ "$vt_forged" = "$vt_shadow_new" ] && printf yes || printf no)" "variadic $vt_pattern shadow: forged row differs"
+    expect "" "$(explainMismatch "$vt_shadow_old" "$vt_forged" types "$vt_shadow")" "variadic rejects $vt_pattern binder shadow"
+  done
+  VT_REAL_ORACLE=$ORACLE; export VT_REAL_ORACLE
+  cat > "$vt_dir/failed" <<'PROBE'
+#!/bin/sh
+case "$VT_WITNESS_FAILURE:$1" in
+  fail:check) exit 1 ;;
+  timeout:--dump-ast) exit 142 ;;
+  tokens:--dump-tokens) printf 'ident 0..1\n'; exit 0 ;;
+  ast:--dump-ast) printf '(program)\n'; exit 0 ;;
+esac
+exec "$VT_REAL_ORACLE" "$@"
+PROBE
+  chmod +x "$vt_dir/failed"
+  ORACLE="$vt_dir/failed"
+  for VT_WITNESS_FAILURE in fail timeout tokens ast; do
+    export VT_WITNESS_FAILURE
+    expect "" "$(explainMismatch "$vt_old" "$vt_new" types "$vt_source")" "variadic failed $VT_WITNESS_FAILURE witness"
+  done
+  ORACLE="$vt_dir/missing"
+  expect "" "$(explainMismatch "$vt_old" "$vt_new" types "$vt_source")" 'variadic missing witness'
+  ORACLE=$VT_REAL_ORACLE
+  expect "" "$(explainMismatch "$vt_old" "$vt_new" types "$vt_dir/missing.bit")" 'variadic missing source'
+  unset ORACLE BIT2 VT_WITNESS_FAILURE VT_REAL_ORACLE
+  rm -rf "${vt_dir:?}"
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever
