@@ -1,0 +1,419 @@
+// Native durable-history controls use the existing test-binary re-exec mechanism.
+const kwChildEnv: string = "BIT_KV_WATCH_CHILD"
+
+fn kwPut(db: Db, key: string) {
+  db.tx((t) => {
+    t.put([]byte(key), []byte("value"))?
+  }) catch e {
+    panic(e.message())
+  }
+}
+
+fn kwVersion(db: Db): i64 {
+  return db.version() catch e {
+    panic(e.message())
+  }
+}
+
+fn kwWatch(db: Db, prefix: []byte): Watcher {
+  return db.watch(prefix, 1) catch e {
+    panic(e.message())
+  }
+}
+
+fn kwNext(w: Watcher): Option<Change> {
+  return w.next(0) catch e {
+    panic(e.message())
+  }
+}
+
+fn kwChange(w: Watcher, version: i64, overflow: bool = false) {
+  let change = kwNext(w)
+  assert(isSome(change), "expected a change")
+  assert(unwrap(change).version == version && unwrap(change).overflow == overflow, "wrong change")
+  assert(isNone(kwNext(w)), "change repeated")
+}
+
+test "watch fresh put publishes an owned touched key" {
+  let path = scratchPath5721("watch-owned-key")
+  let db = open(path) catch e {
+    panic(e.message())
+  }
+  let w = kwWatch(db, []byte("owned"))
+  let key = []byte("owned")
+  db.tx((t) => {
+    t.put(key, []byte("yes"))?
+    key[0] = u8(120)
+  }) catch e {
+    panic(e.message())
+  }
+  kwChange(w, 1)
+  w.close()
+  db.close()
+  kvTestTeardown(path)
+}
+
+test "watch version has three commits and two rollbacks without changing a writer" {
+  let path = scratchPath5721("watch-version")
+  let db = open(path) catch e {
+    panic(e.message())
+  }
+  assert(kwVersion(db) == 0, "initial version")
+  let i = 0
+  while (i < 3) {
+    kwPut(db, "key${i}")
+    i = i + 1
+    assert(kwVersion(db) == i64(i), "commit version")
+  }
+  i = 0
+  while (i < 2) {
+    db.tx((t) => {
+      t.put([]byte("rolledback"), []byte("no"))?
+      fail newError("rollback")
+    }) catch _ {}
+    assert(kwVersion(db) == 3, "rollback published")
+    i = i + 1
+  }
+  db.tx((t) => {
+    let root = t.db.root
+    let slot = t.db.eng.activeMeta
+    assert(t.db.version()? == 3, "in-flight version")
+    assert(t.db.root == root && t.db.eng.activeMeta == slot, "version changed writer state")
+    t.put([]byte("fourth"), []byte("yes"))?
+  }) catch e {
+    panic(e.message())
+  }
+  assert(kwVersion(db) == 4, "fourth commit")
+  db.close()
+  kvTestTeardown(path)
+}
+
+test "watch a second process observes and publishes the same durable version" {
+  let child = envOr(kwChildEnv, "")
+  if (child != "") {
+    let db = open(child) catch e {
+      panic(e.message())
+    }
+    assert(kwVersion(db) == 1, "child version")
+    kwPut(db, "child")
+    db.close()
+    return
+  }
+  let path = scratchPath5721("watch-process")
+  let db = open(path) catch e {
+    panic(e.message())
+  }
+  let w = kwWatch(db, []byte("child"))
+  kwPut(db, "parent")
+  let result = output("/usr/bin/env", ["${kwChildEnv}=${path}", selfExe()], 15000)
+  assert(result.exitCode == 0, "child ${result.exitCode}: ${result.stderr}")
+  assert(kwVersion(db) == 2, "parent stale version")
+  kwChange(w, 2)
+  w.close()
+  db.close()
+  kvTestTeardown(path)
+}
+
+test "watch prefix owns bytes and preserves every retained miss and delete" {
+  let path = scratchPath5721("watch-prefix")
+  let db = open(path) catch e {
+    panic(e.message())
+  }
+  let prefix = []byte("user/")
+  let w = kwWatch(db, prefix)
+  prefix[0] = u8(120)
+  kwPut(db, "outside")
+  assert(isNone(kwNext(w)) && w.cursor == 1, "prefix miss did not advance")
+  kwPut(db, "user/one")
+  kwPut(db, "outside-two")
+  kwPut(db, "outside-three")
+  kwChange(w, 4)
+  db.tx((t) => {
+    t.delete([]byte("user/one"))?
+  }) catch e {
+    panic(e.message())
+  }
+  kwChange(w, 5)
+  db.tx((t) => {
+    t.delete([]byte("missing"))?
+  }) catch e {
+    panic(e.message())
+  }
+  assert(isNone(kwNext(w)) && w.cursor == 6, "absent delete reported a change")
+  w.close()
+  db.close()
+  kvTestTeardown(path)
+}
+
+test "watch retains 1024 commits and signals 1025 overflow with bounded storage" {
+  let path = scratchPath5721("watch-overflow")
+  let db = open(path) catch e {
+    panic(e.message())
+  }
+  let current = kwWatch(db, []byte("match"))
+  let lagged = kwWatch(db, []byte("never"))
+  kwPut(db, "match")
+  let i = 1
+  while (i < 1024) {
+    kwPut(db, "outside")
+    i = i + 1
+  }
+  kwChange(current, 1024)
+  kwPut(db, "outside")
+  kwChange(lagged, 1025, true)
+  let size = db.eng.file.size() catch e {
+    panic(e.message())
+  }
+  i = 0
+  while (i < 10) {
+    kwPut(db, "outside")
+    i = i + 1
+  }
+  let later = db.eng.file.size() catch e {
+    panic(e.message())
+  }
+  println("watch ring storage: full=${size}, after10=${later}")
+  assert(later <= size + 2 * i64(kvPageSize), "retired journal pages leaked")
+  current.close()
+  lagged.close()
+  db.close()
+  kvTestTeardown(path)
+}
+
+// Exact pre-extension commit boundary: COW data/free list, sync, zero-extension meta flip, sync.
+fn kwLegacyWrite(db: Db) {
+  db.eng.file.lock() catch e {
+    panic(e.message())
+  }
+  kvRefreshMeta(db.eng) catch e {
+    panic(e.message())
+  }
+  let bytes = db.eng.readPage(i64(db.eng.activeMeta)) catch e {
+    panic(e.message())
+  }
+  db.root = kvReadRoot(bytes)
+  let (free, chain) = kvReadFreeList(db.eng, db.eng.freeListRoot) catch e {
+    panic(e.message())
+  }
+  let t = Tx{
+    db = db,
+    root = db.root,
+    alloc = kvAllocator{ e = db.eng, free = free },
+    freed = kvIdSet{ ids = [] },
+  }
+  t.put([]byte("legacy"), []byte("value")) catch e {
+    panic(e.message())
+  }
+  kwLegacyCommit(db, t, chain) catch e {
+    panic(e.message())
+  }
+  db.eng.file.unlock() catch e {
+    panic(e.message())
+  }
+}
+
+fn kwLegacyCommit(db: Db, t: Tx, chain: []i64): ()! {
+  let kept = kvTruncateFreePages(db.eng, t.alloc.free)?
+  let root = kvWriteFreeList(db.eng, append(t.freed.ids, ...chain), kept)?
+  db.eng.file.sync()?
+  let version = db.eng.txid + 1
+  let buf = buildMetaPage(version, root)
+  kvWriteRootField(buf, t.root)
+  putU32(buf, kvCrcOffset, kvComputeCrc(buf))
+  let slot = 1 - db.eng.activeMeta
+  db.eng.writePage(i64(slot), buf)?
+  db.eng.file.sync()?
+  db.eng.txid = version
+  db.eng.freeListRoot = root
+  db.eng.activeMeta = slot
+  db.root = t.root
+}
+
+fn kwAlternation(db: Db, count: int) {
+  let i = 0
+  while (i < count) {
+    kwPut(db, "new")
+    kwLegacyWrite(db)
+    kwLegacyWrite(db)
+    i = i + 1
+  }
+}
+
+test "watch legacy gaps overflow and twenty old writer alternations reclaim journal pages" {
+  let path = scratchPath5721("watch-legacy")
+  let db = open(path) catch e {
+    panic(e.message())
+  }
+  let w = kwWatch(db, []byte("new"))
+  kwPut(db, "new")
+  kwLegacyWrite(db)
+  kwLegacyWrite(db)
+  kwChange(w, 3, true)
+  kwAlternation(db, 6)
+  let size = db.eng.file.size() catch e {
+    panic(e.message())
+  }
+  kwAlternation(db, 20)
+  let later = db.eng.file.size() catch e {
+    panic(e.message())
+  }
+  println("watch legacy storage: after6=${size}, after20more=${later}")
+  assert(later <= size + 2 * i64(kvPageSize), "legacy journal generations leaked")
+  kwPut(db, "new")
+  kwChange(w, kwVersion(db), true)
+  w.close()
+  db.close()
+  kvTestTeardown(path)
+}
+
+test "watch journal looking user bytes are never retired as page headers" {
+  let path = scratchPath5721("watch-collision")
+  let db = open(path) catch e {
+    panic(e.message())
+  }
+  let value = kvJournalPage(
+    kvJournalPayload([[]byte("collision")]) catch e {
+      panic(e.message())
+    },
+    1,
+    -1,
+    -1,
+  )
+  let fragment = value[:100]
+  db.tx((t) => {
+    t.put([]byte("user"), fragment)?
+  }) catch e {
+    panic(e.message())
+  }
+  kwLegacyWrite(db)
+  kwLegacyWrite(db)
+  kwPut(db, "new")
+  assert(
+    string(getOrEmpty(db.eng, db.root, []byte("user"))) == string(fragment),
+    "user value was reclaimed",
+  )
+  db.close()
+  kvTestTeardown(path)
+}
+
+test "watch corrupted journal refuses next and commit before publication" {
+  let path = scratchPath5721("watch-corrupt")
+  let db = open(path) catch e {
+    panic(e.message())
+  }
+  let w = kwWatch(db, []byte(""))
+  kwPut(db, "key")
+  let meta = kvReadMeta(db.eng) catch e {
+    panic(e.message())
+  }
+  let state = kvJournalStateOf(meta.bytes, meta.meta.txid) catch e {
+    panic(e.message())
+  }
+  let bytes = db.eng.readPage(state.root) catch e {
+    panic(e.message())
+  }
+  bytes[100] = bytes[100] ^ u8(1)
+  db.eng.writePage(state.root, bytes) catch e {
+    panic(e.message())
+  }
+  let failed = false
+  w.next(0) catch _ {
+    failed = true
+  }
+  assert(failed && w.cursor == 0, "corrupt next advanced")
+  failed = false
+  db.tx((t) => {
+    t.put([]byte("new"), []byte("no"))?
+  }) catch _ {
+    failed = true
+  }
+  assert(failed && kwVersion(db) == 1, "corrupt commit published")
+  bytes[100] = bytes[100] ^ u8(1)
+  putU32(bytes, kvJournalHeader, 4294967295)
+  putU32(bytes, kvJournalCrcOffset, kvJournalCrc(bytes))
+  db.eng.writePage(state.root, bytes) catch e {
+    panic(e.message())
+  }
+  failed = false
+  w.next(0) catch _ {
+    failed = true
+  }
+  assert(failed && w.cursor == 0, "valid-CRC malformed keys advanced")
+  failed = false
+  db.tx((t) => {
+    t.put([]byte("new"), []byte("no"))?
+  }) catch _ {
+    failed = true
+  }
+  assert(failed && kwVersion(db) == 1, "valid-CRC malformed keys published")
+  w.close()
+  db.close()
+  kvTestTeardown(path)
+}
+
+test "watch validates interval timeout and signed version boundary" {
+  let path = scratchPath5721("watch-boundary")
+  let db = open(path) catch e {
+    panic(e.message())
+  }
+  let failed = false
+  db.watch([]byte(""), 0) catch _ {
+    failed = true
+  }
+  assert(failed, "zero interval accepted")
+  let w = kwWatch(db, []byte(""))
+  failed = false
+  w.next(-1) catch _ {
+    failed = true
+  }
+  assert(failed, "negative timeout accepted")
+  w.close()
+  let meta = buildMetaPage(kvMaxVersion, -1)
+  db.eng.writePage(0, meta) catch e {
+    panic(e.message())
+  }
+  db.eng.writePage(1, meta) catch e {
+    panic(e.message())
+  }
+  assert(kwVersion(db) == i64(kvMaxVersion), "signed boundary lost")
+  failed = false
+  db.tx((t) => {
+    t.put([]byte("overflow"), []byte("no"))?
+  }) catch _ {
+    failed = true
+  }
+  assert(failed && kwVersion(db) == i64(kvMaxVersion), "version overflow published")
+  let outside = buildMetaPage(kvMaxVersion + 1, -1)
+  db.eng.writePage(0, outside) catch e {
+    panic(e.message())
+  }
+  db.eng.writePage(1, outside) catch e {
+    panic(e.message())
+  }
+  failed = false
+  db.version() catch _ {
+    failed = true
+  }
+  assert(failed, "unsigned version wrapped to a signed value")
+  db.close()
+  kvTestTeardown(path)
+}
+
+fn kwCrashJournal(db: Db, logged: int): ()! {
+  let snapshot = kvReadMeta(db.eng)?
+  let version = db.version()?
+  if (version < i64(logged)) {
+    fail newError("journal version lost a completed commit")
+  }
+  let state = kvJournalStateOf(snapshot.bytes, snapshot.meta.txid)?
+  kvJournalPruned(db.eng, state, snapshot.meta.txid)?
+  if (version > 0) {
+    let record = kvReadJournal(db.eng, state.root)?
+    if (len(record.keys) != 1 || decodeInt(record.keys[0]) != version) {
+      fail newError("journal and tree versions differ")
+    }
+    if (decodeInt(getOrEmpty(db.eng, db.root, record.keys[0])) != version) {
+      fail newError("journal key has no committed tree value")
+    }
+  }
+}

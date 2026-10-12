@@ -1,0 +1,291 @@
+// Meta CRC covers the extension; immutable records become visible with the tree's flip.
+const kvJournalRootOffset: int = 44
+const kvJournalCountOffset: int = 52
+const kvJournalMagicOffset: int = 56
+const kvJournalMagic: u32 = 0x4a4e4c31
+const kvJournalTag: byte = 3
+const kvJournalLimit: int = 1024
+const kvJournalCrcOffset: int = 29
+const kvJournalHeader: int = 33
+
+class kvJournalState { root: i64, count: int }
+class kvJournalRecord { version: u64, previous: i64, keys: [][]byte, pages: []i64 }
+class kvJournalPart { version: u64, previous: i64, next: i64, payload: []byte }
+
+fn kvJournalStateOf(buf: []byte, version: u64): kvJournalState! {
+  let root = getI64(buf, kvJournalRootOffset)
+  let count = int(getU32(buf, kvJournalCountOffset))
+  let magic = getU32(buf, kvJournalMagicOffset)
+  if (magic == 0 && root == 0 && count == 0) {
+    return kvJournalState{ root = -1, count = 0 }
+  }
+  if (magic != kvJournalMagic ||
+    root < 2 ||
+    count < 1 ||
+    count > kvJournalLimit ||
+    u64(count) > version) {
+    fail newError("kv: malformed journal meta extension")
+  }
+  return kvJournalState{ root = root, count = count }
+}
+
+fn kvJournalStamp(buf: []byte, state: kvJournalState) {
+  putI64(buf, kvJournalRootOffset, state.root)
+  putU32(buf, kvJournalCountOffset, u32(state.count))
+  putU32(buf, kvJournalMagicOffset, kvJournalMagic)
+}
+
+fn kvJournalCrc(buf: []byte): u32 {
+  let seed = crc32cUpdate(0, buf[:kvJournalCrcOffset])
+  return crc32cUpdate(seed, buf[kvJournalCrcOffset + 4:])
+}
+
+fn kvJournalLink(id: i64): bool { return id == -1 || id >= 2 }
+
+fn kvJournalPartOf(buf: []byte): kvJournalPart! {
+  if (buf[0] != kvJournalTag || getU32(buf, kvJournalCrcOffset) != kvJournalCrc(buf)) {
+    fail newError("kv: journal page tag or checksum mismatch")
+  }
+  let n = int(getU32(buf, 25))
+  let version = getU64(buf, 1)
+  let previous = getI64(buf, 9)
+  let next = getI64(buf, 17)
+  if (n < 1 || n > kvPageSize - kvJournalHeader || version == 0 || version > kvMaxVersion) {
+    fail newError("kv: malformed journal page payload or version")
+  }
+  if (!kvJournalLink(previous) || !kvJournalLink(next)) {
+    fail newError("kv: malformed journal page link")
+  }
+  return kvJournalPart{
+    version = version,
+    previous = previous,
+    next = next,
+    payload = buf[kvJournalHeader:kvJournalHeader + n],
+  }
+}
+
+fn kvJournalKeys(payload: []byte): [][]byte! {
+  if (len(payload) < 4) {
+    fail newError("kv: short journal key list")
+  }
+  let count = int(getU32(payload, 0))
+  if (count > (len(payload) - 4) / 4) {
+    fail newError("kv: journal key count exceeds payload")
+  }
+  let keys: [][]byte = []
+  let off = 4
+  let i = 0
+  while (i < count) {
+    if (off > len(payload) - 4) {
+      fail newError("kv: short journal key length")
+    }
+    let n = int(getU32(payload, off))
+    off = off + 4
+    if (n > kvPageSize || n > len(payload) - off) {
+      fail newError("kv: journal key exceeds payload")
+    }
+    keys = append(keys, payload[off:off + n])
+    off = off + n
+    i = i + 1
+  }
+  if (off != len(payload)) {
+    fail newError("kv: journal key list has trailing bytes")
+  }
+  return keys
+}
+
+fn kvReadJournal(e: Engine, head: i64): kvJournalRecord! {
+  let bound = e.file.size()? / i64(e.pageSize)
+  let seen = map<i64, bool>()
+  let pages: []i64 = []
+  let payload = []byte(0)
+  let id = head
+  let version: u64 = 0
+  let previous: i64 = -1
+  while (id != -1 && i64(len(pages)) < bound) {
+    let (_, duplicate) = seen[id]
+    if (id < 2 || id >= bound || duplicate) {
+      fail newError("kv: journal page link is outside file or cyclic")
+    }
+    seen[id] = true
+    let part = kvJournalPartOf(e.readPage(id)?)?
+    if (len(pages) == 0) {
+      version = part.version
+      previous = part.previous
+    }
+    if (part.version != version || part.previous != previous) {
+      fail newError("kv: journal continuation changes commit")
+    }
+    pages = append(pages, id)
+    payload = append(payload, ...part.payload)
+    id = part.next
+  }
+  if (id != -1) {
+    fail newError("kv: journal continuation exceeds file page bound")
+  }
+  return kvJournalRecord{
+    version = version,
+    previous = previous,
+    keys = kvJournalKeys(payload)?,
+    pages = pages,
+  }
+}
+
+fn kvJournalPayload(keys: [][]byte): []byte! {
+  if (u64(len(keys)) > 4294967295) {
+    fail newError("kv: journal has too many touched keys")
+  }
+  let body = kvAppendU32([]byte(0), u32(len(keys)))
+  for key of keys {
+    if (len(key) > kvPageSize) {
+      fail newError("kv: journal touched key exceeds page size")
+    }
+    body = kvAppendU32(body, u32(len(key)))
+    body = append(body, ...key)
+  }
+  return body
+}
+
+fn kvJournalPage(body: []byte, version: u64, previous: i64, next: i64): []byte {
+  let buf = []byte(kvPageSize)
+  buf[0] = kvJournalTag
+  putU64(buf, 1, version)
+  putI64(buf, 9, previous)
+  putI64(buf, 17, next)
+  putU32(buf, 25, u32(len(body)))
+  let i = 0
+  while (i < len(body)) {
+    buf[kvJournalHeader + i] = body[i]
+    i = i + 1
+  }
+  putU32(buf, kvJournalCrcOffset, kvJournalCrc(buf))
+  return buf
+}
+
+fn kvWriteJournal(a: kvAllocator, keys: [][]byte, version: u64, previous: i64): i64! {
+  let body = kvJournalPayload(keys)?
+  let capacity = kvPageSize - kvJournalHeader
+  let count = (len(body) + capacity - 1) / capacity
+  let next: i64 = -1
+  let i = count - 1
+  while (i >= 0) {
+    let id = a.alloc()?
+    let off = i * capacity
+    a.e.writePage(
+      id,
+      kvJournalPage(body[off:kvWatchMin(len(body), off + capacity)], version, previous, next),
+    )?
+    next = id
+    i = i - 1
+  }
+  return next
+}
+
+// All live page classes have disjoint first bytes: trees 0/1, free lists 2, journals 3.
+// Reserved meta IDs are excluded. Recovered journal pages enter only the deferred list.
+fn kvLegacyJournalPages(e: Engine, free: []i64): []i64! {
+  let available = map<i64, bool>()
+  for id of free {
+    available[id] = true
+  }
+  let bound = e.file.size()? / i64(e.pageSize)
+  let retired: []i64 = []
+  let id: i64 = 2
+  while (id < bound) {
+    let (_, reusable) = available[id]
+    if (!reusable) {
+      let buf = e.readPage(id)?
+      if (buf[0] == kvJournalTag) {
+        kvJournalPartOf(buf)?
+        retired = append(retired, id)
+      }
+    }
+    id = id + 1
+  }
+  return retired
+}
+
+fn kvJournalPruned(e: Engine, state: kvJournalState, version: u64): []i64! {
+  let id = state.root
+  let retired: []i64 = []
+  let i = 0
+  while (i < state.count) {
+    let record = kvReadJournal(e, id)?
+    if (record.version != version - u64(i)) {
+      fail newError("kv: journal commit sequence is broken")
+    }
+    if (i == kvJournalLimit - 1) {
+      retired = record.pages
+    }
+    id = record.previous
+    i = i + 1
+  }
+  return retired
+}
+
+fn kvCommitJournal(tx: Tx, previous: []byte, version: u64): kvJournalState! {
+  let oldVersion = getU64(previous, kvTxidOffset)
+  let state = kvJournalStateOf(previous, oldVersion)?
+  let retired = kvJournalPruned(tx.db.eng, state, oldVersion)?
+  if (state.count == 0) {
+    retired = kvLegacyJournalPages(tx.db.eng, tx.alloc.free)?
+  }
+  tx.freed.ids = append(tx.freed.ids, ...retired)
+  let root = kvWriteJournal(tx.alloc, tx.touched, version, state.root)?
+  return kvJournalState{ root = root, count = kvWatchMin(kvJournalLimit, state.count + 1) }
+}
+
+fn kvJournalPrefix(key: []byte, prefix: []byte): bool {
+  if (len(key) < len(prefix)) {
+    return false
+  }
+  let i = 0
+  while (i < len(prefix)) {
+    if (key[i] != prefix[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn kvJournalMatches(e: Engine, state: kvJournalState, version: u64, w: Watcher): bool! {
+  let id = state.root
+  let matched = false
+  let i = 0
+  while (i < state.count) {
+    let record = kvReadJournal(e, id)?
+    if (record.version != version - u64(i)) {
+      fail newError("kv: journal commit sequence is broken")
+    }
+    if (i64(record.version) > w.cursor) {
+      for key of record.keys {
+        if (kvJournalPrefix(key, w.prefix)) {
+          matched = true
+        }
+      }
+    }
+    id = record.previous
+    i = i + 1
+  }
+  return matched
+}
+
+fn kvJournalPoll(w: Watcher): Option<Change>! {
+  let snapshot = kvReadMeta(w.e)?
+  let v = kvCheckedVersion(snapshot.meta.txid)?
+  let state = kvJournalStateOf(snapshot.bytes, snapshot.meta.txid)?
+  if (v < w.cursor) {
+    fail newError("kv: committed version went backwards")
+  }
+  if (v == w.cursor) {
+    return Option<Change>.None
+  }
+  let overflow = v - w.cursor > i64(state.count)
+  let matched = kvJournalMatches(w.e, state, snapshot.meta.txid, w)?
+  w.cursor = v
+  if (overflow || matched) {
+    return Option.Some(Change{ version = v, overflow = overflow })
+  }
+  return Option<Change>.None
+}

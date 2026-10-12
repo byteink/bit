@@ -1,0 +1,124 @@
+// Durable observation owns a separate file description; it never changes a writer's lock.
+import { clone } from "std/seq"
+import { monotonic, Millisecond, sleep } from "std/time"
+
+const kvMaxVersion: u64 = 9223372036854775807
+const kvMaxWaitMs: int = 9223372036854
+
+fn kvCheckedVersion(v: u64): i64! {
+  if (v > kvMaxVersion) {
+    fail newError("kv: commit version exceeds i64")
+  }
+  return i64(v)
+}
+
+fn kvNextVersion(v: u64): u64! {
+  if (v >= kvMaxVersion) {
+    fail newError("kv: commit version exhausted")
+  }
+  return v + 1
+}
+
+fn kvOpenDb(e: Engine, path: string): Db! {
+  let observer = openEngine(path) catch why {
+    e.close()
+    fail why
+  }
+  let buf = e.readPage(i64(e.activeMeta)) catch why {
+    observer.close()
+    e.close()
+    fail why
+  }
+  return Db{ eng = e, observer = observer, path = path, root = kvReadRoot(buf) }
+}
+
+fn kvVersion(db: Db): i64! {
+  if (db.writerHeld) {
+    let meta = parseMetaPage(db.eng.readPage(i64(db.eng.activeMeta))?)?
+    return kvCheckedVersion(meta.txid)?
+  }
+  let e = db.observer
+  if (!e.file.tryLockShared()?) {
+    fail newError("kv: committed version unavailable while a writer is active")
+  }
+  let snapshot = kvReadMeta(e) catch why {
+    e.file.unlock()?
+    fail why
+  }
+  e.file.unlock()?
+  return kvCheckedVersion(snapshot.meta.txid)?
+}
+
+export class Change {
+  export readonly version: i64,
+  export readonly overflow: bool = false,
+}
+
+export class Watcher {
+  e: Engine
+  prefix: []byte
+  intervalMs: int
+  cursor: i64
+  closed: bool = false
+
+  export close() {
+    if (!this.closed) {
+      this.closed = true
+      this.e.close()
+    }
+  }
+
+  export next(timeoutMs: int): Option<Change>! {
+    if (this.closed) {
+      fail newError("kv: watcher is closed")
+    }
+    if (timeoutMs < 0 || timeoutMs > kvMaxWaitMs) {
+      fail newError("kv: watch timeout is outside the supported range")
+    }
+    let started = monotonic().ns
+    let budget = timeoutMs * Millisecond
+    let polls = timeoutMs / this.intervalMs + 2
+    let i = 0
+    while (i < polls) {
+      let change = kvWatchPoll(this)?
+      if (isSome(change)) {
+        return change
+      }
+      let elapsed = monotonic().ns - started
+      if (elapsed >= budget) {
+        return Option<Change>.None
+      }
+      sleep(kvWatchMin(this.intervalMs * Millisecond, budget - elapsed))
+      i = i + 1
+    }
+    return Option<Change>.None
+  }
+}
+
+fn kvWatch(db: Db, prefix: []byte, intervalMs: int): Watcher! {
+  if (intervalMs <= 0 || intervalMs > kvMaxWaitMs) {
+    fail newError("kv: watch interval must be positive and in range")
+  }
+  let cursor = db.version()?
+  let e = openEngine(db.path)?
+  return Watcher{ e = e, prefix = clone(prefix), intervalMs = intervalMs, cursor = cursor }
+}
+
+fn kvWatchPoll(w: Watcher): Option<Change>! {
+  if (!w.e.file.tryLockShared()?) {
+    return Option<Change>.None
+  }
+  let result = kvJournalPoll(w) catch why {
+    w.e.file.unlock()?
+    fail why
+  }
+  w.e.file.unlock()?
+  return result
+}
+
+fn kvWatchMin(a: int, b: int): int {
+  if (a < b) {
+    return a
+  }
+  return b
+}

@@ -64,5 +64,10 @@ transaction when called outside `store.tx`; every write inside one
 started, transactions, and the secondary-index layer are in
 [`docs/`](docs/README.md).
 
+`store.version()` observes the durable commit number across processes.
+`store.watch(prefix, intervalMs)` returns a reader that polls committed
+touched-key history with `next(timeoutMs)`. See [committed changes](docs/transactions.md#observe-committed-changes)
+for prefix matches, bounded history, overflow and reader lifetime.
+
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).

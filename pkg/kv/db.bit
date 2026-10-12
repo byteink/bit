@@ -84,24 +84,10 @@ import { exists } from "std/fs"
 // parent's `Db` was opened before the child's commit, and without this
 // refresh its own commit clobbered the child's.
 fn kvRefreshMeta(e: Engine): ()! {
-  let bufA = e.readPage(0)?
-  let bufB = e.readPage(1)?
-  let metaA = kvTryParseMeta(bufA)
-  let metaB = kvTryParseMeta(bufB)
-  if (isNone(metaA) && isNone(metaB)) {
-    fail newError("kv: write: both meta pages failed validation; cannot commit")
-  }
-  if (isSome(metaA) && (isNone(metaB) || unwrap(metaA).txid >= unwrap(metaB).txid)) {
-    let m = unwrap(metaA)
-    e.txid = m.txid
-    e.freeListRoot = m.freeListRoot
-    e.activeMeta = 0
-    return
-  }
-  let m = unwrap(metaB)
-  e.txid = m.txid
-  e.freeListRoot = m.freeListRoot
-  e.activeMeta = 1
+  let snapshot = kvReadMeta(e)?
+  e.txid = snapshot.meta.txid
+  e.freeListRoot = snapshot.meta.freeListRoot
+  e.activeMeta = snapshot.slot
 }
 
 // --- B+tree root persistence (this ticket's own extension of the meta page)
@@ -488,6 +474,7 @@ export class Tx {
   root: i64
   alloc: kvAllocator
   freed: kvIdSet
+  touched: [][]byte = []
   live: bool = true
 
   // "The handle must not remain usable after the block returns" (#3467): an
@@ -521,10 +508,12 @@ export class Tx {
         kvEncodeNode(kvNode.Leaf([kvLeafEntry{ key = key, value = value }])),
       )?
       this.root = id
+      this.touched = append(this.touched, clone(key))
       return
     }
     let result = kvTxInsertInto(this.alloc, this.freed, this.root, key, value)?
     this.root = kvApplyInsertRoot(this.alloc, result)?
+    this.touched = append(this.touched, clone(key))
   }
 
   export delete(key: []byte): ()! {
@@ -535,7 +524,10 @@ export class Tx {
     let result = kvTxDeleteFrom(this.alloc, this.freed, this.root, key)?
     match (result) {
       Unchanged => {}
-      Removed(id) => { this.root = id }
+      Removed(id) => {
+        this.root = id
+        this.touched = append(this.touched, clone(key))
+      }
     }
   }
 
@@ -560,10 +552,14 @@ export class Tx {
 export class Db {
   eng: Engine
   root: i64
+  path: string
+  observer: Engine
+  writerHeld: bool = false
   writing: bool = false
 
   clearWriting() {
     this.writing = false
+    this.writerHeld = false
   }
 
   // Best-effort: `File.close` releases the lock unconditionally on Unix and
@@ -571,12 +567,20 @@ export class Db {
   // unlock here is not a stuck lock, only a lock that outlives this call a
   // little longer than intended.
   unlockQuiet() {
+    this.writerHeld = false
     this.eng.file.unlock() catch _ {
       return
     }
   }
 
+  export version(): i64! { return kvVersion(this)? }
+
+  export watch(prefix: []byte, intervalMs: int): Watcher! {
+    return kvWatch(this, prefix, intervalMs)?
+  }
+
   export close() {
+    this.observer.close()
     this.eng.close()
   }
 
@@ -600,6 +604,8 @@ export class Db {
     defer this.unlockQuiet()
 
     kvRefreshMeta(this.eng)?
+    this.writerHeld = true
+    kvNextVersion(this.eng.txid)?
     let metaBuf = this.eng.readPage(i64(this.eng.activeMeta))?
     this.root = kvReadRoot(metaBuf)
 
@@ -669,13 +675,16 @@ export class Db {
     // reads that list, and the single-writer lock means that can only happen
     // after this commit's meta flip has already made the pages they
     // reference unreachable from any meta a reopen could ever choose.
+    let newTxid = kvNextVersion(this.eng.txid)?
+    let previous = this.eng.readPage(i64(this.eng.activeMeta))?
+    let journal = kvCommitJournal(tx, previous, newTxid)?
     let kept = kvTruncateFreePages(this.eng, tx.alloc.free)?
     let pending = append(tx.freed.ids, ...oldChain)
     let newFreeListRoot = kvWriteFreeList(this.eng, pending, kept)?
     this.eng.file.sync()?
-    let newTxid = this.eng.txid + 1
     let buf = buildMetaPage(newTxid, newFreeListRoot)
     kvWriteRootField(buf, tx.root)
+    kvJournalStamp(buf, journal)
     putU32(buf, kvCrcOffset, kvComputeCrc(buf))
     let inactive = 1 - this.eng.activeMeta
     this.eng.writePage(i64(inactive), buf)?
@@ -695,9 +704,8 @@ export class Db {
 export fn open(path: string): Db! {
   if (!exists(path)) {
     let eng = create(path)?
-    return Db{ eng = eng, root = noRoot }
+    return kvOpenDb(eng, path)?
   }
   let eng = openEngine(path)?
-  let buf = eng.readPage(i64(eng.activeMeta))?
-  return Db{ eng = eng, root = kvReadRoot(buf) }
+  return kvOpenDb(eng, path)?
 }
