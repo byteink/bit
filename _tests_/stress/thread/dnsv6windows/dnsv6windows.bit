@@ -1,103 +1,54 @@
-// The Windows resolver asks an IPv6 nameserver (#7480): `netResolvePasses`
-// (runtime/net/windows/netabi.bit) is handed a one-entry list holding `::1` and
-// resolves a name through a fake nameserver bound on [::1]. Before #7480 an IPv6
-// adapter server was dropped at discovery and the Windows resolver could only
-// dial AF_INET, so a host whose first DNS server is IPv6 (Tailscale's
-// `fd7a:115c:a1e0::53` on the test box) asked it nothing.
-//
-// WINDOWS-ONLY, HAND-RUN FROM `_tests_/bit/windowssmoke/windowssmoke.bit`, and placed as a
-// subdirectory of `_tests_/stress/thread/` for the reason ../gcthreadswindows
-// states: nothing imports it, so the stress corpus walker never loads it.
-//
-//   BIT_LIBBITRT=<archive> bit build _tests_/stress/thread/dnsv6windows \
-//     --target x86_64-windows -o <out>.exe
-//
-// The stub is a spawned task on a raw Winsock socket (the runtime's UDP bind
-// takes IPv4 only), blocking in `recvfrom` on its own worker thread while the
-// main thread sits in the resolver's own blocking receive. That needs a second
-// worker, so the harness runs this with BIT_WORKERS=4; with one, the stub's
-// blocking receive starves the task that would send the query. It answers the one
-// query with `1.2.3.4`. The walk's inputs are the resolve block a caller of
-// `bit_rt_net_resolve_w` never sees: the window, the attempt count, the port the
-// stub bound (`netNsPortOff`) and the list of `netAdapterDnsStride` (20) byte
-// entries.
-//
-// Prints `dnsv6 ok 1.2.3.4` on success; anything else is a `dnsv6 FAIL` line, a
-// failure the harness reports with the program's whole output.
+// Native Windows DNS controls (#6351, #7480). The fake IPv6 server is
+// nonblocking too: a raw blocking stub would itself prevent GC progress.
+// Query arrival synchronizes the unanswered lookup before allocation starts.
+// Every wait is bounded; each scenario joins both tasks and closes its socket.
+// Built and run by _tests_/bit/windowssmoke with BIT_WORKERS=4.
+
+import { WaitGroup } from "std/sync"
+import { monotonic } from "std/time"
 
 extern fn socket(af: i32, ty: i32, proto: i32): i64
 extern fn bind(s: i64, name: *byte, namelen: i32): i32
 extern fn getsockname(s: i64, name: *byte, namelen: *i32): i32
-extern fn setsockopt(s: i64, level: i32, optname: i32, optval: *byte, optlen: i32): i32
+extern fn ioctlsocket(s: i64, cmd: i32, arg: *byte): i32
 extern fn recvfrom(s: i64, buf: *byte, len: i32, flags: i32, name: *byte, namelen: *i32): i32
 extern fn sendto(s: i64, buf: *byte, len: i32, flags: i32, name: *byte, namelen: i32): i32
 extern fn closesocket(s: i64): i32
 extern fn WSAGetLastError(): i32
 extern fn bit_rt_port_net_resolve_passes(host: int, hostLen: int, ns: int, out: int): bool
+extern fn bit_rt_port_stw_collections(): int
+extern fn bit_rt_port_stw_pause_max_ns(): int
 
-// winsock2.h / ws2ipdef.h.
-const afInet6: int = 23
-const sockDgram: int = 2
-const ipprotoUdp: int = 17
-const solSocket: int = 65535
-const soRcvTimeo: int = 4102
 const sa6Len: int = 28
-
-// The resolve block (`netNsBlockBytes`, runtime/net/net.bit) is eight words:
-// the address (two), the window, the attempts, the port, the port step, the list
-// pointer and its byte length.
-const nsWindow: int = 2
-const nsAttempts: int = 3
-const nsPort: int = 4
-const nsStep: int = 5
-const nsList: int = 6
-const nsListLen: int = 7
 const entryBytes: int = 20
 const answerBytes: int = 16
 const queryMax: int = 512
-
-// THE FIXTURE'S ONE CLOCK (#7824). The resolver waits at most `windowMs` for the
-// stub: the window word of the block (`netNsTimeoutOff`) is the `SO_RCVTIMEO` that
-// `netDnsSocket` (runtime/net/windows/dns.bit) puts on its socket, and with one
-// attempt (`nsAttempts`) over a one-entry list `netResolvePasses`
-// (runtime/net/windows/netabi.bit) asks exactly once, so the resolve returns false
-// after `windowMs` at the latest. The stub gets the same bound on its own receive
-// (`armTimeout`), and `main` waits `bindPolls` one-millisecond sleeps for the stub's
-// port, so no wait in this program is open-ended. That matters because the stub
-// parks a whole worker thread in a raw `recvfrom`: the process cannot end while it
-// does, and with one worker `main` never runs either. Without the receive timeout
-// a run whose query never arrives never ends (measured on the Windows box:
-// BIT_WORKERS=1 until killed, BIT_WORKERS=4 15 s after `main` returned). A run
-// longer than `2 * windowMs` is a runtime hang, which `runchild.ps1` kills at the
-// harness's phase timeout.
-const windowMs: int = 5000
-const bindPolls: int = 5000
+const windowMs: int = 2000
+const maxPolls: int = 5000
+const sliceWords: int = 65536
+const churnRounds: int = 32
+const pauseBudgetNs: int = 50000000
 
 let stubPort: [1]i64
+let stubArrived: [1]i64
 let stubAnswered: [1]i64
-let stubLen: [1]i32
+let resolverDone: [1]i64
+let resolverOk: [1]i64
+let stubDone: [1]i64
 
-// ::1, `sockaddr_in6`: the family (a little-endian u16) at 0, the address at 8.
 fn loopback6(sa: []byte) {
   sa[0] = 23
   sa[23] = 1
 }
 
-// `windowMs` as the receive timeout, a little-endian DWORD of milliseconds
-// (SO_RCVTIMEO on Windows), so a failed run ends instead of hanging.
-fn armTimeout(s: i64) {
-  let t = []byte(4)
-  t[0] = u8(windowMs % 256)
-  t[1] = u8(windowMs / 256 % 256)
-  t[2] = u8(windowMs / 65536 % 256)
-  t[3] = u8(windowMs / 16777216)
-  let _ = setsockopt(s, i32(solSocket), i32(soRcvTimeo), ptrOf(t), i32(4))
-  keepAlive(t)
+fn nonblocking(s: i64): bool {
+  let one = []byte(4)
+  one[0] = 1
+  let ok = ioctlsocket(s, i32(0x8004667E), ptrOf(one)) == 0
+  keepAlive(one)
+  return ok
 }
 
-// The reply to `q[0..n)`: the query's own bytes with the response and
-// recursion-available flags and one answer, `1.2.3.4`, a compression pointer to
-// the question's name. Returns the reply's length.
 fn answer(q: []byte, n: int): int {
   q[2] = 129
   q[3] = 128
@@ -111,46 +62,73 @@ fn answer(q: []byte, n: int): int {
   return n + answerBytes
 }
 
-fn stub() {
-  let s = socket(i32(afInet6), i32(sockDgram), i32(ipprotoUdp))
-  let sa = []byte(sa6Len)
-  loopback6(sa)
-  if (int(bind(s, ptrOf(sa), i32(sa6Len))) != 0) {
-    print("dnsv6 FAIL stub bind\n")
-    return
-  }
-  stubLen[0] = i32(sa6Len)
-  let _ = getsockname(s, ptrOf(sa), ptrOf(stubLen))
-  armTimeout(s)
-  atomicAdd(ptrOf(stubPort), int(sa[2]) * 256 + int(sa[3]))
-  let q = []byte(queryMax)
-  let from = []byte(sa6Len)
-  stubLen[0] = i32(sa6Len)
-  let n = int(
-    recvfrom(s, ptrOf(q), i32(queryMax - answerBytes), i32(0), ptrOf(from), ptrOf(stubLen)),
-  )
-  if (n < 12) {
-    print("dnsv6 FAIL stub recv ${n} wsa=${int(WSAGetLastError())}\n")
-    return
-  }
-  let m = answer(q, n)
-  let _ = sendto(s, ptrOf(q), i32(m), i32(0), ptrOf(from), i32(sa6Len))
-  atomicAdd(ptrOf(stubAnswered), 1)
-  let _ = closesocket(s)
-}
-
-fn main() {
-  spawn stub()
+fn receive(s: i64, q: []byte, from: []byte): int {
+  let size = []i32(1)
   let polls = 0
-  while (int(atomicLoad(ptrOf(stubPort))) == 0 && polls < bindPolls) {
+  while (polls < maxPolls) {
+    size[0] = i32(sa6Len)
+    let n = int(recvfrom(s, ptrOf(q), i32(queryMax - answerBytes), i32(0), ptrOf(from), ptrOf(size)))
+    if (n >= 0) {
+      return n
+    }
+    if (int(WSAGetLastError()) != 10035) {
+      return -1
+    }
     timeSleepNs(1000000)
     polls = polls + 1
   }
-  let port = int(atomicLoad(ptrOf(stubPort)))
-  if (port == 0) {
-    print("dnsv6 FAIL stub never bound\n")
+  return -1
+}
+
+fn waitWord(word: *i64): bool {
+  let polls = 0
+  while (atomicLoad(word) == 0 && polls < maxPolls) {
+    timeSleepNs(1000000)
+    polls = polls + 1
+  }
+  return atomicLoad(word) != 0
+}
+
+fn serve(s: i64, respond: bool) {
+  let q = []byte(queryMax)
+  let from = []byte(sa6Len)
+  let n = receive(s, q, from)
+  assert(n >= 12, "DNS stub receive ${n}")
+  atomicAdd(ptrOf(stubArrived), 1)
+  if (respond) {
+    let m = answer(q, n)
+    let sent = sendto(s, ptrOf(q), i32(m), i32(0), ptrOf(from), i32(sa6Len))
+    assert(int(sent) == m, "DNS stub send ${int(sent)} of ${m}")
+    atomicAdd(ptrOf(stubAnswered), 1)
     return
   }
+  assert(waitWord(ptrOf(resolverDone)), "DNS resolver did not finish")
+}
+
+fn stub(respond: bool, closed: bool, joined: WaitGroup) {
+  let s = socket(i32(23), i32(2), i32(17))
+  assert(s != -1, "DNS stub socket")
+  let sa = []byte(sa6Len)
+  loopback6(sa)
+  assert(bind(s, ptrOf(sa), i32(sa6Len)) == 0, "DNS stub bind")
+  assert(nonblocking(s), "DNS stub nonblocking")
+  let size = []i32(1)
+  size[0] = i32(sa6Len)
+  assert(getsockname(s, ptrOf(sa), ptrOf(size)) == 0, "DNS stub port")
+  let port = int(sa[2]) * 256 + int(sa[3])
+  if (closed) {
+    assert(closesocket(s) == 0, "DNS closed stub")
+    atomicAdd(ptrOf(stubPort), port)
+  } else {
+    atomicAdd(ptrOf(stubPort), port)
+    serve(s, respond)
+    assert(closesocket(s) == 0, "DNS stub close")
+  }
+  atomicAdd(ptrOf(stubDone), 1)
+  joined.done()
+}
+
+fn resolve(port: int, joined: WaitGroup) {
   let host = []byte(12)
   let name = "example.test"
   let i = 0
@@ -158,26 +136,90 @@ fn main() {
     host[i] = name[i]
     i = i + 1
   }
-  // A list entry is the 16-byte IPv6 wire form then a four-byte scope id: ::1, scope 0.
   let list = []byte(entryBytes)
   list[15] = 1
   let ns = []i64(8)
-  ns[nsWindow] = windowMs
-  ns[nsAttempts] = 1
-  ns[nsPort] = port
-  ns[nsStep] = 0
-  ns[nsList] = int(ptrOf(list))
-  ns[nsListLen] = entryBytes
+  ns[2] = windowMs
+  ns[3] = 1
+  ns[4] = port
+  ns[6] = int(ptrOf(list))
+  ns[7] = entryBytes
   let out = []byte(8)
   let ok = bit_rt_port_net_resolve_passes(int(ptrOf(host)), 12, int(ptrOf(ns)), int(ptrOf(out)))
   keepAlive(host)
   keepAlive(list)
   keepAlive(ns)
-  let addr = "${int(out[0])}.${int(out[1])}.${int(out[2])}.${int(out[3])}"
-  let served = int(atomicLoad(ptrOf(stubAnswered)))
-  if (ok && addr == "1.2.3.4" && served == 1) {
-    print("dnsv6 ok ${addr}\n")
-    return
+  assert(!ok || (out[0] == 1 && out[1] == 2 && out[2] == 3 && out[3] == 4), "DNS address")
+  if (ok) {
+    atomicAdd(ptrOf(resolverOk), 1)
   }
-  print("dnsv6 FAIL resolved=${ok} addr=${addr} answered=${served}\n")
+  atomicAdd(ptrOf(resolverDone), 1)
+  joined.done()
+}
+
+fn churn(): int {
+  let sum = 0
+  let r = 0
+  while (r < churnRounds) {
+    let block = []i64(sliceWords)
+    block[0] = i64(r)
+    block[sliceWords - 1] = i64(r)
+    sum = sum + int(block[0]) + int(block[sliceWords - 1])
+    r = r + 1
+  }
+  return sum
+}
+
+fn checkProgress(): bool {
+  let before = bit_rt_port_stw_collections()
+  let sum = churn()
+  let after = bit_rt_port_stw_collections()
+  let pause = bit_rt_port_stw_pause_max_ns()
+  let pending = atomicLoad(ptrOf(resolverDone)) == 0
+  print("dnsgc collected=${after > before} pending=${pending} pause-ns=${pause} sum=${sum}\n")
+  return after > before && pending && pause < pauseBudgetNs && sum == 992
+}
+
+fn resetWords() {
+  atomicStore(ptrOf(stubPort), 0)
+  atomicStore(ptrOf(stubArrived), 0)
+  atomicStore(ptrOf(stubAnswered), 0)
+  atomicStore(ptrOf(resolverDone), 0)
+  atomicStore(ptrOf(resolverOk), 0)
+  atomicStore(ptrOf(stubDone), 0)
+}
+
+fn scenario(respond: bool, closed: bool): bool {
+  resetWords()
+  let joined = WaitGroup()
+  joined.add(2)
+  spawn stub(respond, closed, joined)
+  assert(waitWord(ptrOf(stubPort)), "DNS stub never bound")
+  let started = monotonic().ns
+  spawn resolve(int(atomicLoad(ptrOf(stubPort))), joined)
+  let progress = true
+  if (!closed) {
+    assert(waitWord(ptrOf(stubArrived)), "DNS query never arrived")
+    if (!respond) {
+      progress = checkProgress()
+    }
+  }
+  assert(waitWord(ptrOf(resolverDone)), "DNS resolver deadline")
+  assert(waitWord(ptrOf(stubDone)), "DNS stub deadline")
+  joined.wait()
+  let elapsed = (monotonic().ns - started) / 1000000
+  let answered = atomicLoad(ptrOf(stubAnswered)) == 1
+  let resolved = atomicLoad(ptrOf(resolverOk)) == 1
+  print("dnsgc answer=${respond} closed=${closed} elapsed-ms=${elapsed} resolved=${resolved}\n")
+  return progress && resolved == respond && answered == respond && elapsed <= windowMs + 250
+}
+
+fn main() {
+  assert(scenario(true, false), "DNS IPv6 success")
+  print("dnsv6 ok 1.2.3.4\n")
+  assert(scenario(false, false), "DNS GC progress and timeout")
+  assert(scenario(false, false), "DNS repeated timeout")
+  assert(scenario(true, false), "DNS success after timeout")
+  assert(scenario(false, true), "DNS closed server")
+  print("dnsgc ok\n")
 }
