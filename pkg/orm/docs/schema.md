@@ -138,24 +138,47 @@ fn addSalaryToPeople() {
 }
 ```
 
-Three other types are deliberately absent, weighed and left out rather
-than overlooked:
+## Binary responses and expiry
 
-- **A separate `i32` column.** `ColumnType.Int` stays the single integer
-  variant on purpose (this file's own header) - a dialect maps it to
-  whichever integer type stores 64 bits, and there is no narrower column
-  to ask for. Nothing observed in this package needs a smaller integer
-  column badly enough to reopen that decision.
-- **`[]byte` (a binary blob).** No table in this package, or in anything
-  that uses it, has needed one yet. Add it, rendered and tested, the day
-  something does; declaring it earlier would be a column nothing exercises.
+Cached HTTP responses need their exact bytes back, including zero bytes and
+non-UTF-8 data. `binary` stores them as PostgreSQL `bytea` or MySQL/MariaDB
+`longblob`. `timestamptz` records the expiry instant: PostgreSQL uses
+`timestamptz`, while MySQL/MariaDB use `datetime(6)`. Write UTC values to the
+latter; unlike `timestamp`, `datetime` performs no session-zone conversion.
+
+```bit
+import { table, alter } from "orm"
+
+fn responseCache() {
+  table("responses", (t) => {
+    t.text("key")
+    t.primaryKey("key")
+    t.binary("body")
+    t.timestamptz("expires_at")
+    t.index("expires_at")
+  })
+  alter("responses", (t) => {
+    t.binary("headers").nullable()
+    t.timestamptz("finished_at").nullable()
+  })
+}
+```
+
+The existing `timestamp` builder keeps its mapping: PostgreSQL `timestamptz`,
+MySQL/MariaDB `timestamp`. Use the explicit instant builder when the latter's
+range or session-zone conversion is unsuitable, as for a UTC expiry store.
+
+Two other types are deliberately absent:
+
+- **A separate `i32` column.** `ColumnType.Int` remains one 64-bit integer
+  type; there is no narrower column to ask for.
 - **A date with no time.** `t.timestamp` always renders `timestamptz` - a
   bare `timestamp` has no zone, so an instant read from one is invented
   (see [Dialect](dialect.md)). A calendar date with genuinely no time
   component is rarer still and has no caller here today; `t.raw(...)` is
   the escape hatch until one shows up.
 
-`Option<T>` is not a fourth entry on this list - it was never a distinct
+`Option<T>` is not another entry on this list - it was never a distinct
 `ColumnType` question. Every column already carries nullability as its own
 flag: `t.decimal("salary").nullable()` is how an optional decimal is
 declared, the identical mechanism `t.timestamp(...).nullable()` already

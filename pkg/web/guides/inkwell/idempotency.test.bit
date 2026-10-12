@@ -12,8 +12,9 @@
 // This is its own file, not more of app.test.bit, to keep both under the
 // 800-line ceiling. Helpers such as `testApp`, `registerAndLogin` and
 // `uniqueName` are app.test.bit's; the two files are one module.
-import { CachedResponse, IdempotencyClaim } from "web"
+import { CachedResponse, Header, IdempotencyClaim } from "web"
 import { sqlReqInt } from "std/sql"
+import { output } from "std/process"
 
 // POST with a JSON body, the caller's session cookie and an `Idempotency-Key`.
 fn keyedPost(path: string, cookie: string, key: string, body: string): Request {
@@ -27,6 +28,7 @@ fn countRows(countSql: string, arg: string): i64 {
   let p = testPool() catch e {
     panic("testPool: ${e.message()}")
   }
+  defer p.close()
   let rows = p.query(countSql, [Value.Text(arg)]) catch e {
     panic("count query: ${e.message()}")
   }
@@ -93,6 +95,7 @@ fn expectReplay(c: Case, body: string, arg: string) {
     second.getHeader("Location") == location,
     "the replay named ${second.getHeader("Location")}, the first response ${location}",
   )
+  assert(second.body == first.body, "replay must retain the exact response bytes")
   assert(countRows(c.countSql, arg) == 1, "a retried request must store exactly one row")
 }
 
@@ -256,4 +259,165 @@ test "POST /articles/:id/comments: a duplicate sent while the first is still run
   let path = "/articles/${articleId}/comments"
   let req = keyedPost(path, cookie, uniqueName("key"), commentBody(text))
   expectInFlightConflict(app, held, req, commentCount, text)
+}
+
+fn poolSessions(p: Pool): i64! {
+  let rows = p.query(
+    "select count(*) as n from pg_stat_activity where datname = current_database() and backend_type = 'client backend'",
+    []Value(0),
+  )?
+  defer rows.close()
+  assert(rows.next()?, "session count returned no row")
+  return sqlReqInt(rows, rows.columns(), "n")?
+}
+
+test "ordinary buildApp shares one pool for readiness and the SQL store" {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let observer = open(cfg.databaseUrl) catch e {
+    panic(e.message())
+  }
+  let p: Pool = observer.pool
+  defer p.close()
+  let before = poolSessions(p) catch e {
+    panic(e.message())
+  }
+  let app = buildApp(cfg) catch e {
+    panic(e.message())
+  }
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  let ready = app.handle(Request{ method = "GET", path = "/ready" })
+  assert(ready.status == 200, "readiness must use the ORM pool")
+  let after = poolSessions(p) catch e {
+    panic(e.message())
+  }
+  assert(
+    after == before + 1,
+    "ordinary app opened ${after - before} connections, want one shared pool",
+  )
+}
+
+fn cacheClaim(store: SqlIdempotencyStore, key: string, fp: string): IdempotencyClaim {
+  return store.begin(key, fp, 60) catch e {
+    panic(e.message())
+  }
+}
+
+fn cacheFinish(store: SqlIdempotencyStore, key: string, token: string, resp: CachedResponse) {
+  store.finish(key, token, resp, 60) catch e {
+    panic(e.message())
+  }
+}
+
+test "builder migration preserves binary cached responses and expired reservations" {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let db = open(cfg.databaseUrl) catch e {
+    panic(e.message())
+  }
+  defer db.pool.close()
+  let store = SqlIdempotencyStore(db.pool) catch e {
+    panic(e.message())
+  }
+  let key = uniqueName("bytes")
+  let fp = string([]byte{ 0, 255, 128, 39, 92, 10 })
+  let first = cacheClaim(store, key, fp)
+  assert(first.won(), "first reservation must win")
+  let resp = CachedResponse{
+    status = 201,
+    body = fp,
+    headers = [Header{ name = "X-Byte-Test", value = "a:b" }],
+  }
+  cacheFinish(store, key, first.token, resp)
+  let replay = cacheClaim(store, key, fp)
+  assert(!replay.won(), "completed reservation must replay")
+  let entry = unwrap(replay.existing)
+  assert(entry.fingerprint == fp, "fingerprint bytes changed")
+  assert(entry.response.status == 201, "cached status changed")
+  assert(entry.response.body == fp, "arbitrary response bytes changed")
+  assert(entry.response.headers[0].name == "X-Byte-Test", "header name changed")
+  assert(entry.response.headers[0].value == "a:b", "header value changed")
+  let expired = db.exec(
+    "update bit_idempotency set expires_at = CURRENT_TIMESTAMP - INTERVAL '1 day' where fingerprint = ?",
+    Value.Blob([]byte(fp)),
+  ) catch e {
+    panic(e.message())
+  }
+  assert(expired == 1, "expiry control must update the completed reservation")
+  let renewed = cacheClaim(store, key, fp)
+  assert(renewed.won(), "expired reservation must become claimable")
+  cacheFinish(store, key, first.token, CachedResponse{ status = 500, body = "stale" })
+  let held = cacheClaim(store, key, fp)
+  assert(!held.won(), "renewed reservation must stay held")
+  assert(
+    unwrap(held.existing).response.body == "",
+    "late finish must not overwrite the new reservation",
+  )
+  store.abandon(key, renewed.token) catch e {
+    panic(e.message())
+  }
+}
+
+test "the idempotency builder migration is recorded once on a second migrate" {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let repo = env("BIT_REPO")
+  let bin = env("BIT_BIN")
+  assert(len(repo) > 0 && len(bin) > 0, "run through the owned web-guide harness")
+  let cmd = "cd '${repo}/pkg/web/guides/inkwell' && DATABASE_URL='${cfg.databaseUrl}' exec '${bin}' migrate"
+  let result = output("/bin/sh", ["-c", cmd], 60000)
+  assert(result.exitCode == 0, "second migrate: ${result.stderr}")
+  let p = testPool() catch e {
+    panic(e.message())
+  }
+  defer p.close()
+  let rows = p.query(
+    "select count(*) as n from migrations where migration = '2026_01_06_000001_create_idempotency_keys'",
+    []Value(0),
+  ) catch e {
+    panic(e.message())
+  }
+  defer rows.close()
+  assert(
+    rows.next() catch e {
+      panic(e.message())
+    },
+    "migration history row",
+  )
+  let n = sqlReqInt(rows, rows.columns(), "n") catch e {
+    panic(e.message())
+  }
+  assert(n == 1, "idempotency migration must be applied once")
+  assert(
+      countRows(
+        "select count(*) as n from pg_indexes where tablename = $1 and indexname = 'bit_idempotency_expires_at_idx'",
+        "bit_idempotency",
+      ) ==
+      1,
+    "builder migration must retain the expiry index",
+  )
+}
+
+test "failed ordinary startup closes the shared pool" {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let db = open(cfg.databaseUrl) catch e {
+    panic(e.message())
+  }
+  defer db.pool.close()
+  let before = poolSessions(db.pool) catch e {
+    panic(e.message())
+  }
+  cfg.jwtSecret = "short"
+  assert(contains(startupError(cfg), "32 bytes"), "startup must reject the key")
+  let after = poolSessions(db.pool) catch e {
+    panic(e.message())
+  }
+  assert(after == before, "failed startup leaked a pool connection")
 }

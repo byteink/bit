@@ -32,6 +32,7 @@ import { open } from "orm"
 
 fn main(): ()! {
   let db = open("postgres://localhost/inkwell")?
+  defer db.pool.close()
   let articles = db.table<Article>()
 
   let a = articles.insert(Article{ id = 0, title = "Hello", body = "First post." })?
@@ -48,6 +49,11 @@ fn main(): ()! {
 `mysql://`) - nothing else in your program names one. `db.table<Article>()`
 already holds the connection, so no function in this package takes `db` as
 an argument the way an older version of this package's `find`/`save` did.
+
+`db.pool` is the same read-only `std/sql.Pool` held by every repository.
+Pass it to a sibling store that accepts a pool, such as a response cache,
+and close it when the process finishes; opening another pool is unnecessary.
+The field cannot be replaced, while the pool itself remains usable.
 
 ## Docs
 

@@ -156,11 +156,10 @@ takes a `std/sql` pool and works on PostgreSQL, MySQL 8 and MariaDB. The app's
 
 ```bit
 import { SqlIdempotencyStore } from "web"
-import { Datasource, pool } from "std/sql"
-import { adapter } from "postgres"
+import { Db } from "orm"
 
-fn openIdempotencyStore(databaseUrl: string): SqlIdempotencyStore! {
-  let store = SqlIdempotencyStore(pool(adapter(), Datasource{ uri = databaseUrl })?)?
+fn openIdempotencyStore(db: Db): SqlIdempotencyStore! {
+  let store = SqlIdempotencyStore(db.pool)?
   store.purge()?
   return store
 }
@@ -173,34 +172,41 @@ correctness, because a key past its `ttl` counts as new, but nothing else
 removes them, so Inkwell sweeps once on each start. A server that stays up for
 weeks should run `store.purge()` on a schedule too.
 
-The store uses a pool of its own because `pkg/orm`'s `Db` keeps its pool to
-itself; the table behind it, `bit_idempotency`, belongs to the store, and no
-Inkwell entity reads it.
+The store shares the application's `db.pool` with its repositories. `Db`
+exports that pool read-only, so ordinary startup opens one ORM database and
+passes its pool to the store. Tests can still inject a held store through
+`buildAppWith`. No Inkwell entity reads the store's `bit_idempotency` table.
 
 ### The table is a migration like any other
 
-Inkwell's tables come from `bit migrate`, so this one does too. The package
-publishes the exact statements its store reads and writes, and the migration
-hands them to the schema builder's `raw` escape hatch rather than retyping
-them, because the builder has no `bytea` or `timestamptz` column:
+Inkwell's tables come from `bit migrate`, so this one does too. The builder
+expresses the store's contract: a key primary key, binary fingerprint and
+cached headers/body, reservation token/state/status, and an indexed expiry
+instant. `binary` renders `bytea` on PostgreSQL and `longblob` on MySQL;
+`timestamptz` renders `timestamptz` or `datetime(6)` respectively. The store
+writes UTC expiry values. Inkwell itself runs on PostgreSQL.
 
 ```bit
 import { Schema } from "orm"
-import { IdempotencyDialect, sqlIdempotencyMigration } from "web"
 
 export class CreateIdempotencyKeys {
   up(s: Schema): ()! {
-    s.table("bit_idempotency", (t) => {
-      for stmt of sqlIdempotencyMigration(IdempotencyDialect.Postgres) {
-        t.raw(stmt)
-      }
+    s.create("bit_idempotency", (t) => {
+      t.text("key_hash")
+      t.primaryKey("key_hash")
+      t.binary("fingerprint")
+      t.text("token")
+      t.int("state")
+      t.int("status")
+      t.binary("headers")
+      t.binary("body")
+      t.timestamptz("expires_at")
+      t.index("expires_at")
     })?
   }
 
   down(s: Schema): ()! {
-    s.table("bit_idempotency", (t) => {
-      t.raw("drop table if exists bit_idempotency")
-    })?
+    s.drop("bit_idempotency")?
   }
 }
 ```
