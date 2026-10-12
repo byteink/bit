@@ -28,6 +28,11 @@
 // `BIT_G2ARCHIVE_RT` archive build ~5s, one `bit run` of the fixture ~1s —
 // around 6s total, not free enough to add silently to every routine run.
 //
+// #7985 also tests free-list takes, growth, policy windows and remap refusal
+// through a same-module probe in the scratch copy. Its final mark uses the
+// real coordinator close/drain path with a recruited-helper hint; it does
+// not create a concurrent helper or measure RSS.
+//
 // Nothing under `bit-out/` or the checkout is written by this program: every
 // mutated path is under a fresh `$TMPDIR` scratch directory, and the
 // symlink it creates only ever points INTO the checkout, never writes to it.
@@ -188,12 +193,10 @@ fn stageArchive(root: string, bin: string, repo: string, scratch: string, ms: in
   return archivePath
 }
 
-// Stage 4: run the fixture linked against the debug archive — the fixture
-// path itself is inside the scratch tree (via the Stage 1 symlink), so its
-// own compile reads runtime/gc's SOURCE from the same flipped copy the
-// archive was built from.
+// Stage 4: run a private fixture copy linked against the debug archive.
+// Its imports read the same runtime copy, including the trim probe.
 fn stageRun(bin: string, repo: string, archivePath: string, scratch: string, ms: int): string {
-  let fixture = "${repo}/_tests_/stress/gcbit/gcbit.bit"
+  let fixture = stageTrimFixture(repo)
   let script = "BIT_LIBBITRT='${archivePath}' '${bin}' run '${fixture}'\n"
   let (code, out) = runCaptured(scratch, "run", script, ms)
   if (code != 0) {
@@ -256,6 +259,299 @@ fn assertRescanLine(out: string) {
   println("gcfaultrescan: PASS — ${line}")
 }
 
+// Probe source is split at function boundaries to keep each emitter small.
+fn trimProbeSource0(): string {
+  return "let gcTrimProbeLeafWord: i64 = 0\n" +
+    "let gcTrimProbeCalls: i64 = 0\n" +
+    "let gcTrimProbeLo: i64 = 0\n" +
+    "let gcTrimProbeHi: i64 = 0\n" +
+    "let gcTrimProbeFail: bool = false\n" +
+    "\n" +
+    "@nosplit fn gcTrimProbeRemap(addr: i64, nbytes: i64): i64 {\n" +
+    "  gcTrimProbeCalls = gcTrimProbeCalls + 1\n" +
+    "  gcTrimProbeLo = addr - gcMkBase\n" +
+    "  gcTrimProbeHi = gcTrimProbeLo + nbytes\n" +
+    "  if (gcTrimProbeFail) {\n" +
+    "    return 0\n" +
+    "  }\n" +
+    "  return bit_rt_remap_pages(addr, nbytes)\n" +
+    "}\n" +
+    "\n" +
+    "@nosplit fn gcTrimProbeStart(g: *i64, budget: int, takes: int) {\n" +
+    "  *(g + gcStackTop) = 0\n" +
+    "  *(g + gcStackLen) = budget * gcMkSegEntries\n" +
+    "  gcMkSeed(g)\n" +
+    "  gcMkSegs = gcMkFree\n" +
+    "  gcMkFreeMin = gcMkFree\n" +
+    "  gcMkJoined = takes\n" +
+    "}\n" +
+    "\n" +
+    "@nosplit fn gcTrimProbeTake(g: *i64, leaf: int, takes: int): bool {\n" +
+    "  let k = 0\n" +
+    "  while (k < takes) { // bounded: caller uses at most sixteen contexts\n" +
+    "    let c = gcMkCtx(k)\n" +
+    "    gcMkCtxReset(c, g)\n" +
+    "    if (!gcMkTakeFree(c)) {\n" +
+    "      return false\n" +
+    "    }\n" +
+    "    gcMkRoot(c, leaf)\n" +
+    "    storeWord(*(c + gcMkCtxSeg), headerFromBody(leaf))\n" +
+    "    gcMkDrainLocal(c)\n" +
+    "    k = k + 1\n" +
+    "  }\n" +
+    "  return true\n" +
+    "}\n" +
+    "\n" +
+    "@nosplit fn gcTrimProbeReturn(takes: int): bool {\n" +
+    "  atomicStore(ptrOf(gcMkDone), 1)\n" +
+    "  let k = 0\n" +
+    "  while (k < takes) { // bounded: caller uses at most sixteen contexts\n" +
+    "    let c = gcMkCtx(k)\n" +
+    "    if (gcMkRefill(c, false) || *(c + gcMkCtxSeg) != 0) {\n" +
+    "      return false\n" +
+    "    }\n" +
+    "    k = k + 1\n" +
+    "  }\n" +
+    "  return gcMkFree == gcMkSegs\n" +
+    "}\n" +
+    "\n" +
+    "@nosplit fn gcTrimProbePhase(g: *i64, leaf: int, budget: int, takes: int): bool {\n" +
+    "  gcTrimProbeStart(g, budget, takes)\n" +
+    "  if (!gcTrimProbeTake(g, leaf, takes) || !gcTrimProbeReturn(takes)) {\n" +
+    "    return false\n" +
+    "  }\n" +
+    "  if (gcMkOpen != 0 || gcMkIn != 0 || gcMkSegs - gcMkFreeMin != takes) {\n" +
+    "    return false\n" +
+    "  }\n" +
+    "  worldDrainOrDie(ptrOf(gcMkIn))\n" +
+    "  gcMkTrim()\n" +
+    "  return gcOwns(g, leaf) && loadWord(leaf) == 7654321\n" +
+    "}\n" +
+    "\n"
+}
+
+fn trimProbeSource1(): string {
+  return "@nosplit fn gcTrimProbeWindow(g: *i64, leaf: int, takes: int): bool {\n" +
+    "  let k = 0\n" +
+    "  while (k < gcMkTrimPhases) { // bounded: one policy window\n" +
+    "    if (!gcTrimProbePhase(g, leaf, 256, takes)) {\n" +
+    "      return false\n" +
+    "    }\n" +
+    "    k = k + 1\n" +
+    "  }\n" +
+    "  return gcMkTouched == takes && gcMkNeed == 0 && gcMkWin == 0\n" +
+    "}\n" +
+    "\n" +
+    "@nosplit fn gcTrimProbeMark(g: *i64, leaf: int): bool {\n" +
+    "  let w = memMapPages(worldWords * 8)\n" +
+    "  if (w == 0) {\n" +
+    "    return false\n" +
+    "  }\n" +
+    "  let world = wordAt(w)\n" +
+    "  atomicStore(world + worldEpochWord, 1)\n" +
+    "  worldGangOpen(world, int(g))\n" +
+    "  worldGangRecruited(1)\n" +
+    "  atomicStore(ptrOf(gcMkOwner), 0)\n" +
+    "  let ok = gcRootJobsOpen(g)\n" +
+    "  if (ok) {\n" +
+    "    gcTrimProbeLeafWord = leaf\n" +
+    "    gcRootRange(g, int(ptrOf(gcTrimProbeLeafWord)), 1)\n" +
+    "    ok = gcMarkPar(g)\n" +
+    "    gcRootJobsClose(g)\n" +
+    "  }\n" +
+    "  worldGangClose(world)\n" +
+    "  atomicStore(ptrOf(gcGangWorld), 0)\n" +
+    "  atomicStore(ptrOf(gcGangBlock), 0)\n" +
+    "  memUnmapPages(w, worldWords * 8)\n" +
+    "  return ok && gcMkOpen == 0 && gcMkIn == 0 && gcMkFreeMin == gcMkSegs - 1\n" +
+    "}\n" +
+    "\n" +
+    "@nosplit fn gcTrimProbeResetWindow() {\n" +
+    "  gcMkTouched = 0\n" +
+    "  gcMkNeed = 0\n" +
+    "  gcMkWin = 0\n" +
+    "  gcTrimProbeCalls = 0\n" +
+    "}\n" +
+    "\n" +
+    "@nosplit fn gcTrimProbeCold(g: *i64, leaf: int): bool {\n" +
+    "  gcTrimProbeResetWindow()\n" +
+    "  return gcTrimProbeWindow(g, leaf, 1)\n" +
+    "}\n" +
+    "\n"
+}
+
+fn trimProbeSource2(): string {
+  return "@nosplit fn gcTrimProbeRemaps(g: *i64, leaf: int): bool {\n" +
+    "  gcTrimProbeResetWindow()\n" +
+    "  if (!gcTrimProbePhase(g, leaf, 256, 16)) {\n" +
+    "    return false\n" +
+    "  }\n" +
+    "  gcMkNeed = 0\n" +
+    "  gcMkWin = 0\n" +
+    "  if (!gcTrimProbeWindow(g, leaf, 9)) {\n" +
+    "    return false\n" +
+    "  }\n" +
+    "  if (gcTrimProbeCalls != 0) { // nine segments round up to the prior two pages\n" +
+    "    return false\n" +
+    "  }\n" +
+    "  if (!gcTrimProbeWindow(g, leaf, 1)) {\n" +
+    "    return false\n" +
+    "  }\n" +
+    "  if (gcTrimProbeCalls != 1 || gcTrimProbeLo != 16384 || gcTrimProbeHi != 32768) {\n" +
+    "    return false\n" +
+    "  }\n" +
+    "  if (gcMkBase == 0 || loadWord(gcMkBase + 16384) != 0) {\n" +
+    "    return false\n" +
+    "  }\n" +
+    "  return gcTrimProbeFailedRemap(g, leaf)\n" +
+    "}\n" +
+    "\n" +
+    "@nosplit fn gcTrimProbeFailedRemap(g: *i64, leaf: int): bool {\n" +
+    "  gcMkTouched = 16\n" +
+    "  gcTrimProbeFail = true\n" +
+    "  let k = 0\n" +
+    "  while (k < gcMkTrimPhases) { // bounded: one failed-remap window\n" +
+    "    if (!gcTrimProbePhase(g, leaf, 256, 1)) {\n" +
+    "      gcTrimProbeFail = false\n" +
+    "      return false\n" +
+    "    }\n" +
+    "    k = k + 1\n" +
+    "  }\n" +
+    "  gcTrimProbeFail = false\n" +
+    "  return gcMkBase == 0 && gcTrimProbeCalls == 2 && gcMkTouched == 0 &&\n" +
+    "    gcMkNeed == 0 && gcMkWin == 0 && gcMkReserve()\n" +
+    "}\n" +
+    "\n"
+}
+
+fn trimProbeSource3(): string {
+  return "@nosplit fn gcTrimProbeSwap(g: *i64, leaf: int): bool {\n" +
+    "  gcTrimProbeStart(g, 256, 1)\n" +
+    "  let c = gcMkCtx(0)\n" +
+    "  gcMkCtxReset(c, g)\n" +
+    "  if (!gcMkTakeFree(c)) {\n" +
+    "    return false\n" +
+    "  }\n" +
+    "  storeWord(*(c + gcMkCtxSeg), headerFromBody(leaf))\n" +
+    "  *(c + gcMkCtxN) = 1\n" +
+    "  if (!gcMkSwap(c) || !gcMkRefill(c, false)) {\n" +
+    "    return false\n" +
+    "  }\n" +
+    "  gcMkDrainLocal(c)\n" +
+    "  if (gcMkRefill(c, false)) {\n" +
+    "    return false\n" +
+    "  }\n" +
+    "  return gcMkSegs - gcMkFreeMin == 2 && gcMkFree == gcMkSegs\n" +
+    "}\n" +
+    "\n" +
+    "@nosplit fn gcTrimProbePolicy(g: *i64, leaf: int): int {\n" +
+    "  if (!gcTrimProbeSwap(g, leaf)) {\n" +
+    "    return 8\n" +
+    "  }\n" +
+    "  if (!gcTrimProbeCold(g, leaf)) {\n" +
+    "    return 16\n" +
+    "  }\n" +
+    "  if (!gcTrimProbeRemaps(g, leaf)) {\n" +
+    "    return 32\n" +
+    "  }\n" +
+    "  if (!gcTrimProbeMark(g, gcAllocRaw(g, 8, loadWord(headerFromBody(leaf))))) {\n" +
+    "    return 64\n" +
+    "  }\n" +
+    "  return 0\n" +
+    "}\n" +
+    "\n" +
+    "export @nosplit fn gcTrimProbe(g: *i64, leaf: int): int {\n" +
+    "  let oldLen = *(g + gcStackLen)\n" +
+    "  atomicStore(ptrOf(gcMkOwner), 1)\n" +
+    "  if (!gcMkReserve()) {\n" +
+    "    return 90\n" +
+    "  }\n" +
+    "  storeWord(leaf, 7654321)\n" +
+    "  gcTrimProbeResetWindow()\n" +
+    "  let result = 0\n" +
+    "  if (!gcTrimProbePhase(g, leaf, 256, 1)) {\n" +
+    "    result = result + 1\n" +
+    "  }\n" +
+    "  if (!gcTrimProbePhase(g, leaf, 256, 9)) {\n" +
+    "    result = result + 2\n" +
+    "  }\n" +
+    "  if (!gcTrimProbePhase(g, leaf, 1, 2)) {\n" +
+    "    result = result + 4\n" +
+    "  }\n" +
+    "  if (result == 0) {\n" +
+    "    result = gcTrimProbePolicy(g, leaf)\n" +
+    "  }\n" +
+    "  *(g + gcStackLen) = oldLen\n" +
+    "  atomicStore(ptrOf(gcMkOwner), 0)\n" +
+    "  return result\n" +
+    "}\n"
+}
+
+// #7985: private same-module access tests the real free-list and trim paths.
+// The probe and remap recorder exist only in the scratch runtime.
+fn stageTrimProbe(repo: string) {
+  let path = "${repo}/runtime/gc/gcmarktrim.bit"
+  let src = readFile(path) catch e {
+    panic("gcfaultrescan: cannot read ${path}: ${e.message()}")
+  }
+  let want = "bit_rt_remap_pages(i64(gcMkBase + lo), i64(hi - lo))"
+  if (count(src, want) != 1) {
+    panic("gcfaultrescan: trim remap call changed shape")
+  }
+  let probe = trimProbeSource0() + trimProbeSource1() + trimProbeSource2() + trimProbeSource3()
+  writeFile(
+    path,
+    replace(src, want, "gcTrimProbeRemap(i64(gcMkBase + lo), i64(hi - lo))") + "\n" + probe,
+  ) catch e {
+    panic("gcfaultrescan: cannot write trim probe: ${e.message()}")
+  }
+}
+
+// Keep the established scripted heap and leaf descriptor for the trim test.
+fn stageTrimFixture(repo: string): string {
+  let src = readFile("${repo}/_tests_/stress/gcbit/gcbit.bit") catch e {
+    panic("gcfaultrescan: cannot read gcbit fixture: ${e.message()}")
+  }
+  let call = "  recoverOverflowTrace(s)"
+  if (count(src, call) != 1 || count(src, "  gcInit,") != 1) {
+    panic("gcfaultrescan: gcbit fixture changed shape")
+  }
+  src = replace(src, "../../../runtime", "../runtime")
+  src = replace(src, "  gcInit,", "  gcInit,\n  gcTrimProbe,")
+  let probe = "  let leaf = gcAllocRaw(g, 8, metaAddr + MI_LEAF * 8)\n" +
+    "  let trimCode = gcTrimProbe(g, leaf)\n" +
+    "  let trimAlive = len(b.arena) + len(b.indexArena) + len(b.heapBlock) +\n" +
+    "    len(b.meta) + len(b.state) + len(b.roots)\n" +
+    "  print(\"gcmarktrim code=\${trimCode} alive=\${trimAlive} expected=\${alive}\\n\")\n"
+  src = replace(src, call, call + "\n" + probe)
+  let dir = "${repo}/trim"
+  mkdir(dir) catch e {
+    panic("gcfaultrescan: cannot create ${dir}: ${e.message()}")
+  }
+  let path = "${dir}/gcbit.bit"
+  writeFile(path, src) catch e {
+    panic("gcfaultrescan: cannot write ${path}: ${e.message()}")
+  }
+  return path
+}
+
+fn assertTrimLine(out: string) {
+  let line = findLine(split(out, "\n"), "gcmarktrim ")
+  let alive = fieldInt(line, "alive")
+  let expected = fieldInt(line, "expected")
+  let hdr = findLine(split(out, "\n"), "hdrpack ")
+  if (len(line) == 0 ||
+    fieldInt(line, "code") != 0 ||
+    alive <= 0 ||
+    alive != expected ||
+    expected != fieldInt(hdr, "alive")) {
+    eprint(out)
+    println("gcfaultrescan: FAIL — native mark-pool trim probe")
+    exit(1)
+  }
+  println("gcfaultrescan: PASS — ${line}")
+}
+
 fn main() {
   let ms = timeoutMs()
   let root = repoRoot()
@@ -268,9 +564,11 @@ fn main() {
 
   let repo = stageCopy(root, scratch, ms)
   flipFaultConst(repo)
+  stageTrimProbe(repo)
   let archivePath = stageArchive(root, bin, repo, scratch, ms)
   let out = stageRun(bin, repo, archivePath, scratch, ms)
 
   teardown(scratch, ms)
   assertRescanLine(out)
+  assertTrimLine(out)
 }
