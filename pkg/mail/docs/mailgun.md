@@ -214,3 +214,17 @@ a bad port, a path, any query parameter but `insecureSkipVerify`, and
 [Signing your mail](dkim.md) has the keys used above, [Retries and pace](retry.md)
 the options, and [Sending through SendGrid](sendgrid.md) is the same idea for a
 provider that builds the message itself.
+
+## Require TLS for the recipient hop
+
+A welcome email that must not leave Mailgun over plaintext sets
+`Options.requireTls = true`. The MIME request includes `o:require-tls=yes` and
+`o:skip-verification=no`; the message file retains the exact signed bytes.
+[Mailgun's sending options](https://documentation.mailgun.com/docs/mailgun/user-manual/sending-messages/pass-sending-options)
+state that unavailable TLS prevents delivery. This is Mailgun's provider
+setting, rather than a claim that it propagates SMTP REQUIRETLS to every relay.
+
+`Message.dsn` and `Options.bounce` have no equivalent in this MIME endpoint and
+fail `Invalid` before a request. Do not add a Return-Path header to imitate an
+envelope sender. [The envelope example](mailer.md#keep-delivery-guarantees-on-the-envelope)
+shows the SMTP form when those guarantees are required.

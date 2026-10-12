@@ -354,6 +354,51 @@ fn main(): ()! {
 `Auth`, `Rejected`, `Transient` and `Unknown` carry the server's `Reply`: its `code`, its
 `enhanced` status code (`""` when it sent none) and its `text`.
 
+
+## Keep delivery guarantees on the envelope
+
+Inkwell wants a failed welcome message reported and refuses delivery over
+plaintext. Set the guarantees when the mailer starts, then request SMTP delivery
+notifications on the message. The bounce address has exactly the same DNS
+domain as the effective From, after IDNA conversion and case normalization.
+Its local part may differ. It changes MAIL FROM, not From, Message-ID or DKIM.
+
+```bit
+import { Mailer, Message, Options, Outbox } from "mail"
+import { Dsn, Notify, Ret } from "std/smtp"
+
+fn main(): ()! {
+  let box = Outbox()
+  let mailer = Mailer(
+    box,
+    Options{ from = "hello@inkwell.dev", bounce = "bounce@inkwell.dev", requireTls = true },
+  )?
+  defer mailer.close()
+  let receipt = mailer.send(
+    Message{
+      to = ["sara@example.com"], subject = "Welcome to Inkwell", text = "Hello Sara.",
+      dsn = Dsn{ notify = [Notify.Failure], ret = Ret.Headers, envid = "welcome-7" },
+    },
+  )?
+  println(receipt.accepted[0])
+  return
+}
+```
+
+This local Outbox example prints `sara@example.com`. With SMTP, every transaction
+carries REQUIRETLS; the sender must negotiate verified TLS and the server must
+offer REQUIRETLS and DSN. A missing capability fails `Rejected` before MAIL and
+never retries or tries a fallback that could drop the guarantee. An unrelated
+bounce domain fails `Invalid` before delivery, including from `render`.
+Subdomains are also refused: this package checks strict alignment, not a public
+suffix or organizational-domain rule. The stored Message and Options are unchanged.
+
+Mailgun carries the TLS request as `o:require-tls=yes` with verification enabled;
+it cannot request this SMTP DSN or a per-message bounce. Resend, Postmark and
+SendGrid cannot request these guarantees and fail `Invalid` before any request.
+A custom transport receives the captured envelope and owns honoring it. Outbox
+records locally and makes no promise about a network hop.
+
 ## Where to go next
 
 The package front page is [README](../README.md), and

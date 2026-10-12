@@ -1,0 +1,405 @@
+// #6915: guarantees survive envelopes, batches, redirects and durable jobs.
+import { Dsn, Notify, Ret, Envelope, checkEnvelope } from "std/smtp"
+import { jsonDecode, jsonEncode, jsonParse } from "std/json"
+
+fn eoServe(f: smTls) {
+  defer f.ln.close()
+  let c = f.ln.accept() catch e {
+    f.log <- "accept: ${e.message()}"
+    return
+  }
+  let seen = smRunTls(f, c) catch e {
+    c.close()
+    f.log <- "server: ${e.message()}"
+    return
+  }
+  c.close()
+  f.log <- seen
+}
+
+fn eoStart(replies: []string): (int, chan<string>)! {
+  let ln = tlsListen("127.0.0.1", 0, smServerConfig()?)?
+  let port = ln.port() catch e {
+    ln.close()
+    fail e
+  }
+  let log = chan<string>(1)
+  spawn eoServe(smTls{ ln = ln, replies = replies, log = log })
+  return (port, log)
+}
+
+fn eoServePlain(f: smPlain) {
+  defer f.ln.close()
+  let c = f.ln.accept() catch e {
+    f.log <- "accept: ${e.message()}"
+    return
+  }
+  let seen = smRunPlain(f, c) catch e {
+    c.close()
+    f.log <- "server: ${e.message()}"
+    return
+  }
+  c.close()
+  f.log <- seen
+}
+
+fn eoStartPlain(replies: []string): (int, chan<string>)! {
+  let ln = listen("127.0.0.1", 0)?
+  let port = ln.port() catch e {
+    ln.close()
+    fail e
+  }
+  let log = chan<string>(1)
+  spawn eoServePlain(smPlain{ ln = ln, replies = replies, log = log })
+  return (port, log)
+}
+
+fn eoOptions(): Options {
+  let o = smOpts()
+  o.requireTls = true
+  o.bounce = "Bounce <bounce@INKWELL.dev>"
+  return o
+}
+
+fn eoMessage(): Message {
+  let m = smMsg(["sara@example.com", "lee@example.com"])
+  m.dsn = Dsn{ notify = [Notify.Failure], ret = Ret.Headers, envid = "welcome 7" }
+  return m
+}
+
+fn eoCase1(): ()! {
+  let caps = "250-REQUIRETLS\r\n250-DSN\r\n250-LIMITS RCPTMAX=1\r\n"
+  let replies = smHappy(smEhlo(caps), false, ["250 accepted\r\n"])
+  replies = replies[:len(replies) - 1]
+  let second = smHappy("", false, ["250 accepted\r\n"])
+  for reply of second[1:] {
+    replies = append(replies, reply)
+  }
+  let (port, log) = eoStart(replies)?
+  let ca = smCaFile()?
+  defer {
+    remove(ca) catch _ {}
+  }
+  let o = eoOptions()
+  let mailer = open(smTlsUrl(port, ca, ""), o)?
+  let msg = eoMessage()
+  let receipt = mailer.send(msg)?
+  mailer.close()
+  let wire = <- log
+  assert(len(receipt.accepted) == 2, wire)
+  assert(
+    inCount(wire, "MAIL FROM:<bounce@inkwell.dev> RET=HDRS ENVID=welcome+207 REQUIRETLS") == 2,
+    wire,
+  )
+  assert(inCount(wire, "NOTIFY=FAILURE ORCPT=rfc822;") == 2, wire)
+  assert(inCount(wire, "From: \"Inkwell\" <hello@inkwell.dev>") == 2, wire)
+  assert(inCount(wire, "Message-ID: <welcome-1@inkwell.dev>") == 2, wire)
+  assert(o.bounce == "Bounce <bounce@INKWELL.dev>" && msg.from == "", "caller mutated")
+}
+
+test "E6915 verified TLS DSN and bounce survive every recipient batch" {
+  eoCase1() catch e {
+    panic(e.message())
+  }
+}
+
+fn eoMissing(tls: bool): ()! {
+  let caps = "250-DSN\r\n"
+  if (!tls) {
+    caps = "250-REQUIRETLS\r\n"
+  }
+  let (port, log) = eoStart([smEhlo(caps), "221 Bye\r\n"])?
+  let ca = smCaFile()?
+  defer {
+    remove(ca) catch _ {}
+  }
+  let mailer = open(smTlsUrl(port, ca, ""), eoOptions())?
+  let fallback = foScript([])
+  mailer.t = Failover(
+    [mailer.t, fallback],
+    ["smtp://test", "fallback://test"],
+    false,
+    FoClock{ t = 0 },
+  )
+  let refused = false
+  mailer.send(eoMessage()) catch e {
+    match (e) {
+      Rejected(r) => refused = contains(r.text, "does not offer")
+      _ => panic(e.message())
+    }
+  }
+  mailer.close()
+  let wire = <- log
+  assert(refused && foCalls(fallback) == 0, "guarantee refused with fallback")
+  assert(
+    !contains(wire, "MAIL FROM:") && !contains(wire, "RCPT TO:") && !contains(wire, "DATA\r\n"),
+    wire,
+  )
+}
+
+fn eoCase2(): ()! {
+  eoMissing(true)?
+  eoMissing(false)?
+}
+
+test "E6915 missing REQUIRETLS or DSN is permanent before MAIL with no fallback" {
+  eoCase2() catch e {
+    panic(e.message())
+  }
+}
+
+fn eoCase3(): ()! {
+  let o = inOptions()
+  assert(
+      parseField("bounce", "\"Odd@Local\"@BÜCHER.example")?.email ==
+      "\"Odd@Local\"@xn--bcher-kva.example",
+  )
+  o.bounce = "Bounce@BÜCHER.example"
+  o.dkim = [Dkim{ domain = "xn--bcher-kva.example", selector = "rsa1", key = rsaPkcs8Pem }]
+  o.redirect = "qa@Bücher.example"
+  let mailer = Mailer(Outbox(), o)?
+  defer mailer.close()
+  let msg = inMessage()
+  msg.dsn = Dsn{ notify = [Notify.Failure] }
+  let d = mailer.prepare(msg)?
+  assert(d.envelope.from == "Bounce@xn--bcher-kva.example")
+  assert(d.envelope.to[0] == "qa@xn--bcher-kva.example" && d.envelope.dsn.notify[0] == Notify.Failure)
+  assert(d.message.dsn.notify[0] == Notify.Failure)
+  assert(
+      contains(d.raw, "d=xn--bcher-kva.example;") &&
+      contains(d.raw, "<Sender@xn--bcher-kva.example>"),
+    d.raw,
+  )
+  assert(msg.to[0] == "Sara <Sara@Bücher.example>" && o.bounce == "Bounce@BÜCHER.example")
+}
+
+test "E6915 strict bounce preserves header From signing IDNA redirect and caller" {
+  eoCase3() catch e {
+    panic(e.message())
+  }
+}
+
+fn eoInvalidBounce(bounce: string): ()! {
+  let box = Outbox()
+  let o = smOpts()
+  o.bounce = bounce
+  let mailer = Mailer(box, o)?
+  let rejected = 0
+  mailer.send(eoMessage()) catch e {
+    assert(contains(e.message(), "Options.bounce"))
+    rejected = rejected + 1
+  }
+  mailer.render(eoMessage()) catch e {
+    assert(contains(e.message(), "Options.bounce"))
+    rejected = rejected + 1
+  }
+  mailer.close()
+  assert(rejected == 2 && len(box.sent()) == 0)
+}
+
+fn eoCase4(): ()! {
+  eoInvalidBounce("bounce@unrelated.dev")?
+  eoInvalidBounce("bounce@child.inkwell.dev")?
+  eoInvalidBounce("bounce@evilinkwell.dev")?
+}
+
+test "E6915 bounce unrelated child and suffix lookalike domains fail send and render" {
+  eoCase4() catch e {
+    panic(e.message())
+  }
+}
+
+fn eoDecode(text: string): queuedMail! {
+  return jsonDecode<queuedMail>(jsonParse(text)?)?
+}
+
+fn eoCase5(): ()! {
+  let o = eoOptions()
+  o.dkim = [Dkim{ domain = "inkwell.dev", selector = "rsa1", key = rsaPkcs8Pem }]
+  let mailer = Mailer(Outbox(), o)?
+  defer mailer.close()
+  let d = mailer.prepare(eoMessage())?
+  let stored = queuedMailOf(d, false)
+  let restored = deliveryOf(eoDecode(jsonEncode(stored.toJson()))?)?
+  assert(restored.raw == d.raw && restored.messageId == d.messageId)
+  assert(contains(restored.raw, "DKIM-Signature:") && contains(restored.raw, "d=inkwell.dev;"))
+  assert(restored.envelope.from == d.envelope.from && restored.envelope.requireTls)
+  assert(restored.envelope.dsn.notify[0] == Notify.Failure && restored.envelope.dsn.ret == Ret.Headers)
+  assert(restored.envelope.dsn.envid == "welcome 7")
+  let legacy = eoDecode("{\"raw\":\"\",\"messageId\":\"old\",\"from\":\"hello@inkwell.dev\",\"to\":[\"a@example.com\"]}")?
+  let old = deliveryOf(legacy)?
+  assert(!old.envelope.requireTls && !dsnRequested(old.envelope.dsn))
+}
+
+test "E6915 durable queue captures guarantees and bytes with legacy defaults" {
+  eoCase5() catch e {
+    panic(e.message())
+  }
+}
+
+fn eoCase6(): ()! {
+  checkEnvelope(Envelope{ from = "", to = ["a@example.com"] })?
+  let bad = queuedMail{
+    raw = "",
+    messageId = "bad",
+    from = "hello@inkwell.dev",
+    to = ["a@example.com"],
+    notify = Option.Some("NEVER,FAILURE"),
+  }
+  let transport = quTransport([])
+  let mailer = Mailer(transport)?
+  defer mailer.close()
+  let refused = false
+  deliverQueued(mailer, bad) catch _ {
+    refused = true
+  }
+  assert(refused && transport.calls() == 0)
+  bad.notify = Option.Some("")
+  bad.envid = Option.Some("bad\r\nid")
+  refused = false
+  deliverQueued(mailer, bad) catch _ {
+    refused = true
+  }
+  assert(refused && transport.calls() == 0)
+}
+
+test "E6915 malformed restored DSN fails before custom delivery and null reverse path valid" {
+  eoCase6() catch e {
+    panic(e.message())
+  }
+}
+
+fn eoUnsupported(t: Transport, scheme: string): ()! {
+  let refused = false
+  Mailer(t, eoOptions()) catch e {
+    refused = contains(e.message(), "cannot")
+  }
+  assert(refused, scheme)
+  let required = smOpts()
+  required.requireTls = true
+  refused = false
+  Mailer(t, required) catch e {
+    refused = contains(e.message(), "cannot guarantee REQUIRETLS")
+  }
+  assert(refused, scheme)
+  let d = Mailer(Outbox(), smOpts())?.prepare(eoMessage())?
+  refused = false
+  t.deliver(d) catch e {
+    refused = contains(e.message(), "cannot request delivery notifications")
+  }
+  assert(refused, scheme)
+  d.envelope.dsn = Dsn{}
+  d.envelope.requireTls = true
+  refused = false
+  t.deliver(d) catch e {
+    refused = contains(e.message(), "cannot guarantee REQUIRETLS")
+  }
+  assert(refused, scheme)
+  d.envelope.requireTls = false
+  d.envelope.from = "bounce@inkwell.dev"
+  refused = false
+  t.deliver(d) catch e {
+    refused = contains(e.message(), "bounce")
+  }
+  assert(refused, scheme)
+  t.close()
+}
+
+fn eoCase7(): ()! {
+  let o = smOpts()
+  eoUnsupported(ResendTransport(parseResend("resend://key@127.0.0.1:1")?, o), "resend")?
+  eoUnsupported(PostmarkTransport(parsePostmark("postmark://key@127.0.0.1:1")?, o), "postmark")?
+  eoUnsupported(SendgridTransport(parseSendgrid("sendgrid://key@127.0.0.1:1")?, o), "sendgrid")?
+  let refused = false
+  open("smtp://127.0.0.1:1?tls=off", Options{ requireTls = true }) catch e {
+    refused = contains(e.message(), "tls=off")
+  }
+  assert(refused)
+}
+
+test "E6915 all JSON providers refuse unsupported guarantees before network and direct Mailer" {
+  eoCase7() catch e {
+    panic(e.message())
+  }
+}
+
+fn eoCase8(): ()! {
+  let o = smOpts()
+  o.requireTls = true
+  let (port, log) = rsStart([mgAccepted()])?
+  let (mailer, tap) = mgTapMailer(port, o)
+  mailer.send(mgMsg())?
+  mailer.close()
+  let form = mgForm(<- log)
+  assert(mgValues(form, "o:require-tls")[0] == "yes")
+  assert(mgValues(form, "o:skip-verification")[0] == "no")
+  assert(string(form.files[0].content) == tap.raw)
+  let t = MailgunTransport(parseMailgun(mgUrl(1))?, o)
+  let d = Mailer(Outbox(), smOpts())?.prepare(eoMessage())?
+  let refused = false
+  t.deliver(d) catch e {
+    refused = contains(e.message(), "delivery notifications")
+  }
+  assert(refused)
+  d.envelope.dsn = Dsn{}
+  d.envelope.from = "bounce@inkwell.dev"
+  refused = false
+  t.deliver(d) catch e {
+    refused = contains(e.message(), "bounce")
+  }
+  assert(refused)
+  t.close()
+}
+
+test "E6915 Mailgun MIME sends TLS flags preserves bytes refuses DSN and bounce" {
+  eoCase8() catch e {
+    panic(e.message())
+  }
+}
+
+fn eoQueuedWorker(): ()! {
+  let store = quStoreNew()
+  let q = quQueue(store)
+  let t = quTransport([])
+  let o = eoOptions()
+  o.queue = Option.Some(q)
+  let mailer = Mailer(t, o)?
+  let queued = mailer.send(eoMessage())?
+  assert(queued.queued && t.calls() == 0)
+  quDrain(q, store)
+  mailer.close()
+  assert(t.calls() == 1 && store.row(1).done)
+  let d = t.seen[0]
+  assert(d.envelope.requireTls && d.envelope.from == "bounce@inkwell.dev")
+  assert(d.envelope.dsn.notify[0] == Notify.Failure && d.envelope.dsn.envid == "welcome 7")
+  assert(contains(d.raw, "From: \"Inkwell\" <hello@inkwell.dev>") && d.messageId == queued.id)
+}
+
+test "E6915 actual queue worker delivers captured guarantees" {
+  eoQueuedWorker() catch e {
+    panic(e.message())
+  }
+}
+
+fn eoRawPlain(): ()! {
+  let (port, log) = eoStartPlain([smEhlo("250-REQUIRETLS\r\n"), "221 Bye\r\n"])?
+  let mailer = open("smtp://127.0.0.1:${port}?tls=off", smOpts())?
+  let d = mailer.prepare(smMsg(["sara@example.com"]))?
+  d.envelope.requireTls = true
+  let refused = false
+  mailer.t.deliver(d) catch e {
+    match (e) {
+      Rejected(r) => refused = contains(r.text, "connection is not TLS")
+      _ => panic(e.message())
+    }
+  }
+  mailer.close()
+  let wire = <- log
+  assert(refused && !contains(wire, "MAIL FROM:"), wire)
+}
+
+test "E6915 raw delivery cannot lose REQUIRETLS on plaintext" {
+  eoRawPlain() catch e {
+    panic(e.message())
+  }
+}

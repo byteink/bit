@@ -118,3 +118,11 @@ fn main(): ()! {
 
 That prints `mail: configuration: Options.pool must be 1 to 100 sessions, got 0`.
 A transport that is not SMTP, such as `Outbox`, ignores `pool`.
+
+## Keep guarantees on each recipient batch
+
+A relay's RCPTMAX can split one welcome mail into several SMTP transactions.
+Every batch keeps the original MAIL FROM, DSN request and REQUIRETLS flag,
+with the same signed DATA bytes. A later batch cannot silently omit a guarantee.
+[The envelope example](mailer.md#keep-delivery-guarantees-on-the-envelope)
+uses the same options whether the pool sends one recipient or several batches.
