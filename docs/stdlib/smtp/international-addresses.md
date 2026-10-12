@@ -39,6 +39,9 @@ A Unicode sender domain also stays in the generated Message-ID.
 or rendered header contains a non-ASCII byte. Both capabilities must be
 advertised, even if the body contains only ASCII. Existing SIZE, delivery
 notification and onward TLS options continue to describe the same message.
+Delivery notifications name Unicode recipients with `ORCPT=utf-8`; native
+UTF-8 stays intact, while `+` and `=` are escaped inside that parameter.
+ASCII recipients and envelope identifiers keep their existing encoding.
 
 ## Submit already signed bytes
 
