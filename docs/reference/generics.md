@@ -58,6 +58,36 @@ The rule in one line: if a type parameter shows up in a function's
 *arguments*, Bit infers it from what you call with; if it only shows up in
 the *return type*, you say it at the call site.
 
+## Keeping a generic function as a callback
+
+Inkwell can pass the same identity function through callbacks for draft ids
+and titles. The callback's function type supplies its type argument:
+
+```bit
+fn identity<T>(value: T): T { return value }
+
+fn titleWith(f: (string) => string, title: string): string {
+  return f(title)
+}
+
+fn main() {
+  let keepId: (int) => int = identity
+  println("${keepId(42)}")
+  println(titleWith(identity, "Draft"))
+}
+```
+
+A binding annotation, a callback parameter, a function-typed field or a
+return type can supply this expectation. Parameters and results must match
+the whole function type, including variadics and fallible results. Generic
+bounds still apply. A callback inside another generic function uses that
+function's type arguments when its body is instantiated.
+
+Without a target, `let keep = identity` reports E0068: `cannot infer type
+parameter 'T' for function value 'identity'`. Annotate the binding with a
+function type. Every declared type parameter must be determined, including
+ones that appear in neither the parameters nor the result.
+
 ## Asking a type parameter for a capability
 
 `Counter<T>` accepts any key because it never does anything with one except
