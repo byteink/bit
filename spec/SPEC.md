@@ -2402,6 +2402,10 @@ interface is a separate extension this section does not make.
   (`[rows * cols]i64`). It is folded at compile time; a length that does not fold
   to a non-negative integer is E0064, and neither a function-local `let` nor a
   module `const` set at startup (§15.4) is a constant however evident its value.
+  The element bytes, allocator headers and alignment must fit the storage
+  representation (**E0192** otherwise). The same check includes containing
+  class fields and the static image of a module array. An unresolved generic
+  element is checked when its concrete type is known; zero length remains valid.
   Note the type-prefixed literal form `[N]T{...}` (§12.3) still requires a
   literal length, because `[x]` there is ambiguous with a one-element slice literal.
 - **Map** `map<K,V>`: hash map; reference type; `K` must be a comparable type
