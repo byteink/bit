@@ -92,20 +92,10 @@ so the browser refuses to register the same device twice.
 
 ## Step two: the browser
 
-The browser turns the options into a key pair. This is the whole client side
-(a packaged client helper is a separate page):
-
-```js
-const options = await (await fetch("/passkeys/options", { method: "POST" })).json()
-const credential = await navigator.credentials.create({
-  publicKey: PublicKeyCredential.parseCreationOptionsFromJSON(options),
-})
-await fetch("/passkeys/register", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify(credential.toJSON()),
-})
-```
+The browser turns the options into a key pair. The complete
+[browser page below](#the-browser-page) connects the Add a passkey button to
+both routes, converts the binary fields and handles cancellation. Keep the
+options request and registration response in the same session.
 
 ## Step three: verify and store
 
@@ -366,6 +356,7 @@ import { WebAuthnStrategy } from "auth"
 import { jsonEncode } from "std/json"
 
 fn signInRoutes(app: App, passkeys: WebAuthnStrategy) {
+  println("Inkwell sign-in method: ${passkeys.name()}")
   app.post("/signin/options", (c) => {
     let options = passkeys.beginLogin(c, Option<string>.None)?
     return c.text(jsonEncode(options)).header("Content-Type", "application/json")
@@ -385,19 +376,9 @@ A user id nobody has, or one with no passkeys, gets the same five members as a
 real one with a single made-up credential id (the same on every request), so the
 options never say whether an account exists.
 
-The browser side:
-
-```js
-const options = await (await fetch("/signin/options", { method: "POST" })).json()
-const assertion = await navigator.credentials.get({
-  publicKey: PublicKeyCredential.parseRequestOptionsFromJSON(options),
-})
-await fetch("/signin", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify(assertion.toJSON()),
-})
-```
+`name()` returns `"passkey"`, the name of this authentication method. The
+[browser page below](#the-browser-page) uses these routes for both the
+Sign in with a passkey button and the username field's autofill suggestions.
 
 `authenticate` spends the challenge first, on every attempt, then checks in this
 order: the credential exists and belongs to the author the options were for;
@@ -446,6 +427,272 @@ fn auditedSignIn(
 
 Attempts are counted under `passkey:` and the credential id the client named,
 so guessing at one credential does not lock another.
+
+## The browser page
+
+The author needs a button to add a passkey and a login page that offers both
+passkeys and passwords. Keep the routes above, then mount these pages on the
+same app. Its session configuration and password route are the ones in
+[Sign in with a password](getting-started.md). Call `browserPages(app)` when
+building that app. Serve HTTPS outside localhost; the browser only exposes
+passkeys in a secure context.
+
+```bit
+import { attr, csrf, elem, static, text } from "web"
+
+fn browserPages(app: App) {
+  app.use(csrf())
+  app.use(static("/assets", "./public"))
+  app.get("/passkeys", (c) => {
+    let _ = currentIdentity(c) catch _ {
+      fail unauthorized()
+    }
+    return c.html(
+      <html lang="en">
+        <head><title>Inkwell passkeys</title></head>
+        <body>
+          <input type="hidden" name="_csrf" value={c.csrfToken()?} />
+          <button id="register-passkey" type="button">Add a passkey</button>
+          <p id="passkey-status" role="status" aria-live="polite"></p>
+          <script src="/assets/passkeys.js"></script>
+        </body>
+      </html>,
+    )
+  })
+  app.get("/login", (c) => {
+    return c.html(
+      <html lang="en">
+        <head><title>Sign in to Inkwell</title></head>
+        <body>
+          <form id="password-login" action="/login/" method="post">
+            <input type="hidden" name="_csrf" value={c.csrfToken()?} />
+            <label for="username">Username</label>
+            <input id="username" name="username" autocomplete="username webauthn" required />
+            <label for="password">Password</label>
+            <input
+              id="password"
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              required
+            />
+            <button type="submit">Sign in with a password</button>
+          </form>
+          <button id="login-passkey" type="button">Sign in with a passkey</button>
+          <p id="passkey-status" role="status" aria-live="polite"></p>
+          <script src="/assets/passkeys.js"></script>
+        </body>
+      </html>,
+    )
+  })
+}
+```
+
+`c.csrfToken()` binds the token to this session. Every POST below sends it as
+`X-CSRF-Token`, which `csrf()` checks. Put a rate limit in front of anonymous
+pages that create sessions; see the web guide's
+[CSRF and anonymous visitors](../../web/docs/security.md#csrf-and-anonymous-visitors).
+The password handler sends JSON because `PasswordStrategy` accepts JSON,
+not form-encoded credentials. Successful login navigates to `/me`, loading
+the regenerated session instead of reusing the old page's token.
+
+Save this whole script as `public/passkeys.js`. It contains all four flows:
+registration, explicit login, conditional login and error handling. It uses
+the browser's JSON helpers when available. The fallback converts the fields
+these server routes use: challenges, user and credential ids, client data,
+attestation, authenticator data, signatures and nullable user handles.
+These options request no extensions; adding binary extension inputs needs
+their own conversion in an older browser.
+
+```js
+const status = document.querySelector("#passkey-status")
+const token = document.querySelector('input[name="_csrf"]').value
+const passwordForm = document.querySelector("#password-login")
+const conditional = new AbortController()
+let busy = false
+
+function decode64url(value) {
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/")
+  const bytes = atob(padded + "=".repeat((4 - padded.length % 4) % 4))
+  return Uint8Array.from(bytes, (char) => char.charCodeAt(0)).buffer
+}
+
+function encode64url(value) {
+  if (value === null) return null
+  const bytes = Array.from(new Uint8Array(value), (byte) => String.fromCharCode(byte))
+  return btoa(bytes.join("")).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+}
+
+function descriptors(items = []) {
+  return items.map((item) => ({ ...item, id: decode64url(item.id) }))
+}
+
+function creationOptions(options) {
+  if (typeof PublicKeyCredential.parseCreationOptionsFromJSON === "function") {
+    return PublicKeyCredential.parseCreationOptionsFromJSON(options)
+  }
+  return {
+    ...options,
+    challenge: decode64url(options.challenge),
+    user: { ...options.user, id: decode64url(options.user.id) },
+    excludeCredentials: descriptors(options.excludeCredentials),
+  }
+}
+
+function requestOptions(options) {
+  if (typeof PublicKeyCredential.parseRequestOptionsFromJSON === "function") {
+    return PublicKeyCredential.parseRequestOptionsFromJSON(options)
+  }
+  return {
+    ...options,
+    challenge: decode64url(options.challenge),
+    allowCredentials: descriptors(options.allowCredentials),
+  }
+}
+
+function credentialJSON(credential) {
+  if (typeof credential.toJSON === "function") return credential.toJSON()
+  const source = credential.response
+  const response = { clientDataJSON: encode64url(source.clientDataJSON) }
+  if (source.attestationObject !== undefined) {
+    response.attestationObject = encode64url(source.attestationObject)
+    response.transports = source.getTransports ? source.getTransports() : []
+  } else {
+    response.authenticatorData = encode64url(source.authenticatorData)
+    response.signature = encode64url(source.signature)
+    response.userHandle = encode64url(source.userHandle)
+  }
+  return {
+    id: credential.id,
+    rawId: encode64url(credential.rawId),
+    type: credential.type,
+    response,
+    clientExtensionResults: credential.getClientExtensionResults(),
+  }
+}
+
+async function post(path, body) {
+  const response = await fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) throw new Error(`Request refused (${response.status}). Try again.`)
+  return response
+}
+
+function available() {
+  return window.isSecureContext && typeof PublicKeyCredential !== "undefined"
+}
+
+function showError(error) {
+  if (error.name === "AbortError") return
+  if (error.name === "NotAllowedError") {
+    status.textContent = "No passkey was selected, or the request expired. Try again."
+    return
+  }
+  if (error.name === "InvalidStateError") {
+    status.textContent = "This device already has a passkey for this account. Sign in with it."
+    return
+  }
+  status.textContent = error.message
+}
+
+async function registerPasskey() {
+  if (!available()) throw new Error("Passkeys need a supported browser on HTTPS or localhost.")
+  const options = await (await post("/passkeys/options")).json()
+  const credential = await navigator.credentials.create({ publicKey: creationOptions(options) })
+  if (credential === null) throw new Error("No passkey was created. Try again.")
+  await post("/passkeys/register", credentialJSON(credential))
+  status.textContent = "Passkey added."
+}
+
+async function signIn(signal, mediation) {
+  // Let the options request finish before another flow replaces its challenge.
+  const options = await (await post("/signin/options")).json()
+  signal.throwIfAborted()
+  const credential = await navigator.credentials.get({
+    publicKey: requestOptions(options), signal, mediation,
+  })
+  signal.throwIfAborted()
+  if (credential === null) throw new Error("No passkey was selected. Try again.")
+  await post("/signin", credentialJSON(credential))
+  window.location.assign("/me")
+}
+
+async function conditionalLogin() {
+  if (!passwordForm || !available()) return
+  if (typeof PublicKeyCredential.isConditionalMediationAvailable !== "function") return
+  if (!await PublicKeyCredential.isConditionalMediationAvailable()) return
+  conditional.signal.throwIfAborted()
+  await signIn(conditional.signal, "conditional")
+}
+
+const conditionalTask = conditionalLogin().catch(showError)
+
+async function stopConditional() {
+  conditional.abort()
+  await conditionalTask
+}
+
+async function explicitLogin() {
+  await stopConditional()
+  if (!available()) throw new Error("Passkeys need a supported browser on HTTPS or localhost.")
+  await signIn(new AbortController().signal, "required")
+}
+
+async function passwordLogin() {
+  await stopConditional()
+  const fields = new FormData(passwordForm)
+  await post(passwordForm.getAttribute("action"), {
+    username: fields.get("username"), password: fields.get("password"),
+  })
+  window.location.assign("/me")
+}
+
+async function run(action) {
+  if (busy) return
+  busy = true
+  const buttons = document.querySelectorAll("button")
+  buttons.forEach((button) => { button.disabled = true })
+  try {
+    await action()
+  } catch (error) {
+    showError(error)
+  } finally {
+    busy = false
+    buttons.forEach((button) => { button.disabled = false })
+  }
+}
+
+document.querySelector("#register-passkey")?.addEventListener("click", () => run(registerPasskey))
+document.querySelector("#login-passkey")?.addEventListener("click", () => run(explicitLogin))
+passwordForm?.addEventListener("submit", (event) => {
+  event.preventDefault()
+  void run(passwordLogin)
+})
+```
+
+The username field's `autocomplete="username webauthn"` enables passkey
+suggestions. Conditional login starts on page load only when the browser
+reports support, using an empty `allowCredentials` list from `/signin/options`.
+It waits for the author to select a suggestion. Browsers without conditional
+mediation still have the explicit button and password form.
+
+Both the explicit button and password submission abort conditional login and
+wait for it to settle. The server holds one login challenge per session, so
+starting a second options request first would invalidate the first one.
+The buttons disable during their requests to prevent repeated clicks. Keep
+one login page open per session while signing in.
+
+Cancellation or expiry produces `NotAllowedError`; registration on an
+already registered authenticator produces `InvalidStateError`. An aborted
+conditional request stays quiet. A null credential or a refused HTTP request
+never goes on to a finish route. Server refusals show a generic message;
+keep detailed verification failures in server logs. After a five-minute
+challenge expires, click the explicit button for fresh options or reload
+the page to restart autofill.
 
 ## Where to go next
 
