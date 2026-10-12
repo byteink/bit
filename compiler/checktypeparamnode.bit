@@ -1,0 +1,135 @@
+// Documentary names exist only in the AST; canonical types contain positions.
+fn isFunctionTypeParam(tree: Tree, node: int): bool {
+  let n = getNode(tree, node)
+  return n.tag == Tag.Param && n.main == 1
+}
+
+fn functionTypeParamNode(tree: Tree, node: int): int {
+  if (isFunctionTypeParam(tree, node)) {
+    return kidsOf(tree, node)[1]
+  }
+  return node
+}
+
+fn typeFromNodeInConstructed(c: Checker, tag: Tag, node: int, kids: []int, sub: TypeSubst): int {
+  // A generic instance `Name<...>` gets its OWN nominal TypeId per argument list
+  // (#1540) — `Stack<i64>` and `Stack<string>` are distinct types, which is what
+  // gives each one its own `$t<id>`-mangled method bodies. It still RENDERS by
+  // its base name, so `--dump-types` is unchanged. `instantiateNamed` falls back
+  // to the base template for everything it cannot decide.
+  if (tag == Tag.GenericInst) {
+    let iname = typeNodeName(c, node)
+    return instantiateNamed(c, iname, genericInstArgs(c, node, sub))
+  }
+  // A fallible result `T!` / `T!E` — the error defaults to the `error` interface.
+  if (tag == Tag.Fallible) {
+    let errT = c.ctx.errorId
+    if (kids[1] != 0) {
+      errT = typeFromNodeIn(c, kids[1], sub)
+    }
+    return mkFallible(c.ctx, typeFromNodeIn(c, kids[0], sub), errT)
+  }
+  // A function type `(P, Q) => R` (func_type `[type_list, result]`).
+  // `(A, B, ...)` — the element types in order. Without this a tuple annotation
+  // resolved to 0 (unknown), which made every tuple-typed value permissive and
+  // silenced the diagnostics that depend on its type (E0041/E0059).
+  if (tag == Tag.TupleType) {
+    let members = []int(0)
+    let mi = 0
+    while (mi < len(kids)) {
+      members = append(members, typeFromNodeIn(c, kids[mi], sub))
+      mi = mi + 1
+    }
+    return mkTuple(c.ctx, members)
+  }
+  if (tag == Tag.FuncType) {
+    let params = []int(0)
+    let plist = kidsOf(c.tree, kids[0])
+    let pi = 0
+    while (pi < len(plist)) {
+      params = append(params, typeFromNodeIn(c, functionTypeParamNode(c.tree, plist[pi]), sub))
+      pi = pi + 1
+    }
+    return mkFunc(c.ctx, params, false, typeFromNodeIn(c, kids[1], sub))
+  }
+  return 0
+}
+
+fn bindTypeParamComposite(pc: Checker, paramNode: int, argType: int, tpname: string): int {
+  let pn = getNode(pc.tree, paramNode)
+  let at = pc.ctx.types[argType]
+  let pk = kidsOf(pc.tree, paramNode)
+  if (pn.tag == Tag.SliceType && at.kind == TypeKind.Slice) {
+    return bindTypeParamFromNode(pc, pk[0], at.elem, tpname)
+  }
+  if (pn.tag == Tag.ArrayType && at.kind == TypeKind.Array) {
+    return bindTypeParamFromNode(pc, pk[1], at.elem, tpname)
+  }
+  if (pn.tag == Tag.ChanType && at.kind == TypeKind.Chan) {
+    return bindTypeParamFromNode(pc, pk[0], at.elem, tpname)
+  }
+  return bindTypeParamCompositeRest(pc, paramNode, argType, tpname)
+}
+
+fn bindTypeParamCompositeRest(pc: Checker, paramNode: int, argType: int, tpname: string): int {
+  let pn = getNode(pc.tree, paramNode)
+  let at = pc.ctx.types[argType]
+  let pk = kidsOf(pc.tree, paramNode)
+  if (pn.tag == Tag.MapType && at.kind == TypeKind.Map) {
+    let k = bindTypeParamFromNode(pc, pk[0], at.mapKey, tpname)
+    if (k != 0) {
+      return k
+    }
+    return bindTypeParamFromNode(pc, pk[1], at.mapVal, tpname)
+  }
+  if (pn.tag == Tag.Fallible && at.kind == TypeKind.Fallible) {
+    return bindTypeParamFromNode(pc, pk[0], at.result, tpname)
+  }
+  return bindTypeParamNominalOrCallable(pc, paramNode, argType, tpname)
+}
+
+fn bindTypeParamNominalOrCallable(pc: Checker, paramNode: int, argType: int, tpname: string): int {
+  let pn = getNode(pc.tree, paramNode)
+  let at = pc.ctx.types[argType]
+  let pk = kidsOf(pc.tree, paramNode)
+  // `o: Opt<T>` against a concrete `Opt<string>` (#1560). Every other type
+  // constructor above descends into the argument's TYPE; a nominal generic
+  // could not, because before per-instantiation identity the argument type
+  // carried no arguments to descend into. `nominalArgsOf` now recovers them
+  // from the instantiation ledger, so this is the same structural recursion,
+  // not another syntactic recovery arm — which is why the shapes #1566 lists
+  // (a variant construction, a field read) all bind through one change rather
+  // than one arm each.
+  //
+  // Two guards, both THE SAFETY RULE. The argument must be a real
+  // INSTANTIATION — `typeInstOfResult` finding a ledger entry — not a template:
+  // a template's `nominalArgsOf` answers its own bare parameters, so descending
+  // into one binds `T := T` and returns a useless non-zero that short-circuits
+  // the syntactic fallbacks in `bindTypeParamAtCall` which used to answer here
+  // (that regressed `okOr(e, 0)` in _tests_/imports/coreopt to E0053). And the
+  // base NAME must match, since binding `Opt<T>` against a `Box<string>` would
+  // be a guess. Anything else returns 0 and leaves the old path in charge.
+  if (pn.tag == Tag.GenericInst &&
+    at.hasName &&
+    typeNodeName(pc, pk[0]) == at.name &&
+    typeInstOfResult(pc.ctx, argType) >= 0) {
+    return bindTypeParamGenericInstArgs(pc, pk[1], argType, tpname)
+  }
+  // `f: (T) => U` against a concrete `(i64) => i64`. Without this a type param
+  // reachable ONLY through a function-typed parameter — `U` in
+  // `mapped<T, U>(xs: []T, f: (T) => U): []U` — can never bind. Func params live
+  // in `members`; try each position, then the result.
+  if (pn.tag == Tag.FuncType && at.kind == TypeKind.Func) {
+    let plist = kidsOf(pc.tree, pk[0])
+    let i = 0
+    while (i < len(plist) && i < len(at.members)) {
+      let b = bindTypeParamFromNode(pc, plist[i], at.members[i], tpname)
+      if (b != 0) {
+        return b
+      }
+      i = i + 1
+    }
+    return bindTypeParamFromNode(pc, pk[1], at.result, tpname)
+  }
+  return 0
+}
