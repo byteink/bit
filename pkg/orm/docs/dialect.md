@@ -174,24 +174,21 @@ structurally incomplete node on purpose (see schema.md's own "Sharp
 edges"); the dialect is where a migration that forgot `.references(...)`
 is finally caught.
 
-**Postgres only renders the seven column types schema.bit's `ColumnType`
-carries** - `Id`, `Int` (always `bigint`, since Bit's `int` is Bit's only
-ordinary integer size), `String(length)` (`varchar(length)`), `Text`,
-`Bool`, `Timestamp` (always `timestamptz`, never a bare `timestamp` - an
-instant read from a zoneless column is invented) and `Decimal` (bare
-`numeric`, no precision or scale - see [Schema](schema.md)'s own "Money
-columns" section for why an unconstrained `numeric` is the only mapping
-that cannot silently round a `decimal` value). There is no `f64`,
-`[]byte` or `Option<T>` column yet, because the intent tree does not
-carry one; that is schema.bit's surface to grow, not this file's.
+PostgreSQL renders the schema's integer and text types as `bigint`,
+`varchar(length)` and `text`; boolean as `boolean`, decimal as unconstrained
+`numeric`, JSON as `jsonb`, and search vectors as `tsvector`. Both `timestamp`
+and the explicit `timestamptz` builder use `timestamptz`. `binary` uses `bytea`,
+so cached response bytes never pass through a text conversion. MySQL's
+corresponding binary and explicit instant types are `longblob` and
+`datetime(6)`; its existing `timestamp` mapping stays unchanged. See
+[Schema](schema.md) for the running response-cache example and UTC contract.
 
 ## When not to use this
 
 `render` only produces SQL text - it does not open a connection or run
-anything. There is no runner yet to apply a `Statement` list to a real
-database or track which migrations already ran; that is separate, later
-work. Use this package today to see the exact DDL a migration will emit;
-do not expect `migrate up`.
+anything. Use [Migrate](migrate.md) to apply those statements and track
+which migrations already ran. Rendering alone is useful when inspecting
+the exact DDL before applying it.
 
 ## Where to go next
 
