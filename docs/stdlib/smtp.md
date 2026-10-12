@@ -455,8 +455,10 @@ The envelope this message is sent under: `from` is the sender's address, `to` is
 ### `Message.render(): string!SmtpError`
 
 The complete RFC 5322 message: headers, a blank line, and the body, CRLF
-throughout, dot-stuffing NOT applied (that belongs to the transmission, not to
-the message). The headers are, in order, `Date`, `From`, `To`, `Cc`, `Reply-To`, `Subject`,
+throughout, including the final line ending used in SMTP `SIZE`. Existing final
+line endings are preserved. Dot-stuffing is not applied (that belongs to the
+transmission, not to the message). The headers are, in order, `Date`, `From`,
+`To`, `Cc`, `Reply-To`, `Subject`,
 `Message-ID`, the `setHeader` fields, `MIME-Version` and the `Content-*` fields. `Date` is the time of
 the render in RFC 5322 form with a numeric zone, `Date: Sun, 06 Nov 1994
 08:49:37 +0000`, and `Message-ID` is `<uuidv7@sender-domain>` unless
