@@ -146,6 +146,10 @@ requires a port and defaults an empty path to `/`. An explicit URL port or path
 argument must match the URL. Port zero fails; `-1` means omitted. A TLS config
 requires `wss://`.
 
+The function-value type of `dial` now has five parameters, including the optional
+TLS config. Update an explicitly typed four-parameter function binding; ordinary
+four-argument calls continue to work.
+
 TLS verifies the server with system roots by default, falling back to the
 bundled roots if the system store cannot be loaded. An explicit config retains
 its roots, server name, clock and verification setting. The connection offers
