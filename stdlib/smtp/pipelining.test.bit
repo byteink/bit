@@ -50,6 +50,7 @@ class pipelineRecorder {
   groupDone: chan<bool>
   complete: bool
   pendingReplies: int
+  arms: int
 
   export send(s: string): ()! {
     this.active = true
@@ -86,7 +87,10 @@ class pipelineRecorder {
     }
     return reply
   }
-  export deadline(ns: int) { this.inner.deadline(ns) }
+  export deadline(ns: int) {
+    this.arms = this.arms + 1
+    this.inner.deadline(ns)
+  }
   export timedOut(): bool { return this.inner.timedOut() }
   export shut() {
     assert(!this.active, "stream closed before writer acknowledged")
@@ -98,7 +102,7 @@ fn recordPipeline(c: Client, duplex: bool = false): pipelineRecorder {
   let r = pipelineRecorder{
     inner = c.w.s, writes = []string(0), receive = chan<bool>(1), duplex = duplex, opened = false,
     active = false, failWrite = false,
-    groupDone = chan<bool>(1), complete = false, pendingReplies = 0,
+    groupDone = chan<bool>(1), complete = false, pendingReplies = 0, arms = 0,
   }
   c.w.s = r
   return r
@@ -122,6 +126,7 @@ fn assertPipelineGroup(r: pipelineRecorder, raw: Raw) {
   assert(r.writes[0] == group, "MAIL/all RCPT/DATA were not one send")
   assert(unstuffed(r.writes[0] + r.writes[1]) == raw.data, "payload changed")
   assert(r.writes[2] == "QUIT\r\n", "QUIT raced the group")
+  assert(r.arms == 3, "group, payload and QUIT must each arm one deadline")
 }
 
 test "PIPELINING records exactly one send for MAIL three RCPT and DATA" {
@@ -256,7 +261,7 @@ test "PIPELINING malformed empty DATA completion prevents reset and reuse" {
 }
 
 test "PIPELINING actual writer error wins synthetic EOF and joins before close" {
-  let (c, log) = fakeClient([]string(0))
+  let (c, log) = fakeClient(["250 Awaiting MAIL\r\n"])
   let r = recordPipeline(c)
   r.failWrite = true
   let e = refusal(c, threeRecipients())
@@ -373,4 +378,194 @@ test "PIPELINING large verified TLS group receives while writing" {
   }
   assert(c.verifiedTls, "test TLS was not verified")
   proveLargePipeline(c, log, raw)
+}
+
+class pipelineStopPeer {
+  ln: Listener,
+  release: chan<bool>,
+  done: chan<string>,
+  reply: string,
+}
+
+fn servePipelineStop(p: pipelineStopPeer) {
+  let c = p.ln.accept() catch e {
+    panic(e.message())
+  }
+  c.setDeadline(monotonic().ns + 10 * Second)
+  c.write("220 fake\r\n") catch e {
+    panic(e.message())
+  }
+  let hello = c.read(65536)
+  assert(hasPrefix(hello, "EHLO "), "missing EHLO")
+  c.write(ehloPlain()) catch e {
+    panic(e.message())
+  }
+  let prefix = c.read(65536)
+  assert(hasPrefix(prefix, "MAIL FROM:"), "missing grouped MAIL")
+  c.write(p.reply) catch e {
+    panic(e.message())
+  }
+  // Keep the peer open and stop consuming a multi-MiB group: only the
+  // client's cancellation can release its blocked writer before this signal.
+  let _ = <- p.release
+  c.close()
+  p.ln.close()
+  p.done <- prefix
+}
+
+test "PIPELINING reader 421 cancels blocked large writer without losing server code" {
+  let ln = listen("127.0.0.1", 0) catch e {
+    panic(e.message())
+  }
+  let port = ln.port() catch e {
+    panic(e.message())
+  }
+  let peer = pipelineStopPeer{
+    ln = ln, release = chan<bool>(1), done = chan<string>(1), reply = "250 OK\r\n421 Closing\r\n",
+  }
+  spawn servePipelineStop(peer)
+  let c = dial("127.0.0.1", port) catch e {
+    panic(e.message())
+  }
+  c.ehlo("client.example.com") catch e {
+    panic(e.message())
+  }
+  let r = recordPipeline(c, true)
+  let e = refusal(c, largePipelineRaw())
+  c.close()
+  peer.release <- true
+  let prefix = <- peer.done
+  assert(len(prefix) < len(r.writes[0]), "peer consumed the complete group")
+  assert(r.pendingReplies > 0 && !r.active, "writer wasn't pending or wasn't joined")
+  assert(e.code == 421 && e.command == "RCPT TO", "cancellation replaced refusal: ${e.message()}")
+  assert(!c.reusable() && len(r.writes) == 1, "terminal refusal reset or retained session")
+}
+
+test "PIPELINING malformed reader reply survives cancellation of blocked large writer" {
+  let ln = listen("127.0.0.1", 0) catch e {
+    panic(e.message())
+  }
+  let port = ln.port() catch e {
+    panic(e.message())
+  }
+  let peer = pipelineStopPeer{
+    ln = ln, release = chan<bool>(1), done = chan<string>(1), reply = "250 OK\r\n250-first\r\n550 wrong\r\n",
+  }
+  spawn servePipelineStop(peer)
+  let c = dial("127.0.0.1", port) catch e {
+    panic(e.message())
+  }
+  c.ehlo("client.example.com") catch e {
+    panic(e.message())
+  }
+  let r = recordPipeline(c, true)
+  let e = refusal(c, largePipelineRaw())
+  c.close()
+  peer.release <- true
+  let _ = <- peer.done
+  assert(e.command == "RCPT TO" && contains(e.text, "reply changed code"), e.message())
+  assert(r.pendingReplies > 0 && !r.active && !c.reusable(), "reader failed without joining writer")
+}
+
+test "PIPELINING deadline cancels and joins a blocked large writer and reader" {
+  let ln = listen("127.0.0.1", 0) catch e {
+    panic(e.message())
+  }
+  let port = ln.port() catch e {
+    panic(e.message())
+  }
+  let peer = pipelineStopPeer{
+    ln = ln, release = chan<bool>(1), done = chan<string>(1), reply = "250 OK\r\n",
+  }
+  spawn servePipelineStop(peer)
+  let o = Options()
+  o.timeout = 200 * Millisecond
+  let c = dial("127.0.0.1", port, o) catch e {
+    panic(e.message())
+  }
+  c.ehlo("client.example.com") catch e {
+    panic(e.message())
+  }
+  let r = recordPipeline(c, true)
+  let e = refusal(c, largePipelineRaw())
+  c.close()
+  peer.release <- true
+  let _ = <- peer.done
+  assert(e.code == 0 && contains(e.message(), "timed out after 200ms"), e.message())
+  assert(r.arms == 1 && !r.active && !c.reusable(), "deadline changed or writer survived timeout")
+}
+
+test "PIPELINING capability and malformed DSN refusals transmit zero MAIL bytes" {
+  let raws = [
+    dsnRaw(Dsn{ notify = [Notify.Failure] }),
+    requireTlsRaw(),
+    Raw(Envelope{ from = "me@x.com", to = ["a@x.com"] }, rawMessage()),
+    Raw(Envelope{ from = "me@x.com", to = ["élève@x.com"] }, rawMessage()),
+    dsnRaw(Dsn{ notify = [Notify.Never, Notify.Failure] }),
+  ]
+  let i = 0
+  while (i < len(raws)) {
+    let caps = "250-fake\r\n250-PIPELINING\r\n250 SIZE 1\r\n"
+    let (c, log) = fakeClientEhlo(caps, ["221 Bye\r\n"])
+    let r = recordPipeline(c)
+    let e = refusal(c, raws[i])
+    assert(e.command == "validate" && len(r.writes) == 0 && r.arms == 0, e.message())
+    assert(c.reusable(), "preflight refusal lost session")
+    c.quit() catch err {
+      panic(err.message())
+    }
+    let _ = <- log
+    i = i + 1
+  }
+}
+
+test "PIPELINING verified TLS retains DSN REQUIRETLS SIZE and exact Raw bytes" {
+  let caps = "250-fake\r\n250-PIPELINING\r\n250-DSN\r\n250-REQUIRETLS\r\n250 SIZE 1000\r\n"
+  let o = pinnedOptions() catch e {
+    panic(e.message())
+  }
+  let (c, log) = requireTlsClient(o, caps, successfulReplies(1))
+  let r = recordPipeline(c, true)
+  let raw = requireTlsRaw()
+  raw.data = "DKIM-Signature: v=1; a=ed25519-sha256; b=frozen\r\n" + raw.data
+  raw.env.dsn = Dsn{ ret = Ret.Headers, envid = "msg 42", notify = [Notify.Failure] }
+  let _ = c.send(raw) catch e {
+    panic(e.message())
+  }
+  c.quit() catch e {
+    panic(e.message())
+  }
+  let sent = <- log
+  assert(
+    contains(r.writes[0], "RET=HDRS ENVID=msg+2042 REQUIRETLS SIZE=${len(raw.data)}\r\n"),
+    "MAIL guarantees lost",
+  )
+  assert(
+    contains(r.writes[0], "NOTIFY=FAILURE ORCPT=rfc822;a@x.com\r\nDATA\r\n"),
+    "RCPT guarantees lost",
+  )
+  assert(len(r.writes) == 3 && unstuffed(sent) == raw.data, "pre-rendered signature bytes changed")
+}
+
+test "PIPELINING partial 251 451 and 550 replies retain ordered recipient outcomes" {
+  let (c, log) = fakeClient(
+    [
+      "250 OK\r\n", "251 Forwarded\r\n", "451 Busy\r\n", "550 No user\r\n", "354 Go\r\n", "250 Queued\r\n", "221 Bye\r\n",
+    ],
+  )
+  let r = recordPipeline(c)
+  let d = c.send(threeRecipients()) catch e {
+    panic(e.message())
+  }
+  c.quit() catch e {
+    panic(e.message())
+  }
+  let _ = <- log
+  assert(len(d.accepted) == 1 && d.accepted[0] == "a@x.com", "251 forwarding was refused")
+  assert(len(d.rejected) == 2 && d.rejected[0].address == "bad@x.com", "recipient order changed")
+  assert(
+    d.rejected[0].error.transient() && !d.rejected[1].error.transient(),
+    "retry classifications changed",
+  )
+  assert(len(r.writes) == 3, "partial refusals reset or fragmented the group")
 }
