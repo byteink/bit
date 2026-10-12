@@ -38,7 +38,7 @@ Do not parse it and write it back out first: the signature covers the bytes
 Resend sent, and a different spacing or key order makes it fail.
 
 One webhook can name several recipients, and you get one `Event` for each. The
-provider is a value, `Provider.Resend`, and not a different function, so
+provider is a value, `Provider.Resend` or `Provider.Postmark`, and not a different function, so
 the day Inkwell adds a second provider only that argument changes. `Provider`
 lists only the providers whose webhooks `parseEvents` can read; a new one is
 added in the same release as its parser.
@@ -49,12 +49,12 @@ added in the same release as its parser.
 |---|---|
 | `kind` | An `EventKind`: `Delivered`, `Deferred`, `Bounced`, `Complained`, `Unsubscribed`, `Opened`, `Clicked`, `Rejected` or `Subscribe` |
 | `recipient` | The address the event is about |
-| `messageId` | The Message-ID of the mail as written, `<...>`; it is the `Receipt.id` of the send, so you can find the mail again. `""` when Resend did not report it |
-| `providerId` | Resend's own id for the message (`data.email_id`) |
-| `deliveryId` | Resend's id for this webhook delivery (`svix-id`); the same on every retry |
-| `at` | When it happened, as Resend reports it |
-| `permanent` | For `Bounced`: the refusal is for good. A bounce Resend does not classify counts as permanent. `false` for every other kind |
-| `reason` | Resend's explanation, or `""`. It is the provider's text: escape it before you show it on a page |
+| `messageId` | The Message-ID of the mail as written, `<...>`; `""` when the provider did not report it |
+| `providerId` | The provider's message id: Resend `data.email_id`, Postmark `MessageID` |
+| `deliveryId` | The webhook delivery id: Resend `svix-id`, Postmark `X-PM-Webhook-Trace-Id`; stable across retries, `""` if absent |
+| `at` | When it happened, as the provider reports it; delivery time if missing or invalid |
+| `permanent` | For `Bounced`: whether future sends should be suppressed. An unclassified bounce counts as permanent. `false` for every other kind |
+| `reason` | The provider's explanation, or `""`: escape it before showing it on a page |
 | `provider` | Who posted it |
 
 A log line for the support team reads each kind, the time and who posted it:
@@ -105,6 +105,87 @@ and `email.suppressed` become `Rejected`: Resend did not send the mail. Any
 other type, such as `contact.created`, gives `[]`. It is not an error, so
 adding an event type in Resend's dashboard never makes your endpoint answer
 with a failure.
+
+## When Inkwell uses Postmark
+
+Inkwell can keep the same suppression list when it sends through Postmark.
+Configure an HTTPS webhook URL with Basic authentication in Postmark, such as
+`https://<user>:<password>@inkwell.dev/hooks/postmark`. Keep the configured
+`user:password` in your application's secret store and pass it as `secret`.
+Postmark does not sign the body; `parseEvents` checks the decoded Basic
+credentials in constant time before reading any JSON. Your server can also
+allow only [Postmark's webhook IP ranges](https://postmarkapp.com/support/article/800-ips-for-firewalls).
+
+The handler uses Postmark's explicit suppression changes as well as permanent
+bounces and complaints. It reports credential failures as 401 without logging
+the supplied credentials:
+
+```bit
+import { EventKind, Provider, parseEvents } from "mail"
+
+fn onPostmarkWebhook(
+  header: (string) => string,
+  body: string,
+  credentials: string,
+  setSuppressed: (string, bool) => (),
+): int {
+  let events = parseEvents(Provider.Postmark, header, body, credentials) catch e {
+    match (e) {
+      Auth(_) => return 401
+      _ => return 400
+    }
+  }
+  for ev of events {
+    if (ev.kind == EventKind.Subscribe) {
+      setSuppressed(ev.recipient, false)
+    }
+    if (ev.kind == EventKind.Unsubscribed ||
+      ev.kind == EventKind.Complained ||
+      (ev.kind == EventKind.Bounced && ev.permanent)) {
+      setSuppressed(ev.recipient, true)
+    }
+  }
+  return 200
+}
+```
+
+An empty `secret` is `MailError.Invalid`: configure credentials before exposing
+the endpoint. Missing, malformed or incorrect Authorization is `MailError.Auth`.
+Resend continues to report signature failures as `MailError.Signature`.
+Both providers reject bodies over 1 MiB; malformed authenticated JSON is Invalid.
+
+Postmark's `Delivery`, `Bounce`, `SpamComplaint`, `Open` and `Click` records become
+`Delivered`, `Bounced`, `Complained`, `Opened` and `Clicked`. `SubscriptionChange`
+becomes `Unsubscribed` when `SuppressSending` is true and `Subscribe` when false.
+It must be a JSON boolean. Unknown record types give `[]`; known records require
+a recipient from `Recipient`, with `Email` as fallback.
+
+`providerId` reads `MessageID`, which may be null on manual suppressions and
+reactivations. `messageId` reads an original RFC Message-ID your application
+carried in `Metadata.message_id`, then a `Message-ID` entry in the payload's
+`Headers` list (`Name` and `Value`). Missing or null optional ids become `""`.
+Postmark's `MessageID` is its provider id, never a substitute for the mail header.
+The event time reads `DeliveredAt`, `BouncedAt`, `ChangedAt` or `ReceivedAt`;
+the reason reads `Description`, then `Details`, then `SuppressionReason`.
+
+For bounces, the package interprets
+[Postmark's documented types](https://postmarkapp.com/developer/api/bounce-api#bounce-types)
+as suppression policy. It treats `HardBounce`, `Unsubscribe`, `AddressChange`,
+`SpamNotification`, `Unknown`, `BadEmailAddress`, `SpamComplaint`,
+`ManuallyDeactivated` and `Unconfirmed` as permanent. `Transient`, `Subscribe`,
+`AutoResponder`, `DnsError`, `OpenRelayTest`, `SoftBounce`, `VirusNotification`,
+`ChallengeVerification`, `Blocked`, `SMTPApiError`, `InboundError`, `DMARCPolicy`
+and `TemplateRenderingFailed` are temporary: some concern this message or the
+sender's setup rather than a dead address. Missing or new classifications are
+conservatively permanent. These flags are the package's interpretation, not a
+binary field Postmark promises. `Inactive` does not override the type; use
+SubscriptionChange to follow Postmark's actual suppression state.
+
+`deliveryId` reads `X-PM-Webhook-Trace-Id`; keep it when you record the event so
+retries do not apply it twice. When absent, construct a compound key from the
+record's identity, recipient and event time. Never treat all empty ids as one
+delivery. The existing Resend de-duplication example below assumes a nonempty
+delivery id.
 
 ## Retries and de-duplication
 

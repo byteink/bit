@@ -1,0 +1,197 @@
+// Postmark authenticates with configured HTTP Basic credentials, not a body
+// signature. Check them before parsing the body (#6920).
+
+import { jsonAsBool, jsonIsObject } from "std/json"
+
+fn pmWebhookAuth(): MailError {
+  return MailError.Auth(Reply{ code = 401, text = "Postmark webhook credentials do not match" })
+}
+
+fn pmWebhookVerify(header: (string) => string, secret: string): ()!MailError {
+  if (secret == "") {
+    fail MailError.Invalid("postmark webhooks need the basic-auth user:password configured in the webhook URL")
+  }
+  let auth = header("authorization")
+  // A matching credential cannot encode to more than this many bytes. Refuse
+  // an oversized header before the decoder allocates its output.
+  let encodedLen = (len(secret) + 2) / 3 * 4
+  if (len(auth) < 6 || len(auth) > encodedLen + 6) {
+    fail pmWebhookAuth()
+  }
+  if (toLower(auth[:6]) != "basic ") {
+    fail pmWebhookAuth()
+  }
+  let got = decodeBase64(auth[6:]) catch _ {
+    fail pmWebhookAuth()
+  }
+  if (!hmacEqual(got, []byte(secret))) {
+    fail pmWebhookAuth()
+  }
+  return
+}
+
+fn pmWebhookSubscription(j: Json): EventKind!MailError {
+  let v = jsonGet(j, "SuppressSending")
+  if (!isSome(v)) {
+    fail MailError.Invalid("Postmark SubscriptionChange has no SuppressSending boolean")
+  }
+  let suppress = jsonAsBool(unwrap(v))
+  if (!isSome(suppress)) {
+    fail MailError.Invalid("Postmark SuppressSending is not a boolean")
+  }
+  if (unwrap(suppress)) {
+    return EventKind.Unsubscribed
+  }
+  return EventKind.Subscribe
+}
+
+fn pmWebhookKind(t: string, j: Json): Option<EventKind>!MailError {
+  if (t == "SubscriptionChange") {
+    return Option.Some(pmWebhookSubscription(j)?)
+  }
+  let types = ["Delivery", "Bounce", "SpamComplaint", "Open", "Click"]
+  let kinds = [
+    EventKind.Delivered,
+    EventKind.Bounced,
+    EventKind.Complained,
+    EventKind.Opened,
+    EventKind.Clicked,
+  ]
+  assert(len(types) == len(kinds), "Postmark record mapping lengths")
+  let i = 0
+  while (i < len(types)) {
+    if (types[i] == t) {
+      return Option.Some(kinds[i])
+    }
+    i = i + 1
+  }
+  return Option.None
+}
+
+// Complete provider type table: https://postmarkapp.com/developer/api/bounce-api
+// Flags are this package's suppression policy, inferred from those meanings.
+const pmWebhookBounceTypes: []string = [
+  "HardBounce", "Transient", "Unsubscribe", "Subscribe", "AutoResponder", "AddressChange",
+  "DnsError", "SpamNotification", "OpenRelayTest", "Unknown", "SoftBounce", "VirusNotification",
+  "ChallengeVerification", "BadEmailAddress", "SpamComplaint", "ManuallyDeactivated", "Unconfirmed",
+  "Blocked", "SMTPApiError", "InboundError", "DMARCPolicy", "TemplateRenderingFailed",
+]
+const pmWebhookBouncePermanent: []bool = [
+  true, false, true, false, false, true, false, true, false, true, false, false, false, true, true, true,
+  true, false, false, false, false, false,
+]
+
+fn pmWebhookPermanent(kind: EventKind, j: Json): bool {
+  if (kind != EventKind.Bounced) {
+    return false
+  }
+  let t = rsText(j, "Type")
+  assert(
+    len(pmWebhookBounceTypes) == len(pmWebhookBouncePermanent),
+    "Postmark bounce mapping lengths",
+  )
+  let i = 0
+  while (i < len(pmWebhookBounceTypes)) {
+    if (pmWebhookBounceTypes[i] == t) {
+      return pmWebhookBouncePermanent[i]
+    }
+    i = i + 1
+  }
+  // A new or missing classification must not silently resume suppressed mail.
+  return true
+}
+
+fn pmWebhookMessageId(j: Json): string {
+  let meta = jsonGet(j, "Metadata")
+  if (isSome(meta)) {
+    let id = rsText(unwrap(meta), "message_id")
+    if (id != "") {
+      return id
+    }
+  }
+  let h = jsonGet(j, "Headers")
+  if (!isSome(h)) {
+    return ""
+  }
+  let list = jsonAsArray(unwrap(h))
+  if (!isSome(list)) {
+    return ""
+  }
+  for e of unwrap(list) {
+    if (toLower(rsText(e, "Name")) == "message-id") {
+      return rsText(e, "Value")
+    }
+  }
+  return ""
+}
+
+fn pmWebhookAt(t: string, j: Json, fallback: Timestamp): Timestamp {
+  let key = "ReceivedAt"
+  if (t == "Delivery") {
+    key = "DeliveredAt"
+  }
+  if (t == "Bounce" || t == "SpamComplaint") {
+    key = "BouncedAt"
+  }
+  if (t == "SubscriptionChange") {
+    key = "ChangedAt"
+  }
+  return parseRfc3339(rsText(j, key)) catch _ {
+    return fallback
+  }
+}
+
+fn pmWebhookReason(j: Json): string {
+  for key of ["Description", "Details", "SuppressionReason"] {
+    let text = rsText(j, key)
+    if (text != "") {
+      return text
+    }
+  }
+  return ""
+}
+
+fn pmWebhookBuild(j: Json, id: string, at: Timestamp): []Event!MailError {
+  if (!jsonIsObject(j) || rsText(j, "RecordType") == "") {
+    fail MailError.Invalid("Postmark webhook has no RecordType string")
+  }
+  let t = rsText(j, "RecordType")
+  let kind = pmWebhookKind(t, j)?
+  if (!isSome(kind)) {
+    return []
+  }
+  let to = rsText(j, "Recipient")
+  if (to == "") {
+    to = rsText(j, "Email")
+  }
+  if (to == "") {
+    fail MailError.Invalid("Postmark webhook has no recipient string")
+  }
+  let k = unwrap(kind)
+  return [
+    Event{
+      kind = k,
+      recipient = to,
+      messageId = pmWebhookMessageId(j),
+      providerId = rsText(j, "MessageID"),
+      deliveryId = id,
+      at = pmWebhookAt(t, j, at),
+      permanent = pmWebhookPermanent(k, j),
+      reason = pmWebhookReason(j),
+      provider = Provider.Postmark,
+    },
+  ]
+}
+
+fn postmarkEvents(
+  header: (string) => string,
+  body: string,
+  secret: string,
+  at: Timestamp,
+): []Event!MailError {
+  pmWebhookVerify(header, secret)?
+  let j = jsonParse(body) catch _ {
+    fail MailError.Invalid("Postmark webhook body is not valid JSON")
+  }
+  return pmWebhookBuild(j, header("x-pm-webhook-trace-id"), at)?
+}
