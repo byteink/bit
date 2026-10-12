@@ -152,7 +152,7 @@ import { pollCreate, pollClose, pollDrain, pollWake, winSpawnTrampoline } from "
 import { wkSlot } from "../../sched"
 import { threadStackBytes } from "../../thread"
 import { parkMinBackoffNs, parkMaxBackoffNs, parkNextBackoff } from "../../park"
-import { parkMonoNs, parkSleepNs, parkWait, parkWake } from "../../park/windows"
+import { parkMonoNs, parkSleepNs, parkWait, parkWake, parkCpuCount } from "../../park/windows"
 import {
   mapPages, unmapPages, remapPages, protectPages, guardPages, releaseReservation,
 } from "../../alloc/windows"
@@ -580,23 +580,12 @@ export @nosplit @symbol("bit_rt_remap_pages") fn rtRemapPages(addr: int, nbytes:
 // BIT_GC_STATS steps removed (see the header) and step 6/7/8's thread
 // creation and join done through CreateThread/WaitForSingleObject directly.
 fn boot(): int {
-  // 1. Fault handling (#3337, ./signal.bit): a process-wide vectored
-  //    exception handler, plus this (boot) thread's own stack-overflow
-  //    guarantee. Before anything else that can allocate or run user code,
-  //    matching where ../linux and ../darwin install their SIGSEGV/SIGBUS
-  //    dispositions. No alternate stack to map here (unlike sigaltstack on
-  //    the other two platforms) — AddVectoredExceptionHandler runs the
-  //    handler on the FAULTING thread's own stack; SetThreadStackGuarantee
-  //    is what reserves the headroom it needs (./signal.bit's header).
   winInstallStackGuarantee()
   installFatalSignalHandlers()
   installConsoleCtrlHandler()
 
-  // 1b. Raise the timer tick to 1ms for the whole process (see the extern's
-  //     own comment) — once, here, before any worker can park or sleep.
   let _ = timeBeginPeriod(i32(1))
 
-  // 2. Map and bind the heap, then start the collector and type descriptors.
   let spanBytes = arenaWords * 8
   let idxBytes = indexWords * 8
   let span = mapPages(spanBytes)
@@ -612,43 +601,14 @@ fn boot(): int {
     return 70
   }
 
-  // 3. GC config from the environment (BIT_GC/BIT_GC_MIN_KB/BIT_GC_GROWTH_PCT/
-  //    BIT_GC_STATS over the defaults), the Bit port of `runtime/root/`'s
-  //    `configFromEnv`. `osSetArgs` ran in `winMain` before `boot`, so `envp`
-  //    is captured by now — see `winMain`'s own comment for why this MUST
-  //    happen before step 2's `rootInit(rootEnvMarkStack(...))` call, which
-  //    reads `envp` through `gcEnvValuePtr` (#3391 fault A: that call used to
-  //    run before `winCaptureArgsEnv`, reading linear address 0).
   rootConfigureFromEnv(true, false, gcDefaultMinTrigger, gcDefaultGrowthPct, false)
   bootSeedHash() // 3a. the map hash seed (#7379, ./bootseed.bit), before any map exists
 
-  // 4. Scheduler over the worker blocks. `nworkers` is fixed for the life of
-  //    the process: THE POOL DOES NOT GROW ON WINDOWS YET (#4326, deferred
-  //    into the Windows port #3322) -- nothing here calls `schedGrowArm`/
-  //    `schedMaybeGrow` as ../darwin's and ../linux's `bootworker.bit` do.
-  let nworkers = rootEnvWorkers(1)
-  if (nworkers < 1) {
-    nworkers = 1
-  }
-  if (nworkers > bootMaxWorkers) {
-    nworkers = bootMaxWorkers
-  }
+  let nworkers = bootWorkerCount(rootEnvWorkers(1))
   let sched: *i64 = ptrOf(schedBlock)
   schedInit(sched, int(ptrOf(workerBlock)), nworkers)
   spawnBindScheduler(int(sched))
 
-  // 4b. Create the netpoller and bind it into the scheduler (#3339) — the
-  //     Bit form of `runtime/sched/`'s `Scheduler.init` doing
-  //     `poller = try NetPoller.init()` inline, which this port cannot:
-  //     `../../sched` may import neither platform's provider, so the
-  //     consumer that is already per-platform makes the call, exactly as
-  //     ../linux/boottail.bit and ../darwin/boot.bit do at their own step 4b.
-  //
-  //     A FAILURE IS FATAL, not a degrade-to-no-poller, for the identical
-  //     reason ../linux/boottail.bit's step 4b states: silent degradation is
-  //     the one outcome that never gets fixed. `pollCreate` already reports a
-  //     port handle of 0 as failure — `scPollFd`'s own "no poller bound"
-  //     sentinel is 0 — so a single `< 0` test covers both.
   let pollFd = pollCreate()
   if (pollFd < 0) {
     return 70
@@ -656,7 +616,6 @@ fn boot(): int {
   bootPollFd = pollFd
   schedSetPollFd(sched, pollFd)
 
-  // 4c. Channel reserve + registry for `bit_rt_chan_make`.
   let chanMem = mapPages(chanReserveBytes)
   if (chanMem == 0) {
     return 70
@@ -666,96 +625,27 @@ fn boot(): int {
     int(ptrOf(chanRegBlock)), int(sched),
   )
 
-  // 4d. Arm stop-the-world. Cores 0 (unknown: no CPU-count import is admitted
-  //     here) leaves the collector without GC-only helpers (#6460).
-  stwBind(rootGcAddr(), int(sched), int(ptrOf(chanRegBlock)), rootWorldAddr(), 0)
+  stwBind(rootGcAddr(), int(sched), int(ptrOf(chanRegBlock)), rootWorldAddr(), parkCpuCount())
 
-  // 5. Place `bit_main`'s task on worker 0's deque; register before queueing.
-  let stackBase = mapGuardedStack(schedMainStackBytes, ptrOf(winMainStackRegionScratch))
-  if (stackBase == 0) {
-    return 70
-  }
-  // Published for `vehHandler` (#3337, ./signal.bit) to name a main-stack
-  // overflow exactly rather than by heuristic.
-  mainStackBaseAddr = stackBase
-  let task = int(ptrOf(mainTaskBlock))
-  let t: *i64 = ptrOf(mainTaskBlock)
-  schedTaskInit(t, stackBase, schedMainStackBytes, entryOf(mainTrampoline), 0)
-  if (!schedRegisterBigStack(stackBase, schedMainStackBytes, task)) {
-    return 70
-  }
-  schedRegister(sched, task)
-  if (!dqPushBottom(schedWorkerAt(sched, 0) + wkDeque, task)) {
+  if (!bootQueueMain(sched)) {
     return 70
   }
 
-  // 6. Bring the workers up on real OS threads via CreateThread directly —
-  //    this file's own minimal stand-in for ../../thread/windows (#3335),
-  //    which will own the full threadStart/threadRelease contract once it
-  //    lands. A failed spawn is not fatal past the first worker (matching
-  //    ../linux/../darwin): worker 0 must come up or nothing runs, but a
-  //    program should keep the workers it got beyond that.
-  let started = 0
-  let wi = 0
-  while (wi < nworkers) {
-    let workerAddr = int(schedWorkerAt(sched, wi))
-    let z: *byte = nil
-    let argPtr = z + workerAddr
-    let flags = STACK_SIZE_PARAM_IS_A_RESERVATION
-    let nullAttrs: *byte = nil
-    let handle = CreateThread(
-      nullAttrs, i64(threadStackBytes),
-      entryOf(workerBody), argPtr, flags, ptrOf(winThreadIdScratch),
-    )
-    *(ptrOf(startHandles) + wi) = int(handle)
-    if (int(handle) == 0) {
-      if (wi == 0) {
-        return 70
-      }
-      wi = nworkers
-    } else {
-      started = started + 1
-      wi = wi + 1
-    }
+  let started = bootStartWorkers(sched, nworkers)
+  if (started == 0) {
+    return 70
   }
 
-  // 6b. The preemption monitor (./sysmon.bit, #6469), after the workers so
-  //     its first tick has a worker table to scan; one call, boot.bit is at
-  //     the line cap.
   sysmonStart()
 
-  // 7. Wait for `main` — `bootWaitForMain` below, bracketed `blocked` exactly
-  //    as ../linux/../darwin's boot thread (see their "THE BOOT THREAD AND THE
-  //    RENDEZVOUS" header for the full safety argument, which applies
-  //    unchanged here: this function allocates nothing on the managed heap at
-  //    any point). It was an open-coded 1ms poll here until #3717.
   bootWaitForMain()
 
-  // 8. Signal shutdown, then join each started worker's real OS thread —
-  //    `bootJoinWorkers` (./bootjoin.bit, #7829): WaitForSingleObject on its
-  //    CreateThread HANDLE under ONE short deadline, so a worker that cannot see
-  //    the shutdown (blocked in a syscall) is left to `ExitProcess`.
   schedShutdown(sched)
-  // The poller holder blocks in the completion port up to its ceiling;
-  // `schedWakeIdleAll` reaches only parked workers (#6429).
   let _ = pollWake(bootPollFd)
   let joined = bootJoinWorkers(started)
 
-  // 8b. Close the netpoller (#3339) — AFTER the join, for the identical
-  //     ordering reason ../linux/boottail.bit's own step 8b states: a
-  //     worker's loop calls `pollDrain` on this descriptor until it has been
-  //     joined, so closing it under a live poller is a use-after-close, not
-  //     a leak. A worker the join gave up on may still be polling, so then the
-  //     descriptor is left to `ExitProcess`, which is about to close it.
-  if (joined && bootPollFd > 0) {
-    pollClose(bootPollFd)
-    bootPollFd = 0
-  }
+  bootClosePoller(joined)
 
-  // 9. `BIT_GC_STATS`. After the join, so the worker cannot be mid-collection
-  //    while the counters are read, and before the exit code goes back to the
-  //    entry so it lands on stderr while the process still has one. Same
-  //    placement as ../linux/boottail.bit and ../darwin/boot.bit's own step 9.
   if (rootEnvVerbose(false)) {
     statsReport()
   }
