@@ -25,7 +25,7 @@
 #      hardware that matches it. Not the staging tree: the bytes that ship are
 #      the only thing worth testing, and this is what caught macOS serialising
 #      xattrs into every member.
-#   5. generate a CycloneDX SBOM (dist/sbom.py) in a throwaway venv
+#   5. generate a CycloneDX SBOM (dist/sbom.py) in a disposable container
 #   6. SHA256SUMS over every artifact, including the SBOM
 #   7. release notes from conventional commits
 #   8. `gh release create --draft` and upload
@@ -228,31 +228,96 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 -o ConnectionAttempts=1 "${WINDOWS_HOST
 command -v zip >/dev/null || { echo "release.sh: zip not found (needed to package x86_64-windows)" >&2; exit 1; }
 echo "release.sh: windows host reachable (${WINDOWS_HOST})"
 
-# --- preflight: SBOM venv reachability + hash integrity (#2802) -------------
-# dist/sbom.py needs cyclonedx-python-lib, which this Mac does not carry
-# system-wide (#2748). `pip install --require-hashes` against
-# dist/sbom-requirements.txt is the ONLY step in this whole release that
-# needs PyPI, and it used to run after the three cross-builds and their
-# on-hardware smoke tests - about 10 minutes in - so an unreachable PyPI or a
-# stale mirror cost the operator the whole run, discovered far too late to be
-# useful. Resolve it now, before anything is built. ${SBOM_VENV} stays alive
-# across the whole build; the actual `dist/sbom.py` invocation still happens
-# at its original site near the checksums, since its output path depends on
-# ${OUT} - this only moves WHEN reachability and hash integrity are checked,
-# never weakens --require-hashes, and never installs anything outside this
-# throwaway venv.
-echo "release.sh: preflighting the SBOM venv (dist/sbom-requirements.txt)"
-SBOM_VENV="$(mktemp -d)"
-python3 -m venv "${SBOM_VENV}"
-"${SBOM_VENV}/bin/pip" install --quiet --require-hashes -r dist/sbom-requirements.txt || {
-	echo "release.sh: could not install dist/sbom-requirements.txt into a throwaway venv" >&2
-	echo "  either PyPI is unreachable (check network / PIP_INDEX_URL) or a hash in" >&2
-	echo "  that file no longer matches the package it pins. Diagnose with:" >&2
-	echo "    python3 -m venv /tmp/sbomcheck && /tmp/sbomcheck/bin/pip install --require-hashes -r dist/sbom-requirements.txt -v; rm -rf /tmp/sbomcheck" >&2
-	echo "  then fix the network path or repin dist/sbom-requirements.txt and retry." >&2
-	rm -rf "${SBOM_VENV}"
+# --- preflight: SBOM dependencies stay inside one stopped container (#7923) ---
+# Python 3.15 final is not yet in official-images; use the available stable image.
+SBOM_IMAGE="python:3.14.8-slim-trixie@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170"
+SBOM_CONTAINER=""
+SBOM_IMAGE_OWNED=0
+SBOM_SCRATCH=""
+
+sbomRemoveContainer() {
+	local ids
+	[ -n "${SBOM_CONTAINER}" ] || return 0
+	ids="$(docker container ls -aq --filter "label=bit.sbom.owner=${SBOM_CONTAINER}")" || return 1
+	[ -n "${ids}" ] || return 0
+	docker stop --time 5 "${SBOM_CONTAINER}" >/dev/null && docker rm "${SBOM_CONTAINER}" >/dev/null
+}
+
+sbomRemoveImage() {
+	[ "${SBOM_IMAGE_OWNED}" -eq 1 ] || return 0
+	if docker image inspect "${SBOM_IMAGE}" >/dev/null 2>&1; then
+		docker image rm "${SBOM_IMAGE}" >/dev/null
+	else
+		docker info >/dev/null 2>&1
+	fi
+}
+
+sbomCleanup() {
+	local original=$? failed=0
+	trap - EXIT
+	sbomRemoveContainer || failed=1
+	sbomRemoveImage || failed=1
+	if [ -n "${SBOM_SCRATCH}" ]; then rmdir "${SBOM_SCRATCH:?}" || failed=1; fi
+	if [ "${failed}" -ne 0 ]; then
+		echo "release.sh: SBOM cleanup failed; inspect container ${SBOM_CONTAINER} and image ${SBOM_IMAGE}" >&2
+		[ "${original}" -ne 0 ] || original=1
+	fi
+	exit "${original}"
+}
+
+sbomStatus() {
+	local waited=0 result
+	result="$(docker wait "${SBOM_CONTAINER}")" || waited=$?
+	[ "${waited}" -eq 0 ] || return "${waited}"
+	case "${result}" in ''|*[!0-9]*) echo "release.sh: invalid SBOM container status" >&2; return 1 ;; esac
+	[ "${result}" -eq 0 ] || { echo "release.sh: SBOM container exited ${result}" >&2; return 1; }
+}
+
+sbomRun() {
+	local transport=0 result=0 state
+	docker start --attach --interactive "${SBOM_CONTAINER}" || transport=$?
+	if [ "${transport}" -ne 0 ]; then
+		state="$(docker inspect --format '{{.State.Status}}' "${SBOM_CONTAINER}")" || return "${transport}"
+		[ "${state}" = exited ] || return "${transport}"
+	fi
+	sbomStatus || result=$?
+	[ "${transport}" -eq 0 ] || return "${transport}"
+	return "${result}"
+}
+
+sbomArg() {
+	local quoted="$1"
+	# Bash 3.2 retains escape bytes inside a quoted replacement.
+	quoted=${quoted//\'/\'\\\'\'}
+	printf "'%s' " "${quoted}"
+}
+
+trap sbomCleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+SBOM_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/bit-sbom-XXXXXXXX")"
+SBOM_CONTAINER="bit-sbom-$(basename "${SBOM_SCRATCH}")"
+if ! docker image inspect "${SBOM_IMAGE}" >/dev/null 2>&1; then
+	docker info >/dev/null
+	SBOM_IMAGE_OWNED=1
+	docker pull "${SBOM_IMAGE}" >&2
+fi
+docker create --interactive --name "${SBOM_CONTAINER}" --label "bit.sbom.owner=${SBOM_CONTAINER}" \
+	--user "$(id -u):$(id -g)" --env PIP_INDEX_URL \
+	--mount "type=bind,source=${ROOT}/dist/sbom.py,target=/w/dist/sbom.py,readonly" \
+	--mount "type=bind,source=${ROOT}/dist/sbom-requirements.txt,target=/w/dist/sbom-requirements.txt,readonly" \
+	"${SBOM_IMAGE}" sh -s >/dev/null
+echo "release.sh: preflighting SBOM dependencies in Docker"
+sbomRun <<'SBOM_PREPARE'
+set -eu
+python3 -m venv /tmp/sbom
+# Index credentials must not escape through pip diagnostics.
+/tmp/sbom/bin/pip install --quiet --require-hashes --retries 0 --timeout 20 -r /w/dist/sbom-requirements.txt >/tmp/pip.log 2>&1 || {
+	echo "release.sh: SBOM dependency install failed; check the index or pinned hashes" >&2
 	exit 1
 }
+SBOM_PREPARE
 echo "release.sh: SBOM dependencies resolved"
 
 TARGETS=(x86_64-linux aarch64-linux aarch64-macos x86_64-windows)
@@ -615,18 +680,14 @@ fi
 echo "release.sh: x86_64-windows smoke ok on real hardware (${WINDOWS_HOST})"
 
 # --- SBOM --------------------------------------------------------------------
-#
-# dist/sbom.py needs cyclonedx-python-lib, which this Mac does not carry
-# system-wide (#2748: a fifth release artifact, dist/README.md's "## SBOM",
-# was never generated because nothing called the generator). The venv itself
-# and its `pip install --require-hashes` were preflighted at the top of this
-# script, before the cross-builds (#2802) - reachability and hash integrity
-# are already proven by the time we get here, so only the actual generation,
-# whose output path depends on ${OUT}, happens at this site.
 echo "release.sh: generating SBOM"
-"${SBOM_VENV}/bin/python3" dist/sbom.py "${VERSION}" "${STAGE0_VERSION}" "${PASS1_BASE}" "${PASS1_DIR}" \
-	> "${OUT}/bit-${VERSION}.cdx.json"
-rm -rf "${SBOM_VENV}"
+{
+	printf 'set -eu\nexec /tmp/sbom/bin/python3 /w/dist/sbom.py '
+	for value in "${VERSION}" "${STAGE0_VERSION}" "${PASS1_BASE}" "${PASS1_DIR}"; do sbomArg "${value}"; done
+	printf '\n'
+} | sbomRun > "${OUT}/bit-${VERSION}.cdx.json"
+docker rm "${SBOM_CONTAINER}" >/dev/null
+SBOM_CONTAINER=""
 echo "release.sh: wrote ${OUT}/bit-${VERSION}.cdx.json"
 
 # --- checksums and notes ----------------------------------------------------

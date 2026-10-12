@@ -54,9 +54,22 @@ Generated automatically, as one of `dist/release.sh`'s own steps - no
 maintainer ever runs `dist/sbom.py` by hand or decides whether to. The script
 builds it via `cyclonedx-python-lib` (version pinned once, in
 `dist/sbom-requirements.txt`, read by both the release flow and
-`dist/sbom_test.py`) installed into a throwaway venv torn down immediately
-after, so cutting a release never leaves a Python package on the host. `bit`
-has no third-party source and no package manifest declaring dependencies, so
+`dist/sbom_test.py`). The release installs these hash-locked dependencies in
+one disposable Docker container before cross-builds. That container exits after
+preparation and restarts with the same venv for generation. Only the generator
+and requirements are mounted, read-only; JSON streams to the release output.
+The exit trap removes the owned container and any image acquired for this run.
+Preexisting images remain. No Python packages are installed on the host.
+
+The image is the digest-pinned official `python:3.14.8-slim-trixie` in
+`dist/release.sh`. Python 3.15 is stable, but its final slim image was unavailable
+in the official registry when this pin was selected. `PIP_INDEX_URL` is passed
+through without mounting user configuration; install failures report a generic
+message so index credentials do not enter release logs. Docker must remain
+available for cleanup; after an interrupted daemon, inspect the exact owned
+resources reported by the trap before retrying.
+
+`bit` has no third-party source and no package manifest declaring dependencies, so
 there is no external toolchain component at all: the compiler is bootstrapped
 by the pinned stage0 (`dist/stage0/SHA256SUMS`), which is a prior Bit release
 rather than a third-party component. The document states the absence of
