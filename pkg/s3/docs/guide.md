@@ -320,15 +320,15 @@ rate the client was really sending, any other answer lets it climb back along
 a cubic curve, never above twice the measured rate.
 
 ```bit
-import { RateLimiter, RateLimiterOptions, RetryMode, RetryStrategy } from "s3"
+import { DefaultRateLimiter, DefaultRateLimiterOptions, RetryMode, RetryStrategy } from "s3"
 
-fn gentleNightly(): (RetryStrategy, RateLimiter)! {
-  let limiter = RateLimiter(RateLimiterOptions(beta = 0.5, minFillRate = 1.0))?
+fn gentleNightly(): (RetryStrategy, DefaultRateLimiter)! {
+  let limiter = DefaultRateLimiter(DefaultRateLimiterOptions(beta = 0.5, minFillRate = 1.0))?
   let strategy = RetryStrategy(RetryMode.Adaptive, 5, limiter = limiter)?
   return (strategy, limiter)
 }
 
-fn pacing(limiter: RateLimiter): string {
+fn pacing(limiter: DefaultRateLimiter): string {
   if (!limiter.active()) {
     return "S3 has not pushed back, nothing is paced"
   }
@@ -352,7 +352,7 @@ every call it serves, so ten thousand uploads on a client slow down together.
 The curve is the SDK's, constant for constant: `beta` 0.7, `scaleConstant` 0.4,
 `smooth` 0.8 for the measured rate, a fill rate of at least `minFillRate` 0.5
 tokens a second and a bucket of at least `minCapacity` 1 token.
-`RateLimiterOptions` changes them, and `RateLimiter(...)` refuses a value that
+`DefaultRateLimiterOptions` changes them, and `DefaultRateLimiter(...)` refuses a value that
 would make the curve divide by zero or a send wait forever (a `beta` outside
 0 to 1, a `minCapacity` below 1, a `minFillRate` or `scaleConstant` that is not
 above 0). A `Standard` strategy never reads its limiter.
@@ -365,16 +365,16 @@ their own requests, and the one that has not been throttled yet keeps sending at
 full speed into the limit the other found. Give both strategies the same limiter
 and a throttle seen by either slows both.
 
-The `limiter` option takes a `SendLimiter`, the SDK's `RateLimiter` interface:
+The `limiter` option takes the SDK's `RateLimiter` interface:
 `getSendToken()`, called before every attempt, and
 `updateClientSendingRate(throttling)`, called once for every attempt's outcome,
-with `true` when the answer was a throttling one. `RateLimiter` is the built-in
+with `true` when the answer was a throttling one. `DefaultRateLimiter` is the built-in
 one; anything else with those two methods works, such as the counter below that
 only watches. It is called from many tasks at once, so it guards its own state.
 
 ```bit
 import { Mutex } from "std/sync"
-import { RateLimiter, RetryMode, RetryStrategy, SendLimiter } from "s3"
+import { DefaultRateLimiter, RetryMode, RetryStrategy, RateLimiter } from "s3"
 
 class Pushback {
   mu: Mutex
@@ -404,14 +404,14 @@ class Pushback {
 }
 
 fn shareOne(): (RetryStrategy, RetryStrategy)! {
-  let limiter = RateLimiter()?
+  let limiter = DefaultRateLimiter()?
   let uploads = RetryStrategy(RetryMode.Adaptive, 5, limiter = limiter)?
   let reports = RetryStrategy(RetryMode.Adaptive, 5, limiter = limiter)?
   return (uploads, reports)
 }
 
 fn watched(): RetryStrategy! {
-  let watcher: SendLimiter = Pushback()
+  let watcher: RateLimiter = Pushback()
   return RetryStrategy(RetryMode.Adaptive, 5, limiter = watcher)?
 }
 ```
@@ -420,7 +420,7 @@ Each client builds its own `RetryStrategy` (its quota stays its own) and hands
 it the same `limiter`. When `uploads` is told `SlowDown`, the limiter's rate
 drops, and the next `reports.begin()` waits for its token at the lower rate
 without `reports` having been throttled itself. Leave the option out and the
-strategy builds a `RateLimiter()` of its own.
+strategy builds a `DefaultRateLimiter()` of its own.
 
 ## Checking a cover arrived intact
 
