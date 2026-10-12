@@ -282,7 +282,14 @@
 #
 # Each retires at the next stage0 repin, the first oracle cut from a tree that carries #7745
 # (7745-loop-defer-stack), #7761 and #7770 (7761-range-chain-cse) or #7766 and #7773
-# (7766-synth-json-helper-column-shift).
+# (7766-synth-json-helper-column-shift), or #7929 (7933-variadic-type-marker).
+#
+# 7933-variadic-type-marker (`types`) explains only an inferred direct binding
+# of a unique, unshadowed top-level variadic function with primitive parameters
+# and result. Both compilers must check the unchanged source successfully and
+# emit identical AST/tokens. Token offsets pin the binding row; the AST proves
+# the final rest parameter and exact type. Every other dump byte stays equal.
+# Nested/imported/generic captures and failed witnesses remain unexplained.
 #
 # 7766-synth-json-helper-column-shift (`types`). #7766 (a9a95fc70) added `jsonAppendValue`,
 # `jsonDecJson` and `jsonTextValue` to the helper lists a `@json` class synthesizes imports for
@@ -569,6 +576,109 @@ END {
 }'
 }
 
+# #7933: prove each changed binding against identical same-source AST/tokens.
+# Unsupported shapes stay unexplained; no type text is globally normalized.
+variadicTypeWitness() {
+  local witness_dir=$1 source=$2 binary mode rc side=0
+  cp "$source" "$witness_dir/source" || return 1
+  for binary in "$ORACLE" "$BIT2"; do
+    for mode in check --dump-ast --dump-tokens; do
+      ALARMRUN_KEEP_STDERR=1 alarmrun "$binary" "$mode" "$source" > "$witness_dir/$side$mode" 2> "$witness_dir/err"
+      rc=$?
+      [ "$rc" -eq 0 ] && [ ! -s "$witness_dir/err" ] || return 1
+    done
+    side=$((side + 1))
+  done
+  cmp -s "$source" "$witness_dir/source" || return 1
+  cmp -s "$witness_dir/0--dump-ast" "$witness_dir/1--dump-ast" || return 1
+  cmp -s "$witness_dir/0--dump-tokens" "$witness_dir/1--dump-tokens"
+}
+
+explainVariadicTypeMarker() (
+  [ -f "${3:-}" ] && [ -x "${ORACLE:-}" ] && [ -x "${BIT2:-}" ] || return 1
+  command -v alarmrun >/dev/null || return 1
+  local witness_dir rc
+  witness_dir=$(mktemp -d "${TMPDIR:-/tmp}/t7933-witness-XXXXXX") || return 1
+  trap 'rm -rf "${witness_dir:?}"' EXIT
+  printf '%s\n' "$1" > "$witness_dir/old" || return 1
+  printf '%s\n' "$2" > "$witness_dir/new" || return 1
+  variadicTypeWitness "$witness_dir" "$3" || return 1
+  perl - "$witness_dir" <<'PERL'
+use strict; use warnings;
+sub readall { open my $f, '<:raw', $_[0] or die; local $/; return <$f> }
+my $d = shift; my $src = readall("$d/source");
+my @stack; my @nodes; my $tree;
+my $ast = readall("$d/0--dump-ast");
+while ($ast =~ /\G\s*(\(|\)|"(?:\\.|[^"\\])*"|[^()\s]+)/gc) {
+  my $t = $1;
+  if ($t eq '(') {
+    exit 1 if $tree && !@stack;
+    my $n = []; push @nodes, $n;
+    push @{$stack[-1]}, $n if @stack;
+    $tree = $n unless @stack;
+    push @stack, $n;
+  } elsif ($t eq ')') { exit 1 unless @stack; pop @stack }
+  else { exit 1 unless @stack; push @{$stack[-1]}, $t }
+}
+exit 1 if @stack || !$tree || $tree->[0] ne 'program' || $ast !~ /\G\s*\z/gc;
+my (%decl, %count, %bound);
+for my $n (@nodes) {
+  next unless @$n > 1;
+  $count{$n->[2]}++ if $n->[0] eq 'func_decl' && !ref($n->[2]);
+  $bound{$n->[1]}++ if $n->[0] =~ /^(binding|param|param_rest|arrow_p)$/ && !ref($n->[1]);
+}
+my %prim = map { $_ => $_ } qw(bool i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 string);
+@prim{qw(int byte)} = qw(i64 u8);
+for my $n (@$tree[1..$#$tree]) {
+  next unless ref($n) && @$n == 7 && $n->[0] eq 'func_decl';
+  my ($name, $generics, $params, $result) = @$n[2..5];
+  next if ref($name) || $count{$name} != 1 || $bound{$name} || ref($generics) || $generics ne '_';
+  next unless ref($params) && $params->[0] eq 'params' && @$params > 1;
+  next if ref($result) || !exists $prim{$result};
+  my @types; my $valid = 1; my $rest = 0;
+  for my $i (1..$#$params) {
+    my $p = $params->[$i];
+    if (!ref($p) || @$p != 3 || $p->[0] !~ /^param(_rest)?$/ || ref($p->[2]) || !exists $prim{$p->[2]}) { $valid = 0; last }
+    if ($p->[0] eq 'param_rest') { $rest++; $valid = 0 unless $i == $#$params }
+    push @types, $prim{$p->[2]};
+  }
+  next unless $valid && $rest == 1;
+  my $old = '(' . join(', ', @types) . ') => ' . $prim{$result};
+  $types[-1] = '...' . $types[-1];
+  $decl{$name} = [$old, '(' . join(', ', @types) . ') => ' . $prim{$result}];
+}
+my @tokens;
+for my $line (split /\n/, readall("$d/0--dump-tokens")) {
+  exit 1 unless $line =~ /^(\w+) ([0-9]+)\.\.([0-9]+)$/;
+  exit 1 if $2 > $3 || $3 > length($src);
+  push @tokens, [$1, $2, substr($src, $2, $3 - $2)];
+}
+my %bindings;
+for my $i (1..$#tokens-3) {
+  my ($prev, $name, $eq, $callee, $end) = @tokens[$i-1..$i+3];
+  next unless $prev->[0] =~ /^kw_(let|const)$/ && $name->[0] eq 'ident' && $eq->[0] eq 'eq';
+  next unless $callee->[0] eq 'ident' && $end->[0] eq 'semicolon' && exists $decl{$callee->[2]};
+  next unless $bound{$name->[2]} == 1;
+  my @lines = split /\n/, substr($src, 0, $name->[1]), -1;
+  my $pos = scalar(@lines) . ':' . (length($lines[-1]) + 1) . ': ' . $name->[2];
+  $bindings{$pos} = $decl{$callee->[2]};
+}
+my @old = split /\n/, readall("$d/old"), -1; my @new = split /\n/, readall("$d/new"), -1;
+exit 1 unless @old == @new; my $changed = 0;
+for my $i (0..$#old) {
+  next if $old[$i] eq $new[$i];
+  exit 1 unless $old[$i] =~ /^([0-9]+:[0-9]+: [A-Za-z_][A-Za-z_0-9]*): (.+)$/;
+  my ($pos, $ty) = ($1, $2); my $sig = $bindings{$pos};
+  exit 1 unless $sig && $ty eq $sig->[0] && $new[$i] eq "$pos: $sig->[1]";
+  $changed++;
+}
+exit 1 unless $changed;
+PERL
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  awk 'BEGIN { print "7933-variadic-type-marker" }'
+)
+
 # #7925: whole-project O0 ELF proves owner/ABI evidence absent from root IR.
 # The native checker keeps every other root IR byte unchanged.
 explainFnvalueOwners() (
@@ -601,12 +711,12 @@ explainFnvalueOwners() (
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. 7745-loop-defer-stack is registered
 # on the `ir` and `iropt` kinds, 7761-range-chain-cse on `iropt` only, 7766-synth-json-helper-column-shift
-# on `types`.
+# and 7933-variadic-type-marker on `types`.
 explainMismatch() {
   case "$3" in
     ir) explainLoopDeferStack "$1" "$2" || explainFnvalueOwners "$1" "$2" "${4:-}"; return ;;
     iropt) explainLoopDeferStack "$1" "$2" || explainRangeChainCse "$1" "$2" || explainFnvalueOwners "$1" "$2" "${4:-}"; return ;;
-    types) explainJsonHelperShift "$1" "$2" "${4:-}"; return ;;
+    types) explainJsonHelperShift "$1" "$2" "${4:-}" || explainVariadicTypeMarker "$1" "$2" "${4:-}"; return ;;
   esac
   return 1
 }
@@ -626,7 +736,7 @@ declaredSignatureNames() {
     iropt|"") printf '%s\n' 7745-loop-defer-stack 7761-range-chain-cse 7925-fnvalue-owner-reuse ;;
   esac
   case "${1:-}" in
-    types|"") printf '%s\n' 7766-synth-json-helper-column-shift ;;
+    types|"") printf '%s\n' 7766-synth-json-helper-column-shift 7933-variadic-type-marker ;;
   esac
   return 0
 }
