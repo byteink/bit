@@ -11,7 +11,6 @@ the same `data` key.
 
 ```bit
 import { App, Ctx, Res, envelope } from "web"
-import { Json } from "std/json"
 
 @json class User {
   id: int,

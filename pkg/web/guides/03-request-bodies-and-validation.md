@@ -18,7 +18,6 @@ separate type carrying only what a client is allowed to set:
 ```bit
 import { App, Config, Ctx, Res, minLen, notFound } from "web"
 import { Builder, parseInt } from "std/strings"
-import { Json } from "std/json"
 
 @json class Article {
   id: i64,
@@ -129,10 +128,8 @@ PostgreSQL. `c.body<CreateArticleInput>()?` parses the request body into
 that type; the type argument is never optional, since it is the only thing
 the compiler has to build the value from.
 
-Every `@json` class needs `Json` and `JsonEntry` imported from `std/json`,
-even if the handler never names either type directly - the compiler-written
-decoder behind `c.body<T>()` refers to them. Leaving the import out is
-`E0142`, and the error names the exact import to add.
+The compiler builds the decoder for an `@json` class automatically.
+Import from `std/json` when your code calls its functions or names its types.
 
 This example's `ArticleStore` is a single in-process list, useful for
 seeing validation work end to end before this part has a database - it is

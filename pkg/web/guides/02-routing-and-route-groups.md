@@ -23,7 +23,6 @@ under that name. `c.param(name)` reads it back:
 ```bit
 import { App, Config, Ctx, Res, notFound } from "web"
 import { parseInt } from "std/strings"
-import { Json } from "std/json"
 
 @json class Article {
   id: i64,
@@ -91,7 +90,6 @@ added, both article routes moved onto an `/articles` group:
 ```bit
 import { App, Config, Ctx, Res, notFound } from "web"
 import { parseInt } from "std/strings"
-import { Json } from "std/json"
 
 @json class Article {
   id: i64,

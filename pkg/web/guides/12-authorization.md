@@ -22,7 +22,6 @@ can read it back with no second database query:
 ```bit
 import { Ctx, forbidden, unauthorized } from "web"
 import { parseInt } from "std/strings"
-import { Json } from "std/json"
 
 const adminRole = "admin"
 const sessionUserIdKey = "inkwell:userId"

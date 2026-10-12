@@ -6,7 +6,6 @@ A user signs up and your handler needs to send them a welcome email. Doing
 it inline is the obvious thing:
 
 ```bit
-import { Json } from "std/json"
 fn createUserSync(email: string): ()! {
   // insert into your database
   return
