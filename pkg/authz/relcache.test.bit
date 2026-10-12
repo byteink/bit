@@ -1,0 +1,448 @@
+// Every read is counted, including the freshness probe. Barriers return
+// snapshots taken before a write, without sleeps or holding the cache lock.
+class RelObserved {
+  inner: MemoryRelationStore
+  mu: Mutex
+  reads: int
+  down: bool
+  walkDown: bool
+  partial: bool
+  barrier: string
+  entered: chan<bool>
+  release: chan<bool>
+  clock: AtomicI64
+  versionDelay: i64
+  walkDelay: i64
+
+  init(clock: AtomicI64) {
+    this.inner = MemoryRelationStore()
+    this.mu = Mutex()
+    this.reads = 0
+    this.down = false
+    this.walkDown = false
+    this.partial = false
+    this.barrier = ""
+    this.entered = chan<bool>(1)
+    this.release = chan<bool>(1)
+    this.clock = clock
+    this.versionDelay = 0
+    this.walkDelay = 0
+  }
+
+  counted() {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.reads = this.reads + 1
+  }
+
+  count(): int {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.reads
+  }
+
+  paused(kind: string) {
+    this.mu.lock()
+    let pause = this.barrier == kind
+    if (pause) {
+      this.barrier = ""
+    }
+    this.mu.unlock()
+    if (pause) {
+      this.entered <- true
+      let _ = <- this.release
+    }
+  }
+
+  export write(tenant: string, t: Tuple): ()! {
+    this.inner.write(tenant, t)?
+    this.paused("write")
+    if (this.partial) {
+      fail StoreUnavailable{}
+    }
+  }
+
+  export delete(tenant: string, t: Tuple): ()! {
+    this.inner.delete(tenant, t)?
+    if (this.partial) {
+      fail StoreUnavailable{}
+    }
+  }
+
+  export has(tenant: string, t: Tuple): bool! {
+    this.counted()
+    return this.inner.has(tenant, t)?
+  }
+
+  export direct(
+    tenant: string,
+    object: string,
+    relation: string,
+    offset: int,
+    limit: int,
+  ): []string! {
+    this.counted()
+    if (this.walkDown) {
+      fail StoreUnavailable{}
+    }
+    let answer = this.inner.direct(tenant, object, relation, offset, limit)?
+    this.clock.add(this.walkDelay)
+    this.paused("walk")
+    return answer
+  }
+
+  export list(tenant: string, subject: string): []Tuple! {
+    this.counted()
+    return this.inner.list(tenant, subject)?
+  }
+
+  export version(): i64! {
+    this.counted()
+    if (this.down) {
+      fail StoreUnavailable{}
+    }
+    let answer = this.inner.version()?
+    this.clock.add(this.versionDelay)
+    this.paused("version")
+    return answer
+  }
+}
+
+class RelFixture {
+  a: Authz<Action>,
+  store: RelObserved,
+  clock: AtomicI64,
+}
+
+fn relFixture(capacity: int = 2, interval: int = 10): RelFixture {
+  let clock = AtomicI64(1)
+  let store = RelObserved(clock)
+  let a = graph()
+  a.relations = store
+  a.relationCache = RelCache(capacity, interval)
+  a.relationCache.clock = () => int(clock.load())
+  return RelFixture{ a = a, store = store, clock = clock }
+}
+
+fn relRead(a: Authz<Action>, subject: string, out: chan<string>) {
+  out <- outcome(a, subject, "editor", "shelf:a")
+}
+
+fn relWrite(a: Authz<Action>, out: chan<string>) {
+  a.relate("user:a", "editor", "shelf:a") catch e {
+    out <- e.message()
+    return
+  }
+  out <- "ok"
+}
+
+fn relFresh(f: RelFixture) {
+  f.clock.add(10_000_000)
+}
+
+test "relation cache positive and negative warm hits read nothing" {
+  let f = relFixture()
+  put(f.a, "user:a", "editor", "shelf:a")
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  assert(!relAnswer(f.a, "user:b", "editor", "shelf:a"))
+  let reads = f.store.count()
+  assert(reads > 0)
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  assert(!relAnswer(f.a, "user:b", "editor", "shelf:a"))
+  assert(f.store.count() == reads, "all reads stay ${reads}")
+}
+
+test "relation cache local grants revokes and noops invalidate" {
+  let f = relFixture()
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  put(f.a, "user:a", "editor", "shelf:a")
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  let before = f.store.count()
+  put(f.a, "user:a", "editor", "shelf:a")
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  assert(f.store.count() > before, "noop is fenced too")
+  f.a.unrelate("user:a", "editor", "shelf:a") catch e {
+    panic(e.message())
+  }
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+}
+
+test "relation cache tenant views share capacity without sharing answers" {
+  let f = relFixture()
+  let a = f.a.forTenant("a") catch e {
+    panic(e.message())
+  }
+  let b = f.a.forTenant("b") catch e {
+    panic(e.message())
+  }
+  put(a, "user:a", "editor", "shelf:a")
+  assert(relAnswer(a, "user:a", "editor", "shelf:a"))
+  assert(!relAnswer(b, "user:a", "editor", "shelf:a"))
+  let reads = f.store.count()
+  assert(relAnswer(a, "user:a", "editor", "shelf:a"))
+  assert(!relAnswer(b, "user:a", "editor", "shelf:a"))
+  assert(f.store.count() == reads)
+  assert(len(f.a.relationCache.entries) == 2)
+}
+
+test "relation cache Related conditions share direct-check answers" {
+  let f = relFixture()
+  let a = rdBoot(false)
+  a.relations = f.store
+  a.relationCache = f.a.relationCache
+  rdPut(a, "user:sara", "editor", "rdFolder:1")
+  assert(relAnswer(a, "user:sara", "editor", "rdFolder:1"))
+  let reads = f.store.count()
+  assert(a.can<RdFolder>(rdUser("sara"), Action.Update, RdFolder{ id = 1, name = "" }))
+  assert(f.store.count() == reads, "condition reuses the same tuple")
+}
+
+test "relation cache true LRU retains A after A B A C" {
+  let f = relFixture()
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  assert(!relAnswer(f.a, "user:b", "editor", "shelf:a"))
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  assert(!relAnswer(f.a, "user:c", "editor", "shelf:a"))
+  let reads = f.store.count()
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  assert(f.store.count() == reads, "A stays warm")
+  assert(!relAnswer(f.a, "user:b", "editor", "shelf:a"))
+  assert(f.store.count() > reads, "B was least recently used")
+  assert(len(f.a.relationCache.entries) == 2)
+}
+
+test "relation cache default capacity is bounded after 10001 answers" {
+  assert(StoreOptions().relationCacheSize == 10_000)
+  let f = relFixture(StoreOptions().relationCacheSize)
+  let i = 0
+  while (i < 10_001) {
+    assert(!relAnswer(f.a, "user:${i}", "editor", "shelf:a"))
+    i = i + 1
+  }
+  assert(len(f.a.relationCache.entries) == 10_000)
+}
+
+fn relSizeRejected(size: int): bool {
+  let refused = false
+  let _ = Authz<Action>(options = StoreOptions(relationCacheSize = size)) catch e {
+    let (_, bad) = e.(InvalidPolicy)
+    refused = bad
+    Authz<Action>() catch startup {
+      panic(startup.message())
+    }
+  }
+  return refused
+}
+
+test "relation cache nonpositive sizes are rejected and one is accepted" {
+  assert(relSizeRejected(0))
+  assert(relSizeRejected(-1))
+  assert(!relSizeRejected(1))
+}
+
+test "relation cache other handles converge at the interval boundary" {
+  let f = relFixture()
+  let other = graph()
+  other.relations = f.store
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  put(other, "user:a", "editor", "shelf:a")
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  relFresh(f)
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  other.unrelate("user:a", "editor", "shelf:a") catch e {
+    panic(e.message())
+  }
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  relFresh(f)
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+}
+
+test "relation cache version failure refuses a healthy direct store and clears grants" {
+  let f = relFixture()
+  put(f.a, "user:a", "editor", "shelf:a")
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  f.store.down = true
+  relFresh(f)
+  assert(outcome(f.a, "user:a", "editor", "shelf:a") == StoreUnavailable{}.message())
+  assert(len(f.a.relationCache.entries) == 0)
+  assert(
+    f.store.inner.has("", Tuple{ subject = "user:a", relation = "editor", object = "shelf:a" }) catch e {
+      panic(e.message())
+    },
+  )
+  f.store.down = false
+  let reads = f.store.count()
+  assert(outcome(f.a, "user:a", "editor", "shelf:a") == StoreUnavailable{}.message())
+  f.clock.add(9_999_999)
+  assert(outcome(f.a, "user:a", "editor", "shelf:a") == StoreUnavailable{}.message())
+  assert(f.store.count() == reads, "failed attempts also obey the interval")
+  f.clock.add(1)
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+}
+
+test "relation cache local writes permit recovery before failed probe interval" {
+  let f = relFixture()
+  put(f.a, "user:a", "editor", "shelf:a")
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  f.store.down = true
+  relFresh(f)
+  assert(outcome(f.a, "user:a", "editor", "shelf:a") == StoreUnavailable{}.message())
+  let reads = f.store.count()
+  let now = f.clock.load()
+  f.store.down = false
+  f.a.unrelate("user:a", "editor", "shelf:a") catch e {
+    panic(e.message())
+  }
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  assert(f.store.count() > reads)
+  assert(f.clock.load() == now, "local invalidation permits the earlier probe")
+}
+
+test "relation cache invalid requests reach no store" {
+  let f = relFixture()
+  assert(outcome(f.a, "user:", "editor", "shelf:a") != "true")
+  assert(outcome(f.a, "user:a", "missing", "shelf:a") != "true")
+  assert(outcome(f.a, "user:a", "editor", "missing:a") != "true")
+  assert(f.store.count() == 0)
+}
+
+test "relation cache depth and fanout errors are never entries" {
+  let f = relFixture()
+  chain(f.a, 9)
+  assert(contains(outcome(f.a, "user:a", "editor", "shelf:f0"), "maxDepth"))
+  let reads = f.store.count()
+  assert(contains(outcome(f.a, "user:a", "editor", "shelf:f0"), "maxDepth"))
+  assert(f.store.count() > reads)
+  assert(len(f.a.relationCache.entries) == 0)
+  f.a.limits = newLimits(8, 10_000, 1) catch e {
+    panic(e.message())
+  }
+  put(f.a, "user:b", "editor", "shelf:a")
+  put(f.a, "user:c", "editor", "shelf:a")
+  assert(contains(outcome(f.a, "user:a", "editor", "shelf:a"), "maxFanout"))
+  let fanoutReads = f.store.count()
+  assert(contains(outcome(f.a, "user:a", "editor", "shelf:a"), "maxFanout"))
+  assert(f.store.count() > fanoutReads)
+  assert(len(f.a.relationCache.entries) == 0)
+}
+
+test "relation cache slow version probe and walk expire from I O start" {
+  let f = relFixture()
+  f.store.versionDelay = 10_000_000
+  assert(outcome(f.a, "user:a", "editor", "shelf:a") == StoreUnavailable{}.message())
+  f.store.versionDelay = 0
+  f.store.walkDelay = 10_000_000
+  assert(outcome(f.a, "user:a", "editor", "shelf:a") == StoreUnavailable{}.message())
+  assert(len(f.a.relationCache.entries) == 0)
+  f.store.walkDelay = 0
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+}
+
+test "relation cache zero interval checks freshly without retaining answers" {
+  let f = relFixture(interval = 0)
+  put(f.a, "user:a", "editor", "shelf:a")
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  let reads = f.store.count()
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  assert(f.store.count() > reads)
+  assert(len(f.a.relationCache.entries) == 0)
+}
+
+fn relRace(kind: string, initiallyGranted: bool) {
+  let f = relFixture()
+  if (initiallyGranted) {
+    put(f.a, "user:a", "editor", "shelf:a")
+  }
+  f.store.barrier = kind
+  let out = chan<string>(1)
+  spawn relRead(f.a, "user:a", out)
+  let _ = <- f.store.entered
+  if (kind == "version") {
+    let reads = f.store.count()
+    assert(
+      outcome(f.a, "user:b", "editor", "shelf:a") == StoreUnavailable{}.message(),
+      "unknown freshness fails closed",
+    )
+    assert(f.store.count() == reads, "only one probe owns store I/O")
+  }
+  if (initiallyGranted) {
+    f.a.unrelate("user:a", "editor", "shelf:a") catch e {
+      panic(e.message())
+    }
+  } else {
+    put(f.a, "user:a", "editor", "shelf:a")
+  }
+  f.store.release <- true
+  let answer = <- out
+  assert(answer == StoreUnavailable{}.message(), "stale result must be refused")
+  f.store.barrier = ""
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a") != initiallyGranted)
+}
+
+test "relation cache stale walk cannot publish over grant" {
+  relRace("walk", false)
+}
+
+test "relation cache stale walk cannot publish over revoke" {
+  relRace("walk", true)
+}
+
+test "relation cache stale version cannot publish over grant" {
+  relRace("version", false)
+}
+
+test "relation cache stale version cannot publish over revoke" {
+  relRace("version", true)
+}
+
+test "relation cache pending write serves and publishes no answer" {
+  let f = relFixture()
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  f.store.barrier = "write"
+  let out = chan<string>(1)
+  spawn relWrite(f.a, out)
+  let _ = <- f.store.entered
+  let reads = f.store.count()
+  assert(outcome(f.a, "user:a", "editor", "shelf:a") == StoreUnavailable{}.message())
+  assert(f.store.count() == reads, "pending write touches no store")
+  f.store.release <- true
+  assert(<- out == "ok")
+  f.store.barrier = ""
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+}
+
+test "relation cache partial failed grant and revoke invalidate old answers" {
+  let f = relFixture()
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  f.store.partial = true
+  let grantFailed = false
+  f.a.relate("user:a", "editor", "shelf:a") catch _ {
+    grantFailed = true
+  }
+  assert(grantFailed)
+  assert(relAnswer(f.a, "user:a", "editor", "shelf:a"))
+  let revokeFailed = false
+  f.a.unrelate("user:a", "editor", "shelf:a") catch _ {
+    revokeFailed = true
+  }
+  assert(revokeFailed)
+  assert(!relAnswer(f.a, "user:a", "editor", "shelf:a"))
+}
+
+fn relAnswer(a: Authz<Action>, subject: string, relation: string, object: string): bool {
+  return a.hasRelation(subject, relation, object) catch e {
+    panic(e.message())
+  }
+}
+
+test "relation cache walk store failures stay uncached with healthy version" {
+  let f = relFixture()
+  f.store.walkDown = true
+  assert(outcome(f.a, "user:a", "editor", "shelf:a") == StoreUnavailable{}.message())
+  let reads = f.store.count()
+  assert(outcome(f.a, "user:a", "editor", "shelf:a") == StoreUnavailable{}.message())
+  assert(f.store.count() > reads)
+  assert(len(f.a.relationCache.entries) == 0)
+  f.store.walkDown = false
+  assert(outcome(f.a, "user:a", "editor", "shelf:a") == "false")
+}

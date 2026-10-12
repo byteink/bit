@@ -168,7 +168,7 @@ named by a tuple, or be a member of a team that is, or hold the folder
 through a parent folder. `hasRelation` follows all of it:
 
 ```bit
-import { Authz } from "authz"
+import { Authz, StoreOptions } from "authz"
 import { Tabled } from "orm"
 
 enum Action { Manage, Read, Create, Update, Delete, Publish }
@@ -186,7 +186,7 @@ enum Action { Manage, Read, Create, Update, Delete, Publish }
 }
 
 fn main(): ()! {
-  let authz = Authz<Action>()?
+  let authz = Authz<Action>(options = StoreOptions(relationCacheSize = 10_000))?
   authz.resource<Folder>()?.resource<Team>()?
   authz.relation<Team>("member")?
   authz.relation<Folder>("parent")?
@@ -196,16 +196,37 @@ fn main(): ()! {
   authz.relate("folder:q3", "parent", "folder:launch")?
   println("${authz.hasRelation("user:sara", "editor", "folder:launch")?}")
   println("${authz.hasRelation("user:bob", "editor", "folder:launch")?}")
+  authz.unrelate("user:sara", "member", "team:eng")?
+  println("${authz.hasRelation("user:sara", "editor", "folder:launch")?}")
 }
 ```
 
-This prints `true`, then `false`. Sara is a member of `eng`; `eng`'s members
+This prints `true`, `false`, then `false` after revoking Sara's membership.
+Sara is a member of `eng`; `eng`'s members
 edit `q3`; and `q3` is the parent of `launch`, which is why she edits it.
 
 `inherit = "parent"` is the whole rewrite language: whoever is `editor` of an
 object's `parent` is `editor` of the object. It applies to the relation that
 declares it, so `viewer`, declared without `inherit`, is not inherited. Declare
 `parent` before the relation that inherits through it.
+
+The handle keeps positive and negative answers in one least recently used cache
+shared by tenant views and `related(...)` conditions. `relationCacheSize` bounds
+its entry count (default 10,000; values below 1 are `InvalidPolicy`). A repeated
+check within `StoreOptions.refreshEveryMs` reads no store. Local `relate` and
+`unrelate` invalidate before writing and before returning, including no-ops and
+writes that fail after changing the store. Other handles' writes become visible
+when the interval expires and the next check reads `RelationStore.version`;
+that interval defaults to 5,000 ms. With `refreshEveryMs = 0`, relationship
+checks read freshly without retaining answers; policy polling stays manual.
+
+Version failures, concurrent writes or an unfinished freshness probe refuse
+the check with `StoreUnavailable`, even when the store could still answer a
+direct lookup. A walk crossing the freshness deadline is refused too. Errors
+and `RelationLimit` answers never enter the cache. Failed version attempts also
+obey the interval: requests read no store and fail closed until it expires,
+then can recover when the store is healthy. A local tuple write invalidates
+that wait and permits an earlier probe.
 
 ## When the check cannot finish
 

@@ -1,0 +1,232 @@
+// Relationship answers share one bounded LRU across tenant views and conditions.
+// Store I/O never owns mu; generations fence reads against local writes.
+
+const defaultRelationCacheSize: int = 10_000
+
+class RelQuery {
+  store: RelationStore,
+  tenant: string,
+  decls: []RelationDecl,
+  limits: Limits,
+  tuple: Tuple,
+}
+
+class RelStamp {
+  generation: int,
+  version: i64,
+  deadline: int,
+  probe: bool,
+}
+
+class RelEntry {
+  key: string,
+  value: bool,
+  previous: string,
+  next: string,
+}
+
+class RelCache {
+  mu: Mutex
+  capacity: int
+  interval: int
+  clock: () => int
+  entries: map<string, RelEntry>
+  first: string
+  last: string
+  generation: int
+  version: i64
+  deadline: int
+  failedUntil: int
+  pending: int
+  probing: bool
+
+  init(capacity: int, refreshMs: int) {
+    this.mu = Mutex()
+    this.capacity = capacity
+    this.interval = refreshMs * msNs
+    this.clock = () => monotonic().ns
+    this.entries = map<string, RelEntry>()
+    this.first = ""
+    this.last = ""
+    this.generation = 0
+    this.version = -1
+    this.deadline = 0
+    this.failedUntil = 0
+    this.pending = 0
+    this.probing = false
+  }
+
+  clear() {
+    this.entries = map<string, RelEntry>()
+    this.first = ""
+    this.last = ""
+  }
+
+  writing(begin: bool) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (begin) {
+      this.pending = this.pending + 1
+    } else {
+      this.pending = this.pending - 1
+    }
+    this.generation = this.generation + 1
+    this.deadline = 0
+    this.failedUntil = 0
+    this.probing = false
+    this.clear()
+  }
+
+  stamp(): RelStamp {
+    return RelStamp{
+      generation = this.generation, version = this.version, deadline = this.deadline, probe = this.probing,
+    }
+  }
+
+  reserve(): RelStamp! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (this.pending != 0 || this.probing || this.clock() < this.failedUntil) {
+      fail StoreUnavailable{}
+    }
+    if (this.clock() >= this.deadline) {
+      this.generation = this.generation + 1
+      this.probing = true
+    }
+    return this.stamp()
+  }
+
+  failed(generation: int, started: int) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (this.generation == generation) {
+      this.clear()
+      this.deadline = 0
+      this.failedUntil = started + this.interval
+      this.probing = false
+    }
+  }
+
+  probed(s: RelStamp, version: i64, started: int): RelStamp! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (s.generation != this.generation || this.pending != 0) {
+      fail StoreUnavailable{}
+    }
+    this.probing = false
+    this.failedUntil = 0
+    this.deadline = started + this.interval
+    if (this.interval > 0 && this.clock() >= this.deadline) {
+      this.clear()
+      this.deadline = 0
+      fail StoreUnavailable{}
+    }
+    if (this.version != version) {
+      this.clear()
+    }
+    this.version = version
+    return this.stamp()
+  }
+
+  fresh(store: RelationStore): RelStamp! {
+    let s = this.reserve()?
+    if (!s.probe) {
+      return s
+    }
+    let started = this.clock()
+    let version = store.version() catch _ {
+      this.failed(s.generation, started)
+      fail StoreUnavailable{}
+    }
+    return this.probed(s, version, started)?
+  }
+
+  check(s: RelStamp): ()! {
+    if (this.pending != 0 ||
+      this.probing ||
+      s.generation != this.generation ||
+      s.version != this.version ||
+      s.deadline != this.deadline) {
+      fail StoreUnavailable{}
+    }
+    if (this.interval > 0 && this.clock() >= s.deadline) {
+      fail StoreUnavailable{}
+    }
+  }
+
+  unlink(e: RelEntry) {
+    let (p, hasPrevious) = this.entries[e.previous]
+    let (n, hasNext) = this.entries[e.next]
+    if (hasPrevious) {
+      p.next = e.next
+    } else {
+      this.first = e.next
+    }
+    if (hasNext) {
+      n.previous = e.previous
+    } else {
+      this.last = e.previous
+    }
+  }
+
+  newest(e: RelEntry) {
+    e.previous = this.last
+    e.next = ""
+    let (p, ok) = this.entries[this.last]
+    if (ok) {
+      p.next = e.key
+    } else {
+      this.first = e.key
+    }
+    this.last = e.key
+  }
+
+  lookup(s: RelStamp, key: string): Option<bool>! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.check(s)?
+    let (e, ok) = this.entries[key]
+    if (!ok) {
+      return Option<bool>.None
+    }
+    this.unlink(e)
+    this.newest(e)
+    return Option<bool>.Some(e.value)
+  }
+
+  publish(s: RelStamp, key: string, value: bool): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.check(s)?
+    if (this.interval == 0) {
+      return
+    }
+    let (old, exists) = this.entries[key]
+    if (exists) {
+      this.unlink(old)
+      delete(this.entries, key)
+    }
+    if (len(this.entries) == this.capacity) {
+      let (e, ok) = this.entries[this.first]
+      assert(ok, "LRU head must exist")
+      this.unlink(e)
+      delete(this.entries, e.key)
+    }
+    let e = RelEntry{ key = key, value = value, previous = "", next = "" }
+    this.newest(e)
+    this.entries[key] = e
+  }
+}
+
+fn cachedRelation(cache: RelCache, q: RelQuery): bool! {
+  let t = q.tuple
+  let key = scoped(q.tenant, tupleKey(t))
+  let stamp = cache.fresh(q.store)?
+  let hit = cache.lookup(stamp, key)?
+  if (isSome(hit)) {
+    return unwrap(hit)
+  }
+  let value = walk(q.store, q.tenant, q.decls, q.limits, t)?
+  cache.publish(stamp, key, value)?
+  return value
+}
