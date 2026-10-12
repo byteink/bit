@@ -1,0 +1,208 @@
+// #6494: public HTTP/2 engines over loopback, with handlers held through close observations.
+class h2BytePair {
+  client: H2Conn,
+  socket: Conn,
+  listener: Listener,
+  accepted: chan<ByteStream>,
+  release: chan<bool>,
+  done: chan<string>,
+}
+
+fn h2ByteTransport(c: Conn): H2Transport {
+  return H2Transport(
+    (n) => []byte(c.read(n)),
+    (b) => {
+      c.writeBytes(b)?
+    },
+    () => {
+      c.shutdown()
+    },
+  )
+}
+
+fn h2ByteServer(l: Listener, accepted: chan<ByteStream>, release: chan<bool>): ()! {
+  let c = l.accept()?
+  defer c.close()
+  c.setDeadline(monotonic().ns + 10 * 1000000000)
+  let cfg = h2defaultConfig()
+  cfg.enableConnectProtocol = true
+  let hc = h2accept(h2ByteTransport(c), cfg, c.deadline())?
+  defer hc.waitWriterDone()
+  defer hc.waitReaderDone()
+  defer c.shutdown()
+  hc.serve((req, s) => {
+    let t = s.acceptExtendedConnect() catch e {
+      assert(false, e.message())
+      return H2Response(500, []byte(0))
+    }
+    accepted <- ByteStream(StreamSource.H2(t))
+    select {
+      case _ = <- release:
+        {}
+      case _ = <- after(10000 * Millisecond):
+        assert(false, "handler release timed out")
+    }
+    return H2Response(0, []byte(0))
+  })?
+}
+
+fn h2ByteJoin(done: chan<string>): string {
+  select {
+    case err = <- done:
+      return err
+    case _ = <- after(10000 * Millisecond):
+      return "server join timed out"
+  }
+}
+
+fn h2ByteSetupAbort(l: Listener, release: chan<bool>, done: chan<string>) {
+  release <- true
+  l.close()
+  let cleanup = h2ByteJoin(done)
+  if (cleanup != "") {
+    eprint("H2 setup cleanup: ${cleanup}\n")
+  }
+}
+
+fn h2BytePairOpen(): h2BytePair! {
+  let l = listen("127.0.0.1", 0)?
+  let port = l.port() catch e {
+    l.close()
+    fail e
+  }
+  let accepted = chan<ByteStream>(1)
+  let release = chan<bool>(1)
+  let done = chan<string>(1)
+  spawn {
+    h2ByteServer(l, accepted, release) catch e {
+      done <- e.message()
+      return
+    }
+    done <- ""
+  }
+  let c = dialDeadline("127.0.0.1", port, monotonic().ns + 10 * 1000000000) catch e {
+    h2ByteSetupAbort(l, release, done)
+    fail e
+  }
+  let hc = h2connect(h2ByteTransport(c), h2defaultConfig(), c.deadline()) catch e {
+    c.shutdown()
+    h2ByteSetupAbort(l, release, done)
+    c.close()
+    fail e
+  }
+  return h2BytePair{
+    client = hc, socket = c, listener = l, accepted = accepted,
+    release = release, done = done,
+  }
+}
+
+fn h2BytePairClose(p: h2BytePair) {
+  p.release <- true
+  p.socket.shutdown()
+  p.client.waitReaderDone()
+  p.client.waitWriterDone()
+  let err = h2ByteJoin(p.done)
+  assert(err == "", "server: ${err}")
+  p.socket.close()
+  p.listener.close()
+}
+
+fn h2ByteStreams(p: h2BytePair): (ByteStream, ByteStream)! {
+  let req = H2Request("CONNECT", "localhost", "/stream")
+  req.protocol = "websocket"
+  let (res, t) = p.client.openTunnel(req, monotonic().ns + 5 * 1000000000)?
+  assert(res.status == 200, "tunnel status ${res.status}")
+  select {
+    case server = <- p.accepted:
+      return ByteStream(StreamSource.H2(t)), server
+    case _ = <- after(5000 * Millisecond):
+      fail newError("tunnel handler timed out")
+  }
+}
+
+fn h2ByteData(client: ByteStream, server: ByteStream): ()! {
+  client.writeStr("abcdef")?
+  assert(server.readUp(2)? == "ab", "partial network read")
+  server.unread("XY")
+  server.unread("Z")
+  assert(server.readUp(2)? == "ZX", "unread must prepend")
+  assert(server.readUp(2)? == "Y", "unread remainder")
+  assert(server.readUp(4)? == "cdef", "underlying H2 pending bytes")
+  server.writeBytes([]byte("reply"))?
+  assert(client.readUp(5)? == "reply", "reverse writeBytes")
+  client.writeBytes([]byte("bytes"))?
+  assert(server.readUp(5)? == "bytes", "forward writeBytes")
+  server.writeStr("str")?
+  assert(client.readUp(3)? == "str", "reverse writeStr")
+  assert(client.peer() == "" && server.peer() == "", "H2 peer metadata")
+}
+
+fn h2ByteDeadline(client: ByteStream, server: ByteStream): ()! {
+  server.setIdleDeadline(monotonic().ns + 20 * Millisecond)
+  let timedOut = false
+  let _ = server.readUp(1) catch e {
+    timedOut = true
+    assert(e.message() == "http2: tunnel read timed out", e.message())
+    ""
+  }
+  assert(timedOut, "idle tunnel must time out")
+  server.setIdleDeadline(0)
+  let wrote = chan<string>(1)
+  spawn {
+    <- after(20 * Millisecond)
+    client.writeStr("recovered") catch e {
+      wrote <- e.message()
+      return
+    }
+    wrote <- ""
+  }
+  assert(server.readUp(9)? == "recovered", "cleared deadline must recover")
+  select {
+    case err = <- wrote:
+      assert(err == "", "recovery write: ${err}")
+    case _ = <- after(1000 * Millisecond):
+      assert(false, "recovery writer join timed out")
+  }
+}
+
+fn h2ByteOrderly(): ()! {
+  let p = h2BytePairOpen()?
+  defer h2BytePairClose(p)
+  let (client, server) = h2ByteStreams(p)?
+  defer server.shut()
+  defer client.shut()
+  h2ByteData(client, server)?
+  h2ByteDeadline(client, server)?
+  client.shut()
+  server.setIdleDeadline(monotonic().ns + 1000 * Millisecond)
+  assert(server.readUp(1)? == "", "shut must deliver orderly EOF while handler remains live")
+}
+
+fn h2ByteReset(): ()! {
+  let p = h2BytePairOpen()?
+  defer h2BytePairClose(p)
+  let (client, server) = h2ByteStreams(p)?
+  defer server.shut()
+  defer client.shut()
+  client.forceClose()
+  server.setIdleDeadline(monotonic().ns + 1000 * Millisecond)
+  let reset = false
+  let _ = server.readUp(1) catch e {
+    reset = true
+    assert(e.message() == "http2: stream reset by peer (code 8)", e.message())
+    ""
+  }
+  assert(reset, "forceClose must deliver CANCEL reset, not orderly EOF")
+}
+
+test "ByteStream H2 forwarding preserves pending bytes deadlines and orderly EOF" {
+  h2ByteOrderly() catch e {
+    assert(false, e.message())
+  }
+}
+
+test "ByteStream H2 forceClose sends CANCEL while the handler remains live" {
+  h2ByteReset() catch e {
+    assert(false, e.message())
+  }
+}
