@@ -50,8 +50,8 @@ added in the same release as its parser.
 | `kind` | An `EventKind`: `Delivered`, `Deferred`, `Bounced`, `Complained`, `Unsubscribed`, `Opened`, `Clicked`, `Rejected` or `Subscribe` |
 | `recipient` | The address the event is about |
 | `messageId` | The Message-ID of the mail as written, `<...>`; `""` when the provider did not report it |
-| `providerId` | The provider's message id: Resend `data.email_id`, Postmark `MessageID` |
-| `deliveryId` | The webhook delivery id: Resend `svix-id`, Postmark `X-PM-Webhook-Trace-Id`; stable across retries, `""` if absent |
+| `providerId` | The provider's id: Resend message `data.email_id`, Postmark message `MessageID`, Mailgun event `event-data.id` |
+| `deliveryId` | The webhook delivery id: Resend `svix-id`, Postmark `X-PM-Webhook-Trace-Id`, Mailgun `signature.token`; `""` if absent |
 | `at` | When it happened, as the provider reports it; delivery time if missing or invalid |
 | `permanent` | For `Bounced`: whether future sends should be suppressed. An unclassified bounce counts as permanent. `false` for every other kind |
 | `reason` | The provider's explanation, or `""`: escape it before showing it on a page |
