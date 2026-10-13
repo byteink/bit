@@ -1,0 +1,245 @@
+// pkg/mail/webhookmailgun.bit — Mailgun event signatures and replay rejection.
+// Signing covers the timestamp text and token, not the event payload bytes.
+
+import { decodeHex, digest, hmac, hmacEqual, HashAlg, Sha256 } from "std/crypto"
+import { jsonAsNumber, jsonAsObject, jsonEncode, jsonGet, jsonParse, Json } from "std/json"
+import { Mutex } from "std/sync"
+import { parseEpochSeconds, Second } from "std/time"
+
+const mgReplayCapacity: int = 10000
+const mgDigestBytes: int = 32
+
+class MgReplay {
+  mu: Mutex
+  hashes: [320000]byte
+  expires: [10000]int
+  count: int = 0
+
+  init() {
+    this.mu = Mutex()
+  }
+}
+
+let mgReplay = MgReplay()
+
+fn mgDigestMatches(cache: MgReplay, slot: int, hash: []byte): bool {
+  let i = 0
+  while (i < mgDigestBytes) {
+    if (cache.hashes[slot * mgDigestBytes + i] != hash[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn mgMoveSlot(cache: MgReplay, from: int, to: int) {
+  let i = 0
+  while (i < mgDigestBytes) {
+    cache.hashes[to * mgDigestBytes + i] = cache.hashes[from * mgDigestBytes + i]
+    i = i + 1
+  }
+  cache.expires[to] = cache.expires[from]
+}
+
+// Stable compaction preserves insertion order, including timestamps out of order.
+fn mgExpire(cache: MgReplay, at: int) {
+  let kept = 0
+  let i = 0
+  while (i < cache.count) {
+    if (cache.expires[i] >= at) {
+      if (i != kept) {
+        mgMoveSlot(cache, i, kept)
+      }
+      kept = kept + 1
+    }
+    i = i + 1
+  }
+  cache.count = kept
+}
+
+fn mgInsert(cache: MgReplay, hash: []byte, expiry: int) {
+  if (cache.count == mgReplayCapacity) {
+    let i = 1
+    while (i < mgReplayCapacity) {
+      mgMoveSlot(cache, i, i - 1)
+      i = i + 1
+    }
+    cache.count = cache.count - 1
+  }
+  let i = 0
+  while (i < mgDigestBytes) {
+    cache.hashes[cache.count * mgDigestBytes + i] = hash[i]
+    i = i + 1
+  }
+  cache.expires[cache.count] = expiry
+  cache.count = cache.count + 1
+}
+
+// Verify outside the lock; this one critical section makes duplicate acceptance atomic.
+fn mgRemember(cache: MgReplay, hash: []byte, expiry: int, at: int): bool {
+  assert(len(hash) == mgDigestBytes, "Mailgun token digest size")
+  cache.mu.lock()
+  mgExpire(cache, at)
+  let i = 0
+  while (i < cache.count) {
+    if (mgDigestMatches(cache, i, hash)) {
+      cache.mu.unlock()
+      return false
+    }
+    i = i + 1
+  }
+  mgInsert(cache, hash, expiry)
+  cache.mu.unlock()
+  return true
+}
+
+fn mgObject(j: Json, key: string): Json!MailError {
+  let v = jsonGet(j, key)
+  if (!isSome(v)) {
+    fail MailError.Invalid("Mailgun webhook has no ${key} object")
+  }
+  let o = unwrap(v)
+  if (!isSome(jsonAsObject(o))) {
+    fail MailError.Invalid("Mailgun webhook ${key} is not an object")
+  }
+  return o
+}
+
+fn mgSignedTime(ts: string, at: Timestamp): int!MailError {
+  svixSeconds(ts)?
+  let instant = parseEpochSeconds(ts) catch _ {
+    fail webhookRejected("timestamp is not a representable Unix time")
+  }
+  let sent = instant.ns
+  if (sent > 9223372036854775807 - toleranceNs) {
+    fail webhookRejected("timestamp has no representable replay expiry")
+  }
+  if (at.ns > sent + toleranceNs || at.ns < sent - toleranceNs) {
+    fail webhookRejected("timestamp is more than 5 minutes from now")
+  }
+  return sent
+}
+
+fn mgVerify(signature: Json, secret: string, at: Timestamp): string!MailError {
+  let ts = rsText(signature, "timestamp")
+  let token = rsText(signature, "token")
+  let tag = rsText(signature, "signature")
+  if (ts == "" || token == "" || tag == "") {
+    fail MailError.Invalid("Mailgun webhook signature fields must be nonempty strings")
+  }
+  let sent = mgSignedTime(ts, at)?
+  let got = decodeHex(tag) catch _ {
+    fail webhookRejected("signature is not hex")
+  }
+  let want = hmac(HashAlg.Sha256, []byte(secret), []byte(ts + token))
+  if (!hmacEqual(got, want)) {
+    fail webhookRejected("signature does not match")
+  }
+  let hash = digest(Sha256(), []byte(token))
+  if (!mgRemember(mgReplay, hash, sent + toleranceNs, at.ns)) {
+    fail webhookRejected("Mailgun token was already accepted")
+  }
+  return token
+}
+
+fn mgFailedKind(data: Json): Option<EventKind>!MailError {
+  let severity = rsText(data, "severity")
+  if (severity == "permanent") {
+    return Option.Some(EventKind.Bounced)
+  }
+  if (severity == "temporary") {
+    return Option.Some(EventKind.Deferred)
+  }
+  fail MailError.Invalid("Mailgun failed event has unknown severity")
+}
+
+fn mgKind(data: Json): Option<EventKind>!MailError {
+  let name = rsText(data, "event")
+  if (name == "failed") {
+    return mgFailedKind(data)?
+  }
+  let names = ["delivered", "complained", "unsubscribed", "opened", "clicked"]
+  let kinds = [
+    EventKind.Delivered, EventKind.Complained, EventKind.Unsubscribed,
+    EventKind.Opened, EventKind.Clicked,
+  ]
+  let i = 0
+  while (i < len(names)) {
+    if (name == names[i]) {
+      return Option.Some(kinds[i])
+    }
+    i = i + 1
+  }
+  return Option.None
+}
+
+fn mgAt(data: Json, fallback: Timestamp): Timestamp {
+  let v = jsonGet(data, "timestamp")
+  if (!isSome(v)) {
+    return fallback
+  }
+  let t = unwrap(v)
+  if (!isSome(jsonAsNumber(t))) {
+    return fallback
+  }
+  return parseEpochSeconds(jsonEncode(t)) catch _ {
+    return fallback
+  }
+}
+
+fn mgReason(data: Json): string {
+  let status = jsonGet(data, "delivery-status")
+  if (isSome(status)) {
+    for k of ["description", "message"] {
+      let text = rsText(unwrap(status), k)
+      if (text != "") {
+        return text
+      }
+    }
+  }
+  return rsText(data, "reason")
+}
+
+fn mgMessageId(data: Json): string {
+  let message = jsonGet(data, "message")
+  if (!isSome(message)) {
+    return ""
+  }
+  let headers = jsonGet(unwrap(message), "headers")
+  if (!isSome(headers)) {
+    return ""
+  }
+  return rsText(unwrap(headers), "message-id")
+}
+
+fn mgBuild(data: Json, token: string, at: Timestamp): []Event!MailError {
+  let kind = mgKind(data)?
+  if (!isSome(kind)) {
+    return []
+  }
+  let recipient = rsText(data, "recipient")
+  if (recipient == "") {
+    fail MailError.Invalid("Mailgun event has no recipient")
+  }
+  let k = unwrap(kind)
+  return [
+    Event{
+      kind = k, recipient = recipient, messageId = mgMessageId(data),
+      providerId = rsText(data, "id"), deliveryId = token, at = mgAt(data, at),
+      permanent = k == EventKind.Bounced, reason = mgReason(data), provider = Provider.Mailgun,
+    },
+  ]
+}
+
+fn mailgunEvents(body: string, secret: string, at: Timestamp): []Event!MailError {
+  if (secret == "") {
+    fail MailError.Config("the Mailgun webhook signing key is empty")
+  }
+  let j = jsonParse(body) catch _ {
+    fail MailError.Invalid("Mailgun webhook body is not valid JSON")
+  }
+  let signature = mgObject(j, "signature")?
+  let token = mgVerify(signature, secret, at)?
+  return mgBuild(mgObject(j, "event-data")?, token, at)?
+}
