@@ -4650,7 +4650,8 @@ keeps NO "last sender" state, and `std/net`'s `UdpSocket.recv` decodes the
 address from its own buffer. A zero-length datagram returns `0` with a valid
 sender; a failed receive returns `-1`, which is how it is told from one.
 
-Windows posts real `WSARecvFrom` and `WSASendTo` operations (#8023). The
+Windows retains immediate `recvfrom` and `sendto` results. A would-block
+result posts a real `WSARecvFrom` or `WSASendTo` operation (#8023). The
 bounded IOCP pool retains each OVERLAPPED until the caller reads its result.
 The caller roots payload and peer; managed sender, flags and address-length
 scratch stays live through terminal completion. Windows reports a truncated
