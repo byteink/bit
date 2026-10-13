@@ -160,6 +160,42 @@ A gap or an overlap after the last listed change resolves exactly as it does
 before it (see below). A rule that is not a valid POSIX TZ string makes
 `zone` fail, naming the footer; it is never ignored.
 
+### Find the clock change around an article's publication
+
+An Inkwell publication planned in local time can cross a clock change.
+Ask the zone for the exact change instead of comparing offsets at two
+sampled instants: two changes can cancel between those samples.
+
+```bit
+import { zone, parseRfc3339 } from "std/time"
+
+fn publicationClockChanges(): ()! {
+  let london = zone("Europe/London")?
+  let publishAt = parseRfc3339("2040-04-01T09:00:00Z")?
+  match (london.prevChangeAtOrBefore(publishAt)) {
+    Some(change) => println("Previous clock change: ${change.toString()}")
+    None => println("No previous clock change")
+  }
+  match (london.nextChangeAfter(publishAt)) {
+    Some(change) => println("Next clock change: ${change.toString()}")
+    None => println("No next clock change")
+  }
+}
+```
+
+`nextChangeAfter` is strictly later than the argument.
+`prevChangeAtOrBefore` includes a change exactly at the argument. Both
+return `Option<Timestamp>` and cover listed changes and the recurring rule
+after the last listed change. A renamed abbreviation with the same offset
+does not count. `None` means there is no change in that direction within
+the range a `Timestamp` can represent; UTC and fixed offsets have none.
+
+For a half-open interval `[start, end)`, when `start < end`, ask for the
+previous change at `end.ns - 1` and check that it is at or after `start`.
+This includes a change at `start` and excludes one exactly at `end`.
+For ordinary display, use a `DateTime`'s offset instead; you do not need to
+search for a change to format an article's publication time.
+
 ### Daylight saving: the two awkward days
 
 Twice a year a zone that observes daylight saving moves its clocks, and on
@@ -1925,6 +1961,16 @@ Cancels this timer; returns whether it was still pending.
 ### `Zone`
 
 An IANA time zone, identified by its canonical name, such as `Asia/Dubai`. Immutable and safe to share across green threads. See [Zones](#zones).
+
+### `Zone.nextChangeAfter(t: Timestamp): Option<Timestamp>`
+
+The first actual UTC offset change strictly after `t`, or `None` when none
+is representable. See [Find the clock change around an article's publication](#find-the-clock-change-around-an-articles-publication).
+
+### `Zone.prevChangeAtOrBefore(t: Timestamp): Option<Timestamp>`
+
+The last actual UTC offset change at or before `t`, or `None` when none is
+representable. See [Find the clock change around an article's publication](#find-the-clock-change-around-an-articles-publication).
 
 ### `zone(name: string): Zone!`
 
