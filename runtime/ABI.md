@@ -4650,6 +4650,14 @@ keeps NO "last sender" state, and `std/net`'s `UdpSocket.recv` decodes the
 address from its own buffer. A zero-length datagram returns `0` with a valid
 sender; a failed receive returns `-1`, which is how it is told from one.
 
+Windows retains immediate `recvfrom` and `sendto` results. A would-block
+result posts a real `WSARecvFrom` or `WSASendTo` operation (#8023). The
+bounded IOCP pool retains each OVERLAPPED until the caller reads its result.
+The caller roots payload and peer; managed sender, flags and address-length
+scratch stays live through terminal completion. Windows reports a truncated
+message as a failed receive. A zero-byte readiness probe cannot serve UDP:
+a receive consumes the datagram, and a send emits an empty datagram.
+
 **This replaced a per-worker "last sender" slot (#7746).** `recv` used to record
 the sender in `udpSenderBuf`/`udpSenderValid`, one `[4]i64` sockaddr and one
 valid flag per worker indexed by the calling task's `wkId`, and `std/net` read
@@ -4744,8 +4752,10 @@ clears its marker before issuing the operation. The completion drain copies
 its byte count and status, decrements the pending count, then release-publishes
 the marker before waking the cached task. It reads no slot state after
 publication. The caller reads results before releasing the slot. A deadline
-cancellation uses the same marker and retains the slot when its separately
-bounded drain expires, so an outstanding kernel operation cannot reuse it.
+cancellation uses the same marker and drains for at most 500 polls. If completion
+is still pending at that bound, `bit_rt_fatal` exits the process before caller
+payload owners can unwind; a recovery boundary cannot catch this failure (#8012).
+A completed cancellation releases the slot normally.
 
 ---
 
