@@ -4744,8 +4744,10 @@ clears its marker before issuing the operation. The completion drain copies
 its byte count and status, decrements the pending count, then release-publishes
 the marker before waking the cached task. It reads no slot state after
 publication. The caller reads results before releasing the slot. A deadline
-cancellation uses the same marker and retains the slot when its separately
-bounded drain expires, so an outstanding kernel operation cannot reuse it.
+cancellation uses the same marker and drains for at most 500 polls. If completion
+is still pending at that bound, `bit_rt_fatal` exits the process before caller
+payload owners can unwind; a recovery boundary cannot catch this failure (#8012).
+A completed cancellation releases the slot normally.
 
 ---
 
