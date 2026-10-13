@@ -1,28 +1,20 @@
-// The UDP section of the Windows socket provider, split out of ./sock.bit
-// (#3340), mirroring ../linux/udp.bit's own split. Sibling file, same
-// module.
-//
-// UDP NEEDS NONE OF THIS FILE'S TCP SIBLING'S MACHINERY — no AcceptEx (no
-// connection to accept), no ConnectEx (a bound, unconnected socket sends to
-// whatever address each `sendto` names), so the ordinary non-blocking
-// `sendto`/`recvfrom` plus the readiness-translation poller (`netAwaitReady`,
-// ./sock.bit) is both sufficient and the simpler path — the SAME shape
-// ../linux/udp.bit and ../darwin/udp.bit already use, just with `ioctlsocket
-// (FIONBIO)` standing in for Linux's `SOCK_NONBLOCK`-at-creation flag.
-
-// `netParseIpv4`/`netMaxStalls`/`saBytes`/`ipBytes` are already imported by
-// ../tcp.bit (imports are module-scoped); only the names it does NOT bring
-// in are imported here.
-import { netMaxSpins, saBytes2 } from "../../net"
-import { pollRead, pollWrite } from "../../sched"
+// UDP uses real overlapped operations: a zero-byte readiness receive consumes
+// a datagram, and a zero-byte readiness send emits one (#8023).
+extern fn WSARecvFrom(
+  sock: i64, buffers: *byte, count: i32, bytes: *byte, flags: *byte,
+  from: *u8, fromLen: *i32, overlapped: *byte, completion: *byte,
+): i32
+extern fn WSASendTo(
+  sock: i64, buffers: *byte, count: i32, bytes: *byte, flags: i32,
+  to: *u8, toLen: i32, overlapped: *byte, completion: *byte,
+): i32
 
 // FIONBIO (winsock2.h) — set non-blocking mode. Windows has no equivalent
 // of Linux's `SOCK_NONBLOCK` creation flag or Darwin's `fcntl`, so this is
 // the one way to get there, applied right after `socket()`.
 @nosplit fn fionbio(): i32 { return i32(0x8004667E) }
 
-// WSAEWOULDBLOCK (winsock2.h) — the non-blocking-socket "try again" error,
-// Windows' analogue of `EAGAIN`.
+// Also used by the deadline-bounded DNS exchange in dns.bit.
 @nosplit fn wsaEwouldblock(): int { return 10035 }
 
 fn netSetNonBlockUdp(fd: int): bool {
@@ -52,69 +44,91 @@ export @symbol("bit_rt_port_net_bind_udp") fn netBindUdp(host: *u8, hostLen: int
   return fd
 }
 
-// One datagram of `data[0..dataLen]` to `host:port` from `fd`. Returns the
-// byte count, or -1.
-export @symbol("bit_rt_port_net_send_to") fn netSendTo(
-  fd: int,
-  host: *u8,
-  hostLen: int,
-  port: int,
-  data: *u8,
-  dataLen: int,
-): int {
-  let ip = ipBytes()
-  if (!netParseIpv4(host, hostLen, ip)) {
+// All terminal paths read the result before releasing its static IOCP slot.
+// A synchronous failure has no completion packet and must disarm the park.
+fn udpFinish(slot: int, posted: bool): int {
+  if (!posted) {
+    pollOpAbort(slot)
+    let _ = schedParkDisarm()
     return 0 - 1
   }
-  netFillSockAddr(saBytes2(), ip, port)
-  let stalls = 0
-  let spins = 0
-  while (stalls < netMaxStalls && spins < netMaxSpins) {
-    let n = wsaRc(int(sendto(i64(fd), data, i32(dataLen), i32(0), saBytes2(), i32(16))))
-    if (n >= 0) {
-      return n
-    }
-    if (lastErr() != wsaEwouldblock()) {
-      return 0 - 1
-    }
-    if (netAwaitReady(fd, pollWrite)) {
-      stalls = stalls + 1
-    } else {
-      spins = spins + 1
-    }
+  pollOpCommit(slot)
+  schedPark()
+  let n = pollOpBytes(slot)
+  let status = pollOpStatus(slot)
+  pollOpRelease(slot)
+  if (status != 0) {
+    return 0 - 1
   }
-  return 0 - 1
+  return n
 }
 
-// Up to `bufCap` bytes of the next datagram on `fd`, parking until one
-// arrives, writing the sender's raw sockaddr to `peer` (which must hold
-// `netSockAddrLen()` bytes, matching ../linux/udp.bit's contract). Returns
-// the byte count, or -1.
-export @symbol("bit_rt_port_net_recv_from") fn netRecvFrom(
-  fd: int,
-  buf: *u8,
-  bufCap: int,
-  peer: *u8,
-): int {
-  let stalls = 0
-  let spins = 0
-  while (stalls < netMaxStalls && spins < netMaxSpins) {
-    let lenBuf = []i64(1)
-    lenBuf[0] = i64(16)
-    let n = wsaRc(
-      int(recvfrom(i64(fd), buf, i32(bufCap), i32(0), peer, i32PtrAt(int(ptrOf(lenBuf))))),
-    )
-    if (n >= 0) {
-      return n
-    }
-    if (lastErr() != wsaEwouldblock()) {
-      return 0 - 1
-    }
-    if (netAwaitReady(fd, pollRead)) {
-      stalls = stalls + 1
-    } else {
-      spins = spins + 1
-    }
+fn udpSend(fd: int, data: *u8, dataLen: int, target: *u8): int {
+  let pollFd = currentPollFd()
+  let taskAddr = currentTaskAddr()
+  if (pollFd == 0 || taskAddr == 0) {
+    return 0 - 1
   }
-  return 0 - 1
+  let slot = armAndClaim(pollFd, fd, taskAddr)
+  if (slot < 0) {
+    return 0 - 1
+  }
+  fillWsabuf(pollOpWsabuf(slot), data, dataLen)
+  let rc = int(
+    WSASendTo(
+      i64(fd), pollOpWsabuf(slot), i32(1), nilByte(), i32(0),
+      target, i32(saLen), pollOpOverlapped(slot), nilByte(),
+    ),
+  )
+  // Capture the thread-local error before an ordinary call can grow or migrate.
+  let posted = rc == 0 || int(WSAGetLastError()) == wsaIoPending()
+  let n = udpFinish(slot, posted)
+  if (n != dataLen) {
+    return 0 - 1
+  }
+  return n
+}
+
+export @symbol("bit_rt_port_net_send_to") fn netSendTo(
+  fd: int, host: *u8, hostLen: int, port: int, data: *u8, dataLen: int,
+): int {
+  let ip = []i64(1)
+  let target = []i64(2)
+  if (!netParseIpv4(host, hostLen, bytesAtI64(ptrOf(ip)))) {
+    return 0 - 1
+  }
+  netFillSockAddr(bytesAtI64(ptrOf(target)), bytesAtI64(ptrOf(ip)), port)
+  let n = udpSend(fd, data, dataLen, bytesAtI64(ptrOf(target)))
+  keepAlive(target)
+  return n
+}
+
+// The caller roots payload and peer. Managed flags/length remain live until
+// terminal completion, including zero-length datagrams and truncation errors.
+export @symbol("bit_rt_port_net_recv_from") fn netRecvFrom(
+  fd: int, buf: *u8, bufCap: int, peer: *u8,
+): int {
+  let pollFd = currentPollFd()
+  let taskAddr = currentTaskAddr()
+  if (pollFd == 0 || taskAddr == 0) {
+    return 0 - 1
+  }
+  let state = []i64(2)
+  state[1] = i64(saLen)
+  let slot = armAndClaim(pollFd, fd, taskAddr)
+  if (slot < 0) {
+    return 0 - 1
+  }
+  fillWsabuf(pollOpWsabuf(slot), buf, bufCap)
+  let rc = int(
+    WSARecvFrom(
+      i64(fd), pollOpWsabuf(slot), i32(1), nilByte(), bytesAtI64(ptrOf(state)),
+      peer, i32PtrAt(int(ptrOf(state) + 1)), pollOpOverlapped(slot), nilByte(),
+    ),
+  )
+  // Capture the thread-local error before an ordinary call can grow or migrate.
+  let posted = rc == 0 || int(WSAGetLastError()) == wsaIoPending()
+  let n = udpFinish(slot, posted)
+  keepAlive(state)
+  return n
 }
