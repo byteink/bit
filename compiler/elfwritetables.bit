@@ -1,0 +1,147 @@
+// ELF string/symbol tables and the final section/header patches.
+
+fn ewSymbolTables(
+  obj: ElfObject,
+  out: ByteBuf,
+  shstrtab: ByteBuf,
+  symbols: ([]int, int),
+  state: ([]ElfShdr, []int, []int),
+): []ElfShdr {
+  let (order, nLocal) = symbols
+  let (shdrs, shIndexOf, relaPositions) = state
+  // ---- .symtab before .strtab (header table only; the physical BYTES stay
+  // .strtab-then-.symtab below) --------------------------------------------
+  // GNU BFD's elf_object_p/bfd_section_from_shdr (bfd/elf.c) walks section
+  // headers by increasing index and resolves a STRTAB's owner via
+  // elf_onesymtab(abfd), which is only populated once the SYMTAB header
+  // itself has been visited. A .strtab listed at a lower index than its
+  // .symtab forces BFD into a recursive re-entry to resolve the ownership,
+  // and on real GNU binutils this makes `strip`/`objcopy` reject the file
+  // with "Unable to recognise the format of the input file" — readelf and
+  // objdump, which parse ELF directly rather than through BFD, never see
+  // this. Same fix as #3607 (compiler/elflayout.bit): list .symtab's header
+  // entry before .strtab's.
+  let strtab = newByteBuf()
+  strtab.bytes = append(strtab.bytes, u8(0))
+  let symNameOffs = []int(0)
+  let oi = 0
+  while (oi < len(order)) {
+    symNameOffs = append(symNameOffs, elfInternString(strtab, obj.symbols[order[oi]].name))
+    oi = oi + 1
+  }
+
+  let strtabNameOff = elfInternString(shstrtab, ".strtab")
+  let strtabFileOff = len(out.bytes)
+  appendBytes(out, strtab.bytes)
+
+  let symtabNameOff = elfInternString(shstrtab, ".symtab")
+  padTo(out, 8)
+  let symtabFileOff = len(out.bytes)
+  appendElfSym(out, 0, 0, 0, 0, 0) // index 0: mandatory null symbol
+  oi = 0
+  while (oi < len(order)) {
+    let sym = obj.symbols[order[oi]]
+    let shndx = 0 // SHN_UNDEF
+    if (sym.hasSection) {
+      shndx = shIndexOf[elfKindIndex(sym.section)]
+    }
+    appendElfSym(
+      out, symNameOffs[oi], elfSymInfo(sym.binding, sym.kind), shndx,
+      sym.offset, sym.size,
+    )
+    oi = oi + 1
+  }
+  let symtabIndex = len(shdrs)
+  let strtabIndex = symtabIndex + 1
+  shdrs = append(
+    shdrs,
+    ElfShdr{
+      name = symtabNameOff, shtype = 2, // SHT_SYMTAB
+      flags = 0, addr = 0, offset = symtabFileOff,
+      size = (len(obj.symbols) + 1) * sizeofElfSym(),
+      link = strtabIndex,
+      info = nLocal + 1, // one greater than the last local symbol's index
+      addralign = 8, entsize = sizeofElfSym(),
+    },
+  )
+  shdrs = append(
+    shdrs,
+    ElfShdr{
+      name = strtabNameOff, shtype = 3, // SHT_STRTAB
+      flags = 0, addr = 0, offset = strtabFileOff, size = len(strtab.bytes),
+      link = 0, info = 0, addralign = 1, entsize = 0,
+    },
+  )
+  let pi = 0
+  while (pi < len(relaPositions)) {
+    shdrs[relaPositions[pi]].link = symtabIndex
+    pi = pi + 1
+  }
+
+  return shdrs
+}
+
+fn ewSectionNames(out: ByteBuf, shstrtab: ByteBuf, shdrs: []ElfShdr): []ElfShdr {
+  let shstrtabNameOff = elfInternString(shstrtab, ".shstrtab")
+  let shstrtabFileOff = len(out.bytes)
+  appendBytes(out, shstrtab.bytes)
+  shdrs = append(
+    shdrs,
+    ElfShdr{
+      name = shstrtabNameOff, shtype = 3, // SHT_STRTAB
+      flags = 0, addr = 0, offset = shstrtabFileOff, size = len(shstrtab.bytes),
+      link = 0, info = 0, addralign = 1, entsize = 0,
+    },
+  )
+
+  return shdrs
+}
+
+fn ewSectionHeaders(out: ByteBuf, shdrs: []ElfShdr): int {
+  padTo(out, 8)
+  let shoff = len(out.bytes)
+  let hi = 0
+  while (hi < len(shdrs)) {
+    appendElfShdr(out, shdrs[hi])
+    hi = hi + 1
+  }
+
+  return shoff
+}
+
+fn ewPatchHeader(
+  target: ElfTarget,
+  out: ByteBuf,
+  shoff: int,
+  sectionCount: int,
+  shstrtabIndex: int,
+) {
+  // ---- the header, patched over the space reserved up front -------------
+  let hdr = newByteBuf()
+  hdr.bytes = append(hdr.bytes, u8(127)) // 0x7f 'E' 'L' 'F'
+  appendBytes(hdr, []byte("ELF"))
+  hdr.bytes = append(hdr.bytes, u8(2)) // EI_CLASS: ELFCLASS64
+  hdr.bytes = append(hdr.bytes, u8(1)) // EI_DATA: ELFDATA2LSB
+  hdr.bytes = append(hdr.bytes, u8(1)) // EI_VERSION
+  hdr.bytes = append(hdr.bytes, u8(0)) // EI_OSABI: ELFOSABI_NONE
+  appendZeros(hdr, 8)                  // EI_ABIVERSION + padding (to EI_NIDENT=16)
+  appendU16(hdr, 1)                    // e_type: ET_REL
+  appendU16(hdr, elfMachine(target))
+  appendU32(hdr, 1)     // e_version
+  appendU64(hdr, 0)     // e_entry
+  appendU64(hdr, 0)     // e_phoff
+  appendU64(hdr, shoff) // e_shoff
+  appendU32(hdr, 0)     // e_flags
+  appendU16(hdr, sizeofElfEhdr())
+  appendU16(hdr, 0) // e_phentsize
+  appendU16(hdr, 0) // e_phnum
+  appendU16(hdr, sizeofElfShdr())
+  appendU16(hdr, sectionCount)
+  appendU16(hdr, shstrtabIndex)
+  let bi = 0
+  while (bi < len(hdr.bytes)) {
+    out.bytes[bi] = hdr.bytes[bi]
+    bi = bi + 1
+  }
+}
+

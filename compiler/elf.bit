@@ -9,7 +9,6 @@
 // Field ORDER and the padding between fields are the whole contract here — the
 // layout comments below are load-bearing, not decoration.
 //
-// bit:lint max-fn-lines=320 -- writeElfObject validates sections and symbol order, then derives file offsets and the symtab layout from that validated state in file order; the header fields it writes are position-dependent on everything computed above them, so a phase boundary would bundle the running offsets rather than remove them.
 
 enum ElfTarget {
   X86_64,
@@ -368,97 +367,12 @@ fn writeElfObject(target: ElfTarget, obj: ElfObject): []u8! {
     )
     ki = ki + 1
   }
-  let si = 0
-  while (si < len(obj.sections)) {
-    let s = obj.sections[si]
-    let idx = elfKindIndex(s.kind)
-    if (present[idx]) {
-      fail newError("DuplicateSection")
-    }
-    if (s.alignment != 0 && !elfIsPowerOfTwo(s.alignment)) {
-      fail newError("InvalidSectionAlignment")
-    }
-    present[idx] = true
-    byKind[idx] = s
-    si = si + 1
-  }
-
-  // ---- symbol order: every STB_LOCAL before any STB_GLOBAL ---------------
-  // ELF's symtab contract: sh_info names the boundary as a single index, so the
-  // two groups must be contiguous. Each group keeps obj.symbols's own order.
-  // `order[i]` is the original index landing at final symtab slot i+1 (slot 0 is
-  // the mandatory null symbol).
-  let order = []int(0)
-  let yi = 0
-  while (yi < len(obj.symbols)) {
-    let sym = obj.symbols[yi]
-    if (!sym.hasSection && sym.binding == ElfBinding.Local) {
-      fail newError("UndefinedLocalSymbol")
-    }
-    if (sym.hasSection) {
-      let kidx = elfKindIndex(sym.section)
-      if (!present[kidx]) {
-        fail newError("SectionNotPresent")
-      }
-      if (sym.offset + sym.size > elfSectionBytes(byKind[kidx])) {
-        fail newError("SymbolOutOfBounds")
-      }
-    }
-    if (sym.binding == ElfBinding.Local) {
-      order = append(order, yi)
-    }
-    yi = yi + 1
-  }
+  ewValidateSections(obj, present, byKind)?
+  let order = ewLocalSymbols(obj, present, byKind)?
   let nLocal = len(order)
-  yi = 0
-  while (yi < len(obj.symbols)) {
-    if (obj.symbols[yi].binding != ElfBinding.Local) {
-      order = append(order, yi)
-    }
-    yi = yi + 1
-  }
-
-  // Final symtab slot of each symbol, by name (+1 past the null symbol).
-  let symIdx = map<string, int>{}
-  let oi = 0
-  while (oi < len(order)) {
-    let nm = obj.symbols[order[oi]].name
-    let (_, dup) = symIdx[nm]
-    if (dup) {
-      fail newError("DuplicateSymbol")
-    }
-    symIdx[nm] = oi + 1
-    oi = oi + 1
-  }
-
-  // ---- validate relocations, bucketed by target section ------------------
-  let ri = 0
-  while (ri < len(obj.relocations)) {
-    let r = obj.relocations[ri]
-    let kidx = elfKindIndex(r.section)
-    if (!present[kidx]) {
-      fail newError("SectionNotPresent")
-    }
-    if (r.offset + elfRelocWidth(r.kind) > elfSectionBytes(byKind[kidx])) {
-      fail newError("RelocOutOfBounds")
-    }
-    if (elfRelocType(r.kind, target) < 0) {
-      fail newError("RelocKindUnsupportedForTarget")
-    }
-    // #5198: the two-result index form, not a scan of `obj.symbols`. `order`
-    // is a permutation of every symbol index (locals in the first pass above,
-    // non-locals in the second), and the loop that fills `symIdx` rejects a
-    // repeated name, so membership in `symIdx` is exactly membership in
-    // `obj.symbols`. The scan made writing an object O(R*S) in its own
-    // relocation and symbol counts; the rela emission below already reads this
-    // same map by hash.
-    let (_, known) = symIdx[r.symbol]
-    if (!known) {
-      fail newError("UnknownSymbol")
-    }
-    ri = ri + 1
-  }
-
+  order = ewGlobalSymbols(obj, order)
+  let symIdx = ewSymbolIndex(obj, order)?
+  ewValidateRelocations(target, obj, (present, byKind), symIdx)?
   let out = newByteBuf()
   let shstrtab = newByteBuf()
   shstrtab.bytes = append(shstrtab.bytes, u8(0)) // offset 0 == empty string
@@ -473,205 +387,36 @@ fn writeElfObject(target: ElfTarget, obj: ElfObject): []u8! {
     },
   ) // index 0: null section
 
-  // ---- real sections, in canonical order --------------------------------
-  let shIndexOf = []int(0)
-  ki = 0
-  while (ki < elfNumKinds()) {
-    shIndexOf = append(shIndexOf, 0)
-    ki = ki + 1
-  }
+  let shIndexOf = ewSectionIndices()
   let ord = elfCanonicalOrder()
   let ci = 0
   while (ci < len(ord)) {
-    let kind = ord[ci]
-    let kidx = elfKindIndex(kind)
+    let kidx = elfKindIndex(ord[ci])
     if (present[kidx]) {
-      let sec = byKind[kidx]
-      let nameOff = elfInternString(shstrtab, elfSectionName(kind))
-      let alignment = sec.alignment
-      if (alignment == 0) {
-        alignment = 1
-      }
-      padTo(out, alignment)
-      let fileOff = len(out.bytes)
-      if (kind != ElfSectionKind.Bss) {
-        appendBytes(out, sec.data)
-      }
-      shIndexOf[kidx] = len(shdrs)
-      shdrs = append(
-        shdrs,
-        ElfShdr{
-          name = nameOff, shtype = elfShType(kind),
-          flags = elfShFlags(kind), addr = 0, offset = fileOff, size = elfSectionBytes(sec),
-          link = 0, info = 0, addralign = alignment, entsize = 0,
-        },
-      )
+      shdrs = ewRealSection(out, shstrtab, shdrs, byKind[kidx], shIndexOf)
     }
     ci = ci + 1
   }
-
-  // ---- .rela.<name> sections --------------------------------------------
-  // sh_link (the symtab's section index) isn't known until the symtab is
-  // emitted below, so it is patched afterwards; relaPositions remembers where.
   let relaPositions = []int(0)
   ci = 0
   while (ci < len(ord)) {
     let kind = ord[ci]
     let kidx = elfKindIndex(kind)
-    // This section's relocations, in the caller's original relative order.
-    let mine = []ElfRelocation(0)
-    ri = 0
-    while (ri < len(obj.relocations)) {
-      if (elfKindIndex(obj.relocations[ri].section) == kidx) {
-        mine = append(mine, obj.relocations[ri])
-      }
-      ri = ri + 1
-    }
+    let mine = ewSectionRelocations(obj.relocations, kidx)
     if (len(mine) > 0) {
       let nameOff = elfInternString(shstrtab, ".rela${elfSectionName(kind)}")
       padTo(out, 8)
       let fileOff = len(out.bytes)
-      ri = 0
-      while (ri < len(mine)) {
-        let r = mine[ri]
-        let (sidx, ok) = symIdx[r.symbol]
-        if (!ok) {
-          fail newError("UnknownSymbol")
-        }
-        appendElfRela(out, r.offset, sidx, elfRelocType(r.kind, target), r.addend)
-        ri = ri + 1
-      }
+      ewRelocationBytes(target, out, mine, symIdx)?
       relaPositions = append(relaPositions, len(shdrs))
-      shdrs = append(
-        shdrs,
-        ElfShdr{
-          name = nameOff, shtype = 4, // SHT_RELA
-          flags = 64,                 // SHF_INFO_LINK
-          addr = 0, offset = fileOff, size = len(mine) * sizeofElfRela(),
-          link = 0, // patched below
-          info = shIndexOf[kidx], addralign = 8, entsize = sizeofElfRela(),
-        },
-      )
+      shdrs = append(shdrs, ewRelocationHeader(nameOff, fileOff, len(mine), shIndexOf[kidx]))
     }
     ci = ci + 1
   }
-
-  // ---- .symtab before .strtab (header table only; the physical BYTES stay
-  // .strtab-then-.symtab below) --------------------------------------------
-  // GNU BFD's elf_object_p/bfd_section_from_shdr (bfd/elf.c) walks section
-  // headers by increasing index and resolves a STRTAB's owner via
-  // elf_onesymtab(abfd), which is only populated once the SYMTAB header
-  // itself has been visited. A .strtab listed at a lower index than its
-  // .symtab forces BFD into a recursive re-entry to resolve the ownership,
-  // and on real GNU binutils this makes `strip`/`objcopy` reject the file
-  // with "Unable to recognise the format of the input file" — readelf and
-  // objdump, which parse ELF directly rather than through BFD, never see
-  // this. Same fix as #3607 (compiler/elflayout.bit): list .symtab's header
-  // entry before .strtab's.
-  let strtab = newByteBuf()
-  strtab.bytes = append(strtab.bytes, u8(0))
-  let symNameOffs = []int(0)
-  oi = 0
-  while (oi < len(order)) {
-    symNameOffs = append(symNameOffs, elfInternString(strtab, obj.symbols[order[oi]].name))
-    oi = oi + 1
-  }
-
-  let strtabNameOff = elfInternString(shstrtab, ".strtab")
-  let strtabFileOff = len(out.bytes)
-  appendBytes(out, strtab.bytes)
-
-  let symtabNameOff = elfInternString(shstrtab, ".symtab")
-  padTo(out, 8)
-  let symtabFileOff = len(out.bytes)
-  appendElfSym(out, 0, 0, 0, 0, 0) // index 0: mandatory null symbol
-  oi = 0
-  while (oi < len(order)) {
-    let sym = obj.symbols[order[oi]]
-    let shndx = 0 // SHN_UNDEF
-    if (sym.hasSection) {
-      shndx = shIndexOf[elfKindIndex(sym.section)]
-    }
-    appendElfSym(
-      out, symNameOffs[oi], elfSymInfo(sym.binding, sym.kind), shndx,
-      sym.offset, sym.size,
-    )
-    oi = oi + 1
-  }
-  let symtabIndex = len(shdrs)
-  let strtabIndex = symtabIndex + 1
-  shdrs = append(
-    shdrs,
-    ElfShdr{
-      name = symtabNameOff, shtype = 2, // SHT_SYMTAB
-      flags = 0, addr = 0, offset = symtabFileOff,
-      size = (len(obj.symbols) + 1) * sizeofElfSym(),
-      link = strtabIndex,
-      info = nLocal + 1, // one greater than the last local symbol's index
-      addralign = 8, entsize = sizeofElfSym(),
-    },
-  )
-  shdrs = append(
-    shdrs,
-    ElfShdr{
-      name = strtabNameOff, shtype = 3, // SHT_STRTAB
-      flags = 0, addr = 0, offset = strtabFileOff, size = len(strtab.bytes),
-      link = 0, info = 0, addralign = 1, entsize = 0,
-    },
-  )
-  let pi = 0
-  while (pi < len(relaPositions)) {
-    shdrs[relaPositions[pi]].link = symtabIndex
-    pi = pi + 1
-  }
-
-  let shstrtabNameOff = elfInternString(shstrtab, ".shstrtab")
-  let shstrtabFileOff = len(out.bytes)
-  appendBytes(out, shstrtab.bytes)
-  let shstrtabIndex = len(shdrs)
-  shdrs = append(
-    shdrs,
-    ElfShdr{
-      name = shstrtabNameOff, shtype = 3, // SHT_STRTAB
-      flags = 0, addr = 0, offset = shstrtabFileOff, size = len(shstrtab.bytes),
-      link = 0, info = 0, addralign = 1, entsize = 0,
-    },
-  )
-
-  padTo(out, 8)
-  let shoff = len(out.bytes)
-  let hi = 0
-  while (hi < len(shdrs)) {
-    appendElfShdr(out, shdrs[hi])
-    hi = hi + 1
-  }
-
-  // ---- the header, patched over the space reserved up front -------------
-  let hdr = newByteBuf()
-  hdr.bytes = append(hdr.bytes, u8(127)) // 0x7f 'E' 'L' 'F'
-  appendBytes(hdr, []byte("ELF"))
-  hdr.bytes = append(hdr.bytes, u8(2)) // EI_CLASS: ELFCLASS64
-  hdr.bytes = append(hdr.bytes, u8(1)) // EI_DATA: ELFDATA2LSB
-  hdr.bytes = append(hdr.bytes, u8(1)) // EI_VERSION
-  hdr.bytes = append(hdr.bytes, u8(0)) // EI_OSABI: ELFOSABI_NONE
-  appendZeros(hdr, 8)                  // EI_ABIVERSION + padding (to EI_NIDENT=16)
-  appendU16(hdr, 1)                    // e_type: ET_REL
-  appendU16(hdr, elfMachine(target))
-  appendU32(hdr, 1)     // e_version
-  appendU64(hdr, 0)     // e_entry
-  appendU64(hdr, 0)     // e_phoff
-  appendU64(hdr, shoff) // e_shoff
-  appendU32(hdr, 0)     // e_flags
-  appendU16(hdr, sizeofElfEhdr())
-  appendU16(hdr, 0) // e_phentsize
-  appendU16(hdr, 0) // e_phnum
-  appendU16(hdr, sizeofElfShdr())
-  appendU16(hdr, len(shdrs))
-  appendU16(hdr, shstrtabIndex)
-  let bi = 0
-  while (bi < len(hdr.bytes)) {
-    out.bytes[bi] = hdr.bytes[bi]
-    bi = bi + 1
-  }
+  shdrs = ewSymbolTables(obj, out, shstrtab, (order, nLocal), (shdrs, shIndexOf, relaPositions))
+  shdrs = ewSectionNames(out, shstrtab, shdrs)
+  let shstrtabIndex = len(shdrs) - 1
+  let shoff = ewSectionHeaders(out, shdrs)
+  ewPatchHeader(target, out, shoff, len(shdrs), shstrtabIndex)
   return out.bytes
 }
