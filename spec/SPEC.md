@@ -2396,7 +2396,8 @@ interface is a separate extension this section does not make.
   `[]u8(127, 69, 76, 70)` are both **E0050** rather than an empty slice and a
   127-byte one. Write elements as `[]T{...}` and bytes as `[]byte("...")`.
 - **Array** `[N]T`: fixed length `N` (a compile-time constant), value type, copied
-  on assignment. Built with an array literal or zero-valued via `let a: [N]T`.
+  on assignment. Built with an array literal, zero-valued via `let a: [N]T`,
+  or explicitly copied from a slice with the fallible `[N]T(s)` (§12.9).
   `N` is a `const_expr`: an integer literal, a module-level `const` of integer
   type that folds to a constant, or an expression over those
   (`[rows * cols]i64`). It is folded at compile time; a length that does not fold
@@ -3728,10 +3729,10 @@ A bare element list is a slice literal **in every context, including where an
 array type is expected**. It is therefore ill-typed against an `[N]T`
 annotation, parameter, or result - `let a: [2]f32 = [4.5, 4.5]` is an error
 (E0041, `expected '[2]f32', found '[]f64'`), not an array literal. An array
-value is constructed only by the type-prefixed form `[N]T{...}`, whose element
-count must equal `N` (E0050), or left zero-valued by `let a: [N]T` (§11.2).
-There is no implicit slice-to-array conversion; §22 keeps arrays-as-values
-otherwise deferred for v0.1.
+value is constructed by the type-prefixed form `[N]T{...}`, whose element
+count must equal `N` (E0050), left zero-valued by `let a: [N]T` (§11.2),
+or copied by the explicit fallible conversion `[N]T(s)` (§12.9).
+There is no implicit slice-to-array conversion.
 
 This was previously left implicit, and the two compilers disagreed: the seed
 rejected the bare form while the self-hosted checker accepted it and
@@ -3954,6 +3955,27 @@ from copying, so an implementation may represent that case either way.
 ### 12.9 Type Conversions and Constructors
 
 A type used in call position converts or constructs:
+
+When a fixed-length value is required from a slice, `[N]T(s)` returns `[N]T!`.
+`N` must be a nonnegative integer literal and `T` a concrete scalar type
+(integer, bool, float or decimal). The sole positional argument must have
+exactly type `[]T`; named arguments, unresolved type parameters and numeric
+widening are refused. The core prelude is required. Array aliases keep their
+existing conversion rules; this form uses the explicit array type.
+
+The slice expression is evaluated once. Its length is checked before any
+element read or destination array allocation. Equal lengths produce an
+independent value copy, including an empty or nil slice when `N` is zero.
+A mismatch returns the default error with the exact message
+`array conversion length mismatch: expected N, found M`, with decimal lengths
+substituted for `N` and `M`. Ordinary `?` and `catch` handle the result. There
+is no truncation, padding or implicit conversion; the storage limits in §11.2
+also apply.
+
+```text
+let values: []int = [7, 8]
+let pair = [2]int(values)?
+```
 
 ```
 i32(x)            // numeric conversion (explicit; no implicit narrowing)
