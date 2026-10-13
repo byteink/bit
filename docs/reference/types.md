@@ -92,6 +92,53 @@ fn main() {
 }
 ```
 
+### Copying a slice into an array
+
+An Inkwell draft imported from a decoded record has a `[]int` of tag IDs.
+Its archive record needs exactly two IDs, and later edits to the imported
+slice must not change the archived value. Convert explicitly with `[2]int(decoded)`:
+
+```bit
+class ArchivedDraft { tagIds: [2]int }
+
+fn main(): ()! {
+  let decoded: []int = [3, 8]
+  let ids = [2]int(decoded)?
+  let archived = ArchivedDraft{ tagIds = ids }
+
+  decoded[0] = 99
+  ids[1] = 42
+  assert(archived.tagIds[0] == 3 && archived.tagIds[1] == 8)
+  assert(decoded[1] == 8)
+  println("${archived.tagIds[0]}, ${archived.tagIds[1]}")
+
+  let incomplete: []int = [3]
+  let _ = [2]int(incomplete) catch err {
+    assert(err.message() == "array conversion length mismatch: expected 2, found 1")
+    println("Cannot archive draft: ${err.message()}")
+    return
+  }
+}
+```
+
+`[N]T(s)` returns `[N]T!`: the slice expression is evaluated once, its length
+is checked before reading elements or allocating the destination array, and
+success gives an independent copy. A mismatch returns the default error with
+`array conversion length mismatch: expected N, found M`, substituting decimal
+lengths. Use `?` to propagate it or `catch` to handle it, as on [Errors](errors.md).
+
+A few edges:
+
+- `N` must be a nonnegative integer literal. `T` must be a concrete integer,
+  bool, float or decimal type; strings and reference types are excluded.
+- The one positional argument must have exactly type `[]T`. There is no
+  implicit conversion or numeric widening, and no truncation or padding.
+- The core prelude is required. `[0]T(s)` succeeds for an empty or nil slice
+  of the matching type; array storage limits still apply.
+
+Keep a slice when the number of IDs may change. Use the array conversion
+when the fixed length is part of the record's contract.
+
 ## Value vs. reference semantics
 
 | Category | Types | On assignment / passing |
