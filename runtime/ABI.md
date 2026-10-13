@@ -2772,19 +2772,15 @@ wakes it (#6008): the stamp is stored before the word is read, the word
 before `startTick` is re-scanned, so one side always sees the other. The
 epoch stands still while parked, so a task stamped during the park is
 flagged by the same `preemptBudgetTicks` real ticks as one stamped while
-ticking. Windows starts no monitor thread at all (#6469). The loop is bounded by
-`WORKER_MAX_STEPS`
-(`runtime/sched/workerrun.bit:65`; 1e9 iterations at ~2ms is over 20 days,
-so in practice it runs for the life of the process) rather than looping
-unbounded: defined at `runtime/root/darwin/boot.bit:380` and started on its
-own OS thread at `runtime/root/darwin/boot.bit:625`; the linux twin is
-defined at `runtime/root/linux/sysmon.bit:85` and started at
-`runtime/root/linux/boottail.bit:373`. Both start next to the
-`BIT_WORKERS` worker boot sequence above. The thread is deliberately never
-registered as a mutator with the collector — see the rationale already
-written at `runtime/root/darwin/boot.bit:325-379` (linux's `sysmon.bit`
-header makes the same argument rather than repeating it). So `requested` is
-set by a real, clock-driven tick on both platforms, not only by the
+ticking. Windows also starts a monitor through `sysmonStart`
+(`runtime/root/windows/sysmon.bit`, #6469). Each `sysmonRun` runs for the
+process lifetime; process termination ends the thread. Each turn and its
+resource use remain bounded. Linux and Darwin start their monitors beside
+the `BIT_WORKERS` worker boot sequence in `boot`
+(`runtime/root/linux/boottail.bit`, `runtime/root/darwin/boot.bit`).
+The monitor stays GC-blocked through `gcBlockingBegin`: it holds no live
+Bit references, as explained by `sysmonRun` in each provider. So `requested` is
+set by a real, clock-driven tick on all three platforms, not only by the
 dispatch-time stamp described above.
 
 **Wired: the safepoint consumes the flag (landed).**
