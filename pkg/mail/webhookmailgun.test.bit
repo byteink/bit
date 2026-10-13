@@ -1,0 +1,178 @@
+// pkg/mail/webhookmailgun.test.bit — signed events, expiry, capacity and concurrent replay.
+
+import { encodeHex, hmac, HashAlg } from "std/crypto"
+import { env } from "std/os"
+import { parseInt, replace } from "std/strings"
+import { after } from "std/time"
+
+const mwhKey: string = "inkwell-webhook-signing-key"
+const mwhTime: int = 1700000000
+
+fn mwhBody(data: string, token: string, ts: string): string {
+  let tag = encodeHex(hmac(HashAlg.Sha256, []byte(mwhKey), []byte(ts + token)))
+  return "{\"signature\":{\"timestamp\":\"${ts}\",\"token\":\"${token}\",\"signature\":\"${tag}\"},\"event-data\":${data}}"
+}
+
+fn mwhRun(data: string, token: string): []Event {
+  let body = mwhBody(data, token, "${mwhTime}")
+  return webhookEvents(Provider.Mailgun, (name) => "", body, mwhKey, whAt(mwhTime)) catch e {
+    panic(e.message())
+  }
+}
+
+fn mwhVerdict(body: string, secret: string, at: Timestamp): string {
+  webhookEvents(Provider.Mailgun, (name) => "", body, secret, at) catch e {
+    match (e) {
+      Signature(_) => return "Signature"
+      Invalid(_) => return "Invalid"
+      Config(_) => return "Config"
+      _ => return "other"
+    }
+  }
+  return "ok"
+}
+
+const mwhDelivered: string = "{\"event\":\"delivered\",\"recipient\":\"sara@inkwell.dev\",\"id\":\"event-7\",\"message\":{\"headers\":{\"message-id\":\"<welcome-7@inkwell.dev>\"}},\"timestamp\":1700000000.125,\"delivery-status\":{\"description\":\"accepted\",\"message\":\"second\"},\"reason\":\"third\"}"
+
+test "Mailgun maps seven kinds and preserves event identity and time" {
+  mgReplay = MgReplay()
+  let types = ["delivered", "failed", "failed", "complained", "unsubscribed", "opened", "clicked"]
+  let severities = ["", "permanent", "temporary", "", "", "", ""]
+  let kinds = [
+    EventKind.Delivered, EventKind.Bounced, EventKind.Deferred, EventKind.Complained,
+    EventKind.Unsubscribed, EventKind.Opened, EventKind.Clicked,
+  ]
+  let i = 0
+  while (i < len(types)) {
+    let data = replace(
+      mwhDelivered,
+      "\"delivered\"",
+      "\"${types[i]}\",\"severity\":\"${severities[i]}\"",
+    )
+    let evs = mwhRun(data, "mapping-${i}")
+    assert(len(evs) == 1 && evs[0].kind == kinds[i], types[i])
+    let e = evs[0]
+    assert(
+      e.recipient == "sara@inkwell.dev" && e.messageId == "<welcome-7@inkwell.dev>",
+      "identity",
+    )
+    assert(e.providerId == "event-7" && e.deliveryId == "mapping-${i}", "ids")
+    assert(e.at.ns == mwhTime * Second + 125000000 && e.reason == "accepted", "time and reason")
+    assert(e.permanent == (i == 1) && e.provider == Provider.Mailgun, "policy")
+    i = i + 1
+  }
+  assert(len(mwhRun("{\"event\":\"accepted\"}", "accepted")) == 0, "accepted ignored")
+  assert(len(mwhRun("{\"event\":\"new-event\"}", "unknown")) == 0, "unknown ignored")
+}
+
+test "Mailgun optional time and reason fall back without changing IDs" {
+  mgReplay = MgReplay()
+  let i = 0
+  for value of ["null", "\"yesterday\"", "999999999999999999"] {
+    let data = replace(mwhDelivered, "1700000000.125", value)
+    assert(mwhRun(data, "time-${i}")[0].at.ns == mwhTime * Second, "time fallback")
+    i = i + 1
+  }
+  let data = replace(mwhDelivered, "\"description\":\"accepted\"", "\"description\":\"\"")
+  assert(mwhRun(data, "reason-message")[0].reason == "second", "message")
+  data = replace(data, "\"message\":\"second\"", "\"message\":\"\"")
+  assert(mwhRun(data, "reason-direct")[0].reason == "third", "reason")
+  data = "{\"event\":\"delivered\",\"recipient\":\"a@x\"}"
+  let e = mwhRun(data, "missing")[0]
+  assert(e.messageId == "" && e.providerId == "" && e.reason == "", "absent optional fields")
+  assert(e.at.ns == mwhTime * Second, "absent time")
+}
+
+test "Mailgun typed refusals and invalid signatures leave replay storage unchanged" {
+  mgReplay = MgReplay()
+  let at = whAt(mwhTime)
+  let body = mwhBody(mwhDelivered, "refusals", "${mwhTime}")
+  assert(mwhVerdict(body, "wrong-key", at) == "Signature", "wrong signature")
+  assert(mgReplay.count == 0, "invalid signature consumed a slot")
+  assert(mwhVerdict(body, "", at) == "Config", "empty key")
+  for bad of ["not json", "{}", "{\"signature\":{}}"] {
+    assert(mwhVerdict(bad, mwhKey, at) == "Invalid", "malformed signature")
+  }
+  let malformed = mwhBody("[]", "bad-data", "${mwhTime}")
+  assert(mwhVerdict(malformed, mwhKey, at) == "Invalid", "malformed event data")
+  let failed = mwhBody("{\"event\":\"failed\",\"severity\":\"new\"}", "bad-severity", "${mwhTime}")
+  assert(mwhVerdict(failed, mwhKey, at) == "Invalid", "unknown severity")
+  assert(mwhVerdict(body, mwhKey, whAt(mwhTime + 301)) == "Signature", "stale")
+  assert(mwhVerdict(body, mwhKey, at) == "ok", "valid after bad signature")
+  assert(mwhVerdict(body, mwhKey, at) == "Signature", "replay")
+}
+
+test "Mailgun includes both clock boundaries and retains tokens through exact expiry" {
+  mgReplay = MgReplay()
+  let past = mwhBody(mwhDelivered, "past", "${mwhTime - 300}")
+  let future = mwhBody(mwhDelivered, "future", "${mwhTime + 300}")
+  assert(mwhVerdict(past, mwhKey, whAt(mwhTime)) == "ok", "past boundary")
+  assert(mwhVerdict(future, mwhKey, whAt(mwhTime)) == "ok", "future boundary")
+  assert(mwhVerdict(future, mwhKey, whAt(mwhTime + 600)) == "Signature", "exact expiry replay")
+  let next = mwhBody(mwhDelivered, "next", "${mwhTime + 600}")
+  assert(
+    mwhVerdict(next, mwhKey, Timestamp{ ns = (mwhTime + 600) * Second + 1 }) == "ok",
+    "after expiry",
+  )
+  assert(mgReplay.count == 1, "expired entries retained")
+  let old = mwhBody(mwhDelivered, "too-old", "${mwhTime - 301}")
+  let ahead = mwhBody(mwhDelivered, "too-future", "${mwhTime + 301}")
+  assert(mwhVerdict(old, mwhKey, whAt(mwhTime)) == "Signature", "past outside")
+  assert(mwhVerdict(ahead, mwhKey, whAt(mwhTime)) == "Signature", "future outside")
+}
+
+test "Mailgun holds 10000 verified digests and evicts the oldest insertion" {
+  mgReplay = MgReplay()
+  let i = 0
+  while (i < mgReplayCapacity + 1) {
+    let _ = mwhRun("{\"event\":\"accepted\"}", "capacity-${i}")
+    i = i + 1
+  }
+  assert(mgReplay.count == mgReplayCapacity, "capacity")
+  let retained = mwhBody(mwhDelivered, "capacity-1", "${mwhTime}")
+  assert(mwhVerdict(retained, mwhKey, whAt(mwhTime)) == "Signature", "second retained")
+  let evicted = mwhBody(mwhDelivered, "capacity-0", "${mwhTime}")
+  assert(mwhVerdict(evicted, mwhKey, whAt(mwhTime)) == "ok", "oldest evicted")
+  assert(mgReplay.count == mgReplayCapacity, "bounded after eviction")
+}
+
+fn mwhConcurrent(body: string, start: chan<bool>, done: chan<bool>) {
+  <- start
+  done <- mwhVerdict(body, mwhKey, whAt(mwhTime)) == "ok"
+}
+
+test "concurrent Mailgun duplicate acceptance occurs once" {
+  let workers = parseInt(env("BIT_WORKERS")) catch _ {
+    panic("BIT_WORKERS must be at least 2")
+  }
+  assert(workers >= 2, "Mailgun race test needs at least two workers")
+  mgReplay = MgReplay()
+  let body = mwhBody(mwhDelivered, "concurrent", "${mwhTime}")
+  let start = chan<bool>(8)
+  let done = chan<bool>(8)
+  let i = 0
+  while (i < 8) {
+    spawn mwhConcurrent(body, start, done)
+    i = i + 1
+  }
+  i = 0
+  while (i < 8) {
+    start <- true
+    i = i + 1
+  }
+  let accepted = 0
+  let deadline = after(10 * Second)
+  i = 0
+  while (i < 8) {
+    select {
+      case ok = <- done:
+        if (ok) {
+          accepted = accepted + 1
+        }
+      case <- deadline:
+        panic("Mailgun duplicate workers did not join")
+    }
+    i = i + 1
+  }
+  assert(accepted == 1 && mgReplay.count == 1, "duplicate acceptance count ${accepted}")
+}

@@ -38,7 +38,7 @@ Do not parse it and write it back out first: the signature covers the bytes
 Resend sent, and a different spacing or key order makes it fail.
 
 One webhook can name several recipients, and you get one `Event` for each. The
-provider is a value, `Provider.Resend` or `Provider.Postmark`, and not a different function, so
+provider is a value, `Provider.Resend`, `Provider.Postmark` or `Provider.Mailgun`, and not a different function, so
 the day Inkwell adds a second provider only that argument changes. `Provider`
 lists only the providers whose webhooks `parseEvents` can read; a new one is
 added in the same release as its parser.
@@ -186,6 +186,69 @@ retries do not apply it twice. When absent, construct a compound key from the
 record's identity, recipient and event time. Never treat all empty ids as one
 delivery. The existing Resend de-duplication example below assumes a nonempty
 delivery id.
+
+## When Inkwell uses Mailgun
+
+Keep the same suppression list when Inkwell sends through Mailgun. Copy the
+account's HTTP webhook signing key from Settings > API Security. This is the
+raw signing key, not the API key. Mailgun sends signature fields inside JSON:
+
+```json
+{"signature":{"timestamp":"1700000000","token":"delivery-7","signature":"hex HMAC-SHA256"},"event-data":{"event":"delivered","recipient":"sara@inkwell.dev","id":"event-7","timestamp":1700000000.125,"message":{"headers":{"message-id":"<welcome-7@inkwell.dev>"}}}}
+```
+
+The signature is hexadecimal HMAC-SHA256 over the exact timestamp text followed
+by the token, with no separator. It does not sign the event payload bytes.
+Use HTTPS and pass the raw body and signing key to the same API:
+
+```bit
+import { EventKind, Provider, parseEvents } from "mail"
+
+fn onMailgunWebhook(body: string, signingKey: string, suppress: (string) => ()): int {
+  let events = parseEvents(Provider.Mailgun, (name) => "", body, signingKey) catch e {
+    match (e) {
+      Signature(_) => return 401
+      Config(_) => return 500
+      _ => return 400
+    }
+  }
+  for ev of events {
+    if (ev.kind == EventKind.Complained ||
+      ev.kind == EventKind.Unsubscribed ||
+      (ev.kind == EventKind.Bounced && ev.permanent)) {
+      suppress(ev.recipient)
+    }
+  }
+  return 200
+}
+```
+
+The signed timestamp must be within five minutes either way, including both
+boundaries. Wrong signatures, stale timestamps and repeated tokens return
+`MailError.Signature`. An empty signing key returns `MailError.Config`.
+Malformed signature fields or event data return `MailError.Invalid`. The same
+1 MiB body limit applies. Bounded JSON is read to extract the signature;
+event fields are mapped after verification.
+
+Delivered, complained, unsubscribed, opened and clicked become the matching
+`EventKind`. A failed event with permanent severity becomes `Bounced` with
+`permanent = true`; temporary severity becomes `Deferred`. An unknown failure
+severity is Invalid. Accepted and unknown events give `[]`.
+
+`providerId` reads the event's `id`, `messageId` reads
+`message.headers.message-id`, and `deliveryId` is the signed token.
+`at` reads numeric `event-data.timestamp`, including fractional seconds;
+missing, nonnumeric or out-of-range time falls back to request time.
+`reason` is the first nonempty `delivery-status.description`,
+`delivery-status.message`, then `event-data.reason`.
+
+Each process remembers at most 10,000 verified token digests. A token expires
+only after its signed time plus five minutes, so a future-dated token remains
+protected throughout its acceptance window. Capacity evicts the oldest
+insertion. A restart or eviction loses that local replay record. Store
+`Event.deliveryId` in shared application storage for durable deduplication
+across instances; local rejection alone cannot provide it. Invalid signatures
+never consume a cache slot.
 
 ## Retries and de-duplication
 
