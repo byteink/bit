@@ -19,7 +19,6 @@
 // <mach-o/nlist.h>, <mach-o/reloc.h>, <mach-o/x86_64/reloc.h>,
 // <mach-o/arm64/reloc.h>, cross-checked byte-for-byte against as/otool output.
 //
-// bit:lint max-fn-lines=281 -- writeMacho validates sections and symbols, then builds the load commands and symtab from that validated state in file order, mirroring elf.bit/emitpe.bit's writers; splitting would bundle the running offsets and index maps across a boundary rather than remove them.
 
 enum MachoTarget {
   X86_64,
@@ -338,96 +337,21 @@ fn machoInternString(buf: ByteBuf, s: string): int {
 // Emits a complete Mach-O64 MH_OBJECT for `obj`, targeting the given
 // architecture.
 fn writeMacho(target: MachoTarget, obj: MachoObject): []u8! {
-  // Section ordinals are a u8 with 0 reserved (nlist.h's MAX_SECT), and a
-  // relocation's symbol index is 24 bits — neither can be allowed to truncate
-  // silently, however unreachable a real compilation unit makes them.
-  if (len(obj.sections) > 255) {
-    fail newError("TooManySections")
-  }
-  if (len(obj.symbols) > (1 << 24) - 1) {
-    fail newError("TooManySymbols")
-  }
-
+  machoWriteCounts(obj)?
   let n = machoNumKinds()
   let hasKind = []bool(n)
   let sectionOf = []MachoSection(n)
-  let i = 0
-  while (i < len(obj.sections)) {
-    let s = obj.sections[i]
-    let idx = machoKindIndex(s.kind)
-    if (hasKind[idx]) {
-      fail newError("DuplicateSection")
-    }
-    if (s.alignment != 0 && !isPowerOfTwo(s.alignment)) {
-      fail newError("InvalidSectionAlignment")
-    }
-    hasKind[idx] = true
-    sectionOf[idx] = s
-    i = i + 1
-  }
-
-  i = 0
-  while (i < len(obj.symbols)) {
-    let sym = obj.symbols[i]
-    if (!sym.hasSection && sym.binding == MachoBinding.Local) {
-      fail newError("UndefinedLocalSymbol")
-    }
-    if (sym.hasSection) {
-      let idx = machoKindIndex(sym.section)
-      if (!hasKind[idx]) {
-        fail newError("SectionNotPresent")
-      }
-      if (sym.offset + sym.size > machoSectionBytes(sectionOf[idx])) {
-        fail newError("SymbolOutOfBounds")
-      }
-    }
-    i = i + 1
-  }
-
-  // #5185: the two-result index form, NOT a scan of the keys. Both membership
-  // tests here (and the relocation one below) used to walk every entry of this
-  // map with `==`, which made writing an object O(S^2 + R*S) in its own symbol
-  // and relocation counts. On the 34744-symbol, 158464-relocation object a
-  // one-line `import ... from "pkg/web"` produces that was 82% of the ENTIRE
-  // `bit build` -- 23.5 s of a 33.2 s compile, against 1.6 s of real codegen.
-  // The ELF and PE writers already spell the duplicate check this way
-  // (elf.bit, emitpe.bit); this is macho.bit catching up, not a new idiom.
+  machoWriteSectionsValid(obj, hasKind, sectionOf)?
+  machoWriteSymbolsValid(obj, hasKind, sectionOf)?
   let symIdxOf = map<string, int>{}
-  i = 0
-  while (i < len(obj.symbols)) {
-    let (_, dup) = symIdxOf[obj.symbols[i].name]
-    if (dup) {
-      fail newError("DuplicateSymbol")
-    }
-    symIdxOf[obj.symbols[i].name] = i
-    i = i + 1
-  }
-
-  // Relocations, bucketed by section and kept in their original order.
+  machoWriteSymbolIndex(obj, symIdxOf)?
   let relocBuckets = []MachoRelocList(0)
-  i = 0
+  let i = 0
   while (i < n) {
     relocBuckets = append(relocBuckets, MachoRelocList{ list = []MachoRelocation(0) })
     i = i + 1
   }
-  i = 0
-  while (i < len(obj.relocations)) {
-    let r = obj.relocations[i]
-    let idx = machoKindIndex(r.section)
-    if (!hasKind[idx]) {
-      fail newError("SectionNotPresent")
-    }
-    if (r.offset + machoRelocWidth(r.kind) > machoSectionBytes(sectionOf[idx])) {
-      fail newError("RelocOutOfBounds")
-    }
-    let (_, known) = symIdxOf[r.symbol]
-    if (!known) {
-      fail newError("UnknownSymbol")
-    }
-    relocBuckets[idx].list = append(relocBuckets[idx].list, r)
-    i = i + 1
-  }
-
+  machoWriteRelocsValid(obj, hasKind, sectionOf, symIdxOf, relocBuckets)?
   let present = []MachoSectionKind(0)
   let order = machoCanonicalOrder()
   i = 0
@@ -437,19 +361,11 @@ fn writeMacho(target: MachoTarget, obj: MachoObject): []u8! {
     }
     i = i + 1
   }
-  let nsects = len(present)
-
-  let segCmdSize = sizeofSegmentCommand64() + nsects * sizeofSection64()
+  let segCmdSize = sizeofSegmentCommand64() + len(present) * sizeofSection64()
   let sizeofcmds = segCmdSize + sizeofSymtabCommand()
   let cmdsEnd = sizeofMachHeader64() + sizeofcmds
-
   let out = newByteBuf()
-  // Header + load commands are patched in place once every offset below is
-  // known; reserve the space now so section/symbol/string data lands at the
-  // offsets those commands record.
   appendZeros(out, cmdsEnd)
-
-  // Per-present-section header fields, filled as each section's bytes land.
   let hdrs = []MachoSecHdr(0)
   let addrOf = []int(n)
   let ordinalOf = []int(n)
@@ -458,7 +374,7 @@ fn writeMacho(target: MachoTarget, obj: MachoObject): []u8! {
   let segFileoffSet = false
   let filesize = 0
   i = 0
-  while (i < nsects) {
+  while (i < len(present)) {
     let kind = present[i]
     let idx = machoKindIndex(kind)
     let sec = sectionOf[idx]
@@ -470,59 +386,18 @@ fn writeMacho(target: MachoTarget, obj: MachoObject): []u8! {
     addrOf[idx] = addrCursor
     ordinalOf[idx] = i + 1 // section ordinals are 1-based
     addrCursor = addrCursor + machoSectionBytes(sec)
-
-    let fileOff = 0
+    let h = machoWriteSection(out, sec, alignment, addrOf[idx], len(relocBuckets[idx].list))
     if (!machoIsZerofill(kind)) {
-      padTo(out, alignment)
-      fileOff = len(out.bytes)
       if (!segFileoffSet) {
-        segFileoff = fileOff
+        segFileoff = h.offset
         segFileoffSet = true
       }
-      appendBytes(out, sec.data)
       filesize = len(out.bytes) - segFileoff
     }
-
-    hdrs = append(
-      hdrs,
-      MachoSecHdr{
-        kind = kind, addr = addrOf[idx],
-        size = machoSectionBytes(sec), offset = fileOff, align = log2Int(alignment),
-        reloff = 0, nreloc = len(relocBuckets[idx].list),
-      },
-    )
+    hdrs = append(hdrs, h)
     i = i + 1
   }
-  let vmsize = addrCursor
-  // Relocations, one contiguous run per section, in canonical order.
-  padTo(out, 4)
-  i = 0
-  while (i < nsects) {
-    let idx = machoKindIndex(present[i])
-    let rl = relocBuckets[idx].list
-    if (len(rl) > 0) {
-      hdrs[i].reloff = len(out.bytes)
-      let j = 0
-      while (j < len(rl)) {
-        let r = rl[j]
-        appendU32(out, r.offset)
-        // r_extern is always true: every relocation here targets a symtab entry,
-        // local or not.
-        appendU32(
-          out,
-          machoRelocInfo(
-            symIdxOf[r.symbol], machoRelocPcrel(r.kind),
-            machoRelocLength(r.kind), true, machoRelocType(r.kind, target),
-          ),
-        )
-        j = j + 1
-      }
-    }
-    i = i + 1
-  }
-
-  // The string table is built independently of `out` so every symbol's n_strx is
-  // known before the nlist_64 array (which lives in `out`) is written.
+  machoWriteRelocs(target, out, present, relocBuckets, (hdrs, symIdxOf))
   let strtab = newByteBuf()
   strtab.bytes = append(strtab.bytes, u8(0)) // offset 0 == empty string
   let nameOffs = []int(0)
@@ -531,91 +406,14 @@ fn writeMacho(target: MachoTarget, obj: MachoObject): []u8! {
     nameOffs = append(nameOffs, machoInternString(strtab, obj.symbols[i].name))
     i = i + 1
   }
-
   padTo(out, 8)
   let symoff = len(out.bytes)
-  i = 0
-  while (i < len(obj.symbols)) {
-    let sym = obj.symbols[i]
-    let ntype = nUndf()
-    let nsect = 0
-    let nvalue = 0
-    if (sym.hasSection) {
-      let idx = machoKindIndex(sym.section)
-      ntype = nSect()
-      nsect = ordinalOf[idx]
-      nvalue = addrOf[idx] + sym.offset
-    }
-    if (sym.binding == MachoBinding.Global) {
-      ntype = ntype | nExt()
-    }
-    appendU32(out, nameOffs[i])
-    out.bytes = append(out.bytes, u8(ntype))
-    out.bytes = append(out.bytes, u8(nsect))
-    appendU16(out, 0) // n_desc
-    appendU64(out, nvalue)
-    i = i + 1
-  }
-
+  machoWriteSymbols(out, obj, nameOffs, ordinalOf, addrOf)
   let stroff = len(out.bytes)
   appendBytes(out, strtab.bytes)
-
-  // Patch the header and load commands now that every offset is known.
-  let hdr = newByteBuf()
-  appendU32(hdr, mhMagic64())
-  appendU32(hdr, machoCpuType(target))
-  appendU32(hdr, machoCpuSubtype(target))
-  appendU32(hdr, mhObject())
-  appendU32(hdr, 2) // ncmds: LC_SEGMENT_64 + LC_SYMTAB
-  appendU32(hdr, sizeofcmds)
-  appendU32(hdr, 0) // flags
-  appendU32(hdr, 0) // reserved
-
-  appendU32(hdr, lcSegment64())
-  appendU32(hdr, segCmdSize)
-  appendName16(hdr, "") // MH_OBJECT convention: the one segment is nameless
-  appendU64(hdr, 0)     // vmaddr
-  appendU64(hdr, vmsize)
-  appendU64(hdr, segFileoff)
-  appendU64(hdr, filesize)
-  appendU32(hdr, vmProtAll()) // maxprot
-  appendU32(hdr, vmProtAll()) // initprot
-  appendU32(hdr, nsects)
-  appendU32(hdr, 0) // flags
-
-  i = 0
-  while (i < nsects) {
-    let h = hdrs[i]
-    appendName16(hdr, machoSectionName(h.kind))
-    appendName16(hdr, machoSegmentName(h.kind))
-    appendU64(hdr, h.addr)
-    appendU64(hdr, h.size)
-    appendU32(hdr, h.offset)
-    appendU32(hdr, h.align)
-    appendU32(hdr, h.reloff)
-    appendU32(hdr, h.nreloc)
-    appendU32(hdr, machoSectionFlags(h.kind))
-    appendU32(hdr, 0) // reserved1
-    appendU32(hdr, 0) // reserved2
-    appendU32(hdr, 0) // reserved3
-    i = i + 1
-  }
-
-  appendU32(hdr, lcSymtab())
-  appendU32(hdr, sizeofSymtabCommand())
-  appendU32(hdr, symoff)
-  appendU32(hdr, len(obj.symbols))
-  appendU32(hdr, stroff)
-  appendU32(hdr, len(strtab.bytes))
-
-  // The reserved prefix must be exactly what the commands filled — a mismatch
-  // means a class size above is wrong and every recorded offset is a lie.
-  assert(len(hdr.bytes) == cmdsEnd)
-  i = 0
-  while (i < cmdsEnd) {
-    out.bytes[i] = hdr.bytes[i]
-    i = i + 1
-  }
+  let vm = (addrCursor, segFileoff, filesize, sizeofcmds, segCmdSize, cmdsEnd)
+  let sy = (symoff, stroff, len(strtab.bytes), len(obj.symbols))
+  machoWriteHeader(target, out, hdrs, vm, sy)
   return out.bytes
 }
 
