@@ -102,6 +102,12 @@ fn serve(certChainPem: string, keyPem: string): ()! {
   let sock = udpBind("127.0.0.1", 8443)?
   let conn = h3Accept(sock, certChainPem, keyPem)?
   let sr = conn.accept()?
+  if (sr.req.method == "") {
+    // End a malformed request without response headers; keep other streams open.
+    conn.reject(sr, 0x010e)
+    conn.close()
+    return
+  }
   let resp = H3Response{
     status = 200,
     headers = []HeaderField(0),
@@ -363,6 +369,14 @@ Accepts the next request, blocking until one opens. Fails on a transport or deco
 ### `H3Conn.respond(sr: H3ServerRequest, resp: H3Response): ()!`
 
 Answers the request in `sr` with `resp` on its stream. Fails on a transport error.
+
+### `H3Conn.reject(sr: H3ServerRequest, code: int)`
+
+Ends both directions of the accepted request stream with `code`, without response
+headers. Other streams on the connection remain usable. For a malformed request,
+use `0x010e` (`H3_MESSAGE_ERROR`), as the server example above shows. Like
+`respond`, pass a request accepted by this connection. The reset is best effort
+if the stream has already ended.
 
 ### `H3Conn.peerIp(): string`
 
