@@ -1,0 +1,188 @@
+import { selfExe } from "std/os"
+import { output } from "std/process"
+
+// Tracing changes elapsed time, so the child supplies only syscall arguments.
+// The observer follows only its child, bounds stops and threads, and joins each.
+fn proveArguments() {
+  let result = output(
+    "/usr/bin/python3",
+    ["-c", "import sys; exec(sys.argv[2] + sys.argv[3])", selfExe(), observerSource, observerTail],
+    30000,
+  )
+  if (result.exitCode != 0 || result.truncated || result.stdout != "arguments true\n") {
+    panic("syscall argument observer failed: ${result.exitCode} ${result.stdout} ${result.stderr}")
+  }
+  print(result.stdout)
+}
+
+const observerSource: string = `import ctypes, json, os, signal, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.ptrace.restype = ctypes.c_long
+class Info(ctypes.Structure):
+    _fields_ = [('op',ctypes.c_ubyte),('pad',ctypes.c_ubyte*3),('arch',ctypes.c_uint32),('ip',ctypes.c_ulonglong),('sp',ctypes.c_ulonglong),('words',ctypes.c_ulonglong*8)]
+def ptrace(request, tid, addr=0, data=0):
+    ctypes.set_errno(0)
+    value = libc.ptrace(ctypes.c_ulong(request),ctypes.c_ulong(tid),ctypes.c_void_p(addr),ctypes.c_void_p(data))
+    error = ctypes.get_errno()
+    if value == -1 and error:
+        raise OSError(error,'ptrace')
+    return value
+def expired(signum, frame):
+    raise TimeoutError('syscall observer exceeded its deadline')
+def slot(tid):
+    for index in range(64):
+        if tids[index] == tid:
+            return index
+        if tids[index] == 0:
+            tids[index] = tid
+            return index
+    raise RuntimeError('owned thread limit exceeded')
+def own(tid):
+    if tid not in tids:
+        with open('/proc/'+str(tid)+'/status') as stream:
+            status = stream.read(16384).splitlines()
+        assert 'Tgid:\t'+str(pid) in status
+        assert 'TracerPid:\t'+str(os.getpid()) in status
+    return slot(tid)
+def clone(tid):
+    child = ctypes.c_ulonglong()
+    ptrace(0x4201,tid,0,ctypes.addressof(child))
+    slot(child.value)
+def syscall(tid, index):
+    global count
+    info = Info()
+    assert ptrace(0x420e,tid,ctypes.sizeof(info),ctypes.addressof(info)) >= 24
+    if info.op == 1:
+        nr = info.words[0]
+        pending[index] = None
+        if nr not in (create_nr, fallback_nr, 441):
+            return
+        args = tuple(info.words[1:7])
+        ts = None
+        if nr == 441 and args[3]:
+            ts = (ptrace(2,tid,args[3]),ptrace(2,tid,args[3]+8))
+        pending[index] = (nr,args,ts)
+        return
+    assert info.op == 2
+    row = pending[index]
+    pending[index] = None
+    if row is None:
+        return
+    assert count < len(rows), 'syscall row limit exceeded'
+    rows[count] = (*row,ctypes.c_longlong(info.words[0]).value)
+    count += 1
+def complete(tid, status, index):
+    global native, native_signal
+    joined[index] = True
+    if tid == pid and os.WIFEXITED(status):
+        native = os.WEXITSTATUS(status)
+    if tid == pid and os.WIFSIGNALED(status):
+        native_signal = os.WTERMSIG(status)
+def stopped(tid, status, index):
+    assert os.WIFSTOPPED(status)
+    stop,event = os.WSTOPSIG(status),status >> 16
+    if stop == 133:
+        syscall(tid,index)
+    elif stop == signal.SIGTRAP and event == 3:
+        clone(tid)
+    elif stop not in (signal.SIGTRAP, signal.SIGSTOP):
+        ptrace(24,tid,0,stop)
+        return
+    else:
+        assert stop == signal.SIGSTOP, (tid,stop,event)
+    ptrace(24,tid)
+def all_joined():
+    return all(t == 0 or joined[i] for i,t in enumerate(tids))
+def observe():
+    child,status = os.waitpid(pid,0)
+    assert child == pid and os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGTRAP
+    ptrace(0x4200,pid,0,0x100009)
+    ptrace(24,pid)
+    for _ in range(8192):
+        tid,status = os.waitpid(-1,0x40000000)
+        index = own(tid)
+        if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+            complete(tid,status,index)
+            if all_joined():
+                return
+        else:
+            stopped(tid,status,index)
+    raise TimeoutError('syscall observer exceeded 8192 stops')
+`
+
+const observerTail: string = `def cleanup_stop(tid,status,index):
+    if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+        joined[index] = True
+        return
+    assert os.WIFSTOPPED(status)
+    try:
+        ptrace(7,tid)
+    except OSError as error:
+        assert error.errno == 3
+def cleanup():
+    if not all_joined():
+        try:
+            os.kill(pid,signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    signal.alarm(8)
+    try:
+        for _ in range(8192):
+            try:
+                tid,status = os.waitpid(-1,0x40000000)
+            except ChildProcessError:
+                return all_joined()
+            cleanup_stop(tid,status,own(tid))
+        return False
+    finally:
+        signal.alarm(0)
+def exact_wait(args,ts,result):
+    assert ts == (0,400000)
+    assert args[2] == 64 and args[4:] == (0,8) and result == 0
+def exact_fallback(args,result):
+    assert args[2:] == (64,1,0,8) and result == 0
+def fixture_fd():
+    fd = None
+    for row in rows[:count]:
+        if row[0] == create_nr:
+            assert row[3] >= 0
+            fd = row[3]
+    assert fd is not None
+    return fd
+def verify():
+    fd = fixture_fd()
+    requests = fallback = 0
+    for nr,args,ts,result in rows[:count]:
+        if nr == 441 and args[0] == fd:
+            exact_wait(args,ts,result)
+            requests += 1
+        if nr == fallback_nr and args[0] == fd:
+            exact_fallback(args,result)
+            fallback += 1
+    assert requests == 11 and fallback == 1, (requests,fallback)
+architecture = os.uname().machine
+assert architecture in ('aarch64','x86_64')
+create_nr,fallback_nr = (20,22) if architecture == 'aarch64' else (291,281)
+tids,joined,pending,rows = [0]*64,[False]*64,[None]*64,[None]*64
+count = 0
+native = native_signal = None
+signal.signal(signal.SIGALRM,expired)
+signal.alarm(20)
+pid = os.fork()
+if pid == 0:
+    ptrace(0,0)
+    os.execv(sys.argv[1],[sys.argv[1],'--arguments-child'])
+slot(pid)
+failure = None
+try:
+    observe()
+except BaseException as error:
+    failure = repr(error)
+finally:
+    signal.alarm(0)
+    cleaned = cleanup()
+print(json.dumps(dict(native=native,signal=native_signal,observer_error=failure,cleanup=0 if cleaned else 1,owned=sum(t != 0 for t in tids),joined=sum(joined),syscalls=rows[:count])),file=sys.stderr)
+assert failure is None and cleaned and native == 0 and native_signal is None
+verify()
+print('arguments true')
+`
