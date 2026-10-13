@@ -37,8 +37,8 @@ fn runScript(s: Stream, replies: []string, greet: bool = true): string! {
 }
 
 // A real transport with recorded call boundaries. The optional rendezvous
-// holds the grouped writer until the caller starts receiving, independently
-// of kernel buffer sizes; payload writes must follow its terminal return.
+// holds the grouped writer until receive starts. Large groups instead wait
+// for real reply bytes, because kernel buffering does not enforce that order.
 class pipelineRecorder {
   inner: Stream
   writes: []string
@@ -50,19 +50,21 @@ class pipelineRecorder {
   groupDone: chan<bool>
   complete: bool
   pendingReplies: int
+  replyFence: bool
+  replyReleased: bool
   arms: int
 
   export send(s: string): ()! {
     this.active = true
     this.writes = append(this.writes, s)
-    if (this.duplex && hasPrefix(s, "MAIL FROM:")) {
+    if (this.duplex && !this.replyFence && hasPrefix(s, "MAIL FROM:")) {
       let _ = <- this.receive
     }
     if (this.failWrite) {
       this.active = false
       fail newError("scripted grouped write failed")
     }
-    this.inner.send(s) catch e {
+    this.sendRecorded(s) catch e {
       this.active = false
       fail e
     }
@@ -71,13 +73,36 @@ class pipelineRecorder {
       this.groupDone <- true
     }
   }
+  sendRecorded(s: string): ()! {
+    if (!this.replyFence || !hasPrefix(s, "MAIL FROM:")) {
+      this.inner.send(s)?
+      return
+    }
+    let at = strIndexOf(s, "\r\n") + 2
+    assert(at > 1 && at < len(s), "group has no MAIL boundary")
+    this.inner.send(s[0:at])?
+    // Keep RCPT/DATA unsent until a real MAIL reply proves concurrent receive.
+    let _ = <- this.receive
+    this.inner.send(s[at:])?
+  }
+  releaseReply() {
+    if (this.replyFence && !this.replyReleased) {
+      this.replyReleased = true
+      this.receive <- true
+    }
+  }
   export recv(max: int): string! {
     if (this.duplex && !this.opened) {
       this.opened = true
-      this.receive <- true
+      if (!this.replyFence) {
+        this.receive <- true
+      }
     }
-    let reply = this.inner.recv(max)?
-    if (this.duplex && !this.complete) {
+    let reply = this.inner.recv(max) catch e {
+      this.releaseReply()
+      fail e
+    }
+    if (this.duplex && !this.complete && len(reply) > 0) {
       select {
         case _ = <- this.groupDone:
           this.complete = true
@@ -85,6 +110,8 @@ class pipelineRecorder {
           this.pendingReplies = this.pendingReplies + 1
       }
     }
+    // EOF must also release the writer so the error path can join it.
+    this.releaseReply()
     return reply
   }
   export deadline(ns: int) {
@@ -103,6 +130,7 @@ fn recordPipeline(c: Client, duplex: bool = false): pipelineRecorder {
     inner = c.w.s, writes = []string(0), receive = chan<bool>(1), duplex = duplex, opened = false,
     active = false, failWrite = false,
     groupDone = chan<bool>(1), complete = false, pendingReplies = 0, arms = 0,
+    replyFence = false, replyReleased = false,
   }
   c.w.s = r
   return r
@@ -338,6 +366,7 @@ fn proveLargePipeline(c: Client, log: chan<string>, raw: Raw) {
     panic(e.message())
   }
   let r = recordPipeline(c, true)
+  r.replyFence = true
   let d = c.send(raw) catch e {
     panic(e.message())
   }
