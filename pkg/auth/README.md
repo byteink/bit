@@ -117,6 +117,10 @@ protected route that is not itself doing the authenticating just reads
   `ProfileFetch` you supply turns the access token into an `Identity`, and a
   provider's refusal arrives as a typed `OAuth2Error`; see
   [Sign in with GitHub](docs/oauth2.md).
+- `facebook`, `FacebookOptions`, `FacebookFetch` - Facebook login on
+  `OAuth2Strategy`, with app-bound token inspection and an app secret proof on
+  both Graph requests. Email is always unverified; see
+  [Sign in with Facebook](docs/oauth2.md#sign-in-with-facebook).
 - `github`, `GithubOptions`, `GithubFetch`, `OAuth2Endpoints.defaultScopes` - Sign in with GitHub on
   `OAuth2Strategy`: `github(opts)` returns GitHub's endpoints and a profile step whose
   `Identity.id` is the numeric user id (never the login) and whose `email` is the primary
