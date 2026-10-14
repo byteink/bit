@@ -139,7 +139,16 @@ non-zero (printing the first divergence) on any mismatch.
 
 Lex every corpus `.bit` file with both the PINNED STAGE0 (the previous
 release) and the working tree's compiler, and diff their `--dump-tokens`
-output. They must be byte-identical. Files the oracle rejects with a lex
+output. They must be byte-identical unless the complete ordered streams satisfy
+`8110-contextual-in-token` (#7279, #8110): at least one oracle `kw_in` row
+becomes a tree `ident` row at identical decimal byte offsets, and the unchanged
+source contains the literal bytes `in` at every changed span. All other rows,
+payloads, offsets and ordering stay byte-identical. Missing source, changed
+source, reverse changes, extra or missing rows, and mixed unrelated token or
+automatic-semicolon changes remain unexplained. The driver prints every
+explained file; it does not allowlist filenames. This signature retires at the
+next stage0 repin carrying #7279; explaining zero corpus files fails the gate.
+Files the oracle rejects with a lex
 error are skipped -- the two lexers disagree about how far to lex past an
 error, so those files measure the diagnostic renderer rather than the
 lexer.

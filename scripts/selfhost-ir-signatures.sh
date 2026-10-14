@@ -68,7 +68,7 @@
 # Each retires at the next stage0 repin, the first oracle cut from a tree that carries #7745
 # (7745-loop-defer-stack), #7761 and #7770 (7761-range-chain-cse) or #7766 and #7773
 # (7766-synth-json-helper-column-shift), or #7929 (7933-variadic-type-marker
-# and 7936-variadic-doc-marker).
+# and 7936-variadic-doc-marker), or #7279 (8110-contextual-in-token).
 #
 # 7933-variadic-type-marker (`types`) explains only an inferred direct binding
 # of a unique, unshadowed top-level variadic function with primitive parameters
@@ -675,13 +675,57 @@ explainFnvalueOwners() (
   awk 'BEGIN { print "7925-fnvalue-owner-reuse" }'
 )
 
+# #8110: contextual in changes only its token kind; offsets witness raw source bytes.
+explainContextualIn() (
+  [ -f "${3:-}" ] || return 1
+  local d rc
+  d=$(mktemp -d "${TMPDIR:-/tmp}/t8110-witness-XXXXXX") || return 1
+  trap 'rm -rf "${d:?}"' EXIT
+  cp "$3" "$d/source" || return 1
+  printf '%s' "$1" > "$d/old" || return 1
+  printf '%s' "$2" > "$d/new" || return 1
+  perl - "$d" <<'PERL'
+use strict; use warnings;
+sub readall {
+  open my $f, '<:raw', $_[0] or die;
+  local $/; my $text = <$f>; close $f or die;
+  return defined($text) ? $text : '';
+}
+sub contextualRow {
+  my ($old, $new, $source) = @_;
+  return 0 unless $old =~ /\Akw_in ([0-9]+)\.\.([0-9]+)\z/;
+  my ($start, $end) = ($1, $2);
+  return 0 unless $new eq "ident $start..$end";
+  return 0 if length($start) > 16 || length($end) > 16;
+  return 0 unless $end - $start == 2 && $end <= length($source);
+  return substr($source, $start, 2) eq 'in';
+}
+my $d = shift; my $source = readall("$d/source");
+my @old = split /\n/, readall("$d/old"), -1;
+my @new = split /\n/, readall("$d/new"), -1;
+exit 1 unless @old == @new;
+my $changed = 0;
+for my $i (0 .. $#old) {
+  next if $old[$i] eq $new[$i];
+  exit 1 unless contextualRow($old[$i], $new[$i], $source);
+  $changed++;
+}
+exit($changed ? 0 : 1);
+PERL
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  cmp -s "$3" "$d/source" || return 1
+  awk 'BEGIN { print "8110-contextual-in-token" }'
+)
+
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. 7745-loop-defer-stack is registered
 # on the `ir` and `iropt` kinds, 7761-range-chain-cse on `iropt` only, 7766-synth-json-helper-column-shift
-# and 7933-variadic-type-marker on `types`.
+# and 7933-variadic-type-marker on `types`, 8110-contextual-in-token on `tokens`.
 explainMismatch() {
   case "$3" in
+    tokens) explainContextualIn "$1" "$2" "${4:-}"; return ;;
     ir) explainLoopDeferStack "$1" "$2" || explainFnvalueOwners "$1" "$2" "${4:-}"; return ;;
     iropt) explainLoopDeferStack "$1" "$2" || explainRangeChainCse "$1" "$2" || explainFnvalueOwners "$1" "$2" "${4:-}"; return ;;
     types) explainJsonHelperShift "$1" "$2" "${4:-}" || explainVariadicTypeMarker "$1" "$2" "${4:-}"; return ;;
@@ -689,7 +733,7 @@ explainMismatch() {
   return 1
 }
 
-# declaredSignatureNames [ir|iropt|ast|fmt|types|diags|doc] -- every registered
+# declaredSignatureNames [ir|iropt|ast|fmt|types|diags|tokens|doc] -- every registered
 # mismatch identity for the given surface, one per line (#5509, #5510, #7936).
 # The single source of truth for the retirement check in
 # scripts/selfhost-diffdump.sh's run_ir()/run_types(): a signature this
@@ -697,7 +741,7 @@ explainMismatch() {
 # that explainMismatch no longer prints would make that check fail on every
 # run. Kept in sync by hand, and selfhost-ir-signatures-selfcheck.sh asserts
 # the list matches the `print "..."` statements in this file. Declared for
-# `ir`, `iropt`, `types` and `doc`.
+# `ir`, `iropt`, `types`, `tokens` and `doc`.
 declaredSignatureNames() {
   case "${1:-}" in
     ir) printf '%s\n' 7745-loop-defer-stack 7925-fnvalue-owner-reuse ;;
@@ -705,9 +749,10 @@ declaredSignatureNames() {
   esac
   case "${1:-}" in
     types|"") printf '%s\n' 7766-synth-json-helper-column-shift 7933-variadic-type-marker ;;
+    tokens) printf '%s\n' 8110-contextual-in-token ;;
     doc) printf '%s\n' 7936-variadic-doc-marker ;;
   esac
-  [ -n "${1:-}" ] || printf '%s\n' 7936-variadic-doc-marker
+  [ -n "${1:-}" ] || printf '%s\n' 7936-variadic-doc-marker 8110-contextual-in-token
   return 0
 }
 

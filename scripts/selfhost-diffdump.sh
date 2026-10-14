@@ -211,7 +211,7 @@ run_basic() {
       # so this never forks awk for them.
       sig=""
       if [ "$NAME" = ast ] || [ "$NAME" = diags ] || [ "$NAME" = tokens ]; then
-        sig=$(explainMismatch "$seed" "$b2" "$NAME")
+        sig=$(explainMismatch "$seed" "$b2" "$NAME" "$f")
       fi
       if [ -n "$sig" ]; then
         explained=$((explained + 1))
@@ -274,7 +274,19 @@ run_basic() {
     diff <(alarmrun "$ORACLE" "$FLAG" "$firstbad") <(alarmrun "$BIT2" "$FLAG" "$firstbad") | head -20
   fi
 
-  diffexit "$LABEL" -f "$mismatch" -t "file(s)=$timeout"
+  # #8110: a token identity must retire when its source change reaches stage0.
+  retiredcount=0
+  if [ "$NAME" = tokens ]; then
+    while IFS= read -r signame; do
+      [ -n "$signame" ] || continue
+      if ! grep -q "declared signature '${signame}'" "$work/explained"; then
+        echo "RETIRED: $signame explained zero files and must be removed."
+        retiredcount=$((retiredcount + 1))
+      fi
+    done < <(declaredSignatureNames tokens)
+  fi
+
+  diffexit "$LABEL" -f "$mismatch" "$retiredcount" -t "file(s)=$timeout"
 }
 
 # types row body: a timeout is not evidence — a bit killed by the alarm produced
