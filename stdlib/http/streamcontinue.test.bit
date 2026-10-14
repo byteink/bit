@@ -1,0 +1,263 @@
+class continueReport {
+  bytes: string,
+  elapsed: int,
+  err: string,
+}
+
+class continueTiming {
+  silent: bool,
+  pulls: int,
+  armed: int,
+  deadline: int,
+  pulled: int,
+}
+
+class continueTimedStream {
+  inner: byteStream
+  timing: continueTiming
+
+  readUp(n: int): string! { return this.inner.readUp(n)? }
+  writeStr(data: string): ()! { this.inner.writeStr(data)? }
+  writeBytes(data: []byte): ()! { this.inner.writeBytes(data)? }
+  shut() { this.inner.shut() }
+  forceClose() { this.inner.forceClose() }
+  peer(): string { return this.inner.peer() }
+  unread(extra: string) { this.inner.unread(extra) }
+
+  setIdleDeadline(deadline: int) {
+    if (deadline != 0) {
+      this.timing.deadline = deadline
+      this.timing.armed = monotonic().ns
+    }
+    this.inner.setIdleDeadline(deadline)
+  }
+}
+
+fn continueWire(s: byteStream, mode: int, rep: continueReport): ()! {
+  s.setIdleDeadline(monotonic().ns + 3 * Second)
+  defer s.shut()
+  readHeadBlock(s)?
+  let start = monotonic().ns
+  if (mode == 403) {
+    s.writeStr("HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\nno")?
+    rep.bytes = s.readUp(16)?
+    return
+  }
+  if (mode == 100) {
+    s.writeStr("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 100 Continue\r\n\r\n")?
+  }
+  if (mode == 103) {
+    s.writeStr("HTTP/1.1 100 Cont")?
+  }
+  rep.bytes = readContentLengthBody(s, "", 5)?
+  rep.elapsed = (monotonic().ns - start) / Millisecond
+  // The wait deadline must be cleared before reading the final reply.
+  sleep(120 * Millisecond)
+  if (mode == 103) {
+    s.writeStr("inue\r\n\r\n")?
+  }
+  s.writeStr("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")?
+}
+
+fn continuePlain(l: Listener, mode: int, out: chan<continueReport>) {
+  let rep = continueReport{ bytes = "", elapsed = 0, err = "" }
+  let c = l.accept() catch e {
+    rep.err = e.message()
+    out <- rep
+    return
+  }
+  continueWire(netStream{ conn = c }, mode, rep) catch e {
+    rep.err = e.message()
+  }
+  out <- rep
+}
+
+fn continueTls(l: TlsListener, mode: int, out: chan<continueReport>) {
+  let rep = continueReport{ bytes = "", elapsed = 0, err = "" }
+  let c = l.accept() catch e {
+    rep.err = e.message()
+    out <- rep
+    return
+  }
+  c.setDeadline(monotonic().ns + 3 * Second)
+  c.handshake() catch e {
+    c.close()
+    rep.err = e.message()
+    out <- rep
+    return
+  }
+  continueWire(tlsStream{ conn = c }, mode, rep) catch e {
+    rep.err = e.message()
+  }
+  out <- rep
+}
+
+fn continueCall(port: int, secure: bool, headers: []Header, body: StreamBody): Response! {
+  if (!secure) {
+    return requestWithStreamingBody("PUT", "http://127.0.0.1:${port}/x", headers, body)?
+  }
+  return continueExchange(
+    tlsStream{ conn = tlsDial("127.0.0.1", port, tls5916ClientConfig())? },
+    port,
+    true,
+    headers,
+    body,
+  )?
+}
+
+fn continueExchange(
+  s: byteStream,
+  port: int,
+  secure: bool,
+  headers: []Header,
+  body: StreamBody,
+): Response! {
+  defer s.shut()
+  let scheme = "http"
+  if (secure) {
+    scheme = "https"
+  }
+  let u = parseUrl("${scheme}://127.0.0.1:${port}/x")?
+  let head = buildStreamingRequestHead("PUT", u, serializeHeaders(headers)?, framingLine(body)?)
+  return exchangeStreaming(s, "PUT", head, body)?
+}
+
+fn continueRequest(
+  port: int, secure: bool,
+  headers: []Header, body: StreamBody, timing: continueTiming,
+): Response! {
+  if (!timing.silent) {
+    return continueCall(port, secure, headers, body)?
+  }
+  if (secure) {
+    let s = continueTimedStream{
+      inner = tlsStream{ conn = tlsDial("127.0.0.1", port, tls5916ClientConfig())? },
+      timing = timing,
+    }
+    return continueExchange(s, port, true, headers, body)?
+  }
+  let s = continueTimedStream{
+    inner = netStream{ conn = dial("127.0.0.1", port)? },
+    timing = timing,
+  }
+  return continueExchange(s, port, false, headers, body)?
+}
+
+fn continueSource(timing: continueTiming): BodySource {
+  return (n) => {
+    if (timing.pulls == 0) {
+      timing.pulled = monotonic().ns
+    }
+    timing.pulls = timing.pulls + 1
+    return "abcde"
+  }
+}
+
+// A TLS peer may finish reading the head after the client's wait has begun.
+fn continueTimingBounds(timing: continueTiming, timeoutMs: int): int {
+  assert(timing.armed > 0 && timing.deadline > timing.armed, "wait deadline missing")
+  let armedMs = (timing.deadline - timing.armed) / Millisecond
+  assert(armedMs >= timeoutMs * 9 / 10, "deadline too short: ${armedMs} ms")
+  assert(armedMs <= timeoutMs * 11 / 10, "deadline too long: ${armedMs} ms")
+  assert(timing.pulled >= timing.deadline, "source pulled before wait deadline")
+  let elapsed = (timing.pulled - timing.armed) / Millisecond
+  assert(elapsed >= timeoutMs * 9 / 10, "fallback too early: ${elapsed} ms")
+  assert(elapsed <= timeoutMs * 11 / 10, "fallback too late: ${elapsed} ms")
+  return elapsed
+}
+
+fn continueRoundTrip(secure: bool, mode: int, timeoutMs: int, expect: bool): ()! {
+  let out = chan<continueReport>(1)
+  let port = 0
+  let stop: () => () = () => {}
+  if (secure) {
+    let l = tlsListen("127.0.0.1", 0, tls5916ServerConfig()?)?
+    port = l.port()?
+    stop = () => {
+      l.close()
+    }
+    spawn continueTls(l, mode, out)
+  } else {
+    let l = listen("127.0.0.1", 0)?
+    port = l.port()?
+    stop = () => {
+      l.close()
+    }
+    spawn continuePlain(l, mode, out)
+  }
+  let timing = continueTiming{ silent = mode == 0 && expect }
+  let body = StreamBody{
+    length = Option.Some(5), expectContinueTimeoutMs = timeoutMs,
+    source = continueSource(timing),
+  }
+  let headers = []Header(0)
+  if (expect) {
+    headers = [Header{ name = "eXpEcT", value = "100-ConTinue" }]
+  }
+  let res = continueRequest(port, secure, headers, body, timing) catch e {
+    stop()
+    fail e
+  }
+  stop()
+  let rep = <- out
+  assert(rep.err == "", "server: ${rep.err}")
+  if (mode == 403) {
+    assert(res.status == 403, "early final status lost")
+    assert(res.body == "no", "early final body lost")
+    assert(timing.pulls == 0, "early final pulled the source")
+    assert(rep.bytes == "", "early final sent body '${rep.bytes}'")
+    return
+  }
+  assert(res.status == 200 && res.body == "ok", "final reply lost")
+  assert(rep.bytes == "abcde" && timing.pulls == 1, "body '${rep.bytes}', pulls ${timing.pulls}")
+  if (!expect) {
+    assert(rep.elapsed < 100, "no Expect waited ${rep.elapsed} ms")
+  }
+  if (timing.silent) {
+    let elapsed = continueTimingBounds(timing, timeoutMs)
+    println("continue fallback: ${elapsed} ms (bound ${timeoutMs} ms)")
+  }
+}
+
+test "Expect continue early final sends zero bytes on plain and TLS" {
+  for secure of [false, true] {
+    continueRoundTrip(secure, 403, 1000, true) catch e {
+      assert(false, e.message())
+    }
+  }
+}
+
+test "Expect continue 100 sends full body on plain and TLS" {
+  for secure of [false, true] {
+    continueRoundTrip(secure, 100, 1000, true) catch e {
+      assert(false, e.message())
+    }
+  }
+}
+
+test "Expect continue silence uses default and configured bounds on plain and TLS" {
+  assert(StreamBody{}.expectContinueTimeoutMs == 1000, "default wait changed")
+  for secure of [false, true] {
+    for timeoutMs of [1000, 100] {
+      continueRoundTrip(secure, 0, timeoutMs, true) catch e {
+        assert(false, e.message())
+      }
+    }
+  }
+}
+
+test "Expect continue partial late 100 preserves bytes on plain and TLS" {
+  for secure of [false, true] {
+    continueRoundTrip(secure, 103, 100, true) catch e {
+      assert(false, e.message())
+    }
+  }
+}
+
+test "Expect continue no Expect sends immediately on plain and TLS" {
+  for secure of [false, true] {
+    continueRoundTrip(secure, 0, 1000, false) catch e {
+      assert(false, e.message())
+    }
+  }
+}
