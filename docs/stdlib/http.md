@@ -170,6 +170,39 @@ See the [full section](http/clients.md#getstreaming-url-string-headers-header-si
 ### `requestWithStreamingBody(method: string, url: string, headers: []Header, body: StreamBody): Response!`
 
 See the [full section](http/clients.md#requestwithstreamingbody-method-string-url-string-headers-header-body-streambody-response).
+### Wait before uploading a draft
+
+Set `Expect: 100-continue` when you want the server to reject an upload before
+reading its body. A final response returns without calling your source. A `100`
+response starts the upload. A silent server starts it after 1000 ms by default.
+Set `StreamBody.expectContinueTimeoutMs` to another non-negative wait; zero sends
+immediately. An out-of-range value fails with
+`StreamBody.expectContinueTimeoutMs is out of range`.
+
+```bit
+import { Header, StreamBody, requestWithStreamingBody } from "std/http"
+
+fn uploadDraft(url: string): int! {
+  let draft = "A new Inkwell draft"
+  let pos = 0
+  let body = StreamBody{
+    length = Option.Some(len(draft)),
+    expectContinueTimeoutMs = 250,
+    source = (n) => {
+      let end = pos + n
+      if (end > len(draft)) { end = len(draft) }
+      let part = draft[pos:end]
+      pos = end
+      return part
+    },
+  }
+  let res = requestWithStreamingBody(
+    "PUT", url, [Header{ name = "Expect", value = "100-continue" }], body,
+  )?
+  return res.status
+}
+```
+
 ### `StreamBody`
 
 See the [full section](http/clients.md#streambody).

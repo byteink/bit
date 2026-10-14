@@ -142,6 +142,8 @@ export class StreamBody {
   export source: BodySource,
   export length: Option<int>,
   export trailers: Option<TrailerSource>,
+  // Wait only when headers contain Expect: 100-continue.
+  export expectContinueTimeoutMs: int = 1000,
 }
 
 // The widest size line a chunk of at most `streamChunkSize` bytes needs
@@ -318,12 +320,97 @@ fn writeBody(s: byteStream, body: StreamBody): ()! {
   }
 }
 
-// Sends `head` and the body, then reads the response — the
-// transport-independent half of `requestWithStreamingBody`.
+// TLS reports a timed-out read as EOF; plaintext reports the deadline sentinel.
+fn continuePiece(s: byteStream, deadline: int): string! {
+  let piece = s.readUp(maxFramingLine) catch e {
+    if (e.message() == "read timed out") {
+      return ""
+    }
+    fail e
+  }
+  if (len(piece) == 0 && monotonic().ns < deadline) {
+    fail newError("response: connection closed inside the head")
+  }
+  return piece
+}
+
+// Keep a partial head for the normal response reader after timeout fallback.
+fn readContinueHead(s: byteStream, deadline: int): string! {
+  let acc = ""
+  let reads = 0
+  while (reads <= maxHeaderBytes + 4) {
+    reads = reads + 1
+    let at = indexOf(acc, "\r\n\r\n")
+    if (at >= 0 && at <= maxHeaderBytes) {
+      s.unread(acc[at + 4:len(acc)])
+      return acc[0:at]
+    }
+    if (len(acc) >= maxHeaderBytes + 4) {
+      fail newError("response: head exceeds ${maxHeaderBytes} bytes")
+    }
+    let piece = continuePiece(s, deadline)?
+    if (len(piece) == 0) {
+      s.unread(acc)
+      return ""
+    }
+    acc = acc + piece
+  }
+  fail newError("response: head exceeds ${maxHeaderBytes} bytes")
+}
+
+fn waitContinue(s: byteStream, method: string, timeoutMs: int): bool! {
+  let now = monotonic().ns
+  if (timeoutMs < 0 || timeoutMs > (9223372036854775807 - now) / Millisecond) {
+    fail newError("StreamBody.expectContinueTimeoutMs is out of range")
+  }
+  if (timeoutMs == 0) {
+    return true
+  }
+  let deadline = now + timeoutMs * Millisecond
+  s.setIdleDeadline(deadline)
+  defer s.setIdleDeadline(0)
+  let seen = 0
+  while (seen <= maxInterimResponses) {
+    seen = seen + 1
+    let block = readContinueHead(s, deadline)?
+    if (block == "") {
+      return true
+    }
+    let head = parseHeadBlock(block, method)?
+    if (head.status == 100) {
+      return true
+    }
+    if (head.status < 100 || head.status >= 200) {
+      s.unread(block + "\r\n\r\n")
+      return false
+    }
+  }
+  fail newError("response: more than ${maxInterimResponses} interim responses")
+}
+
+// A late 100 after fallback must not become the caller's final response.
+fn streamingResponse(s: byteStream, method: string): Response! {
+  let head = readStreamHead(s, method)?
+  let body = ""
+  if (!bodyless(method, head.status)) {
+    body = readResponseBody(s, "", head.headers, method, defaultMaxBodyBytes)?
+  }
+  return Response{
+    status = head.status, headers = head.headers,
+    contentType = header(head.headers, "content-type"), body = body,
+  }
+}
+
 fn exchangeStreaming(s: byteStream, method: string, head: string, body: StreamBody): Response! {
   s.writeStr(head)?
-  writeBody(s, body)?
-  return readResponse(s, method, defaultMaxBodyBytes)?
+  let sendBody = true
+  if (toLower(header(head, "expect")) == "100-continue") {
+    sendBody = waitContinue(s, method, body.expectContinueTimeoutMs)?
+  }
+  if (sendBody) {
+    writeBody(s, body)?
+  }
+  return streamingResponse(s, method)?
 }
 
 // Runs `method url` with the request body `body` streamed from its source,
