@@ -7,6 +7,33 @@ visible at the call site: propagate with `?`, or handle with `catch`.
 
 ## Whole files
 
+Inkwell reads a token that another process replaces through a symlink.
+`openRegular` from `std/fs/secure` follows that link while refusing a FIFO,
+device or directory. It checks the opened descriptor, so a replacement of
+the path cannot change what is inspected.
+
+```bit
+import { openRegular } from "std/fs/secure"
+
+fn main(): ()! {
+  let file = openRegular("/var/run/inkwell/token")?
+  defer file.close()
+  let bytes = []byte(16385)
+  let count = file.readAt(bytes, 0)?
+  if (count > 16384) {
+    fail newError("token exceeds the byte limit")
+  }
+  println("read ${count} token bytes")
+  return
+}
+```
+
+POSIX opens with `O_NONBLOCK` before it checks the descriptor, so a FIFO
+with no writer does not hold the call. Windows refuses non-disk handles
+without a `WaitNamedPipe` call. This prevents pipe waits; filesystem and
+device-driver operations have their usual OS behavior. Close each successful
+handle after use, as with every `File`.
+
 Reach for these first. They open, transfer, and close in one call.
 
 ### `readFile(path: string): string!`
