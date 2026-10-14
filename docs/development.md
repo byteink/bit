@@ -448,6 +448,15 @@ also has its own named step
 (`./make test-golden|test-examples|test-stress|test-selfcheck|…`) for running one
 area directly.
 
+`./make test-windows-smoke` cross-builds against the candidate Windows runtime
+and runs on a native Windows SSH host. Its return-word phase compares complete
+outputs of `run_multiword_return`, `run_errword_shapes` and
+`run_tuple_fallible_words` with their golden files. `BIT_ERR_REG` is unset for
+compilation and the remote child, so integer, mixed and two-float returns,
+fallible void/float/integer results, and function-value calls exercise the default
+Win64 convention. Each child has a bounded job-object lifetime; cleanup uses
+this run's unique names.
+
 **Golden-file tests** are `_tests_/cases/*.bit` with a sibling `.expected`; the
 line-1 directive selects the mode - `// run` (execute, compare stdout),
 `// panic` (must exit 2, compare stderr), `// error` (expect diagnostics),
