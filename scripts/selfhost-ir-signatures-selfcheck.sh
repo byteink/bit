@@ -50,6 +50,53 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     fi
   }
 
+  # #8110: complete token streams, raw UTF-8 witnesses and mixed regressions.
+  token_dir=$(mktemp -d "${TMPDIR:-/tmp}/t8110-selfcheck-XXXXXX") || exit 2
+  printf '\303\251 in in' > "$token_dir/source"
+  token_old='ident 0..2
+kw_in 3..5
+semi 5..5
+kw_in 6..8
+eof 8..8'
+  token_new='ident 0..2
+ident 3..5
+semi 5..5
+ident 6..8
+eof 8..8'
+  token_sig=8110-contextual-in-token
+  expect "$token_sig" "$(explainMismatch "$token_old" "$token_new" tokens "$token_dir/source")" 'contextual in multiple byte witnesses'
+  expect "$token_sig" "$(explainMismatch 'kw_in 3..5' 'ident 3..5' tokens "$token_dir/source")" 'contextual in one witness'
+  for token_kind in ir iropt ast fmt types diags; do
+    expect "" "$(explainMismatch "$token_old" "$token_new" "$token_kind" "$token_dir/source")" "contextual in wrong kind $token_kind"
+  done
+  expect "" "$(explainMismatch "$token_new" "$token_old" tokens "$token_dir/source")" 'contextual in reverse'
+  expect "" "$(explainMismatch "$token_old" "$token_old" tokens "$token_dir/source")" 'contextual in equal'
+  expect "" "$(explainMismatch "$token_old" "$token_new" tokens)" 'contextual in missing source argument'
+  expect "" "$(explainMismatch "$token_old" "$token_new" tokens "$token_dir/missing")" 'contextual in absent source'
+  printf '\303\251 on in' > "$token_dir/wrong"
+  expect "" "$(explainMismatch "$token_old" "$token_new" tokens "$token_dir/wrong")" 'contextual in wrong source bytes'
+  printf '\303\251 in' > "$token_dir/short"
+  expect "" "$(explainMismatch "$token_old" "$token_new" tokens "$token_dir/short")" 'contextual in source bounds'
+  for token_change in 'ident 3..6' 'ident 03..5' 'ident 3..5 changed' 'kw_for 3..5'; do
+    expect "" "$(explainMismatch 'kw_in 3..5' "$token_change" tokens "$token_dir/source")" "contextual in rejects $token_change"
+  done
+  expect "" "$(explainMismatch 'kw_in 2..4' 'ident 2..4' tokens "$token_dir/source")" 'contextual in character offsets are not bytes'
+  expect "" "$(explainMismatch 'kw_in 3..6' 'ident 3..6' tokens "$token_dir/source")" 'contextual in span length'
+  expect "" "$(explainMismatch 'kw_in 99999999999999999..100000000000000001' 'ident 99999999999999999..100000000000000001' tokens "$token_dir/source")" 'contextual in oversized span'
+  token_rejects=("$token_new
+extra 8..8" "${token_new%eof*}" 'ident 3..5
+ident 0..2
+semi 5..5
+ident 6..8
+eof 8..8' "${token_new/ident 0..2/string 0..2}" "${token_new/semi 5..5/semi 5..6}")
+  for token_change in "${token_rejects[@]}"; do
+    expect "" "$(explainMismatch "$token_old" "$token_change" tokens "$token_dir/source")" 'contextual in mixed row/order/cardinality/ASI delta'
+  done
+  cp() { command cp "$@" && printf x >> "$token_dir/source"; }
+  expect "" "$(explainMismatch "$token_old" "$token_new" tokens "$token_dir/source")" 'contextual in source changed during witness'
+  unset -f cp
+  rm -rf "${token_dir:?}"
+
   # #7931: the shared IR probe must distinguish unsupported lowering from
   # absent tools, failed execution, stale objects and unrelated diagnostics.
   probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/t7931-probe.XXXXXX") || exit 2
