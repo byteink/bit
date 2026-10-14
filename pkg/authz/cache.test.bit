@@ -7,7 +7,7 @@
 // `st*` (store.test.bit) build the documents and handles, `tn*`
 // (tenant.test.bit) the tenant views, `LogLines` (decide.test.bit) the log.
 
-import { sleep, Millisecond } from "std/time"
+import { sleep, Millisecond, monotonic, after as cxAfter } from "std/time"
 import { xxhash64 } from "std/hash"
 import { contains } from "std/strings"
 
@@ -17,15 +17,27 @@ class FlakyStore {
   inner: MemoryStore
   off: bool
   calls: int
+  block: AtomicI64
+  entered: chan<bool>
+  release: chan<bool>
+  frozen: bool
 
   init(inner: MemoryStore) {
     this.inner = inner
     this.off = false
     this.calls = 0
+    this.block = AtomicI64(0)
+    this.entered = chan<bool>(1)
+    this.release = chan<bool>(1)
+    this.frozen = false
   }
 
   gate(): ()! {
     this.calls = this.calls + 1
+    if (this.block.compareAndSwap(1, 0)) {
+      this.entered <- true
+      let _ = <- this.release
+    }
     if (this.off) {
       fail newError("connection refused")
     }
@@ -63,11 +75,17 @@ class FlakyStore {
 
   export version(): i64! {
     this.gate()?
+    if (this.frozen) {
+      return 0
+    }
     return this.inner.version()?
   }
 
   export scopeVersion(tenant: string): i64! {
     this.gate()?
+    if (this.frozen) {
+      return 0
+    }
     return this.inner.scopeVersion(tenant)?
   }
 }
@@ -158,13 +176,17 @@ test "the background poll brings another handle's write in within a few interval
     tries = tries + 1
   }
   assert(cxCan(reader), "not seen after ${tries} tries of 10 ms")
-  reader.close()
-  reader.close()
+  reader.close() catch e {
+    panic(e.message())
+  }
+  reader.close() catch e {
+    panic(e.message())
+  }
   writer.detach(stRole("PubAll", "author")) catch e {
     panic("detach: ${e.message()}")
   }
   sleep(100 * Millisecond)
-  assert(cxCan(reader), "a closed handle is not refreshed")
+  assert(!cxCan(reader), "a closed handle refuses authorization")
 }
 
 test "100 checks reach the store 0 times" {
@@ -225,7 +247,9 @@ test "a handle whose refresh has stalled for two intervals is down" {
   assert(cxCheckErr(a) == "authorization unavailable", "check fails closed")
   cxRefresh(a)
   assert(!a.storeSync.isDown(), "a refresh brings it back")
-  a.close()
+  a.close() catch e {
+    panic(e.message())
+  }
 }
 
 test "a store that cannot be read at startup is an error" {
@@ -526,4 +550,229 @@ test "a maxTenants below 1 is refused" {
     return
   }
   assert(false, "maxTenants 0 accepted")
+}
+
+fn cxClose(a: Authz<Action>): string {
+  a.close() catch e {
+    return e.message()
+  }
+  return "ok"
+}
+
+fn cxWait(c: chan<bool>) {
+  select {
+    case <- c:
+    case <- cxAfter(3_000 * Millisecond):
+      panic("owned fixture did not reach its barrier")
+  }
+}
+
+fn cxDrain(a: Authz<Action>) {
+  let n = 0
+  while (a.storeSync.pendingCount() != 0 && n < 1000) {
+    sleep(Millisecond)
+    n = n + 1
+  }
+  assert(a.storeSync.pendingCount() == 0, "owned fixture must finish cleanup")
+}
+
+fn cxSpawn(a: Authz<Action>, name: string, body: (chan<bool>) => ()!): string {
+  a.spawnBackground(name, body) catch e {
+    return e.message()
+  }
+  return "ok"
+}
+
+test "lifecycle cooperative close joins cleanup and rejects later registration" {
+  let a = cxAuthz(MemoryStore(), 0)
+  let cleaned = AtomicI64(0)
+  assert(
+      cxSpawn(a, "cooperative", (stop) => {
+        let _ = <- stop
+        cleaned.store(1)
+      }) ==
+      "ok",
+    "admitted",
+  )
+  assert(cxClose(a) == "ok", "cooperative close")
+  assert(cleaned.load() == 1 && a.storeSync.pendingCount() == 0, "cleanup before retirement")
+  assert(cxSpawn(a, "late", (stop) => {}) != "ok", "registration after shutdown refused")
+  assert(cxClose(a) == "ok", "repeat close after drain")
+}
+
+test "lifecycle fixed registry refuses capacity plus one and tenant shares shutdown" {
+  let a = cxAuthz(MemoryStore(), 0)
+  let tenant = tnView(a, "a")
+  let i = 0
+  while (i < backgroundCapacity) {
+    assert(
+        cxSpawn(tenant, "task${i}", (stop) => {
+          let _ = <- stop
+        }) ==
+        "ok",
+      "slot ${i}",
+    )
+    i = i + 1
+  }
+  assert(cxSpawn(a, "overflow", (stop) => {}) != "ok", "capacity plus one refused")
+  assert(a.storeSync.pendingCount() == backgroundCapacity, "shared fixed registry")
+  assert(
+    cxClose(tenant) == "ok" && a.storeSync.pendingCount() == 0,
+    "tenant joins the shared tasks",
+  )
+  assert(cxSpawn(a, "late", (stop) => {}) != "ok", "parent admission is closed")
+}
+
+test "lifecycle blocked store times out retains ownership and late return stays down" {
+  let store = FlakyStore(MemoryStore())
+  let a = cxAuthz(store, 10)
+  store.block.store(1)
+  cxWait(store.entered)
+  let started = monotonic().ns
+  let why = cxClose(a)
+  let elapsed = monotonic().ns - started
+  println("blocked close elapsed ns: ${elapsed}")
+  assert(contains(why, "policy-poll"), "timeout names unfinished owner: ${why}")
+  assert(elapsed >= closeWaitNs && elapsed < closeWaitNs + 200 * Millisecond, "shared deadline")
+  assert(a.storeSync.pendingCount() == 1 && a.storeSync.isDown(), "live ownership retained")
+  let again = monotonic().ns
+  assert(contains(cxClose(a), "policy-poll"), "repeat still reports ownership")
+  assert(monotonic().ns - again < 100 * Millisecond, "repeat cannot extend deadline")
+  store.release <- true
+  cxDrain(a)
+  assert(a.storeSync.isDown() && !cxCan(a), "late poll cannot restore a stopped handle")
+  assert(cxClose(a) == "ok", "eventual cleanup leaves no tasks")
+}
+
+test "lifecycle registration at the stop barrier cannot extend its deadline" {
+  let a = cxAuthz(MemoryStore(), 0)
+  let rejected = AtomicI64(0)
+  assert(
+      cxSpawn(a, "race", (stop) => {
+        let _ = <- stop
+        if (cxSpawn(a, "after-barrier", (next) => {}) != "ok") {
+          rejected.store(1)
+        }
+      }) ==
+      "ok",
+    "racer admitted",
+  )
+  let started = monotonic().ns
+  assert(cxClose(a) == "ok", "racer joined")
+  assert(rejected.load() == 1 && a.storeSync.pendingCount() == 0, "admission barrier precedes stop")
+  assert(
+      a.storeSync.deadline >= started + closeWaitNs &&
+      a.storeSync.deadline <= monotonic().ns + closeWaitNs,
+    "one established deadline",
+  )
+}
+
+fn cxRefreshOwned(a: Authz<Action>, done: chan<bool>) {
+  a.refresh() catch _ {}
+  done <- true
+}
+
+test "invalidate reloads global and all followed tenants at unchanged versions without I O" {
+  let store = FlakyStore(MemoryStore())
+  store.frozen = true
+  let a = cxAuthz(store, 0)
+  let ta = tnView(a, "a")
+  let tb = tnView(a, "b")
+  cxRefresh(a)
+  let _ = store.inner.putPolicy(stDoc("PubAll", "allow", ["Publish"], "null")) catch e {
+    panic(e.message())
+  }
+  store.inner.attach(stRole("PubAll", "author")) catch e {
+    panic(e.message())
+  }
+  store.inner.attach(tnAt("PubAll", "author", "a")) catch e {
+    panic(e.message())
+  }
+  store.inner.attach(tnAt("PubAll", "author", "b")) catch e {
+    panic(e.message())
+  }
+  let before = store.calls
+  tb.invalidate()
+  a.invalidate()
+  assert(store.calls == before, "invalidation performs no store reads")
+  cxRefresh(a)
+  assert(cxCan(a) && cxCan(ta) && cxCan(tb), "all views reload unchanged versions")
+  assert(a.storeSync.acknowledged == a.storeSync.generation(), "captured generation acknowledged")
+}
+
+test "invalidate during reload refuses the old publication and preserves the next refresh" {
+  let store = FlakyStore(MemoryStore())
+  let a = cxAuthz(store, 0)
+  cxGrant(a)
+  a.invalidate()
+  store.block.store(1)
+  let done = chan<bool>(1)
+  spawn cxRefreshOwned(a, done)
+  cxWait(store.entered)
+  a.invalidate()
+  store.release <- true
+  cxWait(done)
+  assert(a.storeSync.acknowledged != a.storeSync.generation(), "later invalidation remains pending")
+  assert(a.storeSync.isDown(), "raced snapshot does not allow stale authorization")
+  cxRefresh(a)
+  assert(cxCan(a), "next refresh reloads and restores the current generation")
+}
+
+test "lifecycle callback errors retire only after cleanup and refuse authorization" {
+  let a = cxAuthz(MemoryStore(), 0)
+  cxGrant(a)
+  let cleaned = AtomicI64(0)
+  assert(
+      cxSpawn(a, "failed-owner", (stop) => {
+        cleaned.store(1)
+        fail newError("owned transport closed after error")
+      }) ==
+      "ok",
+    "admitted",
+  )
+  cxDrain(a)
+  assert(cleaned.load() == 1 && a.storeSync.isDown(), "error follows cleanup and fails closed")
+  assert(!cxCan(a), "failed owned task refuses authorization")
+  assert(cxClose(a) == "ok", "no unfinished task")
+}
+
+test "notification wake reloads unchanged versions before the long poll interval" {
+  let store = FlakyStore(MemoryStore())
+  store.frozen = true
+  let a = cxAuthz(store, 5000)
+  let _ = store.inner.putPolicy(stDoc("PubAll", "allow", ["Publish"], "null")) catch e {
+    panic(e.message())
+  }
+  store.inner.attach(stRole("PubAll", "author")) catch e {
+    panic(e.message())
+  }
+  let i = 0
+  while (i < 100) {
+    a.invalidate()
+    i = i + 1
+  }
+  let tries = 0
+  while (!cxCan(a) && tries < 1000) {
+    sleep(Millisecond)
+    tries = tries + 1
+  }
+  assert(cxCan(a), "notifications wake the poll without waiting five seconds")
+  assert(cxClose(a) == "ok" && a.storeSync.pendingCount() == 0, "owned timers and tasks stop")
+}
+
+extern fn bit_rt_port_sched_timer_chan_count(): int
+
+test "watchdog close frees its losing stop timer before task retirement" {
+  let before = bit_rt_port_sched_timer_chan_count()
+  let a = cxAuthz(MemoryStore(), 5000)
+  let tries = 0
+  while (bit_rt_port_sched_timer_chan_count() < before + 2 && tries < 1000) {
+    sleep(Millisecond)
+    tries = tries + 1
+  }
+  assert(bit_rt_port_sched_timer_chan_count() == before + 2, "poll and watchdog timers armed")
+  assert(cxClose(a) == "ok" && a.storeSync.pendingCount() == 0, "owned callbacks joined")
+  let afterClose = bit_rt_port_sched_timer_chan_count()
+  println("timer slots before: ${before}; after close: ${afterClose}")
+  assert(afterClose == before, "close must free both timers before task retirement")
 }

@@ -363,7 +363,13 @@ fn main(): ()! {
   authz.refresh() catch e {
     println("down: ${e.message()}")
   }
-  authz.close()
+  authz.spawnBackground("notification", (stop) => {
+    let _ = <- stop
+    // A transport closes its own connection before this callback returns.
+  })?
+  authz.invalidate()
+  authz.refresh()?
+  authz.close()?
   println("closed")
 }
 ```
@@ -372,9 +378,27 @@ fn main(): ()! {
 go unseen. `refresh()` is the same step on demand: call it once after you have
 registered your resources and roles, because a store that already holds
 policies cannot be compiled before then and the handle answers every request
-with a refusal until it has been. `close()` stops the poll; the handle keeps
-what it has loaded. A handle on its own in-memory store (`Authz()`) has no
-other writer and starts no poll.
+with a refusal until it has been.
+
+`invalidate()` performs no store I/O. It wakes the poll and forces the next
+refresh to reload policies, global attachments and every followed tenant,
+even when the store versions remain unchanged. It also invalidates relationship
+answers and refuses publication from older in-flight reads.
+
+`spawnBackground(name, callback)` reserves one of 32 shared task slots before
+spawn. Names follow the policy-name rules. The poll and watchdog use two slots
+when enabled. Each callback receives the shared stop channel. Wait on it, or
+select it beside bounded transport reads, then close the owned transport before
+returning. The callback is fallible; an error takes the handle down and is logged.
+Post-shutdown registration and excess capacity fail. Tenant views share the slots.
+
+`close()` closes admission, signals every owned task, and fails closed. All callers
+share one monotonic two-second deadline, including repeated calls. Successful
+close joins callback cleanup and leaves zero tasks. Deadline expiry returns an
+error naming unfinished tasks; their state and ownership remain until they return.
+It cannot cancel an arbitrary blocked store call. Release that call safely and
+close again to confirm cleanup. Late reads cannot publish or restore authorization.
+A handle on its own in-memory store (`Authz()`) has no other writer and starts no poll.
 
 A write through the handle does not wait for the poll: it reloads before it
 returns, so the server that wrote is consistent at once. A save or a global

@@ -52,14 +52,17 @@
 // the registrations, brings it up; the poller does it at the latest one
 // interval later.
 
-import { Mutex, WaitGroup, AtomicI64 } from "std/sync"
-import { after, monotonic } from "std/time"
+import { Mutex, AtomicI64 } from "std/sync"
+import { monotonic, sleepUntil, Timer } from "std/time"
+import { join } from "std/strings"
 
 // The default poll interval and number of followed tenants.
 const defaultRefreshMs: int = 5000
 const defaultMaxTenants: int = 10_000
 
 const msNs: int = 1_000_000
+const backgroundCapacity: int = 32
+const closeWaitNs: int = 2_000_000_000
 
 // How a handle follows its store (`Authz`'s `options`). `policyStore` is the
 // store to use in place of the `store` URL; `refreshEveryMs` and `maxTenants`
@@ -111,8 +114,12 @@ class StoreSync {
   lastOk: AtomicI64
   stopping: AtomicI64
   stop: chan<bool>
-  wg: WaitGroup
-  polling: bool
+  lifecycle: Mutex
+  tasks: []string
+  deadline: int
+  wake: chan<bool>
+  invalidated: int
+  acknowledged: int
 
   init(refreshEveryMs: int, maxTenants: int) {
     this.interval = refreshEveryMs * msNs
@@ -126,8 +133,75 @@ class StoreSync {
     this.lastOk = AtomicI64(i64(monotonic().ns))
     this.stopping = AtomicI64(0)
     this.stop = chan<bool>()
-    this.wg = WaitGroup()
-    this.polling = false
+    this.lifecycle = Mutex()
+    this.tasks = []string(backgroundCapacity)
+    this.deadline = 0
+    this.wake = chan<bool>(1)
+    this.invalidated = 0
+    this.acknowledged = 0
+  }
+
+  reserve(name: string): int! {
+    checkName("/background", name)?
+    this.lifecycle.lock()
+    defer this.lifecycle.unlock()
+    if (this.stopping.load() != 0) {
+      fail StoreUnavailable{}
+    }
+    let i = 0
+    while (i < backgroundCapacity) {
+      if (this.tasks[i] == "") {
+        this.tasks[i] = name
+        return i
+      }
+      i = i + 1
+    }
+    fail InvalidPolicy{ detail = "background task capacity ${backgroundCapacity} reached" }
+  }
+
+  retire(slot: int) {
+    this.lifecycle.lock()
+    defer this.lifecycle.unlock()
+    assert(slot >= 0 && slot < backgroundCapacity && this.tasks[slot] != "", "owned task slot")
+    this.tasks[slot] = ""
+  }
+
+  pending(): []string {
+    this.lifecycle.lock()
+    defer this.lifecycle.unlock()
+    let out = []string(0, backgroundCapacity)
+    for name of this.tasks {
+      if (name != "") {
+        out = append(out, name)
+      }
+    }
+    return out
+  }
+
+  pendingCount(): int {
+    this.lifecycle.lock()
+    defer this.lifecycle.unlock()
+    let n = 0
+    for name of this.tasks {
+      if (name != "") {
+        n = n + 1
+      }
+    }
+    return n
+  }
+
+  unchanged(total: i64, registration: int, force: bool): bool {
+    return !force && total == this.total && registration == this.registration
+  }
+
+  globalMoved(version: i64, registration: int, force: bool): bool {
+    return force || version != this.global || registration != this.registration
+  }
+
+  generation(): int {
+    this.lifecycle.lock()
+    defer this.lifecycle.unlock()
+    return this.invalidated
   }
 
   // The followed tenants, in no order.
@@ -223,15 +297,20 @@ fn logPolicyFailures<A: ActionEnum>(a: Authz<A>, before: StoredIndex<A>, after: 
 // published, and nothing recorded, when any read fails.
 fn syncLocked<A: ActionEnum>(a: Authz<A>): ()! {
   let s = a.storeSync
+  let generation = s.generation()
+  if (s.stopping.load() != 0) {
+    fail StoreUnavailable{}
+  }
+  let force = generation != s.acknowledged
   let total = a.store.version()?
   let reg = a.registered()
   // Resources and declarations are append-only under the handle admin lock.
   let registration = len(reg.resources) + len(reg.decls)
-  if (total == s.total && registration == s.registration) {
+  if (s.unchanged(total, registration, force)) {
     return
   }
   let g = a.store.scopeVersion("")?
-  let global = g != s.global || registration != s.registration
+  let global = s.globalMoved(g, registration, force)
   let before = reg.stored
   let ix = before
   if (global) {
@@ -242,15 +321,22 @@ fn syncLocked<A: ActionEnum>(a: Authz<A>): ()! {
   let changed = []string(0)
   for t of s.followed() {
     let v = a.store.scopeVersion(t)?
-    if (v != s.versionOf(t)) {
+    if (force || v != s.versionOf(t)) {
       ix = storedWithTenant<A>(ix, t, a.store.attachments(t)?)
       moved[t] = v
       changed = append(changed, t)
     }
   }
+  s.lifecycle.lock()
+  if (s.stopping.load() != 0 || generation != s.invalidated) {
+    s.lifecycle.unlock()
+    fail StoreUnavailable{}
+  }
   a.state.cache.publishStored(ix, global, changed)
   s.loaded(total, g, moved)
   s.registration = registration
+  s.acknowledged = generation
+  s.lifecycle.unlock()
   logPolicyFailures<A>(a, before, ix)
 }
 
@@ -263,8 +349,16 @@ fn goDown<A: ActionEnum>(a: Authz<A>, e: error) {
 
 // A sync succeeded: the handle is up, and says so once if it was down.
 fn comeUp<A: ActionEnum>(a: Authz<A>) {
-  a.storeSync.lastOk.store(i64(monotonic().ns))
-  if (a.storeSync.down.swap(0) == 1) {
+  let s = a.storeSync
+  s.lifecycle.lock()
+  if (s.stopping.load() != 0) {
+    s.lifecycle.unlock()
+    return
+  }
+  s.lastOk.store(i64(monotonic().ns))
+  let wasDown = s.down.swap(0) == 1
+  s.lifecycle.unlock()
+  if (wasDown) {
     loggerOf<A>(a.registered()).info().log("policy store reachable again")
   }
 }
@@ -296,8 +390,14 @@ fn followTenant<A: ActionEnum>(a: Authz<A>, t: string): ()! {
   let v = a.store.scopeVersion(t) catch e {
     fail typedFailure(e)
   }
+  let generation = s.generation()
   let atts = a.store.attachments(t) catch e {
     fail typedFailure(e)
+  }
+  s.lifecycle.lock()
+  defer s.lifecycle.unlock()
+  if (s.stopping.load() != 0 || generation != s.invalidated) {
+    fail StoreUnavailable{}
   }
   a.state.cache.publishStored(
     storedWithTenant<A>(a.registered().stored, t, atts),
@@ -321,29 +421,46 @@ fn checkStale<A: ActionEnum>(a: Authz<A>, nowNs: int) {
 
 // Whether `s` was told to stop; waits `s.interval` for it.
 fn stoppedWithin(s: StoreSync): bool {
+  let timer = Timer(s.interval)
+  let stopped = false
   select {
     case <- s.stop:
-      return true
-    case <- after(s.interval):
-      return false
+      stopped = true
+    case <- timer.c:
   }
+  let _ = timer.stop()
+  return stopped
+}
+
+fn pollStoppedWithin(s: StoreSync): bool {
+  let timer = Timer(s.interval)
+  let stopped = false
+  select {
+    case <- s.stop:
+      stopped = true
+    case <- s.wake:
+      stopped = s.stopping.load() != 0
+    case <- timer.c:
+  }
+  let _ = timer.stop()
+  return stopped
 }
 
 fn pollLoop<A: ActionEnum>(a: Authz<A>) {
-  while (!stoppedWithin(a.storeSync)) {
+  while (!pollStoppedWithin(a.storeSync)) {
     a.refresh() catch _ {
       // goDown logged it.
       continue
     }
   }
-  a.storeSync.wg.done()
+
 }
 
 fn watchLoop<A: ActionEnum>(a: Authz<A>) {
   while (!stoppedWithin(a.storeSync)) {
     checkStale<A>(a, monotonic().ns)
   }
-  a.storeSync.wg.done()
+
 }
 
 // Startup: reads the store's version (a store that cannot be read is a
@@ -364,20 +481,52 @@ fn startSync<A: ActionEnum>(a: Authz<A>, shared: bool): ()! {
     s.down.store(1)
   }
   if (shared && s.interval > 0) {
-    s.polling = true
-    s.wg.add(2)
-    spawn pollLoop<A>(a)
-    spawn watchLoop<A>(a)
+    a.spawnBackground("policy-poll", (stop) => {
+      pollLoop<A>(a)
+    })?
+    a.spawnBackground("policy-watch", (stop) => {
+      watchLoop<A>(a)
+    })?
   }
 }
 
-// Stops the poller and the watcher and waits for them. Safe to call twice.
-fn stopSync(s: StoreSync) {
-  if (!s.polling) {
-    return
-  }
-  if (s.stopping.compareAndSwap(0, 1)) {
+// One admission barrier and deadline shared by every close, independent of admin.
+fn stopSync(s: StoreSync): ()! {
+  s.lifecycle.lock()
+  if (s.stopping.load() == 0) {
+    s.deadline = monotonic().ns + closeWaitNs
+    s.stopping.store(1)
+    s.down.store(1)
     close(s.stop)
   }
-  s.wg.wait()
+  let deadline = s.deadline
+  s.lifecycle.unlock()
+  let i = 0
+  while (i < 2001) {
+    if (s.pendingCount() == 0) {
+      return
+    }
+    let now = monotonic().ns
+    if (now >= deadline) {
+      let pending = s.pending()
+      if (len(pending) == 0) {
+        return
+      }
+      fail newError("authz close deadline: unfinished owned tasks ${join(pending, ",")}")
+    }
+    let next = now + msNs
+    if (next > deadline) {
+      next = deadline
+    }
+    sleepUntil(next)
+    i = i + 1
+  }
+  fail newError("authz close deadline: unfinished owned tasks ${join(s.pending(), ",")}")
+}
+
+fn runBackground<A: ActionEnum>(a: Authz<A>, slot: int, callback: (chan<bool>) => ()!) {
+  callback(a.storeSync.stop) catch e {
+    goDown<A>(a, e)
+  }
+  a.storeSync.retire(slot)
 }
