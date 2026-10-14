@@ -1,0 +1,214 @@
+// SendGrid batches signed with a freshly generated P-256 key.
+
+import {
+  asn1BitString, asn1Encode, asn1Oid, asn1Sequence, digest, ecdsaGenerateKey,
+  ecdsaSign, ecdsaSignatureToDer, EcdsaPrivateKey, encodeBase64, HashAlg,
+  nistecP256, nistecPointEncode, Sha256,
+} from "std/crypto"
+import { hasPrefix, repeat, replace } from "std/strings"
+import { now } from "std/time"
+
+const swhTime: int = 1700000000
+const swhEvent: string = "{\"event\":\"delivered\",\"email\":\"sara@inkwell.dev\",\"timestamp\":1700000000,\"sg_message_id\":\"message-7\",\"sg_event_id\":\"event-7\",\"reason\":\"accepted\"}"
+
+fn swhKey(key: EcdsaPrivateKey, curveOid: string): string {
+  let alg = asn1Oid([1, 2, 840, 10045, 2, 1]) catch e {
+    panic(e.message())
+  }
+  let curve = asn1Oid([1, 2, 840, 10045, 3, 1, 7]) catch e {
+    panic(e.message())
+  }
+  if (curveOid == "wrong") {
+    curve = asn1Oid([1, 3, 132, 0, 34]) catch e {
+      panic(e.message())
+    }
+  }
+  let point = nistecPointEncode(key.curve, key.q, false) catch e {
+    panic(e.message())
+  }
+  return encodeBase64(
+    asn1Encode(
+      asn1Sequence(
+        [
+          asn1Sequence([alg, curve]), asn1BitString(0, point),
+        ],
+      ),
+    ),
+  )
+}
+
+fn swhHeader(key: EcdsaPrivateKey, body: string, ts: string): (string) => string {
+  let sig = ecdsaSign(key, digest(Sha256(), []byte(ts + body)), HashAlg.Sha256) catch e {
+    panic(e.message())
+  }
+  return whHeader(
+    WhReq{
+      names = ["x-twilio-email-event-webhook-timestamp", "x-twilio-email-event-webhook-signature"],
+      values = [ts, encodeBase64(ecdsaSignatureToDer(sig))],
+    },
+  )
+}
+
+fn swhRun(key: EcdsaPrivateKey, body: string): []Event {
+  return webhookEvents(
+    Provider.SendGrid,
+    swhHeader(key, body, "${swhTime}"),
+    body,
+    swhKey(key, ""),
+    whAt(swhTime),
+  ) catch e {
+    panic(e.message())
+  }
+}
+
+test "SendGrid signed four-event batch retains identity and bounce policy" {
+  let key = ecdsaGenerateKey(nistecP256())
+  let body = "[${swhEvent},${replace(swhEvent, "delivered", "deferred")},${replace(
+    swhEvent,
+    "delivered",
+    "bounce\",\"type\":\"bounce",
+  )},${replace(swhEvent, "delivered", "bounce\",\"type\":\"blocked")}]"
+  let events = swhRun(key, body)
+  assert(len(events) == 4, "four events")
+  let kinds = [EventKind.Delivered, EventKind.Deferred, EventKind.Bounced, EventKind.Bounced]
+  let i = 0
+  while (i < 4) {
+    let e = events[i]
+    assert(e.kind == kinds[i] && e.provider == Provider.SendGrid, "mapping")
+    assert(e.recipient == "sara@inkwell.dev" && e.providerId == "message-7", "message identity")
+    assert(e.deliveryId == "event-7" && e.messageId == "", "delivery identity")
+    assert(e.at.ns == swhTime * Second && e.reason == "accepted", "time and reason")
+    assert(e.permanent == (i == 2), "bounce permanence")
+    i = i + 1
+  }
+}
+
+test "SendGrid verifies the exact raw body and key before accepting events" {
+  let key = ecdsaGenerateKey(nistecP256())
+  let body = "[${swhEvent}]"
+  let h = swhHeader(key, body, "${swhTime}")
+  let secret = swhKey(key, "")
+  let at = whAt(swhTime)
+  assert(whVerdict(Provider.SendGrid, h, body, secret, at) == "ok", "valid")
+  for changed of [body + " ", replace(body, "sara", "tara")] {
+    assert(
+      hasPrefix(whVerdict(Provider.SendGrid, h, changed, secret, at), "Signature:"),
+      "raw body changed",
+    )
+  }
+  let other = swhKey(ecdsaGenerateKey(nistecP256()), "")
+  assert(hasPrefix(whVerdict(Provider.SendGrid, h, body, other, at), "Signature:"), "wrong key")
+  for ts of [swhTime - 301, swhTime + 301] {
+    let stale = swhHeader(key, body, "${ts}")
+    assert(
+      hasPrefix(whVerdict(Provider.SendGrid, stale, body, secret, at), "Signature:"),
+      "outside replay window",
+    )
+  }
+  for ts of [swhTime - 300, swhTime + 300] {
+    let edge = swhHeader(key, body, "${ts}")
+    assert(
+      whVerdict(Provider.SendGrid, edge, body, secret, at) == "ok",
+      "inclusive replay boundary",
+    )
+  }
+}
+
+test "SendGrid rejects malformed capped keys signatures and timestamps with typed errors" {
+  let key = ecdsaGenerateKey(nistecP256())
+  let body = "[]"
+  let h = swhHeader(key, body, "${swhTime}")
+  let secret = swhKey(key, "")
+  for bad of ["", "!", "AA==", secret + "AAAA", swhKey(key, "wrong"), repeat("A", sgMaxKeyText + 1)] {
+    assert(
+      hasPrefix(whVerdict(Provider.SendGrid, h, body, bad, whAt(swhTime)), "Config:"),
+      "malformed SPKI",
+    )
+  }
+  for sig of ["", "!", "AA==", "MAYCAQECAQA=", repeat("A", sgMaxSignatureText + 1)] {
+    let broken = whHeader(
+      WhReq{
+        names = [
+          "x-twilio-email-event-webhook-timestamp",
+          "x-twilio-email-event-webhook-signature",
+        ],
+        values = ["${swhTime}", sig],
+      },
+    )
+    assert(
+      hasPrefix(whVerdict(Provider.SendGrid, broken, body, secret, whAt(swhTime)), "Signature:"),
+      "malformed signature",
+    )
+  }
+  for ts of ["", "-1", "1.5", " 1700000000", "9223372037", "99999999999"] {
+    let broken = swhHeader(key, body, ts)
+    assert(
+      hasPrefix(whVerdict(Provider.SendGrid, broken, body, secret, whAt(swhTime)), "Signature:"),
+      "malformed timestamp",
+    )
+  }
+  assert(
+    hasPrefix(
+      whVerdict(Provider.SendGrid, h, repeat("x", maxWebhookBody + 1), secret, whAt(swhTime)),
+      "Invalid:",
+    ),
+    "body cap precedes verification",
+  )
+}
+
+test "SendGrid maps remaining kinds and ignores processed and unknown events" {
+  let key = ecdsaGenerateKey(nistecP256())
+  let names = [
+    "dropped",
+    "spamreport",
+    "unsubscribe",
+    "group_unsubscribe",
+    "group_resubscribe",
+    "open",
+    "click",
+  ]
+  let kinds = [
+    EventKind.Rejected,
+    EventKind.Complained,
+    EventKind.Unsubscribed,
+    EventKind.Unsubscribed,
+    EventKind.Subscribe,
+    EventKind.Opened,
+    EventKind.Clicked,
+  ]
+  let i = 0
+  while (i < len(names)) {
+    let events = swhRun(key, "[${replace(swhEvent, "delivered", names[i])}]")
+    assert(len(events) == 1 && events[0].kind == kinds[i] && !events[0].permanent, names[i])
+    i = i + 1
+  }
+  assert(
+    len(swhRun(key, "[{\"event\":\"processed\"},{\"event\":\"new-event\"}]")) == 0,
+    "unknown events ignored",
+  )
+}
+
+test "SendGrid authenticated malformed payloads fail Invalid and public dispatch reads the clock" {
+  let key = ecdsaGenerateKey(nistecP256())
+  let secret = swhKey(key, "")
+  for body of [
+    "{",
+    "{}",
+    "[null]",
+    "[{\"event\":\"delivered\"}]",
+    replace("[${swhEvent}]", "1700000000", "-1"),
+    replace("[${swhEvent}]", "1700000000", "9223372037"),
+  ] {
+    let h = swhHeader(key, body, "${swhTime}")
+    assert(
+      hasPrefix(whVerdict(Provider.SendGrid, h, body, secret, whAt(swhTime)), "Invalid:"),
+      "malformed event",
+    )
+  }
+  let body = "[${swhEvent}]"
+  let ts = "${now().ns / Second}"
+  let events = parseEvents(Provider.SendGrid, swhHeader(key, body, ts), body, secret) catch e {
+    panic(e.message())
+  }
+  assert(len(events) == 1, "public dispatch")
+}

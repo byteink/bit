@@ -1,0 +1,157 @@
+// pkg/mail/webhooksendgrid.bit — SendGrid's signed event batches.
+// The dashboard key is SPKI; the signature covers raw timestamp + raw body.
+
+import {
+  asn1OidString, asn1Parse, asn1ReadBitString, asn1ReadOid, asn1ReadSequence,
+  decodeBase64, digest, ecdsaPublicKey, ecdsaSignatureFromDer, ecdsaVerify,
+  EcdsaPublicKey, nistecP256, Sha256,
+} from "std/crypto"
+import { jsonAsArray, jsonAsInt, jsonAsObject, jsonGet, jsonParse, Json } from "std/json"
+import { Second } from "std/time"
+
+// Bounds precede decoding so hostile headers cannot allocate large DER trees.
+const sgMaxKeyText: int = 172
+const sgMaxSignatureText: int = 96
+const sgMaxSeconds: int = 9223372036
+
+fn sgSpki(der: []byte): EcdsaPublicKey! {
+  let parts = asn1ReadSequence(asn1Parse(der)?)?
+  if (len(parts) != 2) {
+    fail newError("SPKI needs algorithm and point")
+  }
+  let alg = asn1ReadSequence(parts[0])?
+  if (len(alg) != 2) {
+    fail newError("SPKI needs EC algorithm and named curve")
+  }
+  let algorithm = asn1OidString(asn1ReadOid(alg[0])?)
+  let curve = asn1OidString(asn1ReadOid(alg[1])?)
+  if (algorithm != "1.2.840.10045.2.1" || curve != "1.2.840.10045.3.1.7") {
+    fail newError("SPKI must be EC P-256")
+  }
+  let point = asn1ReadBitString(parts[1])?
+  if (point.unusedBits != 0) {
+    fail newError("SPKI point must use whole octets")
+  }
+  return ecdsaPublicKey(nistecP256(), point.bytes)?
+}
+
+fn sgWebhookKey(secret: string): EcdsaPublicKey!MailError {
+  if (len(secret) == 0 || len(secret) > sgMaxKeyText) {
+    fail MailError.Config("SendGrid needs its base64 P-256 public verification key")
+  }
+  let der = decodeBase64(secret) catch _ {
+    fail MailError.Config("SendGrid verification key is not base64")
+  }
+  return sgSpki(der) catch _ {
+    fail MailError.Config("SendGrid verification key is not a P-256 SPKI")
+  }
+}
+
+fn sgVerify(
+  header: (string) => string,
+  body: string,
+  key: EcdsaPublicKey,
+  at: Timestamp,
+): ()!MailError {
+  let ts = header("x-twilio-email-event-webhook-timestamp")
+  let seconds = svixSeconds(ts)?
+  if (seconds > sgMaxSeconds || at.ns < 0) {
+    fail webhookRejected("timestamp is not a representable Unix time")
+  }
+  let skew = at.ns - seconds * Second
+  if (skew > toleranceNs || skew < 0 - toleranceNs) {
+    fail webhookRejected("timestamp is more than 5 minutes from now")
+  }
+  let text = header("x-twilio-email-event-webhook-signature")
+  if (len(text) == 0 || len(text) > sgMaxSignatureText) {
+    fail webhookRejected("SendGrid signature is missing or too large")
+  }
+  let der = decodeBase64(text) catch _ {
+    fail webhookRejected("SendGrid signature is not base64")
+  }
+  let sig = ecdsaSignatureFromDer(der) catch _ {
+    fail webhookRejected("SendGrid signature is not DER ECDSA")
+  }
+  let hash = digest(Sha256(), []byte(ts + body))
+  if (!ecdsaVerify(key, hash, sig)) {
+    fail webhookRejected("signature does not match")
+  }
+}
+
+fn sgKind(name: string): Option<EventKind> {
+  let names = [
+    "delivered", "deferred", "bounce", "dropped", "spamreport", "unsubscribe",
+    "group_unsubscribe", "group_resubscribe", "open", "click",
+  ]
+  let kinds = [
+    EventKind.Delivered, EventKind.Deferred, EventKind.Bounced, EventKind.Rejected,
+    EventKind.Complained, EventKind.Unsubscribed, EventKind.Unsubscribed,
+    EventKind.Subscribe, EventKind.Opened, EventKind.Clicked,
+  ]
+  let i = 0
+  while (i < len(names)) {
+    if (name == names[i]) {
+      return Option.Some(kinds[i])
+    }
+    i = i + 1
+  }
+  return Option.None
+}
+
+fn sgEventAt(data: Json): Timestamp!MailError {
+  let value = jsonGet(data, "timestamp")
+  if (!isSome(value)) {
+    fail MailError.Invalid("SendGrid event has no timestamp")
+  }
+  let seconds = jsonAsInt(unwrap(value))
+  if (!isSome(seconds)) {
+    fail MailError.Invalid("SendGrid event timestamp is not Unix seconds")
+  }
+  let secs = int(unwrap(seconds))
+  if (secs < 0 || secs > sgMaxSeconds) {
+    fail MailError.Invalid("SendGrid event timestamp is not representable")
+  }
+  return Timestamp{ ns = secs * Second }
+}
+
+fn sgBuild(data: Json, kind: EventKind): Event!MailError {
+  let email = rsText(data, "email")
+  if (email == "") {
+    fail MailError.Invalid("SendGrid event has no email string")
+  }
+  return Event{
+    kind = kind, recipient = email, messageId = "",
+    providerId = rsText(data, "sg_message_id"), deliveryId = rsText(data, "sg_event_id"),
+    at = sgEventAt(data)?, permanent = kind == EventKind.Bounced &&
+      rsText(data, "type") == "bounce",
+    reason = rsText(data, "reason"), provider = Provider.SendGrid,
+  }
+}
+
+fn sendgridEvents(
+  header: (string) => string,
+  body: string,
+  secret: string,
+  at: Timestamp,
+): []Event!MailError {
+  let key = sgWebhookKey(secret)?
+  sgVerify(header, body, key, at)?
+  let json = jsonParse(body) catch _ {
+    fail MailError.Invalid("SendGrid webhook body is not valid JSON")
+  }
+  let list = jsonAsArray(json)
+  if (!isSome(list)) {
+    fail MailError.Invalid("SendGrid webhook body is not a list")
+  }
+  let out: []Event = []
+  for data of unwrap(list) {
+    if (!isSome(jsonAsObject(data))) {
+      fail MailError.Invalid("SendGrid event is not an object")
+    }
+    let kind = sgKind(rsText(data, "event"))
+    if (isSome(kind)) {
+      out = append(out, sgBuild(data, unwrap(kind))?)
+    }
+  }
+  return out
+}
