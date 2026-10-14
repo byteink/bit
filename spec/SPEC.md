@@ -125,7 +125,7 @@ Reserved; may not be used as identifiers (member names, §12.5):
 as      asm     break     case       catch   chan
 class   const   continue  default    defer   else
 enum    export  fail      false      fn      for
-if      import  in        interface  let     map
+if      import            interface  let     map
 match   nil     of        return     select  spawn
 switch  this    trait     true       type    while
 ```
@@ -160,6 +160,11 @@ method literally named `from` - except immediately after an `import_decl`'s
 is unambiguous without reserving the word: an `import_decl` always reaches it
 right after its body, and the only legal next token there is the
 path-introducing `from`.
+
+`in` is contextual too: it lexes as an ordinary identifier, so a function,
+parameter, variable, field, or method can use the name. Only the delimiter
+after a `for` binder (§13.1) reads `in` as the iteration keyword. This also
+preserves `in:` as a map literal key (§12.3.1).
 
 ### 5.3 Predeclared Identifiers (not keywords)
 
