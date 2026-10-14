@@ -384,8 +384,7 @@ warm.
 
 ### When the store is down
 
-If the store cannot answer the poll, or a stored policy does not compile
-against what this server has registered, the handle fails closed: `can` is
+If the store cannot answer the poll, the handle fails closed: `can` is
 `false`, and `check` and `filterFor` fail with `StoreUnavailable` (a 503 in
 `web`), for everyone, until a later refresh succeeds. Allowing on the strength
 of a cache whose age is unknown would be the wrong default; OWASP's word for the
@@ -400,6 +399,116 @@ attachments once (and is a `StoreUnavailable` if it cannot); after that the
 tenant is followed by the poll and a view costs no store call. At most
 `maxTenants` (10,000) are followed, so a tenant name invented by a client cannot
 grow the set: the next one is an `InvalidPolicy` naming the option.
+
+### When one server cannot read a new policy
+
+During a rolling deploy, a newer Inkwell server can save a policy for a resource
+that an older server has not registered. The older server refuses every check
+for the subjects attached to that policy. Other subjects keep their own grants.
+This applies to both allow and deny policies: dropping an unreadable deny could
+let another grant permit the operation.
+
+```bit
+import {
+  Authz,
+  Attachment,
+  MemoryStore,
+  PolicyDoc,
+  PolicyStore,
+  Statement,
+  StoreOptions,
+  Subject,
+  Target,
+} from "authz"
+import { Tabled } from "orm"
+import { jsonParse } from "std/json"
+
+enum Action { Manage, Read, Create, Update, Delete, Publish }
+
+@table class Article {
+  @id
+  id: i64
+}
+
+@table class Draft {
+  @id
+  id: i64
+}
+
+class User {
+  export id: string,
+  export roles: []string,
+}
+
+fn main(): ()! {
+  let shared = MemoryStore()
+  let options = StoreOptions(policyStore = Option<PolicyStore>.Some(shared), refreshEveryMs = 0)
+  let older = Authz<Action>(options = options)?
+  older.resource<Article>()?
+  let newer = Authz<Action>(options = options)?
+  newer.resource<Article>()?.resource<Draft>()?
+  newer.savePolicy(
+    PolicyDoc{
+      name = "PublishArticles",
+      statements = [
+        Statement{
+          effect = "allow",
+          actions = ["Publish"],
+          resource = "Article",
+          when = jsonParse("null")?,
+        },
+      ],
+    },
+  )?
+  newer.attach(
+    Attachment{
+      policy = "PublishArticles",
+      to = Target{ role = Option<string>.Some("author") },
+      tenant = "",
+    },
+  )?
+  newer.savePolicy(
+    PolicyDoc{
+      name = "ProtectDrafts",
+      statements = [
+        Statement{
+          effect = "deny",
+          actions = ["Publish"],
+          resource = "Draft",
+          when = jsonParse("null")?,
+        },
+      ],
+    },
+  )?
+  newer.attach(
+    Attachment{
+      policy = "ProtectDrafts",
+      to = Target{ role = Option<string>.Some("author") },
+      tenant = "",
+    },
+  )?
+  older.refresh()?
+  let mira = Option<Subject>.Some(User{ id = "mira", roles = ["author"] })
+  let article = Article{ id = 1 }
+  println("older: ${older.can<Article>(mira, Action.Publish, article)}")
+  println("newer: ${newer.can<Article>(mira, Action.Publish, article)}")
+  older.resource<Draft>()?
+  println("registered: ${older.can<Article>(mira, Action.Publish, article)}")
+}
+```
+
+This prints `older: false`, `newer: true` and `registered: true`. Registering the
+missing resource or relation retries failed policies without a store write.
+For an affected subject, `can` returns `false`; `check` and `filterFor` report an
+`InvalidPolicy` naming the failed policy. Global attachments also apply inside
+each tenant; tenant attachments affect that tenant alone. The guest follows the
+attachments of the `guest` role. A failed stored policy still refuses its subjects
+when a policy in code has the same name.
+
+Each failed-policy transition produces one ERROR record. Repeated refreshes and
+requests do not repeat it. `refresh` succeeds when the store can be read, even
+when some policies cannot compile here; those failures remain attached to their
+subjects until a later refresh or registration resolves them.
 
 ## Sharp edges
 

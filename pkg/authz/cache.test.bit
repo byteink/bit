@@ -248,7 +248,7 @@ test "a handle started on a store that already holds policies denies until it ha
   assert(cxCan(late), "loaded")
 }
 
-test "a stored policy that does not compile here keeps the handle down with an InvalidPolicy" {
+test "a stored policy that does not compile here refuses its subjects with an InvalidPolicy" {
   let shared = MemoryStore()
   cxGrant(cxAuthz(shared, 0))
   let bare = Authz<Action>(options = cxOptions(shared, 0, 10_000)) catch e {
@@ -258,8 +258,8 @@ test "a stored policy that does not compile here keeps the handle down with an I
   bare.refresh() catch e {
     why = e.message()
   }
-  assert(contains(why, "invalid policy"), "refresh: ${why}")
-  assert(!cxCan(bare), "down")
+  assert(why == "", "refresh: ${why}")
+  assert(!bare.storeSync.isDown() && !cxCan(bare), "only attached subjects refuse")
 }
 
 test "a write in tenant a leaves tenant b's rules warm; a global write rebuilds both" {
@@ -327,6 +327,197 @@ test "a negative refreshEveryMs is refused" {
     return
   }
   assert(false, "refreshEveryMs -1 accepted")
+}
+
+@table class CxFuture {
+  @id
+  id: i64
+}
+
+fn cxBroken(store: PolicyStore, effect: string, at: Attachment) {
+  let doc = stDoc(at.policy, effect, ["Publish"], "null")
+  doc.statements[0].resource = "CxFuture"
+  let _ = store.putPolicy(doc) catch e {
+    panic(e.message())
+  }
+  store.attach(at) catch e {
+    panic(e.message())
+  }
+}
+
+fn cxIsolated(effect: string, at: Attachment): Authz<Action> {
+  let shared = MemoryStore()
+  let a = cxAuthz(shared, 0)
+  let _ = a.subject<StUser>()
+  cxGrant(a)
+  cxBroken(shared, effect, at)
+  cxRefresh(a)
+  return a
+}
+
+fn cxAllRefuse(a: Authz<Action>, user: Option<Subject>) {
+  assert(!a.can<Article>(user, Action.Publish, stRow("x", "draft")), "can refuses")
+  let checkBad = false
+  a.check<Article>(user, Action.Publish, stRow("x", "draft")) catch e {
+    let (_, invalid) = e.(InvalidPolicy)
+    checkBad = invalid
+  }
+  let filterBad = false
+  let _ = a.filterFor<Article>(user, Action.Publish) catch e {
+    let (_, invalid) = e.(InvalidPolicy)
+    filterBad = invalid
+    Filter.None
+  }
+  assert(checkBad && filterBad, "check and filter retain the policy failure")
+  assert(!a.storeSync.isDown(), "store remains reachable")
+}
+
+test "failed stored ALLOW refuses its attached role on every resource and action" {
+  let a = cxIsolated("allow", stRole("Future", "author"))
+  cxAllRefuse(a, cxSub())
+  assert(!a.can<Article>(cxSub(), Action.Read, stRow("x", "draft")), "another action refuses")
+  assert(!a.can<CxFuture>(cxSub(), Action.Manage, CxFuture{ id = 1 }), "another resource refuses")
+}
+
+test "failed stored DENY defeats a competing grant, including a code policy of its name" {
+  let a = cxIsolated("deny", stRole("Future", "author"))
+  let code = Policy<StUser, Action>("Future", (p, user) => {
+    p.can<Article>([Action.Publish])
+  })
+  let _ = a.role<StUser>("author", [code]) catch e {
+    panic(e.message())
+  }
+  cxAllRefuse(a, cxSub())
+}
+
+test "a failed stored policy leaves an unrelated role's grant unchanged" {
+  let a = cxIsolated("deny", stRole("Future", "other"))
+  assert(cxCan(a), "author remains allowed")
+  cxAllRefuse(a, stWho("other", ["other"], "x"))
+}
+
+test "a failed group attachment refuses the group's subjects alone" {
+  let a = cxIsolated("deny", stGroup("Future", "editors"))
+  cxAllRefuse(a, stWho("sara", ["author", "group:editors"], "x"))
+  assert(cxCan(a), "author outside the group remains allowed")
+}
+
+test "a failed user attachment refuses that user's checks alone" {
+  let a = cxIsolated("deny", stUserAtt("Future", "sara"))
+  cxAllRefuse(a, cxSub())
+  assert(
+    stCan(a, stWho("mira", ["author"], "x"), stRow("x", "draft")),
+    "another user retains the grant",
+  )
+}
+
+test "failed tenant and global attachments preserve guest and subject isolation" {
+  let a = cxIsolated("deny", tnAt("Future", "author", "a"))
+  cxAllRefuse(tnView(a, "a"), cxSub())
+  assert(cxCan(a) && cxCan(tnView(a, "b")), "global and other tenant retain the grant")
+  let guests = cxIsolated("deny", tnAt("Future", "guest", "a"))
+  cxAllRefuse(tnView(guests, "a"), Option<Subject>.None)
+  assert(cxCan(guests), "guest failure does not reach a signed-in subject")
+  let globalGuest = cxIsolated("deny", stRole("Future", "guest"))
+  cxAllRefuse(globalGuest, Option<Subject>.None)
+  cxAllRefuse(tnView(globalGuest, "b"), Option<Subject>.None)
+  let global = cxIsolated("deny", stRole("Future", "author"))
+  cxAllRefuse(tnView(global, "b"), cxSub())
+}
+
+test "failed policy metadata persists through warm can check and filter calls" {
+  let a = cxIsolated("deny", stRole("Future", "author"))
+  let i = 0
+  while (i < 3) {
+    cxAllRefuse(a, cxSub())
+    i = i + 1
+  }
+}
+
+test "resource registration retries failed policies without a store version change" {
+  let a = cxIsolated("deny", stRole("Future", "author"))
+  let before = a.store.version() catch e {
+    panic(e.message())
+  }
+  cxAllRefuse(a, cxSub())
+  let _ = a.resource<CxFuture>() catch e {
+    panic(e.message())
+  }
+  let after = a.store.version() catch e {
+    panic(e.message())
+  }
+  assert(
+    before == after && cxCan(a),
+    "registration recovers the unrelated resource grant without a write",
+  )
+}
+
+test "relation registration retries failed policies without a store version change" {
+  let shared = MemoryStore()
+  let a = cxAuthz(shared, 0)
+  cxGrant(a)
+  let _ = a.resource<RdFolder>() catch e {
+    panic(e.message())
+  }
+  let _ = a.resource<RdLinked>() catch e {
+    panic(e.message())
+  }
+  let doc = stDoc("FutureRelation", "deny", ["Publish"], "{\"folder\":{\"$related\":\"editor\"}}")
+  doc.statements[0].resource = "RdLinked"
+  let _ = shared.putPolicy(doc) catch e {
+    panic(e.message())
+  }
+  shared.attach(stRole("FutureRelation", "author")) catch e {
+    panic(e.message())
+  }
+  cxRefresh(a)
+  cxAllRefuse(a, cxSub())
+  let before = shared.version() catch e {
+    panic(e.message())
+  }
+  let _ = a.relation<RdFolder>("editor") catch e {
+    panic(e.message())
+  }
+  let after = shared.version() catch e {
+    panic(e.message())
+  }
+  assert(
+    before == after && cxCan(a),
+    "relation declaration recovers and invalidates the warm failure",
+  )
+}
+
+test "two handles isolate old server failure and log each compile failure transition once" {
+  let shared = MemoryStore()
+  let old = cxAuthz(shared, 0)
+  cxGrant(old)
+  let next = cxAuthz(shared, 0)
+  let _ = next.resource<CxFuture>() catch e {
+    panic(e.message())
+  }
+  cxBroken(shared, "deny", stRole("Future", "author"))
+  let sink = newLogLines()
+  let _ = old.logTo(linesLogger(sink, LevelError))
+  cxRefresh(old)
+  cxRefresh(next)
+  assert(
+    !cxCan(old) && cxCan(next),
+    "new server compiles while old server refuses only attached subjects",
+  )
+  assert(len(sink.lines) == 1, "first failure logs once")
+  cxRefresh(old)
+  cxAllRefuse(old, cxSub())
+  assert(len(sink.lines) == 1, "unchanged refresh and requests do not repeat the log")
+  let _ = old.resource<CxFuture>() catch e {
+    panic(e.message())
+  }
+  assert(cxCan(old), "old server heals")
+  let doc = stDoc("Future", "deny", ["Publish"], "{\"missing\":true}")
+  let _ = shared.putPolicy(doc) catch e {
+    panic(e.message())
+  }
+  cxRefresh(old)
+  assert(!cxCan(old) && len(sink.lines) == 2, "a later failure is a new transition")
 }
 
 test "a maxTenants below 1 is refused" {

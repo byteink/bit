@@ -35,8 +35,7 @@
 // option, so a client cannot grow the set by inventing tenant names.
 //
 // FAIL CLOSED. If the store cannot answer a poll, a reload or a version read,
-// or a stored policy does not compile against what is registered, the handle
-// goes DOWN: `can` is false, `check` and `filterFor` fail with
+// the handle goes DOWN: `can` is false, `check` and `filterFor` fail with
 // `StoreUnavailable` (503), for every subject and tenant, until a later
 // refresh succeeds. Nothing is allowed on the strength of a cache whose
 // freshness is unknown. The cause is logged once at ERROR when the handle goes
@@ -107,6 +106,7 @@ class StoreSync {
   tenants: map<string, i64>
   total: i64
   global: i64
+  registration: int
   down: AtomicI64
   lastOk: AtomicI64
   stopping: AtomicI64
@@ -121,6 +121,7 @@ class StoreSync {
     this.tenants = map<string, i64>()
     this.total = -1
     this.global = -1
+    this.registration = -1
     this.down = AtomicI64(0)
     this.lastOk = AtomicI64(i64(monotonic().ns))
     this.stopping = AtomicI64(0)
@@ -192,14 +193,29 @@ fn typedFailure(e: error): error {
 }
 
 // Every stored policy compiled against what is registered now.
-fn compiledPolicies<A: ActionEnum>(a: Authz<A>): map<string, CompiledPolicy<A>>! {
+fn compiledPolicies<A: ActionEnum>(a: Authz<A>): StoredIndex<A>! {
   let reg = a.registered()
-  let out = map<string, CompiledPolicy<A>>()
+  let out = emptyStored<A>()
   for doc of a.store.policies()? {
-    let cp = compileDocIn<A>(reg.resources, reg.decls, doc)?
-    out[cp.name] = cp
+    let cp = compileDocIn<A>(reg.resources, reg.decls, doc) catch e {
+      out.failures[doc.name] = "policy ${doc.name}: ${e.message()}"
+      continue
+    }
+    out.policies[cp.name] = cp
   }
   return out
+}
+
+// Log only a published transition; a failed store read publishes nothing.
+fn logPolicyFailures<A: ActionEnum>(a: Authz<A>, before: StoredIndex<A>, after: StoredIndex<A>) {
+  for (name, detail) of after.failures {
+    let (old, found) = before.failures[name]
+    if (!found || old != detail) {
+      loggerOf<A>(a.registered()).error().str("policy", name).str("detail", detail).log(
+        "stored policy invalid: attached subjects fail closed",
+      )
+    }
+  }
 }
 
 // Under `admin`: brings the index up to what the store holds, reading as
@@ -208,12 +224,16 @@ fn compiledPolicies<A: ActionEnum>(a: Authz<A>): map<string, CompiledPolicy<A>>!
 fn syncLocked<A: ActionEnum>(a: Authz<A>): ()! {
   let s = a.storeSync
   let total = a.store.version()?
-  if (total == s.total) {
+  let reg = a.registered()
+  // Resources and declarations are append-only under the handle admin lock.
+  let registration = len(reg.resources) + len(reg.decls)
+  if (total == s.total && registration == s.registration) {
     return
   }
   let g = a.store.scopeVersion("")?
-  let global = g != s.global
-  let ix = a.registered().stored
+  let global = g != s.global || registration != s.registration
+  let before = reg.stored
+  let ix = before
   if (global) {
     ix = storedWithPolicies<A>(ix, compiledPolicies<A>(a)?)
     ix = storedWithTenant<A>(ix, "", a.store.attachments("")?)
@@ -230,6 +250,8 @@ fn syncLocked<A: ActionEnum>(a: Authz<A>): ()! {
   }
   a.state.cache.publishStored(ix, global, changed)
   s.loaded(total, g, moved)
+  s.registration = registration
+  logPolicyFailures<A>(a, before, ix)
 }
 
 // The handle goes down because of `e`; the first time, that is one ERROR.
