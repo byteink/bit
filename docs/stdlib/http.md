@@ -190,7 +190,9 @@ fn uploadDraft(url: string): int! {
     expectContinueTimeoutMs = 250,
     source = (n) => {
       let end = pos + n
-      if (end > len(draft)) { end = len(draft) }
+      if (end > len(draft)) {
+        end = len(draft)
+      }
       let part = draft[pos:end]
       pos = end
       return part
