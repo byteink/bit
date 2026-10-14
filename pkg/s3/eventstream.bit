@@ -1,7 +1,236 @@
-// pkg/s3/eventstream.bit — the response payload type of an event-stream
-// operation (SelectObjectContent). #6606 gives it the frame decoder and the
-// pull interface; until then it holds the decoded events.
+// Framing is shared; Select interpretation stays separate from wire decoding.
+import { crc32 } from "std/hash"
+import { isValidUtf8 } from "std/strings"
+import { parse as parseXml } from "std/xml"
 
 export class EventStream<T> {
   export events: []T,
+}
+
+export enum EventHeaderValue {
+  Bool(bool),
+  Byte(i8),
+  Short(i16),
+  Integer(i32),
+  Long(i64),
+  Binary([]byte),
+  Text(string),
+  Timestamp(i64),
+  Uuid([]byte),
+}
+
+export class EventMessage {
+  export headers: map<string, EventHeaderValue>,
+  export payload: []byte,
+}
+
+// Local allocation policy, not the service's protocol-size restrictions.
+const eventMessageLimit: int = 16777216
+
+class EventCursor {
+  data: []byte
+  pos: int = 0
+
+  take(n: int): []byte!S3Error {
+    if (n < 0 || n > len(this.data) - this.pos) {
+      fail invalidInput("event stream: truncated header")
+    }
+    let out = this.data[this.pos:this.pos + n]
+    this.pos = this.pos + n
+    return out
+  }
+
+  number(n: int): u64!S3Error {
+    let bytes = this.take(n)?
+    let value: u64 = 0
+    for b of bytes {
+      value = (value << 8) | u64(b)
+    }
+    return value
+  }
+
+  text(n: int): string!S3Error {
+    let value = string(this.take(n)?)
+    if (!isValidUtf8(value)) {
+      fail invalidInput("event stream: invalid UTF-8 header")
+    }
+    return value
+  }
+
+  value(kind: int): EventHeaderValue!S3Error {
+    if (kind < 2) {
+      return EventHeaderValue.Bool(kind == 0)
+    }
+    if (kind == 2) {
+      return EventHeaderValue.Byte(i8(this.number(1)?))
+    }
+    if (kind == 3) {
+      return EventHeaderValue.Short(i16(this.number(2)?))
+    }
+    if (kind == 4) {
+      return EventHeaderValue.Integer(i32(this.number(4)?))
+    }
+    if (kind == 5) {
+      return EventHeaderValue.Long(i64(this.number(8)?))
+    }
+    if (kind == 6) {
+      return EventHeaderValue.Binary(this.take(int(this.number(2)?))?)
+    }
+    if (kind == 7) {
+      return EventHeaderValue.Text(this.text(int(this.number(2)?))?)
+    }
+    if (kind == 8) {
+      return EventHeaderValue.Timestamp(i64(this.number(8)?))
+    }
+    if (kind == 9) {
+      return EventHeaderValue.Uuid(this.take(16)?)
+    }
+    fail invalidInput("event stream: unknown header type")
+  }
+}
+
+fn eventHeaders(data: []byte): map<string, EventHeaderValue>!S3Error {
+  let cursor = EventCursor{ data = data }
+  let out = map<string, EventHeaderValue>()
+  // Each iteration consumes at least a name length, one name byte and a type.
+  let maxHeaders = len(data) / 3
+  let count = 0
+  while (count < maxHeaders) {
+    count = count + 1
+    if (cursor.pos == len(data)) {
+      return out
+    }
+    let n = int(cursor.number(1)?)
+    if (n == 0) {
+      fail invalidInput("event stream: empty header name")
+    }
+    let name = cursor.text(n)?
+    let (_, exists) = out[name]
+    if (exists) {
+      fail invalidInput("event stream: duplicate header name")
+    }
+    out[name] = cursor.value(int(cursor.number(1)?))?
+  }
+  if (cursor.pos != len(data)) {
+    fail invalidInput("event stream: truncated header")
+  }
+  return out
+}
+
+export fn decodeEventMessage(data: []byte): EventMessage!S3Error {
+  if (len(data) < 12) {
+    fail invalidInput("event stream: truncated prelude")
+  }
+  let cursor = EventCursor{ data = data }
+  let total = int(cursor.number(4)?)
+  let headers = int(cursor.number(4)?)
+  let preludeCrc = u32(cursor.number(4)?)
+  if (crc32(data[0:8]) != preludeCrc) {
+    fail clientError(ErrorKind.ChecksumMismatch, "event stream: prelude CRC mismatch")
+  }
+  if (total > eventMessageLimit) {
+    fail invalidInput("event stream: message exceeds local 16 MiB limit")
+  }
+  if (total < 16 || headers > total - 16 || len(data) != total) {
+    fail invalidInput("event stream: invalid message length")
+  }
+  cursor.pos = total - 4
+  if (crc32(data[0:total - 4]) != u32(cursor.number(4)?)) {
+    fail clientError(ErrorKind.ChecksumMismatch, "event stream: message CRC mismatch")
+  }
+  return EventMessage{
+    headers = eventHeaders(data[12:12 + headers])?,
+    payload = data[12 + headers:total - 4],
+  }
+}
+
+fn eventText(message: EventMessage, name: string): string!S3Error {
+  let (value, exists) = message.headers[name]
+  if (!exists) {
+    fail invalidInput("event stream: missing ${name}")
+  }
+  match (value) {
+    Text(text) => return text
+    _ => fail invalidInput("event stream: ${name} is not a string")
+  }
+}
+
+fn eventServiceError(message: EventMessage, kind: string): S3Error!S3Error {
+  let name = ":error-code"
+  if (kind == "exception") {
+    name = ":exception-type"
+  }
+  let code = eventText(message, name)?
+  let detail = string(message.payload)
+  if (kind == "error") {
+    detail = eventText(message, ":error-message")?
+  }
+  let serviceError = clientError(kindForCode(code), detail)
+  serviceError.code = code
+  return serviceError
+}
+
+fn eventStats(payload: []byte, root: string): Stats!S3Error {
+  let element = parseXml(payload, 8, 32, eventMessageLimit, 256) catch _ {
+    fail invalidInput("event stream: invalid statistics XML")
+  }
+  if (element.local != root) {
+    fail invalidInput("event stream: wrong statistics root")
+  }
+  let details = element
+  // The event appendix uses direct counters; modeled XML wraps them in Details.
+  match (element.child("Details")) {
+    Some(inner) => details = inner
+    None => {}
+  }
+  return Stats{
+    bytesScanned = xmlOpt(details, "BytesScanned", xmlInt) catch _ {
+      fail invalidInput("event stream: invalid BytesScanned")
+    },
+    bytesProcessed = xmlOpt(details, "BytesProcessed", xmlInt) catch _ {
+      fail invalidInput("event stream: invalid BytesProcessed")
+    },
+    bytesReturned = xmlOpt(details, "BytesReturned", xmlInt) catch _ {
+      fail invalidInput("event stream: invalid BytesReturned")
+    },
+  }
+}
+
+export fn decodeSelectEvent(data: []byte): SelectObjectContentEventStream!S3Error {
+  let message = decodeEventMessage(data)?
+  let kind = eventText(message, ":message-type")?
+  if (kind == "error" || kind == "exception") {
+    fail eventServiceError(message, kind)?
+  }
+  if (kind != "event") {
+    fail invalidInput("event stream: unknown message type")
+  }
+  let name = eventText(message, ":event-type")?
+  if (name == "Records") {
+    return SelectObjectContentEventStream.Records(RecordsEvent{ payload = Option.Some(message.payload) })
+  }
+  if (name == "Stats") {
+    return SelectObjectContentEventStream.Stats(
+      StatsEvent{ details = Option.Some(eventStats(message.payload, name)?) },
+    )
+  }
+  if (name == "Progress") {
+    let stats = eventStats(message.payload, name)?
+    return SelectObjectContentEventStream.Progress(
+      ProgressEvent{
+        details = Option.Some(
+          Progress{
+            bytesScanned = stats.bytesScanned, bytesProcessed = stats.bytesProcessed, bytesReturned = stats.bytesReturned,
+          },
+        ),
+      },
+    )
+  }
+  if (name == "Cont") {
+    return SelectObjectContentEventStream.Cont(ContinuationEvent{})
+  }
+  if (name == "End") {
+    return SelectObjectContentEventStream.End(EndEvent{})
+  }
+  return SelectObjectContentEventStream.Unknown(name)
 }
