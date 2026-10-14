@@ -65,6 +65,39 @@ for the moment a server answers `ExpiredToken`. A profile that names a file the
 parser cannot read fails with a `ProfileFileError` carrying `path`, `line` and
 `reason`.
 
+### A task role for Inkwell
+
+Inkwell deployed as an ECS task or EKS pod uses the task's temporary identity
+instead of a key in its configuration. Give the container provider to the
+same cache; forced refresh reads a rotated authorization token file again.
+
+```bit
+import { Credentials, Refresh, containerCredentials } from "aws"
+
+fn main(): ()! {
+  let identity = Credentials.Provider(containerCredentials).resolver()?
+  println(identity.resolve(Refresh.IfNeeded)?.show())
+  println(identity.resolve(Refresh.Force)?.show())
+  return
+}
+```
+
+`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` takes precedence over
+`AWS_CONTAINER_CREDENTIALS_FULL_URI`. Relative paths use `169.254.170.2`.
+An HTTP full URI must name `localhost`, IPv4 loopback, IPv6 loopback,
+`169.254.170.2`, `169.254.170.23` or `fd00:ec2::23`; HTTPS can name any host.
+Invalid hosts fail before a request. Redirects are refused, so another
+endpoint never receives the authorization header.
+
+`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` takes precedence over
+`AWS_CONTAINER_AUTHORIZATION_TOKEN`. The file is reopened on each attempt,
+following rotating symlinks while refusing devices, pipes and directories.
+Tokens with control characters fail before a request. Each HTTP attempt has
+a one-second deadline, with three retries separated by one second. URI text
+has an 8 KiB budget; token files and responses have a 16 KiB budget each.
+These are this provider's resource limits. Errors name fields or HTTP status
+without copying tokens, credentials, response bodies or endpoint URLs.
+
 ## Signing a request
 
 A signed request needs the credential's view for one region and service, and

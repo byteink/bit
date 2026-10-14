@@ -1,7 +1,7 @@
 # pkg/aws
 
 What every AWS client in Bit shares: who a request is signed as (credentials,
-the environment, shared config profiles, STS), how it is signed (Signature
+the environment, shared config profiles, container task roles, STS), how it is signed (Signature
 Version 4, in a header or in a presigned URL), and where it goes (partitions
 and endpoint URLs). `pkg/s3` is built on it; so is any other AWS service
 client, the SES transport of `pkg/mail` included, without importing an S3

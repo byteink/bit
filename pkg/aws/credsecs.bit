@@ -1,0 +1,310 @@
+// Container identities use the same refresh cache as every other AWS provider.
+import { Client as ContainerHttp, Redirects, Response } from "std/http"
+import { Json, jsonGet, jsonParse } from "std/json"
+import { isIpv4Literal, isIpv6Literal } from "std/net"
+import { env } from "std/os"
+import { openRegular } from "std/fs/secure"
+import { hasPrefix, indexOf, split, toLower } from "std/strings"
+import { Millisecond, now, parseRfc3339, sleep } from "std/time"
+
+const containerRelative: string = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+const containerFull: string = "AWS_CONTAINER_CREDENTIALS_FULL_URI"
+const containerToken: string = "AWS_CONTAINER_AUTHORIZATION_TOKEN"
+const containerTokenFile: string = "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
+// These are byte budgets, not limits imposed by AWS.
+const containerMaxBytes: int = 16384
+const containerMaxUri: int = 8192
+const containerTimeoutMs: int = 1000
+
+fn containerUriBytes(uri: string): ()! {
+  if (len(uri) == 0 || len(uri) > containerMaxUri) {
+    fail newError("aws: container: URI is empty or exceeds the byte limit")
+  }
+  let i = 0
+  while (i < len(uri)) {
+    if (uri[i] <= ' ' || uri[i] == 127 || uri[i] == '\\') {
+      fail newError("aws: container: invalid URI character")
+    }
+    i = i + 1
+  }
+}
+
+fn containerPort(port: string): ()! {
+  if (len(port) == 0 || len(port) > 5) {
+    fail newError("aws: container: invalid port")
+  }
+  let n = 0
+  let i = 0
+  while (i < len(port)) {
+    if (port[i] < '0' || port[i] > '9') {
+      fail newError("aws: container: invalid port")
+    }
+    n = n * 10 + int(port[i] - '0')
+    i = i + 1
+  }
+  if (n == 0 || n > 65535) {
+    fail newError("aws: container: invalid port")
+  }
+}
+
+fn containerBracketHost(authority: string): string! {
+  let end = indexOf(authority, "]")
+  if (end < 0 || !isIpv6Literal(authority[1:end])) {
+    fail newError("aws: container: invalid IPv6 host")
+  }
+  let tail = authority[end + 1:len(authority)]
+  if (tail != "") {
+    if (tail[0] != ':') {
+      fail newError("aws: container: invalid IPv6 authority")
+    }
+    containerPort(tail[1:len(tail)])?
+  }
+  return authority[1:end]
+}
+
+fn containerAuthority(authority: string): string! {
+  if (len(authority) == 0 || indexOf(authority, "@") >= 0 || indexOf(authority, "%") >= 0) {
+    fail newError("aws: container: invalid authority")
+  }
+  if (authority[0] == '[') {
+    return containerBracketHost(authority)?
+  }
+  let colon = indexOf(authority, ":")
+  let host = authority
+  if (colon >= 0) {
+    containerPort(authority[colon + 1:len(authority)])?
+    host = authority[0:colon]
+  }
+  if (host == "" || indexOf(host, "[") >= 0 || indexOf(host, "]") >= 0) {
+    fail newError("aws: container: invalid host")
+  }
+  return host
+}
+
+// Expand only validated IPv6 groups so equivalent spellings share one policy.
+fn containerIpv6Groups(host: string): []string {
+  let parts = split(host, ":")
+  let groups = []string(0)
+  let missing = 8
+  for part of parts {
+    if (part != "") {
+      missing = missing - 1
+    }
+  }
+  let expanded = false
+  for part of parts {
+    if (part == "") {
+      if (!expanded) {
+        let i = 0
+        while (i < missing) {
+          groups = append(groups, "0")
+          i = i + 1
+        }
+        expanded = true
+      }
+    } else {
+      let i = 0
+      while (i + 1 < len(part) && part[i] == '0') {
+        i = i + 1
+      }
+      groups = append(groups, part[i:len(part)])
+    }
+  }
+  return groups
+}
+
+fn containerIpv6Ends(groups: []string): bool {
+  let loopback = groups[0] == "0" && groups[1] == "0" && groups[7] == "1"
+  let eks = groups[0] == "fd00" && groups[1] == "ec2" && groups[7] == "23"
+  return loopback || eks
+}
+
+fn containerIpv6Allowed(host: string): bool {
+  if (!isIpv6Literal(host) || indexOf(host, ".") >= 0) {
+    return false
+  }
+  let groups = containerIpv6Groups(host)
+  if (len(groups) != 8) {
+    return false
+  }
+  let i = 2
+  while (i < 7) {
+    if (groups[i] != "0") {
+      return false
+    }
+    i = i + 1
+  }
+  return containerIpv6Ends(groups)
+}
+
+fn containerHttpAllowed(host: string): bool {
+  if (host == "localhost" || host == "169.254.170.2" || host == "169.254.170.23") {
+    return true
+  }
+  if (isIpv4Literal(host)) {
+    return hasPrefix(host, "127.")
+  }
+  return containerIpv6Allowed(host)
+}
+
+fn containerPath(path: string): string {
+  let fragment = indexOf(path, "#")
+  if (fragment >= 0) {
+    path = path[0:fragment]
+  }
+  if (!hasPrefix(path, "/")) {
+    path = "/${path}"
+  }
+  return path
+}
+
+fn containerUri(uri: string): string! {
+  containerUriBytes(uri)?
+  let lower = toLower(uri)
+  let offset = 7
+  let https = hasPrefix(lower, "https://")
+  if (https) {
+    offset = 8
+  } else if (!hasPrefix(lower, "http://")) {
+    fail newError("aws: container: URI must use HTTP or HTTPS")
+  }
+  let end = offset
+  while (end < len(uri) && uri[end] != '/' && uri[end] != '?' && uri[end] != '#') {
+    end = end + 1
+  }
+  let authority = lower[offset:end]
+  let host = containerAuthority(authority)?
+  if (!https && !containerHttpAllowed(host)) {
+    fail newError("aws: container: HTTP host is not allowed")
+  }
+  let path = containerPath(uri[end:len(uri)])
+  return "${lower[0:offset]}${authority}${path}"
+}
+
+fn containerEndpoint(get: (string) => string): string! {
+  let relative = get(containerRelative)
+  if (relative != "") {
+    if (!hasPrefix(relative, "/")) {
+      fail newError("aws: container: relative URI must start with /")
+    }
+    return containerUri("http://169.254.170.2${relative}")?
+  }
+  return containerUri(get(containerFull))?
+}
+
+fn containerAuthorization(get: (string) => string, read: (string) => string!): string! {
+  let token = get(containerToken)
+  let file = get(containerTokenFile)
+  if (file != "") {
+    token = read(file) catch _ {
+      fail newError("aws: container: authorization token file cannot be read")
+    }
+  }
+  if (len(token) > containerMaxBytes || hasControl([]byte(token))) {
+    fail newError("aws: container: invalid authorization token")
+  }
+  return token
+}
+
+fn containerField(json: Json, field: string): string! {
+  match (jsonGet(json, field)) {
+    Some(value) => match (value) {
+      JsonString(text) => return text
+      _ => fail newError("aws: container: ${field} must be a string")
+    }
+    None => fail newError("aws: container: ${field} is missing")
+  }
+}
+
+fn containerIdentity(response: Response): AwsCredential! {
+  if (response.status != 200) {
+    fail newError("aws: container: endpoint returned HTTP ${response.status}")
+  }
+  if (len(response.body) > containerMaxBytes) {
+    fail newError("aws: container: response exceeds the byte limit")
+  }
+  let json = jsonParse(response.body) catch _ {
+    fail newError("aws: container: invalid response JSON")
+  }
+  let expiration = parseRfc3339(containerField(json, "Expiration")?) catch _ {
+    fail newError("aws: container: invalid Expiration timestamp")
+  }
+  if (expiration.ns <= now().ns) {
+    fail newError("aws: container: credentials have expired")
+  }
+  return AwsCredential(
+    accessKeyId = containerField(json, "AccessKeyId")?,
+    secretAccessKey = containerField(json, "SecretAccessKey")?,
+    sessionToken = Option<string>.Some(containerField(json, "Token")?),
+    expiration = Option.Some(expiration),
+  )?
+}
+
+fn containerFetch(uri: string, token: string): Response! {
+  let client = ContainerHttp()
+  defer client.close()
+  client.setRedirects(Redirects.None)
+  client.setMaxBodyBytes(containerMaxBytes)
+  if (token != "") {
+    client.setHeader("Authorization", token) catch _ {
+      fail newError("aws: container: invalid authorization token")
+    }
+  }
+  return client.getTimeout(uri, containerTimeoutMs) catch _ {
+    fail newError("aws: container: endpoint request failed")
+  }
+}
+
+fn containerReadToken(path: string): string! {
+  let file = openRegular(path)?
+  defer file.close()
+  let bytes = []byte(containerMaxBytes + 1)
+  let total = 0
+  while (total < len(bytes)) {
+    let count = file.readAt(bytes[total:len(bytes)], i64(total))?
+    if (count == 0) {
+      return string(bytes[0:total])
+    }
+    total = total + count
+  }
+  fail newError("aws: container: authorization token exceeds the byte limit")
+}
+
+fn containerAttempt(
+  uri: string,
+  get: (string) => string,
+  read: (string) => string!,
+  fetch: (string, string) => Response!,
+): AwsCredential! {
+  let token = containerAuthorization(get, read)?
+  let response = fetch(uri, token) catch _ {
+    fail newError("aws: container: endpoint request failed")
+  }
+  return containerIdentity(response)?
+}
+
+fn containerFrom(
+  get: (string) => string,
+  read: (string) => string!,
+  fetch: (string, string) => Response!,
+): AwsCredential! {
+  let uri = containerEndpoint(get)?
+  let attempt = 0
+  while (attempt < 4) {
+    let identity = containerAttempt(uri, get, read, fetch) catch e {
+      attempt = attempt + 1
+      if (attempt == 4) {
+        fail newError("aws: container: credential fetch failed after four attempts: ${e.message()}")
+      }
+      sleep(containerTimeoutMs * Millisecond)
+      continue
+    }
+    return identity
+  }
+  fail newError("aws: container: credential fetch failed")
+}
+
+// ECS/EKS container environment credentials, suitable for Credentials.Provider.
+export fn containerCredentials(): AwsCredential! {
+  return containerFrom(env, containerReadToken, containerFetch)?
+}
