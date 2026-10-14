@@ -3643,6 +3643,14 @@ live across calls in a large function.
 
 ## 14. Filesystem primitives
 
+`bit_rt_fs_open_read_nonblocking_w` (#8128) takes packed path bytes and
+returns a read-only descriptor, or -1. Symlinks are followed. POSIX opens
+with `O_NONBLOCK|O_CLOEXEC`; Windows uses `CreateFileW(OPEN_EXISTING)` without
+`WaitNamedPipe`, refuses non-disk handles and closes refused handles.
+`std/fs/secure.openRegular` then checks the same descriptor with `statOpen`,
+closes any inspection failure or nonregular descriptor, and transfers
+ownership only for a regular file. No data is read before this check.
+
 ```
 bit_rt_fs_open(path, write: bool) -> i64        // fd, or -1
 bit_rt_fs_append(path)            -> i64        // fd opened O_APPEND, or -1
@@ -3654,6 +3662,7 @@ bit_rt_fs_pread_w(fd, buf, max, off) -> i64     // positional read; count, or ne
 bit_rt_fs_pwrite_w(fd, buf, n, off)  -> i64     // positional write; count, or negative
 bit_rt_fs_open_rw_w(words, n)     -> i64        // O_RDWR|O_CREAT, no O_TRUNC; fd, or -1
 bit_rt_fs_open_nofollow_w(words, n) -> i64      // read-only, refuses a symlinked final component; fd, or -1
+bit_rt_fs_open_read_nonblocking_w(words, n) -> i64 // read-only, follows symlinks; fd, or -1
 bit_rt_fs_sync(fd)                -> i64        // 0, or -1
 bit_rt_fs_truncate(fd, size: i64) -> i64        // set fd's length; 0, or -1
 bit_rt_fs_size(fd)                -> i64        // fd's length in bytes, or -1
