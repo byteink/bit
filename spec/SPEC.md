@@ -163,8 +163,8 @@ path-introducing `from`.
 
 `in` is contextual too: it lexes as an ordinary identifier, so a function,
 parameter, variable, field, or method can use the name. Only the delimiter
-after a `for` binder (§13.1) reads `in` as the iteration keyword. This also
-preserves `in:` as a map literal key (§12.3.1).
+after a `for` binder (§13.1) reads `in` as the iteration keyword. A line
+break after that delimiter does not end the loop header. This also preserves `in:` as a map literal key (§12.3.1).
 
 ### 5.3 Predeclared Identifiers (not keywords)
 
