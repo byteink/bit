@@ -1,0 +1,283 @@
+// Pinned SDK container/fromHttp vectors plus bounded transport and secret controls.
+import { Request, Server, listenAndServeOn, respond, serve } from "std/http"
+import { envOr } from "std/os"
+import { remove, writeFile } from "std/fs"
+import { contains, repeat } from "std/strings"
+
+const containerFixture: string = "{\"AccessKeyId\":\"CONTAINERKEY\",\"SecretAccessKey\":\"private-secret\",\"Token\":\"session-secret\",\"Expiration\":\"2099-01-01T00:00:00Z\"}"
+
+class ContainerFake {
+  vars: map<string, string>
+  calls: int
+  uri: string
+  token: string
+  answer: string
+  failures: int
+  rotate: string
+
+  init() {
+    this.vars = map<string, string>()
+    this.calls = 0
+    this.uri = ""
+    this.token = ""
+    this.answer = containerFixture
+    this.failures = 0
+    this.rotate = ""
+  }
+
+  get(name: string): string {
+    let (value, _) = this.vars[name]
+    return value
+  }
+
+  fetch(uri: string, token: string): Response! {
+    this.calls = this.calls + 1
+    this.uri = uri
+    this.token = token
+    if (this.failures > 0) {
+      this.failures = this.failures - 1
+      if (this.rotate != "") {
+        writeFile(this.get(containerTokenFile), this.rotate)?
+      }
+      fail newError("private-secret transport failure")
+    }
+    return respond(200, this.answer)
+  }
+
+  resolve(): AwsCredential! {
+    return containerFrom(
+      (key) => this.get(key),
+      containerReadToken,
+      (uri, token) => this.fetch(uri, token),
+    )?
+  }
+}
+
+fn containerMust(fake: ContainerFake): AwsCredential {
+  return fake.resolve() catch e {
+    panic(e.message())
+  }
+}
+
+fn containerRefused(fake: ContainerFake) {
+  fake.resolve() catch e {
+    assert(!contains(e.message(), "private-secret"), "error leaked a secret")
+    assert(fake.calls == 0, "invalid configuration made ${fake.calls} requests")
+    return
+  }
+  panic("invalid container configuration accepted")
+}
+
+test "container relative URI wins and loopback full URI fetches an identity" {
+  let relative = ContainerFake()
+  relative.vars[containerRelative] = "/credentials?role=inkwell"
+  relative.vars[containerFull] = "http://example.com/private-secret"
+  let got = containerMust(relative)
+  assert(got.accessKeyId == "CONTAINERKEY" && got.token() == "session-secret", "identity fields")
+  assert(relative.uri == "http://169.254.170.2/credentials?role=inkwell", "relative URI precedence")
+  assert(relative.calls == 1, "relative request count")
+  let loopback = ContainerFake()
+  loopback.vars[containerFull] = "http://127.0.0.1:8080/credentials"
+  let _ = containerMust(loopback)
+  assert(loopback.calls == 1 && loopback.uri == loopback.vars[containerFull], "loopback request")
+}
+
+test "container HTTP host policy refuses before any request" {
+  let denied = [
+    "http://example.com/private-secret", "http://169.254.170.3/", "http://169.254.170.24/",
+    "http://192.168.1.1/", "http://constructor/", "http://127.0.0.1.example.com/",
+    "http://127.1/", "http://0177.0.0.1/", "http://127.0.0.256/",
+    "http://[fd00:ec2::24]/", "http://[::ffff:127.0.0.1]/", "http://[::1%25lo]/",
+    "http://user:private-secret@127.0.0.1/", "http://127.0.0.1:65536/",
+    "http://127.0.0.1:/", "http://127.0.0.1:bad/", "wss://localhost/", "not a valid url",
+  ]
+  for uri of denied {
+    let fake = ContainerFake()
+    fake.vars[containerFull] = uri
+    containerRefused(fake)
+  }
+  let missing = ContainerFake()
+  containerRefused(missing)
+}
+
+test "container policy accepts HTTPS and canonical IPv4 and IPv6 loopback hosts" {
+  let allowed = [
+    "https://example.com/credentials", "http://169.254.170.2/", "http://169.254.170.23/",
+    "http://localhost/", "http://LOCALHOST/", "http://127.0.0.0/", "http://127.255.255.255/",
+    "http://[::1]/", "http://[0000:0000:0000:0000:0000:0000:0000:0001]/",
+    "http://[0:0::01]/", "http://[fd00:ec2::23]/", "http://[FD00:0EC2:0:0:0:0:0:0023]/",
+  ]
+  for uri of allowed {
+    let fake = ContainerFake()
+    fake.vars[containerFull] = uri
+    let _ = containerMust(fake)
+    assert(fake.calls == 1, "allowed host did not make one request")
+  }
+}
+
+fn containerWrite(path: string, token: string) {
+  writeFile(path, token) catch e {
+    panic(e.message())
+  }
+}
+
+fn containerRemove(path: string) {
+  remove(path) catch e {
+    panic(e.message())
+  }
+}
+
+test "container token file wins and is reread after rotation" {
+  let path = "${envOr("TMPDIR", "/tmp")}/t6591-token-${timeUnixNs()}"
+  containerWrite(path, "first-token")
+  defer containerRemove(path)
+  let fake = ContainerFake()
+  fake.vars[containerFull] = "http://127.0.0.1/"
+  fake.vars[containerToken] = "stale-token"
+  fake.vars[containerTokenFile] = path
+  let _ = containerMust(fake)
+  assert(fake.token == "first-token", "file did not win")
+  containerWrite(path, "second-token")
+  let _ = containerMust(fake)
+  assert(fake.token == "second-token" && fake.calls == 2, "rotation was not observed")
+  fake.calls = 0
+  fake.failures = 1
+  fake.rotate = "third-token"
+  let _ = containerMust(fake)
+  assert(fake.token == "third-token" && fake.calls == 2, "retry did not reread the rotated file")
+  containerWrite(path, repeat("x", containerMaxBytes + 1))
+  fake.calls = 0
+  containerRefused(fake)
+}
+
+test "container malformed authorization never reaches the transport" {
+  for token of ["private-secret\r\nX-Injected: secret", "private-secret\n", "private-secret\0"] {
+    let fake = ContainerFake()
+    fake.vars[containerFull] = "http://127.0.0.1/"
+    fake.vars[containerToken] = token
+    containerRefused(fake)
+  }
+}
+
+fn containerBodyRefused(body: string, status: int = 200) {
+  containerIdentity(respond(status, body)) catch e {
+    assert(
+      !contains(e.message(), "private-secret") && !contains(e.message(), "session-secret"),
+      "response error leaked a secret",
+    )
+    return
+  }
+  panic("invalid container response accepted")
+}
+
+test "container retries a transient token file read before its first request" {
+  let fake = ContainerFake()
+  fake.vars[containerFull] = "http://127.0.0.1/"
+  fake.vars[containerTokenFile] = "/virtual-token"
+  let reads = 0
+  let identity = containerFrom(
+    (key) => fake.get(key),
+    (_) => {
+      reads = reads + 1
+      if (reads == 1) {
+        fail newError("private-secret read error")
+      }
+      return "rotated-token"
+    },
+    (uri, token) => fake.fetch(uri, token),
+  ) catch e {
+    panic(e.message())
+  }
+  assert(reads == 2 && fake.calls == 1 && fake.token == "rotated-token", "token read retry")
+  assert(identity.accessKeyId == "CONTAINERKEY", "identity after read retry")
+}
+
+test "container malformed responses and expiration are checked without secret disclosure" {
+  for body of [
+    "private-secret", "[]", "{}", "{\"AccessKeyId\":1}",
+    "{\"Expiration\":\"private-secret\"}",
+    "{\"Expiration\":\"2000-01-01T00:00:00Z\"}",
+    "{\"AccessKeyId\":\"key\",\"SecretAccessKey\":\"private-secret\",\"Token\":7,\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    repeat("x", containerMaxBytes + 1),
+  ] {
+    containerBodyRefused(body)
+  }
+  containerBodyRefused("private-secret", 403)
+  containerBodyRefused("session-secret", 500)
+  containerBodyRefused(containerFixture, 302)
+}
+
+class ContainerWire {
+  hits: int,
+  status: int,
+  body: string,
+  headers: string,
+  location: string,
+}
+
+fn containerServe(server: Server, wire: ContainerWire) {
+  listenAndServeOn(server, (request: Request) => {
+    wire.hits = wire.hits + 1
+    wire.headers = request.headers
+    let response = respond(wire.status, wire.body)
+    response.headers = "Location: ${wire.location}\r\n"
+    return response
+  }) catch _ {
+    return
+  }
+}
+
+test "container transport reads a loopback response and never follows redirects" {
+  let server = serve("127.0.0.1", 0) catch e {
+    panic(e.message())
+  }
+  defer server.close()
+  let port = server.port() catch e {
+    panic(e.message())
+  }
+  let other = serve("127.0.0.1", 0) catch e {
+    panic(e.message())
+  }
+  defer other.close()
+  let otherPort = other.port() catch e {
+    panic(e.message())
+  }
+  let unseen = ContainerWire{
+    hits = 0,
+    status = 200,
+    body = containerFixture,
+    headers = "",
+    location = "",
+  }
+  spawn containerServe(other, unseen)
+  let wire = ContainerWire{
+    hits = 0, status = 200, body = containerFixture, headers = "",
+    location = "http://127.0.0.1:${otherPort}/credentials",
+  }
+  spawn containerServe(server, wire)
+  let uri = "http://127.0.0.1:${port}/credentials"
+  let response = containerFetch(uri, "Bearer wire-token") catch e {
+    panic(e.message())
+  }
+  let identity = containerIdentity(response) catch e {
+    panic(e.message())
+  }
+  assert(identity.accessKeyId == "CONTAINERKEY" && wire.hits == 1, "native loopback fetch")
+  assert(contains(wire.headers, "Bearer wire-token"), "authorization header missing")
+  wire.status = 302
+  let redirected = containerFetch(uri, "Bearer wire-token") catch e {
+    panic(e.message())
+  }
+  assert(
+    redirected.status == 302 && redirected.redirects == 0 && wire.hits == 2,
+    "redirect followed",
+  )
+  assert(unseen.hits == 0 && unseen.headers == "", "redirect target received authorization")
+  wire.status = 200
+  wire.body = repeat("x", containerMaxBytes + 1)
+  containerFetch(uri, "Bearer wire-token") catch e {
+    assert(!contains(e.message(), "wire-token"), "transport error leaked token")
+    return
+  }
+  panic("oversized response body accepted")
+}
