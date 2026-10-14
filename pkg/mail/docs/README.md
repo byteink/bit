@@ -26,6 +26,6 @@ bitlang.org's sidebar reads it in.
 | [Checking the setup at boot](verify.md) | `Mailer.verify` on Inkwell's deploy: every transport connects and logs in without sending a message, each DKIM key is compared with the TXT record DNS publishes for it, every problem in one `Config` error with the record to publish |
 | [Staging mail](redirect.md) | `Options.redirect` on Inkwell's staging server: one address takes every mail, the envelope is that address alone, `X-Original-To`, the `[redirected]` Subject, Bcc in no header, DKIM over the redirected bytes, a provider API's recipient fields, a bad address failing at `Mailer(...)` |
 | [Test the mail your app sends](testing.md) | Inkwell's registration test with an injected `Mailer` and `Outbox`, rendered text snapshots, `log://` and `file://` in development, local Mailpit SMTP and HTML checks, staging redirects |
-| [Webhooks](webhooks.md) | `parseEvents`, `Event`, `EventKind` and `Provider` on Inkwell's suppression list: Resend's Svix signature, the 5 minute window, de-duplicating on `deliveryId`, what each Resend event becomes |
+| [Webhooks](webhooks.md) | `parseEvents`, `Event`, `EventKind` and `Provider` on Inkwell's suppression list: Resend, Postmark, Mailgun and signed SendGrid batches; the 5 minute window and de-duplicating on `deliveryId` |
 
 See the [package front page](../README.md) for install and a minimal example.

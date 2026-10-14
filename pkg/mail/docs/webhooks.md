@@ -38,7 +38,8 @@ Do not parse it and write it back out first: the signature covers the bytes
 Resend sent, and a different spacing or key order makes it fail.
 
 One webhook can name several recipients, and you get one `Event` for each. The
-provider is a value, `Provider.Resend`, `Provider.Postmark` or `Provider.Mailgun`, and not a different function, so
+provider is a value, `Provider.Resend`, `Provider.Postmark`, `Provider.Mailgun`
+or `Provider.SendGrid`, and not a different function, so
 the day Inkwell adds a second provider only that argument changes. `Provider`
 lists only the providers whose webhooks `parseEvents` can read; a new one is
 added in the same release as its parser.
@@ -50,10 +51,10 @@ added in the same release as its parser.
 | `kind` | An `EventKind`: `Delivered`, `Deferred`, `Bounced`, `Complained`, `Unsubscribed`, `Opened`, `Clicked`, `Rejected` or `Subscribe` |
 | `recipient` | The address the event is about |
 | `messageId` | The Message-ID of the mail as written, `<...>`; `""` when the provider did not report it |
-| `providerId` | The provider's id: Resend message `data.email_id`, Postmark message `MessageID`, Mailgun event `event-data.id` |
-| `deliveryId` | The webhook delivery id: Resend `svix-id`, Postmark `X-PM-Webhook-Trace-Id`, Mailgun `signature.token`; `""` if absent |
-| `at` | When it happened, as the provider reports it; delivery time if missing or invalid |
-| `permanent` | For `Bounced`: whether future sends should be suppressed. An unclassified bounce counts as permanent. `false` for every other kind |
+| `providerId` | The provider's id: Resend message `data.email_id`, Postmark message `MessageID`, Mailgun event `event-data.id`, SendGrid `sg_message_id` |
+| `deliveryId` | The webhook delivery id: Resend `svix-id`, Postmark `X-PM-Webhook-Trace-Id`, Mailgun `signature.token`, SendGrid `sg_event_id`; `""` if absent |
+| `at` | When it happened, as the provider reports it; delivery time if missing or invalid, except SendGrid requires valid Unix seconds |
+| `permanent` | For `Bounced`: whether future sends should be suppressed. SendGrid requires `type: "bounce"`; the other providers treat an unclassified bounce as permanent. `false` for every other kind |
 | `reason` | The provider's explanation, or `""`: escape it before showing it on a page |
 | `provider` | Who posted it |
 
@@ -186,6 +187,55 @@ retries do not apply it twice. When absent, construct a compound key from the
 record's identity, recipient and event time. Never treat all empty ids as one
 delivery. The existing Resend de-duplication example below assumes a nonempty
 delivery id.
+
+## When Inkwell uses SendGrid
+
+SendGrid posts a batch, so Inkwell authenticates the entire raw body before
+updating its suppression list. Enable the Signed Event Webhook and copy its
+base64 public verification key from the dashboard. This is an EC P-256 SPKI
+key, not the API key used to send mail.
+
+```bit
+import { Event, Provider, parseEvents } from "mail"
+
+fn sendgridBatch(header: (string) => string, rawBody: string, publicKey: string): []Event! {
+  return parseEvents(Provider.SendGrid, header, rawBody, publicKey)?
+}
+```
+
+The header lookup receives lower-case
+`x-twilio-email-event-webhook-timestamp` and
+`x-twilio-email-event-webhook-signature`. Verification uses ECDSA P-256 over
+one SHA-256 digest of the exact timestamp text followed by the raw body. Do
+not parse and re-encode JSON before calling `parseEvents`. The timestamp
+must be within five minutes of the server clock, including both boundaries.
+An invalid signature or stale timestamp fails `MailError.Signature`; a
+malformed public key fails `MailError.Config`. The shared 1 MiB body limit
+applies before verification.
+
+Each object supplies `email`, integer Unix-second `timestamp`, `sg_message_id`
+and `sg_event_id`. A known event without an email or representable timestamp
+fails `MailError.Invalid`. `messageId` is empty: the provider's message id is
+kept separately. Record each nonempty `sg_event_id` when applying an event,
+so retries inside the clock window do not apply it twice. Signature
+verification does not maintain a SendGrid replay cache.
+
+| SendGrid `event` | `EventKind` |
+|---|---|
+| `delivered` | `Delivered` |
+| `deferred` | `Deferred` |
+| `bounce` | `Bounced`; permanent only when `type` is `bounce`, not `blocked` |
+| `dropped` | `Rejected` |
+| `spamreport` | `Complained` |
+| `unsubscribe`, `group_unsubscribe` | `Unsubscribed` |
+| `group_resubscribe` | `Subscribe` |
+| `open` | `Opened` |
+| `click` | `Clicked` |
+| `processed`, unknown kinds | ignored |
+
+These fields and signing bytes follow SendGrid's
+[event reference](https://www.twilio.com/docs/sendgrid/for-developers/tracking-events/event)
+and [signed webhook guide](https://www.twilio.com/docs/sendgrid/for-developers/tracking-events/getting-started-event-webhook-security-features).
 
 ## When Inkwell uses Mailgun
 
