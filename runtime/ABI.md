@@ -107,7 +107,7 @@ uniform "every aggregate is one traced handle" model this ABI is built on.
 
 This is not a new constraint being imposed on codegen — it is the contract
 codegen implements everywhere §1.2.2's exception does not apply. On a target
-outside that exception (x86_64-windows today), boxing in the lowerer is what
+outside that exception, boxing in the lowerer is what
 makes a multi-value `ret` unreachable rather than what works around it: no
 backend has to refuse one, because the front end never produces one.
 
@@ -220,9 +220,7 @@ the one direction that cannot be wrong.
 **The target gate is on the RETURN side only.** `explodedRetWords`
 (`compiler/lowerexplode.bit`) returns the empty list unless `Lowerer.multiWordRet`
 — that is `targetReturnsInRegisters` (`compiler/build.bit`), true for
-`aarch64-macos`, `aarch64-linux` and `x86_64-linux`, and false for
-`x86_64-windows` — so an `x86_64-windows` build hands a returned enum back as
-one handle and keeps the boxed object at every `ret`. The PARAMETER side has
+all four supported targets, including `x86_64-windows` (#5875). The PARAMETER side has
 no target gate: it rides `explodesParams` on every target, exactly as a tuple
 or a `decimal` parameter already does.
 
@@ -286,7 +284,7 @@ most 4 int words. A tuple-of-words ok type (`tupleWordTypes`) returns in words
 followed by the error word; every err-path `ret` carries one zero constant per
 ok word (`fallibleZeroArgs`, `compiler/lowerfail.bit`) before the error. A
 `string`, `decimal` or enum ok type keeps one handle, as does every method an
-interface declares fallible. `x86_64-windows` and `BIT_ERR_REG=0` use §13's slot.
+interface declares fallible. `BIT_ERR_REG=0` use §13's slot.
 
 **A method reached only by a direct `call`** returns its result in words when
 `methodRetExplodes` (`compiler/lowerexplodemethod.bit`) admits it: the same
@@ -329,9 +327,8 @@ synthesized ones, are excluded before agreement is computed.
 
 **Target gate.** All three forms are additionally gated on
 `Lowerer.multiWordRet`, seeded from `targetReturnsInRegisters`
-(`compiler/build.bit`): true for `aarch64-macos`, `aarch64-linux` and
-`x86_64-linux`. `x86_64-windows` boxes and every rule above reads "one
-handle" there. The word list must also fit the one target-independent
+(`compiler/build.bit`): true for all four targets, including
+`x86_64-windows` (#5875). The word list must also fit the one target-independent
 return-register budget (`retWordsFitRegisters`; `maxRetIntWords()` = 5,
 `maxRetFloatWords()` = 6, `compiler/lowerexplode.bit`), the smallest lists
 any register-return target implements.
@@ -3197,8 +3194,8 @@ fourth rows are emitted as ordinary lowered IR instead, by `compiler/lowerentry.
 - the user's fallible `main` body is emitted under the private link name
   **`main$fallible`** (same shape it always had — a void or `T` result, with the
   error travelling as the last return word, §13);
-- a synthesized `main`, result `i64`, calls it, tests that error word (on
-  `x86_64-windows` it reads the slot with `bit_rt_get_err`), and branches. The `i64` result is also what stops the
+- a synthesized `main`, result `i64`, calls it, tests that error word (or
+  the slot with `BIT_ERR_REG=0`), and branches. The `i64` result is also what stops the
   trampoline zeroing the return register: its void-`main` test reads the IR
   function's result type.
 
@@ -3232,8 +3229,8 @@ call to `bit$startup`, and so is the first statement of the `bit test` dispatch
 first green task, after `boot` has brought up the scheduler and the collector, so
 an initializer may allocate, spawn and block.
 
-The driver tests each init function's error word (§13; the §7 error slot on
-`x86_64-windows`) after the call. A pending error
+The driver tests each init function's error word (§13; the §7 error slot with
+`BIT_ERR_REG=0`) after the call. A pending error
 writes one line to fd 2 through `bit_rt_eprint` and ends the process through
 `bit_rt_os_exit`:
 
@@ -3568,7 +3565,7 @@ since #6693).
 | `aarch64-macos`    | `x0`, `x1`, `x2`, ... | `x1`                    | `x0`                        |
 | `aarch64-linux`    | `x0`, `x1`, `x2`, ... | `x1`                    | `x0`                        |
 | `x86_64-linux`     | `rax`, `rdx`, `rcx`, `rsi`, `rdi`, ... | `rdx`  | `rax`                       |
-| `x86_64-windows`   | none: the slot below  | (slot)                  | (slot)                      |
+| `x86_64-windows`   | `rax`, `rdx`, `rcx`, `r8`, `r9` | `rdx` | `rax` |
 
 The word is typed `error` (a GC object pointer), `nil` meaning ok, and the ok
 words plus the error word must fit the return registers (§1.2.2: at most 4 int
@@ -3594,11 +3591,10 @@ binding on it is an SSA value, which the safepoint root maps already cover like
 any other. This is the same window argument the slot made, with nothing stored
 anywhere in between.
 
-### The slot (`x86_64-windows`, `BIT_ERR_REG=0`)
+### The slot (`BIT_ERR_REG=0`)
 
-`x86_64-windows` keeps the per-task slot until `multiWordRet` is on there
-(#5875), and so does code built by the pinned compiler until the repin that
-carries #6693; the compiler's `BIT_ERR_REG=0` selects it too. Nothing else
+Code built by a pinned compiler predating register errors keeps the per-task
+slot; the compiler's `BIT_ERR_REG=0` selects it too. Nothing else
 reads or writes it. The slot is accessed through two symbols:
 
 ```
