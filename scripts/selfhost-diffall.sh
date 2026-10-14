@@ -204,6 +204,7 @@ pass=0 fail=0 inconc=0 timeout=0 absent=0
 : >"$work/failed"
 : >"$work/undecided"
 : >"$work/absent"
+: >"$work/evidence"
 
 # Concurrency: cores minus headroom (this box's real incidents have all been
 # MEMORY, never load -- a leaked language server at 10.8GB, VS Code at
@@ -247,6 +248,10 @@ record_verdict() {
     0)
       verdict=PASS
       pass=$((pass + 1))
+      if grep -q '^BEGIN CHECKER_CAPTURE ' "$work/$name.log" &&
+         grep -q '^END CHECKER_CAPTURE$' "$work/$name.log"; then
+        echo "$name" >>"$work/evidence"
+      fi
       ;;
     1)
       verdict=FAIL
@@ -373,11 +378,11 @@ exec 8>&-
 #
 # Full log, not a tail (#3678): the log was already captured whole at spawn
 # time (`>"$log" 2>&1` above has no bound), so this only stops throwing part
-# of it away. No marker string is grepped for -- each constituent reports a
+# of it away. Failure logs are not filtered by marker strings -- each constituent reports a
 # divergence in its own vocabulary (SAFEPOINT DIVERGENCE, MISMATCH:, DIFF,
 # REGRESSION:, ...) and hardcoding any one of them here would special-case
 # that constituent over the other seventeen.
-for kind in failed undecided; do
+for kind in failed undecided evidence; do
   [ -s "$work/$kind" ] || continue
   while read -r name; do
     lines=$(wc -l <"$work/$name.log" 2>/dev/null | tr -d '[:space:]')
@@ -395,12 +400,12 @@ done
 # per run is reaped after 24h so it cannot accumulate the way a fixed-name
 # scratch path would -- $TMPDIR is shared by every concurrent agent on this
 # box, so a per-run unique prefix is required, never a fixed name.
-if [ -s "$work/failed" ] || [ -s "$work/undecided" ]; then
+if [ -s "$work/failed" ] || [ -s "$work/undecided" ] || [ -s "$work/evidence" ]; then
   tmproot=${TMPDIR:-/tmp}
   find "$tmproot" -maxdepth 1 -name 'selfhost-diffall-keep.*' -type d -mmin +1440 \
     -exec rm -rf {} + 2>/dev/null || true
   keepdir=$(mktemp -d "$tmproot/selfhost-diffall-keep.XXXXXX")
-  for kind in failed undecided; do
+  for kind in failed undecided evidence; do
     [ -s "$work/$kind" ] || continue
     while read -r name; do
       cp "$work/$name.log" "$keepdir/$name.log" 2>/dev/null || true
