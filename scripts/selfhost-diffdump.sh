@@ -104,6 +104,20 @@ print_bucket() {
   while read -r f; do echo "  $f"; done <"$file"
 }
 
+# #8110: a token identity must retire when its source change reaches stage0.
+tokenSignaturesLive() {
+  local kind=$1 manifest=$2 signame retired=0
+  [ "$kind" = tokens ] || return 0
+  while IFS= read -r signame; do
+    [ -n "$signame" ] || continue
+    if ! grep -q "declared signature '${signame}'" "$manifest"; then
+      echo "RETIRED: $signame explained zero files and must be removed."
+      retired=1
+    fi
+  done < <(declaredSignatureNames tokens)
+  [ "$retired" -eq 0 ]
+}
+
 # ast/tokens/diags row bodies: a single MATCH/MISMATCH pass, first divergence
 # reported. diags never skips (SKIPLABEL empty) — a valid file renders empty on
 # both sides and a rejected one renders the same diagnostic on both, so nothing
@@ -274,17 +288,8 @@ run_basic() {
     diff <(alarmrun "$ORACLE" "$FLAG" "$firstbad") <(alarmrun "$BIT2" "$FLAG" "$firstbad") | head -20
   fi
 
-  # #8110: a token identity must retire when its source change reaches stage0.
-  retiredcount=0
-  if [ "$NAME" = tokens ]; then
-    while IFS= read -r signame; do
-      [ -n "$signame" ] || continue
-      if ! grep -q "declared signature '${signame}'" "$work/explained"; then
-        echo "RETIRED: $signame explained zero files and must be removed."
-        retiredcount=$((retiredcount + 1))
-      fi
-    done < <(declaredSignatureNames tokens)
-  fi
+  tokenSignaturesLive "$NAME" "$work/explained"
+  retiredcount=$?
 
   diffexit "$LABEL" -f "$mismatch" "$retiredcount" -t "file(s)=$timeout"
 }
