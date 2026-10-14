@@ -6,6 +6,71 @@ When Inkwell saves a storage setting, save the value the service expects.
 `wire()` gives you that value. `fromWire()` reads it back without losing a
 value a service adds later.
 
+## Read an event frame
+
+If you already have a complete Select response frame, check its lengths and
+checksums before reading article records. `decodeEventMessage` reads exactly
+one frame; trailing bytes and incomplete frames fail. `decodeSelectEvent`
+also interprets its Select event headers. It returns the existing modeled
+Records, Stats, Progress, Cont and End values. Records can end partway through
+a record; End marks normal completion. Neither function sends a request or
+collects a response stream for you.
+
+```bit
+import {
+  EventHeaderValue, EventMessage, EventStream, SelectObjectContentEventStream,
+  decodeEventMessage, decodeSelectEvent,
+} from "s3"
+import { decodeBase64 } from "std/crypto"
+
+fn main(): ()! {
+  let frame = decodeBase64("AAAAOAAAACjBxoTUDTptZXNzYWdlLXR5cGUHAAVldmVudAs6ZXZlbnQtdHlwZQcAA0VuZM+X05I=")?
+  let message: EventMessage = decodeEventMessage(frame)?
+  println("${len(message.headers)} headers, ${len(message.payload)} payload bytes")
+  let event: SelectObjectContentEventStream = decodeSelectEvent(frame)?
+  let stream = EventStream<SelectObjectContentEventStream>{ events = [event] }
+  println("${len(stream.events)} decoded event")
+
+  // Header values retain their wire types, including signed integers.
+  let values: []EventHeaderValue = [
+    EventHeaderValue.Bool(true), EventHeaderValue.Byte(i8(-1)),
+    EventHeaderValue.Short(i16(42)), EventHeaderValue.Integer(i32(42)),
+    EventHeaderValue.Long(i64(42)), EventHeaderValue.Binary([]byte("article")),
+    EventHeaderValue.Text("article"), EventHeaderValue.Timestamp(i64(8675309)),
+    EventHeaderValue.Uuid([]byte(16)),
+  ]
+  println("${len(values)} header value types")
+}
+```
+
+Timestamps retain signed milliseconds since the Unix epoch. UUIDs retain
+their sixteen bytes. Header names are unique, nonempty UTF-8; string values
+must also be valid UTF-8. Binary values and payloads remain bytes.
+
+The decoder applies a local **16 MiB total-frame resource limit**, including
+headers and checksums. This is an allocation policy, not an AWS protocol
+maximum. Payloads and binary headers borrow slices of the input, so retaining
+one retains its frame. Process and discard frames individually.
+
+A failed checksum gives `S3Error.kind = ChecksumMismatch` and the message
+`event stream: prelude CRC mismatch` or `event stream: message CRC mismatch`.
+Stop reading that stream. Service error and exception frames give an
+`S3Error` with the service's code and its mapped kind. Unknown event names
+remain `Unknown(name)` so a future event does not silently disappear.
+
+Malformed frames give `InvalidInput`: `truncated prelude`, `invalid message
+length`, `message exceeds local 16 MiB limit`, `truncated header`, `empty
+header name`, `duplicate header name`, `unknown header type`, or `invalid
+UTF-8 header`, each prefixed with `event stream: `. A missing required
+event header reports `missing <name>`; a non-string event header reports
+`<name> is not a string`; an unrecognized message type reports `unknown
+message type`. Statistics errors report `invalid statistics XML`, `wrong
+statistics root`, or `invalid BytesScanned`,
+`invalid BytesProcessed`, `invalid BytesReturned`, with the same prefix.
+
+Use the ordinary object operations in [Storing article covers](guide.md)
+when you need an HTTP client rather than a frame decoder.
+
 ```bit
 import { StorageClass } from "s3"
 

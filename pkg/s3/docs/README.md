@@ -3,4 +3,4 @@
 | Chapter | Covers |
 | ------- | ------ |
 | [Storing article covers](guide.md) | The whole method surface, built up against one running example: uploading and serving an article's cover image |
-| [Keep storage values and response details](models.md) | Preserve wire values, future enum values and operation response metadata |
+| [Keep storage values and response details](models.md) | Preserve wire values, future enum values and operation response metadata; decode a complete Select event frame |
