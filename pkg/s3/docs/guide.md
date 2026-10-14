@@ -562,3 +562,6 @@ for an interface of your own with this package behind one implementation -
 
 SigV4 signing follows AWS's "Signature Version 4 signing process"; its
 conformance is checked against AWS's published test suite in `pkg/aws`.
+
+For stored enum values and typed operation results, see
+[Keep storage values and response details](models.md).
