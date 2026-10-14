@@ -284,7 +284,7 @@ most 4 int words. A tuple-of-words ok type (`tupleWordTypes`) returns in words
 followed by the error word; every err-path `ret` carries one zero constant per
 ok word (`fallibleZeroArgs`, `compiler/lowerfail.bit`) before the error. A
 `string`, `decimal` or enum ok type keeps one handle, as does every method an
-interface declares fallible. `BIT_ERR_REG=0` use §13's slot.
+interface declares fallible. `BIT_ERR_REG=0` uses §13's slot.
 
 **A method reached only by a direct `call`** returns its result in words when
 `methodRetExplodes` (`compiler/lowerexplodemethod.bit`) admits it: the same
