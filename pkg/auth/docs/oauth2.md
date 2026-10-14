@@ -130,6 +130,73 @@ fn enterprise(tls: TlsConfig): OAuth2Endpoints! {
 A host with a scheme, a path, a query or userinfo is an `Error` when the app
 starts: that string would be a URL the access token is sent to.
 
+## Sign in with Facebook
+
+For authors who use Facebook, `facebook(...)` supplies the same redirect flow.
+Register its callback with Meta and use the same app id and secret for both
+the preset and the strategy. The default Graph version is `v26.0`, checked
+against [Meta's changelog](https://developers.facebook.com/docs/graph-api/changelog/)
+on October 14, 2026. `apiVersion` can select another supported version.
+
+```bit
+import { FacebookOptions, FacebookFetch, facebook } from "auth"
+
+fn facebookStrategy(rootsPem: string, appId: string, appSecret: string): OAuth2Strategy! {
+  let tls = TlsConfig(fromPem(rootsPem)?)
+  let endpoints = facebook(
+    FacebookOptions{
+      appId = appId,
+      appSecret = appSecret,
+      tls = Option.Some(tls),
+      fields = ["id", "name", "email"],
+    },
+  )?
+  return OAuth2Strategy(
+    endpoints,
+    appId,
+    appSecret,
+    "https://app.example.com/auth/facebook/callback",
+    OAuth2Options{ tls = Option.Some(tls), clientAuth = ClientAuth.Post, name = "facebook" },
+  )?
+}
+
+fn facebookRoutes(app: App, fb: OAuth2Strategy) {
+  app.get("/auth/facebook", (c) => fb.beginAuthorization(c))
+  app.get("/auth/facebook/callback", (c) => {
+    let who = fb.authenticate(c)?
+    return c.redirect("/me")
+  })
+}
+```
+
+The preset inspects the user token through `/debug_token` using the app access
+token, then fetches `/me` using the user token. Each request carries the
+`appsecret_proof` for its own access token. Token inspection must name this
+app and a valid user; `/me` must return that same user id. HTTP failures,
+malformed responses and Graph error bodies fail the login. Errors carry a
+numeric Graph code or a fixed message, never credentials or provider text.
+
+The identity uses Facebook's app-scoped id. `name` and `email` are strings,
+empty when absent; `email_verified` is always false. Do not link an existing
+account by this email. Store the provider and app-scoped id instead.
+Missing `appId`, `appSecret` or explicit TLS fails construction; injected
+`apiFetch` replaces TLS for tests. Never put app credentials in browser code.
+
+```bit
+import { Response } from "std/http"
+
+fn fakeFacebookEndpoints(): OAuth2Endpoints! {
+  let api: FacebookFetch = (url, headers) => {
+    let body = "{\"id\":\"42\",\"name\":\"Ada\"}"
+    if (contains(url, "/debug_token?")) {
+      body = "{\"data\":{\"app_id\":\"123\",\"user_id\":\"42\",\"is_valid\":true}}"
+    }
+    return Response{ status = 200, contentType = "application/json", headers = "", body = body }
+  }
+  return facebook(FacebookOptions{ appId = "123", appSecret = "test-secret", apiFetch = api })?
+}
+```
+
 ## Any other provider
 
 For a provider with no preset you supply the same three things yourself: the
