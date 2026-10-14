@@ -95,13 +95,8 @@ diffrequire diffcheck "$ORACLE" "$BIT2"
 BIT_STDLIB="$(pwd)/stdlib"
 export BIT_STDLIB
 
-# The alarm is a HANG guard, not a performance budget. Measured worst legitimate
-# case over this exact corpus is 1.23s (`bit check _tests_/imports/nethttp/main.bit`,
-# on a host running 9 parallel agents) against a 20s budget — 16x headroom, so no
-# real work was ever near it and every trip was a DESCHEDULED process, not a slow
-# one. Raising the constant would fix a cause that does not exist, so instead a
-# trip is RETRIED ONCE: a genuine hang is deterministic and trips twice, a load
-# artifact does not. TIMEOUT_S overrides for a slower host.
+# The default wall-clock guard is 20s, with one retry after SIGALRM.
+# A recovered retry does not explain the first alarm; preserve both attempts.
 TIMEOUT_S=${TIMEOUT_S:-20}
 
 # The compared payload never leaves its capture FILE (#6357, same shape as
@@ -120,20 +115,65 @@ TIMEOUT_S=${TIMEOUT_S:-20}
 # alarmrun_cap does for its own merged capture and for the same reason
 # (#3478): a stalled first attempt's partial bytes must never survive into a
 # retry's compared payload.
+# Separate attempt files survive the normal comparison scratch cleanup (#8129).
+# 125 is this wrapper's capture failure, never a checker verdict.
+capture_attempt() {
+  local dir=$1 attempt=$2 rc=$3 cap=$4
+  shift 4
+  cp "$cap" "$dir/$attempt.stderr" &&
+    printf '%s\n' "$rc" >"$dir/$attempt.rc" &&
+    printf '%s\0' "$@" >"$dir/$attempt.argv"
+}
+
 run_cap() {
-  local side=$1 cap=$2 rc
+  local side=$1 cap=$2 rc dir
   shift 2
   local TIMEOUT="$TIMEOUT_S"
-  : >"$cap"
+  rm -f "$cap.attemptdir" || return 125
+  : >"$cap" || return 125
   ALARMRUN_KEEP_STDERR=1 alarmrun "$@" 2>"$cap" >/dev/null
   rc=$?
   if [ "$rc" -eq 142 ]; then
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/selfhost-diffcheck-attempt.XXXXXX") || return 125
+    printf '%s\n' "$dir" >"$cap.attemptdir" || return 125
+    capture_attempt "$dir" 1 "$rc" "$cap" "$@" || return 125
     echo "$side check stalled once (SIGALRM after ${TIMEOUT_S}s), retrying: $*" >&9
-    : >"$cap"
+    : >"$cap" || return 125
     ALARMRUN_KEEP_STDERR=1 alarmrun "$@" 2>"$cap" >/dev/null
     rc=$?
+    capture_attempt "$dir" 2 "$rc" "$cap" "$@" || return 125
   fi
   return "$rc"
+}
+
+# Parent-side frames cannot interleave the two concurrently captured streams.
+# Base64 also keeps arbitrary stderr bytes intact in archived constituent logs.
+emit_attempt() {
+  local side=$1 dir=$2 attempt=$3 input=$4 rc bytes argvbytes
+  rc=$(cat "$dir/$attempt.rc") || return 125
+  bytes=$(wc -c <"$dir/$attempt.stderr") || return 125
+  argvbytes=$(wc -c <"$dir/$attempt.argv") || return 125
+  printf 'BEGIN CHECKER_CAPTURE side=%s attempt=%s native_rc=%s stderr_bytes=%s argv_bytes=%s input=%s raw=%s\n' \
+    "$side" "$attempt" "$rc" "$((bytes))" "$((argvbytes))" "$input" "$dir" >&9 || return 125
+  printf 'ARGV_BASE64\n' >&9 && base64 <"$dir/$attempt.argv" >&9 &&
+    printf '\nSTDERR_BASE64\n' >&9 && base64 <"$dir/$attempt.stderr" >&9 &&
+    printf '\nEND CHECKER_CAPTURE\n' >&9
+}
+
+emit_capture() {
+  local cap=$1 side=$2 input=$3 dir attempt
+  [ -f "$cap.attemptdir" ] || return 0
+  dir=$(cat "$cap.attemptdir") || return 125
+  for attempt in 1 2; do
+    emit_attempt "$side" "$dir" "$attempt" "$input" || return 125
+  done
+}
+
+capture_guard() {
+  if [ "$1" -eq 125 ] || [ "$2" -eq 125 ]; then
+    echo "UNDECIDED: checker capture failed (oracle wrapper=$1 bit wrapper=$2)" >&2
+    exit 2
+  fi
 }
 
 # runpair <file> -- both sides of one file CONCURRENTLY into $seedcap/$b2cap;
@@ -148,6 +188,8 @@ runpair() {
   bit2pid=$!
   wait "$oraclepid"; src=$?
   wait "$bit2pid"; brc=$?
+  capture_guard "$src" "$brc"
+  emit_capture "$seedcap" ORACLE "$1" && emit_capture "$b2cap" BIT2 "$1" || exit 2
 }
 
 # FALSE POSITIVES DECLARED AGAINST THE PINNED ORACLE. One line per file:
@@ -165,7 +207,7 @@ declaredCode() {
 }
 
 match=0 missing=0 falsepos=0 diff=0 timeout=0 explained=0 unstable=0 firstfp="" firstdiff="" firsthang="" firstunstable="" hitdeclared=""
-work=$(mktemp -d)
+work=$(mktemp -d) || exit 2
 trap 'rm -rf "$work"' EXIT
 seedcap="$work/seed.out"
 b2cap="$work/b2.out"
@@ -176,6 +218,7 @@ for f in $(find stdlib examples _tests_/cases _tests_/imports -name '*.bit' | so
     # deliberately NOT folded into MISSING or FALSEPOS — those are tracked,
     # pinned counts, and an undecided file sitting inside them corrupts the pin.
     timeout=$((timeout + 1))
+    echo "timeout: $f (seed=$src bit=$brc)"
     [ -z "$firsthang" ] && firsthang="$f (SIGALRM after ${TIMEOUT_S}s x2, seed=$src bit=$brc)"
     continue
   fi
@@ -259,6 +302,8 @@ done
 if [ -n "$firstfp" ]; then
   echo "=== FIRST FALSE POSITIVE (bit2 rejects code the seed accepts): $firstfp"
   run_cap BIT2 "$b2cap" "$BIT2" check "$firstfp"
+  capture_guard 0 "$?"
+  emit_capture "$b2cap" BIT2 "$firstfp" || exit 2
   head -8 "$b2cap"
 fi
 if [ -n "$firstdiff" ]; then
