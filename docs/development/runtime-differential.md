@@ -9,6 +9,36 @@ compilers' `--dump-ir-pre` and diff the lowered SSA text.
 
 ## Why this exists
 
+### Checking an unoptimized runtime member
+
+An optimized runtime archive can build even when a helper lacks a stable
+cross-object name: inlining can remove its call before the freestanding
+emitter checks the remaining references. Adding `--no-optimize` to
+`bit build <module> --emit-obj --freestanding` keeps that call and can expose
+the missing pin. The flag combination is supported; its objects must still
+obey SPEC §17.6 and the pinned-symbol contract in `runtime/ABI.md` §9.
+
+The refusal names the unresolved `m<id>$helper`. `export` makes the helper
+importable in Bit, but only `@symbol` gives independently compiled objects
+the same link name. Check the declaring function and its signature before
+adding a pin; passing an optimized build does not prove an unoptimized
+runtime provider is supported by those declarations. Imported mutable
+module cells remain unavailable across freestanding object boundaries
+(SPEC §11.11); a function pin cannot make such a cell shareable.
+
+For a small reproduction, keep one scalar helper in a dependency and call
+it from a pinned root function. Compare optimized and unoptimized object
+emits, then pin the helper and compare the root's undefined symbol with
+the dependency object's definition. Remove and restore that pin to prove
+the refusal. Task #8056 records this control and the unchanged runtime
+provider's owning declarations.
+
+`--dump-ir-pre` resolves an ordinary source project, including its prelude;
+its module ordinals can differ from a freestanding build. Compare symbol
+ownership, not the ordinal alone. The optimized dump also filters out
+imported bodies before optimizing, so it cannot demonstrate the cross-module
+inlining performed by an object build.
+
 The other fifteen `selfhost-diff*.sh` all walk the same corpus:
 
 ```
