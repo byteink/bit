@@ -90,14 +90,10 @@ export const workerStepStop: int = -1
 // verbatim rather than keeping a copy each that could drift. Everything here is
 // independent of how `addr` was found.
 @nosplit fn schedWorkerStep(w: *i64, s: *i64, addr: int, backoff: int): int {
-  // Cleared on every turn, set only in the `taskDone` branch below, so a
-  // caller that reads it right after this call never sees a stale task from
-  // an earlier turn (#2167).
+  // Clear the previous turn before publishing a new completed task (#2167).
   *(w + wkLastDone) = 0
   if (addr == 0) {
-    // No work. Stop if shutdown has been signalled, else back off and retry.
-    // Checked AFTER `findWork` so a worker never exits leaving queued work
-    // behind — `runtime/sched/`'s ordering, and the reason shutdown drains.
+    // Drain queued work before observing shutdown.
     let stopping = atomicLoad(s + scStopping)
     if (stopping != 0) {
       return workerStepStop
@@ -110,39 +106,19 @@ export const workerStepStop: int = -1
   // Atomic (#4134): `./deadlockpool.bit`'s `schedCheckDeadlockPool` reads this cross-thread.
   atomicStore(w + wkRunning, addr)
 
-  // The migration point. A task carries no worker affinity, so the worker
-  // that resumes it need not be the one it parked on, and this store is what
-  // makes `schedCurrentWorker` correct after a migration. `runtime/sched/` gets
-  // the same effect from its thread-local, which is why its `trampoline`
-  // must RE-FETCH the worker after the body returns.
+  // A migrated task must identify the worker that resumes it.
   *(t + taskWorker) = int(w)
   *(t + taskState) = taskRunning
 
-  // Must be overwritten by the task before it switches back; the states
-  // below are the only three a task may leave in.
+  // The task must overwrite this before switching back.
   *(w + wkDisposition) = taskRunning
 
-  // Stamp the sysmon tick this worker starts running `addr` on, so the sysmon
-  // thread (#2579/#2580) can later tell -- via `sysmonTick` -- whether this
-  // worker has held it for `preemptBudgetTicks` ticks. Must happen here, once
-  // per dispatch, and before `schedSwitch` actually hands control to the task:
-  // `preempt.bit` also clears any `requested` flag left over from whatever ran
-  // on this worker before `addr`, so a freshly dispatched task must not
-  // inherit a stale one (see `preemptStamp`'s own comment).
-  // #4736: a tick epoch, NOT `monoNs()` -- this runs once per context switch,
-  // and `monoNs` on Linux is a raw `clock_gettime` trap that cost +147 ns on
-  // every one of them (285 -> 423 ns/switch, arm64-linux `test-schedbench`).
+  // Use the sysmon epoch to avoid a clock syscall per dispatch (#4736).
+  // Stamp before switching and clear the previous task's preemption request.
   preemptStamp(*(w + wkId), preemptTickNow())
   schedSwitch(w + wkCtx, t)
   atomicStore(w + wkRunning, 0)
-  // The mirror image of the stamp above (#4278): `addr` is not executing on
-  // this worker any more -- it parked, finished, or is about to be requeued
-  // -- so this worker has no task in flight until the next `preemptStamp`.
-  // Without this, a worker that never dispatches again (idle, or a task
-  // parked with no more work behind it) kept its last stamp forever, so
-  // `sysmonTick` flagged it as perpetually over budget and every OTHER
-  // thread's back edge stayed on the safepoint slow path permanently
-  // (`stwpoll.bit`'s `preemptAnyPending` clause, #4203).
+  // An idle worker must not keep a stale stamp on the safepoint slow path (#4278).
   preemptClear(*(w + wkId))
   *(t + taskWorker) = 0
 
@@ -151,35 +127,10 @@ export const workerStepStop: int = -1
     schedRequeue(s, w, addr)
   }
   if (disp == taskParked) {
-    // Safe only now: `t`'s context was just saved by this same thread, in
-    // program order, above. The atomic store is what lets another thread's
-    // later load see that write — `runtime/sched/` makes exactly this argument
-    // for its release store, and §11.5's sequential consistency is strictly
-    // stronger.
-    //
-    // THREE CASES, TRIED IN THIS ORDER, AND THE ORDER IS THE PROOF.
-    //
-    //  1. `taskParking -> taskParked`. The task armed (`schedParkArm`) and
-    //     no waker reached it: publish the park, and a later waker finds a
-    //     properly parked task. This is the common armed path.
-    //  2. `taskWakePending -> taskRunnable`. A waker reached the task inside
-    //     its arm/park window and handed the wake here rather than dropping
-    //     it. The task must NOT be left parked — nothing will wake it again,
-    //     because a one-shot poller registration has already been consumed
-    //     by the drain that failed to deliver. So the owed wake is delivered
-    //     by requeueing, which is exactly what `schedUnpark` would have done
-    //     had it been able to.
-    //  3. Neither: the state is `taskRunning`, i.e. an ordinary unarmed park
-    //     (`schedPark` alone — timers, channels, `schedYield`'s siblings).
-    //     A plain store is correct AND cannot lose a wake, because only the
-    //     task itself writes `taskParking` and it is suspended right now, so
-    //     no waker can be inside the armed protocol for it.
-    //
-    // Case 2 is checked BETWEEN 1 and 3 rather than after 3, because a waker
-    // may flip `taskParking -> taskWakePending` after 1's compare-exchange
-    // has already failed. Once 2 has failed as well the state is `taskRunning`
-    // and can no longer change under us, which is what makes 3's plain store
-    // safe rather than merely likely.
+    // Publish only after this thread saves the task context. Armed parking
+    // first publishes taskParking; an owed wake requeues taskWakePending.
+    // Check that wake between the first CAS and the unarmed plain store:
+    // a waker may race the first CAS, but taskRunning cannot change here.
     if (!atomicCmpxchg(t + taskState, taskParking, taskParked)) {
       if (atomicCmpxchg(t + taskState, taskWakePending, taskRunnable)) {
         schedRequeue(s, w, addr)
@@ -191,9 +142,7 @@ export const workerStepStop: int = -1
   if (disp == taskDone) {
     atomicStore(t + taskState, taskDone)
     schedUnregister(s, addr)
-    // Published AFTER `schedUnregister`, so a caller that sees this non-zero
-    // is guaranteed the task is already gone from the collector's root set —
-    // safe to unmap its stack and task block (#2167).
+    // Publish after unregistering: observers may now unmap the stack (#2167).
     *(w + wkLastDone) = addr
   }
   return parkMinBackoffNs
