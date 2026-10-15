@@ -20,9 +20,9 @@
 //   internal: (key, childId)   pairs — `key` is a LOWER BOUND on the keys
 //             reachable through `childId` (see `kvFindChild`'s own comment
 //             for why it need not be exact, only a valid bound).
-// A node that would overflow one page (`Engine.pageSize`) on `put` splits in
-// half by entry count, promoting the new right half's first key to the
-// parent; a split at the root allocates a new root page one level taller.
+// A node that would overflow one page (`Engine.pageSize`) on `put` splits
+// into ordered siblings sized by encoded bytes. Their lower bounds propagate
+// to the parent; root splits add levels until those bounds fit.
 // This ticket does not add overflow pages: a single key/value pair too
 // large to fit one page on its own is out of scope, matching the "one page
 // per record" limitation #5716 already accepted for the meta format.
@@ -269,56 +269,23 @@ fn kvUpsertLeaf(entries: []kvLeafEntry, key: []byte, value: []byte): []kvLeafEnt
 
 // The result of inserting into one subtree: either the subtree's single
 // page was rewritten in place (COW: to a NEW id) with no split, or it
-// overflowed and split into two siblings plus the key to promote to the
-// parent.
+// overflowed into ordered siblings carrying lower bounds for the parent.
 enum kvInsertResult {
   Replaced(i64),
-  Split(i64, []byte, i64),
+  Split([]kvInternalEntry),
 }
 
-// Writes `entries` as one leaf page if it fits, else splits it in half by
-// entry count and writes both halves — always to freshly allocated ids
-// (COW), never back to a page this file has already read.
+// Grow-only entry points share byte partitioning with transaction writes.
 fn kvWriteLeafOrSplit(e: Engine, entries: []kvLeafEntry): kvInsertResult! {
-  let whole = kvNode.Leaf(entries)
-  if (kvNodeEncodedSize(whole) <= kvPageSize) {
-    let id = kvAllocatePage(e)?
-    e.writePage(id, kvEncodeNode(whole))?
-    return kvInsertResult.Replaced(id)
-  }
-  let mid = len(entries) / 2
-  let left = entries[0:mid]
-  let right = entries[mid:len(entries)]
-  let leftId = kvAllocatePage(e)?
-  e.writePage(leftId, kvEncodeNode(kvNode.Leaf(left)))?
-  let rightId = kvAllocatePage(e)?
-  e.writePage(rightId, kvEncodeNode(kvNode.Leaf(right)))?
-  return kvInsertResult.Split(leftId, right[0].key, rightId)
+  return kvWriteNodeOrSplit(kvAllocator{ e = e, free = [] }, kvNode.Leaf(entries))?
 }
 
-// The internal-node counterpart of `kvWriteLeafOrSplit`. The promoted key on
-// a split is the new right sibling's own first entry key — the same "key is
-// a lower bound on this child" shape an ordinary internal entry has, so an
-// internal split needs no different rule than a leaf split.
 fn kvWriteInternalOrSplit(e: Engine, entries: []kvInternalEntry): kvInsertResult! {
-  let whole = kvNode.Internal(entries)
-  if (kvNodeEncodedSize(whole) <= kvPageSize) {
-    let id = kvAllocatePage(e)?
-    e.writePage(id, kvEncodeNode(whole))?
-    return kvInsertResult.Replaced(id)
-  }
-  let mid = len(entries) / 2
-  let left = entries[0:mid]
-  let right = entries[mid:len(entries)]
-  let leftId = kvAllocatePage(e)?
-  e.writePage(leftId, kvEncodeNode(kvNode.Internal(left)))?
-  let rightId = kvAllocatePage(e)?
-  e.writePage(rightId, kvEncodeNode(kvNode.Internal(right)))?
-  return kvInsertResult.Split(leftId, right[0].key, rightId)
+  return kvWriteNodeOrSplit(kvAllocator{ e = e, free = [] }, kvNode.Internal(entries))?
 }
 
 // `entries` with index `idx`'s child id replaced (no split below it) or
-// split into two adjacent entries (a split below it) — the parent-side half
+// replaced by adjacent ordered siblings (a split below it) — the parent side
 // of propagating one level's `kvInsertResult` up to the next.
 fn kvApplyChildResult(
   entries: []kvInternalEntry,
@@ -337,9 +304,11 @@ fn kvApplyChildResult(
       Replaced(newId) => {
         out = append(out, kvInternalEntry{ key = entries[i].key, child = newId })
       }
-      Split(leftId, promoteKey, rightId) => {
-        out = append(out, kvInternalEntry{ key = entries[i].key, child = leftId })
-        out = append(out, kvInternalEntry{ key = promoteKey, child = rightId })
+      Split(siblings) => {
+        out = append(out, kvInternalEntry{ key = entries[i].key, child = siblings[0].child })
+        for (let j = 1; j < len(siblings); j++) {
+          out = append(out, siblings[j])
+        }
       }
     }
     i = i + 1
@@ -398,27 +367,11 @@ export fn get(e: Engine, root: i64, key: []byte): []byte! {
 export fn put(e: Engine, root: i64, key: []byte, value: []byte): i64! {
   if (root == noRoot) {
     let entries: []kvLeafEntry = [kvLeafEntry{ key = key, value = value }]
-    let id = kvAllocatePage(e)?
-    e.writePage(id, kvEncodeNode(kvNode.Leaf(entries)))?
-    return id
+    let result = kvWriteLeafOrSplit(e, entries)?
+    return kvApplyInsertRoot(kvAllocator{ e = e, free = [] }, result)?
   }
   let result = kvInsertInto(e, root, key, value)?
-  match (result) {
-    Replaced(id) => return id
-    Split(leftId, promoteKey, rightId) => {
-      // The new root's leftmost entry never needs a real lower bound
-      // (`kvFindChild` never reads it, see its own comment) — an empty key
-      // is the smallest possible byte string, so it also reads correctly
-      // as "no lower bound" if anything ever did read it.
-      let rootEntries: []kvInternalEntry = [
-        kvInternalEntry{ key = []byte(0), child = leftId },
-        kvInternalEntry{ key = promoteKey, child = rightId },
-      ]
-      let newRootId = kvAllocatePage(e)?
-      e.writePage(newRootId, kvEncodeNode(kvNode.Internal(rootEntries)))?
-      return newRootId
-    }
-  }
+  return kvApplyInsertRoot(kvAllocator{ e = e, free = [] }, result)?
 }
 
 // `entries` with the entry at `idx` removed.

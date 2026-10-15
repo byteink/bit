@@ -56,6 +56,11 @@ propagated error, an explicit `fail`, or a panic. Nothing the block wrote
 becomes visible until it returns normally - across every collection it
 touched, not just the one write that failed.
 
+A `put` or `delete` error aborts that transaction even if the block catches
+it. Later operations on that handle fail with the original error, and
+`store.tx` returns the error without committing. Start another `store.tx`
+on the same database to continue.
+
 ```bit
 import { Tx, open } from "kv"
 
