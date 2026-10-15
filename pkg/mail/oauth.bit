@@ -1,0 +1,406 @@
+// OAuth grants stay outside SMTP: a source shares one refresh across mailers.
+import { Client as HttpClient, Redirects, percentEncode } from "std/http"
+import { Timer, Timestamp, now } from "std/time"
+
+export class Token {
+  export value: string,
+  export expires: Timestamp,
+  generation: int = 0,
+  secrets: []string = [],
+}
+
+export interface TokenSource { token(): Token!MailError }
+
+class OAuthSecrets {
+  current: []string,
+  prior: []string,
+}
+
+class TokenCache {
+  permit: chan<bool>
+  saved: Token
+  clock: () => Timestamp
+  client: () => HttpClient
+  generation: int
+
+  init() {
+    this.permit = chan<bool>(1)
+    this.permit <- true
+    this.saved = Token{ value = "", expires = Timestamp{ ns = 0 } }
+    this.clock = now
+    this.client = oauthClient
+    this.generation = 0
+  }
+
+  acquire(timeout: int): ()!MailError {
+    if (timeout <= 0) {
+      fail oauthTimeout()
+    }
+    select {
+      case <- this.permit:
+        return
+      default:
+        {}
+    }
+    let wait = timeout
+    let maxWait = 9223372036854775807 - monotonic().ns
+    if (wait > maxWait) {
+      wait = maxWait
+    }
+    let timer = Timer(wait)
+    defer timer.stop()
+    select {
+      case <- this.permit:
+        return
+      case <- timer.c:
+        fail oauthTimeout()
+    }
+  }
+
+  release() { this.permit <- true }
+
+  get(fetch: (int, []string) => Token!MailError, failed: int, timeout: int): Token!MailError {
+    let start = monotonic().ns
+    this.acquire(timeout)?
+    defer this.release()
+    let remaining = timeout - (monotonic().ns - start)
+    if (remaining <= 0) {
+      fail oauthTimeout()
+    }
+    let secrets = append([this.saved.value], ...this.saved.secrets)
+    if (failed != 0 && this.saved.generation == failed) {
+      this.saved = Token{ value = "", expires = Timestamp{ ns = 0 } }
+    }
+    if (this.saved.value != "" && this.saved.expires.ns - this.clock().ns > 60 * Second) {
+      return this.saved
+    }
+    let fresh = fetch(remaining, secrets) catch e {
+      fail oauthError(e, secrets)
+    }
+    assert(this.generation < 9223372036854775807, "OAuth token generation exhausted")
+    this.generation = this.generation + 1
+    fresh.generation = this.generation
+    this.saved = fresh
+    return this.saved
+  }
+}
+
+fn oauthTimeout(): MailError {
+  return MailError.Transient(Reply{ text = "OAuth token acquisition timed out" })
+}
+
+fn oauthClient(): HttpClient {
+  return HttpClient()
+}
+
+// SMTP's Exchange resource scope, verified against Microsoft's SMTP OAuth guide.
+export class MicrosoftApp {
+  export tenant: string
+  export clientId: string
+  export clientSecret: string
+  cache: TokenCache
+  endpoint: string
+
+  init(tenant: string, clientId: string, clientSecret: string) {
+    this.tenant = tenant
+    this.clientId = clientId
+    this.clientSecret = clientSecret
+    this.cache = TokenCache()
+    this.endpoint = ""
+  }
+
+  export token(): Token!MailError {
+    return this.getToken(30 * Second, 0)?
+  }
+
+  check(): ()!MailError {
+    if (len(this.tenant) > 253 || (indexOf(this.tenant, ".") < 0 && !oauthGuid(this.tenant))) {
+      fail MailError.Config("MicrosoftApp.tenant must be a GUID or domain")
+    }
+    checkDomain(this.tenant) catch _ {
+      fail MailError.Config("MicrosoftApp.tenant must be a GUID or domain")
+    }
+    if (this.clientId == "" || this.clientSecret == "") {
+      fail MailError.Config("MicrosoftApp needs clientId and clientSecret")
+    }
+  }
+
+  getToken(timeout: int, failed: int, attempted: []string = []): Token!MailError {
+    this.check()?
+    return this.cache.get(
+      (budget, cached) => {
+        let url = this.endpoint
+        if (url == "") {
+          url = "https://login.microsoftonline.com/${this.tenant}/oauth2/v2.0/token"
+        }
+        let form = "grant_type=client_credentials&client_id=${percentEncode(this.clientId)}&client_secret=${percentEncode(this.clientSecret)}&scope=${percentEncode("https://outlook.office365.com/.default")}"
+        let secrets = OAuthSecrets{
+          current = [this.clientSecret], prior = append(cached, ...attempted),
+        }
+        let (token, _) = oauthPost(this.cache, url, form, budget, secrets)?
+        return token
+      },
+      failed, timeout,
+    )?
+  }
+}
+
+export class RefreshToken {
+  export tokenUrl: string
+  export clientId: string
+  export clientSecret: string
+  export refreshToken: string
+  export scope: string
+  cache: TokenCache
+
+  init(
+    tokenUrl: string,
+    clientId: string,
+    refreshToken: string,
+    clientSecret: string = "",
+    scope: string = "",
+  ) {
+    this.tokenUrl = tokenUrl
+    this.clientId = clientId
+    this.clientSecret = clientSecret
+    this.refreshToken = refreshToken
+    this.scope = scope
+    this.cache = TokenCache()
+  }
+
+  export token(): Token!MailError {
+    return this.getToken(30 * Second, 0)?
+  }
+
+  check(): ()!MailError {
+    oauthEndpoint(this.tokenUrl)?
+    if (this.clientId == "" || this.refreshToken == "") {
+      fail MailError.Config("RefreshToken needs clientId and refreshToken")
+    }
+  }
+
+  getToken(timeout: int, failed: int, attempted: []string = []): Token!MailError {
+    return this.cache.get(
+      (budget, cached) => {
+        this.check()?
+        let form = "grant_type=refresh_token&client_id=${percentEncode(this.clientId)}&refresh_token=${percentEncode(this.refreshToken)}"
+        if (this.clientSecret != "") {
+          form = form + "&client_secret=${percentEncode(this.clientSecret)}"
+        }
+        if (this.scope != "") {
+          form = form + "&scope=${percentEncode(this.scope)}"
+        }
+        let (token, rotated) = oauthPost(
+          this.cache,
+          this.tokenUrl,
+          form,
+          budget,
+          OAuthSecrets{
+            current = [this.clientSecret, this.refreshToken], prior = append(cached, ...attempted),
+          },
+        )?
+        if (rotated != "") {
+          this.refreshToken = rotated
+        }
+        return token
+      },
+      failed, timeout,
+    )?
+  }
+}
+
+fn oauthGuid(s: string): bool {
+  if (len(s) != 36) {
+    return false
+  }
+  for (i, c) in []byte(s) {
+    if (!oauthGuidByte(i, c)) {
+      return false
+    }
+  }
+  return true
+}
+
+fn oauthGuidByte(i: int, c: byte): bool {
+  if (i == 8 || i == 13 || i == 18 || i == 23) {
+    return c == '-'
+  }
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+fn oauthEndpoint(url: string): ()!MailError {
+  if (!hasPrefix(url, "https://") || contains(url, "@") || contains(url, "#")) {
+    fail MailError.Config("RefreshToken.tokenUrl must be an https URL without credentials or fragment")
+  }
+  for c of []byte(url) {
+    if (c <= 32 || c == 127) {
+      fail MailError.Config("RefreshToken.tokenUrl contains a control byte or space")
+    }
+  }
+  let host = split(split(url[8:], "/")[0], "?")[0]
+  if (host == "") {
+    fail MailError.Config("RefreshToken.tokenUrl needs a host")
+  }
+}
+
+fn oauthPost(
+  cache: TokenCache,
+  url: string,
+  form: string,
+  timeout: int,
+  secrets: OAuthSecrets,
+): (Token, string)!MailError {
+  if (timeout < Millisecond) {
+    fail oauthTimeout()
+  }
+  let at = cache.clock().ns
+  let c = cache.client()
+  defer c.close()
+  c.setRedirects(Redirects.None)
+  c.setMaxBodyBytes(65536)
+  c.setHeader("Content-Type", "application/x-www-form-urlencoded") catch _ {
+    fail MailError.Config("OAuth token request headers are invalid")
+  }
+  let timeoutMs = timeout / Millisecond
+  if (timeoutMs < 1) {
+    timeoutMs = 1
+  }
+  let res = c.requestTimeout("POST", url, form, timeoutMs) catch _ {
+    fail MailError.Transient(Reply{ text = "OAuth token endpoint request failed" })
+  }
+  return oauthAnswer(res, secrets, at)?
+}
+
+fn oauthAnswer(res: HttpResponse, secrets: OAuthSecrets, at: int): (Token, string)!MailError {
+  let hidden = [apiField(res.body, "access_token"), apiField(res.body, "refresh_token")]
+  for secret of secrets.current {
+    hidden = append(hidden, secret)
+  }
+  if (res.status != 200) {
+    fail oauthGrantError(res, append(hidden, ...secrets.prior))
+  }
+  let (token, rotated) = oauthParseToken(res.body, at)?
+  token.secrets = hidden
+  return (token, rotated)
+}
+
+fn oauthGrantError(res: HttpResponse, secrets: []string): MailError {
+  let text = apiField(res.body, "error") + ": " + apiField(res.body, "error_description")
+  let r = Reply{ code = res.status, text = apiClip(oauthScrub(text, secrets)) }
+  if (res.status == 400 || res.status == 401) {
+    return MailError.Auth(r)
+  }
+  if (res.status == 429 || res.status >= 500) {
+    return MailError.Transient(r)
+  }
+  return MailError.Rejected(r)
+}
+
+fn oauthParseToken(body: string, at: int): (Token, string)!MailError {
+  let ttl = apiIntField(body, "expires_in", 0)
+  let value = apiField(body, "access_token")
+  if (!apiSecretOk(value) ||
+    toLower(apiField(body, "token_type")) != "bearer" ||
+    at < 0 ||
+    ttl <= 0 ||
+    ttl > (9223372036854775807 - at) / Second) {
+    fail MailError.Auth(Reply{ text = "OAuth token endpoint returned an invalid bearer token or expiry" })
+  }
+  return (
+    Token{ value = value, expires = Timestamp{ ns = at + ttl * Second } },
+    apiField(body, "refresh_token"),
+  )
+}
+
+fn oauthScrub(text: string, secrets: []string): string {
+  let forms: []string = []
+  for secret of secrets {
+    if (secret != "") {
+      forms = append(forms, secret)
+      forms = append(forms, percentEncode(secret))
+    }
+  }
+  if (len(forms) == 0) {
+    return text
+  }
+  let out = Builder()
+  let covered = 0
+  let masked = false
+  for (let at = 0; at < len(text); at = at + 1) {
+    let end = oauthCoveredEnd(text, forms, at)
+    if (end > covered) {
+      covered = end
+    }
+    if (at < covered) {
+      if (!masked) {
+        out.write("***")
+      }
+      masked = true
+    } else {
+      out.writeByte(text[at])
+      masked = false
+    }
+  }
+  return out.toString()
+}
+
+// Covered positions still start matches that can extend the original span.
+fn oauthCoveredEnd(text: string, forms: []string, at: int): int {
+  let end = at
+  for form of forms {
+    if (matchAt(text, at, form) && at + len(form) > end) {
+      end = at + len(form)
+    }
+  }
+  return end
+}
+
+fn oauthReply(r: Reply, secrets: []string): Reply {
+  return Reply{
+    code = r.code, enhanced = oauthScrub(r.enhanced, secrets),
+    text = oauthScrub(r.text, secrets), retryAfter = r.retryAfter,
+  }
+}
+
+fn oauthError(e: MailError, secrets: []string): MailError {
+  match (e) {
+    Invalid(text) => return MailError.Invalid(oauthScrub(text, secrets))
+    Config(text) => return MailError.Config(oauthScrub(text, secrets))
+    Auth(r) => return MailError.Auth(oauthReply(r, secrets))
+    Rejected(r) => return MailError.Rejected(oauthReply(r, secrets))
+    Signature(text) => return MailError.Signature(oauthScrub(text, secrets))
+    Transient(r) => return MailError.Transient(oauthReply(r, secrets))
+    Unknown(r) => return MailError.Unknown(oauthReply(r, secrets))
+  }
+}
+
+fn checkTokenSource(source: TokenSource, timeout: int): ()!MailError {
+  let (ms, microsoft) = source.(MicrosoftApp)
+  if (microsoft) {
+    ms.check()?
+  }
+  let (rt, refresh) = source.(RefreshToken)
+  if (refresh) {
+    rt.cache.acquire(timeout)?
+    defer rt.cache.release()
+    rt.check()?
+  }
+}
+
+fn sourceToken(
+  source: TokenSource,
+  timeout: int,
+  failed: int = 0,
+  attempted: []string = [],
+): Token!MailError {
+  let (ms, microsoft) = source.(MicrosoftApp)
+  if (microsoft) {
+    return ms.getToken(timeout, failed, attempted)?
+  }
+  let (rt, refresh) = source.(RefreshToken)
+  if (refresh) {
+    return rt.getToken(timeout, failed, attempted)?
+  }
+  return source.token()?
+}
+

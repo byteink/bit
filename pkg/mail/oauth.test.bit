@@ -1,0 +1,687 @@
+// Local TLS peers exercise the same HTTP and SMTP wire paths as production.
+const otSecret: string = "oauth-secret-&+"
+const otRefresh: string = "refresh-token-&+"
+const otAccess: string = "access-token-6901"
+
+class OtClock {
+  at: int
+  read(): Timestamp { return Timestamp{ ns = this.at } }
+}
+
+fn otClient(): HttpClient {
+  let roots = fromPem(smPem("CERTIFICATE", smCaHex)) catch e {
+    panic(e.message())
+  }
+  return HttpClient(TlsConfig(roots, serverName = "localhost"))
+}
+
+fn otCache(c: TokenCache) {
+  c.client = otClient
+}
+
+fn otAnswer(value: string, rotated: string = ""): string {
+  return rsReply(
+    200,
+    "",
+    "{\"access_token\":\"${value}\",\"token_type\":\"Bearer\",\"expires_in\":120,\"refresh_token\":\"${rotated}\"}",
+  )
+}
+
+fn otSource(port: int): RefreshToken {
+  let source = RefreshToken("https://127.0.0.1:${port}/token", "inkwell", otRefresh, otSecret)
+  otCache(source.cache)
+  return source
+}
+
+fn otToken(s: TokenSource): Token {
+  return s.token() catch e {
+    panic(e.message())
+  }
+}
+
+fn otSend(source: TokenSource, url: string): Receipt {
+  let opts = smOpts()
+  opts.token = source
+  let m = open(url, opts) catch e {
+    panic(e.message())
+  }
+  defer m.close()
+  return m.send(smMsg(["sara@example.com"])) catch e {
+    panic(e.message())
+  }
+}
+
+test "OAuth MicrosoftApp exact client-credentials form and XOAUTH2 over verified TLS" {
+  let (port, requests) = rsStart([otAnswer(otAccess)]) catch e {
+    panic(e.message())
+  }
+  let source = MicrosoftApp("inkwell.example", "client&+", otSecret)
+  source.endpoint = "https://127.0.0.1:${port}/token"
+  otCache(source.cache)
+  let (smtp, wire) = smStartTls(smHappy(smEhlo("250-AUTH XOAUTH2\r\n"), true, ["250 ok\r\n"])) catch e {
+    panic(e.message())
+  }
+  let ca = smCaFile() catch e {
+    panic(e.message())
+  }
+  defer {
+    remove(ca) catch _ {}
+  }
+  let _ = otSend(source, smTlsUrl(smtp, ca, "hello@"))
+  let request = <- requests
+  let form = "grant_type=client_credentials&client_id=client%26%2B&client_secret=${percentEncode(otSecret)}&scope=https%3A%2F%2Foutlook.office365.com%2F.default"
+  assert(
+    hasPrefix(request, "POST /token HTTP/1.1\r\n") && contains(request, "\r\n\r\n${form}"),
+    request,
+  )
+  let seen = <- wire
+  let auth = encodeBase64([]byte("user=hello\x01auth=Bearer ${otAccess}\x01\x01"))
+  assert(contains(seen, "AUTH XOAUTH2 ${auth}\r\n"), seen)
+  assert(inCount(seen, "MAIL FROM") == 1, seen)
+}
+
+test "OAuth prefers OAUTHBEARER when both mechanisms are offered" {
+  let (port, requests) = rsStart([otAnswer(otAccess)]) catch e {
+    panic(e.message())
+  }
+  let (smtp, wire) = smStartTls(
+    smHappy(smEhlo("250-AUTH XOAUTH2 OAUTHBEARER\r\n"), true, ["250 ok\r\n"]),
+  ) catch e {
+    panic(e.message())
+  }
+  let ca = smCaFile() catch e {
+    panic(e.message())
+  }
+  defer {
+    remove(ca) catch _ {}
+  }
+  let _ = otSend(otSource(port), smTlsUrl(smtp, ca, "hello@"))
+  let seen = <- wire
+  let auth = encodeBase64([]byte("n,a=hello,\x01host=127.0.0.1\x01port=${smtp}\x01auth=Bearer ${otAccess}\x01\x01"))
+  assert(contains(seen, "AUTH OAUTHBEARER ${auth}\r\n") && !contains(seen, "AUTH XOAUTH2"), seen)
+  assert(contains(<- requests, "grant_type=refresh_token"))
+}
+
+test "OAuth 120-second token is reused until the injected clock reaches 60 seconds and rotates refresh tokens" {
+  let (port, requests) = rsStart([otAnswer("first", "rotated&+"), otAnswer("second")]) catch e {
+    panic(e.message())
+  }
+  let source = otSource(port)
+  let clock = OtClock{ at = 1000 * Second }
+  source.cache.clock = () => clock.read()
+  assert(otToken(source).value == "first")
+  let ca = smCaFile() catch e {
+    panic(e.message())
+  }
+  defer {
+    remove(ca) catch _ {}
+  }
+  for (let i = 0; i < 2; i = i + 1) {
+    let (smtp, wire) = smStartTls(smHappy(smEhlo("250-AUTH XOAUTH2\r\n"), true, ["250 ok\r\n"])) catch e {
+      panic(e.message())
+    }
+    let _ = otSend(source, smTlsUrl(smtp, ca, "hello@"))
+    assert(contains(<- wire, "AUTH XOAUTH2"))
+  }
+  assert(source.cache.generation == 1)
+  clock.at = clock.at + 59 * Second
+  assert(otToken(source).value == "first")
+  clock.at = clock.at + Second
+  assert(otToken(source).value == "second")
+  let first = <- requests
+  let second = <- requests
+  assert(
+      contains(first, "refresh_token=${percentEncode(otRefresh)}") &&
+      contains(first, "client_secret=${percentEncode(otSecret)}"),
+    first,
+  )
+  assert(contains(second, "refresh_token=rotated%26%2B"), second)
+}
+
+test "OAuth early refresh failure redacts the cached bearer without a response token field" {
+  let body = "{\"error\":\"invalid_grant\",\"error_description\":\"refused abcdef\"}"
+  let (port, requests) = rsStart([otAnswer("abcdef"), rsReply(400, "", body)]) catch e {
+    panic(e.message())
+  }
+  let source = otSource(port)
+  source.clientSecret = "abc"
+  let clock = OtClock{ at = 1000 * Second }
+  source.cache.clock = () => clock.read()
+  assert(otToken(source).value == "abcdef")
+  clock.at = clock.at + 59 * Second
+  assert(otToken(source).value == "abcdef")
+  clock.at = clock.at + Second
+  source.token() catch e {
+    match (e) {
+      Auth(r) => assert(
+        r.code == 400 && contains(r.text, "invalid_grant") && contains(r.text, "refused"),
+      )
+      _ => panic(e.message())
+    }
+    assert(!contains(e.message(), "def"), e.message())
+    assert(source.cache.generation == 1)
+    assert(contains(<- requests, "POST /token") && contains(<- requests, "POST /token"))
+    return
+  }
+  panic("OAuth accepted the refused early refresh")
+}
+
+fn otConcurrent(s: TokenSource, done: chan<string>) {
+  let token = s.token() catch e {
+    done <- e.message()
+    return
+  }
+  done <- token.value
+}
+
+test "OAuth twenty concurrent acquisitions share one token request" {
+  let (port, requests) = rsStart([otAnswer(otAccess)]) catch e {
+    panic(e.message())
+  }
+  let source = otSource(port)
+  let done = chan<string>(20)
+  for (let i = 0; i < 20; i = i + 1) {
+    spawn otConcurrent(source, done)
+  }
+  for (let i = 0; i < 20; i = i + 1) {
+    assert(<- done == otAccess)
+  }
+  assert(contains(<- requests, "POST /token"))
+  assert(source.cache.generation == 1)
+}
+
+fn otConcurrentSend(source: TokenSource, url: string, done: chan<bool>) {
+  let _ = otSend(source, url)
+  done <- true
+}
+
+test "OAuth twenty concurrent sends share one HTTPS request across SMTP sessions" {
+  let (port, requests) = rsStart([otAnswer(otAccess)]) catch e {
+    panic(e.message())
+  }
+  let source = otSource(port)
+  let ln = tlsListen(
+    "127.0.0.1",
+    0,
+    smServerConfig() catch e {
+      panic(e.message())
+    },
+  ) catch e {
+    panic(e.message())
+  }
+  defer ln.close()
+  let smtp = ln.port() catch e {
+    panic(e.message())
+  }
+  let ca = smCaFile() catch e {
+    panic(e.message())
+  }
+  defer {
+    remove(ca) catch _ {}
+  }
+  let wire = chan<string>(20)
+  let done = chan<bool>(20)
+  let script = smTls{
+    ln = ln,
+    replies = smHappy(smEhlo("250-AUTH XOAUTH2\r\n"), true, ["250 ok\r\n"]),
+    log = wire,
+  }
+  for (let i = 0; i < 20; i = i + 1) {
+    spawn smServeTls(script)
+    spawn otConcurrentSend(source, smTlsUrl(smtp, ca, "hello@"), done)
+  }
+  for (let i = 0; i < 20; i = i + 1) {
+    assert(<- done)
+    let seen = <- wire
+    assert(inCount(seen, "MAIL FROM") == 1 && inCount(seen, "AUTH XOAUTH2") == 1, seen)
+  }
+  assert(source.cache.generation == 1)
+  assert(contains(<- requests, "POST /token"))
+}
+
+fn otRefreshFailed(s: RefreshToken, failed: int, done: chan<int>) {
+  let token = s.getToken(10 * Second, failed) catch e {
+    panic(e.message())
+  }
+  done <- token.generation
+}
+
+test "OAuth concurrent 535 invalidations coalesce even when a refresh returns identical token bytes" {
+  let (port, requests) = rsStart([otAnswer(otAccess), otAnswer(otAccess)]) catch e {
+    panic(e.message())
+  }
+  let source = otSource(port)
+  let old = otToken(source)
+  let done = chan<int>(20)
+  for (let i = 0; i < 20; i = i + 1) {
+    spawn otRefreshFailed(source, old.generation, done)
+  }
+  for (let i = 0; i < 20; i = i + 1) {
+    assert(<- done == 2)
+  }
+  assert(source.cache.generation == 2)
+  assert(contains(<- requests, "POST /token") && contains(<- requests, "POST /token"))
+}
+
+test "OAuth 535 refreshes once and retries only AUTH before the single delivery" {
+  let (port, requests) = rsStart([otAnswer("initial-bearer"), otAnswer("retry-bearer")]) catch e {
+    panic(e.message())
+  }
+  let source = otSource(port)
+  assert(otToken(source).value == "initial-bearer")
+  let replies = smHappy(smEhlo("250-AUTH XOAUTH2\r\n"), true, ["250 ok\r\n"])
+  replies[len(replies) - 2] = "250 2.0.0 queued initial-bearer retry-bearer\r\n"
+  let retry = [replies[0], "535 5.7.8 refused\r\n"]
+  for reply of replies[1:] {
+    retry = append(retry, reply)
+  }
+  let (smtp, wire) = smStartTls(retry) catch e {
+    panic(e.message())
+  }
+  let ca = smCaFile() catch e {
+    panic(e.message())
+  }
+  defer {
+    remove(ca) catch _ {}
+  }
+  let receipt = otSend(source, smTlsUrl(smtp, ca, "hello@"))
+  assert(contains(receipt.providerId, "queued *** ***"))
+  assert(
+      !contains(receipt.providerId, "initial-bearer") &&
+      !contains(receipt.providerId, "retry-bearer"),
+  )
+  let seen = <- wire
+  assert(inCount(seen, "AUTH XOAUTH2") == 2 && inCount(seen, "MAIL FROM") == 1, seen)
+  assert(source.cache.generation == 2)
+  assert(contains(<- requests, "POST /token") && contains(<- requests, "POST /token"))
+}
+
+test "OAuth endpoint errors redact both secrets and response tokens" {
+  let body = "{\"error\":\"invalid_grant\",\"error_description\":\"${otSecret} ${otRefresh} ${otAccess}\",\"access_token\":\"${otAccess}\"}"
+  let (port, requests) = rsStart([rsReply(400, "", body)]) catch e {
+    panic(e.message())
+  }
+  otSource(port).token() catch e {
+    match (e) {
+      Auth(r) => assert(r.code == 400 && contains(r.text, "invalid_grant"))
+      _ => assert(false, e.message())
+    }
+    for secret of [otSecret, otRefresh, otAccess] {
+      assert(!contains(e.message(), secret), "secret disclosed")
+    }
+    assert(contains(<- requests, "POST /token"))
+    return
+  }
+  panic("OAuth accepted a refused grant")
+}
+
+test "OAuth a second 535 stops without starting a mail transaction and hides credentials" {
+  let (port, requests) = rsStart([otAnswer("initial-bearer"), otAnswer(otAccess)]) catch e {
+    panic(e.message())
+  }
+  let source = otSource(port)
+  assert(otToken(source).value == "initial-bearer")
+  let (smtp, wire) = smStartTls(
+    [
+      smEhlo("250-AUTH XOAUTH2\r\n"), "535 5.7.8 refused\r\n",
+      "535 5.7.8 initial-bearer ${otAccess} ${otSecret} ${otRefresh}\r\n",
+    ],
+  ) catch e {
+    panic(e.message())
+  }
+  let ca = smCaFile() catch e {
+    panic(e.message())
+  }
+  defer {
+    remove(ca) catch _ {}
+  }
+  let opts = smOpts()
+  opts.token = source
+  let m = open(smTlsUrl(smtp, ca, "hello@"), opts) catch e {
+    panic(e.message())
+  }
+  defer m.close()
+  m.send(smMsg(["sara@example.com"])) catch e {
+    match (e) {
+      Auth(r) => assert(r.code == 535)
+      _ => panic(e.message())
+    }
+    for secret of ["initial-bearer", otSecret, otRefresh, otAccess] {
+      assert(!contains(e.message(), secret), "secret disclosed")
+    }
+    let seen = <- wire
+    assert(inCount(seen, "AUTH XOAUTH2") == 2 && !contains(seen, "MAIL FROM"), seen)
+    assert(source.cache.generation == 2)
+    assert(contains(<- requests, "POST /token") && contains(<- requests, "POST /token"))
+    return
+  }
+  panic("OAuth ignored a second 535")
+}
+
+test "OAuth malformed bearer responses and expiry overflow are refused" {
+  let clock = 1000 * Second
+  for body of [
+    "{}", "{\"access_token\":\"T\",\"token_type\":\"Basic\",\"expires_in\":120}",
+    "{\"access_token\":\"T\",\"token_type\":\"Bearer\",\"expires_in\":0}",
+    "{\"access_token\":\"T\",\"token_type\":\"Bearer\",\"expires_in\":9223372036854775807}",
+    "{\"access_token\":\"bad\\u0001token\",\"token_type\":\"Bearer\",\"expires_in\":120}",
+  ] {
+    oauthParseToken(body, clock) catch e {
+      match (e) {
+        Auth(_) => continue
+        _ => panic(e.message())
+      }
+    }
+    panic("OAuth accepted a malformed bearer response")
+  }
+}
+
+fn otNoSecrets(text: string) {
+  for secret of ["old-bearer", "new-bearer", "first-rotated-refresh", otSecret] {
+    assert(!contains(text, secret), "a session disclosed a credential")
+  }
+}
+
+fn otFirstMail(): []string {
+  return [
+    smEhlo("250-AUTH XOAUTH2\r\n"),
+    "235 logged in\r\n",
+    "250 sender\r\n",
+    "250 recipient\r\n",
+    "354 data\r\n",
+    "250 2.0.0 firstqueue\r\n",
+  ]
+}
+
+test "OAuth pooled session redacts old bearer queue IDs and recipient rejections after refresh" {
+  let (port, requests) = rsStart(
+    [
+      otAnswer("old-bearer", "first-rotated-refresh"),
+      otAnswer("new-bearer", "second-rotated-refresh"),
+    ],
+  ) catch e {
+    panic(e.message())
+  }
+  let source = otSource(port)
+  let clock = OtClock{ at = 1000 * Second }
+  source.cache.clock = () => clock.read()
+  let old = otToken(source)
+  let script = append(
+    otFirstMail(),
+    ...[
+      "250 sender\r\n", "250 recipient\r\n",
+      "550 5.1.1 no recipient old-bearer first-rotated-refresh ${otSecret}\r\n", "354 data\r\n",
+      "250 2.0.0 queue-old-bearer first-rotated-refresh ${otSecret}\r\n", "221 bye\r\n",
+    ],
+  )
+  let (smtp, wire) = smStartTls(script) catch e {
+    panic(e.message())
+  }
+  let ca = smCaFile() catch e {
+    panic(e.message())
+  }
+  defer {
+    remove(ca) catch _ {}
+  }
+  let opts = smOpts()
+  opts.pool = 1
+  opts.token = source
+  let m = open(smTlsUrl(smtp, ca, "hello@"), opts) catch e {
+    panic(e.message())
+  }
+  defer m.close()
+  m.send(smMsg(["sara@example.com"])) catch e {
+    panic(e.message())
+  }
+  clock.at = clock.at + 60 * Second
+  assert(otToken(source).value == "new-bearer")
+  old.value = "mutated-object"
+  let receipt = m.send(smMsg(["sara@example.com", "lee@example.com"])) catch e {
+    panic(e.message())
+  }
+  assert(len(receipt.accepted) == 1 && len(receipt.rejected) == 1)
+  assert(
+      contains(receipt.providerId, "queue-***") &&
+      contains(receipt.rejected[0].reply.text, "no recipient"),
+  )
+  assert(receipt.rejected[0].reply.code == 550 && receipt.rejected[0].reply.enhanced == "5.1.1")
+  otNoSecrets(receipt.providerId)
+  otNoSecrets(receipt.rejected[0].reply.toString())
+  m.close()
+  let seen = <- wire
+  assert(inCount(seen, "AUTH XOAUTH2") == 1 && inCount(seen, "MAIL FROM") == 2, seen)
+  assert(
+      contains(<- requests, "POST /token") &&
+      contains(<- requests, "refresh_token=first-rotated-refresh"),
+  )
+}
+
+test "OAuth pooled session redacts old bearer transaction errors after refresh" {
+  let (port, requests) = rsStart(
+    [otAnswer("old-bearer", "first-rotated-refresh"), otAnswer("new-bearer")],
+  ) catch e {
+    panic(e.message())
+  }
+  let source = otSource(port)
+  let old = otToken(source)
+  let script = append(
+    otFirstMail(),
+    ...[
+      "550 5.7.1 sender refused old-bearer first-rotated-refresh ${otSecret}\r\n",
+      "250 reset\r\n", "221 bye\r\n",
+    ],
+  )
+  let (smtp, wire) = smStartTls(script) catch e {
+    panic(e.message())
+  }
+  let ca = smCaFile() catch e {
+    panic(e.message())
+  }
+  defer {
+    remove(ca) catch _ {}
+  }
+  let opts = smOpts()
+  opts.pool = 1
+  opts.token = source
+  let m = open(smTlsUrl(smtp, ca, "hello@"), opts) catch e {
+    panic(e.message())
+  }
+  defer m.close()
+  m.send(smMsg(["sara@example.com"])) catch e {
+    panic(e.message())
+  }
+  source.getToken(10 * Second, old.generation) catch e {
+    panic(e.message())
+  }
+  old.value = "mutated-object"
+  m.send(smMsg(["sara@example.com"])) catch e {
+    match (e) {
+      Rejected(r) => assert(
+        r.code == 550 && r.enhanced == "5.7.1" && contains(r.text, "sender refused"),
+      )
+      _ => panic(e.message())
+    }
+    otNoSecrets(e.message())
+    m.close()
+    let seen = <- wire
+    assert(inCount(seen, "AUTH XOAUTH2") == 1 && inCount(seen, "MAIL FROM") == 2, seen)
+    assert(contains(<- requests, "POST /token") && contains(<- requests, "POST /token"))
+    return
+  }
+  panic("OAuth accepted the refused sender")
+}
+
+test "OAuth 535 refresh grant failure redacts the initial attempted bearer" {
+  let body = "{\"error\":\"invalid_grant\",\"error_description\":\"refused initial-bearer\"}"
+  let (port, requests) = rsStart([otAnswer("initial-bearer"), rsReply(400, "", body)]) catch e {
+    panic(e.message())
+  }
+  let source = otSource(port)
+  assert(otToken(source).value == "initial-bearer")
+  let (smtp, wire) = smStartTls([smEhlo("250-AUTH XOAUTH2\r\n"), "535 5.7.8 refused\r\n"]) catch e {
+    panic(e.message())
+  }
+  let ca = smCaFile() catch e {
+    panic(e.message())
+  }
+  defer {
+    remove(ca) catch _ {}
+  }
+  let opts = smOpts()
+  opts.token = source
+  let m = open(smTlsUrl(smtp, ca, "hello@"), opts) catch e {
+    panic(e.message())
+  }
+  defer m.close()
+  m.send(smMsg(["sara@example.com"])) catch e {
+    match (e) {
+      Auth(r) => assert(
+        r.code == 400 && contains(r.text, "invalid_grant") && contains(r.text, "refused"),
+      )
+      _ => panic(e.message())
+    }
+    assert(!contains(e.message(), "initial-bearer"))
+    let seen = <- wire
+    assert(inCount(seen, "AUTH XOAUTH2") == 1 && !contains(seen, "MAIL FROM"))
+    assert(contains(<- requests, "POST /token") && contains(<- requests, "POST /token"))
+    return
+  }
+  panic("OAuth ignored the refused refresh grant")
+}
+
+class OtDelayed {
+  ln: TlsListener,
+  ready: chan<bool>,
+  release: chan<bool>,
+}
+
+fn otDelayedServer(f: OtDelayed) {
+  let c = f.ln.accept() catch e {
+    panic(e.message())
+  }
+  defer c.close()
+  rsReadRequest(c) catch e {
+    panic(e.message())
+  }
+  f.ready <- true
+  <- f.release
+  c.write([]byte(otAnswer(otAccess))) catch e {
+    panic(e.message())
+  }
+}
+
+fn otLongAcquire(source: RefreshToken, done: chan<string>) {
+  let token = source.getToken(5 * Second, 0) catch e {
+    done <- e.message()
+    return
+  }
+  done <- token.value
+}
+
+fn otReleaseLater(release: chan<bool>) {
+  sleep(Second)
+  release <- true
+}
+
+test "OAuth short waiter times out while a longer refresh remains valid and later acquisition recovers" {
+  let ln = tlsListen(
+    "127.0.0.1",
+    0,
+    smServerConfig() catch e {
+      panic(e.message())
+    },
+  ) catch e {
+    panic(e.message())
+  }
+  defer ln.close()
+  let port = ln.port() catch e {
+    panic(e.message())
+  }
+  let source = otSource(port)
+  let f = OtDelayed{ ln = ln, ready = chan<bool>(1), release = chan<bool>(1) }
+  let done = chan<string>(1)
+  spawn otDelayedServer(f)
+  spawn otLongAcquire(source, done)
+  assert(<- f.ready)
+  spawn otReleaseLater(f.release)
+  let start = monotonic().ns
+  source.getToken(20 * Millisecond, 0) catch e {
+    match (e) {
+      Transient(r) => assert(contains(r.text, "timed out"))
+      _ => panic(e.message())
+    }
+    assert(monotonic().ns - start < Second, "short waiter exceeded its own budget")
+    select {
+      case <- done:
+        panic("original refresher completed before release")
+      default:
+        {}
+    }
+    f.release <- true
+    assert(<- done == otAccess)
+    assert(otToken(source).value == otAccess && source.cache.generation == 1)
+    return
+  }
+  panic("short waiter ignored its own timeout")
+}
+
+test "OAuth setup refuses HTTP endpoints, injected tenants, and a username without credentials" {
+  for tenant of ["", "common", "inkwell.example/evil", "inkwell.example?x", "inkwell..example"] {
+    let source = MicrosoftApp(tenant, "client", otSecret)
+    Mailer(Outbox(), Options{ token = source }) catch e {
+      assert(!contains(e.message(), otSecret))
+      continue
+    }
+    panic("accepted invalid tenant")
+  }
+  for url of [
+    "http://localhost/token",
+    "https:///token",
+    "https://user:pass@host/token",
+    "https://host/#fragment",
+  ] {
+    Mailer(Outbox(), Options{ token = RefreshToken(url, "client", otRefresh) }) catch e {
+      assert(!contains(e.message(), otRefresh))
+      continue
+    }
+    panic("accepted invalid endpoint")
+  }
+  open("smtps://hello@mail.example.com") catch e {
+    match (e) {
+      Config(_) => return
+      _ => panic(e.message())
+    }
+  }
+  panic("accepted a username with neither password nor source")
+}
+
+test "OAuth bearer redaction preserves a local permanent capability refusal" {
+  let (port, requests) = rsStart([otAnswer("SMTPUTF8")]) catch e {
+    panic(e.message())
+  }
+  let (smtp, wire) = smStartTls(smHappy(smEhlo("250-AUTH XOAUTH2\r\n"), true, ["250 ok\r\n"])) catch e {
+    panic(e.message())
+  }
+  let ca = smCaFile() catch e {
+    panic(e.message())
+  }
+  defer {
+    remove(ca) catch _ {}
+  }
+  let opts = smOpts()
+  opts.token = otSource(port)
+  let m = open(smTlsUrl(smtp, ca, "hello@"), opts) catch e {
+    panic(e.message())
+  }
+  defer m.close()
+  let (rejected, why) = inCredentialError(m, smMsg(["josé@example.com"]))
+  assert(rejected, "OAuth capability refusal lost its permanent classification")
+  assert(!contains(why, "SMTPUTF8"), why)
+  m.send(smMsg(["sara@example.com"])) catch e {
+    panic(e.message())
+  }
+  m.close()
+  let seen = <- wire
+  assert(inCount(seen, "AUTH XOAUTH2") == 1 && inCount(seen, "MAIL FROM") == 1, seen)
+  assert(contains(<- requests, "POST /token"))
+}

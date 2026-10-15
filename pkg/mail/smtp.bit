@@ -21,19 +21,20 @@ class SmtpTransport {
   t: Target
   hello: string
   sessions: SessionPool
+  token: TokenSource
+  timeout: int
 
   // `opts.pool` sessions at most, `opts.timeout` for every wait. Nothing is
   // connected until the first `deliver`.
   init(t: Target, hello: string, opts: Options, idleAfter: int = idleProbeAfter) {
     this.t = t
     this.hello = hello
-    let dialIt: () => Client!MailError = () => {
+    this.token = opts.token
+    this.timeout = opts.timeout
+    let dialIt: () => SmtpLogin!MailError = () => {
       return this.connect()?
     }
-    let liftIt: (SmtpError) => MailError = (e) => {
-      return this.lift(e)
-    }
-    this.sessions = SessionPool(dialIt, liftIt, opts, idleAfter)
+    this.sessions = SessionPool(dialIt, opts, idleAfter)
   }
 
   // Sends `d` over a pooled session. A refusal from the server maps to
@@ -78,8 +79,8 @@ class SmtpTransport {
   // the first send, with no message. A QUIT the server answers badly is not a
   // problem with the setup.
   export check(): ()!MailError {
-    let c = this.connect()?
-    c.quit() catch _ {}
+    let login = this.connect()?
+    login.c.quit() catch _ {}
   }
 
   // Quits the idle sessions; later sends fail `Invalid("mailer is closed")`.
@@ -94,13 +95,17 @@ class SmtpTransport {
 
   // A connection that is greeted, encrypted and logged in, or an error with
   // the socket closed.
-  connect(): Client!MailError {
+  connect(): SmtpLogin!MailError {
     let c = this.dialServer()?
-    this.prepare(c) catch e {
+    let secrets = this.prepare(c) catch e {
       c.close()
       fail e
     }
-    return c
+    return SmtpLogin{
+      c = c,
+      scrub = (text) => oauthScrub(text, secrets),
+      lift = (e) => oauthError(this.lift(e), secrets),
+    }
   }
 
   dialServer(): Client!MailError {
@@ -115,7 +120,7 @@ class SmtpTransport {
   }
 
   // EHLO, STARTTLS (required unless `tls=off`), EHLO again, login.
-  prepare(c: Client): ()!MailError {
+  prepare(c: Client): []string!MailError {
     c.ehlo(this.hello) catch e {
       fail this.lift(e)
     }
@@ -123,11 +128,54 @@ class SmtpTransport {
       this.upgrade(c)?
     }
     if (this.t.hasUser) {
+      if (this.token != nil) {
+        let attempted = this.authenticateToken(c)?
+        return attempted
+      }
       let a = this.chooseAuth(c.authMechanisms())?
       c.auth(a) catch e {
         fail this.lift(e)
       }
     }
+    return [this.t.pass]
+  }
+
+  authenticateToken(c: Client): []string!MailError {
+    let offered = c.authMechanisms()
+    if (!hasMech(offered, "OAUTHBEARER") && !hasMech(offered, "XOAUTH2")) {
+      fail MailError.Config("${this.t.display}: the server offers neither OAUTHBEARER nor XOAUTH2")
+    }
+    let token = sourceToken(this.token, this.timeout)?
+    let used = token.value
+    let attempted = append([used], ...token.secrets)
+    let generation = token.generation
+    this.authToken(c, used, offered) catch e {
+      if (e.code != 535) {
+        fail this.tokenError(e, attempted)
+      }
+      token = sourceToken(this.token, this.timeout, generation, attempted) catch refresh {
+        fail oauthError(refresh, attempted)
+      }
+      used = token.value
+      attempted = append(attempted, used)
+      attempted = append(attempted, ...token.secrets)
+      this.authToken(c, used, offered) catch second {
+        fail this.tokenError(second, attempted)
+      }
+    }
+    return attempted
+  }
+
+  authToken(c: Client, token: string, offered: []string): ()!SmtpError {
+    if (hasMech(offered, "OAUTHBEARER")) {
+      c.auth(Auth.OauthBearer(this.t.user, token))?
+      return
+    }
+    c.auth(Auth.Xoauth2(this.t.user, token))?
+  }
+
+  tokenError(e: SmtpError, attempted: []string): MailError {
+    return oauthError(this.lift(e), attempted)
   }
 
   upgrade(c: Client): ()!MailError {
@@ -213,10 +261,7 @@ class SmtpTransport {
   }
 
   scrub(s: string): string {
-    if (this.t.pass == "") {
-      return s
-    }
-    return replace(s, this.t.pass, "***")
+    return oauthScrub(s, [this.t.pass])
   }
 
   receipt(d: Delivery, out: SmtpDelivery): Receipt {
