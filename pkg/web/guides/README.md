@@ -8,9 +8,8 @@ it becomes a blogging API with users, articles, tags and comments, using
 over HTTP. You do not need to have built the earlier chapters to follow this
 one; it starts a fresh project of its own.
 
-Seventeen chapters, in the same shape as the rest of the Book: each one
-starts from a problem, adds one idea to solve it, and ends with a `curl`
-command you can run against your own copy. By the end you have a tested,
+Each chapter follows the same shape as the rest of the Book: it starts
+from a problem, adds one idea to solve it, and ends with a `curl` command you can run against your own copy. By the end you have a tested,
 configured service that starts from a single binary and talks to a real
 PostgreSQL database - covered in [Shipping](../../../docs/book/33-shipping.md),
 which closes out Part 5.
@@ -55,7 +54,12 @@ audience and access-token header are rejected; sign in again to get a new one.
 
 Chapter 40 goes back to the finished app and makes its two creating routes safe
 to retry. The chapters numbered 31 to 39 are not written yet, so it follows
-chapter 30 for now.
+chapter 30 for now. Chapter 40 closes Season 2.
+
+## Part 41: Season 3
+
+Part 41 is the next course part. Season 3 has not been written yet; there is
+no chapter to open here.
 
 Part 4 ends there; [Shipping](../../../docs/book/33-shipping.md) covers
 building and running the finished binary, for the ink CLI and this server
