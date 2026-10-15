@@ -49,32 +49,31 @@ that never sends one.
 
 ## The simplest thing that works
 
-`idempotency` takes a policy: where to remember keys and for how long. This is
-a complete program with the in-process store, the one to use while you are
-trying it out:
+Inkwell already has PostgreSQL, so you can use its SQL-backed store without
+adding another service. The finished app's startup opens the store over the
+same connection pool as its articles and comments. This function is copied
+from [`inkwell/main.bit`](inkwell/main.bit):
 
 ```bit
-import {
-  App, Config, Ctx, IdempotencyPolicy, MemoryIdempotencyStore, Res, idempotency,
-} from "web"
+import { SqlIdempotencyStore } from "web"
+import { Db } from "orm"
 
-fn createComment(c: Ctx): Res! {
-  return c.createdUrl("/articles/42/comments/17")
-}
-
-fn main(): ()! {
-  let app = App(Config{ secret = "dev-secret-change-me" })
-  let write = app.group("/articles/:id/comments")
-  write.use(idempotency(IdempotencyPolicy{ store = MemoryIdempotencyStore(10_000), ttl = 86400 }))
-  write.post("/", createComment)
-  app.listen()?
+fn openIdempotencyStore(db: Db): SqlIdempotencyStore! {
+  let store = SqlIdempotencyStore(db.pool)?
+  store.purge()?
+  return store
 }
 ```
 
-`ttl` is how many seconds a key is remembered, here one day: long enough for any
-retry a client will make, short enough that the table does not grow forever.
-`MemoryIdempotencyStore(10_000)` keeps at most 10,000 keys, and there is no
-default store on purpose, for the reason in the next section.
+Run the [finished app](README.md#run-the-finished-app) after applying its
+migrations. The following requests target that app, including its real
+comment handler and authentication, rather than a separate demo server.
+Replace the example session cookie and article id with your own.
+
+A policy connects this store to the middleware and gives each key a lifetime.
+Inkwell uses one day: longer than a normal client retry, with expired rows
+removed by `purge()`. Keys are kept separately for each signed-in user, so
+another reader sending the same key does not receive your response.
 
 ## The three answers
 
@@ -150,20 +149,8 @@ Inkwell behind a load balancer and the retry lands on the other server, which
 has never heard of the key, so the comment is posted twice again. That is why
 `idempotency` has no default store.
 
-Inkwell already has PostgreSQL, so its keys go there: `SqlIdempotencyStore`
-takes a `std/sql` pool and works on PostgreSQL, MySQL 8 and MariaDB. The app's
-`main.bit` builds it next to its other startup work:
-
-```bit
-import { SqlIdempotencyStore } from "web"
-import { Db } from "orm"
-
-fn openIdempotencyStore(db: Db): SqlIdempotencyStore! {
-  let store = SqlIdempotencyStore(db.pool)?
-  store.purge()?
-  return store
-}
-```
+The `SqlIdempotencyStore` opened above takes a `std/sql` pool and works on
+PostgreSQL, MySQL 8 and MariaDB. Inkwell uses PostgreSQL.
 
 `SqlIdempotencyStore(pool)` asks the server what it is and fails at startup if
 it is not a database it can serve, instead of on the first request that carries
@@ -217,48 +204,32 @@ rest. Running it again changes nothing.
 
 ## Mount it on the two POST routes
 
-`idempotency(...)` is a `Middleware`, built once from the policy. Inkwell builds
-it in `buildApp` and hands it to the two modules that own the routes:
+Inkwell creates one middleware from its store and passes it to
+`mountArticles` and `mountComments`. This is the actual policy statement in
+`buildAppFromDb` in [`main.bit`](inkwell/main.bit):
 
-```bit
-import { IdempotencyPolicy, IdempotencyStore, Middleware, idempotency } from "web"
-
-const idempotencyTtlSeconds: i64 = 86400
-
-fn guardWrites(keys: IdempotencyStore): Middleware {
-  return idempotency(IdempotencyPolicy{ store = keys, ttl = idempotencyTtlSeconds })
-}
+```text
+let once = idempotency(IdempotencyPolicy{ store = keys, ttl = idempotencyTtlSeconds })
 ```
 
-Each module puts it on a group that holds only its `POST` route, next to the
-group that holds the reads. `comments.bit` does it like this:
+`idempotencyTtlSeconds` is the one-day lifetime declared in that same file.
+The excerpt uses the app's existing `keys` argument; it is not a standalone
+program. The complete app supplies its store, routes and configuration.
 
-```bit
-import { App, Ctx, Middleware, Res } from "web"
-import { Db } from "orm"
+Each module puts the middleware on a group that holds only its creating
+route. Here is the write group copied from
+[`mountComments`](inkwell/comments.bit):
 
-fn listComments(c: Ctx, db: Db): Res! {
-  return c.text("[]")
-}
-
-fn createComment(c: Ctx, db: Db): Res! {
-  return c.createdUrl("/articles/42/comments/17")
-}
-
-export fn mountComments(app: App, db: Db, once: Middleware) {
-  let onArticle = app.group("/articles/:id/comments")
-  onArticle.get("/", (c) => listComments(c, db))
-  let write = app.group("/articles/:id/comments")
-  write.use(once)
-  write.post("/", (c) => createComment(c, db))
-}
+```text
+let write = app.group("/articles/:id/comments")
+write.use(once)
+write.post("/", (c) => createComment(c, db))
 ```
 
-(The handlers here are stubs so the block stands on its own; the real ones are
-in `comments.bit`.) Two groups can share a prefix. A middleware on a group
-covers every route of that group, so giving the `POST` its own group is what
-keeps `GET /articles/:id/comments` out of it. `articles.bit` does the same for
-`POST /articles`.
+The real `createComment` checks the article, reads the signed-in user,
+validates the body and inserts the comment. Two groups can share a prefix,
+so the separate read group serves `GET /articles/:id/comments` without
+reserving a key. `mountArticles` does the same for `POST /articles`.
 
 Because the middleware sits in front of the handler, a handler that fails, say
 a `401` for a missing session or a `400` for a body that does not validate,
@@ -299,36 +270,19 @@ class HeldStore {
 
 `HeldStore` has the three methods of an idempotency store, so `buildAppWith(cfg,
 store)`, the variant of `buildApp` that takes the store as an argument, accepts
-it. The test then reads like the story:
-
-```bit ignore
-test "POST /articles: a duplicate sent while the first is still running is 409" {
-  let (app, held) = heldApp()
-  let cookie = registerAndLogin(app, uniqueName("idem"), "correct horse battery") catch e {
-    panic(e.message())
-  }
-  let title = uniqueName("inflight")
-  let req = keyedPost("/articles", cookie, uniqueName("key"), articleBody(title))
-  let out = chan<Response>(1)
-  spawn sendInto(app, req, out)
-  <- held.reached
-  let duplicate = app.handle(req)
-  assert(duplicate.status == 409, "want 409 while the first is running")
-  held.release <- true
-  let first = <- out
-  assert(first.status == 201, "want 201 from the first request")
-  let after = app.handle(req)
-  assert(after.status == 201, "want the replayed 201")
-  assert(countRows(articleCount, title) == 1, "exactly one row must exist")
-}
-```
+it. The test named `POST /articles: a duplicate sent while the first is still
+running is 409` in
+[`idempotency.test.bit`](inkwell/idempotency.test.bit) calls
+`expectInFlightConflict` with a real signed-in request. Read that helper
+beside the test to see the row-count assertion against PostgreSQL.
 
 The test sends the request on another thread, waits until the handler has run and
 `finish` is holding, sends the duplicate (`409`), lets the first request finish,
-and sends it a third time (the replay). The last line asks PostgreSQL, not the
-response, how many articles exist: one. The same file does the replay and the
-mismatch for both routes. Run it with the rest of the suite; it needs the
-PostgreSQL that [Testing the API](16-testing-the-api.md) set up:
+and sends it a third time (the replay). Its final assertion asks PostgreSQL,
+not the response, how many articles exist: one. The same file tests replay
+and mismatch for both routes, plus two signed-in users sending the same key
+and body: each gets a separate article and its own replay. Run it with the
+rest of the suite; it needs the PostgreSQL that [Testing the API](16-testing-the-api.md) set up:
 
 ```text
 $ bit test pkg/web/guides/inkwell
@@ -345,7 +299,7 @@ $ bit test pkg/web/guides/inkwell
   caller with no session is told apart by the address the connection came from.
   Behind a proxy that is the proxy's address, so name the hops you trust with
   `scope = bySubject(byForwardedIp(hops))` on the policy; see "Whose key is it" in
-  the operational middleware chapter.
+  the [operational middleware chapter](../docs/operations.md#whose-key-is-it).
 - **A handler that outlives `ttl` can run twice.** Its reservation expires, a
   retry takes the key, and now two copies run. Keep `ttl` far longer than the
   slowest `POST /articles`.
@@ -373,8 +327,9 @@ new row each time, which is why they carry it.
 Inkwell's two creating routes now take an `Idempotency-Key`, kept per signed-in
 user. A retry with the same key and body returns the first answer and stores one
 row, a retry during the first request is a `409`, and the same key with a
-different body is a `422`. The keys live in PostgreSQL next to the data, in a table that `bit migrate` creates,
-so every server behind the load balancer answers for all of them.
+different body is a `422`. The keys live in PostgreSQL next to the data, in
+a table that `bit migrate` creates, so every server behind the load balancer
+answers for all of them.
 
-Previous: [Operations](17-operations.md). This is the last chapter written so
-far; the course continues from here.
+Previous: [Operations](17-operations.md).
+Next: [Part 41: Season 3](README.md#part-41-season-3), which is not written yet.
