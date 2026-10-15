@@ -50,19 +50,17 @@ audience and access-token header are rejected; sign in again to get a new one.
 28. [Transactions](15-transactions.md)
 29. [Testing the API](16-testing-the-api.md)
 30. [Operations: health, graceful shutdown](17-operations.md)
-40. [Idempotency keys: retry a write without doing it twice](40-idempotency-keys.md)
+31. [Find articles by their words](28-full-text-search.md)
+32. [Keep deleted articles recoverable](29-soft-deletes.md)
+33. [Refuse an edit based on an old article](30-optimistic-locking.md)
+34. [API tokens with JWT](34-api-tokens-with-jwt.md)
+35. [Refresh tokens](35-refresh-tokens.md)
+36. [Sign in with Google](36-sign-in-with-google.md)
+37. [Idempotency keys: retry a write without doing it twice](40-idempotency-keys.md)
 
-Chapter 40 goes back to the finished app and makes its two creating routes safe
-to retry. The chapters numbered 31 to 39 are not written yet, so it follows
-chapter 30 for now. Chapter 40 closes Season 2.
-
-## Part 41: Season 3
-
-Part 41 is the next course part. Season 3 has not been written yet; there is
-no chapter to open here.
-
-Part 4 ends there; [Shipping](../../../docs/book/33-shipping.md) covers
-building and running the finished binary, for the ink CLI and this server
-alike, as Part 5's close.
+Idempotency closes this part by making the app's two creating routes safe
+to retry. Part 5 starts with [Background jobs](../../../docs/book/31-background-jobs.md)
+and ends with [Shipping](../../../docs/book/33-shipping.md), which covers
+building and running the finished binary for the ink CLI and this server.
 
 Start with [chapter 14](01-first-endpoint.md).

@@ -331,5 +331,5 @@ different body is a `422`. The keys live in PostgreSQL next to the data, in
 a table that `bit migrate` creates, so every server behind the load balancer
 answers for all of them.
 
-Previous: [Operations](17-operations.md).
-Next: [Part 41: Season 3](README.md#part-41-season-3), which is not written yet.
+Previous: [Sign in with Google](36-sign-in-with-google.md).
+Next: [Background jobs](../../../docs/book/31-background-jobs.md).

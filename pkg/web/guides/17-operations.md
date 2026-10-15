@@ -150,7 +150,5 @@ check depend on the database going down turning into a restart storm. And
 it stops the way a real deployment stops it: `SIGTERM` or `SIGINT` drains
 whatever is in flight instead of cutting it off.
 
-Previous: [Testing the API](16-testing-the-api.md). Part 4 ends here; the
-Book picks the thread back up in Part 5 with
-[Background jobs](../../../docs/book/31-background-jobs.md), which moves
-Inkwell's slow work out of the request.
+Previous: [Testing the API](16-testing-the-api.md).
+Next: [Find articles by their words](28-full-text-search.md).

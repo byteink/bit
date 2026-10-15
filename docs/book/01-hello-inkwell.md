@@ -74,7 +74,7 @@ ink is ready: 01912e9b-...
 ```
 
 `bit build` compiles `main.bit` into a standalone executable, `ink`, that
-runs with no `bit` toolchain present. That is the same binary [chapter 33,
+runs with no `bit` toolchain present. That is the same binary [chapter 40,
 Shipping](33-shipping.md) cross-compiles for other machines, much later.
 
 ## What you built

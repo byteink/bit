@@ -230,5 +230,5 @@ and drains cleanly on shutdown along with everything else in flight.
 
 Specification: [pkg/jobs](/packages/jobs).
 
-Previous: [Operations](../../pkg/web/guides/17-operations.md). Next:
+Previous: [Idempotency keys](../../pkg/web/guides/40-idempotency-keys.md). Next:
 [Making it fast](32-making-it-fast.md).

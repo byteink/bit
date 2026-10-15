@@ -69,15 +69,22 @@ up.
 28. [Transactions](../../pkg/web/guides/15-transactions.md)
 29. [Testing the API](../../pkg/web/guides/16-testing-the-api.md)
 30. [Operations](../../pkg/web/guides/17-operations.md)
+31. [Find articles by their words](../../pkg/web/guides/28-full-text-search.md)
+32. [Keep deleted articles recoverable](../../pkg/web/guides/29-soft-deletes.md)
+33. [Refuse an edit based on an old article](../../pkg/web/guides/30-optimistic-locking.md)
+34. [API tokens with JWT](../../pkg/web/guides/34-api-tokens-with-jwt.md)
+35. [Refresh tokens](../../pkg/web/guides/35-refresh-tokens.md)
+36. [Sign in with Google](../../pkg/web/guides/36-sign-in-with-google.md)
+37. [Idempotency keys: retry a write without doing it twice](../../pkg/web/guides/40-idempotency-keys.md)
 
 ## Part 5: Running it for real
 
 Inkwell is a real program now. The last part makes it fast, observable, and
 easy to ship.
 
-31. [Background jobs](31-background-jobs.md)
-32. [Making it fast](32-making-it-fast.md)
-33. [Shipping](33-shipping.md)
+38. [Background jobs](31-background-jobs.md)
+39. [Making it fast](32-making-it-fast.md)
+40. [Shipping](33-shipping.md)
 
 ## Where things are defined
 
