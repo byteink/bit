@@ -163,8 +163,9 @@ The function rejects expiry outside 1..604800 seconds, negative or reversed
 size ranges, duplicate fields, and reserved signing fields supplied by callers.
 It limits custom fields plus conditions to 128 entries, each value to 4096
 bytes, and the JSON policy to 16384 bytes. Names and values must be UTF-8.
-Errors begin with `s3 POST:`. A refused upload returns an S3 HTTP error to the
-browser; a returned form does not mean the upload succeeded.
+POST validation errors begin with `s3 POST:`. Endpoint parsing errors propagate
+from the AWS helper with an `aws:` prefix. A refused upload returns an S3 HTTP
+error to the browser; a returned form does not mean the upload succeeded.
 
 For a single-object upload URL without policy size limits, use `presignPut`
 above instead.
