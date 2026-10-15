@@ -114,6 +114,62 @@ fn downloadUrlFor(client: Client, key: string): string! {
 }
 ```
 
+## Limit a browser upload with a POST policy
+
+To cap a cover image before it reaches your application, return a
+`PresignedPost` from `presignPost`. Send every returned field to `post.url`
+as `multipart/form-data`, with the `file` part last. The browser needs no
+secret key. Your bucket must allow your browser origin through its CORS rules.
+
+```bit
+import { PostCondition, PostOptions, PresignedPost, presignPost } from "s3"
+
+fn coverUploadForm(client: Client): PresignedPost! {
+  return presignPost(
+    client.cfg,
+    "articles/42/cover.jpg",
+    300,
+    PostOptions{
+      fields = [("Content-Type", "image/jpeg")],
+      conditions = [
+        PostCondition.Exact("Content-Type", "image/jpeg"),
+        PostCondition.StartsWith("key", "articles/42/"),
+        PostCondition.ContentLengthRange(1, 1048576),
+      ],
+    },
+  )?
+}
+
+fn printCoverForm(client: Client): ()! {
+  let post = coverUploadForm(client)?
+  println(post.url)
+  for (name, value) of post.fields {
+    println("${name}: ${value}")
+  }
+}
+```
+
+Fields receive exact-match conditions automatically. Extra conditions further
+restrict those fields. To let the browser choose a filename, end the key in
+`${filename}`; the policy constrains its prefix. The returned fields include
+bucket, key, algorithm, credential, date, policy and signature.
+
+`PostOptions.sessionToken` adds a temporary credential's session token to the
+form and policy. Leave `signingDate` empty for the current UTC time; set it to
+`YYYYMMDDTHHMMSSZ` only when you need a reproducible signing time. Expiration is
+relative to that time, so a historical date produces an expired upload form.
+
+The function rejects expiry outside 1..604800 seconds, negative or reversed
+size ranges, duplicate fields, and reserved signing fields supplied by callers.
+It limits custom fields plus conditions to 128 entries, each value to 4096
+bytes, and the JSON policy to 16384 bytes. Names and values must be UTF-8.
+POST validation errors begin with `s3 POST:`. Endpoint parsing errors propagate
+from the AWS helper with an `aws:` prefix. A refused upload returns an S3 HTTP
+error to the browser; a returned form does not mean the upload succeeded.
+
+For a single-object upload URL without policy size limits, use `presignPut`
+above instead.
+
 ## Multipart upload for large exports
 
 A cover image never needs this, but an export of every article a writer has
