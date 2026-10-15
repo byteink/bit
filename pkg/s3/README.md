@@ -60,7 +60,8 @@ Signature Version 4 (`pkg/aws`), checked against AWS's own published test
 suite (`pkg/aws/sigv4.test.bit`, `pkg/aws/sigv4suite.test.bit`).
 
 The full method surface (put/get/head/delete, `list`'s paginated iterator,
-multipart upload, `presignGet`/`presignPut`), streaming large objects, and
+multipart upload, `presignGet`/`presignPut`, and bounded browser upload forms
+with `presignPost`), streaming large objects, and
 what this package does not implement (virtual-hosted addressing, bucket
 policies, lifecycle rules) are in [`docs/`](docs/README.md).
 
