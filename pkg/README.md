@@ -34,12 +34,11 @@ race test in a package must fail, not skip, below two workers.
 | the diff touches | what runs |
 |---|---|
 | `pkg/<name>/**` only | `./make test-package-<name>` |
-| `compiler/`, `runtime/`, `stdlib/`, `tools/build/` | the full pre-push gate, then `./make test-packages` |
+| `compiler/`, `runtime/`, `stdlib/`, `tools/build/` | the full pre-push gate (includes `test-packages`) |
 
-Neither step is part of `./make test`, on purpose: a package is a leaf, so a
-`pkg/`-only diff cannot break the language and owes none of the language's
-gates. The language can break a package, so a compiler change owes
-`test-packages` on top of its own gate.
+The individual `test-package-<name>` steps stay outside `./make test`.
+The `test-packages` umbrella is included in `./make test`, so
+`./make test-prepush` already runs every package's tests.
 
 ## Workspace
 
