@@ -149,4 +149,6 @@ diffdump_setup() {
   # inherit this environment, so force "1" to compare ON against ON. Delete
   # with the flag, one release after the flip.
   export BIT_IF_BRANCHCHAIN=1
+  # #6175: compare fresh append semantics until the fresh-default release is pinned.
+  export BIT_APPEND_FRESH=1
 }

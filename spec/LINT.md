@@ -241,7 +241,7 @@ These need scope and symbol information and land after phase 1.
 | E0210 | `unused-import` | Left behind by refactors; misleads the next reader about a module's dependencies. |
 | E0211 | `unused-local` | Same, at function scope. |
 | E0213 | `shadowed-local` | A `let` that hides a name from an enclosing scope. Later edits to either binding silently change which one is read. |
-| E0214 | `append-aliasing` | `append` on a slice parameter grows it in place and aliases the caller's backing array, so the caller sees writes it never made. |
+| E0214 | `append-aliasing` | `append` on a slice parameter may write into the caller's shared backing array, even though the caller's slice length stays unchanged. |
 | E0215 | `unused-result` | A bare call whose non-void result is thrown away with no assignment at all - the one case E0211 cannot see because nothing was ever named. See §4.3. |
 
 (E0212 `unreachable-code` is numbered in this block but requires no resolver;
