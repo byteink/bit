@@ -32,9 +32,8 @@
 // problem to work around.
 //
 // EVERY ONE OF 10 CYCLES uses a DIFFERENT `targetLines` (1, 3, 5, ..., 19
-// logged transactions), so the kill lands at a different
-// point relative to each cycle's own write/sync/meta-flip sequence — a
-// single lucky kill proves nothing about that ordering. Bounded on OBSERVED
+// logged transactions), exercising different observed progress prefixes.
+// These targets do not select internal write/sync/meta-flip phases. Bounded on OBSERVED
 // PROGRESS (`wc -l` on the side-file), not on elapsed wall-clock time, so a
 // loaded box slows the whole cycle down uniformly rather than producing a
 // false miss — this workspace has been burned by fixed wall-clock bounds
@@ -46,11 +45,12 @@
 //
 // THE ASSERTION always runs against a FRESH `open` from this (the parent)
 // process, never from the process being killed. Every committed value
-// logged before the child's last progress line must be present after
-// reopen, proving no torn state; the very last one may be present or absent
-// (the kill can land between the meta write finishing and the log line
-// landing) but if present it must decode to the correct value, never a
-// corrupt one.
+// logged through the child's last complete progress line must be present
+// after reopen: Db.tx returned before that acknowledgement was written.
+// At most one additional transaction can have committed without its ACK.
+// Each transaction also replaces an alternating multi-key tuple; its whole
+// state must match the recovered version. These process kills do not select
+// internal commit phases or simulate power loss.
 
 import { split } from "std/strings"
 
@@ -64,9 +64,8 @@ const crashChildEnv5725 = "BIT_KV_CRASH_CHILD"
 // The child half: the env var carries the cycle directory, which holds the
 // `db` to write and the `progress` side-file to append to. Commits one
 // transaction at a time, logging a line after each, until the parent's
-// `kill -9` lands (or `crashChildBudgetMs` expires); the 3ms sleep spreads
-// the commits so the kill falls at different points of the
-// write/sync/meta-flip sequence.
+// `kill -9` lands (or `crashChildBudgetMs` expires); the 3ms sleep gives
+// the shell poller opportunities to observe completed acknowledgements.
 fn crashChild5725(cdir: string) {
   let db = open("${cdir}/db") catch e {
     panic("child open: ${e.message()}")
@@ -77,6 +76,10 @@ fn crashChild5725(cdir: string) {
     let key = encodeInt(i64(i))
     db.tx((tx) => {
       tx.put(key, key)?
+      tx.put(encodeInt(-1), key)?
+      tx.put(encodeInt(-2), encodeInt(-i64(i)))?
+      tx.put(encodeInt(-3 - i64(i % 2)), key)?
+      tx.delete(encodeInt(-4 + i64(i % 2)))?
     }) catch e {
       panic("child write: ${e.message()}")
     }
@@ -115,11 +118,14 @@ fn crashKillWrapperScript5725(
     "  n=$((n+1))\n" +
     "done\n" +
     "kill -9 $p 2>/dev/null\n" +
+    "kill_rc=$?\n" +
     "wait $p\n" +
-    "exit $?\n"
+    "child_rc=$?\n" +
+    "printf 'child PID=%s kill_rc=%s wait_rc=%s\\n' \"$p\" \"$kill_rc\" \"$child_rc\"\n" +
+    "exit $child_rc\n"
 }
 
-// The `wait $p; exit $?` pattern above reports POSIX's 128+signal via the
+// The captured `wait $p` result above reports POSIX's 128+signal via the
 // wrapper's own (normal) exit code, not via `osRunBounded`'s separate
 // killed-by-signal encoding — the wrapper itself always exits cleanly, it is
 // only reporting the GRANDCHILD's status. Mirrors
@@ -170,38 +176,109 @@ fn crashCheck5725(t: CrashTally5725, cond: bool, label: string) {
   }
 }
 
-// The actual consistency proof, from a FRESH `open` in THIS process —
-// never the one that was killed. Keys 1..loggedCount-1 must all be present
-// and correct (no torn state); the last logged one may be present or
-// absent, but if present must decode correctly.
+fn crashValue8171(value: []byte, expected: i64): bool {
+  return len(value) == 8 && decodeInt(value) == expected
+}
+
+// The scan returns values in key order, so missing the last key must fail
+// even when every earlier acknowledged value and the meta version survived.
+fn crashHistory8171(values: [][]byte, count: int): bool {
+  if (len(values) != count) {
+    return false
+  }
+  let k = 0
+  while (k < count) {
+    if (!crashValue8171(values[k], i64(k + 1))) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+fn crashTuple8171(values: [][]byte, version: i64): bool {
+  if (version == 0) {
+    return len(values) == 0
+  }
+  if (len(values) != 3) {
+    return false
+  }
+  return crashValue8171(values[0], version) &&
+    crashValue8171(values[1], -version) &&
+    crashValue8171(values[2], version)
+}
+
+fn crashJournal8171(db: Db, version: i64): ()! {
+  let snapshot = kvReadMeta(db.eng)?
+  let state = kvJournalStateOf(snapshot.bytes, snapshot.meta.txid)?
+  kvJournalPruned(db.eng, state, snapshot.meta.txid)?
+  if (version == 0) {
+    return
+  }
+  let record = kvReadJournal(db.eng, state.root)?
+  let touched = 5
+  if (version == 1) {
+    touched = 4 // The first delete has no previous alternating key to remove.
+  }
+  if (len(record.keys) != touched || !crashValue8171(record.keys[0], version)) {
+    fail newError("journal and tree versions differ")
+  }
+}
+
+fn crashTupleKeys8171(db: Db, version: i64): ()! {
+  let left = get(db.eng, db.root, encodeInt(-1))?
+  let right = get(db.eng, db.root, encodeInt(-2))?
+  if (!crashValue8171(left, version) || !crashValue8171(right, -version)) {
+    fail newError("fixed tuple keys differ from version ${version}")
+  }
+  let active = get(db.eng, db.root, encodeInt(-3 - version % 2))?
+  if (!crashValue8171(active, version)) {
+    fail newError("alternating key differs from version ${version}")
+  }
+}
+
+fn crashRecovered8171(db: Db, loggedCount: int): ()! {
+  let version = db.version()?
+  if (version < i64(loggedCount) || version > i64(loggedCount) + 1) {
+    fail newError("recovered version ${version} outside ACK prefix ${loggedCount}")
+  }
+  let positiveEnd = append(encodeInt(9223372036854775807), byte(0))
+  let history = scan(db.eng, db.root, encodeInt(1), positiveEnd)?
+  if (!crashHistory8171(history, int(version))) {
+    fail newError("acknowledged history missing or corrupt through version ${version}")
+  }
+  let key = 1
+  while (key <= int(version)) {
+    let value = get(db.eng, db.root, encodeInt(i64(key)))?
+    if (!crashValue8171(value, i64(key))) {
+      fail newError("recovered history key ${key} has a corrupt value")
+    }
+    key = key + 1
+  }
+  let tuple = scan(db.eng, db.root, encodeInt(-4), encodeInt(0))?
+  if (!crashTuple8171(tuple, version)) {
+    fail newError("partial multi-key transaction at version ${version}")
+  }
+  if (version > 0) {
+    crashTupleKeys8171(db, version)?
+  }
+  crashJournal8171(db, version)?
+}
+
+// Fresh reopen in the parent, with no handle inherited from the killed child.
 fn verifyCrashConsistency5725(dbPath: string, progressPath: string, cycle: int, t: CrashTally5725) {
   let loggedCount = countCompleteLines5725(progressPath)
   let db = open(dbPath) catch e {
     crashCheck5725(t, false, "cycle ${cycle}: fresh reopen failed: ${e.message()}")
     return
   }
-  let k = 1
-  kwCrashJournal(db, loggedCount) catch e {
-    crashCheck5725(t, false, "cycle ${cycle}: journal: ${e.message()}")
+  let valid = true
+  let detail = "all ACKs and one whole transaction state"
+  crashRecovered8171(db, loggedCount) catch e {
+    valid = false
+    detail = e.message()
   }
-  while (k < loggedCount) {
-    let v = getOrEmpty(db.eng, db.root, encodeInt(i64(k)))
-    let ok = len(v) > 0 && decodeInt(v) == i64(k)
-    crashCheck5725(
-      t, ok,
-        "cycle ${cycle}: committed value ${k} of ${loggedCount} missing after reopen -- " +
-        "torn commit",
-    )
-    k = k + 1
-  }
-  if (loggedCount > 0) {
-    let lastVal = getOrEmpty(db.eng, db.root, encodeInt(i64(loggedCount)))
-    let lastOk = len(lastVal) == 0 || decodeInt(lastVal) == i64(loggedCount)
-    crashCheck5725(
-      t, lastOk,
-      "cycle ${cycle}: last logged value ${loggedCount} present but CORRUPT -- torn commit",
-    )
-  }
+  crashCheck5725(t, valid, "cycle ${cycle}: ${detail}")
   db.close()
 }
 
@@ -235,6 +312,10 @@ fn runCrashCycle5725(cfg: CrashCycleCfg5725, cycle: int, targetLines: int, t: Cr
       "cycle ${cycle}: child must die by SIGKILL, wrapper reports exit ${rc} (${sigLabel}); " +
       "child log: ${crashChildLog5725(cdir)}",
   )
+  crashCheck5725(
+    t, countCompleteLines5725(progressPath) >= targetLines,
+    "cycle ${cycle}: child did not reach ACK target ${targetLines}",
+  )
   verifyCrashConsistency5725(dbPath, progressPath, cycle, t)
   println(
       "cycle ${cycle}: targetLines=${targetLines} killed=${sigLabel} loggedCount=" +
@@ -258,7 +339,7 @@ test "kill -9 mid-commit at 10 varying delays: fresh reopen never sees a torn co
   let cfg = CrashCycleCfg5725{ exe = selfExe(), dir = dir, maxPollTries = 1000 }
   let cycle = 0
   while (cycle < 10) {
-    let targetLines = 1 + cycle * 2 // 1,3,5,...,19 of 30 writes: 10 distinct kill points
+    let targetLines = 1 + cycle * 2 // 1,3,5,...,19: distinct progress targets
     runCrashCycle5725(cfg, cycle, targetLines, t)
     cycle = cycle + 1
   }
@@ -268,6 +349,102 @@ test "kill -9 mid-commit at 10 varying delays: fresh reopen never sees a torn co
       "-- see the per-cycle lines above for which one and why",
   )
   kvTestTeardown(dir)
+}
+
+test "crash recovery oracles reject missing last ACK and mixed transaction tuples" {
+  let first = encodeInt(1)
+  let second = encodeInt(2)
+  assert(crashHistory8171([first, second], 2), "complete ACK prefix rejected")
+  assert(!crashHistory8171([first], 2), "missing last ACK accepted")
+  assert(crashTuple8171([first, encodeInt(-1), first], 1), "whole prior state rejected")
+  assert(crashTuple8171([second, encodeInt(-2), second], 2), "whole next state rejected")
+  assert(!crashTuple8171([second, encodeInt(-1), second], 2), "mixed tuple accepted")
+  let path = crashScratchPath5725("ack-fixture")
+  writeFile(path, "1\n1") catch e {
+    panic(e.message())
+  }
+  assert(countCompleteLines5725(path) == 1, "partial final ACK counted")
+  appendFile(path, "\n") catch e {
+    panic(e.message())
+  }
+  assert(countCompleteLines5725(path) == 2, "complete final ACK ignored")
+  kvTestTeardown(path)
+}
+
+// Low-level root replacement calibrates the reader; this is not a storage crash.
+fn crashOracleFixture8171(tag: string): Db {
+  let db = open(crashScratchPath5725("oracle-${tag}")) catch e {
+    panic(e.message())
+  }
+  db.tx((tx) => {
+    tx.put(encodeInt(1), encodeInt(1))?
+    tx.put(encodeInt(-1), encodeInt(1))?
+    tx.put(encodeInt(-2), encodeInt(-1))?
+    tx.put(encodeInt(-4), encodeInt(1))?
+  }) catch e {
+    panic(e.message())
+  }
+  crashRecovered8171(db, 1) catch e {
+    panic("valid recovered state rejected: ${e.message()}")
+  }
+  return db
+}
+
+fn crashOracleReject8171(db: Db, expected: string) {
+  let observed = ""
+  crashRecovered8171(db, 1) catch e {
+    observed = e.message()
+  }
+  assert(observed == expected, "recovered oracle expected ${expected}, got ${observed}")
+  db.close()
+  kvTestTeardown(db.path)
+}
+
+test "crash recovered state rejects future positive keys" {
+  let db = crashOracleFixture8171("future-key")
+  db.root = put(db.eng, db.root, encodeInt(2), encodeInt(2)) catch e {
+    panic(e.message())
+  }
+  crashOracleReject8171(db, "acknowledged history missing or corrupt through version 1")
+}
+
+test "crash recovered state rejects a misplaced fixed tuple key" {
+  let db = crashOracleFixture8171("tuple-key")
+  db.root = delete(db.eng, db.root, encodeInt(-2)) catch e {
+    panic(e.message())
+  }
+  db.root = put(db.eng, db.root, encodeInt(-3), encodeInt(-1)) catch e {
+    panic(e.message())
+  }
+  crashOracleReject8171(db, "kv: get: key not found")
+}
+
+fn crashUnackedFixture8177(): Db {
+  let db = crashOracleFixture8171("unacked-key-8177")
+  db.tx((tx) => {
+    tx.put(encodeInt(2), encodeInt(2))?
+    tx.put(encodeInt(-1), encodeInt(2))?
+    tx.put(encodeInt(-2), encodeInt(-2))?
+    tx.put(encodeInt(-3), encodeInt(2))?
+    tx.delete(encodeInt(-4))?
+  }) catch e {
+    panic(e.message())
+  }
+  crashRecovered8171(db, 1) catch e {
+    panic("valid unacknowledged state rejected: ${e.message()}")
+  }
+  return db
+}
+
+test "crash recovered state rejects a misplaced unacknowledged history key" {
+  let db = crashUnackedFixture8177()
+  db.root = delete(db.eng, db.root, encodeInt(2)) catch e {
+    panic(e.message())
+  }
+  db.root = put(db.eng, db.root, encodeInt(3), encodeInt(2)) catch e {
+    panic(e.message())
+  }
+  crashOracleReject8171(db, "kv: get: key not found")
 }
 
 // Namespaced with this ticket's own prefix (`bit-kv-crash-5725-`) rather
