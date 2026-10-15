@@ -17,6 +17,8 @@
 // and a write never fails because the store is full. Expired entries are
 // also swept every `memoryStoreSweepEvery` writes, so an id nobody ever
 // presents again does not hold its bytes until the process exits.
+// Rotation alone needs two slots for successor and source tombstone, so
+// `rotate` refuses a cap of one without changing any entry.
 //
 // The bound matters because `Ctx.csrfToken()` (ctx.bit) writes a session for
 // an ANONYMOUS visitor — a public form page therefore mints one store entry
@@ -134,6 +136,109 @@ export class MemoryStore {
   ): i64! {
     let nowNs = now().ns
     return this.compareAndSetAt(sid, expectedVersion, newEntry(data, index, ttl, nowNs), nowNs)?
+  }
+
+  export rotate(
+    source: (string, i64),
+    destination: string,
+    data: map<string, string>,
+    index: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    let nowNs = now().ns
+    if (ttl <= 0 || ttl > (9223372036854775807 - nowNs) / nsPerSecond) {
+      fail newError("web: session: rotation ttl must be positive and representable")
+    }
+    return this.rotateAt(source, destination, newEntry(data, index, ttl, nowNs), nowNs)?
+  }
+
+  validateRotationInput(
+    source: (string, i64),
+    destination: string,
+    write: MemoryEntry,
+    nowNs: i64,
+  ): ()! {
+    let (sid, version) = source
+    if (len(sid) == 0 || len(destination) == 0 || sid == destination || version < 0) {
+      fail newError("web: session: rotation requires distinct non-empty ids and a valid version")
+    }
+    if (version == 9223372036854775807 || write.expiresAtNs <= nowNs) {
+      fail newError("web: session: rotation version or expiry is out of range")
+    }
+  }
+
+  // Validate before eviction or index changes; all state transitions share
+  // the lock with ordinary writes and indexed revocation.
+  rotateAt(source: (string, i64), destination: string, write: MemoryEntry, nowNs: i64): i64! {
+    this.validateRotationInput(source, destination, write, nowNs)?
+    let (sid, version) = source
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.validateRotation(source, destination, nowNs)?
+    if (this.maxEntries < 2) {
+      fail newError("web: session: rotation requires room for a session and its tombstone")
+    }
+    let (_, present) = this.entries[sid]
+    let required = 2
+    if (present) {
+      required = 1
+    }
+    // At most two slots are needed. Never evict the source tombstone this
+    // very operation must preserve; no fallible operation follows eviction.
+    let reserved = 0
+    while (reserved < 2) {
+      if (len(this.entries) + required > this.maxEntries) {
+        this.evictForRotation(sid)
+      }
+      reserved = reserved + 1
+    }
+    this.putEntry(
+      sid,
+      MemoryEntry{
+        data = map<string, string>(), index = map<string, string>(),
+        expiresAtNs = write.expiresAtNs, version = version + 1, tombstone = true,
+      },
+    )
+    write.version = 1
+    this.putEntry(destination, write)
+    return 1
+  }
+
+  validateRotation(source: (string, i64), destination: string, nowNs: i64): ()! {
+    let (sid, version) = source
+    let (entry, present) = this.entries[sid]
+    let (_, occupied) = this.entries[destination]
+    if (occupied) {
+      fail newError("web: session: rotation destination already exists")
+    }
+    if (version == 0) {
+      if (present) {
+        fail conflictError(sid, version, "the fresh rotation source already exists")
+      }
+      return
+    }
+    if (!present || entry.tombstone || entry.expiresAtNs <= nowNs || entry.version != version) {
+      fail conflictError(sid, version, "the rotation source changed or expired")
+    }
+  }
+
+  // Same oldest-expiring policy as ordinary writes, excluding the source.
+  evictForRotation(source: string) {
+    let victim = ""
+    let victimNs: i64 = 0
+    let found = false
+    for (sid, entry) of this.entries {
+      if (sid == source) {
+        continue
+      }
+      if (!found || entry.expiresAtNs < victimNs) {
+        victim = sid
+        victimNs = entry.expiresAtNs
+        found = true
+      }
+    }
+    assert(found, "rotation capacity reservation has an evictable entry")
+    this.dropEntry(victim)
   }
 
   // Unconditional: tombstones `sid` so no `compareAndSet` holding an older

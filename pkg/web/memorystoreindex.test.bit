@@ -7,6 +7,188 @@
 
 const idxKey = "auth:sub"
 
+fn rotationRefused(s: MemoryStore, source: (string, i64), destination: string, t: i64): bool {
+  s.rotateAt(source, destination, newEntry(noIndex(), noIndex(), 3600, t), t) catch _ {
+    return true
+  }
+  return false
+}
+
+fn mustRotate(s: MemoryStore, source: (string, i64), destination: string, t: i64) {
+  let version = s.rotateAt(source, destination, newEntry(noIndex(), noIndex(), 3600, t), t) catch e {
+    panic("rotateAt: ${e.message()}")
+  }
+  assert(version == 1, "successor must start at version one")
+}
+
+test "atomic rotation rejects revoked stale missing and expired snapshots without writes" {
+  let t: i64 = 1_000_000_000
+  let s = MemoryStore(10)
+  writeIndexed(s, "revoked", "alice", 3600, t)
+  s.destroyAt("revoked", 3600, t)
+  writeIndexed(s, "updated", "alice", 3600, t)
+  writeIndexed(s, "updated", "bob", 3600, t)
+  writeIndexed(s, "expired", "alice", 1, t)
+  for sid of []string{ "revoked", "updated", "expired", "missing" } {
+    let count = len(s.entries)
+    let slots = len(s.byIndex)
+    assert(rotationRefused(s, (sid, 1), "new", t + nsPerSecond), "stale source accepted")
+    assert(len(s.entries) == count && len(s.byIndex) == slots, "refusal mutated store")
+    let (_, found) = s.entries["new"]
+    assert(!found, "refusal created a destination")
+  }
+  assert(s.entries["updated"].version == 2, "updated source changed")
+  assert(s.entries["revoked"].tombstone, "revoked source changed")
+  assert(!s.entries["expired"].tombstone, "expired source changed")
+}
+
+test "atomic rotation refuses occupied destinations and zero-version stored sources" {
+  let t: i64 = 1_000_000_000
+  let s = MemoryStore(10)
+  writeIndexed(s, "source", "alice", 3600, t)
+  writeIndexed(s, "live", "bob", 3600, t)
+  writeIndexed(s, "expired", "bob", 1, t)
+  s.destroyAt("tombstone", 3600, t)
+  for sid of []string{ "live", "expired", "tombstone", "source" } {
+    assert(rotationRefused(s, ("source", 1), sid, t + nsPerSecond), "occupied id accepted")
+    assert(s.entries["source"].version == 1, "collision changed source")
+  }
+  for sid of []string{ "source", "expired", "tombstone" } {
+    assert(rotationRefused(s, (sid, 0), "new", t + nsPerSecond), "zero adopted stored id")
+  }
+  assert(len(s.entries) == 4, "refusal changed entries")
+}
+
+test "atomic rotation refuses a present live version-zero source without changes" {
+  let s = MemoryStore(2)
+  let t: i64 = 1_000_000_000
+  let data = storeData([]string{ "cart", "book" })
+  let index = storeData([]string{ idxKey, "alice" })
+  // Exercise the exact store boundary independently of version producers.
+  s.putEntry("source", newEntry(data, index, 3600, t))
+  assert(rotationRefused(s, ("source", 0), "new", t), "present source adopted as fresh")
+  let (source, found) = s.entries["source"]
+  assert(found && !source.tombstone && source.version == 0, "refusal changed source")
+  assert(source.data["cart"] == "book" && source.index[idxKey] == "alice", "maps changed")
+  let (_, destination) = s.entries["new"]
+  assert(!destination && len(s.entries) == 1, "refusal created destination")
+  assert(len(s.byIndex[indexSlot(idxKey, "alice")]) == 1, "refusal changed reverse index")
+}
+
+test "atomic rotation preserves dirty data index flags and independent map ownership" {
+  let s = MemoryStore(10)
+  let session = newIndexedSession(s, "alice")
+  let old = session.id()
+  session.set("cart", "book")
+  session.index(idxKey, "bob")
+  session.regenerate() catch e {
+    panic("regenerate: ${e.message()}")
+  }
+  assert(session.version == 1 && !session.dirty && session.fresh, "rotation flags/version")
+  assert(s.entries[old].tombstone && len(s.entries[old].index) == 0, "old id not tombstoned")
+  session.set("cart", "changed")
+  session.index(idxKey, "carol")
+  let saved = s.load(session.id()) catch e {
+    panic("load: ${e.message()}")
+  }
+  let (data, version, index) = unwrap(saved)
+  assert(version == 1 && data["cart"] == "book" && index[idxKey] == "bob", "maps aliased")
+  data["cart"] = "also changed"
+  index[idxKey] = "dave"
+  assert(mustRead(s, session.id())["cart"] == "book", "load data aliases store")
+  assert(destroyAllOf(s, "alice", "") == 0, "old index survived")
+  assert(destroyAllOf(s, "dave", "") == 0, "load index aliases store")
+  assert(destroyAllOf(s, "bob", "") == 1, "new index missing")
+}
+
+test "atomic rotation supports fresh unsaved sessions and refuses cap one without changes" {
+  let s = MemoryStore(2)
+  let fresh = loadSession(s, "") catch e {
+    panic("load: ${e.message()}")
+  }
+  let old = fresh.id()
+  fresh.set("cart", "book")
+  fresh.regenerate() catch e {
+    panic("regenerate: ${e.message()}")
+  }
+  assert(len(s.entries) == 2 && s.entries[old].tombstone, "fresh tombstone missing")
+  assert(mustRead(s, fresh.id())["cart"] == "book", "fresh data lost")
+  let tiny = MemoryStore(1)
+  let t: i64 = 1_000_000_000
+  assert(rotationRefused(tiny, ("absent", 0), "new", t), "cap one accepted")
+  assert(len(tiny.entries) == 0, "failed fresh rotation mutated store")
+  writeIndexed(tiny, "old", "alice", 3600, t)
+  assert(rotationRefused(tiny, ("old", 1), "new", t), "cap one evicted source")
+  assert(len(tiny.entries) == 1 && !tiny.entries["old"].tombstone, "source changed")
+}
+
+test "atomic rotation evicts unrelated oldest expiry and preserves the source tombstone" {
+  let s = MemoryStore(3)
+  let t: i64 = 1_000_000_000
+  writeIndexed(s, "old", "alice", 1, t)
+  writeIndexed(s, "victim", "bob", 10, t)
+  writeIndexed(s, "keep", "carol", 20, t)
+  mustRotate(s, ("old", 1), "new", t)
+  let (_, victim) = s.entries["victim"]
+  assert(!victim && s.entries["old"].tombstone, "eviction must skip source")
+  assert(isSome(s.loadAt("keep", t)), "wrong victim")
+  assert(len(s.entries) == 3 && len(s.byIndex) == 1, "bounded entry/index count")
+  let fresh = MemoryStore(2)
+  writeIndexed(fresh, "a", "alice", 10, t)
+  writeIndexed(fresh, "b", "bob", 20, t)
+  mustRotate(fresh, ("unsaved", 0), "new", t)
+  assert(len(fresh.entries) == 2 && len(fresh.byIndex) == 0, "fresh needs two slots")
+}
+
+fn raceRotation(s: MemoryStore, destination: string, start: chan<bool>, done: chan<bool>) {
+  <- start
+  s.rotate(("old", 1), destination, noIndex(), noIndex(), sessionTTLSeconds) catch _ {
+    done <- false
+    return
+  }
+  done <- true
+}
+
+test "atomic rotation concurrent snapshots produce exactly one live successor" {
+  let workers = parseInt(envOr("BIT_WORKERS", "1")) catch e {
+    panic("invalid worker count: ${e.message()}")
+  }
+  assert(workers >= 2, "rotation race requires BIT_WORKERS>=2")
+  let s = MemoryStore(10)
+  mustWrite(s, "old", noIndex(), 3600)
+  let start = chan<bool>(2)
+  let done = chan<bool>(2)
+  spawn raceRotation(s, "a", start, done)
+  spawn raceRotation(s, "b", start, done)
+  start <- true
+  start <- true
+  let a = <- done
+  let b = <- done
+  assert(a != b, "exactly one rotation must succeed")
+  assert(isLive(s, "a") != isLive(s, "b"), "exactly one destination must exist")
+  assert(s.entries["old"].tombstone && len(s.entries) == 2, "source or count wrong")
+}
+
+test "atomic rotation validates ids expiry and version boundaries before mutation" {
+  let s = MemoryStore(10)
+  let t: i64 = 1_000_000_000
+  for pair of [](string, i64){ ("", 0), ("old", -1), ("old", 9223372036854775807) } {
+    assert(rotationRefused(s, pair, "new", t), "invalid source accepted")
+  }
+  assert(rotationRefused(s, ("old", 0), "", t), "empty destination accepted")
+  for ttl of []i64{ 0, -1, 9223372036854775807 } {
+    let refused = false
+    s.rotate(("old", 0), "new", noIndex(), noIndex(), ttl) catch _ {
+      refused = true
+    }
+    assert(refused, "invalid ttl accepted")
+  }
+  assert(len(s.entries) == 0 && len(s.byIndex) == 0, "boundary failure mutated store")
+  mustRotate(s, ("old", 0), "new", t)
+  assert(isSome(s.loadAt("new", t + 3600 * nsPerSecond - 1)), "expired early")
+  assert(!isSome(s.loadAt("new", t + 3600 * nsPerSecond)), "must expire at boundary")
+}
+
 fn noIndex(): map<string, string> {
   return map<string, string>()
 }

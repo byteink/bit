@@ -87,8 +87,9 @@ bounded together with its entries.
 
 ### Saving is automatic
 
-`session.set()`/`delete()`/`regenerate()` only change this request's own
-copy of the data; none of them writes to the store by themselves. The
+`session.set()` and `delete()` change this request's own copy of the data;
+neither writes to the store by itself. `regenerate()` writes immediately so
+the replacement id exists before a response sends its cookie. The
 framework saves a session that changed once the handler returns, before the
 response goes out, so this is already enough:
 
@@ -139,6 +140,42 @@ Session Management Cheat Sheet states the rule this follows: renew the
 session id after any privilege change, not only at login. The old id is
 destroyed through the store's atomic path (see above), so it is invalid the
 instant `regenerate()` returns, even to a request that had already loaded it.
+
+A cached session cannot rotate after another request revoked or updated its
+source id. `SessionStore.rotate(source, destination, data, index, ttl)` checks
+the source `(id, version)` and destination's absence, then writes the new
+session and old tombstone in **one transaction**. A conflict or store error
+changes neither id nor unrelated entries. A read followed by two writes is
+insufficient: revocation can happen between them. Implement this transaction
+in the backing store itself, including both entries' secondary indexes.
+
+The successor starts at version `1`; both entries expire after `ttl` seconds.
+Pass the dirty cached data and index, which the store must copy on input and
+output. Source version `0` explicitly means a fresh unsaved session and is
+accepted only while its id is currently absent. Every positive version must
+match a live, unexpired source. An occupied destination, including an expired
+entry or tombstone, fails without reuse. Invalid ids, versions and TTLs that
+are not positive or cannot be represented fail before any state changes.
+
+```bit
+import { SessionStore, sessionTTLSeconds } from "web"
+
+fn rotateStored(
+  store: SessionStore,
+  source: (string, i64),
+  destination: string,
+  data: map<string, string>,
+  index: map<string, string>,
+): i64! {
+  return store.rotate(source, destination, data, index, sessionTTLSeconds)?
+}
+```
+
+`MemoryStore` performs this under the same lock as revocation. Rotation needs
+two entries: the successor and source tombstone. A cap of `1` refuses rotation
+without changing the store. Larger stores evict unrelated oldest-expiring
+entries when necessary, preserving the source tombstone. Other stores must
+likewise reserve capacity before committing either write.
 
 ## CSRF and anonymous visitors
 
