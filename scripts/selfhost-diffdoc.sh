@@ -250,8 +250,6 @@ for d in stdlib/*/ examples/*/ _tests_/imports/*/; do
 
   if cmp -s "$work/seed.plain.out" "$work/bit.plain.out" && cmp -s "$work/seed.json.out" "$work/bit.json.out"; then
     match=$((match + 1))
-  elif signature=$(explainVariadicDocMarker "$work/seed.plain.out" "$work/bit.plain.out" "$work/seed.json.out" "$work/bit.json.out" "$d"); then
-    printf '%s %s\n' "$d" "$signature" >> "$work/explained"
   else
     echo "$d" >>"$work/mismatch"
   fi

@@ -95,34 +95,12 @@ matches a registered signature is EXPLAINED immediately, no repin needed.
 This is deliberately NOT the deleted expected-mismatch list reborn -- see
 that function's header for why a signature checked against an identity is a
 different, narrower thing than a file checked against nothing. `types` also
-checks declared signatures, including synthesized JSON helper column shifts.
-
-The variadic function marker repair (#7929) has a separate strict `types`
-identity (#7933). It applies to direct inferred bindings of unique, unshadowed
-top-level variadic functions with primitive parameters and results. Both
-compilers must accept the unchanged source and produce identical AST and token
-dumps. AST binder metadata rejects names shadowed by parameters, destructuring,
-loops, match/catch patterns, receivers or receive bindings. The AST proves the
-final rest parameter and exact signature; token
-offsets tie it to the binding's line, column and name. Only that final
-parameter gains `...`; every other dump byte must agree. Unsupported nested,
-imported or generic captures, changed rows/types/positions and failed witnesses
-remain unexplained. The existing function-value corpus exercises the identity,
-and the self-check includes real paired compiler evidence and negative controls.
-Retire this signature when stage0 contains the renderer repair.
-
-The same renderer repair appears in exported function documentation. The `doc`
-identity (#7936) checks both plain and JSON output against fresh successful
-commands on the original module. It includes all module `.bit` files, including
-tests, in bytewise order, strips each BOM and adds the loader's newline separator.
-Raw names and file bytes must remain identical throughout the witness. Paired
-AST and tokens must agree; the shared AST parser proves the exported declaration,
-generic parameters, complete parameter list, final rest slot and result.
-Aliases and unsupported type forms remain unexplained. Only the final rest
-marker can change; every other byte, including JSON comments and metadata, agrees.
-The gate reports named EXPLAINED modules separately from byte-identical MATCH
-modules, includes both in the actual coverage denominator, and fails a registered
-doc identity that explains no module. Retire it when stage0 includes #7929.
+checks the same declared signatures. The 0.42.0 stage0 repin retired all
+current dump identities (#8163, #8178). The registry remains empty and fails
+closed: an unknown difference cannot become EXPLAINED. Both plain and JSON
+documentation output must match exactly. The retirement audit and the shared
+oracle-coverage probe controls remain active. The retired derivations and
+fixtures remain available in Git history.
 
 ## AST differential
 
@@ -139,15 +117,8 @@ non-zero (printing the first divergence) on any mismatch.
 
 Lex every corpus `.bit` file with both the PINNED STAGE0 (the previous
 release) and the working tree's compiler, and diff their `--dump-tokens`
-output. They must be byte-identical unless the complete ordered streams satisfy
-`8110-contextual-in-token` (#7279, #8110): at least one oracle `kw_in` row
-becomes a tree `ident` row at identical decimal byte offsets, and the unchanged
-source contains the literal bytes `in` at every changed span. All other rows,
-payloads, offsets and ordering stay byte-identical. Missing source, changed
-source, reverse changes, extra or missing rows, and mixed unrelated token or
-automatic-semicolon changes remain unexplained. The driver prints every
-explained file; it does not allowlist filenames. This signature retires at the
-next stage0 repin carrying #7279; explaining zero corpus files fails the gate.
+output. They must be byte-identical. The contextual `in` token identity
+retired with the 0.42.0 repin because both compilers now emit the same token.
 Files the oracle rejects with a lex
 error are skipped -- the two lexers disagree about how far to lex past an
 error, so those files measure the diagnostic renderer rather than the
@@ -507,5 +478,18 @@ Historical registry comments, moved unchanged from the signature registry.
 # `irLenToHeader`, `irGuardOff`) are preserved in git history at this file's
 # state before #6533; scripts/ir-signatures-walk.sh and
 # scripts/ir-signatures-forof.sh are deleted.
+#
+# The stage0 0.42.0 repin (#8163) retires the remaining seven dump identities
+# (#8178): 7745-loop-defer-stack and 7925-fnvalue-owner-reuse (ir/iropt),
+# 7761-range-chain-cse (iropt), 7766-synth-json-helper-column-shift and
+# 7933-variadic-type-marker (types), 7936-variadic-doc-marker (doc), and
+# 8110-contextual-in-token (tokens). Each source repair is absent from
+# v0.41.0 and present in v0.42.0. On edab51f2d, aarch64-macos, tokens and
+# types each report MATCH=1826, ir and iropt each MATCH=1173, and doc
+# MATCH=263. All five report MISMATCH=0 and EXPLAINED=0, then fail only
+# because their old identities are RETIRED. The five obsolete variadic
+# selfcheck expectations also fail because the two compilers now agree.
+# The direct doc allowance and the loop-defer safepoint fallback retire
+# with their shared helpers. The separate 4500 safepoint identity remains.
 #
 ```

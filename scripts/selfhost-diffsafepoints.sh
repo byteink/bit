@@ -230,11 +230,6 @@ echo "self-test: plain-loop safepoint count — seed=$st_seed self=$st_self"
 # delta goes to zero and this signature stops matching anything. Delete it then,
 # exactly as scripts/selfhost-diffall.absent's header says of its own entries.
 
-# SECOND SIGNATURE, 7745-loop-defer-stack (#7762): explainLoopDeferPolls
-# (scripts/selfhost-ir-signatures.sh, fixtures in its selfcheck) explains an extra poll per
-# defer-stack pop loop (the back edge) and nothing else; it retires at the repin its header names.
-# explainSafepoint tries both; explainSafepointDelta stays the 4500 signature alone.
-
 # explainSafepointDelta <oracle_ir_text> <bit2_ir_text> <seed_count> <self_count>
 # Prints the name of the registered signature that explains the divergence and
 # returns 0, or prints nothing and returns 1 if none does. Takes TEXT rather
@@ -269,7 +264,7 @@ explainSafepointDelta() {
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
 }
 
-explainSafepoint() { explainSafepointDelta "$@" || explainLoopDeferPolls "$@"; }
+explainSafepoint() { explainSafepointDelta "$@"; }
 
 # --- self-test: prove the signature REFUSES, not only accepts -----------------
 # A signature that explained everything would be the mute button #1883 deleted,
