@@ -1,0 +1,358 @@
+// Page ownership is checked independently of get/scan and free-list traversal.
+class pageVisit8168 { id: i64, lo: string, hi: string }
+class pageTotals8168 { checkpoints: int = 0, pages: i64 = 0, live: int = 0, replay: string = "" }
+
+fn pageId8168(id: i64, pages: int) {
+  assert(id >= 2 && id < i64(pages), "page ${id} outside [2,${pages})")
+}
+
+fn pageField8168(buf: []byte, off: int, size: int): int {
+  assert(off >= 0 && size >= 0 && off <= len(buf) - size, "node field exceeds page")
+  return off + size
+}
+
+fn pageRawNode8168(buf: []byte): kvNode {
+  assert(buf[0] == kvNodeLeafTag || buf[0] == kvNodeInternalTag, "not a tree page")
+  let count = int(getU32(buf, 1))
+  assert(count <= (len(buf) - kvNodeHeaderSize) / 8, "unbounded node count")
+  let off = kvNodeHeaderSize
+  for (let i = 0; i < count; i++) {
+    let _ = pageField8168(buf, off, 4)
+    let keySize = int(getU32(buf, off))
+    off = pageField8168(buf, off + 4, keySize)
+    if (buf[0] == kvNodeInternalTag) {
+      off = pageField8168(buf, off, 8)
+      continue
+    }
+    let _ = pageField8168(buf, off, 4)
+    let valueSize = int(getU32(buf, off))
+    off = pageField8168(buf, off + 4, valueSize)
+  }
+  let node = kvDecodeNode(buf)
+  assert(kvNodeEncodedSize(node) == off, "encoded byte accounting differs")
+  return node
+}
+
+fn pageLeaf8168(entries: []kvLeafEntry, visit: pageVisit8168) {
+  for (let i = 0; i < len(entries); i++) {
+    let key = string(entries[i].key)
+    assert(key >= visit.lo, "leaf below separator on ${visit.id}")
+    assert(visit.hi == "" || key < visit.hi, "leaf above separator on ${visit.id}")
+    if (i > 0) {
+      assert(string(entries[i - 1].key) < key, "leaf keys not strictly ordered")
+    }
+  }
+}
+
+fn pageEnqueue8168(queue: []pageVisit8168, seen: []bool, visit: pageVisit8168): []pageVisit8168 {
+  pageId8168(visit.id, len(seen))
+  assert(!seen[int(visit.id)], "duplicate live ownership or cycle at ${visit.id}")
+  assert(len(queue) < len(seen), "tree queue exceeds file pages")
+  seen[int(visit.id)] = true
+  queue = append(queue, visit)
+  return queue
+}
+
+fn pageChildren8168(
+  entries: []kvInternalEntry, parent: pageVisit8168,
+  queue: []pageVisit8168, seen: []bool,
+): []pageVisit8168 {
+  assert(len(entries) > 0, "empty branch")
+  for (let i = 0; i < len(entries); i++) {
+    let lo = i == 0 ? parent.lo : string(entries[i].key)
+    let hi = i + 1 == len(entries) ? parent.hi : string(entries[i + 1].key)
+    if (i > 0) {
+      assert(string(entries[i - 1].key) < lo, "branch keys not strictly ordered")
+      assert(lo >= parent.lo, "separator below parent range")
+      assert(parent.hi == "" || lo < parent.hi, "separator above parent range")
+    }
+    queue = pageEnqueue8168(queue, seen, pageVisit8168{ id = entries[i].child, lo = lo, hi = hi })
+  }
+  return queue
+}
+
+fn pageTree8168(e: Engine, root: i64, pages: int): ([]bool, int, int)! {
+  let seen = []bool(pages)
+  if (root == noRoot) {
+    return seen, 0, 0
+  }
+  let queue = pageEnqueue8168([], seen, pageVisit8168{ id = root, lo = "", hi = "" })
+  let step = 0
+  let records = 0
+  while (step < len(queue) && step < pages) {
+    let visit = queue[step]
+    let node = pageRawNode8168(e.readPage(visit.id)?)
+    match (node) {
+      Leaf(entries) => {
+        pageLeaf8168(entries, visit)
+        records = records + len(entries)
+      }
+      Internal(entries) => queue = pageChildren8168(entries, visit, queue, seen)
+    }
+    step = step + 1
+  }
+  assert(step == len(queue), "tree walk exhausted file-page bound")
+  return seen, step, records
+}
+
+fn pageFreePayload8168(buf: []byte, free: []bool, live: []bool) {
+  let count = int(getU32(buf, 1))
+  assert(count <= (len(buf) - kvFreeListHeaderSize) / 8, "free count exceeds page")
+  for (let i = 0; i < count; i++) {
+    let id = getI64(buf, kvFreeListHeaderSize + 8 * i)
+    pageId8168(id, len(free))
+    assert(!free[int(id)], "duplicate free id ${id}")
+    assert(!live[int(id)], "live page ${id} marked free")
+    free[int(id)] = true
+  }
+}
+
+fn pageFree8168(e: Engine, head: i64, live: []bool): ()! {
+  let free = []bool(len(live))
+  let chain = []bool(len(live))
+  let id = head
+  let step = 0
+  while (id != kvNoFreeListRoot && step < len(live)) {
+    pageId8168(id, len(live))
+    assert(!chain[int(id)], "free-chain cycle at ${id}")
+    assert(!live[int(id)], "live page reused as free-chain storage")
+    chain[int(id)] = true
+    let buf = e.readPage(id)?
+    assert(buf[0] == kvFreeListTag, "invalid free-chain tag")
+    pageFreePayload8168(buf, free, live)
+    id = getI64(buf, 5)
+    step = step + 1
+  }
+  assert(id == kvNoFreeListRoot, "free chain exceeds file-page bound")
+  for (let i = 2; i < len(live); i++) {
+    assert(!chain[i] || !free[i], "free id collides with chain storage ${i}")
+  }
+}
+
+fn pageMeta8168(db: Db, pages: int): ()! {
+  let current = db.eng.readPage(i64(db.eng.activeMeta))?
+  let meta = parseMetaPage(current)?
+  assert(meta.txid == db.eng.txid && kvReadRoot(current) == db.root, "active meta differs")
+  assert(meta.freeListRoot == db.eng.freeListRoot, "active free root differs")
+  let previous = db.eng.readPage(i64(1 - db.eng.activeMeta))?
+  let older = parseMetaPage(previous)?
+  assert(older.txid <= meta.txid, "meta generation reversed")
+  // The immediately preceding tree is protected until the flip. Its pages
+  // may now be free; its obsolete free payload may already have been reused.
+  pageTree8168(db.eng, kvReadRoot(previous), pages)?
+}
+
+fn pageKey8168(i: int): []byte { return [byte(32 + i)] }
+
+fn pageValues8168(e: Engine, root: i64, expected: []string): ()! {
+  let ordered: []string = []
+  for (let i = 0; i < len(expected); i++) {
+    let got = get(e, root, pageKey8168(i)) catch err {
+      assert(expected[i] == "", "missing key ${i}: ${err.message()}")
+      continue
+    }
+    assert(expected[i] != "" && string(got) == expected[i], "wrong value at ${i}")
+    ordered = append(ordered, expected[i])
+  }
+  let values = scan(e, root, [byte(32)], [byte(96)])?
+  assert(len(values) == len(ordered), "scan cardinality differs")
+  for (let i = 0; i < len(values); i++) {
+    assert(string(values[i]) == ordered[i], "scan order differs at ${i}")
+  }
+}
+
+fn pageCheckpoint8168(db: Db, expected: []string, transaction: bool, totals: pageTotals8168): ()! {
+  let bytes = db.eng.file.size()?
+  assert(bytes % i64(kvPageSize) == 0, "partial page")
+  let pages = int(bytes / i64(kvPageSize))
+  let (live, count, records) = pageTree8168(db.eng, db.root, pages)?
+  let want = 0
+  for value of expected {
+    if (value != "") {
+      want = want + 1
+    }
+  }
+  assert(records == want, "stored leaf cardinality differs: ${records}/${want}")
+  pageFree8168(db.eng, db.eng.freeListRoot, live)?
+  if (transaction) {
+    pageMeta8168(db, pages)?
+  }
+  pageValues8168(db.eng, db.root, expected)?
+  totals.checkpoints = totals.checkpoints + 1
+  totals.pages = totals.pages + i64(pages)
+  totals.live = totals.live + count
+}
+
+fn pageOrder8168(kind: int): []int {
+  let order = []int(64)
+  for (let i = 0; i < 64; i++) {
+    order[i] = i
+    if (kind == 1) {
+      order[i] = 63 - i
+    }
+    if (kind == 2) {
+      order[i] = i % 2 == 0 ? i / 2 : 63 - i / 2
+    }
+  }
+  if (kind == 3) {
+    let seed: u64 = 8154
+    for (let i = 63; i > 0; i--) {
+      seed = (seed * 1664525 + 1013904223) % 4294967296
+      let j = int(seed % u64(i + 1))
+      let saved = order[i]
+      order[i] = order[j]
+      order[j] = saved
+    }
+  }
+  return order
+}
+
+fn pageValue8168(i: int, phase: int): string {
+  let sizes = [1, 2000, 3000, 4082]
+  let size = phase == 0 || phase == 2 ? 1 : sizes[i % 4]
+  return string([byte(32 + i)]) + repeat(string([byte(97 + phase)]), i64(size - 1))
+}
+
+fn pageBatch8168(
+  db: Db, order: []int, phase: int,
+  expected: []string, transaction: bool,
+): ()! {
+  if (transaction) {
+    db.tx((tx) => {
+      for (let j = 0; j < len(order); j++) {
+        let i = order[j]
+        if (phase == 3) {
+          tx.delete(pageKey8168(i))?
+        } else {
+          tx.put(pageKey8168(i), []byte(pageValue8168(i, phase)))?
+        }
+      }
+    })?
+  } else {
+    for (let j = 0; j < len(order); j++) {
+      let i = order[j]
+      db.root = phase == 3 ? delete(db.eng, db.root, pageKey8168(i))? : put(
+        db.eng,
+        db.root,
+        pageKey8168(i),
+        []byte(pageValue8168(i, phase)),
+      )?
+    }
+  }
+  for (let j = 0; j < len(order); j++) {
+    let i = order[j]
+    expected[i] = phase == 3 ? "" : pageValue8168(i, phase)
+  }
+}
+
+fn pageReject8168(db: Db, expected: []string, transaction: bool, totals: pageTotals8168): ()! {
+  let root = db.root
+  let version = db.eng.txid
+  let rejected = false
+  if (transaction) {
+    db.tx((tx) => {
+      tx.put(pageKey8168(0), []byte(repeat("x", 4083)))?
+    }) catch _ {
+      rejected = true
+    }
+  } else {
+    put(db.eng, db.root, pageKey8168(0), []byte(repeat("x", 4083))) catch _ {
+      rejected = true
+    }
+  }
+  assert(rejected && db.root == root && db.eng.txid == version, "oversize changed committed root")
+  pageCheckpoint8168(db, expected, transaction, totals)?
+}
+
+fn pageHistory8168(kind: int, batch: int, transaction: bool, totals: pageTotals8168): ()! {
+  let path = scratchPath("pages-8168-${kind}-${batch}-${transaction}")
+  totals.replay = "${path}: initial"
+  let db = open(path)?
+  let order = pageOrder8168(kind)
+  let expected = []string(64)
+  pageCheckpoint8168(db, expected, transaction, totals)?
+  for (let phase = 0; phase < 5; phase++) {
+    let oldRoot = db.root
+    let before = []string(64)
+    for (let i = 0; i < 64; i++) {
+      before[i] = expected[i]
+    }
+    let n = phase >= 3 ? 32 : 64
+    for (let lo = 0; lo < n; lo = lo + batch) {
+      let hi = lo + batch
+      totals.replay = "${path}: phase=${phase} step=${hi}"
+      pageBatch8168(db, order[lo:hi], phase, expected, transaction)?
+      pageCheckpoint8168(db, expected, transaction, totals)?
+    }
+    if (!transaction) {
+      let pages = int(db.eng.file.size()? / i64(kvPageSize))
+      pageTree8168(db.eng, oldRoot, pages)?
+      pageValues8168(db.eng, oldRoot, before)?
+    }
+  }
+  totals.replay = "${path}: oversize"
+  pageReject8168(db, expected, transaction, totals)?
+  let root = db.root
+  db.close()
+  totals.replay = "${path}: reopen"
+  let reopened = open(path)?
+  if (!transaction) {
+    reopened.root = root
+  }
+  pageCheckpoint8168(reopened, expected, transaction, totals)?
+  reopened.close()
+  kvTestTeardown(path)
+}
+
+fn pageRun8168(kind: int, batch: int) {
+  let totals = pageTotals8168{}
+  for transaction of [false, true] {
+    let (panicked, message) = runRecovering(() => {
+      pageHistory8168(kind, batch, transaction, totals) catch err {
+        panic(err.message())
+      }
+    })
+    if (panicked) {
+      panic("${totals.replay}: ${message}")
+    }
+  }
+  let expected = 2 * (256 / batch + 3)
+  assert(
+    totals.checkpoints == expected,
+    "checkpoint denominator differs: ${totals.checkpoints}/${expected}",
+  )
+  println("page-invariants8168 order=${kind} batch=${batch} paths=2 checkpoints=${totals.checkpoints} file-pages=${totals.pages} live-pages=${totals.live}")
+}
+
+test "page invariants ascending batch 1" {
+  pageRun8168(0, 1)
+}
+
+test "page invariants ascending batch 8" {
+  pageRun8168(0, 8)
+}
+
+test "page invariants descending batch 1" {
+  pageRun8168(1, 1)
+}
+
+test "page invariants descending batch 8" {
+  pageRun8168(1, 8)
+}
+
+test "page invariants alternating ends batch 1" {
+  pageRun8168(2, 1)
+}
+
+test "page invariants alternating ends batch 8" {
+  pageRun8168(2, 8)
+}
+
+test "page invariants seed 8154 batch 1" {
+  pageRun8168(3, 1)
+}
+
+test "page invariants seed 8154 batch 8" {
+  pageRun8168(3, 8)
+}
+
