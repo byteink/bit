@@ -117,33 +117,52 @@ TIMEOUT_S=${TIMEOUT_S:-20}
 # retry's compared payload.
 # Separate attempt files survive the normal comparison scratch cleanup (#8129).
 # 125 is this wrapper's capture failure, never a checker verdict.
+valid_timing() {
+  local line extra number='[0-9]+[.,][0-9]{3}'
+  [ "${2:-0}" != UNKNOWN ] || return 125
+  { IFS= read -r line && ! IFS= read -r extra && [ -z "$extra" ]; } <"$1" || return 125
+  [[ $line =~ ^wall_seconds=$number\ user_seconds=$number\ system_seconds=$number$ ]]
+}
+
 capture_attempt() {
   local dir=$1 attempt=$2 rc=$3 cap=$4
   shift 4
   cp "$cap" "$dir/$attempt.stderr" &&
     printf '%s\n' "$rc" >"$dir/$attempt.rc" &&
-    printf '%s\0' "$@" >"$dir/$attempt.argv"
+    printf '%s\0' "$@" >"$dir/$attempt.argv" &&
+    [ "$rc" != UNKNOWN ] && cp "$cap.time" "$dir/$attempt.time" &&
+    valid_timing "$dir/$attempt.time"
 }
 
 run_cap() {
   local side=$1 cap=$2 rc dir
   shift 2
   local TIMEOUT="$TIMEOUT_S"
+  # Bash times alarmrun's wrapper and descendants, not checker-only CPU.
+  local TIMEFORMAT='wall_seconds=%3R user_seconds=%3U system_seconds=%3S'
   rm -f "$cap.attemptdir" || return 125
   : >"$cap" || return 125
-  ALARMRUN_KEEP_STDERR=1 alarmrun "$@" 2>"$cap" >/dev/null
-  rc=$?
-  if [ "$rc" -eq 142 ]; then
+  rc=UNKNOWN
+  { time ALARMRUN_KEEP_STDERR=1 alarmrun "$@" 2>"$cap" >/dev/null; rc=$?; } 2>"$cap.time"
+  if [ "$rc" = 142 ] || ! valid_timing "$cap.time" "$rc"; then
     dir=$(mktemp -d "${TMPDIR:-/tmp}/selfhost-diffcheck-attempt.XXXXXX") || return 125
     printf '%s\n' "$dir" >"$cap.attemptdir" || return 125
     capture_attempt "$dir" 1 "$rc" "$cap" "$@" || return 125
     echo "$side check stalled once (SIGALRM after ${TIMEOUT_S}s), retrying: $*" >&9
     : >"$cap" || return 125
-    ALARMRUN_KEEP_STDERR=1 alarmrun "$@" 2>"$cap" >/dev/null
-    rc=$?
+    rc=UNKNOWN
+    { time ALARMRUN_KEEP_STDERR=1 alarmrun "$@" 2>"$cap" >/dev/null; rc=$?; } 2>"$cap.time"
     capture_attempt "$dir" 2 "$rc" "$cap" "$@" || return 125
   fi
   return "$rc"
+}
+
+emit_payloads() {
+  local dir=$1 attempt=$2
+  printf 'ARGV_BASE64\n' >&9 && base64 <"$dir/$attempt.argv" >&9 &&
+    printf '\nSTDERR_BASE64\n' >&9 && base64 <"$dir/$attempt.stderr" >&9 &&
+    printf '\nTIMING_BASE64\n' >&9 && base64 <"$dir/$attempt.time" >&9 &&
+    printf '\nEND CHECKER_CAPTURE\n' >&9
 }
 
 # Parent-side frames cannot interleave the two concurrently captured streams.
@@ -155,9 +174,7 @@ emit_attempt() {
   argvbytes=$(wc -c <"$dir/$attempt.argv") || return 125
   printf 'BEGIN CHECKER_CAPTURE side=%s attempt=%s native_rc=%s stderr_bytes=%s argv_bytes=%s input=%s raw=%s\n' \
     "$side" "$attempt" "$rc" "$((bytes))" "$((argvbytes))" "$input" "$dir" >&9 || return 125
-  printf 'ARGV_BASE64\n' >&9 && base64 <"$dir/$attempt.argv" >&9 &&
-    printf '\nSTDERR_BASE64\n' >&9 && base64 <"$dir/$attempt.stderr" >&9 &&
-    printf '\nEND CHECKER_CAPTURE\n' >&9
+  emit_payloads "$dir" "$attempt"
 }
 
 emit_capture() {
