@@ -24,7 +24,9 @@ n=0
 n=$((n + 1))
 printf '%s\n' "$n" >"$countfile"
 case "$CAPTURE_MODE" in
-  normal) exit 0 ;;
+  normal|malformednormal) exit 0 ;;
+  native7) exit 7 ;;
+  native125) exit 125 ;;
   empty) [ "$n" -ne 1 ] || exit 142; exit 0 ;;
   recompare|finaldiff)
     limit=1
@@ -50,28 +52,51 @@ CHECKER
   chmod 700 "$d/oracle" "$d/bit-out/bin/bit"
   cat >"$d/fakebin/cp" <<'COPY'
 #!/bin/sh
-case "$2" in */1.stderr) exit 1 ;; esac
+case "$2" in
+  */1.stderr) [ "$CAPTURE_MODE" = copytimefail ] || exit 1 ;;
+  */1.time) [ "$CAPTURE_MODE" != copytimefail ] || exit 1 ;;
+esac
 exec /bin/cp "$@"
 COPY
   chmod 700 "$d/fakebin/cp"
   printf '#!/bin/sh\nexit 1\n' >"$d/fakebin/base64"
   chmod 700 "$d/fakebin/base64"
+  # Faults affect only this copied fixture, after the checker returns.
+  sed 's/^alarmrun() {/fixture_alarmrun() {/' "$d/scripts/alarmrun.sh" >"$d/scripts/alarmrun.copy"
+  mv "$d/scripts/alarmrun.copy" "$d/scripts/alarmrun.sh"
+  cat >>"$d/scripts/alarmrun.sh" <<'TIMING'
+alarmrun() {
+  local code
+  fixture_alarmrun "$@"
+  code=$?
+  case "$CAPTURE_MODE" in
+    missingtime) rm -f "$cap.time" ;;
+    malformedtime|malformednormal) TIMEFORMAT='not timing' ;;
+    malformedretry) [ "$code" -ne 0 ] || TIMEFORMAT='not timing' ;;
+    extratime) TIMEFORMAT=$'wall_seconds=%3R user_seconds=%3U system_seconds=%3S\nextra' ;;
+  esac
+  return "$code"
+}
+TIMING
 }
 
 run_case() {
-  local mode=$1 expected=$2 capturefail=$3 d="$scratch/$1" rc
+  local mode=$1 expected=$2 capturefail=$3 d="$scratch/$1" rc runpath=$PATH
   fixture "$d"
-  if [ "$capturefail" = 1 ]; then
-    (cd "$d"; CAPTURE_MODE="$mode" TMPDIR="$d/tmp" PATH="$d/fakebin:$PATH" \
-      bash scripts/selfhost-diffcheck.sh) >"$d/log" 2>&1 && rc=0 || rc=$?
-  elif [ "$capturefail" = 2 ]; then
-    rm "$d/fakebin/cp"
-    (cd "$d"; CAPTURE_MODE="$mode" TMPDIR="$d/tmp" PATH="$d/fakebin:$PATH" \
-      bash scripts/selfhost-diffcheck.sh) >"$d/log" 2>&1 && rc=0 || rc=$?
-  else
-    (cd "$d"; CAPTURE_MODE="$mode" TMPDIR="$d/tmp" \
-      bash scripts/selfhost-diffcheck.sh) >"$d/log" 2>&1 && rc=0 || rc=$?
-  fi
+  if [ "$capturefail" != 0 ]; then runpath="$d/fakebin:$PATH"; fi
+  case "$capturefail" in
+    2) rm "$d/fakebin/cp" ;;
+    3)
+    cat >"$d/fakebin/rm" <<'REMOVE'
+#!/bin/sh
+case "$2" in *.attemptdir) mkdir "$2.time"; mv "$2.time" "${2%.attemptdir}.time" ;; esac
+exec /bin/rm "$@"
+REMOVE
+    chmod 700 "$d/fakebin/rm"
+    rm "$d/fakebin/cp" "$d/fakebin/base64" ;;
+  esac
+  (cd "$d"; CAPTURE_MODE="$mode" TMPDIR="$d/tmp" PATH="$runpath" \
+    bash scripts/selfhost-diffcheck.sh) >"$d/log" 2>&1 && rc=0 || rc=$?
   printf '%s\n' "$rc" >"$d/native.rc"
   [ "$rc" -eq "$expected" ] || fail "$mode: exit $rc, want $expected"
 }
@@ -82,6 +107,7 @@ decode_frames() {
     /^BEGIN CHECKER_CAPTURE / { i++; print > (dir "/frame" i ".header"); state=""; next }
     /^ARGV_BASE64$/ { state="argv"; printf "" > (dir "/frame" i ".argv.base64"); next }
     /^STDERR_BASE64$/ { state="stderr"; printf "" > (dir "/frame" i ".stderr.base64"); next }
+    /^TIMING_BASE64$/ { state="time"; printf "" > (dir "/frame" i ".time.base64"); next }
     /^END CHECKER_CAPTURE$/ { state=""; next }
     state != "" && $0 != "" { print > (dir "/frame" i "." state ".base64") }
     END { print i+0 > (dir "/frames.count") }
@@ -95,6 +121,15 @@ expected_code() {
   echo 142
 }
 
+check_timing_frame() {
+  local d=$1 i=$2
+  perl -MMIME::Base64 -ne 'print decode_base64($_)' \
+    "$d/frame$i.time.base64" >"$d/frame$i.time"
+  cmp "$d/expected-time$i" "$d/frame$i.time" || fail "lost timing bytes"
+  grep -Eq '^wall_seconds=[0-9]+[.,][0-9]{3} user_seconds=[0-9]+[.,][0-9]{3} system_seconds=[0-9]+[.,][0-9]{3}$' \
+    "$d/frame$i.time" || fail "invalid timing record"
+}
+
 check_frame() {
   local d=$1 i=$2 header attempt provider bytes rc
   header=$(cat "$d/frame$i.header")
@@ -106,6 +141,7 @@ check_frame() {
     "$d/frame$i.stderr.base64" >"$d/frame$i.stderr"
   perl -MMIME::Base64 -ne 'print decode_base64($_)' \
     "$d/frame$i.argv.base64" >"$d/frame$i.argv"
+  check_timing_frame "$d" "$i"
   case "$(basename "$d")" in
     empty) : >"$d/expected.stderr" ;;
     *) printf '\000\377attempt-%s' "$attempt" >"$d/expected.stderr" ;;
@@ -125,8 +161,14 @@ check_frame() {
 }
 
 check_frames() {
-  local d=$1 expected=$2 n i
+  local d=$1 expected=$2 n i timing
   cp "$d/log" "$d/archived.log"
+  awk '/^BEGIN CHECKER_CAPTURE / { for (i=1;i<=NF;i++) if ($i ~ /^raw=/) dir=substr($i,5); for (i=1;i<=NF;i++) if ($i ~ /^attempt=/) attempt=substr($i,9); print dir "/" attempt ".time" }' \
+    "$d/log" >"$d/timing-paths"
+  for ((i=1; i<=expected; i++)); do
+    IFS= read -r timing || fail "missing raw timing path"
+    cp "$timing" "$d/expected-time$i"
+  done <"$d/timing-paths"
   # Archived frames must still reconstruct the bytes after container/TMP loss.
   rm -rf "${d:?}/tmp"
   decode_frames "$d"
@@ -135,11 +177,52 @@ check_frames() {
   for ((i=1; i<=n; i++)); do check_frame "$d" "$i"; done
 }
 
+check_timing_failure() {
+  local mode=$1 native=${2:-142} d="$scratch/$1" dir provider
+  run_case "$mode" 2 0
+  grep -q 'UNDECIDED: checker capture failed (oracle wrapper=125 bit wrapper=125)' "$d/log" || fail "lost timing failure"
+  for provider in oracle bit-out/bin/bit; do
+    [ "$(cat "$d/$provider.a.bit.count")" -eq 1 ] || fail "timing failure retried"
+  done
+  for dir in "$d"/tmp/selfhost-diffcheck-attempt.*; do
+    [ "$(cat "$dir/1.rc")" -eq "$native" ] || fail "lost native status"
+    if [ "$native" -eq 0 ]; then : >"$d/expected.stderr"; else printf '\000\377attempt-1' >"$d/expected.stderr"; fi
+    cmp "$d/expected.stderr" "$dir/1.stderr" || fail "lost raw failed attempt"
+    [ -s "$dir/1.argv" ] || fail "lost raw failed argv"
+    [ ! -e "$dir/2.rc" ] || fail "timing failure added retry"
+  done
+}
+
 check_capture_failure() {
   local mode=$1
   run_case "$mode" 2 1
   grep -q 'UNDECIDED: checker capture failed' "$scratch/$mode/log" || fail "lost capture failure"
   ! grep -q 'MATCH=[1-9]' "$scratch/$mode/log" || fail "capture failure scored MATCH"
+}
+
+check_retry_attempt() {
+  local dir=$1 attempt=$2 native=$3
+  [ "$(cat "$dir/$attempt.rc")" -eq "$native" ] || fail "lost retry native status"
+  printf '\000\377attempt-%s' "$attempt" >"$scratch/expected-retry.stderr"
+  cmp "$scratch/expected-retry.stderr" "$dir/$attempt.stderr" || fail "lost retry stderr"
+  [ -s "$dir/$attempt.argv" ] || fail "lost retry argv"
+}
+
+check_retry_timing_failure() {
+  local d="$scratch/malformedretry" dir provider
+  run_case malformedretry 2 0
+  grep -q 'oracle wrapper=125 bit wrapper=125' "$d/log" || fail "lost retry timing failure"
+  for provider in oracle bit-out/bin/bit; do
+    [ "$(cat "$d/$provider.a.bit.count")" -eq 2 ] || fail "wrong retry count"
+  done
+  for dir in "$d"/tmp/selfhost-diffcheck-attempt.*; do
+    check_retry_attempt "$dir" 1 142
+    check_retry_attempt "$dir" 2 0
+    grep -Eq '^wall_seconds=[0-9]+[.,][0-9]{3} user_seconds=[0-9]+[.,][0-9]{3} system_seconds=[0-9]+[.,][0-9]{3}$' \
+      "$dir/1.time" || fail "lost valid first timing"
+    [ "$(cat "$dir/2.time")" = 'not timing' ] || fail "lost malformed second timing"
+    [ ! -e "$dir/3.rc" ] || fail "added third attempt"
+  done
 }
 
 check_parent() {
@@ -183,6 +266,23 @@ check_capture_failure firstfp
 check_capture_failure finaldiff
 run_case base64fail 2 2
 ! grep -q 'MATCH=[1-9]' "$scratch/base64fail/log" || fail "encoder failure scored MATCH"
+check_timing_failure missingtime
+check_timing_failure malformedtime
+check_timing_failure extratime
+check_timing_failure malformednormal 0
+check_retry_timing_failure
+check_capture_failure copytimefail
+run_case redirecttime 2 3
+for provider in oracle bit-out/bin/bit; do
+  [ ! -e "$scratch/redirecttime/$provider.a.bit.count" ] || fail "timing redirection ran checker"
+done
+for dir in "$scratch/redirecttime"/tmp/selfhost-diffcheck-attempt.*; do
+  [ "$(cat "$dir/1.rc")" = UNKNOWN ] || fail "invented native code"
+done
+run_case native125 2 0
+grep -q 'oracle wrapper=125 bit wrapper=125' "$scratch/native125/log" || fail "native125 changed"
+run_case native7 0 0
+check_frames "$scratch/native7" 0
 check_parent recover
 check_parent normal
-echo 'diffcheckcaptures: PASS (binary/empty recovery, double alarm, both inputs, normal, priority, four capture-failure paths, encoder failure, parent retention)'
+echo 'diffcheckcaptures: PASS (lossless stderr/argv/timing, recovery, double alarm, capture faults, unknown native status, parent retention)'
