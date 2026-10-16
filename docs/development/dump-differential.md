@@ -98,25 +98,11 @@ different, narrower thing than a file checked against nothing. `types` also
 checks the same declared signatures. The 0.42.0 stage0 repin retired its
 previous dump identities (#8163, #8178).
 
-The optimized-IR identity `8259-owned-byte-header-copy` removes only a full
-byte-slice header snapshot immediately before `string_from_byte_range`.
-The snapshot must use zero and the source header's saved length. Its source
-must be a `field_get` of `[]u8`, and the snapshot has exactly one use: the
-next copying string reader with the same length. The source, zero and length
-definitions must precede the snapshot on a unique predecessor chain from
-entry. Joins or cycles on that predecessor chain leave the difference
-unexplained, as do unknown terminators, writes and unknown calls. The string reader remains, so the returned string
-still owns an independent copy of the bytes.
-
-All remaining instructions, function and block structure must match under a
-bijective SSA-ID mapping within each function. Quoted literals remain exact,
-including escaped, non-UTF-8, `%` and `$t` bytes. This matcher does not
-canonicalize type IDs or apply to unoptimized IR. At least one actual snapshot
-elision is required; counts and file names cannot explain a difference.
-The selfcheck covers accepted structure and rejected bounds, uses, effects,
-control flow, literal changes and unrelated changes with the same counts.
-No corpus coverage count follows from those controls: the next differential
-must report every explained and unexplained path against the pinned release.
+The 0.43.0 stage0 repin (#8267) retires
+`8259-owned-byte-header-copy`: the published compiler already contains the
+owned byte-header copy elision. No declared dump identity remains. The
+former accepted structures and unrelated literal, symbol, bounds, use and
+control-flow differences must all remain unexplained by the selfcheck.
 
 Unknown differences still fail closed. Both plain and JSON documentation
 output must match exactly. The retirement audit and the shared oracle-coverage
