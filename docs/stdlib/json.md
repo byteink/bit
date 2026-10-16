@@ -493,6 +493,38 @@ Use the `jsonAppend*` functions together when you are already writing into a
 `[]byte` and want to skip building a `Json` tree first, such as generated
 code that streams a document one field at a time.
 
+## Write into a reusable string builder
+
+When one builder spans many records, these functions write into its owned
+buffer. They return the same builder and use the same string escapes and
+float format as the slice helpers.
+
+### `jsonWriteKey(out: Builder, key: string, first: bool): Builder`
+
+Writes the optional comma, escaped key and colon.
+
+### `jsonWriteString(out: Builder, s: string): Builder`
+
+Writes an escaped, quoted string.
+
+### `jsonWriteFloat(out: Builder, v: f64): Builder`
+
+Writes a JSON number, including `null` for a non-finite value.
+
+```bit
+import { Builder } from "std/strings"
+import { jsonWriteKey, jsonWriteString, jsonWriteFloat } from "std/json"
+
+fn draftPreview(title: string, score: f64): string {
+  let out = Builder().write("{")
+  out = jsonWriteKey(out, "title", true)
+  out = jsonWriteString(out, title)
+  out = jsonWriteKey(out, "score", false)
+  out = jsonWriteFloat(out, score)
+  return out.write("}").toString()
+}
+```
+
 ## Typed decoding
 
 ### `jsonDecode<T>(j: Json): T!`
