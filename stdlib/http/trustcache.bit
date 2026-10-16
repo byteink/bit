@@ -77,151 +77,138 @@ let trustCacheState: i64 = 0 // 0 empty, 1 building, 2 ready
 extern fn bit_rt_bytes_copy(dst: *byte, src: *byte, n: int)
 extern fn bit_rt_bytes_equal(a: *byte, b: *byte, n: int): bool
 
-fn tcPutU32(buf: []byte, v: int): []byte {
-  buf = append(buf, byte((v >> 24) & 0xff))
-  buf = append(buf, byte((v >> 16) & 0xff))
-  buf = append(buf, byte((v >> 8) & 0xff))
-  buf = append(buf, byte(v & 0xff))
-  return buf
-}
+// The cursor owns a full-length backing buffer; scalar writes do not clone
+// a slice header, and only growth copies the already-written prefix (#8261).
+class tcWriter { buf: []byte, pos: int }
 
-// #3865: was an 8-iteration back-edge loop, called 6 times per certificate
-// (twice per publish attempt) -- unrolled to match tcPutU32's own shape two
-// functions above, in the same file. A fixed 8-trip loop still pays 8
-// collections per call under BIT_GC=stress; measured to be the difference
-// between clearing and missing this ticket's 10x floor on the real store.
-fn tcPutI64(buf: []byte, v: int): []byte {
-  buf = append(buf, byte((v >> 56) & 0xff))
-  buf = append(buf, byte((v >> 48) & 0xff))
-  buf = append(buf, byte((v >> 40) & 0xff))
-  buf = append(buf, byte((v >> 32) & 0xff))
-  buf = append(buf, byte((v >> 24) & 0xff))
-  buf = append(buf, byte((v >> 16) & 0xff))
-  buf = append(buf, byte((v >> 8) & 0xff))
-  buf = append(buf, byte(v & 0xff))
-  return buf
-}
-
-fn tcPutBool(buf: []byte, v: bool): []byte {
-  if (v) {
-    // bit:lint allow E0214 -- unexported, all seven call sites reassign buf = tcPutBool(buf, ...)
-    return append(buf, byte(1))
+fn tcReserve(wr: tcWriter, n: int) {
+  assert(wr.pos >= 0 && wr.pos <= len(wr.buf), "trustcache: invalid writer position")
+  assert(n >= 0 && wr.pos <= 9223372036854775807 - n, "trustcache: encoding size overflow")
+  let need = wr.pos + n
+  if (need <= len(wr.buf)) {
+    return
   }
-  // bit:lint allow E0214 -- unexported, all seven call sites reassign buf = tcPutBool(buf, ...)
-  return append(buf, byte(0))
-}
-
-// #4009: #3865's fix here was ACCIDENTALLY QUADRATIC. `tcPutBytes` is an
-// ACCUMULATOR — it is `buf`, the whole store-wide encoding built up across
-// every field of every certificate — not a copy into a buffer that is
-// already the right size (that is `asn1appendAll`'s case, and
-// `tcTryPublish`'s/`tcRead`'s fixed-array copies below, which stay as #3865
-// left them). #3865 replaced the old `append`-based accumulation (amortized
-// O(n) in total, via `append`'s own geometric doubling) with an exact-size
-// `[]byte(bn + sn)` allocated and re-copied on EVERY call — O(n^2) in the
-// accumulated length across the ~30 calls per certificate x 125 certs,
-// since each call re-copies the entire already-built prefix, not just the
-// new bytes. Fixed on merged `main`: `test-benchgate`'s trustcache case at
-// cpu=100cs/rss=29933568B against a 47cs/24649728B ceiling (baseline
-// 19cs/16433152B).
-//
-// This restores amortized growth while keeping bulk copies (no per-byte back
-// edges, so the #3865 stress-path win survives): `buf`'s backing array is
-// grown geometrically, like `append`'s own doubling, and only the NEW tail
-// (`b`, plus its length prefix) is ever copied — the already-built prefix is
-// copied again only on the O(log n) calls that actually need to grow the
-// backing array, never on every call.
-fn tcPutBytes(buf: []byte, b: []byte): []byte {
-  buf = tcPutU32(buf, len(b))
-  let bn = len(buf)
-  let sn = len(b)
-  let need = bn + sn
-  if (need <= cap(buf)) {
-    let out = buf[0:need]
-    bit_rt_bytes_copy(ptrOf(out) + bn, ptrOf(b), sn)
-    return out
-  }
-  let newcap = cap(buf)
-  if (newcap == 0) {
-    newcap = 1
-  }
-  while (newcap < need) {
+  let newcap = len(wr.buf)
+  if (newcap <= 4611686018427387903) {
     newcap = newcap * 2
+  } else {
+    newcap = need
   }
-  let out = []byte(need, newcap)
-  bit_rt_bytes_copy(ptrOf(out), ptrOf(buf), bn)
-  bit_rt_bytes_copy(ptrOf(out) + bn, ptrOf(b), sn)
-  return out
+  if (newcap < need) {
+    newcap = need
+  }
+  let out = []byte(newcap)
+  bit_rt_bytes_copy(ptrOf(out), ptrOf(wr.buf), wr.pos)
+  wr.buf = out
 }
 
-fn tcPutString(buf: []byte, s: string): []byte {
-  return tcPutBytes(buf, []byte(s))
+fn tcPutU32(wr: tcWriter, v: int) {
+  tcReserve(wr, 4)
+  wr.buf[wr.pos] = byte((v >> 24) & 0xff)
+  wr.buf[wr.pos + 1] = byte((v >> 16) & 0xff)
+  wr.buf[wr.pos + 2] = byte((v >> 8) & 0xff)
+  wr.buf[wr.pos + 3] = byte(v & 0xff)
+  wr.pos = wr.pos + 4
 }
 
-fn tcPutStringList(buf: []byte, list: []string): []byte {
-  buf = tcPutU32(buf, len(list))
+// Fixed-width writes stay unrolled: a back edge here collects per byte under
+// BIT_GC=stress instead of once at the reserve call (#3865).
+fn tcPutI64(wr: tcWriter, v: int) {
+  tcReserve(wr, 8)
+  wr.buf[wr.pos] = byte((v >> 56) & 0xff)
+  wr.buf[wr.pos + 1] = byte((v >> 48) & 0xff)
+  wr.buf[wr.pos + 2] = byte((v >> 40) & 0xff)
+  wr.buf[wr.pos + 3] = byte((v >> 32) & 0xff)
+  wr.buf[wr.pos + 4] = byte((v >> 24) & 0xff)
+  wr.buf[wr.pos + 5] = byte((v >> 16) & 0xff)
+  wr.buf[wr.pos + 6] = byte((v >> 8) & 0xff)
+  wr.buf[wr.pos + 7] = byte(v & 0xff)
+  wr.pos = wr.pos + 8
+}
+
+fn tcPutBool(wr: tcWriter, v: bool) {
+  tcReserve(wr, 1)
+  wr.buf[wr.pos] = byte(0)
+  if (v) {
+    wr.buf[wr.pos] = byte(1)
+  }
+  wr.pos = wr.pos + 1
+}
+
+// Keep #4009's amortized growth and #3865's bulk payload copy: copying the
+// accumulated prefix on every field is quadratic, and byte loops collect.
+fn tcPutBytes(wr: tcWriter, b: []byte) {
+  tcPutU32(wr, len(b))
+  tcReserve(wr, len(b))
+  bit_rt_bytes_copy(ptrOf(wr.buf) + wr.pos, ptrOf(b), len(b))
+  wr.pos = wr.pos + len(b)
+}
+
+fn tcPutString(wr: tcWriter, s: string) {
+  tcPutBytes(wr, []byte(s))
+}
+
+fn tcPutStringList(wr: tcWriter, list: []string) {
+  tcPutU32(wr, len(list))
   let i = 0
   while (i < len(list)) {
-    buf = tcPutString(buf, list[i])
+    tcPutString(wr, list[i])
     i = i + 1
   }
-  return buf
 }
 
-fn tcPutByteList(buf: []byte, list: [][]byte): []byte {
-  buf = tcPutU32(buf, len(list))
+fn tcPutByteList(wr: tcWriter, list: [][]byte) {
+  tcPutU32(wr, len(list))
   let i = 0
   while (i < len(list)) {
-    buf = tcPutBytes(buf, list[i])
+    tcPutBytes(wr, list[i])
     i = i + 1
   }
-  return buf
 }
 
-fn tcEncodeCertificate(buf: []byte, c: Certificate): []byte {
-  buf = tcPutBytes(buf, c.raw)
-  buf = tcPutBytes(buf, c.tbs)
-  buf = tcPutI64(buf, c.version)
-  buf = tcPutBytes(buf, c.serial)
-  buf = tcPutString(buf, c.sigAlgOid)
-  buf = tcPutBytes(buf, c.sigAlgParams)
-  buf = tcPutString(buf, c.issuer)
-  buf = tcPutString(buf, c.subject)
-  buf = tcPutI64(buf, c.notBefore)
-  buf = tcPutI64(buf, c.notAfter)
-  buf = tcPutI64(buf, c.pubKeyAlg)
-  buf = tcPutBytes(buf, c.pubKeyBytes)
-  buf = tcPutString(buf, c.ecCurveOid)
-  buf = tcPutBytes(buf, c.signature)
-  buf = tcPutStringList(buf, c.dnsNames)
-  buf = tcPutByteList(buf, c.ipAddresses)
-  buf = tcPutBool(buf, c.isCa)
-  buf = tcPutBool(buf, c.hasBasicConstraints)
-  buf = tcPutI64(buf, c.maxPathLen)
-  buf = tcPutBool(buf, c.hasPathLen)
-  buf = tcPutI64(buf, c.keyUsage)
-  buf = tcPutBool(buf, c.hasKeyUsage)
-  buf = tcPutStringList(buf, c.extKeyUsageOids)
-  buf = tcPutBool(buf, c.hasExtKeyUsage)
-  buf = tcPutBytes(buf, c.subjectKeyId)
-  buf = tcPutBytes(buf, c.authorityKeyId)
-  buf = tcPutStringList(buf, c.unknownCriticalOids)
-  buf = tcPutBool(buf, c.hasNameConstraints)
-  buf = tcPutBool(buf, c.hasPermittedDns)
-  buf = tcPutStringList(buf, c.permittedDnsNames)
-  buf = tcPutStringList(buf, c.excludedDnsNames)
-  return buf
+fn tcEncodeCertificate(wr: tcWriter, c: Certificate) {
+  tcPutBytes(wr, c.raw)
+  tcPutBytes(wr, c.tbs)
+  tcPutI64(wr, c.version)
+  tcPutBytes(wr, c.serial)
+  tcPutString(wr, c.sigAlgOid)
+  tcPutBytes(wr, c.sigAlgParams)
+  tcPutString(wr, c.issuer)
+  tcPutString(wr, c.subject)
+  tcPutI64(wr, c.notBefore)
+  tcPutI64(wr, c.notAfter)
+  tcPutI64(wr, c.pubKeyAlg)
+  tcPutBytes(wr, c.pubKeyBytes)
+  tcPutString(wr, c.ecCurveOid)
+  tcPutBytes(wr, c.signature)
+  tcPutStringList(wr, c.dnsNames)
+  tcPutByteList(wr, c.ipAddresses)
+  tcPutBool(wr, c.isCa)
+  tcPutBool(wr, c.hasBasicConstraints)
+  tcPutI64(wr, c.maxPathLen)
+  tcPutBool(wr, c.hasPathLen)
+  tcPutI64(wr, c.keyUsage)
+  tcPutBool(wr, c.hasKeyUsage)
+  tcPutStringList(wr, c.extKeyUsageOids)
+  tcPutBool(wr, c.hasExtKeyUsage)
+  tcPutBytes(wr, c.subjectKeyId)
+  tcPutBytes(wr, c.authorityKeyId)
+  tcPutStringList(wr, c.unknownCriticalOids)
+  tcPutBool(wr, c.hasNameConstraints)
+  tcPutBool(wr, c.hasPermittedDns)
+  tcPutStringList(wr, c.permittedDnsNames)
+  tcPutStringList(wr, c.excludedDnsNames)
 }
 
 fn tcEncodeCertificates(roots: []Certificate): []byte {
-  let buf = []byte(0)
-  buf = tcPutU32(buf, len(roots))
+  let wr = tcWriter{ buf = []byte(0), pos = 0 }
+  tcPutU32(wr, len(roots))
   let i = 0
   while (i < len(roots)) {
-    buf = tcEncodeCertificate(buf, roots[i])
+    tcEncodeCertificate(wr, roots[i])
     i = i + 1
   }
-  return buf
+  return wr.buf[0:wr.pos]
 }
 
 // ---------------------------------------------------------------------------
