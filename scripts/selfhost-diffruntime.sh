@@ -44,6 +44,8 @@ BIT2=bit-out/bin/bit
 # defaults it off, the tree defaults it on, and both invocations share this
 # environment. Delete with the flag, one release after the flip.
 export BIT_IF_BRANCHCHAIN=1
+# #6175: compare fresh append semantics until the fresh-default release is pinned.
+export BIT_APPEND_FRESH=1
 # The alarm is a HANG guard, not a performance budget (#2070). 20s sat below the
 # corpus's slowest file measured on the IR differentials (25.20s on this tree,
 # 21.86s on the oracle), so a busy box turned a clean run red with no divergence

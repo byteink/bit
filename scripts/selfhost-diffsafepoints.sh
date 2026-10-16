@@ -65,6 +65,8 @@ BIT2=bit-out/bin/bit
 # inherit this environment, so force "1" to compare ON against ON. Delete
 # with the flag, one release after the flip.
 export BIT_IF_BRANCHCHAIN=1
+# #6175: compare fresh append semantics until the fresh-default release is pinned.
+export BIT_APPEND_FRESH=1
 
 # 60s, not the 20s dump-call convention (diffdump.sh/diffcheck.sh/diffverdict.sh/
 # diffdoc.sh) this used to follow (#3689): this script's calls are a full

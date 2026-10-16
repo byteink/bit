@@ -198,8 +198,10 @@ A `string` operand is the only one that can denote either shape, so it is the
 only one whose destination is checked: a `string` appended to a `[]u8` takes the
 bytes shape, a `string` appended to a `[]string` is one element, and a `string`
 appended to any other slice is a compile error (**E0130**) naming both shapes.
-Both shapes share `append`'s aliasing rule - the result may share `dst`'s
-backing buffer, so only the returned value is guaranteed to observe the growth.
+Both shapes share `append`'s aliasing rule: the result may share `dst`'s
+backing buffer, but appending does not change `dst`'s length or capacity.
+Only the returned slice observes growth. When capacity is exhausted, its new
+buffer also leaves `dst`'s backing bytes unchanged. Spread uses the same rule.
 
 There is no third, slice-concatenation shape: `x` itself being a slice of
 `dst`'s element type is judged by the element shape above like any other `x`,
@@ -4514,10 +4516,10 @@ read its length a single time, before the first iteration, and run exactly
 that many times, as Go's `range` does ("The range expression x is evaluated
 once before beginning the loop", go.dev/ref/spec#For_range). The elements are
 not snapshotted: each iteration reads `xs[i]` live, so a store to a later
-element made by the body is seen. Because `append` may extend `dst` in place
-and share its header with every alias (§5.3), a body that appends to the
-ranged slice through an alias does not lengthen the loop: the appended
-elements are not visited, and the loop terminates after the original length.
+element made by the body is seen. Appending through an alias returns a
+separate slice value (§5.3), so the ranged slice keeps its length. Assigning
+an append result back to the loop's source binding also does not extend the
+iteration bound: appended elements are not visited by that loop.
 A map is out of this rule: its cursor is a slot position, not a count.
 
 **Iterators.** A class or interface opts into `for_of` structurally, by

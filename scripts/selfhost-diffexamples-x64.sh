@@ -27,6 +27,8 @@ set -u
 # release; it cannot catch a bug present in both — docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=${BIT2:-bit-out/bin/bit}
+# #6175: compare fresh append semantics until the fresh-default release is pinned.
+export BIT_APPEND_FRESH=1
 
 # Refuse before counting anything (#4505): with bit2 absent every invocation
 # fails to exec, the empty result is scored as an ordinary verdict, and this
