@@ -87,19 +87,15 @@ const preemptSlots: int = 32
 // was never stamped, or a later clear zeroed it. `preemptTickNow` never
 // returns 0, so 0 keeps that meaning unambiguously even for a worker
 // dispatched before the monitor thread's very first tick. `requested[w]` is
-// nonzero once `sysmonTick` has observed `w` over budget, and stays set until
-// `maybePreempt` clears it. Fixed globals; nothing here is allocated at run
-// time.
+// the nonzero dispatch stamp once `sysmonTick` observes `w` over budget, and
+// stays set until consumed or cleared. The stamp lets a late publisher retract
+// only its own request. Fixed globals; nothing here is allocated at run time.
 let startTick: [32]i64
 let requested: [32]i64
 
-// The tick epoch: how many `sysmonTick` calls have completed their increment.
-// This is the ONLY clock preemption has (#4736). `sysmonTick` is its only
-// writer and there is exactly one monitor thread per process, so the
-// load-add-store below needs no CAS -- and even a lost update (a second caller
-// driving `sysmonTick` by hand, which `_tests_/bit/pollguardpreempt.bit` does)
-// can only leave the counter LOWER, i.e. make every age look smaller, which
-// delays a preempt request by a tick and can never publish one early.
+// The tick epoch advances atomically because tests and the monitor may call
+// sysmonTick concurrently. A delayed caller must not restore an older epoch:
+// requested cells use dispatch epochs as ownership tags (#8209).
 //
 // A `[1]i64` rather than a bare `let epoch: i64` for the reason every other
 // global here is an array: `ptrOf` is how a `@nosplit` body addresses module
@@ -120,9 +116,8 @@ let sysmonEpoch: [1]i64
 // nonzero. A false POSITIVE is free (one guard evaluation takes the slow path
 // and finds nothing); a false NEGATIVE would drop a preempt request. Which is
 // why the two sides are ordered the way they are:
-//   - the SETTER (`sysmonTick`, the only writer of `requested` and the only
-//     one, single-threaded on its own OS thread) publishes the flag FIRST and
-//     this word SECOND;
+//   - the SETTER (`sysmonTick`) publishes the tagged flag FIRST and this word
+//     SECOND;
 //   - the CLEARER (`refreshPreemptAny`) writes 0 FIRST and re-scans AFTER.
 // A final 0 therefore always comes from a clearer whose scan ran strictly
 // after its own 0-store, hence strictly after any setter's write of 1 to this
@@ -380,10 +375,44 @@ export @nosplit fn preemptClear(worker: i64) {
   }
 }
 
+// These cold helpers also let the native control resume the actual publisher
+// after a worker clears the dispatch it just validated (#8209).
+export @nosplit fn preemptRequestTag(worker: i64): i64 {
+  return atomicLoad(slotAddr(ptrOf(requested), worker))
+}
+
+export @nosplit fn preemptDispatchMatches(worker: i64, started: i64): bool {
+  return atomicLoad(slotAddr(ptrOf(startTick), worker)) == started
+}
+
+export @nosplit fn preemptAdvanceEpoch(): i64 {
+  return atomicAdd(ptrOf(sysmonEpoch), 1) + 2
+}
+
+export @nosplit fn preemptRetract(worker: i64, started: i64) {
+  if (atomicCmpxchg(slotAddr(ptrOf(requested), worker), started, 0)) {
+    refreshPreemptAny()
+  }
+}
+
+export @nosplit fn preemptPublish(worker: i64, started: i64, prior: i64): bool {
+  let request = slotAddr(ptrOf(requested), worker)
+  if (!atomicCmpxchg(request, prior, started) && preemptRequestTag(worker) != started) {
+    return false
+  }
+  atomicStore(slotAddr(ptrOf(anyRequested), 0), 1)
+  pollRequest()
+  if (preemptDispatchMatches(worker, started)) {
+    return true
+  }
+  preemptRetract(worker, started)
+  return false
+}
+
 // Advance the tick epoch by one, then scan every worker slot and flag any that
 // has held its task for `preemptBudgetTicks` ticks or more (#4736: the epoch
 // IS the clock -- this function takes no time reading and makes no OS call, so
-// the monitor thread's whole tick is a load, a store and this scan).
+// the monitor thread's whole tick is an atomic increment and this scan).
 // Bounded by `schedMaxWorkers` AND `preemptSlots` --
 // `preemptSlots` is the one that actually matters for safety here: it is
 // this file's own array capacity, so the scan can never run past
@@ -396,8 +425,8 @@ export @nosplit fn preemptClear(worker: i64) {
 // `preemptStamp` is the only writer of a nonzero value (and `preemptTickNow`
 // never yields 0), so 0 means no task is currently dispatched on that worker.
 //
-// Returns the number of workers that met the over-budget condition this
-// call, whether or not their flag was already set from an earlier tick.
+// Returns retained current-dispatch publications, including a matching tag
+// already published by another caller. A failed CAS alone is no receipt.
 //
 // `@symbol` PINNED (#2579): both darwin's and linux's `boot.bit` build
 // `--freestanding` (#1628) and therefore build no function VALUE — every
@@ -409,39 +438,18 @@ export @nosplit fn preemptClear(worker: i64) {
 // now; the name matches the `bit_rt_port_sched_*` convention those siblings
 // use. Purely an ABI/linkage annotation — no change to the logic below.
 export @nosplit @symbol("bit_rt_port_sched_sysmon_tick") fn sysmonTick(): i64 {
-  // The epoch advance. Load-add-store rather than a CAS: see `sysmonEpoch`'s
-  // own comment for why a lost update here is a delayed preempt request and
-  // never an early one.
-  let epoch = slotAddr(ptrOf(sysmonEpoch), 0)
-  atomicStore(epoch, atomicLoad(epoch) + 1)
-  let now = preemptTickNow()
+  let now = preemptAdvanceEpoch()
   let count: i64 = 0
   let w: i64 = 0
   while (w < schedMaxWorkers && w < preemptSlots) {
     let started = atomicLoad(slotAddr(ptrOf(startTick), w))
-    if (started != 0 &&
-      now - started >= preemptBudgetTicks &&
-      atomicLoad(slotAddr(ptrOf(startTick), w)) == started) {
-      // Re-validated against a second load, immediately before publishing:
-      // `preemptClear` can run on `w`'s own thread between the first load
-      // above and here, if the task that was over budget finishes or parks
-      // in exactly that window. Without the re-check this would publish a
-      // request for a worker that, by the time it lands, is running
-      // nothing -- and since no safepoint or dispatch is coming to consume
-      // it, that republishes the exact permanently-stuck state #4278 fixed.
-      atomicStore(slotAddr(ptrOf(requested), w), 1)
-      // #3746: publish the summary AFTER the flag, never before -- see
-      // `anyRequested`'s own header for the proof that this order (paired with
-      // the clearer's opposite one) admits no interleaving that hides a set
-      // flag behind a zero summary.
-      atomicStore(slotAddr(ptrOf(anyRequested), 0), 1)
-      // #4203: and publish the back-edge poll request on the same terms and for
-      // the same reason -- AFTER the flag. `anyRequested` is what the runtime's
-      // own preempt clause reads; `pollAttention` (./pollreq.bit) is what a
-      // compiled mutator reads at its back edge, and without this a flagged
-      // worker would run to completion because nothing told it to look.
-      pollRequest()
-      count = count + 1
+    let prior = preemptRequestTag(w)
+    if (started != 0 && now - started >= preemptBudgetTicks && preemptDispatchMatches(w, started)) {
+      // The prior request precedes final validation. Publication must not
+      // overwrite a newer tag or survive a clear after that validation.
+      if (preemptPublish(w, started, prior)) {
+        count = count + 1
+      }
     }
     w = w + 1
   }
