@@ -254,7 +254,7 @@ observer_fixture() {
 #!/bin/bash
 set -eu
 [ "$#" -eq 7 ] && [ "$1" = trusted-observer ] && [ "$2" = --stock-pair ] || exit 99
-[ "$3" = _tests_/cases/jsx_bool_attr.bit ] || exit 99
+[ "$3" = _tests_/cases/jsx_attr_reserved_hyphen.bit ] || exit 99
 [ "$6" = "$OBSERVER_ROOT/oracle" ] && [ "$7" = bit-out/bin/bit ] || exit 99
 [ "${4%/*}" = "${5%/*}" ] || exit 99
 printf 'called\n' >>observer.calls
@@ -278,7 +278,7 @@ run_observer_case() {
   local mode=$1 expected=$2 status=${3:-} d="$scratch/observer-$1" rc
   fixture "$d"
   observer_fixture "$d"
-  printf '// run\n' >"$d/_tests_/cases/jsx_bool_attr.bit"
+  printf '// run\n' >"$d/_tests_/cases/jsx_attr_reserved_hyphen.bit"
   (cd "$d"; CAPTURE_MODE=normal OBSERVER_MODE="$mode" OBSERVER_STATUS="$status" OBSERVER_ROOT="$d" \
     DIFFCHECK_OBSERVER=trusted-observer TMPDIR="$d/tmp" PATH="$d/fakebin:$PATH" \
     bash scripts/selfhost-diffcheck.sh) >"$d/log" 2>&1 && rc=0 || rc=$?
@@ -295,7 +295,7 @@ check_observer_calls() {
   for provider in oracle bit-out/bin/bit; do
     [ "$(cat "$d/$provider.a.bit.count")" = 1 ] || fail "unselected a changed"
     [ "$(cat "$d/$provider.b.bit.count")" = 1 ] || fail "unselected b changed"
-    [ ! -e "$d/$provider.jsx_bool_attr.bit.count" ] || fail "selected checker ran outside observer"
+    [ ! -e "$d/$provider.jsx_attr_reserved_hyphen.bit.count" ] || fail "selected checker ran outside observer"
   done
 }
 
@@ -314,11 +314,12 @@ check_unselected_observer() {
   local d="$scratch/observer-unselected" rc
   fixture "$d"
   observer_fixture "$d"
+  printf '// run\n' >"$d/_tests_/cases/jsx_bool_attr.bit"
   (cd "$d"; CAPTURE_MODE=normal DIFFCHECK_OBSERVER=trusted-observer \
     TMPDIR="$d/tmp" PATH="$d/fakebin:$PATH" bash scripts/selfhost-diffcheck.sh) \
     >"$d/log" 2>&1 && rc=0 || rc=$?
   [ "$rc" -eq 0 ] && [ ! -e "$d/observer.calls" ] || fail "unselected input invoked observer"
-  grep -q 'MATCH=2 .*TIMEOUT=0' "$d/log" || fail "unselected comparison changed"
+  grep -q 'MATCH=3 .*TIMEOUT=0' "$d/log" || fail "unselected comparison changed"
 }
 
 run_case recover 0 0

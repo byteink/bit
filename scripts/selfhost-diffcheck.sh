@@ -61,7 +61,7 @@
 #      not reproduce on fresh captures (UNSTABLE, #6357). Not a pass.
 #
 # Optional DIFFCHECK_OBSERVER: trusted, caller-pinned Python helper for only
-# jsx_bool_attr. --stock-pair receives input, both capture paths, oracle, bit2;
+# jsx_attr_reserved_hyphen. --stock-pair receives input, both capture paths, oracle, bit2;
 # preserve concurrent checks, 20s alarms and one 142 retry; retain attempt files.
 # Publish one line "ORACLE <rc> BIT2 <rc> 0" to observer-pair.status beside caps.
 # Nonzero helper exit or invalid status is undecided, never a checker verdict.
@@ -219,7 +219,7 @@ observed_pair() {
 # (#3783). Each is still independently alarm-guarded, so a hung ORACLE still
 # cannot wedge the whole gate: it only stalls this one file's own iteration.
 runpair() {
-  if [ "$1" = _tests_/cases/jsx_bool_attr.bit ] && [ -n "${DIFFCHECK_OBSERVER:-}" ]; then
+  if [ "$1" = _tests_/cases/jsx_attr_reserved_hyphen.bit ] && [ -n "${DIFFCHECK_OBSERVER:-}" ]; then
     observed_pair "$1"; observer_rc=$?
     capture_guard "$observer_rc" 0
     capture_guard "$src" "$brc"
