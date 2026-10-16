@@ -562,13 +562,11 @@ body as a root — so objects reachable only through a slice survive collection.
 A non-ref buffer stays a leaf. The header keeps the buffer itself alive via its
 `ptr_offsets = [0]`.
 
-The compiler defaults to `bit_rt_slice_append_fresh`,
+The compiler lowers append to `bit_rt_slice_append_fresh`,
 `bit_rt_slice_append_str_fresh` and `bit_rt_slice_append_slice_fresh`: these
 preserve an existing destination header. The corresponding names without
-`_fresh` remain mutating targets for proven-owned headers. During the #6175
-rollout, explicit `BIT_APPEND_FRESH=0` also selects the legacy targets until
-the published fresh-default compiler becomes stage0; unset and `1` use fresh
-semantics. Runtime entry points do not read this compiler environment setting.
+`_fresh` remain mutating targets for proven-owned headers. No environment
+setting selects the mutating targets; the ownership proof controls their use.
 
 ### 2.2 Type assertions
 
