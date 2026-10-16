@@ -60,6 +60,12 @@
 #   2  could not decide: a file timed out and was never compared, or a DIFF did
 #      not reproduce on fresh captures (UNSTABLE, #6357). Not a pass.
 #
+# Optional DIFFCHECK_OBSERVER: trusted, caller-pinned Python helper for only
+# jsx_bool_attr. --stock-pair receives input, both capture paths, oracle, bit2;
+# preserve concurrent checks, 20s alarms and one 142 retry; retain attempt files.
+# Publish one line "ORACLE <rc> BIT2 <rc> 0" to observer-pair.status beside caps.
+# Nonzero helper exit or invalid status is undecided, never a checker verdict.
+# Sampled timings are perturbed; helper wait4 CPU differs from Bash wrapper CPU.
 # Usage: ./make selfhost && bash scripts/selfhost-diffcheck.sh
 set -u
 # shellcheck source=scripts/alarmrun.sh
@@ -193,12 +199,33 @@ capture_guard() {
   fi
 }
 
+# Observer mechanism failures never reach the comparison grader.
+observed_pair() {
+  local line extra code observerpid
+  python3 "$DIFFCHECK_OBSERVER" --stock-pair "$1" "$seedcap" "$b2cap" "$ORACLE" "$BIT2" &
+  observerpid=$!
+  wait "$observerpid" || return 125
+  { IFS= read -r line && ! IFS= read -r extra && [ -z "$extra" ]; } <"$work/observer-pair.status" || return 125
+  [[ $line =~ ^ORACLE\ ([0-9]{1,3})\ BIT2\ ([0-9]{1,3})\ 0$ ]] || return 125
+  src=${BASH_REMATCH[1]} brc=${BASH_REMATCH[2]}
+  for code in "$src" "$brc"; do
+    [ "$code" -le 255 ] || return 125
+  done
+}
+
 # runpair <file> -- both sides of one file CONCURRENTLY into $seedcap/$b2cap;
 # the exit statuses land in $src and $brc. ORACLE and BIT2 are independent per
 # file -- compared only after both return -- so they need not run back-to-back
 # (#3783). Each is still independently alarm-guarded, so a hung ORACLE still
 # cannot wedge the whole gate: it only stalls this one file's own iteration.
 runpair() {
+  if [ "$1" = _tests_/cases/jsx_bool_attr.bit ] && [ -n "${DIFFCHECK_OBSERVER:-}" ]; then
+    observed_pair "$1"; observer_rc=$?
+    capture_guard "$observer_rc" 0
+    capture_guard "$src" "$brc"
+    emit_capture "$seedcap" ORACLE "$1" && emit_capture "$b2cap" BIT2 "$1" || exit 2
+    return
+  fi
   run_cap ORACLE "$seedcap" "$ORACLE" check "$1" &
   oraclepid=$!
   run_cap BIT2 "$b2cap" "$BIT2" check "$1" &
@@ -224,7 +251,7 @@ declaredCode() {
 }
 
 match=0 missing=0 falsepos=0 diff=0 timeout=0 explained=0 unstable=0 firstfp="" firstdiff="" firsthang="" firstunstable="" hitdeclared=""
-work=$(mktemp -d) || exit 2
+work=$(mktemp -d "${TMPDIR:-/tmp}/selfhost-diffcheck.XXXXXX") || exit 2
 trap 'rm -rf "$work"' EXIT
 seedcap="$work/seed.out"
 b2cap="$work/b2.out"

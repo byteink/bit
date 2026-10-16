@@ -248,6 +248,79 @@ check_parent() {
   check_frames "$d" 8
 }
 
+observer_fixture() {
+  local d=$1
+  cat >"$d/fakebin/python3" <<'OBSERVER'
+#!/bin/bash
+set -eu
+[ "$#" -eq 7 ] && [ "$1" = trusted-observer ] && [ "$2" = --stock-pair ] || exit 99
+[ "$3" = _tests_/cases/jsx_bool_attr.bit ] || exit 99
+[ "$6" = "$OBSERVER_ROOT/oracle" ] && [ "$7" = bit-out/bin/bit ] || exit 99
+[ "${4%/*}" = "${5%/*}" ] || exit 99
+printf 'called\n' >>observer.calls
+printf 'same\000bytes' >"$4"
+printf 'same\000bytes' >"$5"
+status="${4%/*}/observer-pair.status"
+case "$OBSERVER_MODE" in
+  success) printf 'ORACLE 0 BIT2 0 0\n' >"$status" ;;
+  alarm) printf 'ORACLE 142 BIT2 142 0\n' >"$status" ;;
+  native125) printf 'ORACLE 125 BIT2 125 0\n' >"$status" ;;
+  reject) printf 'ORACLE 7 BIT2 7 0\n' >"$status" ;;
+  exit) printf 'ORACLE 0 BIT2 0 0\n' >"$status"; exit 1 ;;
+  missing) : ;;
+  *) printf '%b' "$OBSERVER_STATUS" >"$status" ;;
+esac
+OBSERVER
+  chmod 700 "$d/fakebin/python3"
+}
+
+run_observer_case() {
+  local mode=$1 expected=$2 status=${3:-} d="$scratch/observer-$1" rc
+  fixture "$d"
+  observer_fixture "$d"
+  printf '// run\n' >"$d/_tests_/cases/jsx_bool_attr.bit"
+  (cd "$d"; CAPTURE_MODE=normal OBSERVER_MODE="$mode" OBSERVER_STATUS="$status" OBSERVER_ROOT="$d" \
+    DIFFCHECK_OBSERVER=trusted-observer TMPDIR="$d/tmp" PATH="$d/fakebin:$PATH" \
+    bash scripts/selfhost-diffcheck.sh) >"$d/log" 2>&1 && rc=0 || rc=$?
+  printf '%s\n' "$rc" >"$d/native.rc"
+  [ "$rc" -eq "$expected" ] || fail "observer $mode: exit $rc, want $expected"
+  check_observer_calls "$d"
+  check_observer_verdict "$d" "$mode"
+}
+
+check_observer_calls() {
+  local d=$1 provider
+  # Only the selected pair is delegated; every other fake checker still runs.
+  [ "$(cat "$d/observer.calls")" = called ] || fail "observer not called exactly once"
+  for provider in oracle bit-out/bin/bit; do
+    [ "$(cat "$d/$provider.a.bit.count")" = 1 ] || fail "unselected a changed"
+    [ "$(cat "$d/$provider.b.bit.count")" = 1 ] || fail "unselected b changed"
+    [ ! -e "$d/$provider.jsx_bool_attr.bit.count" ] || fail "selected checker ran outside observer"
+  done
+}
+
+check_observer_verdict() {
+  local d=$1
+  case "$2" in
+    success|reject) grep -q 'MATCH=3 .*TIMEOUT=0' "$d/log" || fail "observer verdict lost" ;;
+    alarm) grep -q 'MATCH=2 .*TIMEOUT=1' "$d/log" || fail "observer alarm scored verdict" ;;
+    *)
+      grep -q 'UNDECIDED: checker capture failed' "$d/log" || fail "observer failure not undecided"
+      ! grep -q '^check differential:' "$d/log" || fail "observer failure reached grader" ;;
+  esac
+}
+
+check_unselected_observer() {
+  local d="$scratch/observer-unselected" rc
+  fixture "$d"
+  observer_fixture "$d"
+  (cd "$d"; CAPTURE_MODE=normal DIFFCHECK_OBSERVER=trusted-observer \
+    TMPDIR="$d/tmp" PATH="$d/fakebin:$PATH" bash scripts/selfhost-diffcheck.sh) \
+    >"$d/log" 2>&1 && rc=0 || rc=$?
+  [ "$rc" -eq 0 ] && [ ! -e "$d/observer.calls" ] || fail "unselected input invoked observer"
+  grep -q 'MATCH=2 .*TIMEOUT=0' "$d/log" || fail "unselected comparison changed"
+}
+
 run_case recover 0 0
 check_frames "$scratch/recover" 8
 run_case empty 0 0
@@ -285,4 +358,16 @@ run_case native7 0 0
 check_frames "$scratch/native7" 0
 check_parent recover
 check_parent normal
-echo 'diffcheckcaptures: PASS (lossless stderr/argv/timing, recovery, double alarm, capture faults, unknown native status, parent retention)'
+run_observer_case success 0
+run_observer_case reject 0
+run_observer_case alarm 2
+run_observer_case native125 2
+run_observer_case exit 2
+run_observer_case missing 2
+run_observer_case extra 2 'ORACLE 0 BIT2 0 0\nextra\n'
+run_observer_case partial 2 'ORACLE 0 BIT2 0 0\nextra'
+run_observer_case huge 2 'ORACLE 256 BIT2 0 0\n'
+run_observer_case malformed 2 'ORACLE zero BIT2 0 0\n'
+run_observer_case failed 2 'ORACLE 0 BIT2 0 1\n'
+check_unselected_observer
+echo 'diffcheckcaptures: PASS (lossless stderr/argv/timing, recovery, double alarm, capture faults, unknown native status, parent retention, selected observer contract)'
