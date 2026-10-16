@@ -2714,9 +2714,11 @@ It defines:
   `_tests_/bit/pollguardpreempt.bit` backdate one worker deterministically.
 - `sysmonTick(): i64`, which advances `sysmonEpoch` by one and then scans
   every worker slot — bounded by both the scheduler's worker-count constant
-  and `preemptSlots` — setting `requested[w] = 1` for any worker whose
-  `preemptTickNow() - startTick[w]` has reached `preemptBudgetTicks`, and
-  returning the count set this call. It takes no argument and reads no clock.
+  and `preemptSlots` — publishing the nonzero dispatch stamp as the request
+  tag when `preemptTickNow() - startTick[w]` reaches `preemptBudgetTicks`.
+  It counts retained current-dispatch requests. A stale publisher retracts
+  only its own tag. Epoch increments are atomic across concurrent callers.
+  It takes no argument and reads no clock.
 - `preemptRequested(worker: i64): bool`, which reads the flag without
   clearing it (`runtime/sched/preempt.bit:109-111`).
 - `maybePreempt(worker: i64): bool`, which reports a pending request and
