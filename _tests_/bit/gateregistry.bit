@@ -22,11 +22,148 @@
 // run every gate not deliberately excluded, and this gate, running beside
 // them, names any gate it could not account for.
 //
-// No BIT_STDLIB, no BIT_REPO: it imports `tools/build` directly rather than
-// shelling out or reading source text, so it sees the compiled registry
-// itself, not a string that happens to look like one.
+// Imports `tools/build` directly so both accounting and the SDK whitelist
+// use the compiled registry. The phase fixture runs a copied actual driver
+// against owned warm artifacts, and never executes a harness argument.
 import { Gate, gateTable, gateNames } from "../../tools/build"
-import { exit } from "std/os"
+import { args, envOr, exit } from "std/os"
+import { exists, writeFile } from "std/fs"
+import { indexOf, replace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { mustSucceed, rmrf, shQuote } from "./pmvanityhelpers"
+
+// Execute the real driver against warm, isolated artifacts. Every registered
+// argv terminates at this SDK stub; no harness argument is ever executed.
+fn prepushDispatch(g: Gate, source: string, root: string): string {
+  let predicate = "[ \"$#\" -eq ${len(g.argv)} ]"
+  let i = 0
+  for a of g.argv {
+    i = i + 1
+    predicate = predicate +
+      " && [ \"\${" +
+      "${i}" +
+      "}\" = " +
+      shQuote(replace(a, source, root)) +
+      " ]"
+  }
+  for kv of g.env {
+    let eq = indexOf(kv, "=")
+    assert(eq > 0)
+    predicate = predicate +
+      " && [ \"\${" +
+      kv[:eq] +
+      "-}\" = " +
+      shQuote(replace(kv[eq + 1:], source, root)) +
+      " ]"
+  }
+  return "if " +
+    predicate +
+    " && [ \"$score\" -lt ${len(g.env)} ]; then name=" +
+    shQuote(g.name) +
+    "; score=${len(g.env)}; fi\n"
+}
+
+fn prepushSdk(gates: []Gate, covered: map<string, bool>, source: string, root: string): string {
+  let script = "#!/bin/sh\nset -eu\n[ \"$#\" -ne 1 ] || [ \"$1\" != --version ] || { echo fixture-sdk; exit 0; }\nname= score=-1\n"
+  for g of gates {
+    if (covered[g.name] || g.name == "test-differentials") {
+      script = script + prepushDispatch(g, source, root)
+    }
+  }
+  return script +
+    "[ -n \"$name\" ] || { echo 'unexpected SDK argv' >&2; exit 125; }\n" +
+    "root=" +
+    shQuote(root) +
+    "\n" +
+    "if [ \"$name\" = test-differentials ]; then\n" +
+    "  mkdir \"$root/differential\" || exit 125\n" +
+    "  printf '%s\\n' \"\${DIFFALL_JOBS-}\" > \"$root/differential/jobs\"\n" +
+    "  [ -z \"$(ls -A \"$root/active\")\" ] || exit 1\n" +
+    "  (cd \"$root/done\"; printf '%s\\n' *) | LC_ALL=C sort > \"$root/at-diff\"\n" +
+    "  cmp \"$root/expected\" \"$root/at-diff\" || exit 1\n" +
+    "else\n" +
+    "  printf '%s\\n' \"$name\" > \"$root/active/$$\"\n" +
+    "  mkdir \"$root/done/$name\" || exit 125\n" +
+    "  rm \"$root/active/$$\" || exit 125\n" +
+    "fi\n" +
+    "[ \"$name\" != \"$(cat \"$root/fail\")\" ]\n"
+}
+
+fn prepushFixture(gates: []Gate, covered: map<string, bool>) {
+  let source = envOr("BIT_MAKE_ROOT", "")
+  assert(len(source) > 0 && source[0] == '/')
+  let root = envOr("TMPDIR", "/tmp") + "/t8237-" + uuidFormat(uuidV4())
+  let a = args()
+  let driver = source + "/bit-out/make/make-driver"
+  if (len(a) > 1) {
+    driver = a[1]
+  }
+  let script = "set -eu\numask 077\nf=" +
+    shQuote(root) +
+    "\ns=" +
+    shQuote(source) +
+    "\n" +
+    "mkdir -p \"$f/bit-out/bin\" \"$f/bit-out/make\" \"$f/scripts\" \"$f/dist/stage0\"\n" +
+    "for d in runtime compiler stdlib tools pkg; do ln -s \"$s/$d\" \"$f/$d\"; done\n" +
+    "cp \"$s/dist/stage0/SHA256SUMS\" \"$f/dist/stage0/SHA256SUMS\"\n" +
+    "cp \"$s/bit-out/make/fp-libbitrt.stamp\" \"$s/bit-out/make/fp-selfhost.stamp\" \"$f/bit-out/make/\"\n" +
+    "cp " +
+    shQuote(driver) +
+    " \"$f/bit-out/make/make-driver\"\n" +
+    "for t in x86_64-linux aarch64-linux aarch64-macos; do mkdir -p \"$f/bit-out/lib/$t\"; ln -s \"$s/bit-out/lib/$t/libbitrt.a\" \"$f/bit-out/lib/$t/libbitrt.a\"; done\n"
+  mustSucceed("gateregistry", "owned warm fixture", script)
+  let sdk = prepushSdk(gates, covered, source, root)
+  writeFile(root + "/bit-out/bin/bit", sdk) catch _ {
+    exit(1)
+  }
+  writeFile(
+    root + "/scripts/stage0.sh",
+    "#!/bin/sh\nprintf '%s\\n' " + shQuote(root + "/bit-out/bin/bit") + "\n",
+  ) catch _ {
+    exit(1)
+  }
+  let expected = ""
+  for name of gateNames() {
+    expected = expected + name + "\n"
+  }
+  writeFile(root + "/expected.unsorted", expected) catch _ {
+    exit(1)
+  }
+  let cases = ""
+  for caseName of ["", gateNames()[0], "test-osenv", "test-differentials"] {
+    cases = cases + "run_case " + shQuote(caseName) + "\n"
+  }
+  let run = "set -eu\nf=" +
+    shQuote(root) +
+    "\nchmod 700 \"$f/bit-out/bin/bit\" \"$f/scripts/stage0.sh\"\n" +
+    "LC_ALL=C sort \"$f/expected.unsorted\" > \"$f/expected\"\n" +
+    "run_case() {\n" +
+    "  label=\${1:-clean}; mkdir \"$f/$label\"; cd \"$f\"\n" +
+    "  mkdir active done; printf '%s' \"$1\" > fail\n" +
+    "  set +e\n" +
+    "  env -i PATH=\"$PATH\" TMPDIR=\"$f/\" BIT_MAKE_ROOT=\"$f\" BIT_LIBBITRT_TREE=" +
+    shQuote(envOr("BIT_LIBBITRT_TREE", "")) +
+    " \"$f/bit-out/make/make-driver\" test-prepush > \"$label/driver.log\" 2>&1\n" +
+    "  rc=$?\n  set -e\n" +
+    "  [ \"$(grep -c 'make:   up to date' \"$label/driver.log\")\" -eq 2 ] || { cat \"$label/driver.log\"; exit 125; }\n" +
+    "  [ -d \"$f/differential\" ]; [ -z \"$(ls -A \"$f/active\")\" ]\n" +
+    "  cores=$(cat \"$f/bit-out/make/ncpu\"); jobs=$((cores / 3))\n" +
+    "  if [ \"$cores\" -le 2 ]; then jobs=1; elif [ \"$jobs\" -lt 2 ]; then jobs=2; fi\n" +
+    "  width=$((cores - jobs - 1)); [ \"$width\" -ge 1 ] || width=1\n" +
+    "  [ \"$(cat \"$f/differential/jobs\")\" -eq \"$width\" ]\n" +
+    "  (cd \"$f/done\"; printf '%s\\n' *) | LC_ALL=C sort > completed\n" +
+    "  cmp expected completed\n" +
+    "  cmp expected at-diff\n" +
+    "  want=1; [ -n \"$1\" ] || want=0\n" +
+    "  echo \"gateregistry: phase case=$label census=${len(gateNames())} width=$width native=$rc expected=$want\"\n" +
+    "  [ \"$rc\" -eq \"$want\" ] || { cat \"$label/driver.log\"; exit 1; }\n" +
+    "  mv active done differential at-diff fail completed \"$label/\"\n" +
+    "}\n" +
+    cases
+  mustSucceed("gateregistry", "actual prepush phase order and failure continuation", run)
+  rmrf(root)
+  assert(!exists(root))
+}
 
 fn coveredNames(): map<string, bool> {
   let out = map<string, bool>{}
@@ -76,4 +213,5 @@ fn main() {
     exit(1)
   }
   print("gateregistry: ${len(gates)} gate(s), ${len(gates) - len(gateNames())} excluded, 0 unaccounted\n")
+  prepushFixture(gates, covered)
 }
