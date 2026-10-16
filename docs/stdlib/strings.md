@@ -16,7 +16,7 @@ Concatenating in a loop copies the whole string every time, which turns an
 
 ### `Builder`
 
-An append-only string buffer. A class, so it is a reference type: its methods
+A reusable string buffer. A class, so it is a reference type: its methods
 mutate it in place, and they also return it so calls can chain.
 
 ### `Builder()`
@@ -34,6 +34,22 @@ Appends the single byte `c` - not a rune. Returns the same builder.
 ### `Builder.toString(): string`
 
 The accumulated string. The builder stays usable.
+
+### `Builder.tail(start: i64): string`
+
+Copies the bytes from `start` to the current end. A negative start or a
+start beyond the length panics. Later writes and truncation cannot change
+the returned string.
+
+### `Builder.truncate(n: i64): Builder`
+
+Keeps the first `n` bytes and reuses the backing capacity. A negative `n`
+or one beyond the current length panics. Returns the same builder.
+
+### `Builder.capacity(): i64`
+
+Total backing capacity in bytes. Use this to discard a builder that grew
+too large for repeated work.
 
 ### `Builder.length(): i64`
 
@@ -53,6 +69,24 @@ fn csv(xs: []string): string {
     first = false
   }
   return b.toString()
+}
+```
+
+When you compose several draft previews, you can keep the prefix and
+replace only the title. Each saved preview keeps its own bytes.
+
+```bit
+import { Builder } from "std/strings"
+
+fn draftPreviews(): []string {
+  let b = Builder().write("Draft: ")
+  let prefix = b.length()
+  b.write("First title")
+  let first = b.tail(prefix)
+  b.truncate(prefix).write("Revised title")
+  assert(first == "First title")
+  assert(b.capacity() >= b.length())
+  return [first, b.tail(prefix)]
 }
 ```
 
