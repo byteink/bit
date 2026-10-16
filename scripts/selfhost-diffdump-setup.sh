@@ -149,6 +149,267 @@ diffdump_setup() {
   # inherit this environment, so force "1" to compare ON against ON. Delete
   # with the flag, one release after the flip.
   export BIT_IF_BRANCHCHAIN=1
-  # #6175: compare fresh append semantics until the fresh-default release is pinned.
-  export BIT_APPEND_FRESH=1
+}
+
+# Fixed proof-library definitions; ordinary setup never calls this loader.
+diffdump_owned_append_library() {
+  DIFFDUMP_OWNED_APPEND_PYTHON=
+  local diffdump_library_rc=0
+  IFS= builtin read -r -d '' DIFFDUMP_OWNED_APPEND_PYTHON <<'DIFFDUMP_OWNED_APPEND_LIBRARY' || diffdump_library_rc=$?
+def keys(value, expected):
+    require(type(value) is dict and set(value) == set(expected.split()))
+
+
+def integer(value, low, high):
+    require(type(value) is int and low <= value <= high)
+    return value
+
+
+def sequence(value, low=0, high=8192):
+    require(type(value) is list and low <= len(value) <= high)
+    return value
+
+
+def byte(value):
+    require(type(value) is str and len(value) <= 1048576)
+    return value.encode("latin1")
+
+
+def atoms(value):
+    result = [byte(v) for v in sequence(value)]
+    require(all(v and not v.isspace() for v in result))
+    return result
+
+
+def ident(value):
+    return re.fullmatch(rb"%[0-9]+", value) is not None
+
+
+def value_id(value):
+    value = byte(value)
+    require(ident(value))
+    return value
+
+
+def label(value):
+    value = byte(value)
+    require(re.fullmatch(rb"bb[0-9]+", value))
+    return value
+
+
+def compact(row):
+    spend(len(row))
+    result = TOKEN.findall(row)
+    require(b'"' not in result)
+    require(all(t.startswith(b'"') or (b"\n" not in t and b"\r" not in t) for t in result))
+    return [t for t in result if not t.isspace()]
+
+
+def pairs(value):
+    result = []
+    for pair in sequence(value):
+        require(type(pair) is list and len(pair) == 2)
+        v, ty = value_id(pair[0]), tuple(atoms(pair[1]))
+        require(ty and not any(ident(t) for t in ty))
+        result.append((v, ty))
+    return result
+
+
+def comma(parts):
+    result = []
+    for part in parts:
+        if result:
+            result.append(b",")
+        result.extend(part)
+    return result
+
+
+def parameter_tokens(params):
+    return comma([[v, b":", *ty] for v, ty in params])
+
+
+def load_targets(value):
+    result = []
+    for pair in sequence(value, high=2):
+        require(type(pair) is list and len(pair) == 2)
+        result.append((label(pair[0]), [value_id(v) for v in sequence(pair[1])]))
+    return result
+
+
+def semantic_uses(op, ts):
+    if op == b"gc_alloc":
+        return []
+    return [t for t in ts if ident(t)]
+
+
+def load_node(obj):
+    keys(obj, "row ts out op ty name args targets")
+    row, ts, op = byte(obj["row"]), atoms(obj["ts"]), byte(obj["op"])
+    require(ts and ts[0] == op)
+    out = None if obj["out"] is None else value_id(obj["out"])
+    ty = tuple(atoms(obj["ty"]))
+    require(not any(ident(t) for t in ty))
+    name = None if obj["name"] is None else byte(obj["name"])
+    args = [value_id(v) for v in sequence(obj["args"])]
+    targets = load_targets(obj["targets"])
+    prefix = [] if out is None else [out, b"="]
+    require(compact(row) == prefix + ts and (out is None) == (op in EFFECTS))
+    return {"row": row, "ts": ts, "out": out, "op": op, "ty": ty,
+            "name": name, "args": args, "targets": targets,
+            "uses": semantic_uses(op, ts)}
+
+
+def load_block(obj, b):
+    keys(obj, "row params code")
+    row, params = byte(obj["row"]), pairs(obj["params"])
+    require(compact(row) == [b, b"(", *parameter_tokens(params), b")", b":"])
+    code = [load_node(n) for n in sequence(obj["code"], 1, 4096)]
+    return {"row": row, "params": params, "code": code}
+
+
+def check_view(header, order, blocks, raw):
+    ht = compact(header)
+    require(len(ht) >= 5 and ht[0] == b"func" and ht[2] == b"(" and ht[-1] == b"{")
+    close = ht.index(b")", 3)
+    require(ht[3:close] == parameter_tokens(blocks[order[0]]["params"]))
+    rows = [header]
+    for b in order:
+        rows += [blocks[b]["row"]] + [n["row"] for n in blocks[b]["code"]]
+    require(raw == b"\n".join(rows + [b"}"]))
+
+
+def load_graph(obj, raw):
+    keys(obj, "header order blocks")
+    order = [label(b) for b in sequence(obj["order"], 1, 256)]
+    require(len(set(order)) == len(order) and type(obj["blocks"]) is dict)
+    require(set(obj["blocks"]) == {b.decode("ascii") for b in order})
+    blocks = {b: load_block(obj["blocks"][b.decode("ascii")], b) for b in order}
+    require(sum(len(b["code"]) for b in blocks.values()) <= 4096)
+    header = byte(obj["header"])
+    check_view(header, order, blocks, raw)
+    f = {"header": header, "blocks": blocks, "order": order}
+    validate(f)
+    return f
+
+
+def definitions(f):
+    result = {}
+    for b in f["order"]:
+        blk = f["blocks"][b]
+        items = [(v, -1, ty) for v, ty in blk["params"]]
+        items += [(n["out"], i, n["ty"]) for i, n in enumerate(blk["code"]) if n["out"]]
+        for v, i, ty in items:
+            spend()
+            require(v not in result)
+            result[v] = (b, i, ty)
+    require(len(result) <= 8192)
+    return result
+
+
+def edges(f):
+    pred = {b: set() for b in f["order"]}
+    succ = {b: set() for b in f["order"]}
+    for b in f["order"]:
+        code = f["blocks"][b]["code"]
+        require(code and code[-1]["op"] in TERMS)
+        require(all(n["op"] not in TERMS for n in code[:-1]))
+        for target, args in code[-1]["targets"]:
+            require(target in pred and len(args) == len(f["blocks"][target]["params"]))
+            pred[target].add(b)
+            succ[b].add(target)
+    return pred, succ
+
+
+def validate(f):
+    defs = definitions(f)
+    pred, succ = edges(f)
+    for b in f["order"]:
+        for i, node in enumerate(f["blocks"][b]["code"]):
+            for v in node["uses"]:
+                spend()
+                require(v in defs)
+            for target, args in node["targets"]:
+                for v, pair in zip(args, f["blocks"][target]["params"]):
+                    require(not defs[v][2] or defs[v][2] == pair[1])
+    f.update({"defs": defs, "pred": pred, "succ": succ})
+
+
+def load_module(obj):
+    keys(obj, "sha256 chunks")
+    require(type(obj["sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", obj["sha256"]))
+    result, raws = [], []
+    for chunk in sequence(obj["chunks"], 1, 8192):
+        keys(chunk, "kind raw_b64 graph")
+        require(chunk["kind"] in {"raw", "function"} and type(chunk["raw_b64"]) is str)
+        raw = base64.b64decode(chunk["raw_b64"], validate=True)
+        require(len(raw) <= 8 * 1024 * 1024)
+        f = None
+        if chunk["graph"] is not None:
+            require(chunk["kind"] == "function")
+            f = load_graph(chunk["graph"], raw)
+        result.append({"kind": chunk["kind"], "raw": raw, "graph": f})
+        raws.append(raw)
+    require(hashlib.sha256(b"\n".join(raws)).hexdigest() == obj["sha256"])
+    return result
+
+
+def source_facts(obj):
+    keys(obj, "version path raw_b64 sha256 tokens decls")
+    require(type(obj["version"]) is int and obj["version"] == 1)
+    require(type(obj["path"]) is str and 0 < len(obj["path"]) <= 4096)
+    require(type(obj["raw_b64"]) is str and type(obj["sha256"]) is str)
+    raw = base64.b64decode(obj["raw_b64"], validate=True)
+    require(len(raw) <= 1048576 and hashlib.sha256(raw).hexdigest() == obj["sha256"])
+    require(not any(word in raw for word in (b"export", b"extern", b"@")))
+    result = source_tokens(obj["tokens"], raw)
+    decls = sequence(obj["decls"], 1, 4096)
+    for index, d in enumerate(decls):
+        check_decl(d, index, decls, len(result))
+    source_coverage(result, decls)
+    return result, decls
+
+
+def source_coverage(tokens, decls):
+    covered = {i for d in decls if d["parent"] is None for i in range(d["start"], d["end"])}
+    require(all(i in covered or kind in {"whitespace", "comment"} for i, (t, kind) in enumerate(tokens)))
+
+
+def source_tokens(items, raw):
+    result, at = [], 0
+    kinds = {"whitespace", "comment", "string", "word", "punct"}
+    for item in sequence(items, 1, 65536):
+        require(type(item) is list and len(item) == 3 and item[2] in kinds)
+        start = integer(item[0], at, at)
+        end = integer(item[1], start + 1, len(raw))
+        result.append((raw[start:end], item[2]))
+        at = end
+    require(at == len(raw))
+    return result
+
+
+def check_decl(d, index, decls, count):
+    keys(d, "kind name start body end parent")
+    require(d["kind"] in {"import", "class", "interface", "function", "method"})
+    require(type(d["name"]) is str)
+    start = integer(d["start"], 0, count - 1)
+    end = integer(d["end"], start + 1, count)
+    if d["body"] is not None:
+        integer(d["body"], start, end - 1)
+    if d["parent"] is not None:
+        parent = decls[integer(d["parent"], 0, index - 1)]
+        require(parent["kind"] in {"class", "interface"})
+        require(parent["start"] < start < end <= parent["end"])
+
+
+def decl_tokens(tokens, d, header=False):
+    end = d["body"] + 1 if header else d["end"]
+    return [t for t, kind in tokens[d["start"]:end] if kind not in {"whitespace", "comment"}]
+
+
+def unique_object(pairs):
+    result = dict(pairs)
+    require(len(result) == len(pairs))
+    return result
+DIFFDUMP_OWNED_APPEND_LIBRARY
+  [ "$diffdump_library_rc" -eq 1 ]
 }

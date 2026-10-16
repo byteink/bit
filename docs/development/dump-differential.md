@@ -92,17 +92,54 @@ check a mismatch against
 `explainMismatch`'s declared-signature table (`scripts/selfhost-ir-signatures.sh`,
 used from `run_ir` in `selfhost-diffdump.sh`) first: a divergence that
 matches a registered signature is EXPLAINED immediately, no repin needed.
-This is deliberately NOT the deleted expected-mismatch list reborn -- see
-that function's header for why a signature checked against an identity is a
-different, narrower thing than a file checked against nothing. `types` also
+The shared registry also serves the runtime driver's separate per-file
+walk. A caller never maintains its own copy of a signature. `types` also
 checks the same declared signatures. The 0.42.0 stage0 repin retired its
 previous dump identities (#8163, #8178).
 
+### Why a structural identity, rather than a file exception
+
+A filename exception accepts whatever changes next in an allowed file.
+A declared identity must instead establish the rewrite's structural
+preconditions on each mismatching pair. Operands, literal bytes, types,
+uses and control flow outside that rewrite must still agree. A second,
+unrelated bug in the same function therefore remains a failure. Positive
+controls use the actual branch and published compiler; negative controls
+change unrelated literals, symbols, bounds, uses and control flow.
+
+Building the same tree twice does not supply that independent comparison.
+A build can link the same prebuilt runtime archive into both generations,
+leaving its machine code untested. Even without that shared archive, both
+generations can reproduce the same compiler bug. The unchanged public
+compiler remains the comparison point for a declared transformation.
+
+These identities compare typed SSA text before machine instruction
+selection. They establish the stated text transformation, rather than a
+claim about target instruction counts. Each intentional transformation
+needs its own proof and controls; unexplained differences remain failures.
+
 The 0.43.0 stage0 repin (#8267) retires
 `8259-owned-byte-header-copy`: the published compiler already contains the
-owned byte-header copy elision. No declared dump identity remains. The
+owned byte-header copy elision. The
 former accepted structures and unrelated literal, symbol, bounds, use and
 control-flow differences must all remain unexplained by the selfcheck.
+
+The temporary `6175-owned-append-local` identity covers local and loop-owned
+slice appends, plus a closed private object with one `[]int` field. The
+frontend alone parses typed rows and validates SSA definitions, dominance,
+branch arguments and complete residual graph equality before sending its
+typed facts to the proof utility. Allocation pointer offsets remain literal
+metadata, even when their spelling resembles an SSA value.
+
+The utility derives ownership from allocation roots, aliases, liveness and
+escapes; the frontend supplies no ownership decision. Field receivers also
+require a bounded, lossless snapshot of the ordinary source module and its
+declarations. The selected class has no methods, external visibility or
+alternate entry point; every relevant caller and allocation is covered.
+Unknown source, type, borrowing or control-flow shapes decline the identity.
+Scalar inverse expansion remains restricted to its exact `i64` layout;
+bulk calls preserve their element type and allocation layout. Retire this
+identity after the actual public stage0 repin contains the transformation.
 
 Unknown differences still fail closed. Both plain and JSON documentation
 output must match exactly. The retirement audit and the shared oracle-coverage
