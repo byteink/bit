@@ -16,7 +16,7 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 . "${ROOT}/scripts/diffexit.sh"
 
 # Assert that unknown deltas fail and the registry matches the dispatch.
-# The 0.42.0 repin retired the former identities; #8259 adds one strict identity.
+# The 0.43.0 repin retires the last identity; undeclared differences still fail.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   set -u
   fail=0
@@ -44,12 +44,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   # The former contextual-token identity must now fail like any other delta.
   expect "" "$(explainMismatch 'kw_in 0..2' 'ident 0..2' tokens)" 'retired token identity'
   for kind in ir iropt ast fmt types diags tokens doc; do
-    want=""
-    [ "$kind" = iropt ] && want=8259-owned-byte-header-copy
-    expect "$want" "$(declaredSignatureNames "$kind")" "$kind registry"
+    expect "" "$(declaredSignatureNames "$kind")" "$kind registry"
   done
 
-  # The matcher sees raw IR: quoted IDs and non-UTF-8 bytes stay literal.
+  # Retired structure, quoted bytes and symbol differences must remain unexplained.
   python3 - "$ROOT/scripts/selfhost-ir-signatures.sh" <<'PYTHON'
 import subprocess
 import sys
@@ -88,8 +86,8 @@ def verdict(a, b, kind="iropt"):
     return result.returncode, result.stdout
 
 
-expected = (0, b"8259-owned-byte-header-copy\n")
-assert verdict(old, new) == expected, "actual-shaped single function"
+expected = (1, b"")
+assert verdict(old, new) == expected, "retired single-function identity"
 assert verdict(old + b"\n\n" + old.replace(b"func tail", b"func other"),
                new + b"\n\n" + new.replace(b"func tail", b"func other")) == expected
 negatives = {
@@ -145,7 +143,7 @@ for name, pair in negatives.items():
     assert verdict(*pair) == (1, b""), name
 for kind in ("ir", "types", "ast", "fmt", "diags", "tokens", "doc"):
     assert verdict(old, new, kind) == (1, b""), kind
-print("8259 structural signature: 2 positive, 30 negative, 7 kind controls passed")
+print("retired 8259 signature: 2 former-positive, 30 negative, 7 kind controls rejected")
 PYTHON
   rc=$?
   [ "$rc" -eq 0 ] || fail=1
