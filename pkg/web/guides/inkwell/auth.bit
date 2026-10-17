@@ -23,12 +23,12 @@
 // broken path.
 import { conflict, forbidden, minLen, unauthorized } from "web"
 import {
-  AccessTokens, BearerStrategy, KeySet, TokenOptions, Lookup, LookupResult, OidcOptions, OidcStrategy, Provider, Strategy, beginAuthorization,
+  AccessTokens, BearerStrategy, Identity, KeySet, TokenOptions, Lookup, LookupResult, OidcOptions, OidcStrategy, Provider, Strategy, beginAuthorization,
   InvalidRefreshToken, RefreshRecord, RefreshTokens, currentIdentity, handleCallback, hashPassword,
   PasswordStrategy, requireAuth,
 } from "auth"
 import { UniqueViolation, classify } from "orm"
-import { jsonDecString, jsonGet } from "std/json"
+import { jsonAsBool, jsonAsString, jsonDecString, jsonGet } from "std/json"
 import { isSome, unwrap } from "std/core"
 import { Jwk, SigningKey, VerifyKey } from "std/jwt"
 import { systemRoots } from "std/crypto"
@@ -62,13 +62,7 @@ export @json class RegisterInput {
 }
 
 fn insertUser(db: Db, username: string, email: string, passwordHash: string, role: string): User! {
-  let stamp = now().ns
-  return db.table<User>().insert(
-    User{
-      id = 0, username = username, email = email, passwordHash = passwordHash, role = role,
-      createdAt = stamp, updatedAt = stamp,
-    },
-  ) catch e {
+  return db.table<User>().insert(newUser(username, email, passwordHash, role)) catch e {
     let cause = classify(e, "users")
     let (_, ok) = cause.(UniqueViolation)
     if (ok) {
@@ -313,16 +307,56 @@ fn googleBegin(c: Ctx, cfg: AppConfig): Res! {
   return beginAuthorization(buildGoogleStrategy(cfg)?, c)?
 }
 
-// A Google `sub` this app has never seen signs in under a User row keyed by
-// its verified email — `passwordHash = ""` (never a valid Argon2id PHC
-// string, so `POST /auth/login` can never authenticate this row) marks the
-// account as "created via Google", never a real local password.
-fn findOrCreateGoogleUser(db: Db, email: string): User! {
-  let found = db.table<User>().where("username", email).first()?
-  if (isSome(found)) {
-    return unwrap(found)
+fn verifiedGoogleEmail(identity: Identity): string! {
+  let verified = jsonGet(identity.claims, "email_verified")
+  if (!isSome(verified)) {
+    fail unauthorized("Google email must be verified")
   }
-  return insertUser(db, email, email, "", "author")?
+  let flag = jsonAsBool(unwrap(verified))
+  if (!isSome(flag) || !unwrap(flag)) {
+    fail unauthorized("Google email must be verified")
+  }
+  return googleClaim(identity, "email")?
+}
+
+fn googleClaim(identity: Identity, key: string): string! {
+  let field = jsonGet(identity.claims, key)
+  if (!isSome(field)) {
+    fail unauthorized("Google identity carries no '${key}' claim")
+  }
+  let value = jsonAsString(unwrap(field))
+  if (!isSome(value) || unwrap(value) == "") {
+    fail unauthorized("Google identity carries no '${key}' string")
+  }
+  return unwrap(value)
+}
+
+fn findOrCreateGoogleUser(db: Db, identity: Identity): User! {
+  let email = verifiedGoogleEmail(identity)?
+  let issuer = googleClaim(identity, "iss")?
+  let subject = googleClaim(identity, "sub")?
+  let result = []User{ newUser(email, email, "", "author") }
+  db.tx((tx) => {
+    let found = tx.table<GoogleIdentity>().where("issuer", issuer).where("subject", subject).first()?
+    if (isSome(found)) {
+      result[0] = tx.table<User>().find(unwrap(found).userId)?
+      return
+    }
+    // Unique usernames/emails reject collisions; a matching email never grants ownership.
+    let user = tx.table<User>().insert(result[0])?
+    tx.table<GoogleIdentity>().insert(
+      GoogleIdentity{ issuer = issuer, subject = subject, userId = user.id },
+    )?
+    result[0] = user
+  }) catch e {
+    let cause = classify(e, "users")
+    let (_, duplicate) = cause.(UniqueViolation)
+    if (duplicate) {
+      fail conflict("that username, email or provider identity is already registered")
+    }
+    fail cause
+  }
+  return result[0]
 }
 
 // `handleCallback` (oidc_callback.bit) already verifies the ID token,
@@ -335,13 +369,12 @@ fn googleCallback(c: Ctx, db: Db, cfg: AppConfig): Res! {
   if (!googleConfigured(cfg)) {
     fail notFound()
   }
-  let identity = handleCallback(buildGoogleStrategy(cfg)?, c)?
-  let emailField = jsonGet(identity.claims, "email")
-  if (!isSome(emailField)) {
-    fail unauthorized("Google identity carries no 'email' claim")
-  }
-  let email = jsonDecString(unwrap(emailField), "identity.claims.email")?
-  let u = findOrCreateGoogleUser(db, email)?
+  return googleCallbackWith(c, db, buildGoogleStrategy(cfg)?)?
+}
+
+fn googleCallbackWith(c: Ctx, db: Db, strategy: OidcStrategy): Res! {
+  let identity = handleCallback(strategy, c)?
+  let u = findOrCreateGoogleUser(db, identity)?
   let session = c.session()?
   session.set(sessionUserIdKey, "${u.id}")
   session.set(sessionRoleKey, u.role)
