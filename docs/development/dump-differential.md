@@ -113,6 +113,23 @@ leaving its machine code untested. Even without that shared archive, both
 generations can reproduce the same compiler bug. The unchanged public
 compiler remains the comparison point for a declared transformation.
 
+IR dumps print decoded string bytes without escaping embedded quotes or
+newlines. Text alone therefore cannot distinguish a real instruction from
+an instruction-shaped string payload. Before either canonical comparison or
+an append proof, each side supplies its authentic raw capture and its own
+unoptimized object as an independent literal witness. The object reader
+checks the complete bounded string pool and requires unambiguous framing of
+every dumped literal; missing, incomplete or ambiguous witnesses decline.
+Literal contents remain exact opaque bytes throughout both proof routes.
+
+The parent snapshots both captures and objects as bounded regular files,
+rejecting symlinks, changing files and mismatched capture arguments. A NUL
+cannot disappear through Bash substitution: differing captures containing
+NUL decline, while byte-identical captures match through the driver's raw
+file comparison. The worker independently reconstructs both framed dumps
+from the two witnesses. Its version-two envelope preserves one shared work
+budget; the former witness-free protocol is rejected.
+
 These identities compare typed SSA text before machine instruction
 selection. They establish the stated text transformation, rather than a
 claim about target instruction counts. Each intentional transformation
@@ -138,8 +155,22 @@ declarations. The selected class has no methods, external visibility or
 alternate entry point; every relevant caller and allocation is covered.
 Unknown source, type, borrowing or control-flow shapes decline the identity.
 Scalar inverse expansion remains restricted to its exact `i64` layout;
-bulk calls preserve their element type and allocation layout. Retire this
-identity after the actual public stage0 repin contains the transformation.
+bulk calls preserve their element type and allocation layout.
+
+A separate local-nil bulk proof handles a literal nil receiver followed
+immediately by a contiguous append chain. It permits coherent nonreference
+layouts wider than eight bytes, while preserving the exact element type,
+reference count and stride. Every intermediate header may appear only in
+its definition and as the next receiver. The final header may be used only
+after its definition; self-source, saved headers and earlier escapes decline.
+
+Source and layout definitions must be local or dominate through a certificate
+of at most 256 sole-predecessor steps. This limits that proof, rather than
+rejecting a function merely for having unrelated blocks. Module bytes outside
+the typed bulk callee tokens must agree exactly, including quoted text and
+SSA-looking symbol fragments. The ordinary ownership proof, scalar inverse
+and shared work budgets retain their existing limits. Retire this identity
+after the actual public stage0 repin contains the transformation.
 
 Unknown differences still fail closed. Both plain and JSON documentation
 output must match exactly. The retirement audit and the shared oracle-coverage

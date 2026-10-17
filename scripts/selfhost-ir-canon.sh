@@ -31,7 +31,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "$#" -ne 0 ]; then
     *) exit 1 ;;
   esac
   . "${ROOT}/scripts/selfhost-diffdump-setup.sh" || exit 1
-  diffdump_owned_append_library || exit 1
+  . "${ROOT}/scripts/selfhost-diffiropt.sh" || exit 1
+  diffdump_owned_append_library && diffiropt_literal_library || exit 1
   DIFFDUMP_OWNED_APPEND_ENGINE=
   diffdump_engine_rc=0
   IFS= builtin read -r -d '' DIFFDUMP_OWNED_APPEND_ENGINE <<'DIFFDUMP_OWNED_APPEND_ENGINE' || diffdump_engine_rc=$?
@@ -662,33 +663,69 @@ def companion(owned_sites, cache):
             require(any(n["args"][0] in groups[h] for h in bulk))
 
 
+def framing_bytes(value):
+    return [base64.b64decode(s, validate=True) for s in sequence(value, 2, 2)]
+
+
+def framed_proof(envelope):
+    keys(envelope, "version comparison work_left proof original objects framed_sha256")
+    require(type(envelope["version"]) is int and envelope["version"] == 2)
+    original = framing_bytes(envelope["original"])
+    objects = framing_bytes(envelope["objects"])
+    require(sum(map(len, original + objects)) <= 8 * 1024 * 1024)
+    memo = {}
+    framed = [literal_frames(raw, obj, memo) for raw, obj in zip(original, objects)]
+    require(envelope["framed_sha256"] == [hashlib.sha256(r).hexdigest() for r in framed])
+    proof = envelope["proof"]
+    require(type(proof) is dict and type(proof.get("version")) is int and proof["version"] == 1)
+    require(type(proof["work_left"]) is int and proof["work_left"] == envelope["work_left"])
+    if "raw" in proof:
+        require(framing_bytes(proof["raw"]) == framed)
+    return proof, framed
+
+
 def main():
     global remaining
     data = sys.stdin.buffer.read(8 * 1024 * 1024 + 1)
     require(0 < len(data) <= 8 * 1024 * 1024)
-    obj = json.loads(data, object_pairs_hook=unique_object)
-    keys(obj, "version work_left modules queries source")
-    require(type(obj["version"]) is int and obj["version"] == 1)
-    remaining = integer(obj["work_left"], 1, 1000000)
-    keys(obj["modules"], "oracle candidate")
-    modules = {side: load_module(obj["modules"][side]) for side in ("oracle", "candidate")}
-    facts = None if obj["source"] is None else source_facts(obj["source"])
-    prove_queries(obj["queries"], modules, align_modules(modules), facts)
-    response = json.dumps({"version": 1, "query_ids": [q["id"] for q in obj["queries"]],
+    envelope = json.loads(data, object_pairs_hook=unique_object)
+    require(type(envelope) is dict)
+    remaining = integer(envelope["work_left"], 1, 1000000)
+    require(envelope["comparison"] in {"ir", "iropt"})
+    obj, framed = framed_proof(envelope)
+    if obj.get("kind") == "canonical":
+        keys(obj, "version work_left kind queries")
+        require(obj["queries"] == [])
+        require(literal_canonical(framed[0]) == literal_canonical(framed[1]))
+    else:
+        require(envelope["comparison"] == "iropt")
+        prove_identity(obj)
+    response = json.dumps({"version": 2, "query_ids": [q["id"] for q in obj["queries"]],
                            "work_left": remaining}, separators=(",", ":")).encode("ascii") + b"\n"
     require(len(response) <= 65536)
     sys.stdout.buffer.write(response)
 
 
+def prove_identity(obj):
+    if "raw" in obj:
+        nil_bulk_raw(obj)
+    else:
+        keys(obj, "version work_left modules queries source")
+        keys(obj["modules"], "oracle candidate")
+        modules = {side: load_module(obj["modules"][side]) for side in ("oracle", "candidate")}
+        facts = None if obj["source"] is None else source_facts(obj["source"])
+        prove_queries(obj["queries"], modules, align_modules(modules), facts)
+
+
 try:
     main()
-except (ValueError, TypeError, KeyError, IndexError, OverflowError, RecursionError, binascii.Error):
+except (ValueError, TypeError, KeyError, IndexError, OverflowError, RecursionError, binascii.Error, struct.error):
     sys.exit(1)
 DIFFDUMP_OWNED_APPEND_ENGINE
   [ "$diffdump_engine_rc" -eq 1 ] || exit 1
   LC_ALL=C
   export LC_ALL
-  DIFFDUMP_OWNED_APPEND_CODE="${DIFFDUMP_OWNED_APPEND_PYTHON}"$'\n'"${DIFFDUMP_OWNED_APPEND_ENGINE}"
+  DIFFDUMP_OWNED_APPEND_CODE="${DIFFIROPT_LITERAL_PYTHON}"$'\n'"${DIFFDUMP_OWNED_APPEND_PYTHON}"$'\n'"${DIFFDUMP_OWNED_APPEND_ENGINE}"
   [ "${#DIFFDUMP_OWNED_APPEND_CODE}" -le 65536 ] || exit 1
   exec python3 -I /dev/fd/3 3<<<"${DIFFDUMP_OWNED_APPEND_CODE}"
 fi

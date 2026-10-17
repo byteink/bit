@@ -76,6 +76,28 @@ oracle_ir_coverage() {
   oracle_object_coverage "$source" "$dir"
 }
 
+
+# A candidate object is a framing witness, never a second oracle retry.
+ir_mismatch_signature() {
+  local source=$1 dir=$2 old=$3 new=$4 object cap rc
+  case "$NAME" in ir|iropt) ;; *) return 1 ;; esac
+  object="${dir:?}/bit2-object.o"
+  cap="${dir:?}/bit2-object.cap"
+  [ ! -L "$object" ] && [ ! -L "$cap" ] || return 2
+  rm -f "$object" || return 2
+  alarmrun_cap "$cap" "$BIT2" build "$source" --emit-obj --no-optimize -o "$object"
+  rc=$?
+  [ "$rc" -eq 0 ] && [ -f "$object" ] && [ ! -L "$object" ] && [ -s "$object" ] || {
+    printf 'IR framing object command_rc=%s input=%s\n' "$rc" "$source" >&2
+    return 2
+  }
+  if grep -q '^panic: ' "$cap"; then
+    printf 'IR framing object command_rc=%s panic_output input=%s\n' "$rc" "$source" >&2
+    return 2
+  fi
+  explainMismatch "$old" "$new" "$NAME" "$source" "${dir:?}/oracle-object.o" "$object" "${dir:?}/oracle.cap" "${dir:?}/bit2.cap"
+}
+
 diffdump_setup() {
   local name=$1
   # name    | flag           | verdict label   | skip label        | verb (ir only) | kind  | timeout (env, default)
@@ -410,6 +432,345 @@ def unique_object(pairs):
     result = dict(pairs)
     require(len(result) == len(pairs))
     return result
+
+
+# The residual byte comparison supplies no ownership facts to this route.
+def nil_records(raw):
+    spend(len(raw))
+    pattern = re.compile(rb'"(?:\\.|[^"\\])*"|[^"\n]+|\n|"', re.S)
+    rows, row = [], []
+    for match in pattern.finditer(raw):
+        require(match[0] != b'"')
+        if match[0] == b"\n":
+            rows.append(b"".join(row))
+            row = []
+        else:
+            row.append(match[0])
+    rows.append(b"".join(row))
+    require(len(rows) <= 8192)
+    return rows
+
+
+def nil_groups(ts):
+    result, group = [], []
+    require(not ts or ts[-1] != b",")
+    for t in ts:
+        if t == b",":
+            require(group)
+            result.append(group)
+            group = []
+        else:
+            group.append(t)
+    if group:
+        result.append(group)
+    return result
+
+
+def nil_params(ts):
+    result = []
+    for group in nil_groups(ts):
+        require(len(group) >= 3 and ident(group[0]) and group[1] == b":")
+        require(not any(ident(t) for t in group[2:]))
+        result.append((group[0], tuple(group[2:])))
+    return result
+
+
+def nil_target(ts, at):
+    target = label(ts[at].decode("ascii"))
+    require(ts[at + 1] == b"(")
+    end = ts.index(b")", at + 2)
+    args = nil_groups(ts[at + 2:end])
+    require(all(len(g) == 1 and ident(g[0]) for g in args))
+    return (target, [g[0] for g in args]), end + 1
+
+
+def nil_targets(ts):
+    if ts[0] in {b"ret", b"unreachable"}:
+        require(len(ts) == 1 or (ts[0] == b"ret" and len(ts) == 2 and ident(ts[1])))
+        return []
+    require(ts[0] in {b"br", b"jump"})
+    at, count = (3, 2) if ts[0] == b"br" else (1, 1)
+    if ts[0] == b"br":
+        require(ident(ts[1]) and ts[2] == b",")
+    result = []
+    for i in range(count):
+        target, at = nil_target(ts, at)
+        result.append(target)
+        if i + 1 < count:
+            require(ts[at] == b",")
+            at += 1
+    require(at == len(ts))
+    return result
+
+
+def nil_define(defs, value, row, block, ts, ty=()):
+    require(value not in defs and len(defs) < 8192)
+    defs[value] = (row, block, ts, ty)
+
+
+def nil_block(ts, row, blocks, defs):
+    name = label(ts[0].decode("ascii"))
+    require(name not in blocks and ts[1] == b"(" and ts[-2:] == [b")", b":"])
+    params = nil_params(ts[2:-2])
+    blocks[name] = {"at": row, "params": params, "tail": None, "pred": set()}
+    for v, ty in params:
+        nil_define(defs, v, row, name, [], ty)
+    return name
+
+
+def nil_edges(blocks, defs):
+    for b, block in blocks.items():
+        require(block["tail"] is not None)
+        for target, args in nil_targets(block["tail"]):
+            require(target in blocks and len(args) == len(blocks[target]["params"]))
+            require(all(v in defs for v in args))
+            blocks[target]["pred"].add(b)
+
+
+def nil_node(ts, i, block, state):
+    blocks, defs, uses, nodes = state
+    require(block is not None and blocks[block]["tail"] is None)
+    out = ts[0] if ident(ts[0]) else None
+    if out is not None:
+        require(len(ts) > 2 and ts[1] == b"=")
+        nil_define(defs, out, i, block, ts[2:])
+    op = ts[2] if out is not None else ts[0]
+    if op in TERMS:
+        require(out is None)
+        blocks[block]["tail"] = ts
+    else:
+        require(not any(re.fullmatch(rb"bb[0-9]+", t) for t in ts))
+    nodes[i] = (block, ts)
+    for j, t in enumerate(ts):
+        if ident(t):
+            uses.setdefault(t, []).append((i, j))
+
+
+def nil_uses_defined(defs, uses, nodes):
+    require(set(uses) <= set(defs))
+    for value, sites in uses.items():
+        defined, block, unused, ty = defs[value]
+        for row, position in sites:
+            spend()
+            if nodes[row][0] == block:
+                require(defined < row or (defined == row and position == 0))
+
+
+def nil_inventory(rows):
+    header = compact(rows[0])
+    require(len(header) >= 5 and header[0] == b"func" and header[2] == b"(")
+    close = header.index(b")", 3)
+    require(header[-1] == b"{")
+    formals = nil_params(header[3:close])
+    blocks, defs, uses, nodes, block = {}, {}, {}, {}, None
+    for i, row in enumerate(rows[1:-1], 1):
+        ts = compact(row)
+        require(ts)
+        if re.fullmatch(rb"bb[0-9]+", ts[0]):
+            block = nil_block(ts, i, blocks, defs)
+        else:
+            nil_node(ts, i, block, (blocks, defs, uses, nodes))
+    require(blocks and next(iter(blocks.values()))["params"] == formals)
+    require(len(nodes) <= 4096)
+    nil_edges(blocks, defs)
+    nil_uses_defined(defs, uses, nodes)
+    return blocks, defs, uses, nodes
+
+
+def nil_call(ts, name):
+    require(len(ts) >= 16 and ident(ts[0]) and ts[1:3] == [b"=", b"rt_call"])
+    require(ts[3] == name and ts[4] == b"(" and ts[12] == b")")
+    require(ts[6:12:2] == [b",", b",", b","])
+    require(all(ident(ts[i]) for i in (5, 7, 9, 11)))
+    ty = tuple(ts[13:])
+    require(len(ty) >= 3 and ty[:2] == (b"[", b"]") and not any(ident(t) for t in ty))
+    return ts[0], [ts[i] for i in (5, 7, 9, 11)], ty
+
+
+def nil_dominates(blocks, definition, target):
+    seen = set()
+    for unused in range(256):
+        spend()
+        if target == definition:
+            return
+        require(target != next(iter(blocks)))
+        require(target not in seen and len(blocks[target]["pred"]) == 1)
+        seen.add(target)
+        target = next(iter(blocks[target]["pred"]))
+    raise ValueError("local predecessor certificate bound")
+
+
+def nil_value(defs, blocks, value, at, block):
+    require(value in defs)
+    row, defined, ts, ty = defs[value]
+    require(row < at)
+    nil_dominates(blocks, defined, block)
+    return ts, ty
+
+
+def nil_layout(refs, stride):
+    require(refs[:2] == [b"const_int", b"i64"] and len(refs) == 3)
+    require(stride[:2] == [b"const_int", b"i64"] and len(stride) == 3)
+    require(refs[2] in {b"0", b"1"} and re.fullmatch(rb"[0-9]+", stride[2]))
+    width = int(stride[2])
+    require(0 < width <= 9223372036854775807 and (refs[2] == b"0" or width == 8))
+    return refs[2], width
+
+
+def nil_source_type(ts, source_ty, ty):
+    if ts == [b"const_nil"]:
+        return
+    if ts:
+        require(len(ts) >= 5 and ts[0] in {b"rt_call", b"call"} and ts[2] == b"(")
+        require(re.fullmatch(rb"[A-Za-z_$@][A-Za-z0-9_$@.%]*", ts[1]))
+        end = ts.index(b")", 3)
+        require(all(len(g) == 1 and ident(g[0]) for g in nil_groups(ts[3:end])))
+        source_ty = tuple(ts[end + 1:])
+    require(source_ty == ty)
+
+
+def nil_metadata(defs, blocks, args, at, block, ty):
+    src, refs, stride = [nil_value(defs, blocks, v, at, block) for v in args[1:]]
+    nil_source_type(*src, ty)
+    return nil_layout(refs[0], stride[0])
+
+
+def nil_use_audit(uses, chain, changed):
+    for i, value in enumerate(chain[:-1]):
+        spend(len(uses.get(value, [])))
+        definition = changed[0] - 1 if i == 0 else changed[i - 1]
+        require(uses.get(value) == [(definition, 0), (changed[i], 5)])
+    final, at = chain[-1], changed[-1]
+    spend(len(uses.get(final, [])))
+    require(all(i > at or (i == at and j == 0) for i, j in uses.get(final, [])))
+
+
+def nil_function(rows, changed):
+    require(0 < len(changed) < 256)
+    require(changed == list(range(changed[0], changed[0] + len(changed))))
+    blocks, defs, uses, nodes = nil_inventory(rows)
+    block, seed = nodes[changed[0] - 1]
+    require(len(seed) == 3 and seed[1:] == [b"=", b"const_nil"])
+    chain, layout, ty = [seed[0]], None, None
+    for at in changed:
+        spend()
+        current, ts = nodes[at]
+        out, args, result_ty = nil_call(ts, b"slice_append_slice_fresh")
+        require(current == block and args[0] == chain[-1])
+        require(ty is None or ty == result_ty)
+        ty = result_ty
+        meta = nil_metadata(defs, blocks, args, changed[0] - 1, block, ty)
+        require(layout is None or layout == meta)
+        layout = meta
+        chain.append(out)
+    require(all(not (set(nodes[at][1][i] for i in (7, 9, 11)) & set(chain)) for at in changed))
+    nil_use_audit(uses, chain, changed)
+
+
+def nil_bulk_raw(obj):
+    keys(obj, "version work_left raw queries")
+    require(obj["queries"] == [{"id": "q0"}])
+    raw = [base64.b64decode(s, validate=True) for s in sequence(obj["raw"], 2, 2)]
+    require(sum(map(len, raw)) <= 8 * 1024 * 1024)
+    old, new = [nil_records(r) for r in raw]
+    require(len(old) == len(new))
+    start, changed, count = None, [], 0
+    pattern = re.compile(rb'^([ \t]*%[0-9]+[ \t]*=[ \t]*rt_call[ \t]+)slice_append_slice_fresh(?=\()')
+    for i, (a, b) in enumerate(zip(old, new)):
+        spend()
+        if a.startswith(b"func "):
+            require(start is None)
+            start = i
+        if a != b:
+            require(start is not None)
+            match = pattern.match(a)
+            require(match is not None)
+            renamed = a[:match.end() - len(b"slice_append_slice_fresh")] + b"slice_append_slice" + a[match.end():]
+            require(renamed == b)
+            nil_call(compact(a), b"slice_append_slice_fresh")
+            changed.append(i - start)
+        if a == b"}" and start is not None:
+            if changed:
+                nil_function(old[start:i + 1], changed)
+                count += len(changed)
+            start, changed = None, []
+    require(start is None and count > 0)
+
 DIFFDUMP_OWNED_APPEND_LIBRARY
   [ "$diffdump_library_rc" -eq 1 ]
+}
+
+# Fixed byte-parser utilities shared with the isolated parent process.
+diffdump_parent_library() {
+  DIFFDUMP_PARENT_PYTHON=
+  local diffdump_parent_rc=0
+  IFS= builtin read -r -d '' DIFFDUMP_PARENT_PYTHON <<'DIFFDUMP_PARENT_LIBRARY' || diffdump_parent_rc=$?
+def records(data):
+    result, row = [], []
+    for match in RECORD.finditer(data):
+        token = match[0]
+        require(token != b'"')
+        if token == b"\n":
+            result.append(b"".join(row))
+            row = []
+        else:
+            row.append(token)
+    result.append(b"".join(row))
+    return result
+
+def tokens(row):
+    spend(len(row))
+    result = TOKEN.findall(row)
+    require(b'"' not in result)
+    return result
+
+def encoded(value, depth=0):
+    require(depth <= 16)
+    if isinstance(value, bytes):
+        return value.decode("latin1")
+    if value is None or isinstance(value, (str, int)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [encoded(v, depth + 1) for v in value]
+    require(isinstance(value, dict))
+    return {encoded(k, depth + 1): encoded(v, depth + 1) for k, v in value.items()}
+
+
+def source_snapshot():
+    require(0 < len(sys.argv[2]) <= 4096)
+    path = os.path.abspath(sys.argv[2])
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+        before = os.fstat(stream.fileno())
+        require(stat.S_ISREG(before.st_mode) and before.st_size <= 1048576)
+        raw = stream.read(1048577)
+        after, current = os.fstat(stream.fileno()), os.stat(path, follow_symlinks=False)
+        require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) ==
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns))
+        require((current.st_dev, current.st_ino) == (before.st_dev, before.st_ino))
+        require(len(raw) == before.st_size)
+    return source_inventory(raw, path)
+
+
+def file_snapshot(path):
+    require(0 < len(path) <= 4096)
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+        before = os.fstat(stream.fileno())
+        require(stat.S_ISREG(before.st_mode) and 0 <= before.st_size <= 8 * 1024 * 1024)
+        raw = stream.read(8 * 1024 * 1024 + 1)
+        after, current = os.fstat(stream.fileno()), os.stat(path, follow_symlinks=False)
+        require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) ==
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns))
+        require((current.st_dev, current.st_ino) == (before.st_dev, before.st_ino))
+        require(len(raw) == before.st_size)
+    return raw
+
+
+DIFFDUMP_PARENT_LIBRARY
+  [ "$diffdump_parent_rc" -eq 1 ]
+}
+
+# Only the fixed sibling framing source enters either proof process.
+diffdump_frame_libraries() {
+  . "$1/selfhost-diffiropt.sh" || return 1
+  diffdump_parent_library && diffiropt_literal_library
 }
