@@ -49,7 +49,6 @@ def compact(row):
     require(all(t.startswith(b'"') or b"\r" not in t for t in ts))
     return [t for t in ts if not t.isspace()]
 
-
 def ident(t):
     return re.fullmatch(rb"%[0-9]+", t) is not None
 
@@ -152,8 +151,7 @@ def result_type(ts):
     return tuple(ts[5:])
 
 
-def instruction(row):
-    ts = compact(row)
+def instruction(row, ts):
     require(ts)
     out = None
     if ident(ts[0]):
@@ -190,7 +188,7 @@ def parse(rows):
             order.append(current)
         else:
             require(current is not None)
-            blocks[current]["code"].append(instruction(row))
+            blocks[current]["code"].append(instruction(row, ts))
     require(0 < len(order) <= 256 and blocks[order[0]]["params"] == formals)
     require(sum(len(b["code"]) for b in blocks.values()) <= 4096)
     f = {"header": rows[0], "blocks": blocks, "order": order}
@@ -371,7 +369,7 @@ def collapse(f, b, shape):
     removed = {n["out"] for x, i in allowed for n in [f["blocks"][x]["code"][i]] if n["out"]}
     uses_outside(f, removed, allowed)
     row = b"  " + result + b" = rt_call slice_append(" + b", ".join(call["args"]) + b") []i64"
-    f["blocks"][b]["code"] = head[:-4] + [instruction(row)] + f["blocks"][join]["code"]
+    f["blocks"][b]["code"] = head[:-4] + [instruction(row, compact(row))] + f["blocks"][join]["code"]
     for x in (fast, grow, join):
         require(x != f["order"][0] and x != b)
         del f["blocks"][x]
@@ -597,15 +595,26 @@ def method_body(inside, start, end, texts, depth):
 
 
 def source_methods(decls, parent, sig, texts, pair, depth):
-    spend(len(sig))
     owner = decls[parent]
-    inside = [i for i in sig if owner["body"] < i < owner["end"] - 1]
+    spend(2 * len(sig).bit_length())
+    start = bisect.bisect_right(sig, owner["body"])
+    end = bisect.bisect_left(sig, owner["end"] - 1)
+    spend(end - start)
+    inside = sig[start:end]
     starts = method_starts(inside, texts, depth)
     for at, start in enumerate(starts):
         end = starts[at + 1] if at + 1 < len(starts) else owner["end"] - 1
         body = method_body(inside, start, end, texts, depth)
         decls.append({"kind": "method", "name": texts[start].decode("ascii"), "start": start,
                       "body": body, "end": pair[body] + 1 if body is not None else end, "parent": parent})
+
+
+def source_body(sig, at, texts):
+    for j in range(at + 2, len(sig)):
+        spend()
+        if texts[sig[j]] == b"{":
+            return sig[j]
+    return None
 
 
 def source_inventory(raw, path):
@@ -628,8 +637,7 @@ def source_inventory(raw, path):
         require(word in kinds and at + 2 < len(sig))
         name = texts[sig[at + 1]]
         require(re.fullmatch(rb'[A-Za-z_][A-Za-z_0-9]*', name))
-        spend(len(sig) - at)
-        body = next((sig[j] for j in range(at + 2, len(sig)) if texts[sig[j]] == b"{"), None)
+        body = source_body(sig, at, texts)
         require(body in pair)
         decls.append({"kind": kinds[word], "name": name.decode("ascii"), "start": start,
                       "body": body, "end": pair[body] + 1, "parent": None})
@@ -644,12 +652,13 @@ def source_inventory(raw, path):
 def field_types(record):
     if record["graph"] is None:
         return set()
-    f = parse(records(base64.b64decode(record["raw_b64"])))
+    f = record["graph"]
+    defs = definitions(f)
     selected = set()
     for block in f["blocks"].values():
         for n in block["code"]:
             if n["op"] == b"field_get" and n["ty"] == (b"[", b"]", b"i64"):
-                selected.update(f["defs"][n["ts"][1]][2])
+                selected.update(defs[n["ts"][1]][2])
     return selected
 
 
@@ -670,6 +679,16 @@ def context_indices(facts, selected):
     raise ValueError("caller bound")
 
 
+def bind_context(old_record, new_record, old_rows, new_rows):
+    require((old_record["graph"] is None) == (new_record["graph"] is None))
+    if old_record["graph"] is not None:
+        return
+    require(old_rows == new_rows)
+    f = parse(old_rows)
+    bind_graph(old_record, f)
+    bind_graph(new_record, f)
+
+
 def source_context(modules, old, new):
     selected = set().union(*(field_types(c) for c in modules["oracle"]["chunks"]))
     if not selected:
@@ -678,9 +697,7 @@ def source_context(modules, old, new):
     needed = context_indices(facts, selected)
     for i in needed:
         require(isinstance(old[i], list) and isinstance(new[i], list))
-        for side, chunks_ in (("oracle", old), ("candidate", new)):
-            if modules[side]["chunks"][i]["graph"] is None:
-                bind_graph(modules[side]["chunks"][i], parse(chunks_[i]))
+        bind_context(modules["oracle"]["chunks"][i], modules["candidate"]["chunks"][i], old[i], new[i])
     return source_snapshot()
 
 
