@@ -21,6 +21,111 @@ canon_ir_ids() {
     }
   ' <<<"$1"
 }
+# Pure fixture constructors are separate from the production proof library.
+diffiropt_literal_fixture_library() {
+  DIFFIROPT_LITERAL_FIXTURES=
+  local read_rc=0
+  IFS= builtin read -r -d '' DIFFIROPT_LITERAL_FIXTURES <<'DIFFIROPT_LITERAL_FIXTURES' || read_rc=$?
+def literal_test_macho(values):
+    rodata = b''.join(values)
+    payloads, headers, at = [], [], 0
+    for value in values:
+        payloads.append(at)
+        headers.append(struct.pack('<3Q', 0, len(value), 0))
+        at += len(value)
+    strings, symbols, index = b'\0', [], 0
+    for i in range(len(values)):
+        for suffix, section, offset in ((b'_data', 1, payloads[i]), (b'', 2, i * 24)):
+            name = b'___bitstr_' + str(i).encode() + suffix
+            symbols.append(struct.pack('<IBBHQ', len(strings), 0xe, section, 0, offset))
+            strings += name + b'\0'
+            index += 1
+    segment_size = 72 + 160
+    start = 32 + segment_size + 24
+    dataoff = (start + len(rodata) + 7) // 8 * 8
+    relocoff = dataoff + len(headers) * 24
+    relocs = b''.join(struct.pack('<iI', i * 24, 0xe000000 + 2 * i) for i in range(len(values)))
+    symoff = relocoff + len(relocs)
+    stringoff = symoff + len(symbols) * 16
+    head = struct.pack('<8I', 0xfeedfacf, 0x100000c, 0, 1, 2, segment_size + 24, 0, 0)
+    segment = struct.pack('<II16sQQQQiiII', 0x19, segment_size, b'', 0, 0, 0, 0, 0, 0, 2, 0)
+    sections = struct.pack('<16s16sQQIIIIIIII', b'__const', b'__TEXT', 0, len(rodata), start, 0, 0, 0, 0, 0, 0, 0)
+    sections += struct.pack('<16s16sQQIIIIIIII', b'__data', b'__DATA', 0, len(headers) * 24, dataoff, 3, relocoff, len(values), 0, 0, 0, 0)
+    symtab = struct.pack('<6I', 2, 24, symoff, len(symbols), stringoff, len(strings))
+    padding = bytes(dataoff - start - len(rodata))
+    return head + segment + sections + symtab + rodata + padding + b''.join(headers) + relocs + b''.join(symbols) + strings
+
+def literal_test_elf(values):
+    rodata, strings, symbols, relocs = b'', b'\0', [bytes(24)], []
+    for i, value in enumerate(values):
+        offset = len(rodata)
+        rodata += value
+        rodata += bytes((-len(rodata)) % 8)
+        header = len(rodata)
+        rodata += struct.pack('<3Q', 0, len(value), 0)
+        for suffix, location, size in ((b'_data', offset, len(value)), (b'', header, 24)):
+            name = b'__bitstr_' + str(i).encode() + suffix
+            symbols.append(struct.pack('<IBBHQQ', len(strings), 1, 0, 1, location, size))
+            strings += name + b'\0'
+        relocs.append(struct.pack('<QQq', header, ((1 + i * 2) << 32) | 257, 0))
+    names = b'\0.rodata\0.rela.rodata\0.symtab\0.strtab\0.shstrtab\0'
+    chunks = [rodata, b''.join(relocs), b''.join(symbols), strings, names]
+    offsets, cursor = [], 64
+    for chunk in chunks:
+        offsets.append(cursor)
+        cursor += len(chunk)
+    shdrs = [bytes(64)]
+    rows = [(1, 1, 2, 0, 0, 8, 0), (9, 4, 0, 3, 1, 8, 24),
+            (22, 2, 0, 4, 1, 8, 24), (30, 3, 0, 0, 0, 1, 0),
+            (38, 3, 0, 0, 0, 1, 0)]
+    for i, (name, kind, flags, link, info, align, entry) in enumerate(rows):
+        shdrs.append(struct.pack('<IIQQQQIIQQ', name, kind, flags, 0,
+                                 offsets[i], len(chunks[i]), link, info, align, entry))
+    ident = b'\x7fELF\x02\x01\x01' + bytes(9)
+    head = struct.pack('<16sHHIQQQIHHHHHH', ident, 1, 183, 1, 0, 0,
+                       cursor, 0, 64, 0, 0, 64, 6, 5)
+    return head + b''.join(chunks) + b''.join(shdrs)
+
+def literal_closure_case(code, calls, seed, reverse, expected, rounds):
+    charges = []
+    def spend(n):
+        assert type(n) is int and 0 <= n <= 4096
+        assert len(charges) < 64
+        charges.append(n)
+    namespace = {'spend': spend}
+    exec(code, namespace)
+    assert namespace['call_closure'](calls, set(seed), reverse) == set(expected)
+    assert charges == [len(calls) * len(calls)] * rounds
+    if not calls:
+        assert namespace['node_work'](()) == 0
+        f = {'order': ['b', 'c'], 'blocks': {'b': {'code': [{'uses': [0, 1], 'targets': [0]}]},
+                                          'c': {'code': []}}}
+        assert namespace['node_work']((f,)) == 4
+        assert charges == [0, 1, 4, 1, 0]
+
+def literal_closure_selfcheck():
+    import ast
+    with open(canon, encoding='utf-8') as stream:
+        source = stream.read(65537)
+    assert len(source) <= 65536
+    engine = source.split("<<" + "'DIFFDUMP_OWNED_APPEND_ENGINE'", 1)[1].split('\n', 1)[1]
+    engine = engine.split('\nDIFFDUMP_OWNED_APPEND_ENGINE\n', 1)[0]
+    nodes = [node for node in ast.parse(engine).body
+             if isinstance(node, ast.FunctionDef) and node.name in ('call_closure', 'node_work')]
+    assert len(nodes) == 2
+    code = compile(ast.Module(body=nodes, type_ignores=[]), canon, 'exec')
+    calls = {i: {i + 1} for i in range(16)}
+    for reverse in (False, True):
+        literal_closure_case(code, {0: {1}, 1: {0}, 2: set()}, {0}, reverse, {0, 1}, 2)
+        literal_closure_case(code, calls, {16} if reverse else {0}, reverse, range(17), 16)
+        literal_closure_case(code, {0: {1}, 1: {0}}, {0, 1}, reverse, {0, 1}, 1)
+        literal_closure_case(code, {}, {99}, reverse, {99}, 0)
+    literal_closure_case(code, {0: {99}, 1: set()}, {0}, False, {0, 99}, 2)
+    literal_closure_case(code, {0: {99}, 1: set()}, {99}, True, {0, 99}, 2)
+
+DIFFIROPT_LITERAL_FIXTURES
+  [ "$read_rc" -eq 1 ]
+}
 
 # Proof mode replaces this shell so a bounded caller also owns the Python PID.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "$#" -ne 0 ]; then
@@ -54,18 +159,15 @@ TOKEN = re.compile(rb'"(?:\\.|[^"\\])*"|[A-Za-z_$@][A-Za-z0-9_$@.%]*|(?<![A-Za-z
 SOURCE_CALL = re.compile(rb"\s*\(")
 remaining = 0
 
-
 def require(ok):
     if not ok:
         raise ValueError("unsupported proof")
-
 
 def spend(n=1):
     global remaining
     require(type(n) is int and n >= 0)
     remaining -= n
     require(remaining >= 0)
-
 
 def root(parent, value):
     for unused in range(len(parent)):
@@ -75,11 +177,9 @@ def root(parent, value):
         value = parent[value]
     raise ValueError("union bound")
 
-
 def union(parent, a, b):
     a, b = root(parent, a), root(parent, b)
     parent[max(a, b)] = min(a, b)
-
 
 def classes(f):
     parent = {v: v for v in f["defs"]}
@@ -91,7 +191,6 @@ def classes(f):
         result.setdefault(root(parent, v), set()).add(v)
     return {v: members for members in result.values() for v in members}
 
-
 def link_node(f, parent, node):
     if node["op"] == b"rt_call" and node["name"] in APPENDS:
         require(node["out"] and len(node["args"]) == 4)
@@ -99,7 +198,6 @@ def link_node(f, parent, node):
     for target, args in node["targets"]:
         for v, pair in zip(args, f["blocks"][target]["params"]):
             union(parent, v, pair[0])
-
 
 def fresh_class(f, members):
     for v in members:
@@ -116,7 +214,6 @@ def fresh_class(f, members):
             continue
         return False
     return True
-
 
 def liveness(f):
     live = {b: set() for b in f["order"]}
@@ -136,7 +233,6 @@ def liveness(f):
             return live
     raise ValueError("liveness bound")
 
-
 def live_after(f, live):
     result = {}
     for b in f["order"]:
@@ -148,7 +244,6 @@ def live_after(f, live):
             values.discard(n["out"])
             values.update(n["uses"])
     return result
-
 
 def reachable(f, start):
     reached, work = set(), list(f["succ"][start])
@@ -162,7 +257,6 @@ def reachable(f, start):
         reached.add(b)
         work.extend(s for s in f["succ"][b] if s not in reached and s not in work)
     raise ValueError("reach bound")
-
 
 def read_only(node, members):
     used = set(node["uses"]) & members
@@ -178,7 +272,6 @@ def read_only(node, members):
         return node["args"][0] in members and not (set(node["args"][1:]) & members)
     return False
 
-
 def regenerated_pair(f, b, i, node, members):
     h = node["args"][0]
     if members != {h, node["out"]}:
@@ -189,13 +282,11 @@ def regenerated_pair(f, b, i, node, members):
     seed = f["blocks"][db]["code"][di]
     return seed["op"] == b"rt_call" and seed["name"] == b"slice_new"
 
-
 def prior_escape(b, i, eb, ei, reach, regenerated):
     if eb == b and ei <= i:
         return True
     # Re-entering this block executes the exclusive allocation again.
     return not regenerated and b in reach[eb]
-
 
 def owned(f, b, i, groups, after, reach):
     node = f["blocks"][b]["code"][i]
@@ -214,7 +305,6 @@ def owned(f, b, i, groups, after, reach):
                 return False
     return True
 
-
 def zero_offset(f, members):
     if not fresh_class(f, members):
         return False
@@ -225,13 +315,11 @@ def zero_offset(f, members):
                 return False
     return True
 
-
 def constant(f, v, number):
     if v not in f["defs"]:
         return False
     b, i, unused = f["defs"][v]
     return i >= 0 and f["blocks"][b]["code"][i]["ts"] == [b"const_int", b"i64", str(number).encode()]
-
 
 def supported_call(f, node):
     if node["name"] == b"slice_append_slice_fresh":
@@ -248,12 +336,10 @@ def supported_call(f, node):
     ty = (b"i64",) if node["name"] == b"slice_append_fresh" else node["ty"]
     return f["defs"][value][2] == ty
 
-
 def slice_operand(f, v, ty):
     b, i, actual = f["defs"][v]
     nil = i >= 0 and f["blocks"][b]["code"][i]["op"] == b"const_nil"
     return actual == ty or nil
-
 
 def bulk_call(f, node):
     ty = node["ty"]
@@ -263,7 +349,6 @@ def bulk_call(f, node):
     shape = constant(f, stride, 8) or (constant(f, refs, 0) and constant(f, stride, 1))
     flags = constant(f, refs, 0) or constant(f, refs, 1)
     return shape and flags and slice_operand(f, h, ty) and slice_operand(f, value, ty)
-
 
 def align_modules(modules):
     old, new = modules["oracle"], modules["candidate"]
@@ -280,7 +365,6 @@ def align_modules(modules):
     require(changed)
     return changed
 
-
 def class_shape(facts, cls):
     ts, ds = facts
     chosen = [d for d in ds if d["kind"] == "class" and byte(d["name"]) == cls]
@@ -292,7 +376,6 @@ def class_shape(facts, cls):
                           [b":", b"[", b"]", b"int", b",", b"}"]))
     return chosen[0]
 
-
 def source_class(facts, cls, relevant, parsed):
     ts, ds = facts
     chosen = class_shape(facts, cls)
@@ -302,7 +385,6 @@ def source_class(facts, cls, relevant, parsed):
     private = {byte(d["name"]) for d in ds if d["kind"] == "function" and d["parent"] is None}
     require(relevant <= private)
     source_scopes(facts, cls, relevant, parsed, chosen)
-
 
 def source_scopes(facts, cls, relevant, parsed, chosen):
     ts, ds = facts
@@ -317,12 +399,10 @@ def source_scopes(facts, cls, relevant, parsed, chosen):
             require(d["kind"] == "function" and d["parent"] is None and byte(d["name"]) in parsed)
             require(decl_tokens(ts, d, True)[:3] == [b"fn", byte(d["name"]), b"("])
 
-
 def direct_source_refs(raw, relevant):
     for match in re.finditer(rb"[A-Za-z_][A-Za-z0-9_]*", raw):
         if match[0] in relevant:
             require(SOURCE_CALL.match(raw, match.end()) is not None)
-
 
 def function_inventory(module, cls):
     funcs, words = {}, {}
@@ -336,10 +416,8 @@ def function_inventory(module, cls):
             require(cls not in lexed or chunk["graph"] is not None)
     return funcs, words
 
-
 def direct_calls(ts):
     return {t[1:] for i, t in enumerate(ts) if i and ts[i - 1] == b"call" and t.startswith(b"@")}
-
 
 def field_program(module, facts, cls):
     funcs, words = function_inventory(module, cls)
@@ -353,16 +431,17 @@ def field_program(module, facts, cls):
     source_class(facts, cls, relevant, parsed)
     return {name: f for name, f in funcs.items() if f is not None}
 
-
 def call_closure(calls, reached, reverse):
     for unused in range(len(calls)):
         spend(len(calls) * len(calls))
+        count = len(reached)
         if reverse:
             reached |= {name for name in calls if calls[name] & reached}
         else:
             reached |= set().union(*(calls[n] for n in reached if n in calls))
+        if len(reached) == count:
+            return reached
     return reached
-
 
 def direct_references(funcs, words, relevant):
     for name, ts in words.items():
@@ -370,20 +449,30 @@ def direct_references(funcs, words, relevant):
             if t.startswith(b"@") and t[1:] in relevant:
                 require(i > 0 and ts[i - 1] == b"call" and funcs[name] is not None)
 
-
 def nodes(f):
     return [(b, i, n) for b in f["order"] for i, n in enumerate(f["blocks"][b]["code"])]
 
+def node_work(funcs):
+    spend(len(funcs))
+    total = 0
+    for f in funcs:
+        spend(2 * len(f["order"]))
+        for b in f["order"]:
+            code = f["blocks"][b]["code"]
+            spend(len(code))
+            total += len(code) + sum(len(n["uses"]) + len(n["targets"]) for n in code)
+    return total
 
 def object_inputs(funcs, name, b, v):
     f = funcs[name]
-    spend(len(funcs) * 8192)
+    spend(2 * len(f["blocks"][b]["params"]))
     pos = [p[0] for p in f["blocks"][b]["params"]].index(v)
     if b == f["order"][0]:
+        spend(3 * node_work(funcs.values()))
         return {(caller, n["args"][pos]) for caller, g in funcs.items() for eb, ei, n in nodes(g)
                 if n["op"] == b"call" and n["name"] == b"@" + name}
+    spend(3 * node_work((f,)))
     return {(name, args[pos]) for eb, ei, n in nodes(f) for target, args in n["targets"] if target == b}
-
 
 def object_constraints(funcs, cls):
     deps, seeds = {}, set()
@@ -404,7 +493,6 @@ def object_constraints(funcs, cls):
     require(all(inputs <= deps.keys() for inputs in deps.values()))
     return deps, seeds
 
-
 def object_origins(deps, seeds):
     origins = {v: ({v} if v in seeds else set()) for v in deps}
     for unused in range(len(deps) + 1):
@@ -419,7 +507,6 @@ def object_origins(deps, seeds):
             return
     raise ValueError("object origins bound")
 
-
 def object_use(funcs, f, n, used, cls):
     if n["op"] in {b"field_get", b"field_set"}:
         return used == {n["ts"][1]} and n["ts"][3] == b"0"
@@ -431,14 +518,12 @@ def object_use(funcs, f, n, used, cls):
         return False
     return object_call(funcs, n, used, cls)
 
-
 def object_call(funcs, n, used, cls):
     target = n["name"][1:]
     if target not in funcs:
         return False
     params = funcs[target]["blocks"][funcs[target]["order"][0]]["params"]
     return all(params[i][1] == (cls,) for i, v in enumerate(n["args"]) if v in used)
-
 
 def object_uses(funcs, deps, cls):
     for name, f in funcs.items():
@@ -448,12 +533,11 @@ def object_uses(funcs, deps, cls):
             used = set(n["uses"]) & values
             require(not used or object_use(funcs, f, n, used, cls))
 
-
 def seed_initializers(funcs, seeds):
     stores = set()
     for name, v in seeds:
         f = funcs[name]
-        spend(8192)
+        spend(3 * node_work((f,)))
         b, at, ty = f["defs"][v]
         uses = [(i, n) for i, n in enumerate(f["blocks"][b]["code"]) if v in n["uses"]]
         require(uses and uses[0][0] > at)
@@ -468,7 +552,6 @@ def seed_initializers(funcs, seeds):
         stores.add((id(f), b, i))
     return stores
 
-
 def field_root(f, members):
     roots = []
     for v in members:
@@ -482,11 +565,9 @@ def field_root(f, members):
     require(len(roots) == 1 and len(roots[0][1]) == 1)
     return roots[0][0], roots[0][1][0]
 
-
 def append_call(f, n):
     name = next((old for old, new in APPEND.items() if n["name"] == new), n["name"])
     return n["op"] == b"rt_call" and supported_call(f, dict(n, name=name))
-
 
 def next_effect(f, b, i):
     code = f["blocks"][b]["code"]
@@ -495,7 +576,6 @@ def next_effect(f, b, i):
         if code[at]["op"] not in {b"const_int", b"const_nil", b"const_string"}:
             return at
     raise ValueError("missing writeback")
-
 
 def field_chain(f, members, receiver, after, all_headers):
     stores, appends = set(), set()
@@ -515,7 +595,6 @@ def field_chain(f, members, receiver, after, all_headers):
     require(len(appends) <= 2)
     return stores, appends
 
-
 def data_pointer(f, n):
     if n["op"] != b"field_get" or n["ts"][3] != b"0":
         return
@@ -525,14 +604,12 @@ def data_pointer(f, n):
             require(use["op"] == b"index_get" and use["ts"][1] == n["out"])
             require(use["uses"].count(n["out"]) == 1)
 
-
 def header_barrier(n, location, objects, stores, appends):
     if n["op"] == b"call":
         return True
     if n["op"] == b"rt_call":
         return location not in appends
     return n["op"] == b"field_set" and n["ts"][1] in objects and location not in stores
-
 
 def field_uses(f, members, objects, stores, appends, after):
     for b, i, n in nodes(f):
@@ -546,18 +623,15 @@ def field_uses(f, members, objects, stores, appends, after):
         if after[(b, i)] & members:
             require(not header_barrier(n, location, objects, stores, appends))
 
-
 def field_analysis(f, cache):
     if id(f) not in cache:
         cache[id(f)] = classes(f), live_after(f, liveness(f)), {b: reachable(f, b) for b in f["order"]}
     return cache[id(f)]
 
-
 def field_reads(f, cls):
     objects = {v for v, definition in f["defs"].items() if definition[2] == (cls,)}
     reads = [n["out"] for b, i, n in nodes(f) if n["op"] == b"field_get" and n["ts"][1] in objects]
     return objects, reads
-
 
 def field_function(f, cls, initial, cache):
     objects, reads = field_reads(f, cls)
@@ -581,13 +655,11 @@ def field_function(f, cls, initial, cache):
     field_stores(f, objects, stores)
     return appends, {(id(f), v) for v in seen}
 
-
 def field_stores(f, objects, allowed):
     for b, i, n in nodes(f):
         spend()
         if n["op"] == b"field_set" and n["ts"][1] in objects:
             require((id(f), b, i) in allowed)
-
 
 def prove_field(f, at, node, groups, side, modules, facts, cache):
     v = at if node is None else node["args"][0]
@@ -609,7 +681,6 @@ def prove_field(f, at, node, groups, side, modules, facts, cache):
     appends, zero = cache[key]
     return (id(f), v) in zero if node is None else (id(f), *at) in appends
 
-
 def query(obj, modules):
     keys(obj, "id side fn kind block index value")
     require(type(obj["id"]) is str and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", obj["id"]))
@@ -629,7 +700,6 @@ def query(obj, modules):
     n = f["blocks"][b]["code"][i]
     require(n["op"] == b"rt_call" and supported_call(f, n))
     return f, (b, i), n
-
 
 def prove_queries(queries, modules, changed, facts):
     cache, owned_sites, seen, sites = {}, {}, set(), set()
@@ -652,7 +722,6 @@ def prove_queries(queries, modules, changed, facts):
     require(set(owned_sites) == changed)
     companion(owned_sites, cache)
 
-
 def companion(owned_sites, cache):
     for fn, nodes in owned_sites.items():
         groups = cache[("oracle", fn)][0]
@@ -662,10 +731,8 @@ def companion(owned_sites, cache):
             spend(len(bulk))
             require(any(n["args"][0] in groups[h] for h in bulk))
 
-
 def framing_bytes(value):
     return [base64.b64decode(s, validate=True) for s in sequence(value, 2, 2)]
-
 
 def framed_proof(envelope):
     keys(envelope, "version comparison work_left proof original objects framed_sha256")
@@ -682,7 +749,6 @@ def framed_proof(envelope):
     if "raw" in proof:
         require(framing_bytes(proof["raw"]) == framed)
     return proof, framed
-
 
 def main():
     global remaining
@@ -705,7 +771,6 @@ def main():
     require(len(response) <= 65536)
     sys.stdout.buffer.write(response)
 
-
 def prove_identity(obj):
     if "raw" in obj:
         nil_bulk_raw(obj)
@@ -715,7 +780,6 @@ def prove_identity(obj):
         modules = {side: load_module(obj["modules"][side]) for side in ("oracle", "candidate")}
         facts = None if obj["source"] is None else source_facts(obj["source"])
         prove_queries(obj["queries"], modules, align_modules(modules), facts)
-
 
 try:
     main()
@@ -729,7 +793,6 @@ DIFFDUMP_OWNED_APPEND_ENGINE
   [ "${#DIFFDUMP_OWNED_APPEND_CODE}" -le 65536 ] || exit 1
   exec python3 -I /dev/fd/3 3<<<"${DIFFDUMP_OWNED_APPEND_CODE}"
 fi
-
 # Keep the ordinary selfcheck in its existing test file, without a child PID.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   exec /bin/bash "$(dirname -- "${BASH_SOURCE[0]}")/selfhost-ir-signatures-selfcheck.sh" --canon-only

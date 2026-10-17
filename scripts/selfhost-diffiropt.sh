@@ -100,24 +100,46 @@ def literal_macho_location(data, sections, symbol, size):
     require(0 <= relative <= section[3] and size <= section[3] - relative)
     return section, relative, literal_span(data, section[4] + relative, size)
 
-def literal_macho_pointer(data, section, relative, symbols, wanted):
-    found = 0
+def literal_relocation_add(index, address, width, row, section_size):
+    require(width in (1, 2, 4, 8) and 0 <= address <= section_size - width)
+    spend(3)
+    previous = index.get(address)
+    if previous is not None:
+        width, row = max(width, previous[0]), None
+    index[address] = (width, row)
+
+def literal_relocation_rows(index, relative):
+    spend(32)
+    rows = []
+    for address in range(relative - 7, relative + 24):
+        entry = index.get(address)
+        if entry is not None and relative < address + entry[0]:
+            require(entry[1] is not None)
+            spend(2)
+            rows.append((address, entry[1]))
+    return rows
+
+def literal_macho_relocations(data, section):
+    spend()
+    index = {}
     for i in range(section[7]):
         address, bits = literal_unpack(data, section[6] + i * 8, '<iI')
-        require(address >= 0)
-        width = 1 << ((bits >> 25) & 3)
-        require(address <= section[3] - width)
-        if address < relative + 24 and relative < address + width:
-            require(address == relative and bits >> 24 == 14)
-            index = bits & 0xffffff
-            require(index < len(symbols) and symbols[index][1] == wanted)
-            found += 1
-    require(found == 1)
+        literal_relocation_add(index, address, 1 << ((bits >> 25) & 3), bits, section[3])
+    return index
+
+def literal_macho_pointer(index, relative, symbols, wanted):
+    rows = literal_relocation_rows(index, relative)
+    require(len(rows) == 1)
+    address, bits = rows[0]
+    require(address == relative and bits >> 24 == 14)
+    target = bits & 0xffffff
+    require(target < len(symbols) and symbols[target][1] == wanted)
 
 def literal_macho_pool(data):
     sections, symtab = literal_macho_commands(data)
     symbols, pairs = literal_macho_symbols(data, sections, symtab)
-    values, previous = [], None
+    spend()
+    values, previous, relocations = [], None, {}
     for header, payload in pairs:
         hs, ho, raw = literal_macho_location(data, sections, header, 24)
         pointer, size, base = struct.unpack('<3Q', raw)
@@ -126,7 +148,11 @@ def literal_macho_pool(data):
         require(hs[0].rstrip(b'\0') == b'__data' and ds[0].rstrip(b'\0') == b'__const')
         require(hs[1].rstrip(b'\0') == b'__DATA' and ds[1].rstrip(b'\0') == b'__TEXT')
         require(hs[8] & 255 == ds[8] & 255 == 0)
-        literal_macho_pointer(data, hs, ho, symbols, payload)
+        spend(2)
+        if header[2] not in relocations:
+            spend()
+            relocations[header[2]] = literal_macho_relocations(data, hs)
+        literal_macho_pointer(relocations[header[2]], ho, symbols, payload)
         if previous is not None:
             require(header[2] == previous[0] and ho == previous[1] + 24)
             require(payload[2] == previous[2] and do == previous[3] + previous[4])
@@ -181,32 +207,32 @@ def literal_elf_location(data, sections, symbol, size):
     require(symbol[4] <= section[5] and size <= section[5] - symbol[4])
     return section, literal_span(data, section[4] + symbol[4], size)
 
-def literal_elf_relocation(row, symbols, machine, header, payload, section_size):
-    offset, info, addend = row
-    require(info & 0xffffffff == (1 if machine == 62 else 257) and addend == 0)
-    require(offset <= section_size - 8)
-    if not header[4] - 7 <= offset < header[4] + 24:
-        return 0
-    require(offset == header[4] and addend == 0)
-    target = info >> 32
-    require(target < len(symbols) and symbols[target][1] == payload)
-    return 1
-
-def literal_elf_pointer(data, sections, table, symbols, machine, header, payload):
-    found = 0
+def literal_elf_relocations(data, sections, table, machine, target):
+    spend(len(sections) + 1)
+    index = {}
     for section in sections:
-        if section[1] != 4 or section[7] != header[3]:
+        if section[1] != 4 or section[7] != target:
             continue
         require(section[6] == table and section[9] == 24 and section[5] % 24 == 0)
         for i in range(section[5] // 24):
             row = literal_unpack(data, section[4] + i * 24, '<QQq')
-            found += literal_elf_relocation(row, symbols, machine, header, payload, sections[header[3]][5])
-    require(found == 1)
+            require(row[1] & 0xffffffff == (1 if machine == 62 else 257) and row[2] == 0)
+            literal_relocation_add(index, row[0], 8, row, sections[target][5])
+    return index
+
+def literal_elf_pointer(index, symbols, header, payload):
+    rows = literal_relocation_rows(index, header[4])
+    require(len(rows) == 1)
+    offset, info, addend = rows[0][1]
+    require(offset == header[4] and addend == 0)
+    target = info >> 32
+    require(target < len(symbols) and symbols[target][1] == payload)
 
 def literal_elf_pool(data):
     machine, sections, names = literal_elf_sections(data)
     table, symbols, pairs = literal_elf_symbols(data, sections)
-    values, previous = [], None
+    spend()
+    values, previous, relocations = [], None, {}
     for header, payload in pairs:
         hs, raw = literal_elf_location(data, sections, header, 24)
         pointer, size, base = struct.unpack('<3Q', raw)
@@ -215,7 +241,11 @@ def literal_elf_pool(data):
         require(header[3] == payload[3] and names[header[3]] == b'.rodata')
         require(hs[1] == ds[1] == 1 and hs[2] & 7 == 2)
         require(header[4] == (payload[4] + size + 7) // 8 * 8)
-        literal_elf_pointer(data, sections, table, symbols, machine, header, payload)
+        spend(2)
+        if header[3] not in relocations:
+            spend()
+            relocations[header[3]] = literal_elf_relocations(data, sections, table, machine, header[3])
+        literal_elf_pointer(relocations[header[3]], symbols, header, payload)
         if previous is not None:
             require(payload[3] == previous[0] and payload[4] == previous[1] + 24)
         previous = (header[3], header[4])
@@ -260,6 +290,15 @@ def literal_match(raw, start, trie):
     require(len(matches) == 1)
     return matches[0]
 
+# A nonempty match starts with a captured byte; keep the complete pool in the memo.
+def literal_frame_trie(raw, entry):
+    spend(len(raw) + 258)
+    starts = frozenset(raw)
+    if starts != entry[1]:
+        spend(len(entry[0]) + 6)
+        entry[1:] = starts, literal_trie(value for value in entry[0] if not value or value[0] in starts)
+    return entry[2]
+
 def literal_frames(raw, object_raw, memo=None):
     require(type(raw) is bytes and type(object_raw) is bytes and len(raw) + len(object_raw) <= 8388608)
     if memo is None:
@@ -268,10 +307,9 @@ def literal_frames(raw, object_raw, memo=None):
     require(type(memo) is dict and len(memo) <= 2)
     if object_raw not in memo:
         require(len(memo) < 2)
-        spend()
-        memo[object_raw] = literal_trie(literal_pool(object_raw))
-    pool = memo[object_raw]
-    spend(len(raw))
+        spend(2)
+        memo[object_raw] = [literal_pool(object_raw), None, None]
+    pool = literal_frame_trie(raw, memo[object_raw])
     output, offset = [], 0
     prefix = re.compile(rb'  %[0-9]+ = const_string "')
     for unused in range(len(raw) + 1):
@@ -361,83 +399,13 @@ def capture_main():
         return 1
     return 3 if b'"' in old or b'"' in new else 0
 
-
 sys.exit(capture_main())
 DIFFIROPT_CAPTURE_TEXT
 }
-
-# Pure fixture constructors are separate from the production proof library.
-diffiropt_literal_fixture_library() {
-  DIFFIROPT_LITERAL_FIXTURES=
-  local read_rc=0
-  IFS= builtin read -r -d '' DIFFIROPT_LITERAL_FIXTURES <<'DIFFIROPT_LITERAL_FIXTURES' || read_rc=$?
-def literal_test_macho(values):
-    rodata = b''.join(values)
-    payloads, headers, at = [], [], 0
-    for value in values:
-        payloads.append(at)
-        headers.append(struct.pack('<3Q', 0, len(value), 0))
-        at += len(value)
-    strings, symbols, index = b'\0', [], 0
-    for i in range(len(values)):
-        for suffix, section, offset in ((b'_data', 1, payloads[i]), (b'', 2, i * 24)):
-            name = b'___bitstr_' + str(i).encode() + suffix
-            symbols.append(struct.pack('<IBBHQ', len(strings), 0xe, section, 0, offset))
-            strings += name + b'\0'
-            index += 1
-    segment_size = 72 + 160
-    start = 32 + segment_size + 24
-    dataoff = (start + len(rodata) + 7) // 8 * 8
-    relocoff = dataoff + len(headers) * 24
-    relocs = b''.join(struct.pack('<iI', i * 24, 0xe000000 + 2 * i) for i in range(len(values)))
-    symoff = relocoff + len(relocs)
-    stringoff = symoff + len(symbols) * 16
-    head = struct.pack('<8I', 0xfeedfacf, 0x100000c, 0, 1, 2, segment_size + 24, 0, 0)
-    segment = struct.pack('<II16sQQQQiiII', 0x19, segment_size, b'', 0, 0, 0, 0, 0, 0, 2, 0)
-    sections = struct.pack('<16s16sQQIIIIIIII', b'__const', b'__TEXT', 0, len(rodata), start, 0, 0, 0, 0, 0, 0, 0)
-    sections += struct.pack('<16s16sQQIIIIIIII', b'__data', b'__DATA', 0, len(headers) * 24, dataoff, 3, relocoff, len(values), 0, 0, 0, 0)
-    symtab = struct.pack('<6I', 2, 24, symoff, len(symbols), stringoff, len(strings))
-    padding = bytes(dataoff - start - len(rodata))
-    return head + segment + sections + symtab + rodata + padding + b''.join(headers) + relocs + b''.join(symbols) + strings
-
-def literal_test_elf(values):
-    rodata, strings, symbols, relocs = b'', b'\0', [bytes(24)], []
-    for i, value in enumerate(values):
-        offset = len(rodata)
-        rodata += value
-        rodata += bytes((-len(rodata)) % 8)
-        header = len(rodata)
-        rodata += struct.pack('<3Q', 0, len(value), 0)
-        for suffix, location, size in ((b'_data', offset, len(value)), (b'', header, 24)):
-            name = b'__bitstr_' + str(i).encode() + suffix
-            symbols.append(struct.pack('<IBBHQQ', len(strings), 1, 0, 1, location, size))
-            strings += name + b'\0'
-        relocs.append(struct.pack('<QQq', header, ((1 + i * 2) << 32) | 257, 0))
-    names = b'\0.rodata\0.rela.rodata\0.symtab\0.strtab\0.shstrtab\0'
-    chunks = [rodata, b''.join(relocs), b''.join(symbols), strings, names]
-    offsets, cursor = [], 64
-    for chunk in chunks:
-        offsets.append(cursor)
-        cursor += len(chunk)
-    shdrs = [bytes(64)]
-    rows = [(1, 1, 2, 0, 0, 8, 0), (9, 4, 0, 3, 1, 8, 24),
-            (22, 2, 0, 4, 1, 8, 24), (30, 3, 0, 0, 0, 1, 0),
-            (38, 3, 0, 0, 0, 1, 0)]
-    for i, (name, kind, flags, link, info, align, entry) in enumerate(rows):
-        shdrs.append(struct.pack('<IIQQQQIIQQ', name, kind, flags, 0,
-                                 offsets[i], len(chunks[i]), link, info, align, entry))
-    ident = b'\x7fELF\x02\x01\x01' + bytes(9)
-    head = struct.pack('<16sHHIQQQIHHHHHH', ident, 1, 183, 1, 0, 0,
-                       cursor, 0, 64, 0, 0, 64, 6, 5)
-    return head + b''.join(chunks) + b''.join(shdrs)
-
-DIFFIROPT_LITERAL_FIXTURES
-  [ "$read_rc" -eq 1 ]
-}
-
 # Fixed data-only fixture mode shares the pure constructors with the tests.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "$#" -eq 1 ] && [ "$1" = --fixture-object ]; then
   diffiropt_literal_library || exit 1
+  . "$(dirname -- "${BASH_SOURCE[0]}")/selfhost-ir-canon.sh" || exit 1
   diffiropt_literal_fixture_library || exit 1
   DIFFIROPT_FIXTURE_COMMAND=
   read_rc=0
@@ -476,7 +444,6 @@ def fixture_main():
         return 1
     return 0
 
-
 sys.exit(fixture_main())
 DIFFIROPT_FIXTURE_COMMAND
   [ "$read_rc" -eq 1 ] || exit 1
@@ -486,6 +453,7 @@ fi
 # The exact test mode executes only fixed data and the fixed library above.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "$#" -eq 1 ] && [ "$1" = --literal-selfcheck ]; then
   diffiropt_literal_library || exit 1
+  . "$(dirname -- "${BASH_SOURCE[0]}")/selfhost-ir-canon.sh" || exit 1
   diffiropt_literal_fixture_library || exit 1
   DIFFIROPT_LITERAL_TESTS=
   read_rc=0
@@ -500,8 +468,6 @@ def spend(n=1):
     global remaining
     remaining -= n
     require(remaining >= 0)
-
-
 
 def literal_test_refuses(raw, obj):
     global remaining
@@ -549,6 +515,48 @@ def literal_memo_selfcheck():
     literal_memo_refuses(raw, obj, {b'one': {}, b'two': {}, b'three': {}})
     require(len(memo) == 2)
     require(literal_canonical(b'plain') == b'plain')
+    values = [b'normal', b'other', b'\0table', b'']
+    obj, memo = literal_test_macho(values), {}
+    for value in values:
+        raw = b'  %1 = const_string "' + value + b'"\n'
+        quoted = json.dumps(value.decode('latin1')).encode()
+        require(literal_frames(raw, obj, memo) == b'  %1 = const_string ' + quoted + b'\n')
+    require(len(memo) == 1 and memo[obj][0] == values)
+    previous = memo[obj][2]
+    require(literal_frames(raw + b'\n', obj, memo) == raw + b'\n' and memo[obj][2] is previous)
+
+def literal_index_refuses(address, width, duplicate=False):
+    spend()
+    index = {}
+    try:
+        literal_relocation_add(index, address, width, 0x0e000000, 64)
+        if duplicate:
+            literal_relocation_add(index, address, width, 0x0e000000, 64)
+        literal_macho_pointer(index, 8, [(b'', ())], ())
+    except ValueError:
+        return
+    raise AssertionError('literal relocation corruption accepted')
+
+def literal_index_selfcheck():
+    global remaining
+    remaining = 1000000
+    spend()
+    index = {}
+    for i in range(344):
+        literal_relocation_add(index, i * 24, 8, i, 344 * 24)
+    for i in range(302):
+        require(literal_relocation_rows(index, i * 24) == [(i * 24, i)])
+    require(1000000 - remaining == 1 + 344 * 3 + 302 * 34)
+    for address, width in ((-1, 8), (57, 8), (8, 16), (1, 8), (9, 1), (31, 1)):
+        literal_index_refuses(address, width)
+    literal_index_refuses(8, 8, True)
+    literal_relocation_add(index, 23, 1, 999, 344 * 24)
+    literal_relocation_add(index, 23, 1, 999, 344 * 24)
+    require(literal_relocation_rows(index, 24) == [(24, 1)])
+    values = [b'scale-' + str(i).encode() for i in range(512)]
+    raw = b''.join(b'  %1 = const_string "' + value + b'"\n' for value in values)
+    for builder in (literal_test_macho, literal_test_elf):
+        require(literal_frames(raw, builder(values)) == raw)
 
 def literal_selfcheck():
     global remaining
@@ -593,8 +601,6 @@ def literal_selfcheck():
     require(literal_canonical(b'%1 = new $t19\n') == literal_canonical(b'%1 = new $t2\n'))
     require(literal_canonical(b'  %1 = const_string "$t19"\n') != literal_canonical(b'  %1 = const_string "$t2"\n'))
     print('literal framing selfcheck OK')
-
-
 
 import base64
 import copy
@@ -680,14 +686,12 @@ def protocol_literal(packet, token, expected):
     answer = protocol(wire(envelope))
     assert answer.returncode == expected and answer.stderr == b'' and bool(answer.stdout) == (expected == 0)
 
-
 def protocol_positive(packet):
     answer = protocol(wire(packet))
     assert answer.returncode == 0 and answer.stderr == b'', (answer.returncode, answer.stderr)
     reply = json.loads(answer.stdout)
     assert set(reply) == {'version', 'query_ids', 'work_left'} and reply['version'] == 2
     assert reply['query_ids'] == ['q0'] and type(reply['work_left']) is int and 0 <= reply['work_left'] < 1000000
-
 
 def protocol_bad_packets(packet, query):
     bad_packets = []
@@ -716,7 +720,6 @@ def protocol_bad_packets(packet, query):
     bad = copy.deepcopy(packet); bad['original'][0] = base64.b64encode(b'func unrelated() void {\nbb0():\n  ret\n}').decode(); bad_packets.append(bad)
     return bad_packets
 
-
 def protocol_dispatch(packet):
     for args in [('--unknown-proof-mode',), ('--prove-owned-appends', 'extra')]:
         protocol_refuses(wire(packet), args)
@@ -724,7 +727,6 @@ def protocol_dispatch(packet):
     assert answer.returncode == 0 and answer.stderr == b'' and answer.stdout == b'selfhost-ir-canon.sh: self-check passed\n'
     for token, expected in [('"line\nbreak"', 0), ('"line"\nbreak', 1)]:
         protocol_literal(packet, token, expected)
-
 
 def protocol_canonical():
     proof = dict(version=1, work_left=1000000, kind='canonical', queries=[])
@@ -737,14 +739,12 @@ def protocol_canonical():
     packet = protocol_envelope(proof, [old, old.replace(b'$t19', b'$t2')], [[b'$t19'], [b'$t2']])
     protocol_refuses(wire(packet))
 
-
 def capture_status(wrapper, old, new):
     script = '. "$1"; diffiropt_capture_text "$2" "$3"'
     result = subprocess.run(['/bin/bash', '-c', script, 'literal-capture-test', wrapper, old, new],
                             capture_output=True, timeout=10)
     assert result.stdout == result.stderr == b''
     return result.returncode
-
 
 def capture_selfcheck():
     import tempfile
@@ -768,7 +768,6 @@ def capture_selfcheck():
         assert capture_status(wrapper, old, new) == 2
     print('literal captures: text/quotes/NUL/bounds/nofollow controls passed')
 
-
 def protocol_selfcheck():
     query = dict(id='q0', side='oracle', fn=0, kind='owned', block='bb0', index=3, value=None)
     proof = dict(version=1, work_left=1000000, source=None, queries=[query],
@@ -784,7 +783,8 @@ def protocol_selfcheck():
     protocol_canonical()
     print('6175 proof protocol: strict v2 schema, query IDs, budget, dispatch and framing controls passed')
 
-
+literal_closure_selfcheck()
+literal_index_selfcheck()
 literal_selfcheck()
 literal_memo_selfcheck()
 protocol_selfcheck()
