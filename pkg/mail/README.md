@@ -67,6 +67,7 @@ production. The rest, in the order a program meets them:
   [Sending for real](docs/open.md), and one chapter per provider
   ([Resend](docs/resend.md), [Postmark](docs/postmark.md),
   [SendGrid](docs/sendgrid.md), [Mailgun](docs/mailgun.md)).
+- For SMTP access tokens: [Send with OAuth](docs/oauth.md).
 - Going live: [Signing your mail](docs/dkim.md),
   [Checking the setup at boot](docs/verify.md),
   [Staging mail](docs/redirect.md), [Reusing connections](docs/pool.md).
