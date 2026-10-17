@@ -23,6 +23,27 @@ not already required.
 `bit-out/` keeps its name: it is hardcoded in dozens of harnesses, scripts and
 `.gitignore`, and renaming it is a mechanical change with no behavioural payoff.
 
+### Keep the machine available during checks
+
+Set an interactive budget for one command:
+
+```sh
+BIT_MAKE_CPU_BUDGET=2 ./make test-prepush
+```
+
+The budget caps concurrent suite gates and runs each nested compile pool with
+one job. Differential constituents retain their simultaneous oracle/current
+pair, so their width is at most half the budget, with a minimum of one pair.
+Budget 1 therefore permits two simultaneous differential compilers. Runtime
+worker contracts, including package tests at four workers, remain unchanged:
+this is a compile-job budget, not a hard CPU or thread limit.
+
+Unset the variable for the existing release widths. Values must be integers
+from 1 through 2147483647; invalid values fail before any artifact step runs.
+The budget also applies to an explicit `test-differentials` step. It preserves
+all gates, suite-before-differentials order, held-gate isolation, timeouts and
+retries. A lower budget can take longer; no speedup is implied.
+
 ## Bootstrap
 
 Building `bit` requires a `bit`. The chain terminates at a published binary, not

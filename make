@@ -35,7 +35,7 @@ mkdir -p "${CACHE}"
 # that actually matters (the libbitrt fingerprint) is #1869's problem, not this
 # file's.
 #
-# THREE inputs, not two (#2077, #3538). `tools/build/` is the source, the
+# The driver and its shared tools/joblimit module are both source inputs.
 # PINNED STAGE0 compiles it and supplies the `libbitrt.a` it links, and
 # `stdlib/` is what `tools/build/*.bit` itself imports (std/fs, std/os,
 # std/strings, std/time, and — until #3538 — std/crypto). Missing the first
@@ -54,7 +54,7 @@ if [ ! -x "${DRIVER}" ]; then
   needs_build=1
 elif [ -n "$(find "${ROOT}/dist/stage0/SHA256SUMS" -newer "${DRIVER}" -print -quit 2>/dev/null)" ]; then
   needs_build=1
-elif [ -n "$(find "${SRC}" -name '*.bit' -newer "${DRIVER}" -print -quit 2>/dev/null)" ]; then
+elif [ -n "$(find "${SRC}" "${ROOT}/tools/joblimit" -name '*.bit' -newer "${DRIVER}" -print -quit 2>/dev/null)" ]; then
   needs_build=1
 elif [ -n "$(find "${ROOT}/stdlib" -name '*.bit' -newer "${DRIVER}" -print -quit 2>/dev/null)" ]; then
   needs_build=1
