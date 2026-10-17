@@ -109,7 +109,6 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   expect "" "$(explainMismatch 'kw_in 0..2' 'ident 0..2' tokens)" 'retired token identity'
   for kind in ir iropt ast fmt types diags tokens doc; do
     want_registry=""
-    [ "$kind" = iropt ] && want_registry=6175-owned-append-local
     expect "$want_registry" "$(declaredSignatureNames "$kind")" "$kind registry"
   done
 
@@ -258,7 +257,6 @@ for name, pair in negatives.items():
 for kind in ("ir", "types", "ast", "fmt", "diags", "tokens", "doc"):
     assert verdict(old, new, kind) == (1, b""), kind
 print("retired 8259 signature: 2 former-positive, 30 negative, 7 kind controls rejected")
-signature = b"6175-owned-append-local\n"
 local = br'''func owned(%0: []i64) []i64 {
 bb0(%0: []i64):
   %1 = const_int i64 0
@@ -404,8 +402,8 @@ local_fixed = local.replace(b"slice_append_slice_fresh", b"slice_append_slice")
 loop_fixed = loop.replace(b"slice_append_slice_fresh", b"slice_append_slice")
 snapshot_bad = snapshot.replace(b"slice_append_slice_fresh", b"slice_append_slice")
 field_bad = field.replace(b"slice_append_slice_fresh", b"slice_append_slice")
-def expect_case(label, a, b, accepted=False, kind="iropt"):
-    expected = (0, signature) if accepted else (1, b"")
+def expect_case(label, a, b, kind="iropt"):
+    expected = (1, b"")  # Former accepted shapes are retirement controls.
     assert verdict(a, b, kind) == expected, label
 def change_both(a, b, before, after):
     assert before in a and before in b
@@ -413,7 +411,7 @@ def change_both(a, b, before, after):
 for label, a, b in [("retained local", local, local_fixed),
                     ("retained recursive loop", loop, loop_fixed),
                     ("retained mixed scalar island", mixed, mixed_fixed)]:
-    expect_case(label, a, b, True)
+    expect_case(label, a, b)
 bulk = br'''func bulk() []TYPE {
 bb0():
   %0 = const_int i64 0
@@ -430,14 +428,14 @@ for typ, refs, stride in [(b"i64", b"0", b"8"), (b"string", b"1", b"8"), (b"u8",
                           (b"Pair", b"1", b"8"), (b"map<string, i64>", b"1", b"8")]:
     a = bulk.replace(b"TYPE", typ).replace(b"REFS", refs).replace(b"STRIDE", stride)
     b = a.replace(b"slice_append_slice_fresh", b"slice_append_slice")
-    expect_case("coherent bulk " + typ.decode(), a, b, True)
+    expect_case("coherent bulk " + typ.decode(), a, b)
     expect_case("bulk argument swap", a, b.replace(b"(%4, %5, %2, %3)", b"(%4, %5, %3, %2)"))
     other = b"u8" if typ != b"u8" else b"i64"
     expect_case("bulk result type mismatch", a, b.replace(b") []" + typ + b"\n  ret", b") []" + other + b"\n  ret"))
 nil_base = bulk.replace(b"TYPE", b"i64").replace(b"REFS", b"0").replace(b"STRIDE", b"8")
 for value in (b"%4", b"%5"):
     a = nil_base.replace(value + b" = rt_call slice_new(%0, %1, %2, %3) []i64", value + b" = const_nil")
-    expect_case("known nil " + value.decode(), a, a.replace(b"slice_append_slice_fresh", b"slice_append_slice"), True)
+    expect_case("known nil " + value.decode(), a, a.replace(b"slice_append_slice_fresh", b"slice_append_slice"))
 fresh_row = b"  %4 = rt_call slice_new(%0, %1, %2, %3) []i64\n"
 renew_entry = b"  %90 = const_int i64 0\n  jump bb1(%90)\nbb1(%7: i64):\n"
 renew_tail = (b"  %8 = call @observe(%6) void\n  %9 = const_int i64 1\n"
@@ -446,7 +444,7 @@ renew_tail = (b"  %8 = call @observe(%6) void\n  %9 = const_int i64 1\n"
 renew = nil_base.replace(b"func bulk() []i64", b"func renewed() void").replace(fresh_row, renew_entry + fresh_row)
 renew = renew.replace(b"  ret %6\n", renew_tail)
 renew_fixed = renew.replace(b"slice_append_slice_fresh", b"slice_append_slice")
-expect_case("iteration fresh receiver then escape", renew, renew_fixed, True)
+expect_case("iteration fresh receiver then escape", renew, renew_fixed)
 hoisted = renew.replace(fresh_row, b"").replace(renew_entry, fresh_row + renew_entry)
 expect_case("hoisted shared receiver", hoisted, hoisted.replace(b"slice_append_slice_fresh", b"slice_append_slice"))
 expect_case("same iteration prior escape", *change_both(renew, renew_fixed,
@@ -461,12 +459,12 @@ u8 += b"bb5(%25: []u8):\n  %26 = rt_call slice_append_slice_fresh(%25, %9, %2, %
 expect_case("mutated u8 receiver stays declined", u8, u8.replace(b"slice_append_slice_fresh", b"slice_append_slice"))
 u8 = u8.replace(b"  %26 = ", b"  %54 = rt_call slice_new(%2, %10, %2, %11) []u8\n  %26 = ").replace(b"(%25, %9,", b"(%54, %25,")
 u8_fixed = u8.replace(b"slice_append_slice_fresh", b"slice_append_slice")
-expect_case("unchanged u8 capacity island", u8, u8_fixed, True)
+expect_case("unchanged u8 capacity island", u8, u8_fixed)
 expect_case("changed u8 fast store", u8, u8_fixed.replace(b"index_set %18[%14] = %53", b"index_set %18[%14] = %13"))
 renamed = re.sub(rb"%([0-9]+)", lambda m: b"%" + str(int(m[1]) + 100).encode(), local_fixed)
-expect_case("bijective SSA rename", local, renamed, True)
+expect_case("bijective SSA rename", local, renamed)
 loop_renamed = re.sub(rb"bb([0-9]+)", lambda m: b"bb" + str(int(m[1]) + 30).encode(), loop_fixed)
-expect_case("bijective block rename", loop, loop_renamed, True)
+expect_case("bijective block rename", loop, loop_renamed)
 def nil_wide(src, typ=b"decimal", stride=b"16"):
     return src.replace(b"rt_call slice_new(%1, %2, %1, %2) []i64", b"const_nil").replace(
         b"[]i64", b"[]" + typ).replace(b"const_int i64 8", b"const_int i64 " + stride)
@@ -475,7 +473,7 @@ nil_chain = nil_wide(ancestor.replace(b"(%4, %3,", b"(%4, %0,"))
 nil_chain = nil_chain.replace(b"  %3 = const_nil", bridge + b"  %3 = const_nil")
 nil_fixed = nil_chain.replace(b"slice_append_slice_fresh", b"slice_append_slice")
 literal = b'  %90 = const_string "literal %80 bb360\n  %901 = rt_call slice_append_slice_fresh(%3, %0, %1, %2) []decimal"\n'
-expect_case("nil quoted rows unchanged", nil_chain.replace(b"  %3 =", literal + b"  %3 ="), nil_fixed.replace(b"  %3 =", literal + b"  %3 ="), True)
+expect_case("nil quoted rows unchanged", nil_chain.replace(b"  %3 =", literal + b"  %3 ="), nil_fixed.replace(b"  %3 =", literal + b"  %3 ="))
 expect_case("nil quoted callee mutation", nil_chain.replace(b"  %3 =", literal + b"  %3 ="), nil_fixed.replace(b"  %3 =", literal.replace(b"_fresh", b"") + b"  %3 ="))
 # Decoded quotes can imitate a complete valid chain inside one actual string.
 embedded = (b'"\n  %900 = const_int i64 0\n  %901 = const_int i64 16\n'
@@ -493,11 +491,11 @@ assert verdict(local, local_fixed, caps=(local + b"changed", local_fixed)) == (1
 literal_old = nil_chain.replace(b"  %3 =", literal + b"  %3 =")
 literal_new = nil_fixed.replace(b"  %3 =", literal + b"  %3 =")
 assert verdict(literal_old, literal_new, pools=((), fixture_pool(literal_new))) == (1, b"")
-assert verdict(local, local_fixed, pools=((b"unused witness value",), ())) == (0, signature)
+assert verdict(local, local_fixed, pools=((b"unused witness value",), ())) == (1, b"")
 nul_dump = string_dump + b'a\0b"\n  ret\n}\n'
 assert verdict(local + nul_dump.replace(b"\0", b""), local_fixed + nul_dump.replace(b"\0", b""),
                pools=((b"a\0b",), (b"a\0b",)), caps=(local + nul_dump, local_fixed + nul_dump)) == (1, b"")
-assert verdict(local, local_fixed, caps=(local + b"\n\n", local_fixed + b"\n\n")) == (0, signature)
+assert verdict(local, local_fixed, caps=(local + b"\n\n", local_fixed + b"\n\n")) == (1, b"")
 assert verdict(local, local_fixed, files=(os.path.join(store.name, "capture-0"),
                os.path.join(store.name, "absent"))) == (1, b"")
 with open(os.path.join(os.path.dirname(helper), "selfhost-diffdump.sh"), encoding="utf8") as source:
@@ -513,7 +511,7 @@ oracle_ir_coverage() { echo ok; }
 ir_mismatch_signature() { printf '%s\n' "$MOCK_SIG"; return "$MOCK_RC"; }
 declaredSignatureNames() { :; }
 '''
-for code, token in [(1, "canonical-ir-match"), (1, "6175-owned-append-local"),
+for code, token in [(1, "canonical-ir-match"), (1, "6175-owned-append-local"), (0, "6175-owned-append-local"),
                      (0, "unknown-success-token"), (2, "canonical-ir-match")]:
     result = subprocess.run(["/bin/bash", "-s", "--", str(code), token],
                             input=mocks + driver.encode() + b"\nrun_ir\n", capture_output=True, timeout=10, env=clean_env)
@@ -521,10 +519,10 @@ for code, token in [(1, "canonical-ir-match"), (1, "6175-owned-append-local"),
     assert b"INVALID: compared 0 files" in result.stderr
 for typ, stride in [(b"decimal", b"16"), (b"Wide", b"24")]:
     a = nil_chain.replace(b"[]decimal", b"[]" + typ).replace(b"const_int i64 16", b"const_int i64 " + stride)
-    expect_case("nil chain width " + stride.decode(), a, a.replace(b"slice_append_slice_fresh", b"slice_append_slice"), True)
+    expect_case("nil chain width " + stride.decode(), a, a.replace(b"slice_append_slice_fresh", b"slice_append_slice"))
 unrelated = b"".join(b"bb" + str(i).encode() + b"():\n  unreachable\n" for i in range(1000, 1427))
 expect_case("nil chain in 431-block function", nil_chain[:-2] + unrelated + b"}\n",
-            nil_fixed[:-2] + unrelated + b"}\n", True)
+            nil_fixed[:-2] + unrelated + b"}\n")
 bypass = nil_chain.replace(b"  %2 = const_int i64 16\n", b"").replace(b"bb362():", b"bb362():\n  %2 = const_int i64 16")
 bypass = bypass.replace(b"  jump bb360()", b"  %90 = icmp_eq bool %1, %1\n  br %90, bb360(), bb364()")
 entry_bypass = b"func entryBackedge() i64 {\nbb0():\n  jump bb364()\nbb360():\n"
@@ -601,7 +599,7 @@ for label, pair in negative.items():
     if pair[0].startswith(b"func owned("):
         expect_case("wide nil " + label, nil_wide(pair[0]), nil_wide(pair[1]))
 opaque = b'\nfunc helper%80() void {\nbb0():\n  %0 = const_string "literal %80 $t59 \\\" \xc0"\n  ret\n}\n'
-expect_case("unchanged opaque literal", local + opaque, local_fixed + opaque, True)
+expect_case("unchanged opaque literal", local + opaque, local_fixed + opaque)
 for label, before, after in [("literal SSA", b"literal %80", b"literal %81"),
                              ("literal type", b"$t59", b"$t60"),
                              ("literal nonutf8", b"\xc0", b"\xc1"),
@@ -611,7 +609,7 @@ for label, before, after in [("literal SSA", b"literal %80", b"literal %81"),
 numbers = b"  %5 = const_int i64 -12345\n  %6 = const_int i64 987654\n"
 numbers += b"  %7 = field_get %3[16] i64\n  %8 = field_get %3[24] i64\n"
 numeric_old, numeric_new = change_both(local, local_fixed, b"  %4 = rt_call", numbers + b"  %4 = rt_call")
-expect_case("signed and multi-digit constants and offsets", numeric_old, numeric_new, True)
+expect_case("signed and multi-digit constants and offsets", numeric_old, numeric_new)
 for label, before, after in [("changed negative literal", b"-12345", b"-12346"),
                              ("changed multi-digit literal", b"987654", b"987655"),
                              ("changed offset literal", b"%3[16]", b"%3[24]")]:
@@ -639,7 +637,7 @@ expect_case("combined byte bound", local + b" " * (half - len(local)),
             local_fixed + b" " * (half - len(local_fixed) + 1))
 for kind in ("ir", "types", "ast", "fmt", "diags", "tokens", "doc"):
     expect_case(kind, local, local_fixed, kind=kind)
-print("6175 local ownership: retained local/loop/mixed controls and strict negatives passed")
+print("retired 6175 identity: local/loop/mixed cases and strict refusals passed")
 field_main = local.replace(b"func owned(%0: []i64) []i64", b"func main() void")
 field_main = field_main.replace(b"bb0(%0: []i64):", b"bb0():\n  %0 = gc_alloc size=8 ptrs=[%0] Bulk")
 field_main = field_main.replace(b"  %4 = rt_call slice_append_slice_fresh(%3, %0, %1, %2) []i64\n",
@@ -659,16 +657,16 @@ fn main() {
   assert(len(h.items) == 2)
 }
 '''
-def field_check(src, body=field, main=field_main, accepted=False):
+def field_check(src, body=field, main=field_main):
     old = body + b"\n" + main
     new = old.replace(b"slice_append_slice_fresh", b"slice_append_slice").replace(b"slice_append_fresh", b"slice_append")
     with tempfile.TemporaryDirectory(prefix="t6175-field-") as folder:
         path = os.path.join(folder, "private.bit")
         with open(path, "wb") as target:
             assert target.write(src) == len(src)
-        assert verdict(old, new, path=path) == ((0, signature) if accepted else (1, b""))
-field_check(field_source, accepted=True)
-field_check(b'import { now } from "std/time"\n' + field_source, accepted=True)
+        assert verdict(old, new, path=path) == (1, b"")
+field_check(field_source)
+field_check(b'import { now } from "std/time"\n' + field_source)
 for before, after in [(b"class Bulk", b"pub class Bulk"), (b"fn put(", b"pub fn put("),
                       (b"class Bulk { items: []int }", b"class Bulk { items: []int\nfn hidden() {} }"),
                       (b"put(h, src, depth - 1)", b"let callback = put\n  callback(h, src, depth - 1)")]:
@@ -689,11 +687,11 @@ for main in [field_main.replace(seed, b""),
 saved = field_main.replace(b"  %7 = call", b"  %8 = field_get %0[0] []i64\n  %7 = call")
 field_check(field_source, main=saved.replace(b"  ret\n", b"  %9 = slice_len %8\n  ret\n"))
 renamed = field_main.replace(b"  %0 = gc_alloc", b"  %50 = gc_alloc").replace(b"field_set %0[", b"field_set %50[").replace(b"@put(%0,", b"@put(%50,")
-field_check(field_source, main=renamed, accepted=True)
+field_check(field_source, main=renamed)
 scalar = b"  %9 = const_int i64 1\n  %10 = rt_call slice_append_fresh(%7, %9, %3, %6) []i64\n  field_set %0[0] = %10\n"
 mixed_field = field.replace(b"  %8 = rt_call", scalar + b"  %8 = rt_call").replace(b"slice_append_slice_fresh(%7,", b"slice_append_slice_fresh(%10,")
-field_check(field_source.replace(b"    h.items =", b"    h.items = append(h.items, 1)\n    h.items ="), body=mixed_field, accepted=True)
-print("6175 field ownership: private grounded recursion, scalar/bulk and strict refusals passed")
+field_check(field_source.replace(b"    h.items =", b"    h.items = append(h.items, 1)\n    h.items ="), body=mixed_field)
+print("retired 6175 identity: field/scalar/bulk cases and strict refusals passed")
 PYTHON
   rc=$?
   [ "$rc" -eq 0 ] || fail=1
