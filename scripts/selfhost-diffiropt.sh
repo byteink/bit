@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sourceable, fixed framing code for the two-sided ownership proof (#8271).
+# Sourceable, fixed framing code for two-sided canonical proofs (#8271).
 diffiropt_literal_library() {
   DIFFIROPT_LITERAL_PYTHON=
   local read_rc=0
@@ -665,69 +665,30 @@ def protocol_refuses(payload, args=("--prove-owned-appends",)):
     answer = protocol(payload, args)
     assert (answer.returncode, answer.stdout, answer.stderr) == (1, b'', b''), payload[:100]
 
-def protocol_literal(packet, token, expected):
-    proof = copy.deepcopy(packet['proof'])
-    proof['queries'][0]['index'] = 4
-    raw_inputs = []
-    escaped = json.dumps('line\nbreak') if expected == 0 else token
-    for module in proof['modules'].values():
-        chunk = module['chunks'][0]
-        graph = chunk['graph']; code = graph['blocks']['bb0']['code']
-        code.insert(3, dict(row='  %5 = const_string ' + escaped,
-                           ts=['const_string', escaped], out='%5', op='const_string',
-                           ty=['string'], name=None, args=[], targets=[]))
-        raw = '\n'.join([graph['header'], graph['blocks']['bb0']['row']]
-                         + [n['row'] for n in code] + ['}']).encode('latin1')
-        chunk['raw_b64'] = base64.b64encode(raw).decode()
-        module['sha256'] = hashlib.sha256(raw).hexdigest()
-        raw_inputs.append(raw.replace(escaped.encode(), token.encode(), 1))
-    frames = [base64.b64decode(m['chunks'][0]['raw_b64']) for m in proof['modules'].values()]
-    envelope = protocol_envelope(proof, raw_inputs, [[b'line\nbreak']] * 2, frames)
-    answer = protocol(wire(envelope))
-    assert answer.returncode == expected and answer.stderr == b'' and bool(answer.stdout) == (expected == 0)
-
 def protocol_positive(packet):
     answer = protocol(wire(packet))
     assert answer.returncode == 0 and answer.stderr == b'', (answer.returncode, answer.stderr)
     reply = json.loads(answer.stdout)
     assert set(reply) == {'version', 'query_ids', 'work_left'} and reply['version'] == 2
-    assert reply['query_ids'] == ['q0'] and type(reply['work_left']) is int and 0 <= reply['work_left'] < 1000000
+    assert reply['query_ids'] == [] and type(reply['work_left']) is int and 0 <= reply['work_left'] < 1000000
 
-def protocol_bad_packets(packet, query):
+def protocol_bad_packets(packet):
     bad_packets = []
     for key, value in [('version', 1), ('work_left', 1000001), ('work_left', 0), ('extra', [])]:
         bad = copy.deepcopy(packet); bad[key] = value; bad_packets.append(bad)
-    for key, value in [('version', 2), ('source', 'untrusted.bit'), ('extra', []), ('queries', [])]:
+    for key, value in [('version', 2), ('kind', 'owned'), ('extra', []), ('queries', [dict(id='q0')])]:
         bad = copy.deepcopy(packet); bad['proof'][key] = value; bad_packets.append(bad)
-    bad = copy.deepcopy(packet); del bad['proof']['queries'][0]['id']; bad_packets.append(bad)
-    bad = copy.deepcopy(packet); bad['proof']['queries'].append(copy.deepcopy(query)); bad_packets.append(bad)
-    bad = copy.deepcopy(packet); bad['proof']['queries'][0]['fn'] = 1; bad_packets.append(bad)
-    bad = copy.deepcopy(packet); bad['proof']['modules']['oracle']['chunks'][0]['graph']['owned'] = True; bad_packets.append(bad)
-    bad = copy.deepcopy(packet); bad['proof']['modules']['oracle']['sha256'] = '0' * 64; bad_packets.append(bad)
-    bad = copy.deepcopy(packet); bad['proof']['modules']['candidate']['chunks'][0]['graph'] = None; bad_packets.append(bad)
-    bad = copy.deepcopy(packet); bad['proof']['modules']['oracle']['chunks'][0]['graph']['header'] = ['nested']; bad_packets.append(bad)
-    bad = copy.deepcopy(packet); bad['proof']['modules']['oracle']['chunks'][0]['graph']['blocks']['bb0']['code'][0]['ts'][-1] = '1'; bad_packets.append(bad)
-    bad = copy.deepcopy(packet)
-    chunk = bad['proof']['modules']['oracle']['chunks'][0]; node = chunk['graph']['blocks']['bb0']['code'][2]
-    node.update(row='  %3 = field_get %0[0] []i64', ts=['field_get', '%0', '[', '0', ']', '[', ']', 'i64'], op='field_get', name=None, args=[])
-    raw = local.rstrip(b'\n').replace(b'  %3 = rt_call slice_new(%1, %2, %1, %2) []i64', node['row'].encode())
-    chunk['raw_b64'] = base64.b64encode(raw).decode(); bad['proof']['modules']['oracle']['sha256'] = hashlib.sha256(raw).hexdigest()
-    bad['original'][0] = base64.b64encode(raw).decode(); bad['framed_sha256'][0] = hashlib.sha256(raw).hexdigest(); bad_packets.append(bad)
     for key in ('original', 'objects', 'framed_sha256'):
         bad = copy.deepcopy(packet); bad[key][1] = ''; bad_packets.append(bad)
     bad = copy.deepcopy(packet); bad['proof']['work_left'] = 999999; bad_packets.append(bad)
     bad = copy.deepcopy(packet); bad['proof'] = dict(version=1, work_left=1000000, raw=['eA==', 'eQ=='], queries=[dict(id='q0')]); bad_packets.append(bad)
-    bad = copy.deepcopy(packet); bad['original'][0] = base64.b64encode(b'func unrelated() void {\nbb0():\n  ret\n}').decode(); bad_packets.append(bad)
+    bad = copy.deepcopy(packet); bad['original'][0] = base64.b64encode(b'unrelated').decode(); bad_packets.append(bad)
     return bad_packets
-
 def protocol_dispatch(packet):
     for args in [('--unknown-proof-mode',), ('--prove-owned-appends', 'extra')]:
         protocol_refuses(wire(packet), args)
     answer = protocol(b'', ())
     assert answer.returncode == 0 and answer.stderr == b'' and answer.stdout == b'selfhost-ir-canon.sh: self-check passed\n'
-    for token, expected in [('"line\nbreak"', 0), ('"line"\nbreak', 1)]:
-        protocol_literal(packet, token, expected)
-
 def protocol_canonical():
     proof = dict(version=1, work_left=1000000, kind='canonical', queries=[])
     raw = b'func example() $t19 {\nbb0():\n  ret\n}'
@@ -735,6 +696,9 @@ def protocol_canonical():
     packet['comparison'] = 'ir'
     answer = protocol(wire(packet))
     assert answer.returncode == 0 and answer.stderr == b''
+    for value in (b'line\nbreak', b'quoted"\ntext', b'a\0b'):
+        raw_literal = b'func literal() void {\nbb0():\n  %1 = const_string "' + value + b'"\n  ret\n}'
+        protocol_positive(protocol_envelope(proof, [raw_literal, raw_literal], [[value], [value]]))
     old = b'func example() void {\nbb0():\n  %1 = const_string "$t19"\n  ret\n}'
     packet = protocol_envelope(proof, [old, old.replace(b'$t19', b'$t2')], [[b'$t19'], [b'$t2']])
     protocol_refuses(wire(packet))
@@ -770,20 +734,20 @@ def capture_selfcheck():
 
 def protocol_selfcheck():
     query = dict(id='q0', side='oracle', fn=0, kind='owned', block='bb0', index=3, value=None)
-    proof = dict(version=1, work_left=1000000, source=None, queries=[query],
-                 modules=dict(oracle=proof_module(local, 'slice_append_slice_fresh'),
-                              candidate=proof_module(local_fixed, 'slice_append_slice')))
-    packet = protocol_envelope(proof, [local.rstrip(b'\n'), local_fixed.rstrip(b'\n')], [[], []])
+    retired = dict(version=1, work_left=1000000, source=None, queries=[query],
+                   modules=dict(oracle=proof_module(local, 'slice_append_slice_fresh'),
+                                candidate=proof_module(local_fixed, 'slice_append_slice')))
+    protocol_refuses(wire(protocol_envelope(retired, [local, local_fixed], [[], []])))
+    proof = dict(version=1, work_left=1000000, kind='canonical', queries=[])
+    packet = protocol_envelope(proof, [local, local], [[], []])
     protocol_positive(packet)
-    bad_packets = protocol_bad_packets(packet, query)
+    bad_packets = protocol_bad_packets(packet)
     duplicate = wire(packet).replace(b'"version":2', b'"version":2,"version":2', 1)
     for payload in [b'{', b'', duplicate, wire(packet) + b' trailing', wire(proof)] + [wire(b) for b in bad_packets]:
         protocol_refuses(payload)
     protocol_dispatch(packet)
     protocol_canonical()
-    print('6175 proof protocol: strict v2 schema, query IDs, budget, dispatch and framing controls passed')
-
-literal_closure_selfcheck()
+    print('canonical proof protocol: strict schema, budget, dispatch, framing and retired identity refusal passed')
 literal_index_selfcheck()
 literal_selfcheck()
 literal_memo_selfcheck()

@@ -621,8 +621,6 @@ run_ir() {
       fi
       if [ "$rc" -eq 0 ] && [ "$sig" = canonical-ir-match ]; then
         match=$((match + 1))
-      elif [ "$rc" -eq 0 ] && [ "$sig" = 6175-owned-append-local ]; then
-        echo "$f${sep}explained by declared signature '$sig'" >>"$work/explained"
       else
         echo "$f" >>"$work/mismatch"
       fi
