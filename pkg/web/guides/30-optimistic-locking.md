@@ -79,7 +79,9 @@ first opened the article.
 `StaleWriteError` becomes HTTP `412` with the message
 `the article changed since you last read it; reload and retry`. Other database
 errors propagate. The route keeps its ownership check before any write.
-The successful response reloads the article so it returns the saved content.
+The successful response reloads the article so it returns the saved content
+and its new `version`. The public `GET /articles/:id` response also includes
+that integer in `data.version`, alongside the existing article fields.
 
 The ORM's [locking guide](../../orm/docs/locking.md) describes the version
 check and the separate row-lock option.
@@ -107,20 +109,27 @@ The test named `PUT /articles/:id with a stale If-Match returns 412, and a fresh
 creates a new article, submits version `99`, and checks for `412`. It then
 submits that article's initial version, `0`, and checks for `200` and the saved
 title. The test knows `0` from the insertion path; it does not discover it
-through the article response.
+through the article response. The test named `article responses supply the revision for an update, conflict, reload and retry`
+uses `data.version` instead: it reads, updates, rejects the old revision,
+reloads the saved article, and retries with the returned revision.
 
-For a newly created article that has never been edited, you can make the
-same request over HTTP. Replace the id and session cookie with your own:
+Fetch the article before editing it. Copy the integer from `data.version`
+into `If-Match`, without quotes. Replace the id and session cookie with your own:
 
 ```text
+curl -s http://127.0.0.1:8080/articles/42
+# Read data.version from the response; this example receives 3.
+
 curl -i -X PUT http://127.0.0.1:8080/articles/42 \
   -H 'Cookie: sid=YOUR_SESSION_COOKIE' \
   -H 'Content-Type: application/json' \
-  -H 'If-Match: 0' \
+  -H 'If-Match: 3' \
   -d '{"title":"A corrected title","body":"The saved body."}'
 ```
 
-If that edit succeeds, another edit using `If-Match: 0` fails with `412`.
+The successful response returns version `4`. Another edit using `If-Match: 3`
+fails with `412`.
+
 Run the app tests against the migrated PostgreSQL database from
 [Testing the API](16-testing-the-api.md):
 
@@ -128,18 +137,16 @@ Run the app tests against the migrated PostgreSQL database from
 bit test pkg/web/guides/inkwell
 ```
 
-## The unfinished client contract
+## Reload before a retry
 
-The current `ArticleView` contains neither `version` nor an equivalent
-revision field. `showArticle` and `updateArticle` also send no revision header.
-A client therefore cannot learn the current version by fetching the article.
-The route protects writes, but the public API does not yet support a complete
-read, edit, conflict, reload and retry flow.
+On `412`, fetch `GET /articles/:id` again. Show the current content so the
+author can reconcile their edit, then submit the new `data.version` in
+`If-Match`. A successful update returns the saved content and its next
+version, which the editor can use for its next edit.
 
 Do not guess an existing article's version or retry a stale edit blindly.
-A usable editor needs the API to expose the current revision and a way for
-the user to reconcile their changes with the newer content. That API change
-is outside this chapter's existing app behavior.
+Reloading supplies the current revision; the author still decides how to
+combine their changes with the newer content.
 
 ## Sharp edges
 
