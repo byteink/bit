@@ -40,6 +40,7 @@ NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 # file for the full per-flag rationale.
 # shellcheck source=scripts/selfhost-diffdump-setup.sh
 . "${ROOT}/scripts/selfhost-diffdump-setup.sh"
+. "${ROOT}/scripts/selfhost-diffiropt.sh"
 diffdump_setup "$NAME"
 
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
@@ -533,8 +534,7 @@ run_ir() {
       panic)   echo "$f${sep}$(head -n 1 "$ocap")" >>"$work/oraclepanic"; continue ;;
       decline) skip=$((skip + 1)); continue ;;
     esac
-    want=$(cat "$ocap")
-    [ -z "$want" ] && { skip=$((skip + 1)); continue; }
+    [ -s "$ocap" ] || { skip=$((skip + 1)); continue; }
 
     bcap="$work/bit2.cap"
     alarmrun_retry_cap BIT2 "" "$bcap" "$BIT2" "$FLAG" "$f"
@@ -565,13 +565,26 @@ run_ir() {
       panic)         echo "$f${sep}PANICKED: $(head -n 1 "$bcap")" >>"$work/timeout"; continue ;;
       decline)       skip=$((skip + 1)); continue ;;
     esac
-    b2=$(cat "$bcap")
-
-    # $t<id> suffixes are interning-order artifacts, not structural — canonicalize
-    # before comparing (see selfhost-ir-canon.sh). Raw compare first: the
-    # overwhelming majority of files already match byte-for-byte, so skip the
-    # two awk forks unless the raw strings actually differ.
-    if [ "$want" = "$b2" ] || [ "$(canon_ir_ids "$want")" = "$(canon_ir_ids "$b2")" ]; then
+    cmp -s "$ocap" "$bcap"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      match=$((match + 1)); continue
+    fi
+    if [ "$rc" -ne 1 ]; then
+      echo "$f${sep}capture comparison produced no verdict" >>"$work/timeout"; continue
+    fi
+    diffiropt_capture_text "$ocap" "$bcap"
+    capture_state=$?
+    case "$capture_state" in
+      0|3) ;;
+      *) echo "$f${sep}capture bytes are unavailable or contain NUL" >>"$work/timeout"; continue ;;
+    esac
+    want=$(cat "$ocap") && b2=$(cat "$bcap") || {
+      echo "$f${sep}capture read produced no verdict" >>"$work/timeout"; continue;
+    }
+    [ -z "$want" ] && { skip=$((skip + 1)); continue; }
+    # Only NUL-free captures may enter Bash strings or type-ID comparison.
+    if [ "$capture_state" -eq 0 ] && [ "$(canon_ir_ids "$want")" = "$(canon_ir_ids "$b2")" ]; then
       match=$((match + 1))
     else
       # #5175: a raw/canon mismatch can still be fabricated, not a regression.
@@ -600,8 +613,15 @@ run_ir() {
       # above explainMismatch). Only an UNEXPLAINED divergence is a
       # regression — this is the #3125 fix, so a real lowering improvement
       # like #3107's no longer fails this gate by construction.
-      sig=$(explainMismatch "$want" "$b2" "$NAME" "$f")
-      if [ -n "$sig" ]; then
+      sig=$(ir_mismatch_signature "$f" "$work" "$want" "$b2")
+      rc=$?
+      if [ "$rc" -eq 2 ]; then
+        echo "$f${sep}candidate framing object produced no verdict" >>"$work/timeout"
+        continue
+      fi
+      if [ "$rc" -eq 0 ] && [ "$sig" = canonical-ir-match ]; then
+        match=$((match + 1))
+      elif [ "$rc" -eq 0 ] && [ "$sig" = 6175-owned-append-local ]; then
         echo "$f${sep}explained by declared signature '$sig'" >>"$work/explained"
       else
         echo "$f" >>"$work/mismatch"

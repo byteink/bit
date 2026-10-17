@@ -82,9 +82,7 @@ fi
 . "${ROOT}/scripts/selfhost-diffdump-setup.sh"
 # shellcheck source=scripts/diffexit.sh
 . "${ROOT}/scripts/diffexit.sh"
-
-# Assert that unknown deltas fail and the registry matches the dispatch.
-# Retired identities remain rejected; only the proved local append delta is active.
+# Unknown deltas and retired identities decline; registry and dispatch must agree.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   set -u
   fail=0
@@ -115,10 +113,16 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     expect "$want_registry" "$(declaredSignatureNames "$kind")" "$kind registry"
   done
 
+  /bin/bash "$ROOT/scripts/selfhost-diffiropt.sh" --literal-selfcheck || fail=1
   python3 - "$ROOT/scripts/selfhost-ir-signatures.sh" <<'PYTHON'
+import atexit
+import base64
+import json
+import os
+import re
 import subprocess
 import sys
-
+import tempfile
 helper = sys.argv[1]
 old = b"""func tail$t59(%0: Builder, %1: i64) string {
 bb0(%0: Builder, %1: i64):
@@ -145,13 +149,56 @@ new = old.replace(b"  %13 = rt_call slice_slice(%5, %2, %6) []u8\n", b"")
 new = new.replace(b"string_from_byte_range(%13,", b"string_from_byte_range(%5,")
 new = new.replace(b"%14", b"%113").replace(b"%15", b"%114").replace(b"%16", b"%115")
 
-
-def verdict(a, b, kind="iropt"):
-    result = subprocess.run(["bash", "-c", 'source "$1"; explainMismatch "$2" "$3" "$4"',
-                             "fixture", helper, a, b, kind], capture_output=True)
+# Fixed fixture declarations bind pools; an unknown literal is a broken fixture.
+values = [b"\n"]
+values += [b'literal ' + i + b' ' + t + b' \\" ' + c
+           for i in (b"%13", b"%12") for t in (b"$t59", b"$t60") for c in (b"\xc0", b"\xc1")]
+values += [b'literal ' + i + b' ' + t + b' \\" ' + c
+           for i in (b"%80", b"%81") for t in (b"$t59", b"$t60") for c in (b"\xc0", b"\xc1")]
+values += [b"literal %80 bb360\n  %901 = rt_call slice_append_slice" + suffix +
+           b"(%3, %0, %1, %2) []decimal" for suffix in (b"_fresh", b"")]
+store = tempfile.TemporaryDirectory(prefix="t8271-signatures-")
+atexit.register(store.cleanup)
+objects = {}
+clean_env = {k: v for k, v in os.environ.items()
+             if not k.startswith(("BIT", "LIBBITRT", "DIFFALL", "BOXLOCK"))
+             and k not in ("ORACLE", "TIMEOUT_S", "BASH_ENV", "ENV")}
+def fixture_pool(raw):
+    remaining, found = raw, []
+    for value in sorted(values, key=len, reverse=True):
+        token = b'const_string "' + value + b'"'
+        if token in remaining:
+            found.append(value)
+            remaining = remaining.replace(token, b"FIXED_LITERAL")
+    assert b"const_string" not in remaining, "undeclared literal fixture"
+    return tuple(sorted(set(found)))
+def fixture_object(pool):
+    if pool not in objects:
+        wrapper = os.path.join(os.path.dirname(helper), "selfhost-diffiropt.sh")
+        data = json.dumps([base64.b64encode(x).decode() for x in pool]).encode()
+        result = subprocess.run(["/bin/bash", wrapper, "--fixture-object"], input=data,
+                                capture_output=True, timeout=10, env=clean_env)
+        assert result.returncode == 0 and not result.stderr and result.stdout
+        path = os.path.join(store.name, "object-" + str(len(objects)))
+        with open(path, "wb") as target:
+            assert target.write(result.stdout) == len(result.stdout)
+        objects[pool] = path
+    return objects[pool]
+def verdict(a, b, kind="iropt", path="", pools=None, caps=None, files=None):
+    pools = (fixture_pool(a), fixture_pool(b)) if pools is None else pools
+    captures = (a, b) if caps is None else caps
+    paths = [os.path.join(store.name, "capture-" + str(i)) for i in range(2)]
+    for filename, raw in zip(paths, captures):
+        with open(filename, "wb") as target:
+            assert target.write(raw) == len(raw)
+    paths = paths if files is None else files
+    command = 'source "$1"; IFS= read -r -d "" a && IFS= read -r -d "" b && explainMismatch "$a" "$b" "$2" "$3" "$4" "$5" "$6" "$7"'
+    result = subprocess.run(["/bin/bash", "-c", command, "fixture", helper, kind, path,
+                             *(fixture_object(p) for p in pools), *paths],
+                            input=a.rstrip(b"\n") + b"\0" + b.rstrip(b"\n") + b"\0",
+                            capture_output=True, timeout=10, env=clean_env)
     assert result.stderr == b"", result.stderr
     return result.returncode, result.stdout
-
 
 expected = (1, b"")
 assert verdict(old, new) == expected, "retired single-function identity"
@@ -211,29 +258,7 @@ for name, pair in negatives.items():
 for kind in ("ir", "types", "ast", "fmt", "diags", "tokens", "doc"):
     assert verdict(old, new, kind) == (1, b""), kind
 print("retired 8259 signature: 2 former-positive, 30 negative, 7 kind controls rejected")
-PYTHON
-  rc=$?
-  [ "$rc" -eq 0 ] || fail=1
-
-  # #6175: accept only proved local ownership; unsafe or opaque roots decline.
-  python3 - "$ROOT/scripts/selfhost-ir-signatures.sh" <<'OWNED_APPEND'
-import os
-import re
-import subprocess
-import sys
-helper = sys.argv[1]
 signature = b"6175-owned-append-local\n"
-ancestor = br'''func ancestor(%0: []i64) i64 {
-bb0(%0: []i64):
-  %1 = const_int i64 0
-  %2 = const_int i64 8
-  %3 = rt_call slice_new(%1, %2, %1, %2) []i64
-  %4 = rt_call slice_append_slice_fresh(%3, %0, %1, %2) []i64
-  %5 = rt_call slice_append_slice_fresh(%4, %3, %1, %2) []i64
-  %6 = slice_len %5
-  ret %6
-}
-'''
 local = br'''func owned(%0: []i64) []i64 {
 bb0(%0: []i64):
   %1 = const_int i64 0
@@ -243,6 +268,9 @@ bb0(%0: []i64):
   ret %4
 }
 '''
+ancestor = local.replace(b"func owned", b"func ancestor").replace(b") []i64 {", b") i64 {", 1)
+ancestor = ancestor.replace(b"  ret %4\n", b"  %5 = rt_call slice_append_slice_fresh(%4, %3, %1, %2) []i64\n"
+                            b"  %6 = slice_len %5\n  ret %6\n")
 loop = br'''func ownedLoop(%0: []i64, %1: i64) void {
 bb0(%0: []i64, %1: i64):
   %2 = const_int i64 0
@@ -307,6 +335,10 @@ bb9():
   ret
 }
 '''
+mixed_tail = b"  %29 = const_string" + mixed.split(b"  %29 = const_string", 1)[1]
+for before, after in [(b"%29", b"%41"), (b"%28", b"%40"), (b"%44", b"%56"), (b"%45", b"%57"),
+                      (b"%46", b"%58"), (b"%51", b"%63"), (b"%52", b"%64"), (b"bb8", b"bb11"), (b"bb9", b"bb12")]:
+    mixed_tail = mixed_tail.replace(before, after)
 mixed_fixed = mixed.split(b'bb5(%25: []i64):\n', 1)[0] + br'''bb5(%25: []i64):
   %26 = rt_call slice_append_slice(%25, %9, %2, %11) []i64
   %27 = const_int i64 9
@@ -325,20 +357,7 @@ bb7():
   %38 = rt_call slice_append(%26, %27, %2, %11) []i64
   jump bb8(%38)
 bb8(%40: []i64):
-  %41 = const_string "
-"
-  %56 = slice_len %40
-  %57 = sub i64 %56, %13
-  %58 = icmp_ult bool %57, %56
-  br %58, bb12(), bb11()
-bb11():
-  unreachable
-bb12():
-  %63 = field_get %40[0] i64
-  %64 = index_get %63[%57] i64
-  ret
-}
-'''
+''' + mixed_tail
 snapshot = recursive_prefix.replace(b'ownedLoop', b'snapshotLoop') + br'''  %13 = const_nil
   jump bb3(%9, %12, %13, %2)
 bb3(%15: []i64, %16: []i64, %17: []i64, %18: i64):
@@ -385,15 +404,6 @@ local_fixed = local.replace(b"slice_append_slice_fresh", b"slice_append_slice")
 loop_fixed = loop.replace(b"slice_append_slice_fresh", b"slice_append_slice")
 snapshot_bad = snapshot.replace(b"slice_append_slice_fresh", b"slice_append_slice")
 field_bad = field.replace(b"slice_append_slice_fresh", b"slice_append_slice")
-def verdict(a, b, kind="iropt", path=""):
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("BIT", "LIBBITRT", "DIFFALL", "BOXLOCK"))
-           and k not in ("ORACLE", "TIMEOUT_S", "BASH_ENV", "ENV")}
-    command = 'source "$1"; IFS= read -r -d "" a && IFS= read -r -d "" b && explainMismatch "$a" "$b" "$2" "$3"'
-    result = subprocess.run(["bash", "-c", command, "fixture", helper, kind, path],
-                             input=a + b"\0" + b + b"\0", capture_output=True, timeout=10, env=env)
-    assert result.stderr == b"", result.stderr
-    return result.returncode, result.stdout
 def expect_case(label, a, b, accepted=False, kind="iropt"):
     expected = (0, signature) if accepted else (1, b"")
     assert verdict(a, b, kind) == expected, label
@@ -457,7 +467,81 @@ renamed = re.sub(rb"%([0-9]+)", lambda m: b"%" + str(int(m[1]) + 100).encode(), 
 expect_case("bijective SSA rename", local, renamed, True)
 loop_renamed = re.sub(rb"bb([0-9]+)", lambda m: b"bb" + str(int(m[1]) + 30).encode(), loop_fixed)
 expect_case("bijective block rename", loop, loop_renamed, True)
+def nil_wide(src, typ=b"decimal", stride=b"16"):
+    return src.replace(b"rt_call slice_new(%1, %2, %1, %2) []i64", b"const_nil").replace(
+        b"[]i64", b"[]" + typ).replace(b"const_int i64 8", b"const_int i64 " + stride)
+bridge = b"  jump bb360()\nbb360():\n  jump bb362()\nbb362():\n  jump bb364()\nbb364():\n"
+nil_chain = nil_wide(ancestor.replace(b"(%4, %3,", b"(%4, %0,"))
+nil_chain = nil_chain.replace(b"  %3 = const_nil", bridge + b"  %3 = const_nil")
+nil_fixed = nil_chain.replace(b"slice_append_slice_fresh", b"slice_append_slice")
+literal = b'  %90 = const_string "literal %80 bb360\n  %901 = rt_call slice_append_slice_fresh(%3, %0, %1, %2) []decimal"\n'
+expect_case("nil quoted rows unchanged", nil_chain.replace(b"  %3 =", literal + b"  %3 ="), nil_fixed.replace(b"  %3 =", literal + b"  %3 ="), True)
+expect_case("nil quoted callee mutation", nil_chain.replace(b"  %3 =", literal + b"  %3 ="), nil_fixed.replace(b"  %3 =", literal.replace(b"_fresh", b"") + b"  %3 ="))
+# Decoded quotes can imitate a complete valid chain inside one actual string.
+embedded = (b'"\n  %900 = const_int i64 0\n  %901 = const_int i64 16\n'
+            b'  %902 = rt_call slice_new(%900, %900, %900, %901) []decimal\n'
+            b'  %903 = const_nil\n  %904 = rt_call slice_append_slice_fresh(%903, %902, %900, %901) []decimal\n'
+            b'  %905 = rt_call slice_append_slice_fresh(%904, %902, %900, %901) []decimal\n  %906 = const_string "')
+changed = embedded.replace(b"slice_append_slice_fresh", b"slice_append_slice")
+string_dump = b'func strings() void {\nbb0():\n  %0 = const_string "'
+quoted_old = string_dump + embedded + b'"\n  ret\n}\n'
+quoted_new = string_dump + changed + b'"\n  ret\n}\n'
+assert verdict(quoted_old, quoted_new, pools=((embedded,), (changed,))) == (1, b"")
+assert verdict(local + quoted_old, local_fixed + quoted_new,
+               pools=((embedded,), (changed,))) == (1, b"")
+assert verdict(local, local_fixed, caps=(local + b"changed", local_fixed)) == (1, b"")
+literal_old = nil_chain.replace(b"  %3 =", literal + b"  %3 =")
+literal_new = nil_fixed.replace(b"  %3 =", literal + b"  %3 =")
+assert verdict(literal_old, literal_new, pools=((), fixture_pool(literal_new))) == (1, b"")
+assert verdict(local, local_fixed, pools=((b"unused witness value",), ())) == (0, signature)
+nul_dump = string_dump + b'a\0b"\n  ret\n}\n'
+assert verdict(local + nul_dump.replace(b"\0", b""), local_fixed + nul_dump.replace(b"\0", b""),
+               pools=((b"a\0b",), (b"a\0b",)), caps=(local + nul_dump, local_fixed + nul_dump)) == (1, b"")
+assert verdict(local, local_fixed, caps=(local + b"\n\n", local_fixed + b"\n\n")) == (0, signature)
+assert verdict(local, local_fixed, files=(os.path.join(store.name, "capture-0"),
+               os.path.join(store.name, "absent"))) == (1, b"")
+with open(os.path.join(os.path.dirname(helper), "selfhost-diffdump.sh"), encoding="utf8") as source:
+    driver = source.read()
+driver = "run_ir() {\n" + driver.split("run_ir() {\n", 1)[1].split('\ncase "$KIND" in', 1)[0]
+mocks = b'''MOCK_RC=$1 MOCK_SIG=$2
+NAME=iropt LABEL=IR PREFIX=mock VERB=post SKIPLABEL=mock CORPUS=mock ORACLE=oracle BIT2=current FLAG=mock
+find() { printf 'fixture.bit\n'; }
+alarmrun_retry_cap() { printf '%s\n' "$1" > "$3"; }
+classify_rc() { echo ok; }
+diffiropt_capture_text() { return 3; }
+oracle_ir_coverage() { echo ok; }
+ir_mismatch_signature() { printf '%s\n' "$MOCK_SIG"; return "$MOCK_RC"; }
+declaredSignatureNames() { :; }
+'''
+for code, token in [(1, "canonical-ir-match"), (1, "6175-owned-append-local"),
+                     (0, "unknown-success-token"), (2, "canonical-ir-match")]:
+    result = subprocess.run(["/bin/bash", "-s", "--", str(code), token],
+                            input=mocks + driver.encode() + b"\nrun_ir\n", capture_output=True, timeout=10, env=clean_env)
+    assert result.returncode == 1 and b"IR differential: MATCH=0 " in result.stdout and b"EXPLAINED=0 " in result.stdout
+    assert b"INVALID: compared 0 files" in result.stderr
+for typ, stride in [(b"decimal", b"16"), (b"Wide", b"24")]:
+    a = nil_chain.replace(b"[]decimal", b"[]" + typ).replace(b"const_int i64 16", b"const_int i64 " + stride)
+    expect_case("nil chain width " + stride.decode(), a, a.replace(b"slice_append_slice_fresh", b"slice_append_slice"), True)
+unrelated = b"".join(b"bb" + str(i).encode() + b"():\n  unreachable\n" for i in range(1000, 1427))
+expect_case("nil chain in 431-block function", nil_chain[:-2] + unrelated + b"}\n",
+            nil_fixed[:-2] + unrelated + b"}\n", True)
+bypass = nil_chain.replace(b"  %2 = const_int i64 16\n", b"").replace(b"bb362():", b"bb362():\n  %2 = const_int i64 16")
+bypass = bypass.replace(b"  jump bb360()", b"  %90 = icmp_eq bool %1, %1\n  br %90, bb360(), bb364()")
+entry_bypass = b"func entryBackedge() i64 {\nbb0():\n  jump bb364()\nbb360():\n"
+entry_bypass += b"  %1 = const_int i64 0\n  %2 = const_int i64 16\n  %91 = rt_call slice_new(%1, %2, %1, %2) []decimal\n  jump bb0()\nbb364():\n"
+entry_bypass += nil_chain.split(b"bb364():\n", 1)[1].replace(b", %0,", b", %91,").replace(b"  ret %6", b"  jump bb360()")
 negative = {
+    "nil opaque target-bearing op": change_both(nil_chain, nil_fixed, b"  %3 = const_nil", b"  opaque_edge bb360\n  %3 = const_nil"),
+    "nil implicit entry bypass": (entry_bypass, entry_bypass.replace(b"slice_append_slice_fresh", b"slice_append_slice")),
+    "nil final backedge phi": tuple(x.replace(b"bb364():", b"bb364(%99: []decimal):").replace(
+        b"jump bb364()", b"jump bb364(%0)").replace(b"  ret %6", b"  jump bb364(%5)") for x in (nil_chain, nil_fixed)),
+    "nil source type": change_both(nil_chain, nil_fixed, b"%0: []decimal", b"%0: []u8"),
+    "nil reference metadata": change_both(nil_chain, nil_fixed, b"const_int i64 0", b"const_int i64 1"),
+    "nil old-header store": change_both(nil_chain, nil_fixed, b"  %4 = rt_call", b"  field_set %3[8] = %1\n  %4 = rt_call"),
+    "nil final predefinition": change_both(nil_chain, nil_fixed, b"  %3 = const_nil", b"  %90 = slice_len %5\n  %3 = const_nil"),
+    "nil unknown target": change_both(nil_chain, nil_fixed, b"jump bb364()", b"jump bb999()"),
+    "nil branch arity": change_both(nil_chain, nil_fixed, b"jump bb364()", b"jump bb364(%0)"),
+    "nil dominance bypass": (bypass, bypass.replace(b"slice_append_slice_fresh", b"slice_append_slice")),
     "unchanged text is no signature": (local_fixed, local_fixed),
     "reverse target direction": (local_fixed, local),
     "field ownership is not local": (field, field_bad),
@@ -494,8 +578,7 @@ negative = {
     "scalar grow operand": (mixed, mixed_fixed.replace(b"slice_append(%26, %27,", b"slice_append(%26, %2,")),
     "scalar merge operand": (mixed, mixed_fixed.replace(b"jump bb8(%38)", b"jump bb8(%26)")),
 }
-# The live-header control remains well typed after its observable result changes.
-a, b = negative["live original header"]
+a, b = negative["live original header"]  # Keep the observable mutation well typed.
 negative["live original header"] = (a.replace(b") []i64 {", b") i64 {", 1),
                                     b.replace(b") []i64 {", b") i64 {", 1))
 heap_old, heap_new = change_both(local, local_fixed, b"%0: []i64)", b"%0: []i64, %5: Holder)")
@@ -510,12 +593,13 @@ negative["duplicate block label"] = (loop, loop_fixed.replace(b"bb5(%26: []i64):
 late_old, late_new = change_both(local, local_fixed, b"  %1 = const_int i64 0\n", b"")
 negative["use before definition"] = change_both(late_old, late_new, b"  ret %4",
     b"  %1 = const_int i64 0\n  ret %4")
-# An unused class parameter keeps a bare bbN type opaque, even beside renamed labels.
-typed_old, typed_new = change_both(local, local_fixed, b"%0: []i64)", b"%0: []i64, %5: bb80)")
+typed_old, typed_new = change_both(local, local_fixed, b"%0: []i64)", b"%0: []i64, %5: bb80)")  # bbN stays a type.
 typed_new = re.sub(rb"bb([0-9]+)(?=\()", lambda m: b"bb" + str(int(m[1]) + 30).encode(), typed_new)
 expect_case("opaque bbN type with renamed graph", typed_old, typed_new.replace(b": bb80", b": bb81"))
 for label, pair in negative.items():
     expect_case(label, *pair)
+    if pair[0].startswith(b"func owned("):
+        expect_case("wide nil " + label, nil_wide(pair[0]), nil_wide(pair[1]))
 opaque = b'\nfunc helper%80() void {\nbb0():\n  %0 = const_string "literal %80 $t59 \\\" \xc0"\n  ret\n}\n'
 expect_case("unchanged opaque literal", local + opaque, local_fixed + opaque, True)
 for label, before, after in [("literal SSA", b"literal %80", b"literal %81"),
@@ -523,6 +607,7 @@ for label, before, after in [("literal SSA", b"literal %80", b"literal %81"),
                              ("literal nonutf8", b"\xc0", b"\xc1"),
                              ("opaque function symbol", b"helper%80", b"helper%81")]:
     expect_case(label, local + opaque, local_fixed + opaque.replace(before, after))
+    expect_case("nil " + label, nil_chain + opaque, nil_fixed + opaque.replace(before, after))
 numbers = b"  %5 = const_int i64 -12345\n  %6 = const_int i64 987654\n"
 numbers += b"  %7 = field_get %3[16] i64\n  %8 = field_get %3[24] i64\n"
 numeric_old, numeric_new = change_both(local, local_fixed, b"  %4 = rt_call", numbers + b"  %4 = rt_call")
@@ -535,13 +620,14 @@ expect_case("negative header offset unsupported", *change_both(numeric_old, nume
     b"%3[16]", b"%3[-16]"))
 expect_case("numeric SSA adjacency stays opaque", numeric_old.replace(b"-12345", b"1%80"),
             numeric_new.replace(b"-12345", b"1%81"))
-# Limits decline otherwise comparable inputs, before unbounded graph work.
 chain = b"".join(b"bb" + str(i).encode() + b"():\n  jump bb" + str(i + 1).encode() + b"()\n"
                  for i in range(256))
 chain = chain.replace(b"bb0():", b"bb0(%0: []i64):", 1)
 chain += b"bb256():\n" + local.split(b"bb0(%0: []i64):\n", 1)[1]
 chain = local.split(b"\nbb0", 1)[0] + b"\n" + chain
 expect_case("257 blocks", chain, chain.replace(b"slice_append_slice_fresh", b"slice_append_slice"))
+long_nil = nil_wide(chain.replace(b"bb256():", b"bb256():\n  jump bb257()\nbb257():"))
+expect_case("nil predecessor certificate bound", long_nil, long_nil.replace(b"slice_append_slice_fresh", b"slice_append_slice"))
 constants = b"".join(b"  %" + str(i).encode() + b" = const_int i64 0\n" for i in range(5, 4097))
 large_old = local.replace(b"  %4 = rt_call", constants + b"  %4 = rt_call")
 large_new = local_fixed.replace(b"  %4 = rt_call", constants + b"  %4 = rt_call")
@@ -554,93 +640,11 @@ expect_case("combined byte bound", local + b" " * (half - len(local)),
 for kind in ("ir", "types", "ast", "fmt", "diags", "tokens", "doc"):
     expect_case(kind, local, local_fixed, kind=kind)
 print("6175 local ownership: retained local/loop/mixed controls and strict negatives passed")
-# Typed fixture data exercises the proof wire contract without another IR parser.
-import base64, copy, hashlib, json, tempfile
-canon = os.path.join(os.path.dirname(helper), "selfhost-ir-canon.sh")
-def proof_module(src, bulk):
-    rows = src.rstrip(b"\n").decode("latin1").split("\n")
-    st = ["[", "]", "i64"]
-    specs = [("const_int", ["i64", "0"], ["i64"], None, []),
-             ("const_int", ["i64", "8"], ["i64"], None, []),
-             ("rt_call", [], st, "slice_new", ["%1", "%2", "%1", "%2"]),
-             ("rt_call", [], st, bulk, ["%3", "%0", "%1", "%2"]),
-             ("ret", ["%4"], [], None, [])]
-    code = []
-    for i, (op, tail, ty, name, args) in enumerate(specs):
-        if name is not None:
-            tail = [name, "("] + [x for a in args for x in (a, ",")][:-1] + [")"] + ty
-        code.append(dict(row=rows[i + 2], ts=[op] + tail, out="%" + str(i + 1) if i < 4 else None,
-                         op=op, ty=ty, name=name, args=args, targets=[]))
-    graph = dict(header=rows[0], order=["bb0"], blocks={"bb0": dict(row=rows[1],
-                 params=[["%0", st]], code=code)})
-    raw = src.rstrip(b"\n")
-    return dict(sha256=hashlib.sha256(raw).hexdigest(), chunks=[dict(kind="function",
-                raw_b64=base64.b64encode(raw).decode(), graph=graph)])
-query = dict(id="q0", side="oracle", fn=0, kind="owned", block="bb0", index=3, value=None)
-packet = dict(version=1, work_left=1000000, source=None, queries=[query],
-              modules=dict(oracle=proof_module(local, "slice_append_slice_fresh"),
-                           candidate=proof_module(local_fixed, "slice_append_slice")))
-def protocol(data, args=("--prove-owned-appends",)):
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("BIT", "LIBBITRT", "DIFFALL", "BOXLOCK"))
-           and k not in ("ORACLE", "TIMEOUT_S", "BASH_ENV", "ENV")}
-    return subprocess.run(["/bin/bash", canon, *args], input=data, capture_output=True, timeout=10, env=env)
-def wire(obj):
-    return json.dumps(obj, separators=(",", ":")).encode()
-answer = protocol(wire(packet))
-assert answer.returncode == 0 and answer.stderr == b"", (answer.returncode, answer.stderr)
-reply = json.loads(answer.stdout)
-assert set(reply) == {"version", "query_ids", "work_left"} and reply["version"] == 1
-assert reply["query_ids"] == ["q0"] and type(reply["work_left"]) is int and 0 <= reply["work_left"] < 1000000
-bad_packets = []
-for key, value in [("version", 2), ("work_left", 1000001), ("work_left", 0),
-                   ("source", "untrusted.bit"), ("extra", []), ("queries", [])]:
-    bad = copy.deepcopy(packet); bad[key] = value; bad_packets.append(bad)
-bad = copy.deepcopy(packet); del bad["queries"][0]["id"]; bad_packets.append(bad)
-bad = copy.deepcopy(packet); bad["queries"].append(copy.deepcopy(query)); bad_packets.append(bad)
-bad = copy.deepcopy(packet); bad["queries"][0]["fn"] = 1; bad_packets.append(bad)
-bad = copy.deepcopy(packet); bad["modules"]["oracle"]["chunks"][0]["graph"]["owned"] = True; bad_packets.append(bad)
-bad = copy.deepcopy(packet); bad["modules"]["oracle"]["sha256"] = "0" * 64; bad_packets.append(bad)
-bad = copy.deepcopy(packet); bad["modules"]["candidate"]["chunks"][0]["graph"] = None; bad_packets.append(bad)
-bad = copy.deepcopy(packet); bad["modules"]["oracle"]["chunks"][0]["graph"]["header"] = ["nested"]; bad_packets.append(bad)
-bad = copy.deepcopy(packet); bad["modules"]["oracle"]["chunks"][0]["graph"]["blocks"]["bb0"]["code"][0]["ts"][-1] = "1"; bad_packets.append(bad)
-bad = copy.deepcopy(packet)
-chunk = bad["modules"]["oracle"]["chunks"][0]; node = chunk["graph"]["blocks"]["bb0"]["code"][2]
-node.update(row="  %3 = field_get %0[0] []i64", ts=["field_get", "%0", "[", "0", "]", "[", "]", "i64"],
-            op="field_get", name=None, args=[])
-raw = local.rstrip(b"\n").replace(b"  %3 = rt_call slice_new(%1, %2, %1, %2) []i64", node["row"].encode())
-chunk["raw_b64"] = base64.b64encode(raw).decode(); bad["modules"]["oracle"]["sha256"] = hashlib.sha256(raw).hexdigest()
-bad_packets.append(bad)
-duplicate_key = wire(packet).replace(b'"version":1', b'"version":1,"version":1', 1)
-for payload in [b"{", b"", duplicate_key, wire(packet) + b" trailing"] + [wire(bad) for bad in bad_packets]:
-    result = protocol(payload)
-    assert (result.returncode, result.stdout, result.stderr) == (1, b"", b""), payload[:100]
-for args in [("--unknown-proof-mode",), ("--prove-owned-appends", "extra")]:
-    result = protocol(wire(packet), args)
-    assert (result.returncode, result.stdout, result.stderr) == (1, b"", b"")
-result = protocol(b"", ())
-assert result.returncode == 0 and result.stderr == b"" and result.stdout == b"selfhost-ir-canon.sh: self-check passed\n"
-for token, expected in [('"line\nbreak"', 0), ('"line"\nbreak', 1)]:
-    literal = copy.deepcopy(packet); literal["queries"][0]["index"] = 4
-    for module in literal["modules"].values():
-        chunk = module["chunks"][0]; graph = chunk["graph"]; block = graph["blocks"]["bb0"]
-        block["code"].insert(3, dict(row="  %5 = const_string " + token, ts=["const_string", token], out="%5", op="const_string", ty=["string"], name=None, args=[], targets=[]))
-        raw = "\n".join([graph["header"], block["row"]] + [n["row"] for n in block["code"]] + ["}"]).encode("latin1"); chunk["raw_b64"] = base64.b64encode(raw).decode(); module["sha256"] = hashlib.sha256(raw).hexdigest()
-    answer = protocol(wire(literal))
-    assert answer.returncode == expected and answer.stderr == b"" and bool(answer.stdout) == (expected == 0)
-print("6175 proof protocol: strict schema, query IDs, budget and dispatch controls passed")
-field_main = br'''func main() void {
-bb0():
-  %0 = gc_alloc size=8 ptrs=[%0] Bulk
-  %1 = const_int i64 0
-  %2 = const_int i64 8
-  %3 = rt_call slice_new(%1, %2, %1, %2) []i64
-  field_set %0[0] = %3
-  %5 = rt_call slice_new(%1, %2, %1, %2) []i64
-  %6 = const_int i64 2
-  %7 = call @put(%0, %5, %6) void
-  ret
-}
-'''
+field_main = local.replace(b"func owned(%0: []i64) []i64", b"func main() void")
+field_main = field_main.replace(b"bb0(%0: []i64):", b"bb0():\n  %0 = gc_alloc size=8 ptrs=[%0] Bulk")
+field_main = field_main.replace(b"  %4 = rt_call slice_append_slice_fresh(%3, %0, %1, %2) []i64\n",
+    b"  field_set %0[0] = %3\n  %5 = rt_call slice_new(%1, %2, %1, %2) []i64\n"
+    b"  %6 = const_int i64 2\n  %7 = call @put(%0, %5, %6) void\n").replace(b"  ret %4", b"  ret")
 field_source = br'''class Bulk { items: []int }
 fn put(h: Bulk, src: []int, depth: int) {
   if (depth == 0) {
@@ -690,10 +694,9 @@ scalar = b"  %9 = const_int i64 1\n  %10 = rt_call slice_append_fresh(%7, %9, %3
 mixed_field = field.replace(b"  %8 = rt_call", scalar + b"  %8 = rt_call").replace(b"slice_append_slice_fresh(%7,", b"slice_append_slice_fresh(%10,")
 field_check(field_source.replace(b"    h.items =", b"    h.items = append(h.items, 1)\n    h.items ="), body=mixed_field, accepted=True)
 print("6175 field ownership: private grounded recursion, scalar/bulk and strict refusals passed")
-OWNED_APPEND
+PYTHON
   rc=$?
   [ "$rc" -eq 0 ] || fail=1
-
   # #7931: the shared IR probe must distinguish unsupported lowering from
   # absent tools, failed execution, stale objects and unrelated diagnostics.
   probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/t7931-probe.XXXXXX") || exit 2
@@ -780,8 +783,6 @@ PROBE
   ORACLE="$probe_dir/missing"
   expect undecided "$(oracle_ir_coverage input.bit "$probe_dir")" 'missing oracle'
   unset ORACLE PROBE_CASE
-
-  # Registry names must match literal signature prints (#5509).
   got=$(declaredSignatureNames | LC_ALL=C sort)
   # Match the literal print even inside a conditional (#5510).
   want=$(grep -oE 'print[ (]+"[0-9]+-[a-z-]+"' "${ROOT}/scripts/selfhost-ir-signatures.sh" |
@@ -792,7 +793,6 @@ PROBE
     echo "  print \"…\" in the file:   $(printf '%s' "$want" | tr '\n' ' ')"
     fail=1
   fi
-
   if [ "$fail" -eq 0 ]; then
     echo "selfhost-ir-signatures-selfcheck.sh: self-check passed"
   fi

@@ -3,13 +3,19 @@
 # Unknown differences fail closed; filenames never authorize a difference.
 # Rationale and history: docs/development/dump-differential.md.
 
-# explainMismatch <oracle_text> <bit2_text> <kind> [file]
+# explainMismatch <old> <new> <kind> <source> <oldobj> <newobj> <oldcap> <newcap>
 explainMismatch() {
-  [ "$3" = iropt ] || return 1
+  case "$3" in ir|iropt) ;; *) return 1 ;; esac
   local LC_ALL=C
   [ "$((${#1} + ${#2} + 1))" -le 8388608 ] || return 1
-  local proof_source="${BASH_SOURCE[0]%/*}/selfhost-ir-canon.sh"
-  { printf '%s\0%s' "$1" "$2"; } | python3 /dev/fd/3 "$proof_source" "${4:-}" 3<<'PYTHON'
+  local proof_dir="${BASH_SOURCE[0]%/*}" ROOT
+  ROOT=${proof_dir%/scripts}
+  [ "$proof_dir" != scripts ] || ROOT=.
+  local DIFFIROPT_LITERAL_PYTHON DIFFDUMP_PARENT_PYTHON DIFFDUMP_PARENT_ENGINE
+  local parent_read_rc=0 parent_code
+  . "$proof_dir/selfhost-diffdump-setup.sh" || return 1
+  diffdump_frame_libraries "$proof_dir" || return 1
+  IFS= builtin read -r -d '' DIFFDUMP_PARENT_ENGINE <<'PYTHON' || parent_read_rc=$?
 import base64
 import bisect
 import hashlib
@@ -29,38 +35,14 @@ TERMS = {b"br", b"jump", b"ret", b"unreachable"}
 ARITH = {b"add", b"sub", b"mul", b"srem", b"icmp_eq", b"icmp_ult", b"icmp_ule", b"icmp_slt", b"icmp_sgt"}
 remaining = 1000000
 
-
 def require(ok):
     if not ok:
         raise ValueError("unsupported identity")
-
 
 def spend(n=1):
     global remaining
     remaining -= n
     require(remaining >= 0)
-
-
-def records(data):
-    result, row = [], []
-    for match in RECORD.finditer(data):
-        token = match[0]
-        require(token != b'"')
-        if token == b"\n":
-            result.append(b"".join(row))
-            row = []
-        else:
-            row.append(token)
-    result.append(b"".join(row))
-    return result
-
-
-def tokens(row):
-    spend(len(row))
-    result = TOKEN.findall(row)
-    require(b'"' not in result)
-    return result
-
 
 def compact(row):
     ts = tokens(row)
@@ -495,6 +477,8 @@ def compare_function(old_rows, new_rows):
             same, delta = compared_node(old, a, b, maps)
             require(same)
             if delta:
+                if a["name"] == b"slice_append_slice_fresh" and not any(constant(old, a["args"][3], w) for w in (1, 8)):
+                    raise ValueError("local bulk projection required")
                 queries.append(query("owned", "oracle", ob, i))
                 changed += 1
     require(changed)
@@ -520,18 +504,6 @@ def chunks(rows):
             result.append(row)
     require(not current and len(result) <= 8192)
     return result
-
-
-def encoded(value, depth=0):
-    require(depth <= 16)
-    if isinstance(value, bytes):
-        return value.decode("latin1")
-    if value is None or isinstance(value, (str, int)):
-        return value
-    if isinstance(value, (list, tuple)):
-        return [encoded(v, depth + 1) for v in value]
-    require(isinstance(value, dict))
-    return {encoded(k, depth + 1): encoded(v, depth + 1) for k, v in value.items()}
 
 
 def graph(f):
@@ -669,21 +641,6 @@ def source_inventory(raw, path):
             "sha256": hashlib.sha256(raw).hexdigest(), "tokens": parts, "decls": decls}
 
 
-def source_snapshot():
-    require(0 < len(sys.argv[2]) <= 4096)
-    path = os.path.abspath(sys.argv[2])
-    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
-        before = os.fstat(stream.fileno())
-        require(stat.S_ISREG(before.st_mode) and before.st_size <= 1048576)
-        raw = stream.read(1048577)
-        after, current = os.fstat(stream.fileno()), os.stat(path, follow_symlinks=False)
-        require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) ==
-                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns))
-        require((current.st_dev, current.st_ino) == (before.st_dev, before.st_ino))
-        require(len(raw) == before.st_size)
-    return source_inventory(raw, path)
-
-
 def field_types(record):
     if record["graph"] is None:
         return set()
@@ -770,8 +727,8 @@ def prove(packet):
     require(len(result.stdout) <= 65536)
     response = json.loads(result.stdout, object_pairs_hook=unique_object)
     require(type(response) is dict and set(response) == {"version", "query_ids", "work_left"})
-    require(type(response["version"]) is int and response["version"] == 1)
-    require(response["query_ids"] == [q["id"] for q in packet["queries"]])
+    require(type(response["version"]) is int and response["version"] == 2)
+    require(response["query_ids"] == [q["id"] for q in packet["proof"]["queries"]])
     require(type(response["work_left"]) is int)
     require(0 <= response["work_left"] <= packet["work_left"])
     remaining = response["work_left"]
@@ -780,12 +737,39 @@ def prove(packet):
 try:
     data = sys.stdin.buffer.read(8 * 1024 * 1024 + 1)
     require(len(data) <= 8 * 1024 * 1024 and data.count(b"\0") == 1)
-    old, new = data.split(b"\0")
-    prove(compare(old, new))
-except (ValueError, KeyError, IndexError, TypeError, RecursionError, OSError, subprocess.TimeoutExpired):
+    legacy = data.split(b"\0")
+    original = [file_snapshot(path) for path in sys.argv[5:7]]
+    require(len(original) == 2 and all(b"\0" not in raw for raw in original))
+    require([r.rstrip(b"\n") for r in original] == legacy)
+    require(original[0] != original[1])
+    objects = [file_snapshot(path) for path in sys.argv[3:5]]
+    require(len(objects) == 2 and sum(map(len, original + objects)) <= 8 * 1024 * 1024)
+    memo = {}
+    framed = [literal_frames(raw, obj, memo) for raw, obj in zip(original, objects)]
+    if literal_canonical(framed[0]) == literal_canonical(framed[1]):
+        proof = {"version": 1, "work_left": remaining, "kind": "canonical", "queries": []}
+    else:
+        require(sys.argv[7] == "iropt")
+        try:
+            proof = compare(*framed)
+        except ValueError:
+            proof = {"version": 1, "work_left": remaining, "raw": [base64.b64encode(r).decode("ascii") for r in framed], "queries": [{"id": "q0"}]}
+    packet = {"version": 2, "comparison": sys.argv[7], "work_left": remaining, "proof": proof,
+              "original": [base64.b64encode(r).decode("ascii") for r in original],
+              "objects": [base64.b64encode(r).decode("ascii") for r in objects],
+              "framed_sha256": [hashlib.sha256(r).hexdigest() for r in framed]}
+    prove(packet)
+except (ValueError, KeyError, IndexError, TypeError, RecursionError, OSError, OverflowError, struct.error, subprocess.TimeoutExpired):
     sys.exit(1)
-print("6175-owned-append-local")
+if proof.get("kind") == "canonical":
+    print("canonical-ir-match")
+else:
+    print("6175-owned-append-local")
 PYTHON
+  [ "$parent_read_rc" -eq 1 ] || return 1
+  parent_code="${DIFFIROPT_LITERAL_PYTHON}"$'\n'"${DIFFDUMP_PARENT_PYTHON}"$'\n'"${DIFFDUMP_PARENT_ENGINE}"
+  [ "${#parent_code}" -le 65536 ] || return 1
+  { printf '%s\0%s' "$1" "$2"; } | python3 -I /dev/fd/3 "$proof_dir/selfhost-ir-canon.sh" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "$3" 3<<<"$parent_code"
 }
 
 # declaredSignatureNames [kind] -- the retirement audit still consults this table.
