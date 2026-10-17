@@ -18,7 +18,7 @@
 // The certificate chain + RSA key are the throwaway test PKI shared with the tls,
 // http2, and http3-core loopback tests (leaf SAN: localhost).
 import {
-  serveH3On, serveTlsServerOn, tlsServe, TlsServer,
+  serveH3On, h3Serve, serveH3ServerOn, H3Server, serveTlsServerOn, tlsServe, TlsServer,
   Client, getTls, postTls, ok, Request, Response,
 } from "std/http"
 import { TlsConfig } from "std/tls"
@@ -39,7 +39,7 @@ const keyHex: string = "308204be020100300d06092a864886f70d0101010500048204a83082
 const bindAttempts: int = 50
 
 fn hx(s: string): []byte {
-  return decodeHex(s) catch e {
+  return decodeHex(s) catch _ {
     return []byte(0)
   }
 }
@@ -82,6 +82,12 @@ fn h3Server(sock: UdpSocket, handler: (Request) => Response) {
   }
 }
 
+fn attachedH3Server(hs: H3Server) {
+  serveH3ServerOn(hs, h3Route) catch e {
+    println("h3 server error: ${e.message()}")
+  }
+}
+
 // The TLS/HTTP-2 server, advertising Alt-Svc for the h3 endpoint on its own
 // bound port — which is why that port has to be shared with a UDP socket.
 fn tlsServer(ts: TlsServer) {
@@ -90,25 +96,22 @@ fn tlsServer(ts: TlsServer) {
   }
 }
 
-// One port number bound on both protocols: the UDP socket the h3 server serves
-// on and the TLS server that advertises it. UDP is bound first because the
-// kernel guarantees the port it hands out is free; TCP second because that is
-// the side that can still be taken, by any connected client socket in the
-// ephemeral range. A taken number is a redraw, not a failure. Bounded, so the
-// loop is provably finite and a genuinely broken bind fails rather than spins.
-class altPair { ts: TlsServer, udp: UdpSocket }
+// Bind TCP first so a UDP collision can close the TLS listener before retry.
+// H3Server.shutdown drains requests but keeps its UDP demultiplexer alive.
+class altPair { ts: TlsServer, hs: H3Server }
 
 fn bindPair(): altPair! {
   let attempt = 0
   while (attempt < bindAttempts) {
     attempt = attempt + 1
-    let udp = udpBind("127.0.0.1", 0)?
-    let port = udp.port()?
-    let ts = tlsServe("127.0.0.1", port, leafPem(), keyPem()) catch _ {
-      udp.close()
+    let ts = tlsServe("127.0.0.1", 0, leafPem(), keyPem())?
+    let port = ts.port()?
+    let hs = h3Serve("127.0.0.1", port, chainPem(), keyPem()) catch _ {
+      ts.shutdown(2000)?
       continue
     }
-    return altPair{ ts = ts, udp = udp }
+    ts.attachH3(hs)
+    return altPair{ ts = ts, hs = hs }
   }
   fail newError("no free TCP+UDP port pair after ${bindAttempts} attempts")
 }
@@ -129,7 +132,7 @@ fn altCfg(): TlsConfig! {
 fn getRetry(url: string, config: TlsConfig): Response! {
   let attempt = 0
   while (attempt < 300) {
-    let r = getTls(url, config) catch e {
+    let r = getTls(url, config) catch _ {
       sleep(10 * Millisecond)
       attempt = attempt + 1
       continue
@@ -144,7 +147,7 @@ fn getRetry(url: string, config: TlsConfig): Response! {
 fn postRetry(url: string, body: string, config: TlsConfig): Response! {
   let attempt = 0
   while (attempt < 300) {
-    let r = postTls(url, body, config) catch e {
+    let r = postTls(url, body, config) catch _ {
       sleep(10 * Millisecond)
       attempt = attempt + 1
       continue
@@ -160,7 +163,7 @@ fn postRetry(url: string, body: string, config: TlsConfig): Response! {
 fn clientGetRetry(c: Client, url: string): Response! {
   let attempt = 0
   while (attempt < 300) {
-    let r = c.get(url) catch e {
+    let r = c.get(url) catch _ {
       sleep(10 * Millisecond)
       attempt = attempt + 1
       continue
@@ -190,12 +193,14 @@ fn run(): ()! {
   let pair = bindPair()?
   let altPort = pair.ts.port()?
   spawn tlsServer(pair.ts)
-  spawn h3Server(pair.udp, h3Route)
+  spawn attachedH3Server(pair.hs)
   let c = Client(tls = altCfg()?)
   let r1 = clientGetRetry(c, "https://127.0.0.1:${altPort}/hello")?
   report("altsvc-header", r1.status == 200 && r1.body == "via-tcp" && contains(r1.headers, "h3="))
   let r2 = clientGetRetry(c, "https://127.0.0.1:${altPort}/hello")?
   report("altsvc-upgrade", r2.status == 200 && r2.body == "via-h3")
+  c.close()
+  pair.ts.shutdown(2000)?
 }
 
 fn main() {

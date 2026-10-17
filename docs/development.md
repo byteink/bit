@@ -31,8 +31,9 @@ Set an interactive budget for one command:
 BIT_MAKE_CPU_BUDGET=2 ./make test-prepush
 ```
 
-The budget caps concurrent suite gates and runs each nested compile pool with
-one job. Differential constituents retain their simultaneous oracle/current
+The budget caps concurrent suite gates. Compile pools in overlapping gates use
+one job each; the hash-seed gate runs alone and can use the full budget.
+Differential constituents retain their simultaneous oracle/current
 pair, so their width is at most half the budget, with a minimum of one pair.
 Budget 1 therefore permits two simultaneous differential compilers. Runtime
 worker contracts, including package tests at four workers, remain unchanged:
@@ -43,6 +44,10 @@ from 1 through 2147483647; invalid values fail before any artifact step runs.
 The budget also applies to an explicit `test-differentials` step. It preserves
 all gates, suite-before-differentials order, held-gate isolation, timeouts and
 retries. A lower budget can take longer; no speedup is implied.
+
+`test-prepush` runs all suite gates to completion. If any fails, it reports
+the differentials as skipped and exits with failure. A clean suite runs the
+differentials, which must also pass.
 
 ## Bootstrap
 
