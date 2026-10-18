@@ -1789,9 +1789,10 @@ columns, or to construct or serialize one row.
   composite literal, bypassing whatever invariant a hand-written `init`
   enforces (`balance >= 0`), so a row could come back in a state the class
   refuses to construct through its own `init`.
-- The module declaring `T` must import *something* from `"std/sql"` - the
-  compiler resolves `Rows`, the name the mapper's signature is written in
-  terms of, itself. No import from `"std/sql"` at all is **E0153** (#6232).
+- The compiler supplies the mapper's `"std/sql"` dependency in the module
+  declaring `T`, including when another module imports `T` under an alias.
+  The class module needs no SQL import. With `BIT_IMPLICIT_SYNTH_IMPORTS=0`,
+  a missing explicit SQL import remains **E0153** (#6251).
 - **A field's column is its own name in snake_case**, unless the field
   carries `@column("...")`: `createdAt` claims `created_at`,
   `@column("e_mail")` claims `e_mail`. `@column` is compiler-known, matched

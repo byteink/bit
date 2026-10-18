@@ -86,6 +86,9 @@ fn draftById(db: Executor, id: string): Option<Draft>! {
 }
 ```
 
+The class can live in another module without importing `"std/sql"`; the
+compiler supplies its mapper dependency.
+
 A field's column is its own name in **snake_case** (`wordCount` claims
 `word_count`) unless the field carries `@column("...")`. A result column no
 field claims is ignored, so `SELECT *` against a class that only wants three
