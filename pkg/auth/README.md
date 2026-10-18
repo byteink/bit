@@ -11,14 +11,14 @@ its matching sessions. See the route in [Sign in with Google](docs/oidc.md).
 
 ## Install
 
-`bit add bitlang.org/pkg/auth@^0.6.0` (and `bitlang.org/pkg/web@^0.9.0`, which
+`bit add bitlang.org/pkg/auth@^0.9.0` (and `bitlang.org/pkg/web@^0.13.0`, which
 it runs on) writes:
 
 ```json
 {
   "dependencies": {
-    "auth": "bitlang.org/pkg/auth@^0.6.0",
-    "web": "bitlang.org/pkg/web@^0.9.0"
+    "auth": "bitlang.org/pkg/auth@^0.9.0",
+    "web": "bitlang.org/pkg/web@^0.13.0"
   }
 }
 ```
