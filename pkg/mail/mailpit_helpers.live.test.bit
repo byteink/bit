@@ -1,0 +1,320 @@
+// #6931: bounded Mailpit API requests and subject-scoped cleanup.
+
+import { env as mlEnv } from "std/os"
+import { requestTimeout as mlRequest } from "std/http"
+import { decodeBase64 as mlDecodeBase64 } from "std/crypto"
+import {
+  Json as MlJson, jsonParse as mlParse, jsonGet as mlGet,
+  jsonAsString as mlAsString, jsonAsArray as mlAsArray, jsonAsInt as mlAsInt,
+  jsonEncode as mlEncode,
+} from "std/json"
+import { after as mlAfter, monotonic as mlNow, sleep as mlSleep } from "std/time"
+
+const mlFrom: string = "Sender <sender@inkwell.dev>"
+const mlTo: string = "rcpt@live.test"
+const mlApiTimeoutMs: int = 1000
+
+fn mlApi(method: string, url: string, body: string = ""): string {
+  let r = mlRequest(method, url, body, mlApiTimeoutMs) catch e {
+    panic("Mailpit ${method}: ${e.message()}")
+  }
+  assert(r.status == 200, "Mailpit ${method}: HTTP ${r.status}: ${r.body}")
+  return r.body
+}
+
+fn mlJson(body: string): MlJson {
+  return mlParse(body) catch e {
+    panic("Mailpit JSON: ${e.message()}")
+  }
+}
+
+fn mlField(j: MlJson, key: string): MlJson {
+  match (mlGet(j, key)) {
+    Some(v) => return v
+    None => panic("Mailpit field ${key} is missing")
+  }
+}
+
+fn mlString(j: MlJson, key: string): string {
+  match (mlAsString(mlField(j, key))) {
+    Some(v) => return v
+    None => panic("Mailpit field ${key} is not a string")
+  }
+}
+
+fn mlArray(j: MlJson, key: string): []MlJson {
+  match (mlAsArray(mlField(j, key))) {
+    Some(v) => return v
+    None => panic("Mailpit field ${key} is not an array")
+  }
+}
+
+fn mlBytes(s: string): []byte {
+  return mlDecodeBase64(s) catch e {
+    panic("live fixture base64: ${e.message()}")
+  }
+}
+
+fn mlOptions(): Options {
+  return Options{ from = mlFrom, timeout = 5 * Second, retry = Retry{ attempts = 1 } }
+}
+
+fn mlOpen(url: string, o: Options): Mailer {
+  let full = url
+  if (!contains(url, "tls=off")) {
+    full = "${url}&caFile=${mlEnv("MAIL_TEST_CA")}"
+  }
+  return open(full, o) catch e {
+    panic("live open: ${e.message()}")
+  }
+}
+
+fn mlSend(m: Mailer, msg: Message) {
+  let r = m.send(msg) catch e {
+    panic("live send: ${e.message()}")
+  }
+  assert(len(r.accepted) == len(msg.to) + len(msg.bcc), "wrong accepted recipient count")
+  assert(len(r.rejected) == 0, "a live recipient was rejected")
+}
+
+class MlScope {
+  url: string
+  api: string
+  subjects: []string = []
+
+  message(kind: string): Message {
+    assert(len(this.subjects) < 50, "live scope exceeded fifty messages")
+    let subject = "bit-live-${kind}-${timeUnixNs()}"
+    this.subjects = append(this.subjects, subject)
+    return Message{ to = [mlTo], subject = subject, text = "live body\n" }
+  }
+
+  summaries(): []MlJson {
+    let messages = mlArray(
+      mlJson(mlApi("GET", "${this.api}/api/v1/messages?limit=1000")),
+      "messages",
+    )
+    assert(len(messages) <= 1000, "Mailpit exceeded the requested page bound")
+    return messages
+  }
+
+  received(subject: string): MlJson {
+    let deadline = mlNow().ns + 5 * Second
+    let i = 0
+    while (i < 50 && mlNow().ns < deadline) {
+      let found: []MlJson = []
+      for msg of this.summaries() {
+        if (mlString(msg, "Subject") == subject) {
+          found = append(found, msg)
+        }
+      }
+      assert(len(found) <= 1, "Mailpit stored duplicate ${subject}")
+      if (len(found) == 1) {
+        let id = mlString(found[0], "ID")
+        return mlJson(mlApi("GET", "${this.api}/api/v1/message/${id}"))
+      }
+      mlSleep(20 * Millisecond)
+      i = i + 1
+    }
+    panic("Mailpit did not store ${subject}")
+  }
+
+  raw(msg: MlJson): string {
+    return mlApi("GET", "${this.api}/api/v1/message/${mlString(msg, "ID")}/raw")
+  }
+
+  clean() {
+    let ids: []MlJson = []
+    for msg of this.summaries() {
+      if (listHas(this.subjects, mlString(msg, "Subject"))) {
+        ids = append(ids, MlJson.JsonString(mlString(msg, "ID")))
+      }
+    }
+    // An empty IDs list means DELETE ALL in Mailpit.
+    if (len(ids) == 0) {
+      return
+    }
+    let _ = mlApi(
+      "DELETE",
+      "${this.api}/api/v1/messages",
+      "{\"IDs\":${mlEncode(MlJson.JsonArray(ids))}}",
+    )
+  }
+}
+
+fn mlScope(kind: string): MlScope {
+  let url = mlEnv("MAIL_TEST_${kind}_URL")
+  let api = mlEnv("MAIL_TEST_API_${kind}")
+  if (url == "" || api == "") {
+    print("  skipped: MAIL_TEST_${kind}_URL or MAIL_TEST_API_${kind} is unset\n")
+    return MlScope{}
+  }
+  if (kind != "PLAIN") {
+    assert(mlEnv("MAIL_TEST_CA") != "", "MAIL_TEST_CA is unset")
+  }
+  return MlScope{ url = url, api = api }
+}
+
+// Mailpit v1.31.4 takes JSON trigger objects, not the CLI's colon syntax.
+fn mlChaos(api: string, percent: int): string {
+  let body = "{\"Recipient\":{\"ErrorCode\":451,\"Probability\":${percent}}}"
+  let r = mlRequest("PUT", "${api}/api/v1/chaos", body, mlApiTimeoutMs) catch e {
+    return e.message()
+  }
+  if (r.status != 200) {
+    return "chaos HTTP ${r.status}: ${r.body}"
+  }
+  let recipient = mlField(mlJson(r.body), "Recipient")
+  let code = unwrap(mlAsInt(mlField(recipient, "ErrorCode")))
+  let probability = unwrap(mlAsInt(mlField(recipient, "Probability")))
+  if (code != 451 || probability != i64(percent)) {
+    return "chaos configuration did not take effect"
+  }
+  return ""
+}
+
+fn mlRequireChaos(api: string, percent: int) {
+  let err = mlChaos(api, percent)
+  assert(err == "", err)
+}
+
+// Checks outgoing header privacy and counts SMTP attempts; chaos must fail with 451.
+class MlAttempts {
+  inner: SmtpTransport
+  calls: int = 0
+
+  deliver(d: Delivery): Receipt!MailError {
+    let hs = dwHeaders(d.raw)
+    assert(len(dwNamed(hs, "bcc")) == 0, "Bcc header leaked")
+    assert(len(d.message.bcc) <= 1, "live fixture has more than one blind recipient")
+    for blind of d.message.bcc {
+      let address = parseAddress(blind) catch e {
+        panic("live Bcc address: ${e.message()}")
+      }
+      assert(!contains(join(hs, "\r\n"), address.email), "Bcc address leaked in headers")
+    }
+    this.calls = this.calls + 1
+    return this.inner.deliver(d) catch e {
+      match (e) {
+        Transient(r) => assert(r.code == 451, "unexpected transient ${r.code}")
+        _ => panic("expected chaos 451: ${e.message()}")
+      }
+      fail e
+    }
+  }
+
+  signs(): bool {
+    return true
+  }
+
+  check(): ()!MailError {
+    this.inner.check()?
+  }
+
+  close() {
+    this.inner.close()
+  }
+}
+
+// Pacer calls sleep only after it observes Transient. The concurrent reset
+// must acknowledge completion before another SMTP attempt can start.
+class MlRetryClock {
+  retry: chan<bool>
+  done: chan<string>
+  completed: bool = false
+  waits: int = 0
+
+  monotonic(): int {
+    return mlNow().ns
+  }
+
+  sleep(d: int) {
+    this.waits = this.waits + 1
+    assert(this.waits == 1, "chaos recovery needed more than one retry")
+    this.retry <- true
+    let err = this.join()
+    assert(err == "", err)
+    mlSleep(d)
+  }
+
+  join(): string {
+    let deadline = mlAfter(5 * Second)
+    let result = ""
+    select {
+      case err = <- this.done:
+        this.completed = true
+        result = err
+      case <- deadline:
+        panic("chaos reset task did not join")
+    }
+    return result
+  }
+
+  finish() {
+    if (!this.completed) {
+      this.retry <- false
+      let err = this.join()
+      assert(err == "", err)
+    }
+  }
+}
+
+fn mlResetAfterRetry(clock: MlRetryClock, api: string) {
+  let deadline = mlAfter(5 * Second)
+  select {
+    case reset = <- clock.retry:
+      if (reset) {
+        clock.done <- mlChaos(api, 0)
+      } else {
+        clock.done <- ""
+      }
+    case <- deadline:
+      clock.done <- "no transient attempt was observed"
+  }
+}
+
+fn mlRetryMailer(url: string, o: Options): (Mailer, MlAttempts) {
+  let t = parseTarget(url) catch e {
+    panic(e.message())
+  }
+  let attempts = MlAttempts{ inner = SmtpTransport(t, "inkwell.dev", o) }
+  let m = Mailer(attempts, o) catch e {
+    panic(e.message())
+  }
+  return (m, attempts)
+}
+
+test "live: chaos 451 retries after an observed attempt and exhausts its bound" {
+  let s = mlScope("PLAIN")
+  if (s.url == "") {
+    return
+  }
+  defer s.clean()
+  defer mlRequireChaos(s.api, 0)
+  mlRequireChaos(s.api, 100)
+  let o = mlOptions()
+  o.retry = Retry{ attempts = 3, base = Millisecond, max = Millisecond }
+  let (m, attempts) = mlRetryMailer(s.url, o)
+  defer m.close()
+  let clock = MlRetryClock{ retry = chan<bool>(1), done = chan<string>(1) }
+  spawn mlResetAfterRetry(clock, s.api)
+  defer clock.finish()
+  m.pace.clk = clock
+  let msg = s.message("chaos-recover")
+  mlSend(m, msg)
+  assert(attempts.calls == 2 && clock.waits == 1, "chaos did not fail exactly one attempt")
+  s.received(msg.subject)
+  mlRequireChaos(s.api, 100)
+  let (exhaust, counted) = mlRetryMailer(s.url, o)
+  defer exhaust.close()
+  let failed = false
+  exhaust.send(s.message("chaos-exhaust")) catch e {
+    match (e) {
+      Transient(r) => assert(r.code == 451, "wrong exhaustion reply")
+      _ => panic("wrong exhaustion error: ${e.message()}")
+    }
+    failed = true
+  }
+  assert(failed, "permanent chaos accepted a message")
+  assert(counted.calls == o.retry.attempts, "wrong number of retry attempts")
+}

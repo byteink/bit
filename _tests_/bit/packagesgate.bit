@@ -46,11 +46,13 @@
 // `packageNames()` panics on a `readDir` failure rather than reporting zero,
 // and only a genuinely empty `pkg/` reaches this gate as "0 packages".
 
-import { exists, isDir, readDir, readFile, writeFile } from "std/fs"
+import { cwd, exists, isDir, mkdir, openNoFollow, readDir, readFile, remove, writeFile } from "std/fs"
 import { env, envOr, exit } from "std/os"
-import { join } from "std/path"
-import { contains, parseInt } from "std/strings"
+import { clean, join } from "std/path"
+import { contains, hasSuffix, parseInt } from "std/strings"
 import { now } from "std/time"
+import { Json, JsonEntry, jsonAsObject, jsonEncode, jsonGet, jsonParse } from "std/json"
+import { uuidV4, format as uuidFormat } from "std/uuid"
 
 const defaultTimeoutS: int = 300
 const maxTimeoutS: int = 3600
@@ -204,13 +206,206 @@ fn runAll(bin: string, dir: string, cases: []string, timeoutMs: int): int {
 fn runPackage(bin: string, dir: string, name: string, idx: int, timeoutMs: int): int {
   let base = "/tmp/bit-packagesgate-${name}-${now().ns}-${idx}"
   let log = "${base}.log"
-  let cmd = "exec \"${bin}\" test \"${join(dir, name)}\""
+  let source = join(dir, name)
+  let scratch = ""
+  if (name == "mail") {
+    scratch = makeMailScratch(dir) catch e {
+      eprint("packagesgate: mail projection: ${e.message()}\n")
+      return outcomeFailed
+    }
+    source = join(scratch, name)
+  }
+  let cmd = "exec \"${bin}\" test \"${source}\""
   let r = runBounded("${base}.sh", log, cmd, timeoutMs)
+  let valid = true
+  if (name == "mail" && r == 0) {
+    valid = mailUnitOutput(log)
+  }
+  let cleaned = true
+  if (scratch != "") {
+    cleaned = removeMailScratch(scratch)
+  }
   if (r != 0) {
     return report(name, r, log)
   }
   fsRemove(log)
+  if (!cleaned || !valid) {
+    return outcomeFailed
+  }
   return outcomeOk
+}
+
+const mailMaxFiles: int = 512
+const mailMaxFileBytes: int = 1048576
+const mailMaxBytes: int = 16777216
+const mailMaxMembers: int = 64
+
+fn mailUnitOutput(log: string): bool {
+  let text = readMailFile(log) catch e {
+    eprint("packagesgate: mail output: ${e.message()}\n")
+    return false
+  }
+  if (contains(text, "live: ")) {
+    eprint("packagesgate: live test entered the ordinary mail run\n${text}\n")
+    return false
+  }
+  print(text)
+  return true
+}
+
+// #6931: the ordinary gate must never discover Mailpit test declarations.
+// Keep the existing workspace resolution while excluding the live sources.
+fn makeMailScratch(dir: string): string! {
+  let tmp = clean(envOr("TMPDIR", "/tmp"))
+  let scratch = join(tmp, "bit-packagesgate-mail-${uuidFormat(uuidV4())}")
+  mkdir(scratch)?
+  prepareMailScratch(dir, scratch) catch e {
+    if (!removeMailScratch(scratch)) {
+      fail newError("${e.message()}; mail scratch cleanup failed: ${scratch}")
+    }
+    fail e
+  }
+  return scratch
+}
+
+fn readMailFile(path: string): string! {
+  let f = openNoFollow(path)?
+  defer f.close()
+  let size = f.size()?
+  if (size > i64(mailMaxFileBytes)) {
+    fail newError("mail projection file exceeds ${mailMaxFileBytes} bytes: ${path}")
+  }
+  let bytes = []byte(int(size))
+  let n = f.readAt(bytes, i64(0))?
+  if (n != int(size)) {
+    fail newError("short read of mail projection file: ${path}")
+  }
+  return string(bytes)
+}
+
+fn mailSourceNames(source: string): []string! {
+  let entries = readDir(source)?
+  if (len(entries) > mailMaxFiles) {
+    fail newError("mail source directory exceeds ${mailMaxFiles} entries")
+  }
+  let names = ["bit.json", "bit.lock"]
+  for name of entries {
+    if (hasSuffix(name, ".bit") && !hasSuffix(name, ".live.test.bit")) {
+      names = append(names, name)
+    }
+  }
+  if (len(names) > mailMaxFiles) {
+    fail newError("mail projection exceeds ${mailMaxFiles} files")
+  }
+  return names
+}
+
+fn prepareMailScratch(dir: string, scratch: string): ()! {
+  let source = join(dir, "mail")
+  let target = join(scratch, "mail")
+  mkdir(target)?
+  let names = mailSourceNames(source)?
+  let total = 0
+  for name of names {
+    let text = readMailFile(join(source, name))?
+    total = total + len(text)
+    if (total > mailMaxBytes) {
+      fail newError("mail projection exceeds ${mailMaxBytes} bytes")
+    }
+    writeFile(join(target, name), text)?
+  }
+  let workspace = mailWorkspace(dir)?
+  writeFile(join(scratch, "bit.work"), workspace)?
+  if (readMailFile(join(scratch, "bit.work"))? != workspace) {
+    fail newError("mail projection workspace differs after write")
+  }
+  validateMailScratch(source, target, names)?
+}
+
+fn mailWorkspace(dir: string): string! {
+  let text = readMailFile(join(dir, "bit.work"))?
+  let root = jsonParse(text)?
+  let members = unwrapOr(jsonGet(root, "members"), Json.JsonNull)
+  let entries = unwrapOr(jsonAsObject(members), []JsonEntry(0))
+  if (len(entries) == 0 || len(entries) > mailMaxMembers) {
+    fail newError("mail workspace needs 1 to ${mailMaxMembers} members")
+  }
+  let absolute = clean(join(cwd()?, dir))
+  let resolved: []JsonEntry = []
+  for entry of entries {
+    resolved = append(resolved, mailWorkspaceMember(absolute, entry)?)
+  }
+  return jsonEncode(
+    Json.JsonObject(
+      [
+        JsonEntry{ key = "members", value = Json.JsonObject(resolved) },
+      ],
+    ),
+  )
+}
+
+fn mailWorkspaceMember(dir: string, entry: JsonEntry): JsonEntry! {
+  let relative = ""
+  match (entry.value) {
+    JsonString(path) => relative = path
+    _ => fail newError("mail workspace member ${entry.key} must name a directory")
+  }
+  if (relative == "") {
+    fail newError("mail workspace member ${entry.key} has an empty path")
+  }
+  let absolute = clean(join(dir, relative))
+  if (!isDir(absolute)) {
+    fail newError("mail workspace member ${entry.key} does not exist: ${absolute}")
+  }
+  return JsonEntry{ key = entry.key, value = Json.JsonString(absolute) }
+}
+
+fn validateMailScratch(source: string, target: string, names: []string): ()! {
+  let actual = readDir(target)?
+  if (len(actual) != len(names)) {
+    fail newError("mail projection file count differs")
+  }
+  for name of actual {
+    if (hasSuffix(name, ".live.test.bit")) {
+      fail newError("live source entered ordinary mail gate: ${name}")
+    }
+  }
+  for name of names {
+    if (readMailFile(join(source, name))? != readMailFile(join(target, name))?) {
+      fail newError("mail projection source differs: ${name}")
+    }
+  }
+}
+
+fn removeMailScratch(scratch: string): bool {
+  let ok = true
+  let target = join(scratch, "mail")
+  if (isDir(target)) {
+    let entries = readDir(target) catch e {
+      eprint("packagesgate: cleanup ${target}: ${e.message()}\n")
+      ok = false
+      []string(0)
+    }
+    let i = 0
+    while (i < len(entries) && i < mailMaxFiles) {
+      ok = removeMailPath(join(target, entries[i])) && ok
+      i = i + 1
+    }
+    ok = removeMailPath(target) && ok
+  }
+  let workspace = join(scratch, "bit.work")
+  if (exists(workspace)) {
+    ok = removeMailPath(workspace) && ok
+  }
+  return removeMailPath(scratch) && ok
+}
+
+fn removeMailPath(path: string): bool {
+  remove(path) catch e {
+    eprint("packagesgate: cleanup ${path}: ${e.message()}\n")
+    return false
+  }
+  return true
 }
 
 // Writes `cmd` into an executable `/bin/sh` script and runs it under a
