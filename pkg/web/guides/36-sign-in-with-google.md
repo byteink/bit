@@ -37,8 +37,9 @@ consent step, the browser returns to `/auth/google/callback`. Successful
 application code returns `204 No Content`, so there is no welcome page.
 Visit `/me` in the same browser to fetch the local public user.
 
-This is the intended configured flow. The app's automated test only checks
-the unconfigured `404`; it does not exercise a live Google login.
+This is the intended configured flow. Local signed callback fixtures check
+account binding, and the disabled-route test checks `404`. A real Google
+browser round trip remains a deployment check.
 
 ## Build the provider when the route needs it
 
@@ -48,11 +49,11 @@ the imports supply names normally shared by the app's source files.
 
 ```bit
 import { Ctx, Res, conflict, notFound, unauthorized } from "web"
-import { OidcOptions, OidcStrategy, Provider, beginAuthorization, handleCallback } from "auth"
+import { Identity, OidcOptions, OidcStrategy, Provider, beginAuthorization, handleCallback } from "auth"
 import { Db, UniqueViolation, classify } from "orm"
 import { isSome, unwrap } from "std/core"
 import { systemRoots } from "std/crypto"
-import { jsonDecString, jsonGet } from "std/json"
+import { jsonAsBool, jsonAsString, jsonGet } from "std/json"
 import { now } from "std/time"
 import { TlsConfig } from "std/tls"
 
@@ -112,9 +113,12 @@ or bearer `Strategy` to place inside `requireAuth`.
 
 ## Connect the callback to a local user
 
-Inkwell uses the same user table and insertion function as registration.
-These are actual declarations from [`users.bit`](inkwell/users.bit) and
-[`auth.bit`](inkwell/auth.bit), with source comments omitted:
+Inkwell keeps local users separate from Google identities. Apply the
+`CreateGoogleIdentities` migration with `bit migrate` before starting the app.
+It creates a composite primary key on `issuer` and `subject`, plus a foreign
+key to `users.id`. Existing users remain unlinked.
+
+The model in [`users.bit`](inkwell/users.bit) records that binding:
 
 ```bit
 @table("users") @timestamps class User {
@@ -122,41 +126,93 @@ These are actual declarations from [`users.bit`](inkwell/users.bit) and
   username: string,
   email: string,
   passwordHash: string,
+  // "author" or "admin" — checked by auth.bit's `requireAdmin`/`isOwner`.
   role: string,
   createdAt: i64,
   updatedAt: i64,
 }
 
-fn insertUser(db: Db, username: string, email: string, passwordHash: string, role: string): User! {
-  let stamp = now().ns
-  return db.table<User>().insert(
-    User{
-      id = 0, username = username, email = email, passwordHash = passwordHash, role = role,
-      createdAt = stamp, updatedAt = stamp,
-    },
-  ) catch e {
-    let cause = classify(e, "users")
-    let (_, ok) = cause.(UniqueViolation)
-    if (ok) {
-      fail conflict("that username or email is already registered")
-    }
-    fail cause
-  }
+@table("google_identities") class GoogleIdentity {
+  @id
+  issuer: string
+  @id
+  subject: string
+  userId: i64
 }
 
-fn findOrCreateGoogleUser(db: Db, email: string): User! {
-  let found = db.table<User>().where("username", email).first()?
-  if (isSome(found)) {
-    return unwrap(found)
+fn newUser(username: string, email: string, passwordHash: string, role: string): User {
+  let stamp = now().ns
+  return User{
+    id = 0, username = username, email = email, passwordHash = passwordHash, role = role,
+    createdAt = stamp, updatedAt = stamp,
   }
-  return insertUser(db, email, email, "", "author")?
 }
 ```
 
-The helper looks up `username` using the returned email. If no matching
-username exists, it inserts an author whose username and email are that
-email. The empty password hash marks an account without a local password;
-it does not create an empty password that password login will accept.
+The callback requires a JSON boolean `email_verified: true` before any account
+query. It then uses the verified token's issuer and subject, never its email,
+to find a binding. A known identity keeps its original local user when the
+email changes. For a new identity, the user and binding are inserted in one
+transaction. A username, email or identity collision rolls back both writes
+and returns `409`; it never attaches to an existing password account.
+
+These helpers in [`auth.bit`](inkwell/auth.bit) implement that order.
+`newUser` constructs the same `User` registration inserts, including timestamps;
+the empty password hash gives a Google-created user no password login.
+
+```bit
+fn verifiedGoogleEmail(identity: Identity): string! {
+  let verified = jsonGet(identity.claims, "email_verified")
+  if (!isSome(verified)) {
+    fail unauthorized("Google email must be verified")
+  }
+  let flag = jsonAsBool(unwrap(verified))
+  if (!isSome(flag) || !unwrap(flag)) {
+    fail unauthorized("Google email must be verified")
+  }
+  return googleClaim(identity, "email")?
+}
+
+fn googleClaim(identity: Identity, key: string): string! {
+  let field = jsonGet(identity.claims, key)
+  if (!isSome(field)) {
+    fail unauthorized("Google identity carries no '${key}' claim")
+  }
+  let value = jsonAsString(unwrap(field))
+  if (!isSome(value) || unwrap(value) == "") {
+    fail unauthorized("Google identity carries no '${key}' string")
+  }
+  return unwrap(value)
+}
+
+fn findOrCreateGoogleUser(db: Db, identity: Identity): User! {
+  let email = verifiedGoogleEmail(identity)?
+  let issuer = googleClaim(identity, "iss")?
+  let subject = googleClaim(identity, "sub")?
+  let result = []User{ newUser(email, email, "", "author") }
+  db.tx((tx) => {
+    let found = tx.table<GoogleIdentity>().where("issuer", issuer).where("subject", subject).first()?
+    if (isSome(found)) {
+      result[0] = tx.table<User>().find(unwrap(found).userId)?
+      return
+    }
+    // Unique usernames/emails reject collisions; a matching email never grants ownership.
+    let user = tx.table<User>().insert(result[0])?
+    tx.table<GoogleIdentity>().insert(
+      GoogleIdentity{ issuer = issuer, subject = subject, userId = user.id },
+    )?
+    result[0] = user
+  }) catch e {
+    let cause = classify(e, "users")
+    let (_, duplicate) = cause.(UniqueViolation)
+    if (duplicate) {
+      fail conflict("that username, email or provider identity is already registered")
+    }
+    fail cause
+  }
+  return result[0]
+}
+```
 
 Now the callback can reuse Inkwell's session keys:
 
@@ -165,13 +221,12 @@ fn googleCallback(c: Ctx, db: Db, cfg: AppConfig): Res! {
   if (!googleConfigured(cfg)) {
     fail notFound()
   }
-  let identity = handleCallback(buildGoogleStrategy(cfg)?, c)?
-  let emailField = jsonGet(identity.claims, "email")
-  if (!isSome(emailField)) {
-    fail unauthorized("Google identity carries no 'email' claim")
-  }
-  let email = jsonDecString(unwrap(emailField), "identity.claims.email")?
-  let u = findOrCreateGoogleUser(db, email)?
+  return googleCallbackWith(c, db, buildGoogleStrategy(cfg)?)?
+}
+
+fn googleCallbackWith(c: Ctx, db: Db, strategy: OidcStrategy): Res! {
+  let identity = handleCallback(strategy, c)?
+  let u = findOrCreateGoogleUser(db, identity)?
   let session = c.session()?
   session.set(sessionUserIdKey, "${u.id}")
   session.set(sessionRoleKey, u.role)
@@ -179,10 +234,11 @@ fn googleCallback(c: Ctx, db: Db, cfg: AppConfig): Res! {
 }
 ```
 
-`handleCallback` validates the return trip and ID token, regenerates the
-session id and stores the package identity. The app then looks up or creates
-its own `User` and writes the local user id and role into the session keys
-that article handlers already read. It does not regenerate the session again.
+`googleCallbackWith` takes the existing `OidcStrategy` value so local tests
+can supply signed tokens through its public `tokenFetch` seam. Production
+builds the Google strategy as before. Both paths call the same `handleCallback`
+for signature, issuer, audience, nonce, state and PKCE checks. Only after those
+checks and local account validation does the app set its user id and role.
 
 These route registrations are excerpted from `mountAuth`, where `app`, `db`
 and `cfg` already exist:
@@ -192,24 +248,17 @@ app.get("/auth/google", (c) => googleBegin(c, cfg))
 app.get("/auth/google/callback", (c) => googleCallback(c, db, cfg))
 ```
 
-## Know the account-linking limit
+## Keep account linking explicit
 
-A validated ID token and a verified email address are different checks. This
-callback only requires an `email` string; it does not check `email_verified`
-or persist Google's stable `sub` as a provider identity. Google documents
-[the ID token's identity claims](https://developers.google.com/identity/openid-connect/openid-connect#obtainuserinfo)
-and advises using `sub`, rather than email, to identify an account.
+Google documents [the ID token's identity claims](https://developers.google.com/identity/openid-connect/openid-connect#obtainuserinfo):
+`sub` stays with the account, while email can change. Inkwell stores that
+subject together with the verified issuer. A verified email permits a new
+account; it does not prove ownership of an existing local account.
 
-If an existing local username equals that email, this helper uses that row.
-If an existing row has the same email under a different username, the insert
-hits the users table's unique constraint and returns
-`that username or email is already registered`. An email change can also
-select a different local account. Decide how to verify and link provider
-identities before using this course app's mapping for production accounts.
-
-The app reports a missing email claim as
-`Google identity carries no 'email' claim`. It does not fall back to an
-unverified field from the request or create an anonymous author.
+Inkwell has no account-link route. A collision returns `409`; the reader can
+continue with their existing password. Do not backfill provider identities
+from users' email addresses, including older Google-created rows. A future
+link flow must verify the local account and require explicit consent.
 
 ## Check what can be checked without Google
 
@@ -221,8 +270,13 @@ the PostgreSQL setup from [Testing the API](16-testing-the-api.md), run:
 bit test pkg/web/guides/inkwell
 ```
 
-The auth package also tests callback verification with a mock provider.
-Those tests do not test Inkwell's user mapping or a real Google redirect.
+[`google.test.bit`](inkwell/google.test.bit) drives the actual callback with a
+local signed provider fixture. It covers missing, false and nonboolean email
+verification, local username collisions, unchanged password login and stable
+issuer/subject binding after an email change. They also check transaction
+rollback after a binding insert fails, and the real foreign key. The auth package separately
+tests its OIDC callback verification. Neither suite needs Google credentials
+or performs a real Google redirect.
 A configured deployment still needs the browser round trip described above,
 including checking `/me` after the callback.
 

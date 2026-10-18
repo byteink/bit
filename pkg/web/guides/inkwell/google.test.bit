@@ -1,0 +1,325 @@
+// Local signed callback fixtures exercise the app mapping through the real verifier.
+import { CheckViolation, ForeignKeyViolation } from "orm"
+import { JwksCache, JwksSource, OidcConfig, TokenFetch } from "auth"
+import { encodeBase64Url, hmac, HashAlg } from "std/crypto"
+import { jsonEncode } from "std/json"
+import { parseJwks } from "std/jwt"
+import { replace, split } from "std/strings"
+import { Second } from "std/time"
+import { emptyTrustStore } from "std/tls"
+
+const googleFixtureIssuer = "https://accounts.google.com"
+const googleFixtureClient = "inkwell-local-client"
+const googleFixtureKey = "inkwell-callback-fixture-secret-32"
+
+class GoogleTokenBox {
+  token: string,
+  calls: int,
+}
+
+fn googleFixtureStrategy(box: GoogleTokenBox): OidcStrategy! {
+  let cfg = OidcConfig{
+    issuer = googleFixtureIssuer, authorizationEndpoint = googleFixtureIssuer + "/authorize",
+    tokenEndpoint = googleFixtureIssuer + "/token", jwksUri = googleFixtureIssuer + "/jwks",
+  }
+  let keys = parseJwks(
+      "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"fixture\",\"k\":\"" +
+      encodeBase64Url([]byte(googleFixtureKey)) +
+      "\"}]}",
+  )?
+  let cache = JwksCache(cfg.jwksUri, TlsConfig(emptyTrustStore()), JwksSource.Parsed(keys))?
+  let fetch: TokenFetch = (url, headers, body) => {
+    box.calls = box.calls + 1
+    assert(contains(body, "code_verifier="), "PKCE verifier missing from code exchange")
+    return "{\"id_token\":\"" + box.token + "\"}"
+  }
+  return OidcStrategy(
+    Provider.Endpoints(cfg, cache), googleFixtureClient, "local-secret",
+    "https://inkwell.example.test/callback", OidcOptions{ tokenFetch = fetch },
+  )?
+}
+
+fn googleFixtureApp(db: Db, box: GoogleTokenBox): App! {
+  let strategy = googleFixtureStrategy(box)?
+  let app = App(Config{ secret = "google-fixture", sessions = MemoryStore(100) })
+  app.get("/begin", (c) => beginAuthorization(strategy, c))
+  app.get("/flow", (c) => {
+    let session = c.session()?
+    return c.text(session.get("auth:oidc:state") + "|" + session.get("auth:oidc:nonce"))
+  })
+  app.get("/callback", (c) => googleCallbackWith(c, db, strategy))
+  app.get("/me", (c) => showMe(c, db))
+  app.freeze()?
+  return app
+}
+
+fn googleFixtureToken(
+  nonce: string,
+  subject: string,
+  email: string,
+  verified: Option<Json>,
+): string {
+  let entries = []JsonEntry{
+    JsonEntry{ key = "iss", value = Json.JsonString(googleFixtureIssuer) },
+    JsonEntry{ key = "aud", value = Json.JsonString(googleFixtureClient) },
+    JsonEntry{ key = "sub", value = Json.JsonString(subject) },
+    JsonEntry{ key = "exp", value = Json.JsonInt(now().ns / Second + 3600) },
+    JsonEntry{ key = "iat", value = Json.JsonInt(now().ns / Second - 10) },
+    JsonEntry{ key = "nonce", value = Json.JsonString(nonce) },
+    JsonEntry{ key = "email", value = Json.JsonString(email) },
+  }
+  if (isSome(verified)) {
+    entries = append(entries, JsonEntry{ key = "email_verified", value = unwrap(verified) })
+  }
+  let header = encodeBase64Url([]byte("{\"alg\":\"HS256\",\"kid\":\"fixture\"}"))
+  let payload = encodeBase64Url([]byte(jsonEncode(Json.JsonObject(entries))))
+  let input = header + "." + payload
+  return input +
+    "." +
+    encodeBase64Url(hmac(HashAlg.Sha256, []byte(googleFixtureKey), []byte(input)))
+}
+
+fn googleFixtureRequest(path: string, cookie: string): Request {
+  return Request{ method = "GET", path = path, headers = "Cookie: " + cookie, body = "" }
+}
+
+fn googleFixtureLogin(
+  app: App,
+  box: GoogleTokenBox,
+  subject: string,
+  email: string,
+  verified: Option<Json>,
+): Response {
+  let begin = app.handle(googleFixtureRequest("/begin", ""))
+  assert(begin.status == 302, "begin must redirect")
+  let cookie = cookiePair(begin.getHeader("Set-Cookie"))
+  let flow = split(app.handle(googleFixtureRequest("/flow", cookie)).body, "|")
+  box.token = googleFixtureToken(flow[1], subject, email, verified)
+  return app.handle(googleFixtureRequest("/callback?code=local-code&state=" + flow[0], cookie))
+}
+
+fn googleFixtureDb(): Db! {
+  let cfg = testConfig()?
+  return open(cfg.databaseUrl)?
+}
+
+test "Google callback rejects missing, false and nonboolean email verification before any account query" {
+  let db = googleFixtureDb() catch e {
+    panic(e.message())
+  }
+  db.pool.close()
+  let box = GoogleTokenBox{ token = "", calls = 0 }
+  let app = googleFixtureApp(db, box) catch e {
+    panic(e.message())
+  }
+  let email = uniqueName("unverified") + "@example.test"
+  let flags = []Option<Json>{
+    Option.None,
+    Option.Some(Json.JsonBool(false)),
+    Option.Some(Json.JsonString("true")),
+  }
+  for flag of flags {
+    let res = googleFixtureLogin(app, box, "unverified", email, flag)
+    assert(res.status == 401, "unverified callback must fail: ${res.status}: ${res.body}")
+  }
+  assert(box.calls == 3, "each invalid claim must pass through the signed callback verifier")
+}
+
+test "Google callback refuses an existing local username and preserves password login" {
+  let app = testApp()
+  let email = uniqueName("col") + "@example.test"
+  registerAndLogin(app, email, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let db = googleFixtureDb() catch e {
+    panic(e.message())
+  }
+  defer db.pool.close()
+  let box = GoogleTokenBox{ token = "", calls = 0 }
+  let callback = googleFixtureApp(db, box) catch e {
+    panic(e.message())
+  }
+  let subject = uniqueName("collision")
+  let res = googleFixtureLogin(callback, box, subject, email, Option.Some(Json.JsonBool(true)))
+  assert(res.status == 409, "local username must not acquire a Google binding: ${res.body}")
+  let identities = db.table<GoogleIdentity>().where("subject", subject).count() catch e {
+    panic(e.message())
+  }
+  assert(identities == 0, "collision created a provider binding")
+  let login = app.handle(
+    jsonReq(
+      "POST",
+      "/auth/login",
+      "",
+      "{\"username\":\"${email}\",\"password\":\"correct horse battery\"}",
+    ),
+  )
+  assert(login.status == 204, "existing local password stopped working")
+}
+
+test "Google callback keeps issuer and subject binding when the email changes" {
+  let db = googleFixtureDb() catch e {
+    panic(e.message())
+  }
+  defer db.pool.close()
+  let box = GoogleTokenBox{ token = "", calls = 0 }
+  let app = googleFixtureApp(db, box) catch e {
+    panic(e.message())
+  }
+  let subject = uniqueName("stable-subject")
+  let email = uniqueName("google") + "@example.test"
+  let first = googleFixtureLogin(app, box, subject, email, Option.Some(Json.JsonBool(true)))
+  assert(first.status == 204, "first callback failed: ${first.body}")
+  let original = findUserByUsername(db, email) catch e {
+    panic(e.message())
+  }
+  let second = googleFixtureLogin(
+    app,
+    box,
+    subject,
+    uniqueName("changed") + "@example.test",
+    Option.Some(Json.JsonBool(true)),
+  )
+  assert(second.status == 204, "repeat callback failed: ${second.body}")
+  let cookie = cookiePair(second.getHeader("Set-Cookie"))
+  let me = app.handle(googleFixtureRequest("/me", cookie))
+  assert(me.status == 200 && contains(me.body, email), "changed email selected another local user")
+  let binding = db.table<GoogleIdentity>().where("issuer", googleFixtureIssuer).where(
+    "subject",
+    subject,
+  ).first() catch e {
+    panic(e.message())
+  }
+  assert(
+    isSome(binding) && unwrap(binding).userId == original.id,
+    "stable identity changed its local account",
+  )
+  let unverified = googleFixtureLogin(app, box, subject, email, Option.Some(Json.JsonBool(false)))
+  assert(unverified.status == 401, "existing identity bypassed verified-email check")
+}
+
+test "Google callback refuses an existing email under another local username" {
+  let app = testApp()
+  let username = uniqueName("local")
+  registerAndLogin(app, username, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let db = googleFixtureDb() catch e {
+    panic(e.message())
+  }
+  defer db.pool.close()
+  let box = GoogleTokenBox{ token = "", calls = 0 }
+  let callback = googleFixtureApp(db, box) catch e {
+    panic(e.message())
+  }
+  let subject = uniqueName("email-collision")
+  let email = username + "@example.test"
+  let res = googleFixtureLogin(callback, box, subject, email, Option.Some(Json.JsonBool(true)))
+  assert(res.status == 409, "email collision must not link a local account: ${res.body}")
+  let users = db.table<User>().where("username", email).count() catch e {
+    panic(e.message())
+  }
+  let identities = db.table<GoogleIdentity>().where("subject", subject).count() catch e {
+    panic(e.message())
+  }
+  assert(users == 0 && identities == 0, "collision left an orphan user or identity")
+}
+
+fn requireGoogleCheckFailure(db: Db, subject: string, email: string) {
+  let identity = Identity{
+    id = subject,
+    claims = Json.JsonObject(
+      [
+        JsonEntry{ key = "iss", value = Json.JsonString(googleFixtureIssuer) },
+        JsonEntry{ key = "sub", value = Json.JsonString(subject) },
+        JsonEntry{ key = "email", value = Json.JsonString(email) },
+        JsonEntry{ key = "email_verified", value = Json.JsonBool(true) },
+      ],
+    ),
+  }
+  let rejected = false
+  findOrCreateGoogleUser(db, identity) catch e {
+    let (_, check) = e.(CheckViolation)
+    assert(check, "mapping failure must be the controlled CHECK: ${e.message()}")
+    rejected = true
+  }
+  assert(rejected, "mapping bypassed the controlled binding CHECK")
+}
+
+fn requireNoGoogleRows(db: Db, subject: string, email: string) {
+  let users = db.table<User>().where("username", email).count() catch e {
+    panic(e.message())
+  }
+  let identities = db.table<GoogleIdentity>().where("subject", subject).count() catch e {
+    panic(e.message())
+  }
+  assert(users == 0 && identities == 0, "failed binding insert left an orphan user or identity")
+}
+
+// runModuleTests (compiler/testrun.bit) waits for each test child. This
+// constraint excludes only its unique subject, leaving other identities valid.
+test "Google callback rolls back its new user when the binding insert fails" {
+  let db = googleFixtureDb() catch e {
+    panic(e.message())
+  }
+  defer db.pool.close()
+  let subject = uniqueName("rollback")
+  let name = "google_rollback_" + replace(uuidFormat(uuidV4()), "-", "")
+  db.exec("alter table google_identities add constraint ${name} check (subject <> '${subject}')") catch e {
+    panic("add fixture constraint: ${e.message()}")
+  }
+  defer {
+    db.exec("alter table google_identities drop constraint ${name}") catch e {
+      panic("drop fixture constraint: ${e.message()}")
+    }
+  }
+  // The driver drops constraint names. Catalog counts locate this typed
+  // failure uniquely after the user insert, without parsing error messages.
+  let owned = countRows(
+    "select count(*) as n from pg_constraint where conrelid = 'google_identities'::regclass and contype = 'c' and conname = $1", name,
+  )
+  let other = countRows(
+    "select count(*) as n from pg_constraint where conrelid = 'google_identities'::regclass and contype = 'c' and conname <> $1", name,
+  )
+  let userChecks = countRows(
+    "select count(*) as n from pg_constraint where conrelid = 'users'::regclass and contype = 'c' and $1 <> ''", name,
+  )
+  assert(
+    owned == 1 && other == 0 && userChecks == 0,
+    "rollback witness must identify only the owned binding CHECK",
+  )
+  let box = GoogleTokenBox{ token = "", calls = 0 }
+  let app = googleFixtureApp(db, box) catch e {
+    panic(e.message())
+  }
+  let email = uniqueName("rollback") + "@example.test"
+  let res = googleFixtureLogin(app, box, subject, email, Option.Some(Json.JsonBool(true)))
+  assert(
+    res.status == 500 && box.calls == 1,
+    "controlled binding failure must propagate after the signed callback",
+  )
+  requireNoGoogleRows(db, subject, email)
+  requireGoogleCheckFailure(db, subject, email)
+  requireNoGoogleRows(db, subject, email)
+}
+
+test "Google identity migration rejects a binding to a missing local user" {
+  let db = googleFixtureDb() catch e {
+    panic(e.message())
+  }
+  defer db.pool.close()
+  let subject = uniqueName("foreign-key")
+  let rejected = false
+  db.table<GoogleIdentity>().insert(
+    GoogleIdentity{ issuer = googleFixtureIssuer, subject = subject, userId = i64(-1) },
+  ) catch e {
+    let cause = classify(e, "google_identities")
+    let (_, foreignKey) = cause.(ForeignKeyViolation)
+    rejected = foreignKey
+  }
+  assert(rejected, "real Google identity foreign key did not reject a missing user")
+  let identities = db.table<GoogleIdentity>().where("subject", subject).count() catch e {
+    panic(e.message())
+  }
+  assert(identities == 0, "foreign-key refusal left a binding")
+}
