@@ -296,6 +296,26 @@ fn netDialTcpCheckDone(fd: int, rc2: int, ce: int, outResult: *i64): bool {
   return false
 }
 
+fn netDialTcpRetry(fd: int, host: *u8, hostLen: int, port: int): bool {
+  // THE ADDRESS IS REBUILT EVERY ATTEMPT, NOT REUSED. `saBytes()`/`sa6Bytes()`/`ipBytes()`
+  // are PER-WORKER scratch (#3273), shared by every entry point that resumes
+  // on the same worker, and the caller's `netAwaitReady` PARKS the calling green
+  // thread — so either another task runs a `netListenTcp`/`netBindUdp`/
+  // `netDialTcp` of its own on this worker and leaves its address in this
+  // worker's slot, or this task itself resumes on a DIFFERENT worker whose
+  // slot was never filled for this call. Reconnecting to whatever is there
+  // either way would be a silent cross-connection.
+  let salen = netFillHostAddr(host, hostLen, port)
+  if (salen == 0) {
+    netClose(fd)
+    *netDialDoneAddr() = i64(0 - 1)
+    return true
+  }
+  let rc = sysRc(int(syscall(sysConnect(), i64(fd), i64(int(netHostSa(salen))), i64(salen))))
+  let ce = lastErr()
+  return netDialTcpCheckDone(fd, rc, ce, netDialDoneAddr())
+}
+
 fn netDialTcpConnect(fd: int, gen: int, host: *u8, hostLen: int, port: int): int {
   let salen = netFillHostAddr(host, hostLen, port)
   let rc = sysRc(int(syscall(sysConnect(), i64(fd), i64(int(netHostSa(salen))), i64(salen))))
@@ -307,9 +327,10 @@ fn netDialTcpConnect(fd: int, gen: int, host: *u8, hostLen: int, port: int): int
     netClose(fd)
     return 0 - e
   }
+  let stalls = 0
   let spins = 0
-  // Bounded (Power of 10). One parked wait suffices when there is a scheduler;
-  // the loop exists for the unscheduled caller, which must poll for completion.
+  // Readiness can precede connect completion (#8363). Bound parked waits and
+  // unscheduled retries independently, as in netAcceptTcpLoop.
   //
   // `SO_ERROR == 0` DOES NOT MEAN CONNECTED — it means "no error HAS BEEN
   // RECORDED YET", and immediately after EINPROGRESS that is the state of every
@@ -337,32 +358,21 @@ fn netDialTcpConnect(fd: int, gen: int, host: *u8, hostLen: int, port: int): int
   //   anything else            the deferred failure, reported here
   //
   // SO_ERROR is then read on the completed socket, where it IS meaningful.
-  while (spins < netMaxSpins) {
+  while (stalls < netMaxStalls && spins < netMaxSpins) {
     if (netAwaitReady(fd, pollWrite, gen)) {
-      spins = netMaxSpins
+      if (pdFdClosing(fd)) {
+        netClose(fd)
+        return 0 - 1
+      }
+      stalls = stalls + 1
     } else {
       spins = spins + 1
     }
-    // THE ADDRESS IS REBUILT EVERY ATTEMPT, NOT REUSED. `saBytes()`/`sa6Bytes()`/`ipBytes()`
-    // are PER-WORKER scratch (#3273), shared by every entry point that resumes
-    // on the same worker, and `netAwaitReady` above PARKS the calling green
-    // thread — so either another task runs a `netListenTcp`/`netBindUdp`/
-    // `netDialTcp` of its own on this worker and leaves its address in this
-    // worker's slot, or this task itself resumes on a DIFFERENT worker whose
-    // slot was never filled for this call. Reconnecting to whatever is there
-    // either way would be a silent cross-connection.
-    salen = netFillHostAddr(host, hostLen, port)
-    if (salen == 0) {
-      netClose(fd)
-      return 0 - 1
-    }
-    let rc2 = sysRc(int(syscall(sysConnect(), i64(fd), i64(int(netHostSa(salen))), i64(salen))))
-    let ce = lastErr()
-    if (netDialTcpCheckDone(fd, rc2, ce, netDialDoneAddr())) {
+    if (netDialTcpRetry(fd, host, hostLen, port)) {
       return int(*netDialDoneAddr())
     }
   }
-  // Spin bound exhausted with the handshake still pending: not a
+  // Retry bound exhausted with the handshake still pending: not a
   // kernel-reported cause, so this stays the fixed `-1` sentinel — see the
   // identical branch in the Darwin twin.
   netClose(fd)
