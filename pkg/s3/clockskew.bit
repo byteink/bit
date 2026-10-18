@@ -1,0 +1,100 @@
+// Clock correction shared by a client's requests (#6607). The transport passes
+// raw send/receive times; the system clock is never changed.
+import { header as httpHeader } from "std/http"
+import { contains, hasPrefix, toLower } from "std/strings"
+import { Mutex } from "std/sync"
+import { Second, Timestamp, parseHttpDate } from "std/time"
+
+const skewIntMax: int = 9223372036854775807
+const skewIntMin: int = -9223372036854775807 - 1
+
+fn skewSubtract(a: int, b: int): Option<int> {
+  if (b > 0 && a < skewIntMin + b) {
+    return Option<int>.None
+  }
+  if (b < 0 && a > skewIntMax + b) {
+    return Option<int>.None
+  }
+  return Option<int>.Some(a - b)
+}
+
+fn skewCandidate(headers: string, sent: Timestamp, received: Timestamp): Option<int> {
+  // An empty Age field still means a cached response.
+  let lower = toLower(headers)
+  if (hasPrefix(lower, "age:") || contains(lower, "\r\nage:")) {
+    return Option<int>.None
+  }
+  let interval = skewSubtract(received.ns, sent.ns)
+  if (!isSome(interval)) {
+    return Option<int>.None
+  }
+  let elapsed = unwrap(interval)
+  if (elapsed < 0 || elapsed > 900 * Second) {
+    return Option<int>.None
+  }
+  let server = parseHttpDate(httpHeader(headers, "date"), received) catch _ {
+    return Option<int>.None
+  }
+  return skewSubtract(server.ns, sent.ns + elapsed / 2)
+}
+
+// Keep one instance per client. Durations and offsets are nanoseconds.
+export class ClockSkewCorrection {
+  mu: Mutex
+  systemClockOffset: int
+  disabled: bool
+
+  init(disableClockSkewCorrection: bool = false) {
+    this.mu = Mutex()
+    this.systemClockOffset = 0
+    this.disabled = disableClockSkewCorrection
+  }
+
+  // The retained correction, also available to callers inspecting drift.
+  export offset(): int {
+    this.mu.lock()
+    let value = this.systemClockOffset
+    this.mu.unlock()
+    return value
+  }
+
+  // The signing instant and its offset snapshot belong to the same attempt.
+  // Pass the snapshot to observe even if another request corrects the clock.
+  export signingTime(raw: Timestamp): (Timestamp, int)!S3Error {
+    let value = this.offset()
+    if (this.disabled) {
+      value = 0
+    }
+    if (value > 0 && raw.ns > skewIntMax - value) {
+      fail invalidInput("clock skew: signing time is outside the Timestamp range")
+    }
+    if (value < 0 && raw.ns < skewIntMin - value) {
+      fail invalidInput("clock skew: signing time is outside the Timestamp range")
+    }
+    return (Timestamp{ ns = raw.ns + value }, value)
+  }
+
+  // Call for successes and errors. The result is the skewCorrected argument
+  // of Invocation.decide for an error, not a retry decision on its own.
+  export observe(
+    headers: string,
+    sent: Timestamp,
+    received: Timestamp,
+    preRequestOffset: int,
+  ): bool {
+    if (this.disabled) {
+      return false
+    }
+    let measured = skewCandidate(headers, sent, received)
+    if (!isSome(measured)) {
+      return false
+    }
+    let candidate = unwrap(measured)
+    this.mu.lock()
+    this.systemClockOffset = candidate
+    this.mu.unlock()
+    // The SDK compares the new magnitude, not the size of the change.
+    return (candidate >= 240 * Second || candidate <= -240 * Second) &&
+      candidate != preRequestOffset
+  }
+}

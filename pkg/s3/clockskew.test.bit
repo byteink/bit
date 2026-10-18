@@ -1,0 +1,275 @@
+// Pinned SDK vectors: aws-sdk-js-v3 054298b1520f, getUpdatedSystemClockOffset.spec.ts
+// and AwsSdkSigV4Signer.errorHandler. Legacy no-send cases use send == receive.
+import { SigHeader, SigV4Config, SigV4Request, SigV4Signed, sha256Hex, signV4 } from "aws"
+import { Response, atoi } from "std/http"
+import { env } from "std/os"
+import { Millisecond, Second, Timestamp, formatHttpDate, parseHttpDate, utc } from "std/time"
+
+fn skewTime(): Timestamp {
+  return parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT") catch e {
+    panic(e.message())
+  }
+}
+
+fn skewHeaders(server: Timestamp): string {
+  return "Date: ${formatHttpDate(server)}\r\n"
+}
+
+fn skewUpdate(c: ClockSkewCorrection, delta: int, elapsed: int = 0, previous: int = 0): bool {
+  let sent = skewTime()
+  return c.observe(
+    skewHeaders(Timestamp{ ns = sent.ns + delta }), sent,
+    Timestamp{ ns = sent.ns + elapsed }, previous,
+  )
+}
+
+class SkewVector {
+  delta: int,
+  elapsed: int,
+  age: string,
+  expected: int,
+}
+
+test "all 10 pinned SDK offset cases retain their expected correction" {
+  let rows = [
+    SkewVector{ delta = Second, expected = Second },
+    SkewVector{ delta = Second, expected = Second },
+    SkewVector{ delta = 100 * Second, expected = 100 * Second },
+    SkewVector{ delta = Second, elapsed = 2 * Second, expected = 0 },
+    SkewVector{ delta = 300 * Second, elapsed = 2 * Second, expected = 299 * Second },
+    SkewVector{ age = "Age: 17280\r\n", expected = 100 * Millisecond },
+    SkewVector{ delta = 300 * Second, expected = 300 * Second },
+    SkewVector{ delta = 300 * Second, elapsed = 960 * Second, expected = 100 * Millisecond },
+    SkewVector{ delta = 1000 * Second, elapsed = 900 * Second, expected = 550 * Second },
+    SkewVector{ delta = 300 * Second, expected = 300 * Second },
+  ]
+  let passed = 0
+  for row of rows {
+    let c = ClockSkewCorrection()
+    c.systemClockOffset = 100 * Millisecond
+    let sent = skewTime()
+    let headers = skewHeaders(Timestamp{ ns = sent.ns + row.delta }) + row.age
+    let _ = c.observe(headers, sent, Timestamp{ ns = sent.ns + row.elapsed }, c.offset())
+    assert(c.offset() == row.expected, "SDK vector ${passed}: ${c.offset()} != ${row.expected}")
+    passed = passed + 1
+  }
+  assert(passed == 10, "${passed} of 10 SDK cases")
+}
+
+test "retry uses new magnitude at both 240 second boundaries, never delta" {
+  let c = ClockSkewCorrection()
+  for seconds of [239, 240, 241, -239, -240, -241] {
+    let previous = c.offset()
+    let marked = skewUpdate(c, seconds * Second, 0, previous)
+    assert(marked == (seconds >= 240 || seconds <= -240), "boundary ${seconds}")
+    assert(c.offset() == seconds * Second, "small corrections also persist")
+    assert(!skewUpdate(c, seconds * Second, 0, c.offset()), "unchanged offset is not corrected")
+  }
+  assert(skewUpdate(c, 7200 * Second), "large correction")
+  assert(
+    skewUpdate(c, 7201 * Second, 0, c.offset()),
+    "one-second change with large new offset retries",
+  )
+  assert(
+    !skewUpdate(c, Second, 0, c.offset()),
+    "large change with small new offset does not retry",
+  )
+}
+
+test "cached missing malformed and long responses retain offset and never mark correction" {
+  let c = ClockSkewCorrection()
+  let _ = skewUpdate(c, 7200 * Second)
+  let sent = skewTime()
+  let valid = skewHeaders(sent)
+  for headers of [
+    "", "Date: broken\r\n", "Date: Mon, 06 Nov 1994 08:49:37 GMT\r\n",
+    "Age: 0\r\n" + valid, valid + "aGe:\r\n", valid + "AGE: invalid\r\n",
+  ] {
+    assert(!c.observe(headers, sent, sent, c.offset()), "untrusted response: ${headers}")
+    assert(c.offset() == 7200 * Second, "retained on untrusted response")
+  }
+  assert(!skewUpdate(c, 0, 900 * Second + 1, c.offset()), "900 seconds plus one ns rejected")
+  assert(!skewUpdate(c, 0, -1, c.offset()), "backwards clock rejected")
+  assert(c.offset() == 7200 * Second, "invalid intervals retain correction")
+  assert(skewUpdate(c, 1000 * Second, 900 * Second, c.offset()), "900 seconds accepted")
+  assert(c.offset() == 550 * Second, "midpoint at boundary")
+}
+
+test "disabled correction neither learns nor applies an offset" {
+  let c = ClockSkewCorrection(disableClockSkewCorrection = true)
+  assert(!skewUpdate(c, 7200 * Second), "disabled response")
+  assert(c.offset() == 0, "disabled state")
+  let (at, previous) = c.signingTime(skewTime()) catch e {
+    panic(e.message())
+  }
+  assert(at.ns == skewTime().ns && previous == 0, "disabled signing")
+}
+
+test "correction made by another request is compared to this request snapshot" {
+  let c = ClockSkewCorrection()
+  let (_, previous) = c.signingTime(skewTime()) catch e {
+    panic(e.message())
+  }
+  let _ = skewUpdate(c, 7200 * Second)
+  assert(skewUpdate(c, 7200 * Second, 0, previous), "concurrent correction enables retry")
+  assert(!skewUpdate(c, 7200 * Second, 0, c.offset()), "new request already used correction")
+}
+
+test "extreme timestamps cannot wrap interval offset or signing time" {
+  let c = ClockSkewCorrection()
+  let high = Timestamp{ ns = skewIntMax }
+  let low = Timestamp{ ns = skewIntMin }
+  assert(!c.observe(skewHeaders(skewTime()), low, high, 0), "interval overflow")
+  assert(!c.observe(skewHeaders(high), low, low, 0), "offset overflow")
+  for correction of [Second, -Second] {
+    c.systemClockOffset = correction
+    let raw = high
+    if (correction < 0) {
+      raw = low
+    }
+    let rejected = false
+    let _ = c.signingTime(raw) catch e {
+      match (e.kind) {
+        InvalidInput(_) => rejected = true
+        _ => panic("wrong signing error kind")
+      }
+      (raw, 0)
+    }
+    assert(rejected, "signing overflow must fail with InvalidInput")
+  }
+}
+
+// Bounded transport: a response succeeds only when its actual SigV4 date agrees.
+class SkewServer {
+  dates: []string
+
+  send(signed: SigV4Signed): Response {
+    assert(len(this.dates) < 3, "script permits at most three sends")
+    let date = ""
+    for header of signed.headers {
+      if (header.name == "x-amz-date") {
+        date = header.value
+      }
+    }
+    assert(date != "", "signer emitted x-amz-date")
+    this.dates = append(this.dates, date)
+    let status = 400
+    if (date == "19941106T104937Z") {
+      status = 200
+    }
+    return Response{
+      status = status, headers = "Date: Sun, 06 Nov 1994 10:49:37 GMT\r\n",
+      body = "<Error><Code>RequestTimeTooSkewed</Code></Error>",
+    }
+  }
+}
+
+fn skewSigned(at: Timestamp): SigV4Signed! {
+  let date = at.inZone(utc()).format("yyyyMMdd'T'HHmmss'Z'")?
+  return signV4(
+    SigV4Config{
+      accessKeyId = "article-test",
+      secretKey = "article-test-secret",
+      region = "us-east-1",
+      service = "s3",
+    },
+    SigV4Request{
+      method = "GET", path = "/inkwell/cover", headers = [
+        SigHeader{ name = "host", value = "storage.example" },
+      ],
+      payloadHash = sha256Hex(""),
+    }, date,
+  )?
+}
+
+fn skewCall(c: ClockSkewCorrection, strategy: RetryStrategy, server: SkewServer): ()! {
+  let call = strategy.begin()
+  let i = 0
+  while (i < strategy.maxAttempts) {
+    let sent = skewTime()
+    let (at, previous) = c.signingTime(sent)?
+    let response = server.send(skewSigned(at)?)
+    let corrected = c.observe(response.headers, sent, sent, previous)
+    if (response.status == 200) {
+      call.succeeded()
+      return
+    }
+    let serviceError = errorFromResponse(response)
+    match (call.decide(serviceError, true, corrected)) {
+      Stop(_) => fail serviceError
+      Retry(delay) => call.pause(delay)
+    }
+    i = i + 1
+  }
+  fail invalidInput("clock skew test exhausted attempts")
+}
+
+test "two hours ahead rejects first signed date then succeeds twice in exactly three sends" {
+  let c = ClockSkewCorrection()
+  let strategy = RetryStrategy() catch e {
+    panic(e.message())
+  }
+  strategy.random = () => 0.0
+  let server = SkewServer{ dates = []string(0) }
+  skewCall(c, strategy, server) catch e {
+    panic(e.message())
+  }
+  assert(len(server.dates) == 2, "first call needs one retry")
+  assert(server.dates[0] == "19941106T084937Z", "first signing uses local time")
+  assert(server.dates[1] == "19941106T104937Z", "retry signing applies correction")
+  skewCall(c, strategy, server) catch e {
+    panic(e.message())
+  }
+  assert(
+    len(server.dates) == 3 && server.dates[2] == "19941106T104937Z",
+    "next call retains offset",
+  )
+}
+
+test "disabled correction returns the skew service error after one signed send" {
+  let c = ClockSkewCorrection(disableClockSkewCorrection = true)
+  let strategy = RetryStrategy() catch e {
+    panic(e.message())
+  }
+  let server = SkewServer{ dates = []string(0) }
+  let rejected = false
+  skewCall(c, strategy, server) catch e {
+    assert(contains(e.message(), "RequestTimeTooSkewed"), "preserve service error: ${e.message()}")
+    rejected = true
+  }
+  assert(rejected && len(server.dates) == 1 && c.offset() == 0, "disabled stops without retry")
+}
+
+fn skewHammer(c: ClockSkewCorrection, done: chan<int>) {
+  let n = 0
+  while (n < 32) {
+    let raw = skewTime()
+    let (at, previous) = c.signingTime(raw) catch e {
+      panic(e.message())
+    }
+    assert(at.ns - raw.ns == previous, "atomic signing snapshot")
+    assert(previous == 240 * Second || previous == 241 * Second, "complete offset")
+    let _ = skewUpdate(c, (240 + n % 2) * Second, 0, previous)
+    n = n + 1
+  }
+  done <- n
+}
+
+test "four tasks share correction without losing signing snapshots" {
+  assert(atoi(env("BIT_WORKERS")) >= 2, "clock skew concurrency requires BIT_WORKERS>=2")
+  let c = ClockSkewCorrection()
+  let _ = skewUpdate(c, 240 * Second)
+  let done = chan<int>(4)
+  let i = 0
+  while (i < 4) {
+    spawn skewHammer(c, done)
+    i = i + 1
+  }
+  let completed = 0
+  let j = 0
+  while (j < 4) {
+    completed = completed + <- done
+    j = j + 1
+  }
+  assert(completed == 128, "bounded concurrent updates completed")
+}

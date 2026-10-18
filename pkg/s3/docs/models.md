@@ -6,6 +6,60 @@ When Inkwell saves a storage setting, save the value the service expects.
 `wire()` gives you that value. `fromWire()` reads it back without losing a
 value a service adds later.
 
+## Keep signing time in step with storage
+
+When an unattended Inkwell device drifts from its storage server, a request
+can fail even with valid credentials. If you build a request transport,
+keep one `ClockSkewCorrection` alongside its `RetryStrategy`. Capture the
+raw send time, use `signingTime` for the instant passed to your signer, and
+keep the returned offset snapshot until the response arrives.
+
+```bit
+import { ClockSkewCorrection, RetryStrategy } from "s3"
+import { Second, Timestamp, parseHttpDate } from "std/time"
+
+fn main(): ()! {
+  let correction = ClockSkewCorrection()
+  let retries = RetryStrategy()?
+  let call = retries.begin()
+  let sent = parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT")?
+  let (signingAt, previous) = correction.signingTime(sent)?
+  println("Sign the cover request at ${signingAt.toString()}")
+
+  let received = Timestamp{ ns = sent.ns + 2 * Second }
+  let corrected = correction.observe(
+    "Date: Sun, 06 Nov 1994 10:49:38 GMT\r\n", sent, received, previous,
+  )
+  println("Retained offset: ${correction.offset()} nanoseconds")
+  println("Pass ${corrected} as skewCorrected to this call's decide method")
+  println("Attempt ${call.attempt()}")
+
+  let disabled = ClockSkewCorrection(disableClockSkewCorrection = true)
+  let (raw, _) = disabled.signingTime(sent)?
+  println("Disabled signing time: ${raw.toString()}")
+}
+```
+
+Call `observe` after every response, including successes. It keeps the
+server's `Date` minus the midpoint of your raw send and receive times.
+Responses with any `Age` field, no usable HTTP date, a backwards interval,
+or a round trip longer than 900 seconds leave the offset unchanged. Exactly
+900 seconds is accepted. Invalid arithmetic also leaves it unchanged.
+
+Small corrections persist too. For an error, pass `observe`'s result as
+`skewCorrected` to `Invocation.decide`: it is true when the new offset has
+magnitude at least 240 seconds and differs from this attempt's snapshot.
+The retry strategy still enforces replayability, cancellation, attempt and
+quota limits. Use the new signing time on each retry. Concurrent calls
+share a locked offset; each signing instant keeps its matching snapshot.
+
+`disableClockSkewCorrection = true` disables both learning and applying
+the offset. `signingTime` reports `InvalidInput` with
+`clock skew: signing time is outside the Timestamp range` if adding the
+correction would overflow. The helper never changes the system clock.
+This standalone helper is for transports you build; the current `Client`
+does not invoke it automatically.
+
 ## Read an event frame
 
 If you already have a complete Select response frame, check its lengths and
