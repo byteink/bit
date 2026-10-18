@@ -126,7 +126,7 @@ The model in [`users.bit`](inkwell/users.bit) records that binding:
   username: string,
   email: string,
   passwordHash: string,
-  // "author" or "admin" — checked by auth.bit's `requireAdmin`/`isOwner`.
+  // "author" or "admin" - checked by auth.bit's `requireAdmin`/`isOwner`.
   role: string,
   createdAt: i64,
   updatedAt: i64,
