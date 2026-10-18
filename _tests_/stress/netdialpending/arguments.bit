@@ -1,0 +1,253 @@
+import { selfExe } from "std/os"
+import { output } from "std/process"
+
+fn provePending(readyEntry: int) {
+  for mode of ["success", "refused", "pending"] {
+    let argv = [
+      "-c", "import sys; exec(sys.argv[4] + sys.argv[5] + sys.argv[6])", selfExe(), "${readyEntry}", mode,
+      observerSource, observerEvents, observerTail,
+    ]
+    assert(len(argv) <= 64, "observer argument count exceeds runtime limit")
+    for arg of argv {
+      assert(len(arg) < 4096, "observer argument exceeds runtime byte limit")
+    }
+    let result = output("/usr/bin/python3", argv, 30000)
+    if (result.exitCode != 0 || result.truncated || result.stdout != "case true\n") {
+      panic("pending observer ${mode}: ${result.exitCode} ${result.stdout} ${result.stderr}")
+    }
+  }
+}
+
+// Existing schedpollwait2linux observer protocol, restricted to our own child.
+// Only readiness and connect results are injected. The actual dial loop,
+// SO_ERROR read, fd reference protocol and final close remain production code.
+const observerSource: string = `import ctypes, hashlib, json, os, signal, struct, sys
+architecture = os.uname().machine
+assert architecture in ('x86_64','aarch64')
+x64 = architecture == 'x86_64'
+connect_nr,close_nr,error_nr = (42,3,55) if x64 else (203,57,209)
+audit_arch = 0xc000003e if x64 else 0xc00000b7
+leaf = bytes.fromhex('b801000000c39090') if x64 else struct.pack('<II',0x52800020,0xd65f03c0)
+libc = ctypes.CDLL(None, use_errno=True)
+libc.ptrace.restype = ctypes.c_long
+class Info(ctypes.Structure):
+    _fields_ = [('op',ctypes.c_ubyte),('pad',ctypes.c_ubyte*3),('arch',ctypes.c_uint32),('ip',ctypes.c_ulonglong),('sp',ctypes.c_ulonglong),('words',ctypes.c_ulonglong*8)]
+def ptrace(request, tid, addr=0, data=0):
+    ctypes.set_errno(0)
+    value = libc.ptrace(ctypes.c_ulong(request),ctypes.c_ulong(tid),ctypes.c_void_p(addr),ctypes.c_void_p(data))
+    error = ctypes.get_errno()
+    if value == -1 and error:
+        raise OSError(error,'ptrace')
+    return value
+def expired(signum, frame):
+    raise TimeoutError('pending observer deadline')
+def slot(tid):
+    for i in range(64):
+        if tids[i] == tid:
+            return i
+        if tids[i] == 0:
+            tids[i] = tid
+            return i
+    raise RuntimeError('owned thread limit')
+def own(tid):
+    if tid not in tids:
+        with open('/proc/'+str(tid)+'/status') as stream:
+            status = stream.read(16384).splitlines()
+        assert 'Tgid:\t'+str(pid) in status
+        assert 'TracerPid:\t'+str(os.getpid()) in status
+    return slot(tid)
+def clone(tid):
+    child = ctypes.c_ulonglong()
+    ptrace(0x4201,tid,0,ctypes.addressof(child))
+    slot(child.value)
+class Iovec(ctypes.Structure):
+    _fields_ = [('base',ctypes.c_void_p),('length',ctypes.c_size_t)]
+def regset(tid, request, kind, value):
+    vector = Iovec(ctypes.addressof(value),ctypes.sizeof(value))
+    ptrace(request,tid,kind,ctypes.addressof(vector))
+    assert vector.length == ctypes.sizeof(value)
+def result(tid, value, entering):
+    if not x64:
+        if entering:
+            number = ctypes.c_int(value)
+            regset(tid,0x4205,0x404,number)
+            return
+        registers = (ctypes.c_ulonglong*34)()
+        regset(tid,0x4204,1,registers)
+        registers[0] = value & ((1 << 64)-1)
+        regset(tid,0x4205,1,registers)
+        return
+    registers = (ctypes.c_ulonglong*27)()
+    ptrace(12,tid,0,ctypes.addressof(registers))
+    registers[15 if entering else 10] = value & ((1 << 64)-1)
+    ptrace(13,tid,0,ctypes.addressof(registers))
+def connect_entry(tid, args):
+    global fd, connects
+    if fd is None:
+        fd = args[0]
+    assert args[0] == fd and args[2] == 16
+    connects += 1
+    assert connects <= 1025
+    value = -114
+    if connects == 1:
+        value = -115
+    elif mode == 'refused':
+        value = -111
+    elif mode == 'success' and connects >= 3:
+        value = 0
+    result(tid,-1,True)
+    return value
+def syscall(tid, index):
+    global closes, socket_errors
+    info = Info()
+    assert ptrace(0x420e,tid,ctypes.sizeof(info),ctypes.addressof(info)) >= 24
+    assert info.arch == audit_arch
+    if info.op == 1:
+        nr,args = info.words[0],tuple(info.words[1:7])
+        pending[index] = None
+        if nr == connect_nr:
+            pending[index] = ('connect',connect_entry(tid,args))
+        elif nr == close_nr and args[0] == fd:
+            pending[index] = ('close',0)
+            closes += 1
+        elif nr == error_nr and args[0] == fd:
+            assert args[1:3] == (1,4)
+            socket_errors += 1
+        return
+    assert info.op == 2
+    row = pending[index]
+    pending[index] = None
+    if row is None:
+        return
+    if row[0] == 'connect':
+        result(tid,row[1],False)
+    else:
+        assert ctypes.c_longlong(info.words[0]).value == 0
+
+`
+
+const observerEvents: string = `def complete(tid, status, index):
+    global native, native_signal
+    joined[index] = True
+    if tid == pid and os.WIFEXITED(status):
+        native = os.WEXITSTATUS(status)
+    if tid == pid and os.WIFSIGNALED(status):
+        native_signal = os.WTERMSIG(status)
+def stopped(tid, status, index):
+    assert os.WIFSTOPPED(status)
+    stop,event = os.WSTOPSIG(status),status >> 16
+    if stop == 133:
+        syscall(tid,index)
+    elif stop == signal.SIGTRAP and event == 3:
+        clone(tid)
+    elif stop not in (signal.SIGTRAP, signal.SIGSTOP):
+        ptrace(24,tid,0,stop)
+        return
+    else:
+        assert stop == signal.SIGSTOP, (tid,stop,event)
+    ptrace(24,tid)
+def all_joined():
+    return all(t == 0 or joined[i] for i,t in enumerate(tids))
+def observe():
+    child,status = os.waitpid(pid,0)
+    assert child == pid and os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGTRAP
+    assert os.readlink('/proc/'+str(pid)+'/exe') == image
+    before = ptrace(1,pid,ready) & ((1 << 64)-1)
+    assert before == int.from_bytes(preimage,'little')
+    ptrace(4,pid,ready,int.from_bytes(leaf,'little'))
+    ptrace(0x4200,pid,0,0x100009)
+    ptrace(24,pid)
+    for _ in range(65536):
+        tid,status = os.waitpid(-1,0x40000000)
+        index = own(tid)
+        if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+            complete(tid,status,index)
+            if all_joined():
+                return
+        else:
+            stopped(tid,status,index)
+    raise TimeoutError('pending observer stop bound')
+`
+
+const observerTail: string = `def cleanup_stop(tid,status,index):
+    if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+        joined[index] = True
+        return
+    assert os.WIFSTOPPED(status)
+    try:
+        ptrace(7,tid)
+    except OSError as error:
+        assert error.errno == 3
+def cleanup():
+    if not all_joined():
+        try:
+            os.kill(pid,signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    signal.alarm(8)
+    try:
+        for _ in range(65536):
+            try:
+                tid,status = os.waitpid(-1,0x40000000)
+            except ChildProcessError:
+                return all_joined()
+            cleanup_stop(tid,status,own(tid))
+        return False
+    finally:
+        signal.alarm(0)
+def sections(data):
+    offset = struct.unpack_from('<Q',data,40)[0]
+    stride,count = struct.unpack_from('<HH',data,58)
+    assert stride == 64 and 0 < count <= 256
+    return [struct.unpack_from('<IIQQQQIIQQ',data,offset+i*stride) for i in range(count)]
+def named_entry(data, tables):
+    found = []
+    for section in tables:
+        if section[1] != 2:
+            continue
+        assert section[9] == 24 and section[5] // 24 <= 100000
+        strings = tables[section[6]]
+        names = data[strings[4]:strings[4]+strings[5]]
+        for offset in range(section[4],section[4]+section[5],24):
+            name,info,other,index,value,size = struct.unpack_from('<IBBHQQ',data,offset)
+            if names[name:].split(b'\0',1)[0] == b'bit_rt_port_net_await_ready':
+                assert info & 15 == 2 and size >= 8
+                target = tables[index]
+                found.append((value,data[target[4]+value-target[3]:target[4]+value-target[3]+8]))
+    assert len(found) == 1 and found[0][0] == ready
+    return found[0][1]
+image = os.path.realpath(sys.argv[1])
+ready,mode = int(sys.argv[2]),sys.argv[3]
+assert mode in ('success','refused','pending')
+with open(image,'rb') as stream:
+    data = stream.read(32*1024*1024+1)
+assert len(data) <= 32*1024*1024 and data[:6] == b'\x7fELF\x02\x01'
+assert struct.unpack_from('<HH',data,16) == (2,62 if x64 else 183)
+preimage = named_entry(data,sections(data))
+assert len(preimage) == 8
+image_sha = hashlib.sha256(data).hexdigest()
+tids,joined,pending = [0]*64,[False]*64,[None]*64
+native = native_signal = fd = None
+connects = closes = socket_errors = 0
+signal.signal(signal.SIGALRM,expired)
+signal.alarm(20)
+pid = os.fork()
+if pid == 0:
+    ptrace(0,0)
+    os.execv(image,[image,'--dial-child',mode])
+slot(pid)
+failure = None
+try:
+    observe()
+except BaseException as error:
+    failure = repr(error)
+finally:
+    signal.alarm(0)
+    cleaned = cleanup()
+print(json.dumps(dict(mode=mode,native=native,signal=native_signal,observer_error=failure,cleanup=0 if cleaned else 1,image=image_sha,ready=ready,preimage=preimage.hex(),connects=connects,closes=closes,socket_errors=socket_errors,owned=sum(t != 0 for t in tids),joined=sum(joined))),file=sys.stderr)
+assert failure is None and cleaned and native == 0 and native_signal is None
+assert closes == 1
+assert connects == dict(success=3,refused=2,pending=1025)[mode]
+assert socket_errors == (1 if mode == 'success' else 0)
+print('case true')
+`
