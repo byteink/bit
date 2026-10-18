@@ -1,0 +1,642 @@
+// #6952: signed logout claims, issuer isolation and bounded replay state.
+
+fn bcPayload(at: int, sid: string, subject: string, jti: string): Json {
+  let fields = []JsonEntry{
+    JsonEntry{ key = "iss", value = Json.JsonString(testIssuer) },
+    JsonEntry{ key = "aud", value = Json.JsonString(clientId) },
+    JsonEntry{ key = "iat", value = Json.JsonInt(i64(at - 10)) },
+    JsonEntry{ key = "exp", value = Json.JsonInt(i64(at + 120)) },
+    JsonEntry{ key = "jti", value = Json.JsonString(jti) },
+    JsonEntry{
+      key = "events",
+      value = Json.JsonObject(
+        [
+          JsonEntry{ key = logoutEvent, value = Json.JsonObject([]JsonEntry{}) },
+        ],
+      ),
+    },
+  }
+  if (sid != "") {
+    fields = append(fields, JsonEntry{ key = "sid", value = Json.JsonString(sid) })
+  }
+  if (subject != "") {
+    fields = append(fields, JsonEntry{ key = "sub", value = Json.JsonString(subject) })
+  }
+  return Json.JsonObject(fields)
+}
+
+fn bcChange(payload: Json, key: string, value: Option<Json>): Json {
+  let fields = []JsonEntry{}
+  for entry of unwrap(jsonAsObject(payload)) {
+    if (entry.key != key) {
+      fields = append(fields, entry)
+    }
+  }
+  if (isSome(value)) {
+    fields = append(fields, JsonEntry{ key = key, value = unwrap(value) })
+  }
+  return Json.JsonObject(fields)
+}
+
+fn bcToken(payload: Json, typ: string = "logout+jwt"): string {
+  let fields = []JsonEntry{
+    JsonEntry{ key = "alg", value = Json.JsonString("HS256") },
+    JsonEntry{ key = "kid", value = Json.JsonString(testKid) },
+  }
+  if (typ != "") {
+    fields = append(fields, JsonEntry{ key = "typ", value = Json.JsonString(typ) })
+  }
+  let header = encodeBase64Url([]byte(jsonEncode(Json.JsonObject(fields))))
+  let body = encodeBase64Url([]byte(jsonEncode(payload)))
+  let signed = header + "." + body
+  return signed + "." + encodeBase64Url(hmac(HashAlg.Sha256, hmacSecret(), []byte(signed)))
+}
+
+fn bcRejected(payload: Json): bool {
+  verifyLogoutToken(callbackStrategy(), bcToken(payload), fixedNow) catch _ {
+    return true
+  }
+  return false
+}
+
+fn bcValid(): Json {
+  return bcPayload(fixedNow, "sid-one", "u1", "event-one")
+}
+
+test "backchannel logout accepts sid and subject claims" {
+  let claims = verifyLogoutToken(callbackStrategy(), bcToken(bcValid()), fixedNow) catch e {
+    panic(e.message())
+  }
+  assert(claims.sid == "sid-one" && claims.subject == "u1", "verified target")
+}
+
+test "backchannel logout rejects wrong issuer" {
+  assert(
+    bcRejected(bcChange(bcValid(), "iss", Option.Some(Json.JsonString("https://other.example")))),
+    "issuer",
+  )
+}
+
+test "backchannel logout rejects wrong audience" {
+  assert(
+    bcRejected(bcChange(bcValid(), "aud", Option.Some(Json.JsonString("another-client")))),
+    "audience",
+  )
+}
+
+test "backchannel logout rejects missing event" {
+  assert(bcRejected(bcChange(bcValid(), "events", Option.None)), "event missing")
+}
+
+test "backchannel logout rejects non-object event value" {
+  let event = Json.JsonObject([JsonEntry{ key = logoutEvent, value = Json.JsonNull }])
+  assert(bcRejected(bcChange(bcValid(), "events", Option.Some(event))), "event object")
+}
+
+test "backchannel logout rejects nonce even when null" {
+  assert(bcRejected(bcChange(bcValid(), "nonce", Option.Some(Json.JsonNull))), "nonce")
+}
+
+test "backchannel logout rejects token without sid and sub" {
+  assert(bcRejected(bcPayload(fixedNow, "", "", "no-target")), "target")
+}
+
+test "backchannel logout requires exp and iat" {
+  assert(bcRejected(bcChange(bcValid(), "exp", Option.None)), "exp missing")
+  assert(bcRejected(bcChange(bcValid(), "iat", Option.None)), "iat missing")
+}
+
+test "backchannel logout rejects expired and excessive exp" {
+  assert(
+    bcRejected(bcChange(bcValid(), "exp", Option.Some(Json.JsonInt(i64(fixedNow))))),
+    "expired",
+  )
+  assert(
+    bcRejected(bcChange(bcValid(), "exp", Option.Some(Json.JsonInt(i64(fixedNow + 301))))),
+    "unbounded",
+  )
+}
+
+test "backchannel logout rejects stale and future iat" {
+  assert(
+    bcRejected(bcChange(bcValid(), "iat", Option.Some(Json.JsonInt(i64(fixedNow - 301))))),
+    "stale",
+  )
+  assert(
+    bcRejected(bcChange(bcValid(), "iat", Option.Some(Json.JsonInt(i64(fixedNow + 1))))),
+    "future",
+  )
+}
+
+test "backchannel logout rejects malformed subject and missing jti" {
+  assert(bcRejected(bcChange(bcValid(), "sub", Option.Some(Json.JsonInt(1)))), "subject type")
+  assert(bcRejected(bcChange(bcValid(), "jti", Option.None)), "jti missing")
+}
+
+test "backchannel logout accepts absent typ and rejects an ID-token typ" {
+  let s = callbackStrategy()
+  verifyLogoutToken(s, bcToken(bcValid(), ""), fixedNow) catch e {
+    panic(e.message())
+  }
+  let failed = false
+  verifyLogoutToken(s, bcToken(bcValid(), "JWT"), fixedNow) catch _ {
+    failed = true
+  }
+  assert(failed, "wrong explicit type")
+}
+
+test "backchannel logout rejects bad signature and alg none" {
+  let s = callbackStrategy()
+  let failed = false
+  let token = buildToken("HS256", testKid, []byte("wrong secret"), bcValid())
+  verifyLogoutToken(s, token, fixedNow) catch _ {
+    failed = true
+  }
+  assert(failed, "bad signature")
+  failed = false
+  verifyLogoutToken(s, buildToken("none", testKid, hmacSecret(), bcValid()), fixedNow) catch _ {
+    failed = true
+  }
+  assert(failed, "alg none")
+}
+
+fn bcClaimFails(replay: LogoutReplay, key: string, expires: i64, at: i64): bool {
+  replay.claim(key, expires, at) catch _ {
+    return true
+  }
+  return false
+}
+
+test "backchannel replay rejects duplicate in-flight claims and allows failed retries" {
+  let replay = LogoutReplay(1)
+  replay.claim("one", 20, 10) catch e {
+    panic(e.message())
+  }
+  assert(bcClaimFails(replay, "one", 20, 10), "in flight")
+  assert(bcClaimFails(replay, "two", 30, 21), "busy entry survives expiry")
+  replay.finish("one", false)
+  replay.claim("one", 20, 10) catch e {
+    panic(e.message())
+  }
+  replay.finish("one", true)
+  assert(bcClaimFails(replay, "one", 20, 10), "completed replay")
+  assert(bcClaimFails(replay, "two", 20, 10), "capacity fails closed")
+  replay.claim("two", 30, 20) catch e {
+    panic(e.message())
+  }
+  replay.finish("two", true)
+}
+
+test "backchannel replay tuples isolate issuers and avoid delimiter collisions" {
+  assert(oidcTuple("a:b", "c") != oidcTuple("a", "b:c"), "tuple boundaries")
+  let replay = LogoutReplay(2)
+  replay.claim(oidcTuple("issuer-a", "same"), 20, 10) catch e {
+    panic(e.message())
+  }
+  replay.claim(oidcTuple("issuer-b", "same"), 20, 10) catch e {
+    panic(e.message())
+  }
+}
+
+fn bcApp(s: OidcStrategy, store: SessionStore): App {
+  let app = App(Config{ secret = "test-secret", sessions = store })
+  app.post("/backchannel", (c) => handleBackchannelLogout(s, c, store)?)
+  app.get("/me", (c) => c.text(currentIdentity(c)?.id))
+  app.post("/rebind", (c) => {
+    let old = currentIdentity(c)?
+    bindSession(c, Identity{ id = old.id, claims = old.claims })?
+    return c.text("rebound")
+  })
+  app.post("/map", (c) => {
+    let identity = currentIdentity(c)?
+    identity.id = "local-7"
+    bindSession(c, identity)?
+    return c.text(c.session()?.id())
+  })
+  app.post("/map-pending", (c) => {
+    let identity = pendingIdentity(c)?
+    identity.id = "local-7"
+    bindSession(c, identity, BindOptions{ second = true })?
+    return c.text("mapped")
+  })
+  app.post("/complete", (c) => {
+    let identity = completeSecondFactor(c, MfStub{ want = "proof" }, "proof")?
+    return c.text(identity.id)
+  })
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  return app
+}
+
+fn bcRequest(token: string): Request {
+  return Request{
+    method = "POST",
+    path = "/backchannel",
+    headers = "Content-Type: application/x-www-form-urlencoded\r\n",
+    body = "logout_token=" + percentEncode(token),
+  }
+}
+
+class BcLoginOptions {
+  previous: string,
+  expected: int = 200,
+}
+
+// Real callback verification and session persistence; only the IdP transport is fake.
+fn bcLogin(
+  s: OidcStrategy,
+  store: MemoryStore,
+  sid: string,
+  subject: string,
+  opts: BcLoginOptions = BcLoginOptions{},
+): string {
+  let box = newBox()
+  let app = callbackAppOn(s, box, store)
+  let cookie = app.handle(authReq("/begin", opts.previous)).getHeader("Set-Cookie")
+  if (cookie == "") {
+    cookie = opts.previous
+  }
+  let state = split(app.handle(authReq("/session", cookie)).body, "|")
+  let base = roundTripToken(state[1])
+  let parts = split(base, ".")
+  let raw = decodeBase64Url(parts[1]) catch e {
+    panic(e.message())
+  }
+  let payload = jsonParse(string(raw)) catch e {
+    panic(e.message())
+  }
+  payload = bcChange(payload, "iss", Option.Some(Json.JsonString(s.config.issuer)))
+  payload = bcChange(payload, "sub", Option.Some(Json.JsonString(subject)))
+  if (sid != "") {
+    payload = bcChange(payload, "sid", Option.Some(Json.JsonString(sid)))
+  }
+  box.token = signIdToken(testKid, payload)
+  let response = app.handle(callbackReq(cookie, "code", state[0]))
+  assert(response.status == opts.expected, "callback ${response.status}: ${response.body}")
+  return response.getHeader("Set-Cookie")
+}
+
+fn bcLiveToken(sid: string, subject: string, jti: string): string {
+  return bcToken(bcPayload(int(now().ns / Second), sid, subject, jti))
+}
+
+test "backchannel sid revokes exactly one of three callback sessions" {
+  let s = callbackStrategy()
+  let store = MemoryStore(1000)
+  let first = bcLogin(s, store, "sid-one", "u1")
+  let second = bcLogin(s, store, "sid-two", "u1")
+  let third = bcLogin(s, store, "sid-three", "u1")
+  let app = bcApp(s, store)
+  let response = app.handle(bcRequest(bcLiveToken("sid-one", "u1", "sid-success")))
+  assert(response.status == 200, "logout ${response.status}: ${response.body}")
+  assert(response.getHeader("Cache-Control") == "no-store", "no cache")
+  assert(app.handle(authReq("/me", first)).status != 200, "matching session revoked")
+  assert(app.handle(authReq("/me", second)).status == 200, "second session lives")
+  assert(app.handle(authReq("/me", third)).status == 200, "third session lives")
+  let replay = app.handle(bcRequest(bcLiveToken("sid-one", "u1", "sid-success")))
+  assert(replay.status == 400, "replay refused")
+  assert(replay.body == "{\"error\":\"invalid_request\"}", "uniform error")
+}
+
+test "backchannel subject revokes all three callback sessions" {
+  let s = callbackStrategy()
+  let store = MemoryStore(1000)
+  let cookies = [
+    bcLogin(s, store, "one", "u1"),
+    bcLogin(s, store, "two", "u1"),
+    bcLogin(s, store, "", "u1"),
+  ]
+  let app = bcApp(s, store)
+  assert(app.handle(bcRequest(bcLiveToken("", "u1", "sub-success"))).status == 200, "logout")
+  for cookie of cookies {
+    assert(app.handle(authReq("/me", cookie)).status != 200, "all subject sessions revoked")
+  }
+}
+
+test "backchannel same sid and subject from another issuer survive" {
+  let s = callbackStrategy()
+  let config = callbackConfig()
+  config.issuer = "https://other.example"
+  let other = callbackStrategyWith(config, []string{})
+  let store = MemoryStore(1000)
+  let first = bcLogin(s, store, "same", "u1")
+  let second = bcLogin(other, store, "same", "u1")
+  let app = bcApp(s, store)
+  assert(app.handle(bcRequest(bcLiveToken("", "u1", "issuer-isolation"))).status == 200, "logout")
+  assert(app.handle(authReq("/me", first)).status != 200, "matching issuer revoked")
+  assert(app.handle(authReq("/me", second)).status == 200, "other issuer lives")
+}
+
+test "backchannel rejects invalid request without changing indexed sessions" {
+  let s = callbackStrategy()
+  let store = MemoryStore(1000)
+  let cookie = bcLogin(s, store, "same", "u1")
+  let app = bcApp(s, store)
+  let response = app.handle(bcRequest("invalid"))
+  assert(response.status == 400, "invalid request")
+  assert(response.getHeader("Cache-Control") == "no-store", "error no cache")
+  assert(app.handle(authReq("/me", cookie)).status == 200, "invalid request preserves session")
+}
+
+fn bcPost(path: string, cookie: string): Request {
+  let request = authReq(path, cookie)
+  request.method = "POST"
+  return request
+}
+
+test "backchannel cannot revoke a non-OIDC rebind with copied claims" {
+  let s = callbackStrategy()
+  let store = MemoryStore(1000)
+  let cookie = bcLogin(s, store, "old", "u1")
+  let app = bcApp(s, store)
+  assert(app.handle(bcPost("/rebind", cookie)).status == 200, "ordinary bind")
+  assert(app.handle(bcRequest(bcLiveToken("", "u1", "rebind"))).status == 200, "logout")
+  assert(
+    app.handle(authReq("/me", cookie)).status == 200,
+    "copied claims confer no OIDC provenance",
+  )
+}
+
+test "backchannel forgets an earlier sid after a callback without sid" {
+  let s = callbackStrategy()
+  let store = MemoryStore(1000)
+  let old = bcLogin(s, store, "old", "u1")
+  let current = bcLogin(s, store, "", "u1", BcLoginOptions{ previous = old })
+  let app = bcApp(s, store)
+  assert(app.handle(bcRequest(bcLiveToken("old", "u1", "old-sid"))).status == 200, "logout")
+  assert(app.handle(authReq("/me", current)).status == 200, "old sid no longer matches")
+  assert(app.handle(bcRequest(bcLiveToken("", "u1", "new-sub"))).status == 200, "subject logout")
+  assert(app.handle(authReq("/me", current)).status != 200, "subject index survives missing sid")
+}
+
+fn bcMfaStrategy(): OidcStrategy {
+  let s = callbackStrategy()
+  let second: SecondRequired = (id) => true
+  s.second = Option.Some(second)
+  return s
+}
+
+test "backchannel revokes a pending MFA callback session before promotion" {
+  let s = bcMfaStrategy()
+  let store = MemoryStore(1000)
+  let cookie = bcLogin(s, store, "pending", "u1", BcLoginOptions{ expected = 401 })
+  let app = bcApp(s, store)
+  assert(
+    app.handle(bcRequest(bcLiveToken("pending", "u1", "pending-logout"))).status == 200,
+    "logout",
+  )
+  assert(
+    app.handle(bcPost("/complete", cookie)).status != 200,
+    "revoked pending session cannot promote",
+  )
+}
+
+test "backchannel indexes survive MFA promotion and rotation" {
+  let s = bcMfaStrategy()
+  let store = MemoryStore(1000)
+  let pending = bcLogin(s, store, "promoted", "u1", BcLoginOptions{ expected = 401 })
+  let app = bcApp(s, store)
+  let response = app.handle(bcPost("/complete", pending))
+  assert(response.status == 200, "MFA promotion")
+  let cookie = response.getHeader("Set-Cookie")
+  assert(app.handle(authReq("/me", cookie)).status == 200, "promoted login")
+  assert(
+    app.handle(bcRequest(bcLiveToken("promoted", "u1", "promoted-logout"))).status == 200,
+    "logout",
+  )
+  assert(app.handle(authReq("/me", cookie)).status != 200, "promoted session revoked")
+}
+
+class BcFailStore {
+  inner: MemoryStore
+  failDestroy: bool
+  partial: bool
+  calls: int
+
+  export load(sid: string): Option<(map<string, string>, i64, map<string, string>)>! {
+    return this.inner.load(sid)?
+  }
+
+  export compareAndSet(
+    sid: string,
+    version: i64,
+    data: map<string, string>,
+    index: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    return this.inner.compareAndSet(sid, version, data, index, ttl)?
+  }
+
+  export rotate(
+    source: (string, i64),
+    destination: string,
+    data: map<string, string>,
+    index: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    return this.inner.rotate(source, destination, data, index, ttl)?
+  }
+
+  export destroy(sid: string, ttl: i64): ()! {
+    this.inner.destroy(sid, ttl)?
+  }
+
+  export destroyIndexed(key: string, value: string, except: string, ttl: i64): int! {
+    this.calls = this.calls + 1
+    if (this.failDestroy) {
+      if (this.partial) {
+        this.inner.destroyIndexed(key, value, except, ttl)?
+      }
+      fail newError("test: session store down")
+    }
+    return this.inner.destroyIndexed(key, value, except, ttl)?
+  }
+}
+
+test "backchannel destroy failure releases the claim for retry" {
+  let s = callbackStrategy()
+  let store = MemoryStore(1000)
+  let cookie = bcLogin(s, store, "retry", "u1")
+  let fault = BcFailStore{ inner = store, failDestroy = true }
+  let app = bcApp(s, fault)
+  let request = bcRequest(bcLiveToken("retry", "u1", "retry-event"))
+  assert(app.handle(request).status == 400, "store failure")
+  assert(app.handle(authReq("/me", cookie)).status == 200, "failure preserves session")
+  fault.failDestroy = false
+  assert(app.handle(request).status == 200, "retry succeeds")
+  assert(app.handle(request).status == 400, "success retained")
+  assert(fault.calls == 2, "replay cannot reach destroy")
+}
+
+fn bcRaceClaim(replay: LogoutReplay, wins: chan<bool>, wg: WaitGroup) {
+  defer wg.done()
+  replay.claim("raced", 20, 10) catch _ {
+    wins <- false
+    return
+  }
+  wins <- true
+}
+
+test "backchannel two concurrent replay claims have one winner" {
+  let replay = LogoutReplay(2)
+  let wins = chan<bool>(2)
+  let wg = WaitGroup()
+  wg.add(2)
+  spawn bcRaceClaim(replay, wins, wg)
+  spawn bcRaceClaim(replay, wins, wg)
+  wg.wait()
+  let first = <- wins
+  let second = <- wins
+  assert(first != second, "exactly one claim wins")
+}
+
+test "backchannel local token and claim bounds fail closed" {
+  let s = callbackStrategy()
+  let failed = false
+  verifyLogoutToken(s, string([]byte(logoutTokenMax + 1)), fixedNow) catch _ {
+    failed = true
+  }
+  assert(failed, "token cap")
+  let oversized = Json.JsonString(string([]byte(1025)))
+  assert(bcRejected(bcChange(bcValid(), "sid", Option.Some(oversized))), "claim cap")
+  let boundary = Json.JsonString(string([]byte(1024)))
+  assert(!bcRejected(bcChange(bcValid(), "sid", Option.Some(boundary))), "claim boundary")
+}
+
+test "backchannel failed MFA policy does not stage provider indexes" {
+  let s = callbackStrategy()
+  let policy: SecondRequired = (id) => {
+    fail newError("test: policy unavailable")
+  }
+  s.second = Option.Some(policy)
+  let store = MemoryStore(1000)
+  let _ = bcLogin(s, store, "not-staged", "u1", BcLoginOptions{ expected = 500 })
+  let count = store.destroyIndexed(
+    oidcSidIndex,
+    oidcTuple(testIssuer, "not-staged"),
+    "",
+    sessionTTLSeconds,
+  ) catch e {
+    panic(e.message())
+  }
+  assert(count == 0, "policy failed before index staging and autosave")
+}
+
+test "backchannel retry succeeds after a store reports failure after revocation" {
+  let s = callbackStrategy()
+  let store = MemoryStore(1000)
+  let cookie = bcLogin(s, store, "partial", "u1")
+  let fault = BcFailStore{ inner = store, failDestroy = true, partial = true }
+  let app = bcApp(s, fault)
+  let request = bcRequest(bcLiveToken("partial", "u1", "partial-event"))
+  assert(app.handle(request).status == 400, "store reports failure after writes")
+  assert(app.handle(authReq("/me", cookie)).status != 200, "revocation already happened")
+  fault.failDestroy = false
+  assert(app.handle(request).status == 200, "idempotent retry succeeds without matches")
+  assert(fault.calls == 2, "retry reached store")
+}
+
+test "backchannel invalid signed claims return 400 and preserve the session" {
+  let s = callbackStrategy()
+  let store = MemoryStore(1000)
+  let cookie = bcLogin(s, store, "valid", "u1")
+  let app = bcApp(s, store)
+  let at = int(now().ns / Second)
+  let valid = bcPayload(at, "valid", "u1", "invalid-events")
+  let tokens = [
+    buildToken("HS256", testKid, []byte("wrong secret"), valid),
+    bcToken(bcChange(valid, "iss", Option.Some(Json.JsonString("https://other.example")))),
+    bcToken(bcChange(valid, "aud", Option.Some(Json.JsonString("other-client")))),
+    bcToken(bcChange(valid, "events", Option.None)),
+    bcToken(bcChange(valid, "nonce", Option.Some(Json.JsonNull))),
+    bcToken(bcPayload(at, "", "", "no-target")),
+    bcToken(bcChange(valid, "iat", Option.Some(Json.JsonInt(i64(at - 301))))),
+    bcToken(bcChange(valid, "exp", Option.Some(Json.JsonInt(i64(at - 1))))),
+  ]
+  for token of tokens {
+    let response = app.handle(bcRequest(token))
+    assert(response.status == 400, "invalid token status")
+    assert(response.body == "{\"error\":\"invalid_request\"}", "uniform failure")
+    assert(app.handle(authReq("/me", cookie)).status == 200, "invalid token preserves session")
+  }
+}
+
+test "backchannel sid cannot revoke another issuer and provider rebind forgets the previous issuer" {
+  let first = callbackStrategy()
+  let config = callbackConfig()
+  config.issuer = "https://other.example"
+  let second = callbackStrategyWith(config, []string{})
+  let store = MemoryStore(1000)
+  let old = bcLogin(first, store, "same", "u1")
+  let current = bcLogin(second, store, "same", "u1", BcLoginOptions{ previous = old })
+  let app = bcApp(first, store)
+  assert(
+    app.handle(bcRequest(bcLiveToken("same", "u1", "old-provider"))).status == 200,
+    "first issuer logout",
+  )
+  assert(
+    app.handle(authReq("/me", current)).status == 200,
+    "previous issuer cannot revoke rebound session",
+  )
+  let claims = bcChange(
+    bcPayload(int(now().ns / Second), "same", "u1", "new-provider"),
+    "iss",
+    Option.Some(Json.JsonString(config.issuer)),
+  )
+  let otherApp = bcApp(second, store)
+  assert(otherApp.handle(bcRequest(bcToken(claims))).status == 200, "second issuer logout")
+  assert(otherApp.handle(authReq("/me", current)).status != 200, "new provider index is present")
+}
+
+test "backchannel replay admission rechecks token age at the claim clock" {
+  let replay = LogoutReplay(2)
+  let failed = false
+  replay.claim("aged-during-verification", 500, 311, 10) catch _ {
+    failed = true
+  }
+  assert(failed, "an old iat cannot pass after a slow verification")
+  replay.claim("aged-during-verification", 500, 310, 10) catch e {
+    panic(e.message())
+  }
+}
+
+test "backchannel provider subject survives mapping the identity to a local account" {
+  let s = callbackStrategy()
+  let store = MemoryStore(1000)
+  let cookie = bcLogin(s, store, "", "provider-42")
+  let app = bcApp(s, store)
+  let mapped = app.handle(bcPost("/map", cookie))
+  assert(mapped.status == 200, "mapped local account")
+  let record = store.load(mapped.body) catch e {
+    panic(e.message())
+  }
+  assert(isSome(record), "mapped session persisted")
+  let (_, _, indexes) = unwrap(record)
+  let (subject, indexed) = indexes[subjectIndexKey]
+  assert(indexed && subject == "local-7", "ordinary revocation index uses the local id")
+  assert(app.handle(authReq("/me", cookie)).body == "local-7", "local identity is bound")
+  let response = app.handle(bcRequest(bcLiveToken("", "provider-42", "mapped-subject")))
+  assert(response.status == 200, "signed provider-subject logout")
+  assert(
+    app.handle(authReq("/me", cookie)).status != 200,
+    "provider subject still revokes the mapped session",
+  )
+}
+
+test "backchannel provider subject survives a mapped pending MFA identity and promotion" {
+  let s = bcMfaStrategy()
+  let store = MemoryStore(1000)
+  let pending = bcLogin(s, store, "", "provider-42", BcLoginOptions{ expected = 401 })
+  let app = bcApp(s, store)
+  assert(app.handle(bcPost("/map-pending", pending)).status == 200, "pending local account mapped")
+  let completed = app.handle(bcPost("/complete", pending))
+  assert(completed.status == 200 && completed.body == "local-7", "mapped pending identity promoted")
+  let cookie = completed.getHeader("Set-Cookie")
+  let response = app.handle(bcRequest(bcLiveToken("", "provider-42", "mapped-mfa-subject")))
+  assert(response.status == 200, "signed provider-subject logout")
+  assert(
+    app.handle(authReq("/me", cookie)).status != 200,
+    "provider subject survives MFA serialization and rotation",
+  )
+}

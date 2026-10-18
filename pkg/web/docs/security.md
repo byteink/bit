@@ -85,6 +85,24 @@ session, and must neither count nor tombstone a session whose ttl has passed.
 `MemoryStore` does this with a reverse map under its one lock, swept and
 bounded together with its entries.
 
+To stop matching one revocation key while keeping the session, call
+`session.unindex(key)`. For example, Inkwell can remove a temporary review
+association after a review ends:
+
+```bit
+import { Ctx } from "web"
+
+fn finishReview(c: Ctx): ()! {
+  c.session()?.unindex("inkwell:review")
+}
+```
+
+An absent key is harmless. Other indexes and session data stay intact.
+The removal reaches the store with `save()` or the framework's autosave,
+including when the handler fails; `regenerate()` carries it to the new id.
+Calling `unindex()` after `destroy()` panics with
+`web: session: unindex() after destroy()`.
+
 ### Saving is automatic
 
 `session.set()` and `delete()` change this request's own copy of the data;

@@ -1,0 +1,245 @@
+// OIDC Back-Channel Logout 1.0 sections 2.4-2.8 (#6952).
+// Imports are module-wide; the verifier, JSON, web and sync names are bound by siblings.
+
+const logoutEvent = "http://schemas.openid.net/event/backchannel-logout"
+const logoutWindow: i64 = 300
+const logoutTokenMax = 16_384
+const oidcSidIndex = "auth:oidc:issuer-sid"
+const oidcSubIndex = "auth:oidc:issuer-sub"
+
+class LogoutClaims {
+  issuer: string,
+  sid: string,
+  subject: string,
+  jti: string,
+  issuedAt: i64,
+  expiresAt: i64,
+}
+
+fn oidcTuple(issuer: string, value: string): string {
+  return jsonEncode(Json.JsonArray([Json.JsonString(issuer), Json.JsonString(value)]))
+}
+
+fn oidcString(payload: Json, key: string, required: bool): string! {
+  let claim = jsonGet(payload, key)
+  if (!isSome(claim) && !required) {
+    return ""
+  }
+  if (!isSome(claim)) {
+    fail newError("auth: logout token: missing '${key}'")
+  }
+  let value = jsonAsString(unwrap(claim))
+  if (!isSome(value)) {
+    fail newError("auth: logout token: '${key}' is not a string")
+  }
+  let text = unwrap(value)
+  if (text == "" || len(text) > 1024) {
+    fail newError("auth: logout token: invalid '${key}' length")
+  }
+  return text
+}
+
+fn logoutTime(payload: Json, key: string): i64! {
+  let claim = jsonGet(payload, key)
+  if (!isSome(claim)) {
+    fail newError("auth: logout token: missing '${key}'")
+  }
+  let value = jsonAsInt(unwrap(claim))
+  if (!isSome(value)) {
+    fail newError("auth: logout token: '${key}' is not an integer")
+  }
+  return unwrap(value)
+}
+
+fn logoutExpiry(payload: Json, at: i64): i64! {
+  let issued = logoutTime(payload, "iat")?
+  let expires = logoutTime(payload, "exp")?
+  // Range checks precede subtraction, so untrusted integers cannot overflow it.
+  if (issued < at - logoutWindow || issued > at) {
+    fail newError("auth: logout token: stale or future 'iat'")
+  }
+  if (expires <= at || expires > at + logoutWindow || expires <= issued) {
+    fail newError("auth: logout token: invalid 'exp'")
+  }
+  return expires
+}
+
+fn checkLogoutEvent(payload: Json): ()! {
+  if (isSome(jsonGet(payload, "nonce"))) {
+    fail newError("auth: logout token: 'nonce' is prohibited")
+  }
+  let events = jsonGet(payload, "events")
+  if (!isSome(events) || !isSome(jsonAsObject(unwrap(events)))) {
+    fail newError("auth: logout token: missing 'events' object")
+  }
+  let event = jsonGet(unwrap(events), logoutEvent)
+  if (!isSome(event) || !isSome(jsonAsObject(unwrap(event)))) {
+    fail newError("auth: logout token: missing logout event object")
+  }
+}
+
+fn checkLogoutType(token: string): ()! {
+  let parts = split(token, ".")
+  let header = jsonParse(string(decodeBase64Url(parts[0])?))?
+  let typ = jsonGet(header, "typ")
+  if (!isSome(typ)) {
+    return
+  }
+  let value = jsonAsString(unwrap(typ))
+  if (!isSome(value) || unwrap(value) != "logout+jwt") {
+    fail newError("auth: logout token: invalid 'typ'")
+  }
+}
+
+fn verifyLogoutToken(s: OidcStrategy, token: string, at: int): LogoutClaims! {
+  if (token == "" || len(token) > logoutTokenMax) {
+    fail newError("auth: logout token: invalid token length")
+  }
+  let opts = ClaimsOptions{
+    now = at,
+    leewaySeconds = 0,
+    expectedAud = Option.Some(s.clientId),
+  }
+  let payload = verifyOidcToken(token, s.config, s.jwks, opts)?
+  checkLogoutType(token)?
+  checkLogoutEvent(payload)?
+  let sid = oidcString(payload, "sid", false)?
+  let subject = oidcString(payload, "sub", false)?
+  if (sid == "" && subject == "") {
+    fail newError("auth: logout token: requires 'sid' or 'sub'")
+  }
+  return LogoutClaims{
+    issuer = oidcString(payload, "iss", true)?,
+    sid = sid,
+    subject = subject,
+    jti = oidcString(payload, "jti", true)?,
+    issuedAt = logoutTime(payload, "iat")?,
+    expiresAt = logoutExpiry(payload, i64(at))?,
+  }
+}
+
+class LogoutReplayEntry {
+  expiresAt: i64,
+  busy: bool,
+}
+
+// No live entry is evicted. The claim survives expiry while its destroy is in flight.
+class LogoutReplay {
+  mu: Mutex
+  entries: map<string, LogoutReplayEntry>
+  capacity: int
+
+  init(capacity: int = 10_000) {
+    if (capacity < 1) {
+      panic("auth: logout replay capacity must be positive")
+    }
+    this.mu = Mutex()
+    this.entries = map<string, LogoutReplayEntry>()
+    this.capacity = capacity
+  }
+
+  claim(key: string, expiresAt: i64, at: i64 = -1, issuedAt: i64 = 0): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let current = at
+    if (current < 0) {
+      current = now().ns / Second
+    }
+    if (issuedAt < current - logoutWindow ||
+      issuedAt > current ||
+      expiresAt > current + logoutWindow) {
+      fail newError("auth: logout token: invalid time window at admission")
+    }
+    this.expire(current)
+    let (_, seen) = this.entries[key]
+    if (seen || expiresAt <= current || len(this.entries) >= this.capacity) {
+      fail newError("auth: logout token: replay or replay capacity exhausted")
+    }
+    this.entries[key] = LogoutReplayEntry{ expiresAt = expiresAt, busy = true }
+  }
+
+  finish(key: string, success: bool) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (!success) {
+      delete(this.entries, key)
+      return
+    }
+    let (entry, found) = this.entries[key]
+    if (!found) {
+      panic("auth: logout replay claim disappeared")
+    }
+    entry.busy = false
+  }
+
+  // Callers hold the mutex; both walks are bounded by capacity.
+  expire(at: i64) {
+    let dead = []string{}
+    for (key, entry) of this.entries {
+      if (!entry.busy && entry.expiresAt <= at) {
+        dead = append(dead, key)
+      }
+    }
+    for key of dead {
+      delete(this.entries, key)
+    }
+  }
+}
+
+fn terminateOidcSessions(s: OidcStrategy, claims: LogoutClaims, sessions: SessionStore): ()! {
+  let key = oidcTuple(claims.issuer, claims.jti)
+  s.logoutReplay.claim(key, claims.expiresAt, -1, claims.issuedAt)?
+  let success = false
+  defer {
+    s.logoutReplay.finish(key, success)
+  }
+  let index = oidcSubIndex
+  let value = claims.subject
+  if (claims.sid != "") {
+    index = oidcSidIndex
+    value = claims.sid
+  }
+  sessions.destroyIndexed(index, oidcTuple(claims.issuer, value), "", sessionTTLSeconds)?
+  success = true
+}
+
+fn backchannelLogout(s: OidcStrategy, c: Ctx, sessions: SessionStore): ()! {
+  if (c.method() != "POST") {
+    fail newError("auth: logout token: requires POST")
+  }
+  let raw = c.rawBody()?
+  if (len(raw) > logoutTokenMax * 3 + 64) {
+    fail newError("auth: logout token: form too large")
+  }
+  let form = parseQuery(raw)
+  let token = formField(form, "logout_token")
+  let claims = verifyLogoutToken(s, token, int(now().ns / Second))?
+  terminateOidcSessions(s, claims, sessions)?
+}
+
+// Mount once as a POST route with the long-lived strategy used for sign-in.
+// Replay history is local to that strategy and is lost with the process.
+export fn handleBackchannelLogout(s: OidcStrategy, c: Ctx, sessions: SessionStore): Res! {
+  backchannelLogout(s, c, sessions) catch _ {
+    return c.bytes(
+      "{\"error\":\"invalid_request\"}",
+      "application/json",
+    ).status(400).header("Cache-Control", "no-store")
+  }
+  return c.status(200).header("Cache-Control", "no-store")
+}
+
+// Provenance comes from the verified callback, including through pending MFA identities.
+fn bindOidcIndexes(session: Session, id: Identity) {
+  session.unindex(oidcSidIndex)
+  session.unindex(oidcSubIndex)
+  if (id.oidcIssuer == "") {
+    session.delete(idTokenSessionKey)
+    session.delete(sidSessionKey)
+    return
+  }
+  session.index(oidcSubIndex, oidcTuple(id.oidcIssuer, id.oidcSub))
+  if (id.oidcSid != "") {
+    session.index(oidcSidIndex, oidcTuple(id.oidcIssuer, id.oidcSid))
+  }
+}

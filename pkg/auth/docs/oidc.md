@@ -17,7 +17,7 @@ an ID token and verifying it. Both take the `OidcStrategy` built for a
 import { App, Config, MemoryStore, unauthorized } from "web"
 import {
   Identity, Lookup, LookupResult, LogoutOptions, OidcOptions, OidcStrategy, Provider, Strategy,
-  beginAuthorization, currentIdentity, endSession, handleCallback, handleLogoutCallback,
+  beginAuthorization, currentIdentity, endSession, handleBackchannelLogout, handleCallback, handleLogoutCallback,
   PasswordStrategy, requireAuth,
 } from "auth"
 import { TlsConfig } from "std/tls"
@@ -53,7 +53,8 @@ fn google(rootsPem: string): OidcStrategy! {
 }
 
 fn build(rootsPem: string): App! {
-  let app = App(Config{ secret = "change-me", sessions = MemoryStore(10_000) })
+  let sessions = MemoryStore(10_000)
+  let app = App(Config{ secret = "change-me", sessions = sessions })
   let lookup: Lookup = users
   let oidc = google(rootsPem)?
 
@@ -66,6 +67,7 @@ fn build(rootsPem: string): App! {
     let identity: Identity = handleCallback(oidc, c)?
     return c.redirect("/me")
   })
+  app.post("/auth/google/backchannel", (c) => handleBackchannelLogout(oidc, c, sessions)?)
 
   app.get("/logout", (c) => {
     return endSession(
@@ -176,3 +178,63 @@ users to that provider's own sign-out page.
 
 Next: [Other OIDC providers](providers.md), for Microsoft Entra ID and any
 other conformant provider.
+
+## When the provider signs the user out
+
+An enterprise provider can end a user's login while the browser is closed.
+Without a back-channel route, your application's session would remain active
+until its own expiry. The example's `/auth/google/backchannel` route shows
+`handleBackchannelLogout(oidc, c, sessions)`: give it the same strategy and
+session store that the sign-in routes use. Register that absolute route URL
+with a provider that supports OpenID Connect Back-Channel Logout. A provider
+that does not support the protocol will not call this route.
+
+The provider sends a POST form containing `logout_token`. The handler checks
+the signature with the strategy's JWKS, its issuer and client audience, a
+required `jti`, `iat` and `exp`, and the back-channel logout event object. A
+`nonce` claim is forbidden. An absent `typ` header is accepted for providers
+that omit this recommended header; a present header must be `logout+jwt`.
+These checks follow [Back-Channel Logout 1.0 sections 2.4-2.8](https://openid.net/specs/openid-connect-backchannel-1_0.html).
+
+This package also sets local bounds: the compact token is at most 16,384
+bytes, and each issuer, subject, sid and jti string is at most 1,024 bytes.
+The issued-at time must be within the previous 300 seconds. Expiry must be
+later than both now and issued-at, and no more than 300 seconds ahead of
+now. Logout checks use no clock skew allowance. These are application
+policies, not limits set by the protocol; synchronize the provider and server
+clocks. ID-token clock skew behavior stays the same.
+
+A `sid` token ends sessions for that sid and verified issuer. A token with
+only `sub` ends all sessions for that subject and issuer. Sessions from a
+different issuer survive, even when its sid or subject is identical. The
+ordinary subject index used by `logoutEverywhere` stays available. Callback
+sessions retain the verified provider subject separately from `Identity.id`,
+so mapping that exported id to a local account keeps provider logout working.
+The ordinary subject index follows the local id. Callback
+sessions waiting for MFA are indexed too, and promotion carries their
+indexes to the rotated session. A later non-OIDC login removes the old
+provider indexes; arbitrary `Identity.claims` cannot create provider
+provenance. Existing sessions created before this feature have no provider
+provenance and acquire it on the next OIDC login.
+
+A successful request returns 200, including when no matching session remains.
+Every failed request returns 400 with `{"error":"invalid_request"}`. Both
+responses carry `Cache-Control: no-store`.
+
+Each long-lived strategy holds at most 10,000 replay records, keyed by issuer
+and jti. An in-flight request claims its record before destroying sessions;
+a concurrent duplicate is refused, even if the original token expires while
+the store call runs. Successful requests retain their records until expiry.
+A full cache refuses another request and never evicts a live record. A store
+failure releases the claim, so the provider can retry the same token. A store
+that partly completed a failed operation must allow an idempotent retry;
+already-removed sessions count as success.
+
+Replay history belongs to one strategy instance in one process. Reuse the
+strategy created at application startup. Separate instances and processes
+have separate histories, and a restart loses the history. A crash after
+revocation but before recording success also loses that record; a retry can
+repeat the idempotent revocation. Applications that require durable replay
+protection across processes must enforce issuer-and-jti deduplication in
+their shared infrastructure. Session revocation itself uses the configured
+session store and reaches every session indexed there.

@@ -6,6 +6,9 @@ Connect provider like Google or Microsoft Entra ID. Both produce the same
 `Identity`, stored on the request's session, so the rest of your app never
 needs to know which one ran.
 
+`handleBackchannelLogout` accepts a provider's signed logout request and ends
+its matching sessions. See the route in [Sign in with Google](docs/oidc.md).
+
 ## Install
 
 `bit add bitlang.org/pkg/auth@^0.6.0` (and `bitlang.org/pkg/web@^0.9.0`, which
