@@ -1979,8 +1979,13 @@ runtime one (#6302, #6305, #6318, #6322, #6308).**
   fields of the row class - and, when the rows were stored, the line of the
   store. A function whose `return`s name different sources (a raw-SQL row in
   one, a query row in another, or two queries) returns a holder with one writer
-  per `return`: its callers' reads are proven only when every `return` loads the
-  relation, and the error names the `return` (or its query) that does not. A
+  per `return`: when every return is query-backed, a caller's read adds the
+  relation to each query without requiring `.with(...)` on each branch (#6389).
+  Parameter-forwarded or empty returns do not qualify for this mixed-return
+  auto-load; they keep the existing explicit load proof. A returned parameter
+  also keeps the proof of stores that replaced it inside its function.
+  Every return still owes the load proof: a raw-SQL, untraceable or cyclic
+  return stays `E0300`, naming the `return` (or its query) that does not load it. A
   parameter nothing calls has no query to add `.with(...)` to, so its error says
   to call the function, from a function body, with rows from a query. A place
   the error names in another file is written `<file>:<line>`.
