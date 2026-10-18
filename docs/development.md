@@ -31,8 +31,10 @@ Set an interactive budget for one command:
 BIT_MAKE_CPU_BUDGET=2 ./make test-prepush
 ```
 
-The budget caps concurrent suite gates. Compile pools in overlapping gates use
-one job each; the hash-seed gate runs alone and can use the full budget.
+The budget caps concurrent suite gates. Each gate receives an equal integer
+share of the budget, based on the smaller of the batch size and outer width.
+Its compile pools use that share; a single gate can use the full budget.
+The hash-seed and differential gates run alone.
 Differential constituents retain their simultaneous oracle/current
 pair, so their width is at most half the budget, with a minimum of one pair.
 Budget 1 therefore permits two simultaneous differential compilers. Runtime
