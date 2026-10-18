@@ -256,8 +256,8 @@ fn etag(body: string): string {
 // Each variant is the same call with one option.
 fn variants(body: string): []string! {
   let data = []byte(body)
-  let author = []byte("32 bytes of secret key material!")
-  let keyed = Blake3(Blake3Mode.Keyed(author))?
+  let author = [32]byte([]byte("32 bytes of secret key material!"))?
+  let keyed = Blake3(Blake3Mode.Keyed(author))
   let sketch = Shake(ShakeSecurity.S256)
   sketch.absorb(data)
   return []string{
@@ -273,8 +273,21 @@ fn variants(body: string): []string! {
 }
 ```
 
-`Blake3(Blake3Mode.Keyed(key))` is the one fallible digest constructor, because
-BLAKE3 keys must be exactly 32 bytes; use `?` or `catch` on it.
+When a draft MAC key arrives as bytes, validate it once with `[32]byte(bytes)?`
+or `catch`. A length other than 32 fails with
+`array conversion length mismatch: expected 32, found N`; the converted key
+is an independent copy. `Blake3(Blake3Mode.Keyed(key))` then cannot fail.
+
+For a single draft, the slice-taking helper checks the key for you and keeps
+its existing error message, `Blake3: key must be 32 bytes, got N`:
+
+```bit
+import { blake3KeyedHash } from "std/crypto"
+
+fn draftMac(keyBytes: []byte, body: string): []byte! {
+  return blake3KeyedHash(keyBytes, []byte(body))?
+}
+```
 
 ### Name the hash with a `HashAlg`
 
@@ -587,7 +600,11 @@ The BLAKE2s algorithm's internal block size in bytes.
 
 ### `Blake3`
 
-A BLAKE3 hasher, fast on large inputs. `Blake3()` is the plain hash; `Blake3(Blake3Mode.Keyed(key))?` is a MAC under a 32-byte key and fails on any other key length; `Blake3(Blake3Mode.DeriveKey(context))?` derives keys for the given context string. The constructor is fallible, so call it with `?` or `catch`.
+For a draft digest, use `Blake3()`; for a draft MAC, use
+`Blake3(Blake3Mode.Keyed(key))` with a `[32]byte` key.
+`Blake3(Blake3Mode.DeriveKey(context))` derives keys for the given context
+string. All three constructors are infallible. Convert a dynamic byte slice
+with `[32]byte(bytes)?` before keyed construction.
 
 ### `Blake3Mode`
 
