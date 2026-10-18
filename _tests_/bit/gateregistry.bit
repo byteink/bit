@@ -26,7 +26,17 @@
 // use the compiled registry. The phase fixture runs a copied actual driver
 // against owned warm artifacts, and never executes a harness argument.
 import { Gate, gateTable, gateNames, differentialJobsScript } from "../../tools/build"
-import { budgetJobs, hostJobsScript, nestedJobs, pairJobs, parseCpuBudget } from "../../tools/joblimit"
+import {
+  budgetEnvScript,
+  budgetJobs,
+  budgetShare,
+  fanoutJobs,
+  hostJobsScript,
+  nestedEnvScript,
+  nestedJobs,
+  pairJobs,
+  parseCpuBudget,
+} from "../../tools/joblimit"
 import { args, envOr, exit } from "std/os"
 import { exists, writeFile } from "std/fs"
 import { indexOf, replace } from "std/strings"
@@ -77,6 +87,7 @@ fn prepushSdk(gates: []Gate, covered: map<string, bool>, source: string, root: s
     "root=" +
     shQuote(root) +
     "\n" +
+    "[ ! -f \"$root/share-probe\" ] || exec sh \"$root/share-child.sh\" \"$root\" \"$name\"\n" +
     "if [ \"$name\" = test-differentials ]; then\n" +
     "  mkdir \"$root/differential\" || exit 125\n" +
     "  printf '%s\\n' \"\${DIFFALL_JOBS-}\" > \"$root/differential/jobs\"\n" +
@@ -222,6 +233,10 @@ fn prepushFixture(gates: []Gate, covered: map<string, bool>) {
     "for t in x86_64-linux aarch64-linux aarch64-macos; do mkdir -p \"$f/bit-out/lib/$t\"; ln -s \"$s/bit-out/lib/$t/libbitrt.a\" \"$f/bit-out/lib/$t/libbitrt.a\"; done\n"
   mustSucceed("gateregistry", "owned warm fixture", script)
   budgetScriptFixture(root)
+  budgetPoolFixture(root, 4, 1, 4)
+  budgetPoolFixture(root, 4, 2, 4)
+  budgetPoolFixture(root, 4, 4, 4)
+  budgetPoolFixture(root, 1, 4, 4)
   hashseedScriptFixture(root)
   differentialEnvFixture(root)
   let sdk = prepushSdk(gates, covered, source, root)
@@ -244,6 +259,7 @@ fn prepushFixture(gates: []Gate, covered: map<string, bool>) {
   let cases = prepushBudgetCases()
   let run = prepushRunScript(root, cases)
   mustSucceed("gateregistry", "actual prepush phase order and failure continuation", run)
+  budgetDriverFixture(root)
   rmrf(root)
   assert(!exists(root))
 }
@@ -259,7 +275,7 @@ fn budgetSelfTest() {
     assert(pairJobs(requested, 0) == requested)
     assert(nestedJobs(requested, 0) == requested)
     assert(budgetJobs(requested, 1) == 1)
-    assert(nestedJobs(requested, 1) == 1 && nestedJobs(requested, 2) == 1)
+    assert(nestedJobs(requested, 1) == 1 && nestedJobs(requested, 2) == budgetJobs(requested, 2))
     assert(pairJobs(requested, 1) == 1 && pairJobs(requested, 2) == 1)
     let previous = 0
     let budget = 1
@@ -272,11 +288,37 @@ fn budgetSelfTest() {
       budget = budget + 1
     }
   }
-  assert(hostJobsScript(1) == "N=1\n" && hostJobsScript(2) == "N=1\n")
+  assert(hostJobsScript(1) == "N=1\n" + budgetEnvScript(1))
+  assert(hostJobsScript(2) == "N=2\n" + budgetEnvScript(1))
   assert(
       hostJobsScript(0) ==
       "N=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)\n",
   )
+}
+
+fn budgetSharesSelfTest() {
+  assert(budgetEnvScript(0) == "")
+  assert(nestedEnvScript(18, 0) == "")
+  for budget of [1, 2, 3, 4, 8, 17] {
+    for count of [1, 2, 4, 7] {
+      for slots of [1, 2, 4, 16] {
+        let width = fanoutJobs(slots, count, budget)
+        let share = budgetShare(budget, width)
+        assert(width > 0)
+        assert(width <= count)
+        assert(width <= slots)
+        assert(width <= budget)
+        assert(share > 0)
+        assert(width * share <= budget)
+        assert(nestedJobs(18, share) == share)
+      }
+    }
+  }
+  assert(budgetShare(4, 1) == 4)
+  assert(budgetShare(4, 2) == 2)
+  assert(budgetShare(4, 4) == 1)
+  assert(fanoutJobs(16, 1, 0) == 16)
+  assert(budgetShare(0, 16) == 0)
 }
 
 fn differentialEnvFixture(root: string) {
@@ -313,6 +355,157 @@ fn differentialEnvFixture(root: string) {
   mustSucceed("gateregistry", "effective per-gate differential widths", run)
 }
 
+// The first wave meets at a barrier, so every admitted slot must run.
+const budgetWorkerScript: string = `#!/bin/sh
+set -eu
+base=$1; group=$2
+[ "$BIT_MAKE_CPU_BUDGET" -eq 1 ]
+lock() {
+  n=0
+  until mkdir "$base/lock" 2>/dev/null; do
+    n=$((n + 1)); [ "$n" -lt 5000 ] || exit 125
+    sleep 0.001
+  done
+}
+lock
+: > "$base/live/$group.$$"
+total=$(find "$base/live" -type f | wc -l)
+own=$(find "$base/live" -name "$group.*" | wc -l)
+[ "$total" -le "$(cat "$base/limit")" ]
+[ "$own" -le "$(cat "$base/share")" ]
+[ "$total" -le "$(cat "$base/peak")" ] || echo "$total" > "$base/peak"
+[ "$own" -le "$(cat "$base/peak-$group")" ] || echo "$own" > "$base/peak-$group"
+[ "$total" -lt "$(cat "$base/limit")" ] || : > "$base/open"
+rmdir "$base/lock"
+n=0
+while [ ! -f "$base/open" ]; do
+  n=$((n + 1)); [ "$n" -lt 5000 ] || exit 125
+  sleep 0.001
+done
+sleep 0.01
+lock
+rm "$base/live/$group.$$"
+rmdir "$base/lock"
+`
+
+fn budgetPoolFixture(root: string, budget: int, count: int, slots: int) {
+  let width = fanoutJobs(slots, count, budget)
+  let share = budgetShare(budget, width)
+  let total = width * share
+  let base = root + "/pool-${budget}-${count}-${slots}"
+  mustSucceed("gateregistry", "owned nested pool", "mkdir -p " + shQuote(base + "/live"))
+  writeFile(base + "/worker.sh", budgetWorkerScript) catch _ {
+    exit(1)
+  }
+  let run = "set -eu\nbase=" +
+    shQuote(base) +
+    "\necho ${total} > \"$base/limit\"\necho ${share} > \"$base/share\"\necho 0 > \"$base/peak\"\n"
+  let group = 0
+  while (group < width) {
+    let path = base + "/group-${group}.sh"
+    let script = hostJobsScript(share) +
+      "printf '1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n' | xargs -n1 -P \"$N\" sh " +
+      shQuote(base + "/worker.sh") +
+      " " +
+      shQuote(base) +
+      " ${group}\n"
+    writeFile(path, script) catch _ {
+      exit(1)
+    }
+    run = run + "echo 0 > \"$base/peak-${group}\"\nsh " + shQuote(path) + " &\np${group}=$!\n"
+    group = group + 1
+  }
+  group = 0
+  while (group < width) {
+    run = run + "wait \"$p${group}\"\n[ \"$(cat \"$base/peak-${group}\")\" -eq ${share} ]\n"
+    group = group + 1
+  }
+  run = run + "[ \"$(cat \"$base/peak\")\" -eq ${total} ]\n[ -z \"$(ls -A \"$base/live\")\" ]\n"
+  mustSucceed("gateregistry", "nested pool budget=${budget} count=${count} slots=${slots}", run)
+}
+
+const budgetDriverChildScript: string = `#!/bin/sh
+set -eu
+root=$1; name=$2; base=$(cat "$root/share-probe")
+printf '%s\n' "$BIT_MAKE_CPU_BUDGET" > "$base/shares/$name"
+mkdir "$base/active/$name"
+if [ "$name" = test-differentials ]; then
+  [ "$BIT_MAKE_CPU_BUDGET" -eq 4 ]
+  [ "$(ls "$base/done" | wc -l)" -eq 2 ]
+  [ "$(ls "$base/active" | wc -l)" -eq 1 ]
+else
+  N=$BIT_MAKE_CPU_BUDGET
+  BIT_MAKE_CPU_BUDGET=1
+  export BIT_MAKE_CPU_BUDGET
+  printf '1\n2\n3\n4\n5\n6\n7\n8\n' | xargs -n1 -P "$N" sh "$root/share-worker.sh" "$base" "$name"
+fi
+: > "$base/done/$name"
+rmdir "$base/active/$name"
+[ "$name" != "$(cat "$base/fail")" ]
+`
+
+fn budgetDriverCase(root: string, budget: int, names: []string, failedGate: string, mixed: bool) {
+  let pooled = len(names)
+  if (mixed) {
+    pooled = pooled - 1
+  }
+  let width = fanoutJobs(4, pooled, budget)
+  let share = budgetShare(budget, width)
+  let base = root + "/driver-${budget}-${len(names)}-${failedGate}"
+  let run = "set -eu\nf=" + shQuote(root) + "\nbase=" + shQuote(base) + "\n"
+  run = run + "mkdir -p \"$base/live\" \"$base/active\" \"$base/shares\" \"$base/done\"\n"
+  run = run +
+    "echo \"$base\" > \"$f/share-probe\"\necho ${width * share} > \"$base/limit\"\necho ${share} > \"$base/share\"\necho 0 > \"$base/peak\"\n"
+  run = run + "printf '%s' " + shQuote(failedGate) + " > \"$base/fail\"\n"
+  let argv = ""
+  for name of names {
+    run = run + "echo 0 > \"$base/peak-${name}\"\n"
+    argv = argv + " " + shQuote(name)
+  }
+  run = run +
+    "set +e\nenv -i PATH=\"$PATH\" TMPDIR=\"$f/\" BIT_MAKE_ROOT=\"$f\" BIT_MAKE_CPU_BUDGET=${budget} BIT_MAKE_JOBS=4 BIT_LIBBITRT_TREE=" +
+    shQuote(envOr("BIT_LIBBITRT_TREE", "")) +
+    " \"$f/bit-out/make/make-driver\"" +
+    argv +
+    " > \"$base/driver.log\" 2>&1\nrc=$?\nset -e\n"
+  let want = 0
+  if (failedGate != "") {
+    want = 1
+  }
+  run = run +
+    "[ \"$rc\" -eq ${want} ]\n[ -z \"$(ls -A \"$base/active\")\" ]\n[ -z \"$(ls -A \"$base/live\")\" ]\n[ \"$(ls \"$base/done\" | wc -l)\" -eq ${len(names)} ]\n[ \"$(cat \"$base/peak\")\" -eq ${width *
+      share} ]\n"
+  for name of names {
+    let inherited = share
+    if (mixed && name == "test-differentials") {
+      inherited = budget
+    }
+    run = run + "[ \"$(cat \"$base/shares/${name}\")\" -eq ${inherited} ]\n"
+    run = run +
+      "printf 'gateregistry: inherited gate=${name} share=%s\\n' \"$(cat \"$base/shares/${name}\")\"\n"
+  }
+  run = run +
+    "printf 'gateregistry: driver budget=${budget} gates=${len(names)} native=%s peak=%s drained\\n' \"$rc\" \"$(cat \"$base/peak\")\"\nrm \"$f/share-probe\"\n"
+  mustSucceed("gateregistry", "actual driver inherited shares and drain", run)
+}
+
+fn budgetDriverFixture(root: string) {
+  writeFile(root + "/share-worker.sh", budgetWorkerScript) catch _ {
+    exit(1)
+  }
+  writeFile(root + "/share-child.sh", budgetDriverChildScript) catch _ {
+    exit(1)
+  }
+  let two = ["test-golden", "test-checker-diag"]
+  let four = ["test-golden", "test-checker-diag", "test-gate-registry", "test-fmt-strict"]
+  budgetDriverCase(root, 4, ["test-golden"], "", false)
+  budgetDriverCase(root, 4, two, "", false)
+  budgetDriverCase(root, 4, four, "", false)
+  budgetDriverCase(root, 1, two, "", false)
+  budgetDriverCase(root, 4, two, "test-golden", false)
+  budgetDriverCase(root, 4, ["test-golden", "test-checker-diag", "test-differentials"], "", true)
+}
+
 fn budgetScriptFixture(root: string) {
   let probe = root + "/probe"
   mustSucceed("gateregistry", "owned CPU probe", "mkdir " + shQuote(probe))
@@ -320,7 +513,7 @@ fn budgetScriptFixture(root: string) {
     exit(1)
   }
   let run = "chmod 700 " + shQuote(probe + "/getconf") + "\n"
-  for budget of [0, 1, 2] {
+  for budget of [0, 1, 2, 4] {
     let width = nestedJobs(18, budget)
     let path = probe + "/width-${budget}.sh"
     writeFile(path, hostJobsScript(budget) + "[ \"$N\" -eq ${width} ]\n") catch _ {
@@ -328,7 +521,7 @@ fn budgetScriptFixture(root: string) {
     }
     run = run + "PATH=" + shQuote(probe) + ":\"$PATH\" sh " + shQuote(path) + "\n"
   }
-  mustSucceed("gateregistry", "generated nested widths default/1/2", "set -e\n" + run)
+  mustSucceed("gateregistry", "generated nested widths default/1/2/4", "set -e\n" + run)
 }
 
 fn hashseedScriptFixture(root: string) {
@@ -399,6 +592,7 @@ fn printExcluded(gates: []Gate, covered: map<string, bool>) {
 
 fn main() {
   budgetSelfTest()
+  budgetSharesSelfTest()
   let gates = gateTable()
   let covered = coveredNames()
   printExcluded(gates, covered)
