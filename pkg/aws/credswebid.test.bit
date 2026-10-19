@@ -1,0 +1,245 @@
+// Pinned fromTokenFile/fromWebToken cases plus the real cache and STS transport.
+import { isSymlink, rename } from "std/fs"
+import { run } from "std/process"
+
+fn webVars(path: string, role: string, session: string = ""): map<string, string> {
+  let vars = map<string, string>()
+  vars[webIdentityFile] = path
+  vars[webIdentityRole] = role
+  vars[webIdentitySession] = session
+  return vars
+}
+
+fn webProfileVars(path: string, role: string): map<string, string> {
+  let profile = map<string, string>()
+  profile["web_identity_token_file"] = path
+  profile["role_arn"] = role
+  profile["region"] = "eu-west-1"
+  return profile
+}
+
+fn webConfig(vars: map<string, string>): WebIdentityConfig {
+  return webIdentityEnv(lookup(vars), 1700000000123) catch e {
+    panic(e.message())
+  }
+}
+
+fn webProfileConfig(profile: map<string, string>, vars: map<string, string>): WebIdentityConfig {
+  return webIdentityProfileConfig(profile, lookup(vars), 1700000000123) catch e {
+    panic(e.message())
+  }
+}
+
+fn webMissing(provider: () => WebIdentityConfig!): bool {
+  provider() catch e {
+    let (_, ok) = e.(WebIdentityNotConfigured)
+    return ok
+  }
+  return false
+}
+
+fn webPath(): string {
+  return "${envOr("TMPDIR", "/tmp")}/t6625-token-${now().ns}"
+}
+
+fn webServe(seen: Seen): (Server, StsClient) {
+  let server = serve("127.0.0.1", 0) catch e {
+    panic(e.message())
+  }
+  let port = server.port() catch e {
+    server.close()
+    panic(e.message())
+  }
+  spawn fakeServe(server, seen)
+  return (server, clientFor(port))
+}
+
+fn webTokenError(path: string): string {
+  webIdentityReadToken(path) catch e {
+    let (_, missing) = e.(WebIdentityNotConfigured)
+    assert(!missing, "a configured file failure permits chain continuation")
+    return e.message()
+  }
+  return ""
+}
+
+test "web identity missing configuration yields the continuation signal in exactly three cases" {
+  let paths = ["", "/unused-token-file", ""]
+  let roles = ["", "", demoRole]
+  let environment = webVars("/environment-token", demoRole, "environment-session")
+  let count = 0
+  let i = 0
+  while (i < 3) {
+    let vars = webVars(paths[i], roles[i])
+    assert(webMissing(() => webIdentityEnv(lookup(vars), 1)), "environment case ${i}")
+    let profile = webProfileVars(paths[i], roles[i])
+    assert(
+      webMissing(() => webIdentityProfileConfig(profile, lookup(environment), 1)),
+      "incomplete profile borrowed environment token file or role",
+    )
+    count = count + 1
+    i = i + 1
+  }
+  assert(count == 3, "missing configuration cases: ${count}")
+}
+
+test "web identity session defaults and profile environment precedence match the SDK" {
+  let vars = webVars("/env-token", demoRole, "env-session")
+  vars["AWS_REGION"] = "ap-south-1"
+  let fromEnv = webConfig(vars)
+  assert(fromEnv.sessionName == "env-session", "environment session")
+  assert(fromEnv.region == "ap-south-1", "environment region")
+  let profile = webProfileVars("/profile-token", "arn:aws:iam::1:role/profile")
+  let inherited = webProfileConfig(profile, vars)
+  assert(inherited.sessionName == "env-session", "absent profile session uses environment")
+  assert(inherited.tokenFile == "/profile-token", "profile file wins")
+  assert(inherited.roleArn == "arn:aws:iam::1:role/profile", "profile role wins")
+  assert(inherited.region == "ap-south-1", "environment region wins")
+  profile["role_session_name"] = "profile-session"
+  let selected = webProfileConfig(profile, vars)
+  assert(selected.sessionName == "profile-session", "profile session wins")
+  vars["AWS_REGION"] = ""
+  assert(webProfileConfig(profile, vars).region == "eu-west-1", "profile region fallback")
+  vars[webIdentitySession] = ""
+  assert(webConfig(vars).sessionName == "aws-sdk-js-session-1700000000123", "exact default")
+  assert(webConfig(vars).region == "us-east-1", "STS region fallback")
+}
+
+test "web identity token reader enforces both API boundaries without exposing the token" {
+  let path = webPath()
+  defer containerRemove(path)
+  for size of [0, 3, 4, 20000, 20001] {
+    let token = repeat("x", size)
+    containerWrite(path, token)
+    let failure = webTokenError(path)
+    let accepted = size == 4 || size == 20000
+    assert(failure == "" == accepted, "token boundary ${size}")
+    if (accepted) {
+      let actual = webIdentityReadToken(path) catch e {
+        panic(e.message())
+      }
+      assert(actual == token, "token bytes changed")
+    }
+  }
+  containerWrite(path, "private-web-token")
+  containerRemove(path)
+  let failure = webTokenError(path)
+  assert(failure != "" && !contains(failure, "private-web-token"), "missing file is hard")
+  assert(webTokenError("/dev/null") != "", "device accepted")
+  // Leave a file for the deferred cleanup.
+  containerWrite(path, "done")
+}
+
+test "web identity Profile cache preserves typed profile file errors" {
+  let expected = ProfileFileError{
+    path = "t6625-profile", line = 3, reason = "malformed profile",
+  }
+  seededProfileCache(() => {
+    fail expected
+  }) catch e {
+    let (typed, ok) = e.(ProfileFileError)
+    assert(ok, "Profile cache erased the typed error")
+    assert(
+      typed.path == expected.path && typed.line == expected.line && typed.reason == expected.reason,
+      "Profile cache changed the error fields",
+    )
+    return
+  }
+  panic("Profile cache accepted a provider failure")
+}
+
+test "web identity uses unsigned STS and seeds the Profile cache before token rotation" {
+  let path = webPath()
+  containerWrite(path, "first-token+/=")
+  defer containerRemove(path)
+  let seen = Seen{
+    status = 200,
+    answer = replace(webIdentityXml, "2014-10-24T23:00:23Z", "2099-10-24T23:00:23Z"),
+  }
+  let (server, client) = webServe(seen)
+  defer server.close()
+  let config = webProfileConfig(webProfileVars(path, demoRole), webVars("", "", "app1"))
+  let cache = seededProfileCache(() => webIdentityResolve(config, client)) catch e {
+    panic(e.message())
+  }
+  assert(seen.hits == 1, "initial profile exchange count")
+  assert(resolveId(cache) == "ASgeIAIOSFODNN7EXAMPLE", "identity")
+  assert(seen.hits == 1, "first resolve exchanged twice")
+  assert(contains(seen.body, "&WebIdentityToken=first-token%2B%2F%3D"), "token encoding")
+  assert(contains(seen.body, "&RoleSessionName=app1"), "session name")
+  assert(httpHeader(seen.headers, "authorization") == "", "web identity was signed")
+  assert(httpHeader(seen.headers, "x-amz-security-token") == "", "session token header")
+  assert(!contains(seen.headers, "first-token"), "token leaked into headers")
+  let replacement = path + "-replacement"
+  containerWrite(replacement, "rotated-token")
+  rename(replacement, path) catch e {
+    containerRemove(replacement)
+    panic(e.message())
+  }
+  assert(resolveId(cache, Refresh.Force) == "ASgeIAIOSFODNN7EXAMPLE", "forced identity")
+  assert(seen.hits == 2, "forced exchange count")
+  assert(contains(seen.body, "&WebIdentityToken=rotated-token"), "rotation not observed")
+}
+
+test "web identity reopens a rotating file symlink" {
+  let path = webPath()
+  let link = path + "-link"
+  containerWrite(path, "first-token")
+  defer containerRemove(path)
+  let rc = run("/bin/ln", ["-s", path, link])
+  assert(rc == 0 && isSymlink(link), "token symlink fixture")
+  defer containerRemove(link)
+  let first = webIdentityReadToken(link) catch e {
+    panic(e.message())
+  }
+  assert(first == "first-token", "symlink not followed")
+  let replacement = path + "-replacement"
+  containerWrite(replacement, "second-token")
+  rename(replacement, path) catch e {
+    containerRemove(replacement)
+    panic(e.message())
+  }
+  let second = webIdentityReadToken(link) catch e {
+    panic(e.message())
+  }
+  assert(second == "second-token", "replacement was hidden behind a retained descriptor")
+}
+
+test "web identity configured STS failure stays hard and redacts an echoed token" {
+  let path = webPath()
+  let prefix = "private-web-token-prefix"
+  let token = prefix + repeat("x", 2000)
+  let serverDetail = "server-controlled-detail:"
+  containerWrite(path, token)
+  defer containerRemove(path)
+  let seen = Seen{
+    status = 400,
+    answer = replace(expiredToken, "Token expired:", serverDetail + token + " expired:"),
+  }
+  let (server, client) = webServe(seen)
+  defer server.close()
+  let config = webConfig(webVars(path, demoRole))
+  webIdentityResolve(config, client) catch e {
+    let (_, missing) = e.(WebIdentityNotConfigured)
+    assert(!missing, "STS refusal permits chain continuation")
+    assert(
+      !contains(e.message(), prefix) && !contains(e.message(), serverDetail),
+      "STS failure leaked server text",
+    )
+    assert(e.message() == "aws: web identity: STS exchange failed", "hard STS failure")
+    assert(seen.hits == 1, "STS request count")
+    let cache = CredentialCache(() => webIdentityResolve(config, client))
+    let cached = resolveError(cache)
+    assert(
+      !contains(cached, prefix) && !contains(cached, serverDetail),
+      "cached STS failure leaked server text",
+    )
+    assert(
+      cached == "aws: credentials: provider failed: aws: web identity: STS exchange failed",
+      "cached hard STS failure",
+    )
+    assert(seen.hits == 2, "cache did not call the provider")
+    return
+  }
+  panic("STS refusal was accepted")
+}
