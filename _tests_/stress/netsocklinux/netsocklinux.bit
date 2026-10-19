@@ -26,7 +26,7 @@
 // abstraction. The properties must be identical for the comparison to mean
 // anything, and the only way to share them would be a provider indirection —
 // which is precisely the layer whose per-platform correctness is under test.
-// Anything that diverges beyond the imports and this header is a bug.
+// The Linux-only socket-option controls below are an explicit exception (#8383).
 //
 // ---------------------------------------------------------------------------
 // MUTATION RECORD — WHAT THIS FILE PROVABLY GUARDS, AND WHAT IT DOES NOT
@@ -87,18 +87,19 @@ import { netReadSock, netWriteSock, netClose, netSocketError } from "../../../ru
 import { netSockPeerAddr } from "../../../runtime/net/linux"
 import { netBindUdp, netSendTo, netRecvFrom } from "../../../runtime/net/linux"
 import { netFillSockAddr } from "../../../runtime/net/linux"
-import { netSockAddrFamily } from "../../../runtime/net/linux"
 import { netDnsSocket, netResolveHost } from "../../../runtime/net/linux"
 // netSockAddrLen/Port/Octets moved to core in #2552 ("net: pull up
 // darwin-side pure marshalling/scratch-slot helpers to core") -- they are no
 // longer re-exported by runtime/net/linux (an import is not an export, and
 // #2552's own follow-up commit dropped the now-internally-unused import of
-// two of the three from linux/sock.bit). netSockAddrFamily above stays
-// linux-local: the family byte's offset genuinely differs per platform.
+// two of the three from linux/sock.bit).
 import { netSockAddrLen, netSockAddrPort, netSockAddrOctets, getU8 } from "../../../runtime/net"
 import { threadJoin, threadJoinDone, threadRunning } from "../../../runtime/thread"
 import { threadStart, threadRelease } from "../../../runtime/thread/linux"
 import { parkSleepNs, parkMonoNs } from "../../../runtime/park/linux"
+import { netDialTcpDeadline, netReadSockDeadline, netWriteSockDeadline } from "../../../runtime/net/linux"
+import { sysGetSockOpt, sysSetSockOpt } from "../../../runtime/syscalls"
+import { argc, arg } from "std/os"
 
 // Scratch regions. `[N]i64` rather than `[N]byte` because a Bit array stores one
 // 8-BYTE WORD per element (§11.8): only an `[N]i64` walked through a `*u8` is a
@@ -122,6 +123,10 @@ let goWords: [1]i32
 // these adapt them back using this thread's own scratch, which nothing else
 // on this OS thread touches concurrently.
 let joinScratch: [2]i64
+// Four-byte Linux int/socklen_t scratch, used by the main thread only.
+let tcpOptValue: [1]i32
+let tcpOptSize: [1]i32
+let tcpOptWrite: [1]i32
 
 fn sleepAdapt(ns: int) {
   parkSleepNs(ns, ptrOf(joinScratch))
@@ -545,10 +550,147 @@ fn blockedProps(hostLen: int): bool {
   return blocked
 }
 
+// Linux UAPI: IPPROTO_TCP=6, TCP_NODELAY=1, TCP_QUICKACK=12 (#8383).
+// These options belong only to this fixture's owned sockets.
+fn tcpOption(fd: int, name: int): int {
+  *ptrOf(tcpOptValue) = i32(0)
+  *ptrOf(tcpOptSize) = i32(4)
+  let rc = syscall(
+    sysGetSockOpt(), i64(fd), 6, i64(name),
+    i64(int(ptrOf(tcpOptValue))), i64(int(ptrOf(tcpOptSize))),
+  )
+  assert(rc == 0 && *ptrOf(tcpOptSize) == i32(4), "TCP option read failed")
+  return int(*ptrOf(tcpOptValue))
+}
+
+fn setTcpOption(fd: int, name: int, value: int) {
+  *ptrOf(tcpOptWrite) = i32(value)
+  let rc = syscall(sysSetSockOpt(), i64(fd), 6, i64(name), i64(int(ptrOf(tcpOptWrite))), 4)
+  assert(rc == 0, "TCP option write failed")
+  assert(tcpOption(fd, name) == value, "TCP option write did not persist")
+}
+
+fn tcpOptionDefaults(hostLen: int) {
+  let lfd = netListenTcp(hostBytes(), hostLen, 0, 16)
+  assert(lfd >= 0, "option listener failed")
+  let port = netSockLocalPort(lfd)
+  assert(port > 0, "option listener port failed")
+  let listener = tcpOption(lfd, 1)
+  // Accepted sockets must set their own option, not inherit this listener's value.
+  setTcpOption(lfd, 1, 0)
+  let cfd = netDialTcp(hostBytes(), hostLen, port)
+  assert(cfd >= 0, "option ordinary dial failed")
+  let afd = netAcceptTcp(lfd)
+  assert(afd >= 0, "option ordinary accept failed")
+  let dfd = netDialTcpDeadline(hostBytes(), hostLen, port, monoAdapt() + 2000000000)
+  assert(dfd >= 0, "option deadline dial failed")
+  let bfd = netAcceptTcp(lfd)
+  assert(bfd >= 0, "option deadline accept failed")
+  let ordinary = tcpOption(cfd, 1)
+  let deadline = tcpOption(dfd, 1)
+  let accepted = tcpOption(afd, 1)
+  let acceptedDeadline = tcpOption(bfd, 1)
+  netClose(bfd)
+  netClose(dfd)
+  netClose(afd)
+  netClose(cfd)
+  netClose(lfd)
+  println("nodelay ${listener} ${ordinary} ${deadline} ${accepted} ${acceptedDeadline}")
+}
+
+fn delayReadPair(fd: int, buf: *u8, deadline: int) {
+  let got = 0
+  let attempts = 0
+  while (got < 2 && attempts < 2) {
+    let n = netReadSockDeadline(fd, buf + got, 2 - got, deadline)
+    assert(n > 0, "control read failed or expired")
+    got = got + n
+    attempts = attempts + 1
+  }
+  assert(got == 2, "control read was incomplete")
+}
+
+fn delayWritePair(fd: int, split: bool, deadline: int) {
+  if (!split) {
+    assert(netWriteSockDeadline(fd, sendBytes(), 2, deadline) == 2, "combined write failed")
+    return
+  }
+  assert(netWriteSockDeadline(fd, sendBytes(), 1, deadline) == 1, "first write failed")
+  // Let the first segment reach the peer before the second command is ready.
+  timeSleepNs(1000000)
+  assert(netWriteSockDeadline(fd, sendBytes() + 1, 1, deadline) == 1, "second write failed")
+}
+
+fn delaySample(cfd: int, afd: int, split: bool): int {
+  setTcpOption(afd, 12, 0)
+  let start = monoAdapt()
+  let deadline = start + 2000000000
+  delayWritePair(cfd, split, deadline)
+  delayReadPair(afd, recvBytes(), deadline)
+  assert(sameBytes(sendBytes(), recvBytes(), 2), "control request differs")
+  assert(netWriteSockDeadline(afd, recvBytes(), 2, deadline) == 2, "control reply failed")
+  delayReadPair(cfd, echoBytes(), deadline)
+  assert(sameBytes(sendBytes(), echoBytes(), 2), "control reply differs")
+  return monoAdapt() - start
+}
+
+fn delayCase(hostLen: int, group: int, sample: int) {
+  let noDelay = 0
+  let split = group != 2
+  if (group == 1) {
+    noDelay = 1
+  }
+  let lfd = netListenTcp(hostBytes(), hostLen, 0, 16)
+  assert(lfd >= 0, "control listener failed")
+  let port = netSockLocalPort(lfd)
+  assert(port > 0, "control listener port failed")
+  let cfd = netDialTcpDeadline(hostBytes(), hostLen, port, monoAdapt() + 2000000000)
+  assert(cfd >= 0, "control dial failed")
+  let afd = netAcceptTcp(lfd)
+  assert(afd >= 0, "control accept failed")
+  setTcpOption(cfd, 1, noDelay)
+  setTcpOption(afd, 1, 1)
+  let elapsed = delaySample(cfd, afd, split)
+  netClose(afd)
+  netClose(cfd)
+  netClose(lfd)
+  println("tcp-delay nodelay=${noDelay} split=${split} sample=${sample} port=${port} ns=${elapsed}")
+}
+
+fn delayControl(hostLen: int) {
+  let sample = 0
+  while (sample < 32) {
+    let order = 0
+    // Rotate all three controls so the socket option does not select run order.
+    while (order < 3) {
+      delayCase(hostLen, (sample + order) % 3, sample)
+      order = order + 1
+    }
+    sample = sample + 1
+  }
+}
+
 fn main() {
   let hostLen = writeLoopback(hostBytes())
   let badLen = writeHostname(badHostBytes())
   fillPayload(sendBytes())
+  if (argc() == 2 && arg(1) == "tcp-delay-control") {
+    delayControl(hostLen)
+    return
+  }
+  if (argc() == 2 && arg(1) == "mysql-warm-control") {
+    warmTlsControl() catch e {
+      panic("mysql warm control: ${e.message()}")
+    }
+    return
+  }
+  if (argc() == 2 && arg(1) == "mysql-default-control") {
+    warmTlsControl() catch e {
+      panic("mysql default control: ${e.message()}")
+    }
+    return
+  }
+  tcpOptionDefaults(hostLen)
 
   let addrOk = addrLayoutProps()
   let refused = refusedProps(badLen)

@@ -6,6 +6,9 @@ green thread per connection" server costs one `Task` per connection, not one OS
 thread. Every operation that can fail returns `T!` - propagate with `?` or handle
 with `catch`.
 
+Linux enables `TCP_NODELAY` by default on TCP listeners, outbound connections,
+and accepted connections.
+
 Addresses are IP literals, dotted-quad IPv4 (`"127.0.0.1"`) or IPv6 (`"::1"`),
 not hostnames: this module does not resolve hostnames. It also has no TLS - put a terminating
 proxy in front before exposing a public port.
