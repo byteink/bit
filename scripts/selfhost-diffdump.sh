@@ -502,6 +502,18 @@ run_types() {
 # decided nothing and exits 2 instead, matching the split #3351/#3378
 # established for the rest of this family. Explained and oraclecrash never
 # affect the exit code either way — unchanged.
+# Updates run_ir's match counter or its named proof manifest.
+ir_signature_bucket() {
+  local rc=$1 sig=$2 source=$3 kind=$4 separator=$5 directory=$6
+  if [ "$rc" -eq 0 ] && [ "$sig" = canonical-ir-match ]; then
+    match=$((match + 1))
+  elif [ "$rc" -eq 0 ] && [ "$kind" = iropt ] && [ "$sig" = 5909-nonnull-map-guard-thread ]; then
+    printf "%s%sdeclared signature '%s'\n" "$source" "$separator" "$sig" >>"$directory/explained"
+  else
+    echo "$source" >>"$directory/mismatch"
+  fi
+}
+
 run_ir() {
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
@@ -619,11 +631,7 @@ run_ir() {
         echo "$f${sep}candidate framing object produced no verdict" >>"$work/timeout"
         continue
       fi
-      if [ "$rc" -eq 0 ] && [ "$sig" = canonical-ir-match ]; then
-        match=$((match + 1))
-      else
-        echo "$f" >>"$work/mismatch"
-      fi
+      ir_signature_bucket "$rc" "$sig" "$f" "$NAME" "$sep" "$work"
     fi
   done
 

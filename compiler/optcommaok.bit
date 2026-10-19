@@ -22,6 +22,9 @@
 //
 // Z is M unchanged. An absent key leaves through M' with the null word and
 // skips the allocation; a present key holding null still gets the zero object.
+// #5909 also skips J's ok test on H's non-null edge when J is only that
+// guard. Its true arm receives p as a parameter from both H and J: H passes
+// the non-null v, while J passes the original value after checking ok.
 //
 // ## The proof obligation, and the refusal
 //
@@ -50,7 +53,9 @@
 //    `p` is not the null word. Liveness, not a pattern: a guard anywhere, any
 //    number of them, and a use anywhere they dominate. This is judged on the
 //    CFG as lowered; the split only puts M' on the H->M edge, and M' reaches
-//    nothing but Z and J, so the pairing and every dominance it used survive.
+//    nothing but Z and J, so the pairing and every dominance it used survive
+//    that split. Hit threading then rebinds p at S, which must dominate every
+//    use outside J; either entering edge supplies a value safe for that use.
 //
 // A block argument is not a read. `p` passed to a parameter nothing names is
 // dead there; `p` passed along a guard's own ok-true edge, or out of a block a
@@ -62,7 +67,7 @@
 // One rewritable miss: the probe block `h`, the miss block, the join and the
 // index `pi` of `p` among its parameters, the `v` and `ok` fact 1 is stated
 // over, and the miss block's `jump` whose argument is rewritten. `h` is -1
-// when the block asked about is no such probe.
+// when the block asked about is no such probe; `hit` is the optional true arm.
 class CommaOkMiss {
   h: int,
   miss: int,
@@ -71,6 +76,7 @@ class CommaOkMiss {
   v: int,
   ok: int,
   jump: int,
+  hit: int,
 }
 
 // What the candidate tests read besides the function: the predecessor map,
@@ -82,7 +88,9 @@ class MissFacts {
 }
 
 fn noCommaOkMiss(): CommaOkMiss {
-  return CommaOkMiss{ h = -1, miss = -1, join = -1, pi = -1, v = -1, ok = -1, jump = -1 }
+  return CommaOkMiss{
+    h = -1, miss = -1, join = -1, pi = -1, v = -1, ok = -1, jump = -1, hit = -1,
+  }
 }
 
 fn predCount(pm: PredMap, b: int): int {
@@ -174,7 +182,9 @@ fn commaOkMissAt(f: IrFunc, mf: MissFacts, h: int): CommaOkMiss {
   if (pi < 0) {
     return noCommaOkMiss()
   }
-  return CommaOkMiss{ h = h, miss = br.ival2, join = br.ival, pi = pi, v = v, ok = ok, jump = jt }
+  return CommaOkMiss{
+    h = h, miss = br.ival2, join = br.ival, pi = pi, v = v, ok = ok, jump = jt, hit = -1,
+  }
 }
 
 // The miss block's `jump` when the CFG is exactly the header's: the miss block,
@@ -375,9 +385,58 @@ fn namesValue(f: IrFunc, i: int, id: int): bool {
   return false
 }
 
+// Skipping J must skip only its guard, including the optional `!ok` compare.
+fn commaOkGuardOnly(f: IrFunc, mf: MissFacts, c: CommaOkMiss): bool {
+  let blk = f.blocks[c.join]
+  let t = blockTerm(f, c.join)
+  if (f.instrs[t].lhs == c.ok) {
+    return blk.instsLen == blk.paramCount + 1
+  }
+  if (blk.instsLen != blk.paramCount + 3 || f.instrs[t].lhs != t - 1) {
+    return false
+  }
+  return f.instrs[t - 1].rhs == t - 2 && mf.uses[t - 1] == 1 && mf.uses[t - 2] == 1
+}
+
+// A non-null map_val_at proves ok. Move J's one value parameter to its true
+// arm, which must dominate every use outside J, so the new edge binds it too.
+// Refuse effects in J, pinned values, and backward edges rather than cloning.
+fn commaOkHit(f: IrFunc, mf: MissFacts, c: CommaOkMiss): int {
+  let s = guardSuccessor(f, mf.preds, c.join, c.ok)
+  if (s < 0 || f.blocks[c.join].paramCount != 1 || !commaOkGuardOnly(f, mf, c)) {
+    return -1
+  }
+  if (f.blocks[c.h].instsStart >= f.blocks[c.join].instsStart ||
+    f.blocks[c.join].instsStart >= f.blocks[s].instsStart) {
+    return -1
+  }
+  if (!commaOkHitUses(f, mf, c, s)) {
+    return -1
+  }
+  return s
+}
+
+fn commaOkHitUses(f: IrFunc, mf: MissFacts, c: CommaOkMiss, s: int): bool {
+  let p = f.blocks[c.join].instsStart
+  let reach = reachAvoiding(f, s)
+  let all = reachAvoiding(f, -1)
+  let i = 0
+  while (i < len(f.instrs)) {
+    let b = mf.blockOf[i]
+    if (b != c.join && namesValue(f, i, p)) {
+      if (!all[b] || (b != s && reach[b]) || f.blocks[b].instsStart < f.blocks[s].instsStart) {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  return true
+}
+
 // The rebuild's state: per old block, the new id it maps to (a split miss
 // block maps to its `br ok` block) and, for a split one, the new id of the
 // block that keeps its body; `-1` where the block is not split.
+// The hit and branch maps hold candidate indices plus one, or zero for none.
 class SplitCtx {
   b: IrBuilder,
   f: IrFunc,
@@ -385,6 +444,9 @@ class SplitCtx {
   blockMap: []int,
   zeroBlk: []int,
   known: []ConstVal,
+  cs: []CommaOkMiss,
+  hitOf: []int,
+  branchOf: []int,
 }
 
 // Old block `bi` copied into the builder under new id `id`.
@@ -396,11 +458,64 @@ fn copyBlock(x: SplitCtx, bi: int, id: int) {
     x.remap[idx] = builderAddParam(x.b, x.f.instrs[idx].ty)
     idx = idx + 1
   }
+  let hi = x.hitOf[bi] - 1
+  if (hi >= 0) {
+    let p = x.f.blocks[x.cs[hi].join].instsStart
+    x.remap[p] = builderAddParam(x.b, x.f.instrs[p].ty)
+  }
   while (idx < blk.instsStart + blk.instsLen) {
     emitTranslated(x.b, x.f, x.known, x.remap, x.blockMap, idx)
     idx = idx + 1
   }
+  let ci = x.branchOf[bi] - 1
+  if (ci >= 0) {
+    emitCommaOkHit(x, x.cs[ci], bi == x.cs[ci].h)
+  }
   builderEndBlock(x.b)
+}
+
+// Both entering edges bind the new arm parameter. Existing arm arguments
+// keep their positions; the probe substitutes its raw value for J's parameter.
+fn emitCommaOkHit(x: SplitCtx, c: CommaOkMiss, probe: bool) {
+  let guard = x.f.instrs[blockTerm(x.f, c.join)]
+  let src = guard.elseArgs
+  if (guard.ival == c.hit) {
+    src = guard.thenArgs
+  }
+  let p = x.f.blocks[c.join].instsStart
+  let v = p
+  if (probe) {
+    v = c.v
+  }
+  let args = []int(0)
+  for old of src {
+    let a = old
+    if (a == p) {
+      a = v
+    }
+    args = append(args, x.remap[a])
+  }
+  args = append(args, x.remap[v])
+  let br = x.b.instrs[len(x.b.instrs) - 1]
+  if (probe || guard.ival == c.hit) {
+    br.ival = x.blockMap[c.hit]
+    br.thenArgs = args
+  } else {
+    br.elseArgs = args
+  }
+}
+
+fn commaOkHitMaps(x: SplitCtx) {
+  let i = 0
+  while (i < len(x.cs)) {
+    let c = x.cs[i]
+    if (c.hit >= 0) {
+      x.hitOf[c.hit] = i + 1
+      x.branchOf[c.h] = i + 1
+      x.branchOf[c.join] = i + 1
+    }
+    i = i + 1
+  }
 }
 
 // The miss block's replacement: `br ok, Z(), J(..v..)`, the old jump's
@@ -437,7 +552,9 @@ fn splitCommaOkMisses(f: IrFunc, cs: []CommaOkMiss): IrFunc {
   let x = SplitCtx{
     b = newBuilder(), f = f, remap = []int(len(f.instrs)), blockMap = []int(n),
     zeroBlk = []int(n), known = []ConstVal(len(f.instrs)),
+    cs = cs, hitOf = []int(n), branchOf = []int(n),
   }
+  commaOkHitMaps(x)
   let i = 0
   while (i < len(f.instrs)) {
     x.known[i] = noConst()
@@ -491,6 +608,7 @@ fn nullCommaOkMisses(f: IrFunc): IrFunc {
   while (h < len(f.blocks)) {
     let c = commaOkMissAt(f, mf, h)
     if (c.h >= 0 && missReadsNothing(f, mf, c)) {
+      c.hit = commaOkHit(f, mf, c)
       cs = append(cs, c)
     }
     h = h + 1
