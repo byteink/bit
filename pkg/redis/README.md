@@ -8,12 +8,12 @@ This client uses RESP3 by default and falls back to RESP2 for older servers.
 
 ## Install
 
-`bit add bitlang.org/pkg/redis@^0.4.0` writes:
+`bit add bitlang.org/pkg/redis@^0.8.0` writes:
 
 ```json
 {
   "dependencies": {
-    "redis": "bitlang.org/pkg/redis@^0.4.0"
+    "redis": "bitlang.org/pkg/redis@^0.8.0"
   }
 }
 ```

@@ -40,20 +40,25 @@ rediss://...                                    # same, over TLS
   connection shows up under in `CLIENT LIST` on the server.
 
 ```bit
-import { open } from "redis"
+import { connect, parseUrl } from "redis"
 
 fn main(): ()! {
-  let c = open("rediss://:secret@cache.internal:6380/2?timeout=2s&pool=4")?
-  c.set("greeting", "hello")?
-  let v = c.get("greeting")?
+  let opts = parseUrl("rediss://:secret@cache.internal:6380/2?timeout=2s&pool=4")?
+  println("${opts.host}:${opts.port}, database ${opts.db}")
+  let c = connect(opts)?
+  defer c.close()
+  c.set("leaderboard:season", "autumn")?
+  let v = c.get("leaderboard:season")?
   match (v) {
     Some(s) => println(s)
     None => println("(nil)")
   }
-  c.close()
   return
 }
 ```
+
+`parseUrl` lets you inspect or change the options before connecting. It
+validates the URL without opening a connection. Do not log the password.
 
 ## `connect(Options)`: the fields a URL has no room for
 
@@ -63,21 +68,28 @@ directly - every field has a default, so `Options{ host = "cache" }` is a
 complete, working configuration:
 
 ```bit
-import { connect, Options } from "redis"
+import { connect, Options, tlsRootsFor } from "redis"
 import { readFile } from "std/fs"
 
 fn main(): ()! {
-  let c = connect(
-    Options{
-      host = "cache.internal", port = 6380, password = "secret",
-      tls = true, tlsRootCa = readFile("ca.pem")?,
-    },
-  )?
+  let opts = Options{
+    host = "cache.internal", port = 6380, password = "secret",
+    tls = true, tlsRootCa = readFile("ca.pem")?,
+  }
+  let roots = tlsRootsFor(opts)?
+  println("${len(roots.roots)} trusted certificate authorities")
+  let c = connect(opts)?
+  defer c.close()
   c.ping()?
-  c.close()
   return
 }
 ```
+
+`tlsRootsFor` checks the selected trust store without contacting Redis.
+With TLS enabled it parses your CA bundle, or loads the system roots when
+you supplied none. A malformed CA bundle fails before you connect.
+`connect` also performs this check, so call it separately only when you
+need to inspect the trust store first.
 
 `insecureSkipVerify: true` turns certificate verification off - never the
 default, and named for exactly what it does.
@@ -121,3 +133,75 @@ fn main(): ()! {
 decoded, RESP3-attribute-unwrapped `Reply`. A `-ERR ...`/`-WRONGTYPE ...`
 reply surfaces as a typed `RedisError`, not a raw string - match on it the
 same way you would any other failure from this package.
+
+## Run custom reads through the pool or one leased connection
+
+Use a custom `Cmd` when your leaderboard needs a reply decoder of its own.
+`poolRunner` shares the client's pool and retry policy. To keep a read on a
+leased connection, borrow one with `withConn` and build a `pinnedRunner`
+inside its callback:
+
+```bit
+import { open, Cmd, asOptString, poolRunner, pinnedRunner } from "redis"
+import { Second } from "std/time"
+
+fn main(): ()! {
+  let c = open("redis://localhost:6379")?
+  defer c.close()
+  let season = Cmd<Option<string>>{
+    args = ["GET", "leaderboard:season"],
+    decode = (reply) => asOptString(reply, "GET"),
+    readOnly = true,
+  }
+  let pooled = poolRunner(c).runCmd(season)?
+  let pinned = c.withConn<Option<string>>((conn) => {
+    let runner = pinnedRunner(conn, Second)
+    return runner.runCmd(season)?
+  })?
+  println("pooled season: ${unwrapOr(pooled, "(none)")}")
+  println("leased season: ${unwrapOr(pinned, "(none)")}")
+  return
+}
+```
+
+`withConn` releases the lease when the callback returns or fails, closing
+an unusable connection; keep the pinned runner inside that callback. It
+does not retry a failed read. `pinnedRunner` takes a command timeout in
+nanoseconds and refuses a `Cmd` whose `readOnly` flag is false. Use the
+client's named methods for ordinary reads and a [transaction](pipelines-and-transactions.md)
+when writes depend on what you read. Sharing a connection alone does not
+make the two reads agree if another client changes the key between them.
+
+## Own one physical connection
+
+Use `open` for ordinary pooled access. When you need one physical
+connection without a pool, `dialConn` connects and completes the handshake.
+You own the returned connection, so close it when finished:
+
+```bit
+import { dialConn, parseUrl, tlsRootsFor, pinnedRunner, Cmd, asOptString } from "redis"
+
+fn main(): ()! {
+  let opts = parseUrl("redis://localhost:6379")?
+  let roots = tlsRootsFor(opts)?
+  let conn = dialConn(opts, roots)?
+  defer conn.close()
+  let season = pinnedRunner(conn, opts.commandTimeout).runCmd(
+    Cmd<Option<string>>{
+      args = ["GET", "leaderboard:season"],
+      decode = (reply) => asOptString(reply, "GET"),
+      readOnly = true,
+    },
+  )?
+  println("season: ${unwrapOr(season, "(none)")}")
+  return
+}
+```
+
+`close` is idempotent. The connection has one owner; serialize its commands
+and disposal. The deferred close also runs if a command fails. A directly
+dialed connection does not reconnect or retry automatically.
+
+The connection passed to a `withConn` callback is borrowed from the client.
+Do not close it yourself or keep it after the callback returns. Let
+`withConn` release its lease and `Client.close` shut down the pool.
