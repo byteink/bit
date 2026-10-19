@@ -51,6 +51,7 @@ is written `%40`, `%2F`, `%3A`.
 | `postmark://token@default` | Postmark's HTTPS API instead of SMTP: see [Sending through Postmark](postmark.md) |
 | `sendgrid://key@default` | SendGrid's HTTPS API instead of SMTP, `@eu` for its EU host: see [Sending through SendGrid](sendgrid.md) |
 | `mailgun://key:domain@default` | Mailgun's HTTPS API instead of SMTP, `@eu` for its EU region: see [Sending through Mailgun](mailgun.md) |
+| `graph://mailbox%40domain@default` | Microsoft Graph's HTTPS MIME API with `Options.token`: see [Sending through Microsoft Graph](oauth.md#send-through-microsoft-graph) |
 | `log://` | prints each mail to standard output, sends nothing: see [Seeing mail in development](#seeing-mail-in-development) |
 | `file:///var/mail`, `file://./outbox` | writes each mail to that directory as one `.eml` file, sends nothing: see [Seeing mail in development](#seeing-mail-in-development) |
 
