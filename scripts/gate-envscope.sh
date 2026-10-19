@@ -30,34 +30,29 @@
 # The third exists because the first two provably could not see test-fmt, whose
 # argv literally named ${repoRoot()}/pkg while the pkg bucket did not run it.
 
-# Emits "<gate> <tree>" pairs, one per name:relpath entry inside a
-# `"BIT_*_TREES=name:relpath name:relpath ..."` env string, scanning both gate
-# tables in one pass. Line-based, like scripts/gate-filemap.sh's
-# `is_additive_registration()`'s hunk scan: tracks the most recently seen
-# `Gate{name = "..."` as it goes, and pairs any `"..._TREES=..."` string that
-# follows it. Good enough because every Gate{} in this codebase opens with
-# its own `name:` on its own logical line and none is ever nested inside
-# another's env list — the exact assumption assert_dirgates_current's own sed
-# already makes about this source's shape.
+# Emits "<gate> <tree>" pairs from literal BIT_*_TREES entries. The shared
+# reader folds Gate openings; function boundaries clear the current name.
 envscoped_gate_trees() {
-  local file line name m pair
-  for file in tools/build/gates.bit tools/build/gatestable2.bit tools/build/gatestable3.bit; do
-    name=""
-    while IFS= read -r line; do
-      case "${line}" in
-        *'Gate{name = "'*)
-          name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name = "\([^"]*\)".*/\1/p')"
-          ;;
-        *'_TREES='*)
-          m="$(printf '%s' "${line}" | sed -n 's/.*_TREES=\([^"]*\)".*/\1/p')"
-          [ -n "${m}" ] && [ -n "${name}" ] || continue
-          for pair in ${m}; do
-            printf '%s %s\n' "${name}" "${pair#*:}"
-          done
-          ;;
-      esac
-    done <"${file}"
-  done
+  local line name="" m pair
+  local lines
+  lines="$(gate_table_lines)" || return
+  while IFS= read -r line; do
+    case "${line}" in
+      'fn '*) name="" ;;
+      *'Gate{name = "'*)
+        name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name = "\([^"]*\)".*/\1/p')"
+        ;;
+      *'_TREES='*)
+        m="$(printf '%s' "${line}" | sed -n 's/.*_TREES=\([^"]*\)".*/\1/p')"
+        [ -n "${m}" ] && [ -n "${name}" ] || continue
+        for pair in ${m}; do
+          printf '%s %s\n' "${name}" "${pair#*:}"
+        done
+        ;;
+    esac
+  done <<EOF
+${lines}
+EOF
 }
 
 # Maps a source-tree relpath (the right side of one BIT_*_TREES= name:relpath
@@ -264,10 +259,8 @@ assert_envscope_deps() {
 # test-fmt named ${repoRoot()}/pkg in its argv and was absent from the pkg
 # bucket for as long as that bucket existed, with this comment asserting it was
 # covered.
-argv_gate_paths() {
-  sed -n 's/.*Gate{name = "\([^"]*\)".*runArgs("\([^"]*\)").*/\1 \2/p' \
-    tools/build/gates.bit tools/build/gatestable2.bit tools/build/gatestable3.bit
-}
+
+# argv_gate_paths() lives in gate-filemap.sh beside its mapper caller.
 
 # The scan-root spellings a harness uses to name the tree "$1", as an extended
 # regex over its own .bit source:
@@ -441,19 +434,24 @@ argvscope_floor_for_tree() {
 #     `selfhost` too would run it on every compiler-only diff, which the
 #     ticket that added it (#5087) states is exactly what a scoped bucket must
 #     not do.
+# The core-only fault gate and environment-scoped live gates retain their
+# declared registration scope. bench-noopt overrides EXAMPLES to bench/cases;
+# tags-selection reads an owned synthetic pkg tree. S3's stdlib is a build input.
 argvscope_exempt_gate() {
   case "$1 $2" in
     "compiler test-fmt-roundtrip") return 1 ;;
     *' test-fmt-roundtrip') return 0 ;;
-  esac
-  case "$1 $2" in
-    'stdlib test-pmimports' | 'stdlib test-pmvanity' | 'stdlib test-pmaddgit') return 0 ;;
-    'stdlib test-pmrangegate' | 'stdlib test-stdlib-rebuild') return 0 ;;
-    'stdlib test-package-tags') return 0 ;;
-    'pkg test-package-${p}') return 0 ;;
-    'stdlib test-package-surface-${p}') return 0 ;;
-    'pkg test-package-surface-${p}') return 0 ;;
+    'stdlib test-pmimports' | 'stdlib test-pmvanity' | 'stdlib test-pmaddgit' | \
+    'stdlib test-pmrangegate' | 'stdlib test-stdlib-rebuild' | \
+    'stdlib test-package-tags' | 'pkg test-package-${p}' | \
+    'stdlib test-package-surface-${p}' | 'pkg test-package-surface-${p}' | \
     'compiler test-taskwords-sizing') return 0 ;;
+    'runtime test-gc-fault-rescan' | 'examples test-bench-noopt' | \
+    'stdlib test-package-s3-live' | 'pkg test-package-s3-live' | \
+    'examples test-package-redis-live' | 'pkg test-package-redis-live' | \
+    'pkg test-package-jobs-live' | 'pkg test-package-mail-live' | \
+    'pkg test-package-orm-live' | 'pkg test-relation-shapes' | \
+    'pkg test-web-guides-app' | 'pkg test-package-tags-selection') return 0 ;;
   esac
   return 1
 }
@@ -595,29 +593,30 @@ assert_argvscoped_gates_current() {
 # it, blames test-extern-archive for a path that gate never declared (rc=2,
 # 7 gates / 11 paths) — a false finding that fails loudly at an innocent gate.
 argvliteral_gate_paths() {
-  local file line name m p
-  for file in tools/build/gates.bit tools/build/gatestable2.bit tools/build/gatestable3.bit; do
-    name=""
-    while IFS= read -r line; do
-      case "${line}" in
-        'fn '*) name="" ;;
-      esac
-      case "${line}" in
-        *'Gate{name = "'*)
-          name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name = "\([^"]*\)".*/\1/p')"
-          ;;
-      esac
-      [ -n "${name}" ] || continue
-      m="$(printf '%s' "${line}" | command grep -oE '"\$\{repoRoot\(\)\}/[^"$]+"' || true)"
-      [ -n "${m}" ] || continue
-      # No path in either table contains a space, same assumption
-      # envscoped_gate_trees()'s own `for pair in ${m}` already makes.
-      for p in ${m}; do
-        p="${p#\"\$\{repoRoot()\}/}"
-        printf '%s %s\n' "${name}" "${p%\"}"
-      done
-    done <"${file}"
-  done
+  local line name="" m p
+  local lines
+  lines="$(gate_table_lines)" || return
+  while IFS= read -r line; do
+    case "${line}" in
+      'fn '*) name="" ;;
+    esac
+    case "${line}" in
+      *'Gate{name = "'*)
+        name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name = "\([^"]*\)".*/\1/p')"
+        ;;
+    esac
+    [ -n "${name}" ] || continue
+    m="$(printf '%s' "${line}" | command grep -oE '"\$\{repoRoot\(\)\}/[^"$]+"' || true)"
+    [ -n "${m}" ] || continue
+    # No path in either table contains a space, same assumption
+    # envscoped_gate_trees()'s own `for pair in ${m}` already makes.
+    for p in ${m}; do
+      p="${p#\"\$\{repoRoot()\}/}"
+      printf '%s %s\n' "${name}" "${p%\"}"
+    done
+  done <<EOF
+${lines}
+EOF
 }
 
 # Maps a source-tree relpath named in a gate's argv to the gate.sh bucket whose

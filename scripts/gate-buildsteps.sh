@@ -442,7 +442,7 @@ case "${BUCKET}" in
     # #5606 comment: runtime/** can break how a published package resolves
     # just as much as compiler/** can, and #5597 wired it only into `pkg`.
     # Measured `./make test-package-tags` 0m24s on this branch's own tip.
-    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention test-gc-decimalstress test-fmt-citations test-taskwords-sizing test-no-warnings test-tree-archive test-tree-archive-x64)
+    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention test-gc-decimalstress test-fmt-citations test-taskwords-sizing test-no-warnings test-tree-archive test-tree-archive-x64 test-slclen-writesites)
     ;;
   testcases)
     # test-fuzz mutates the real _tests_/cases corpus (BIT_FUZZ_CASES=
@@ -524,7 +524,7 @@ case "${BUCKET}" in
     # package resolves just as much as compiler/** can (every package
     # builds against stdlib/), and #5597 wired it only into `pkg`. Measured
     # `./make test-package-tags` 0m24s on this branch's own tip.
-    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-package-tags test-lint-self test-lint-complexity test-lint-sweep test-stdlib-unit test-gc-retention test-fmt-citations test-release-surface test-no-warnings)
+    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-package-tags test-lint-self test-lint-complexity test-lint-sweep test-stdlib-unit test-gc-retention test-fmt-citations test-release-surface test-no-warnings test-slclen-writesites)
     ;;
   docs)
     # test-stdlib-docs reads docs/stdlib/*.md directly (BIT_DOCS_ROOT — it
@@ -676,7 +676,7 @@ case "${BUCKET}" in
     # closed it by adding `test-package-tags` to the `selfhost`, `runtime`
     # and `stdlib` buckets too (see each bucket's own comment above).
     #
-    BUILD_STEPS=(test-packages test-gens3 test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations test-package-tags test-no-warnings)
+    BUILD_STEPS=(test-packages test-gens3 test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations test-package-tags test-no-warnings test-slclen-writesites)
     ;;
   spec)
     # test-fmt-citations (#5615) is spec's second gate. test-spec alone is a

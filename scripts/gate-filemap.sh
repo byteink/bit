@@ -120,37 +120,11 @@
 # `full`. Prints nothing for any OTHER path that isn't named via `runArgs`;
 # the caller treats that empty result as ambiguous.
 #
-# NINE MORE EXCEPTIONS (#2903, recounted #3047 — recount from the case arms
-# below at fix time, not from this number, which has already drifted twice as
-# later tickets added arms without updating it): nine gates register a whole
-# DIRECTORY in `runArgs("_tests_/bit/<dir>")` rather than a single file,
-# because the directory is one Bit module and the gate runs it as one
-# program — so no path INSIDE that directory can ever match the exact-string
-# grep below, and every file in all nine (abimembers, benchgate, clicmd,
-# pollfree, rootabi, rootpins, spec, stress, stwwiring) was unmapped, forcing
-# `full`, until this fix. One arm per
-# directory, matching the gate(s) gates.bit actually registers for it — for
-# _tests_/bit/stress that is `test-stress-exclusive` only (test-stress-batch
-# is DELIBERATELY EXCLUDED, #3319, same reason and same measurement as the
-# `runtime` bucket below: #3309 measured it standalone at 11m0s, over the
-# subagent Bash tool's 600s ceiling on its own, because
-# _tests_/bit/stress/stress.bit's main loop runs checkProgram() serially with
-# no concurrency available — no batching win, independent of which bucket
-# triggers it). NOT the redundant unpartitioned `test-stress` either, which
-# runs the identical corpus a third time and is deliberately excluded from
-# the `runtime` bucket below for the same reason (gates.bit's comment on
-# `test-stress` is itself stale on this point — it was written before that
-# bucket was changed from `test-stress` to the split pair in cc574965).
-# `assert_dirgates_current`, defined and called right after this function,
-# PROBES this exact function for every directory-target path gates.bit
-# registers, rather than checking gates.bit against a second hardcoded list —
-# a separate list is the same bug this ticket exists to fix, one level up: a
-# maintainer told "add an arm" could instead edit the second list, leaving
-# the real case arm missing and the guard green. Probing means the only way
-# to turn the guard green is to make this function actually resolve the
-# path — it only requires a NON-EMPTY result per directory, not the full set
-# of gates.bit's registered gates, so dropping test-stress-batch here does
-# not trip it (test-stress-exclusive alone keeps the probe non-empty).
+# Directory targets resolve their members through argv_gate_paths() below.
+# Explicit arms retain policy exceptions, especially the stress harness: only
+# test-stress-exclusive belongs here; test-stress-batch remains deliberately
+# excluded (#3319). assert_dirgates_current probes every registered directory,
+# so a new target cannot silently fall back to full.
 #
 # This also closes a gap the `runtime` bucket's #3309 fix did not: before
 # this change, a diff touching BOTH runtime/** and _tests_/bit/stress/** (or
@@ -215,6 +189,52 @@ shared_module_gates() {
   done | sort -u
 }
 
+# Gate openings may put the name on the next physical line. Fold only that
+# opening so every source reader uses the same three-table syntax contract.
+gate_table_lines() {
+  awk '
+    FNR == 1 && pending { exit 2 }
+    /^[[:space:]]*\/\// { next }
+    /^[[:space:]]*Gate\{[[:space:]]*$/ { pending = 1; next }
+    pending {
+      sub(/^[[:space:]]*/, "")
+      $0 = "Gate{" $0
+      pending = 0
+    }
+    /Gate\{/ {
+      if ($0 !~ /Gate\{[[:space:]]*name[[:space:]]*[:=][[:space:]]*"[^"]*"/) {
+        print "gate: Gate opening lacks a literal name: " FILENAME ":" FNR > "/dev/stderr"
+        exit 2
+      }
+      sub(/Gate\{[[:space:]]*name[[:space:]]*[:=][[:space:]]*/, "Gate{name = ")
+    }
+    { print }
+    END { if (pending) exit 2 }
+  ' tools/build/gates.bit tools/build/gatestable2.bit tools/build/gatestable3.bit
+}
+
+# Emits the existing literal runArgs targets, including argv on a later line.
+argv_gate_paths() {
+  local lines
+  lines="$(gate_table_lines)" || return
+  awk '
+    /^fn / { name = "" }
+    /Gate\{name[[:space:]]*[:=][[:space:]]*"/ {
+      name = $0
+      sub(/.*Gate\{name[[:space:]]*[:=][[:space:]]*"/, "", name)
+      sub(/".*/, "", name)
+    }
+    /runArgs\("[^"]+"\)/ && name != "" {
+      path = $0
+      sub(/.*runArgs\("/, "", path)
+      sub(/".*/, "", path)
+      print name " " path
+    }
+  ' <<EOF
+${lines}
+EOF
+}
+
 gates_for_file() {
   case "$1" in
     _tests_/bit/checkercases/*) printf 'test-checker-diag\n'; return 0 ;;
@@ -256,6 +276,12 @@ gates_for_file() {
     _tests_/bit/pmvanityhelpers/*) shared_module_gates pmvanityhelpers; return 0 ;;
     _tests_/bit/pmvanitymulti/*) shared_module_gates pmvanitymulti; return 0 ;;
     _tests_/bit/pmvanitychecks/*) shared_module_gates pmvanitychecks; return 0 ;;
+  esac
+  gates_for_file_modules "$1"
+}
+
+gates_for_file_modules() {
+  case "$1" in
     _tests_/stress/*)
       # A different top-level directory from the harness that reads it
       # (_tests_/bit/stress/, matched by the `_tests_/bit/stress/*)` arm just
@@ -309,6 +335,12 @@ gates_for_file() {
     # sibling to stay under the 800-line limit after `bit fmt`, the same
     # shape as _tests_/bit/fmtcitations/* above.
     _tests_/bit/golden/*) printf 'test-golden\ntest-golden-ifchain\n'; return 0 ;;
+  esac
+  gates_for_file_harnesses "$1"
+}
+
+gates_for_file_harnesses() {
+  case "$1" in
     # #3593 moved this from a single file (_tests_/bit/importsrun.bit) to a
     # directory module — the phase-C grading plus a new retry helper split
     # into a sibling to stay under the 800-line limit, the same shape as
@@ -343,6 +375,12 @@ gates_for_file() {
     # single-file gate target never loads one (#4441), the same shape as
     # _tests_/bit/stringexplode/* below.
     _tests_/bit/shebangmode/*) printf 'test-shebang-mode\n'; return 0 ;;
+  esac
+  gates_for_file_sidecars "$1"
+}
+
+gates_for_file_sidecars() {
+  case "$1" in
     _tests_/bit/spec/*) printf 'test-spec\n'; return 0 ;;
     # test-stress-batch deliberately excluded — see the header comment above
     # gates_for_file() (#3319/#3309).
@@ -367,6 +405,10 @@ gates_for_file() {
     # #2453/#4149: same shape as the complexity-debt.txt arm above — the lint-self gate's data file (one `<CODE> <repo-relative-path>` line per live finding pair, which replaced the lint-ceiling.txt counts), read at runtime by _tests_/bit/lintself, never a `runArgs()` path.
     tools/build/lint-debt.txt) printf 'test-lint-self\n'; return 0 ;;
   esac
+  gates_for_file_registered "$1"
+}
+
+gates_for_file_registered() {
   # Excludes any extracted name containing a literal `${` — that is a
   # per-instance template (e.g. tools/build/gates.bit's `packageGates()`
   # loop emitting `Gate{name = "test-package-${p}", ...}` inside `for p of
@@ -379,28 +421,20 @@ gates_for_file() {
   # correctly (but unhelpfully) rejects, making the whole scoped gate exit 2
   # and run nothing (#3496).
   #
-  # Reads BOTH gate-table files (#4169 split `gateTableB()` out of
-  # tools/build/gates.bit into tools/build/gatestable2.bit once gates.bit hit
-  # the 800-line ceiling) — `-h` suppresses the per-file prefix grep adds once
-  # more than one file is given, which the `sed` below does not expect.
-  grep -hF "runArgs(\"$1\")" tools/build/gates.bit tools/build/gatestable2.bit 2>/dev/null |
-    sed -n 's/.*Gate{name[[:space:]]*[:=][[:space:]]*"\([^"]*\)".*/\1/p' |
-    grep -vF '${' || true
+  argv_gate_paths | awk -v file="$1" '
+    index($1, "${") { next }
+    $2 == file { print $1; next }
+    $2 !~ /\.bit$/ && index(file, $2 "/") == 1 { print $1 }
+  ' | sort -u
 }
 
 # Fails loudly, once, on every real invocation — before any file is
 # classified into a bucket, and regardless of whether this diff touches
 # _tests_/bit/** at all — if gates.bit registers a directory-target gate that
 # gates_for_file() above cannot actually resolve a file inside of (#2903).
-# PROBES THE MAPPER ITSELF: builds the directory list straight from
-# gates.bit (every `runArgs("_tests_/bit/<dir>")` with no `.bit` suffix, same
-# extraction gates_for_file()'s own case arms are hand-matched against), then
-# calls `gates_for_file "<dir>/probe.bit"` for each and fails if any comes
-# back empty. That is the whole point: nothing here is compared against a
-# second list a maintainer could "fix" by editing the wrong thing. The only
-# way to make this pass is to add a case arm that actually makes
-# gates_for_file() resolve the directory — which is the fix the failure
-# message asks for and the only fix that is possible.
+# PROBES THE MAPPER ITSELF: derives directory targets from all three tables,
+# then requires gates_for_file("<dir>/probe.bit") to return a gate. No second
+# list can be edited to hide an unmapped target.
 #
 # The shared harness modules are out of scope for this loop, correctly and by
 # construction: all three have zero `runArgs()` entries in either gate-table
@@ -413,9 +447,8 @@ gates_for_file() {
 # module gates.bit never mentions". Neither can answer the other.
 assert_dirgates_current() {
   local dirs dir probe result
-  # Both gate-table files (#4169) — see gates_for_file()'s matching -h note.
-  dirs="$(grep -hoE 'runArgs\("_tests_/bit/[^"]+"\)' tools/build/gates.bit tools/build/gatestable2.bit |
-    sed -E 's/runArgs\("(.*)"\)/\1/' | sort -u)"
+  # Probe every table read by argv_gate_paths().
+  dirs="$(argv_gate_paths | awk '$2 ~ /^_tests_\/bit\// { print $2 }' | sort -u)"
   for dir in ${dirs}; do
     case "${dir}" in
       *.bit) continue ;;
@@ -424,7 +457,7 @@ assert_dirgates_current() {
     result="$(gates_for_file "${probe}")"
     if [ -z "${result}" ]; then
       echo "gate: tools/build/gates.bit registers directory-target gate \"${dir}\" but gates_for_file() (scripts/gate.sh) cannot resolve a file inside it (probed \"${probe}\")" >&2
-      echo "gate: add a case arm to gates_for_file() that matches \"${dir}/*\", or files inside it will silently force bucket 'full'" >&2
+      echo "gate: repair gates_for_file() so the registered target resolves its members" >&2
       exit 2
     fi
   done

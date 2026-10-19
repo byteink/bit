@@ -186,47 +186,47 @@ echo "gate: assert_composite_is_superset: ${denom} composite bucket(s); each run
 # Line-based and name-tracking, exactly like gate-envscope.sh's
 # envscoped_gate_trees()/argvliteral_gate_paths(), including the `fn ` reset so
 # a `${repoRoot()}` literal in a helper is never attributed to the last Gate{}
-# scanned. An `env:` line ends an argv scan: test-fmt's argv spans three lines
+# scanned. An `env` field ends an argv scan: test-fmt's argv spans three lines
 # with its env on the fourth, and an env path is not a formatted tree.
 fmt_gate_trees() {
-  local file line name m pair p inargv=0
-  for file in tools/build/gates.bit tools/build/gatestable2.bit tools/build/gatestable3.bit; do
-    name=""
-    inargv=0
-    while IFS= read -r line; do
-      case "${line}" in
-        'fn '*) name=""; inargv=0 ;;
-      esac
-      case "${line}" in
-        *'Gate{name = "'*)
-          name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name = "\([^"]*\)".*/\1/p')"
-          inargv=0
-          ;;
-      esac
-      [ -n "${name}" ] || continue
-      case "${line}" in
-        *'BIT_FMTZERO_TREES='*)
-          m="$(printf '%s' "${line}" | sed -n 's/.*BIT_FMTZERO_TREES=\([^"]*\)".*/\1/p')"
-          [ -n "${m}" ] || continue
-          for pair in ${m}; do
-            printf '%s %s\n' "${name}" "${pair#*:}"
-          done
-          continue
-          ;;
-      esac
-      case "${line}" in
-        *'"fmt", "--check"'*) inargv=1 ;;
-        *'env:'*) inargv=0 ;;
-      esac
-      [ "${inargv}" -eq 1 ] || continue
-      m="$(printf '%s' "${line}" | command grep -oE '"\$\{repoRoot\(\)\}/[^"$]+"' || true)"
-      [ -n "${m}" ] || continue
-      for p in ${m}; do
-        p="${p#\"\$\{repoRoot()\}/}"
-        printf '%s %s\n' "${name}" "${p%\"}"
-      done
-    done <"${file}"
-  done
+  local line name="" m pair p inargv=0
+  local lines
+  lines="$(gate_table_lines)" || return
+  while IFS= read -r line; do
+    case "${line}" in
+      'fn '*) name=""; inargv=0 ;;
+    esac
+    case "${line}" in
+      *'Gate{name = "'*)
+        name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name = "\([^"]*\)".*/\1/p')"
+        inargv=0
+        ;;
+    esac
+    [ -n "${name}" ] || continue
+    case "${line}" in
+      *'BIT_FMTZERO_TREES='*)
+        m="$(printf '%s' "${line}" | sed -n 's/.*BIT_FMTZERO_TREES=\([^"]*\)".*/\1/p')"
+        [ -n "${m}" ] || continue
+        for pair in ${m}; do
+          printf '%s %s\n' "${name}" "${pair#*:}"
+        done
+        continue
+        ;;
+    esac
+    case "${line}" in
+      *'"fmt", "--check"'*) inargv=1 ;;
+      *env[[:space:]][:=]*|*env[:=]*) inargv=0 ;;
+    esac
+    [ "${inargv}" -eq 1 ] || continue
+    m="$(printf '%s' "${line}" | command grep -oE '"\$\{repoRoot\(\)\}/[^"$]+"' || true)"
+    [ -n "${m}" ] || continue
+    for p in ${m}; do
+      p="${p#\"\$\{repoRoot()\}/}"
+      printf '%s %s\n' "${name}" "${p%\"}"
+    done
+  done <<EOF
+${lines}
+EOF
 }
 
 # Prints one tree name per `.bit`-holding source tree, sorted and deduplicated.
