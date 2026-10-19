@@ -37,13 +37,13 @@ Direct `source.token()` calls and SMTP mailers use this SMTP scope.
 
 If your Exchange tenant permits Graph instead of SMTP, keep the same Inkwell
 message and token source. Grant the application `Mail.Send`, then change the
-transport:
+transport. Call `sendGraphWelcome()` from `main` to select Graph:
 
 ```bit
 import { Message, MicrosoftApp, Options, open } from "mail"
 import { env } from "std/os"
 
-fn main(): ()! {
+fn sendGraphWelcome(): ()! {
   let source = MicrosoftApp(env("MAIL_TENANT"), env("MAIL_CLIENT_ID"), env("MAIL_CLIENT_SECRET"))
   let mailer = open(
     "graph://hello%40inkwell.dev@default",
