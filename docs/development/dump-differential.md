@@ -144,8 +144,33 @@ control-flow differences must all remain unexplained by the selfcheck.
 The public 0.44.0 stage0 repin (#8279) retires
 `6175-owned-append-local`: both compilers now use unconditional fresh append
 headers. Former local, loop, mixed, field and bulk proof positives must refuse
-any semantic difference. The registry is empty; only independently reconstructed
-object-backed canonical framing remains accepted.
+any semantic difference. Object-backed canonical framing remains accepted.
+
+`5909-nonnull-map-guard-thread` derives one optimized SSA graph from the
+published graph. A non-null `map_val_at(m, slot)` implies `slot >= 0`: the
+runtime returns null immediately for a negative slot. Its edge may therefore
+bypass a join containing only the matching `ok` guard. The guard's true
+successor must have no other predecessor and dominate every free use of the
+join value. Existing successor arguments keep their order; a needed new
+parameter binds the non-null value on the direct edge and the old join value
+on the guarded edge. Independent heads are derived together, including a
+successor that is itself another probe head.
+
+Both proof processes parse the authenticated published and candidate dumps,
+check typed edges and SSA dominance, and independently derive the same forward
+rewrite. Every other instruction, literal, metadata field and edge must remain
+exact. Pointer-offset entries in `ptrs=[%N]` are metadata, not SSA operands.
+Unknown grammar, ambiguous required types or physical instruction placement,
+exhausted work and any unrelated delta decline the identity. Its result is
+`EXPLAINED` for optimized IR only; it cannot supply the required actual match
+or excuse a pre-optimization difference. Retirement auditing remains active.
+
+The dump omits function flags and `IrFunc.keepAlive` pairs. This identity
+establishes the printed SSA transformation, not those hidden GC obligations.
+Source preservation, internal pinned-value controls, object verification and
+normal/stress runtime checks remain separate evidence. The permanent controls
+retain authentic public/candidate captures with their own object witnesses,
+plus mutations of edges, types, uses, side effects, metadata and opaque strings.
 
 Unknown differences still fail closed. Both plain and JSON documentation
 output must match exactly. The retirement audit and the shared oracle-coverage

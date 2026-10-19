@@ -453,6 +453,9 @@ fi
 # The exact test mode executes only fixed data and the fixed library above.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "$#" -eq 1 ] && [ "$1" = --literal-selfcheck ]; then
   diffiropt_literal_library || exit 1
+  ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+  . "$(dirname -- "${BASH_SOURCE[0]}")/selfhost-diffdump-setup.sh" || exit 1
+  diffdump_owned_append_library || exit 1
   . "$(dirname -- "${BASH_SOURCE[0]}")/selfhost-ir-canon.sh" || exit 1
   diffiropt_literal_fixture_library || exit 1
   DIFFIROPT_LITERAL_TESTS=
@@ -752,10 +755,11 @@ literal_index_selfcheck()
 literal_selfcheck()
 literal_memo_selfcheck()
 protocol_selfcheck()
+thread_fixture_selfcheck()
 capture_selfcheck()
 DIFFIROPT_LITERAL_TESTS
   [ "$read_rc" -eq 1 ] || exit 1
-  exec python3 -I /dev/fd/3 "$(dirname -- "${BASH_SOURCE[0]}")" 3<<<"${DIFFIROPT_LITERAL_PYTHON}"$'\n'"${DIFFIROPT_LITERAL_FIXTURES}"$'\n'"${DIFFIROPT_LITERAL_TESTS}"
+  exec python3 -I /dev/fd/3 "$(dirname -- "${BASH_SOURCE[0]}")" 3<<<"${DIFFIROPT_LITERAL_PYTHON}"$'\n'"${DIFFDUMP_OWNED_APPEND_PYTHON}"$'\n'"${DIFFIROPT_LITERAL_FIXTURES}"$'\n'"${DIFFIROPT_LITERAL_TESTS}"
 fi
 
 # Ordinary execution remains the table-driven iropt differential.

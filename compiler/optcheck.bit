@@ -415,3 +415,223 @@ fn checkAppendSpreadOwnership() {
   checkAppendSpreadLocals()
   checkAppendSpreadFields()
 }
+
+// #5909: source lowering cannot retain disconnected or shared guard graphs.
+// Keep those controls at the pass boundary, before ordinary CFG pruning.
+class CommaOkCheck {
+  m: IrModule,
+  f: IrFunc,
+  facts: MissFacts,
+  c: CommaOkMiss,
+}
+
+fn checkCommaOkGraph(f: IrFunc, label: string) {
+  assert(len(arityEscapesInFunc(f)) == 0, "5909/${label}/arity")
+  assert(len(domEscapesInFunc(f)) == 0, "5909/${label}/dominance")
+}
+
+fn commaOkCheckFacts(f: IrFunc): MissFacts {
+  return MissFacts{
+    preds = licmPredMap(f), blockOf = computeBlockOfInstr(f), uses = useCounts(f),
+  }
+}
+
+fn commaOkCheckFixture(label: string): CommaOkCheck {
+  let src = "class Obj { x: int }\n" +
+    "fn probe(m: map<int, Obj>, k: int, flag: bool): int {\n" +
+    "  let (n, ok) = m[k]\n  if (ok) { return n.x }\n  return -1\n}\n"
+  let m = lowerSourceModule(src)
+  assert(len(m.funcs) == 1 && m.funcs[0].name == "probe", "5909/${label}/fixture-functions")
+  let f = m.funcs[0]
+  let facts = commaOkCheckFacts(f)
+  let c = commaOkMissAt(f, facts, 0)
+  assert(c.h >= 0 && missReadsNothing(f, facts, c), "5909/${label}/fixture-miss-candidate")
+  assert(commaOkHit(f, facts, c) > 0, "5909/${label}/fixture-hit-candidate")
+  checkCommaOkGraph(f, "${label}/fixture")
+  return CommaOkCheck{ m = m, f = f, facts = facts, c = c }
+}
+
+fn checkCommaOkUnchanged(x: CommaOkCheck, label: string) {
+  let before = dumpIr(x.m)
+  let edges = x.f.keepAlive
+  let post = nullCommaOkMisses(x.f)
+  checkCommaOkGraph(post, "${label}/unchanged")
+  assert(len(post.keepAlive) == len(edges), "5909/${label}/unchanged-keepalive-count")
+  let i = 0
+  while (i < len(edges)) {
+    assert(post.keepAlive[i] == edges[i], "5909/${label}/unchanged-keepalive-${i}")
+    i = i + 1
+  }
+  x.m.funcs[0] = post
+  assert(dumpIr(x.m) == before, "5909/${label}/unchanged-ir")
+}
+
+fn checkCommaOkSharedJoin() {
+  let x = commaOkCheckFixture("shared-join")
+  let old = x.f.instrs[x.c.jump]
+  let detour = len(x.f.blocks)
+  let jump = mkInstr(Op.Jump, old.ty)
+  jump.ival = x.c.join
+  jump.args = old.args
+  x.f.blocks = append(
+    x.f.blocks, IrBlock{ instsStart = len(x.f.instrs), paramCount = 0, instsLen = 1 },
+  )
+  x.f.instrs = append(x.f.instrs, jump)
+  assert(x.f.instrs[2].op == Op.BlockParam, "5909/shared-join/flag-parameter")
+  assert(x.f.instrs[2].ty == primType(x.m.ctx, 10), "5909/shared-join/flag-type")
+  old.op = Op.Br
+  old.lhs = 2
+  old.thenArgs = old.args
+  old.elseArgs = []int(0)
+  old.ival2 = detour
+  old.args = []int(0)
+  checkCommaOkGraph(x.f, "shared-join/mutated")
+  assert(predCount(licmPredMap(x.f), x.c.join) == 3, "5909/shared-join/predecessor-count")
+  checkCommaOkUnchanged(x, "shared-join")
+}
+
+fn checkCommaOkSharedArm() {
+  let x = commaOkCheckFixture("shared-arm")
+  let jt = x.f.instrs[blockTerm(x.f, x.c.join)]
+  let s = jt.ival
+  let edge = x.f.instrs[blockTerm(x.f, jt.ival2)]
+  assert(edge.op == Op.Ret, "5909/shared-arm/false-terminator")
+  edge.op = Op.Jump
+  edge.ival = s
+  edge.args = jt.thenArgs
+  checkCommaOkGraph(x.f, "shared-arm/mutated")
+  let facts = commaOkCheckFacts(x.f)
+  assert(predCount(facts.preds, s) == 2, "5909/shared-arm/predecessor-count")
+  assert(guardSuccessor(x.f, facts.preds, x.c.join, x.c.ok) == -1, "5909/shared-arm/guard-refusal")
+  assert(commaOkHit(x.f, facts, x.c) == -1, "5909/shared-arm/hit-refusal")
+  checkCommaOkUnchanged(x, "shared-arm")
+}
+
+fn checkCommaOkPinned() {
+  let side = 0
+  while (side < 2) {
+    let x = commaOkCheckFixture("pinned-${side}")
+    let p = x.f.blocks[x.c.join].instsStart + x.c.pi
+    x.f.keepAlive = [p, x.c.v]
+    if (side == 1) {
+      x.f.keepAlive = [x.c.v, p]
+    }
+    assert(namedInKeepAlive(x.f, p), "5909/pinned-${side}/keepalive-name")
+    assert(!missReadsNothing(x.f, x.facts, x.c), "5909/pinned-${side}/miss-refusal")
+    checkCommaOkUnchanged(x, "pinned-${side}")
+    side = side + 1
+  }
+}
+
+fn checkCommaOkUnreachableUse() {
+  let x = commaOkCheckFixture("unreachable")
+  let p = x.f.blocks[x.c.join].instsStart + x.c.pi
+  let load = mkInstr(Op.FieldGet, primType(x.m.ctx, 3))
+  load.lhs = p
+  let ret = mkInstr(Op.Ret, x.m.ctx.voidId)
+  ret.args = [len(x.f.instrs)]
+  let unreachable = len(x.f.blocks)
+  x.f.blocks = append(
+    x.f.blocks, IrBlock{ instsStart = len(x.f.instrs), paramCount = 0, instsLen = 2 },
+  )
+  x.f.instrs = append(x.f.instrs, load)
+  x.f.instrs = append(x.f.instrs, ret)
+  checkCommaOkGraph(x.f, "unreachable/before")
+  assert(buildDomTree(x.f).rpo[unreachable] < 0, "5909/unreachable/disconnected-use")
+  let facts = commaOkCheckFacts(x.f)
+  assert(missReadsNothing(x.f, facts, x.c), "5909/unreachable/miss-candidate")
+  assert(commaOkHit(x.f, facts, x.c) == -1, "5909/unreachable/hit-refusal")
+  let blocks = len(x.f.blocks)
+  let post = nullCommaOkMisses(x.f)
+  checkCommaOkGraph(post, "unreachable/after")
+  assert(len(post.blocks) == blocks + 1, "5909/unreachable/miss-split-count")
+  let hit = post.instrs[blockTerm(post, 0)]
+  assert(post.blocks[hit.ival].paramCount == 1, "5909/unreachable/join-parameter-count")
+  let guard = post.instrs[blockTerm(post, hit.ival)]
+  assert(
+    guard.op == Op.Br && post.blocks[guard.ival].paramCount == 0,
+    "5909/unreachable/guard-preserved",
+  )
+}
+
+// A graph can satisfy dominance while its physical order is unsuitable for
+// this rewrite. Reorder whole blocks, never guess the new value indices.
+fn commaOkCheckBackward(x: CommaOkCheck): IrFunc {
+  let s = guardSuccessor(x.f, x.facts.preds, x.c.join, x.c.ok)
+  let order = []int(0)
+  for bi of blockEmissionOrder(x.f) {
+    if (bi == x.c.join) {
+      order = append(order, s)
+    }
+    if (bi != s) {
+      order = append(order, bi)
+    }
+  }
+  let remap = []int(len(x.f.instrs))
+  let instrs = []IrInstr(0)
+  let blocks = []IrBlock(len(x.f.blocks))
+  for bi of order {
+    let blk = x.f.blocks[bi]
+    let start = len(instrs)
+    let i = blk.instsStart
+    while (i < blk.instsStart + blk.instsLen) {
+      remap[i] = len(instrs)
+      instrs = append(instrs, x.f.instrs[i])
+      i = i + 1
+    }
+    blocks[bi] = IrBlock{ instsStart = start, paramCount = blk.paramCount, instsLen = blk.instsLen }
+  }
+  let f = irFuncOf(x.f.name, x.f.paramTypes, x.f.result, blocks, instrs)
+  let i = 0
+  while (i < len(f.instrs)) {
+    rewriteOperandIds(f, remap, i)
+    i = i + 1
+  }
+  return f
+}
+
+fn checkCommaOkBackwardArm() {
+  let x = commaOkCheckFixture("backward")
+  let f = commaOkCheckBackward(x)
+  checkCommaOkGraph(f, "backward/reordered")
+  let facts = commaOkCheckFacts(f)
+  let c = commaOkMissAt(f, facts, x.c.h)
+  assert(c.h >= 0, "5909/backward/miss-candidate")
+  let s = guardSuccessor(f, facts.preds, c.join, c.ok)
+  assert(
+    s > 0 && f.blocks[c.join].instsStart >= f.blocks[s].instsStart,
+    "5909/backward/physical-order",
+  )
+  assert(commaOkHit(f, facts, c) == -1, "5909/backward/hit-refusal")
+}
+
+fn checkCommaOkVerifierRefusals() {
+  let x = commaOkCheckFixture("verifier")
+  let jt = x.f.instrs[blockTerm(x.f, x.c.join)]
+  let p = x.f.blocks[x.c.join].instsStart + x.c.pi
+  let args = jt.thenArgs
+  jt.thenArgs = append(args, p)
+  assert(len(arityEscapesInFunc(x.f)) == 1, "5909/verifier/arity-negative-count")
+  jt.thenArgs = args
+  checkCommaOkGraph(x.f, "verifier/arity-restored")
+  let read = x.f.instrs[x.f.blocks[jt.ival].instsStart]
+  let other = x.f.blocks[jt.ival2].instsStart + x.f.blocks[jt.ival2].paramCount
+  assert(
+    read.op == Op.FieldGet && x.f.instrs[other].op == Op.ConstInt,
+    "5909/verifier/dominance-witness-shape",
+  )
+  let base = read.lhs
+  read.lhs = other
+  assert(len(domEscapesInFunc(x.f)) == 1, "5909/verifier/dominance-negative-count")
+  read.lhs = base
+  checkCommaOkGraph(x.f, "verifier/dominance-restored")
+}
+
+fn checkCommaOkStructuralControls() {
+  checkCommaOkSharedJoin()
+  checkCommaOkSharedArm()
+  checkCommaOkPinned()
+  checkCommaOkUnreachableUse()
+  checkCommaOkBackwardArm()
+  checkCommaOkVerifierRefusals()
+}
