@@ -84,8 +84,52 @@ GATE_LAST_GREEN_FILE="bit-out/make/gate-last-green"
 # gates_added_since() reported nothing new and a resumed batch skipped every
 # gate added since the last green — silent, and in the direction that runs
 # less.
+# Follow the normal-step helper graph from allGateSteps, or historical gateSteps.
+# Missing helpers and cycles refuse; the depth limit bounds malformed input.
 gate_step_names_from() {
-  sed -n '/^fn gateSteps(): \[\]Step {$/,/^}$/p' |
+  local table
+  table="$(awk '
+    function walk(name, depth, n, calls, i) {
+      if (depth > 64 || !defined[name] || active[name]) {
+        print "gate-resume: missing or cyclic normal step helper: " name > "/dev/stderr"
+        bad = 1
+        return
+      }
+      if (seen[name]) return
+      active[name] = 1
+      output = output body[name]
+      n = split(edges[name], calls, " ")
+      for (i = 1; i <= n; i++) walk(calls[i], depth + 1)
+      active[name] = 0
+      seen[name] = 1
+    }
+    /^fn (allGateSteps|gateSteps[A-Z]*)\(\): \[\]Step \{$/ {
+      name = $2
+      sub(/\(.*$/, "", name)
+      defined[name] = 1
+      next
+    }
+    /^fn / { name = "" }
+    /^}/ { name = "" }
+    /^[[:space:]]*\/\// { next }
+    name != "" {
+      body[name] = body[name] $0 "\n"
+      line = $0
+      gsub(/"([^"\\]|\\.)*"/, "", line)
+      while (match(line, /gateSteps[A-Z]*\(\)/)) {
+        call = substr(line, RSTART, RLENGTH - 2)
+        edges[name] = edges[name] " " call
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }
+    END {
+      root = defined["allGateSteps"] ? "allGateSteps" : "gateSteps"
+      if (defined[root]) walk(root, 0)
+      if (bad) exit 2
+      printf "%s", output
+    }
+  ')" || return
+  printf '%s\n' "${table}" |
     grep -oE 'gateDepStep\("[^"]+|Step\{ *name *[:=] *"[^"]+"' |
     sed -e 's/^gateDepStep("//' \
         -e 's/^Step{ *name *[:=] *"//' -e 's/"$//' \
