@@ -405,8 +405,10 @@ def thread_terminator_type(f, ins):
     if body.startswith(b'br '):
         require(f['defs'][ins['refs'][0]][0] == b'bool')
     if body.startswith(b'ret'):
-        expected = [] if f['result'] == b'void' else [f['result']]
-        require([f['defs'][v][0] for v in ins['refs']] == expected)
+        # The header omits the physical ABI; the authenticated oracle supplies it.
+        words = [f['defs'][v][0] for v in ins['refs']]
+        require(all(typ is not None for typ in words))
+        return words
 
 def thread_def(f, value):
     unused, b, pos = f['defs'][value]
@@ -443,8 +445,15 @@ def thread_probe(f, head):
     return value, thread_slot_flag(f, head, slot, call)
 
 def thread_slot_flag(f, head, slot, call):
-    require(thread_def(f, slot)[0] == head and thread_def(f, slot)[1]['body'].startswith(b'rt_call map_slot('))
-    require(len(thread_def(f, slot)[1]['refs']) == 2 and thread_def(f, slot)[1]['refs'][0] == call['refs'][0])
+    owner, probe = thread_def(f, slot)
+    require(owner == head)
+    shape = re.fullmatch(rb'rt_call (map_slot|map_slot_str)\(.*\) i64', probe['body'])
+    require(shape is not None)
+    arity = 3 if shape[1] == b'map_slot_str' else 2
+    require(len(probe['refs']) == arity and probe['refs'][0] == call['refs'][0])
+    if arity == 3:
+        require(re.fullmatch(rb'map<string, .+>', f['defs'][probe['refs'][0]][0] or b'') is not None)
+        require([f['defs'][v][0] for v in probe['refs'][1:]] == [b'i64', b'i64'])
     wanted = b'icmp_sge bool %' + str(slot).encode() + b', %'
     flags = [ins for ins in f['blocks'][head]['ins'] if ins['body'].startswith(wanted)]
     require(len(flags) == 1 and flags[0]['value'] < call['value'])
@@ -558,6 +567,8 @@ def thread_changed_function(old, new):
     require(f['header'] == g['header'] and len(f['blocks']) == len(g['blocks']))
     heads = []
     for h, block in enumerate(f['blocks']):
+        require(thread_terminator_type(f, block['ins'][-1]) ==
+                thread_terminator_type(g, g['blocks'][h]['ins'][-1]))
         if not block['ins'][-1]['body'].startswith(b'br '):
             continue
         require(bool(g['blocks'][h]['edges']))
