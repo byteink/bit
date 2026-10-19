@@ -65,6 +65,38 @@ for the moment a server answers `ExpiredToken`. A profile that names a file the
 parser cannot read fails with a `ProfileFileError` carrying `path`, `line` and
 `reason`.
 
+### A web identity for Inkwell
+
+An EKS pod or another workload with an identity token can exchange that token
+for temporary AWS credentials. Give the token-file provider to the same cache:
+
+```bit
+import { Credentials, Refresh, webIdentityCredentials } from "aws"
+
+fn main(): ()! {
+  let identity = Credentials.Provider(webIdentityCredentials).resolver()?
+  println(identity.resolve(Refresh.IfNeeded)?.show())
+  println(identity.resolve(Refresh.Force)?.show())
+  return
+}
+```
+
+Set `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN` before the program starts.
+The provider reopens the token file on every refresh, including when the
+workload replaces the file behind a symlink. It accepts tokens from 4 to
+20,000 bytes and closes the file before the exchange.
+
+`AWS_ROLE_SESSION_NAME` names the session; otherwise its name is
+`aws-sdk-js-session-<milliseconds since the Unix epoch>`. STS uses
+`AWS_REGION`, then the selected profile's region, then `us-east-1`.
+
+For a named profile, set `web_identity_token_file` and `role_arn` together
+and use `Credentials.Profile("inkwell")`. Static keys in that profile take
+precedence. Its `role_session_name` takes precedence over
+`AWS_ROLE_SESSION_NAME`. Profile construction performs one exchange and
+keeps the result in its cache. A configured token-file or STS failure is an
+error; the provider does not silently choose another identity.
+
 ### A task role for Inkwell
 
 Inkwell deployed as an ECS task or EKS pod uses the task's temporary identity
