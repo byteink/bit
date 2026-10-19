@@ -736,6 +736,38 @@ def capture_selfcheck():
     print('literal captures: text/quotes/NUL/bounds/nofollow controls passed')
 
 def protocol_selfcheck():
+    map_old = b'''func hitOnly(%0: map<i64, Obj>, %1: i64) i64 {
+bb0(%0: map<i64, Obj>, %1: i64):
+  %2 = rt_call map_slot(%0, %1) i64
+  %3 = const_int i64 0
+  %4 = icmp_sge bool %2, %3
+  %5 = rt_call map_val_at(%0, %2) Obj
+  %6 = const_nil
+  %7 = icmp_ne bool %5, %6
+  br %7, bb3(%5), bb1()
+bb1():
+  br %4, bb2(), bb3(%5)
+bb2():
+  %10 = gc_alloc size=8 ptrs=[] Obj
+  jump bb3(%10)
+bb3(%12: Obj):
+  br %4, bb4(), bb5()
+bb4():
+  %14 = field_get %12[0] i64
+  ret %14
+bb5():
+  %16 = const_int i64 -1
+  ret %16
+}
+'''
+    map_new = map_old.replace(b'br %7, bb3(%5)', b'br %7, bb4(%5)')
+    map_new = map_new.replace(b'br %4, bb4()', b'br %4, bb4(%12)')
+    map_new = map_new.replace(b'bb4():\n  %14 = field_get %12[0] i64\n  ret %14',
+                             b'bb4(%14: Obj):\n  %15 = field_get %14[0] i64\n  ret %15').replace(b'%16', b'%17')
+    for kind in ('canonical', 'nonnull-map-guard-thread'):
+        retired_map = dict(version=1, work_left=1000000, kind=kind,
+                           queries=[] if kind == 'canonical' else [dict(id='f0-b0', fn=0, head=0)])
+        protocol_refuses(wire(protocol_envelope(retired_map, [map_old, map_new], [[], []])))
     query = dict(id='q0', side='oracle', fn=0, kind='owned', block='bb0', index=3, value=None)
     retired = dict(version=1, work_left=1000000, source=None, queries=[query],
                    modules=dict(oracle=proof_module(local, 'slice_append_slice_fresh'),
@@ -755,7 +787,6 @@ literal_index_selfcheck()
 literal_selfcheck()
 literal_memo_selfcheck()
 protocol_selfcheck()
-thread_fixture_selfcheck()
 capture_selfcheck()
 DIFFIROPT_LITERAL_TESTS
   [ "$read_rc" -eq 1 ] || exit 1

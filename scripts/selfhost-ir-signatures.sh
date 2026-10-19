@@ -72,12 +72,8 @@ try:
     memo = {}
     framed = [literal_frames(raw, obj, memo) for raw, obj in zip(original, objects)]
     normalized = [literal_canonical(raw) for raw in framed]
-    kind, queries, verdict = "canonical", [], "canonical-ir-match"
-    if normalized[0] != normalized[1]:
-        require(sys.argv[7] == "iropt")
-        queries = thread_proof(*normalized)
-        kind, verdict = "nonnull-map-guard-thread", "5909-nonnull-map-guard-thread"
-    proof = {"version": 1, "work_left": remaining, "kind": kind, "queries": queries}
+    require(normalized[0] == normalized[1])
+    proof = {"version": 1, "work_left": remaining, "kind": "canonical", "queries": []}
     packet = {"version": 2, "comparison": sys.argv[7], "work_left": remaining, "proof": proof,
               "original": [base64.b64encode(r).decode("ascii") for r in original],
               "objects": [base64.b64encode(r).decode("ascii") for r in objects],
@@ -85,10 +81,7 @@ try:
     prove(packet)
 except (ValueError, KeyError, IndexError, TypeError, RecursionError, OSError, OverflowError, struct.error, subprocess.TimeoutExpired):
     sys.exit(1)
-if verdict == "canonical-ir-match":
-    print("canonical-ir-match")
-else:
-    print("5909-nonnull-map-guard-thread")
+print("canonical-ir-match")
 PYTHON
   [ "$parent_read_rc" -eq 1 ] || return 1
   parent_code="${DIFFIROPT_LITERAL_PYTHON}"$'\n'"${DIFFDUMP_PARENT_PYTHON}"$'\n'"${DIFFDUMP_OWNED_APPEND_PYTHON}"$'\n'"${DIFFDUMP_PARENT_ENGINE}"
@@ -98,7 +91,7 @@ PYTHON
 
 # declaredSignatureNames [kind] -- the retirement audit still consults this table.
 declaredSignatureNames() {
-  case "${1:-}" in ''|iropt) printf '%s\n' 5909-nonnull-map-guard-thread ;; esac
+  :
 }
 
 # shellcheck source=scripts/selfhost-ir-canon.sh
