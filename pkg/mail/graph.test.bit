@@ -1,0 +1,306 @@
+// Local TLS peers inspect Graph MIME and token audience without contacting Microsoft.
+class GrSource {
+  calls: int = 0
+  token(): Token!MailError {
+    this.calls = this.calls + 1
+    return Token{
+      value = "graph-bearer-${this.calls}", expires = Timestamp{ ns = now().ns + 120 * Second },
+    }
+  }
+}
+
+// Reuse the HTTP script with a listener owned by this finite server task.
+fn grStart(replies: []string): (int, chan<string>)! {
+  let ln = tlsListen("127.0.0.1", 0, smServerConfig()?)?
+  let port = ln.port()?
+  let requests = chan<string>(len(replies) + 1)
+  spawn {
+    defer ln.close()
+    rsServe(rsFake{ ln = ln, replies = replies, log = requests })
+  }
+  return (port, requests)
+}
+
+fn grUrl(port: int): string {
+  return "graph://sender%40inkwell.dev@127.0.0.1:${port}?insecureSkipVerify=true"
+}
+
+fn grOptions(source: TokenSource): Options {
+  let opts = rsOpts()
+  opts.token = source
+  return opts
+}
+
+fn grOpen(url: string, source: TokenSource): Mailer {
+  return open(url, grOptions(source)) catch e {
+    panic(e.message())
+  }
+}
+
+fn grDelivery(m: Message): Delivery {
+  let mailer = Mailer(Outbox(), rsOpts()) catch e {
+    panic(e.message())
+  }
+  defer mailer.close()
+  return mailer.prepare(m) catch e {
+    panic(e.message())
+  }
+}
+
+fn grTransport(source: TokenSource): GraphTransport {
+  let t = parseGraph("graph://sender%40inkwell.dev@default") catch e {
+    panic(e.message())
+  }
+  return GraphTransport(t, grOptions(source)) catch e {
+    panic(e.message())
+  }
+}
+
+fn grRefused(d: Delivery) {
+  let source = GrSource{}
+  grTransport(source).deliver(d) catch e {
+    match (e) {
+      Invalid(_) => assert(source.calls == 0, "invalid mail requested a token")
+      _ => panic(e.message())
+    }
+    return
+  }
+  panic("Graph accepted unsupported envelope recipients")
+}
+
+test "Graph posts the exact rendered signed MIME and request-id with the decoded mailbox" {
+  let (port, requests) = grStart([rsReply(202, "request-id: graph-request-1\r\n", "")]) catch e {
+    panic(e.message())
+  }
+  let opts = grOptions(GrSource{})
+  opts.dkim = [Dkim{ domain = "inkwell.dev", selector = "rsa1", key = rsaPkcs8Pem }]
+  let mailer = open(grUrl(port), opts) catch e {
+    panic(e.message())
+  }
+  defer mailer.close()
+  let m = rsMsg()
+  m.to = ["Sara Ali <sara@example.com>", "\"Lee, Jr.\" <junior@example.com>"]
+  m.cc = ["lee@example.com"]
+  let d = mailer.prepare(m) catch e {
+    panic(e.message())
+  }
+  let receipt = mailer.t.deliver(d) catch e {
+    panic(e.message())
+  }
+  let seen = <- requests
+  assert(hasPrefix(seen, "POST /v1.0/users/sender@inkwell.dev/sendMail HTTP/1.1\r\n"), seen)
+  assert(contains(seen, "Content-Type: text/plain\r\n"), seen)
+  assert(contains(seen, "Authorization: Bearer graph-bearer-1\r\n"), seen)
+  let raw = string(
+    decodeBase64(rsBody(seen)) catch e {
+      panic(e.message())
+    },
+  )
+  assert(raw == d.raw, "Graph changed signed MIME")
+  assert(contains(raw, "DKIM-Signature:"), "missing signature")
+  assert(receipt.providerId == "graph-request-1" && len(receipt.accepted) == 3)
+  assert(builtinScheme(grTransport(GrSource{})) == "graph")
+}
+
+test "Graph and SMTP sharing MicrosoftApp request separate audiences and reuse separate caches" {
+  let (tokens, grants) = grStart([otAnswer("graph-audience"), otAnswer("outlook-audience")]) catch e {
+    panic(e.message())
+  }
+  let source = MicrosoftApp("inkwell.example", "client&+", otSecret)
+  source.endpoint = "https://127.0.0.1:${tokens}/token"
+  otCache(source.cache)
+  otCache(source.graphCache)
+  let (port, requests) = grStart([rsReply(202, "", ""), rsReply(202, "", "")]) catch e {
+    panic(e.message())
+  }
+  let mailer = grOpen(grUrl(port), source)
+  defer mailer.close()
+  mailer.send(rsMsg()) catch e {
+    panic(e.message())
+  }
+  assert(contains(<- grants, "scope=${percentEncode("https://graph.microsoft.com/.default")}"))
+  let (smtp, wire) = smStartTls(smHappy(smEhlo("250-AUTH XOAUTH2\r\n"), true, ["250 ok\r\n"])) catch e {
+    panic(e.message())
+  }
+  let ca = smCaFile() catch e {
+    panic(e.message())
+  }
+  defer {
+    remove(ca) catch _ {}
+  }
+  let _ = otSend(source, smTlsUrl(smtp, ca, "hello@"))
+  assert(contains(<- grants, "scope=${percentEncode("https://outlook.office365.com/.default")}"))
+  assert(
+    contains(<- wire, encodeBase64([]byte("user=hello\x01auth=Bearer outlook-audience\x01\x01"))),
+  )
+  mailer.send(rsMsg()) catch e {
+    panic(e.message())
+  }
+  assert(source.cache.generation == 1 && source.graphCache.generation == 1)
+  for (let i = 0; i < 2; i = i + 1) {
+    assert(contains(<- requests, "Authorization: Bearer graph-audience\r\n"))
+  }
+}
+
+test "Graph refuses Bcc before token or HTTP requests" {
+  let m = rsMsg()
+  m.bcc = ["blind@example.com"]
+  grRefused(grDelivery(m))
+}
+
+test "Graph refuses queued Bcc whose original Message was omitted" {
+  let m = rsMsg()
+  m.bcc = ["blind@example.com"]
+  let d = deliveryOf(queuedMailOf(grDelivery(m), false)) catch e {
+    panic(e.message())
+  }
+  assert(len(d.message.bcc) == 0)
+  grRefused(d)
+}
+
+test "Graph refuses a raw Bcc header and mismatched same-length envelope" {
+  let d = grDelivery(rsMsg())
+  d.raw = "Bcc: hidden@example.com\r\n" + d.raw
+  grRefused(d)
+  let mismatch = grDelivery(rsMsg())
+  mismatch.envelope.to = ["other@example.com"]
+  grRefused(mismatch)
+  let m = rsMsg()
+  m.to = ["sara@example.com", "lee@example.com"]
+  let repeated = grDelivery(m)
+  repeated.envelope.to = ["sara@example.com", "sara@example.com"]
+  grRefused(repeated)
+}
+
+test "Graph refuses redirect and missing token at open" {
+  let opts = grOptions(GrSource{})
+  opts.redirect = "qa@example.com"
+  open("graph://sender%40inkwell.dev@default", opts) catch e {
+    match (e) {
+      Config(_) => {}
+      _ => panic(e.message())
+    }
+    open("graph://sender%40inkwell.dev@default", rsOpts()) catch missing {
+      match (missing) {
+        Config(_) => return
+        _ => panic(missing.message())
+      }
+    }
+    panic("Graph accepted a missing token source")
+  }
+  panic("Graph accepted redirect")
+}
+
+fn grFailure(status: int, extra: string, code: string, text: string): MailError {
+  let reply = rsReply(status, extra, "{\"error\":{\"code\":\"${code}\",\"message\":\"${text}\"}}")
+  let (port, requests) = grStart([reply]) catch e {
+    panic(e.message())
+  }
+  let mailer = grOpen(grUrl(port), GrSource{})
+  defer mailer.close()
+  mailer.send(rsMsg()) catch e {
+    assert(contains(<- requests, "POST /v1.0/users/"))
+    assert(!contains(e.message(), "graph-bearer-1"), e.message())
+    return e
+  }
+  panic("Graph accepted an HTTP refusal")
+}
+
+test "Graph 429 503 and 504 retain Retry-After and scrub the bearer" {
+  for status of [429, 503, 504] {
+    match (grFailure(status, "Retry-After: 5\r\n", "Throttled", "graph-bearer-1")) {
+      Transient(r) => assert(
+        r.code == status && r.retryAfter == 5 * Second && contains(r.text, "***"),
+      )
+      _ => panic("wrong Graph error category")
+    }
+  }
+}
+
+test "Graph 403 reports Auth and 400 reports Rejected with the provider code" {
+  match (grFailure(403, "", "ErrorAccessDenied", "Mail.Send missing")) {
+    Auth(r) => assert(contains(r.text, "ErrorAccessDenied"))
+    _ => panic("Graph 403 was not Auth")
+  }
+  match (grFailure(400, "", "BadRequest", "Malformed MIME")) {
+    Rejected(r) => assert(contains(r.text, "Malformed MIME"))
+    _ => panic("Graph 400 was not Rejected")
+  }
+}
+
+test "Graph refreshes a rejected token once and sends with the second bearer" {
+  let (tokens, grants) = grStart(
+    [otAnswer("outlook-audience"), otAnswer("graph-old"), otAnswer("graph-new")],
+  ) catch e {
+    panic(e.message())
+  }
+  let source = MicrosoftApp("inkwell.example", "client", otSecret)
+  source.endpoint = "https://127.0.0.1:${tokens}/token"
+  otCache(source.cache)
+  otCache(source.graphCache)
+  let smtpToken = source.token() catch e {
+    panic(e.message())
+  }
+  let (port, requests) = grStart([rsReply(401, "", ""), rsReply(202, "", "")]) catch e {
+    panic(e.message())
+  }
+  let mailer = grOpen(grUrl(port), source)
+  defer mailer.close()
+  mailer.send(rsMsg()) catch e {
+    panic(e.message())
+  }
+  assert(source.cache.generation == 1 && source.graphCache.generation == 2)
+  assert(source.cache.saved.value == smtpToken.value)
+  assert(contains(<- requests, "Bearer graph-old"))
+  assert(contains(<- requests, "Bearer graph-new"))
+  for (let i = 0; i < 3; i = i + 1) {
+    assert(contains(<- grants, "POST /token"))
+  }
+}
+
+test "Graph stops after two 401 responses and redacts both attempted tokens" {
+  let source = GrSource{}
+  let body = "{\"error\":{\"code\":\"Unauthorized\",\"message\":\"graph-bearer-1 graph-bearer-2\"}}"
+  let (port, requests) = grStart([rsReply(401, "", ""), rsReply(401, "", body)]) catch e {
+    panic(e.message())
+  }
+  let mailer = grOpen(grUrl(port), source)
+  defer mailer.close()
+  mailer.send(rsMsg()) catch e {
+    match (e) {
+      Auth(r) => assert(r.code == 401 && !contains(r.text, "graph-bearer"), r.text)
+      _ => panic(e.message())
+    }
+    assert(source.calls == 2)
+    for (let i = 0; i < 2; i = i + 1) {
+      assert(contains(<- requests, "POST /v1.0/users/"))
+    }
+    return
+  }
+  panic("Graph accepted two unauthorized responses")
+}
+
+test "Graph refuses invalid mailboxes and insecure verification for the real host" {
+  for url of [
+    "graph://@default", "graph://bad-address@default", "graph://sender%0A@default",
+    "graph://sender%40inkwell.dev@default?insecureSkipVerify=true",
+  ] {
+    let rejected = false
+    open(url, grOptions(GrSource{})) catch e {
+      match (e) {
+        Config(_) => rejected = true
+        _ => panic(e.message())
+      }
+    }
+    assert(rejected, "Graph accepted invalid configuration")
+  }
+}
+
+test "Graph preserves envelope restrictions before token acquisition" {
+  let d = grDelivery(rsMsg())
+  d.envelope.requireTls = true
+  grRefused(d)
+  let bounced = grDelivery(rsMsg())
+  bounced.envelope.from = "bounce@inkwell.dev"
+  grRefused(bounced)
+}

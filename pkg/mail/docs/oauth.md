@@ -31,7 +31,63 @@ fn main(): ()! {
 `https://outlook.office365.com/.default`. Its tenant must be a GUID or domain.
 Register the application and grant the mailbox permissions described in
 [Microsoft's SMTP OAuth guide](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth).
-This source does not request Microsoft Graph permissions.
+Direct `source.token()` calls and SMTP mailers use this SMTP scope.
+
+## Send through Microsoft Graph
+
+If your Exchange tenant permits Graph instead of SMTP, keep the same Inkwell
+message and token source. Grant the application `Mail.Send`, then change the
+transport:
+
+```bit
+import { Message, MicrosoftApp, Options, open } from "mail"
+import { env } from "std/os"
+
+fn main(): ()! {
+  let source = MicrosoftApp(env("MAIL_TENANT"), env("MAIL_CLIENT_ID"), env("MAIL_CLIENT_SECRET"))
+  let mailer = open(
+    "graph://hello%40inkwell.dev@default",
+    Options{ from = "Inkwell <hello@inkwell.dev>", token = source },
+  )?
+  defer mailer.close()
+  mailer.send(
+    Message{
+      to = ["sara@example.com"], subject = "Welcome to Inkwell",
+      text = "Your account is ready.",
+    },
+  )?
+}
+```
+
+The mailbox before `@default` is percent-decoded. `default` selects
+`graph.microsoft.com`. A custom host and port use HTTPS; certificate checks
+can be disabled only for a custom test host. The transport posts your final
+MIME bytes as base64 with `Content-Type: text/plain`, so `Options.dkim` can
+sign the message. Read [Microsoft's sendMail contract](https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0)
+for the application permission and mailbox access policy.
+
+Graph requests `https://graph.microsoft.com/.default`. One `MicrosoftApp`
+can serve both Graph and SMTP; each audience has a separate cache. A custom
+`TokenSource` or `RefreshToken` must already produce a Graph token. A Graph
+401 forces one refresh and one further request. A second 401, or a 403,
+fails with `MailError.Auth`. A 429, 503, or 504 fails with
+`MailError.Transient`; `Reply.retryAfter` retains a valid `Retry-After` value.
+A 400 fails with `MailError.Rejected` and the provider's message. A 202
+returns `Receipt.providerId` from `request-id`; it records acceptance,
+not final delivery. A connection lost after sending the request is
+`MailError.Unknown`, because repeating it could send the same mail twice.
+
+Graph gets recipients from the MIME headers. A message with Bcc fails with
+`graph:// cannot send Bcc recipients in MIME mode; send them a separate message`.
+It also refuses an envelope that differs from those visible recipients,
+including a queued blind recipient. `Options.redirect` fails at `open`
+because preserving signed headers would deliver to their original recipients.
+Use SMTP or Mailgun when you need blind recipients, staging redirects, or a
+separate envelope. Graph also refuses delivery notifications, bounce overrides,
+and `requireTls` because its API cannot carry those SMTP requirements.
+
+`Mailer.verify()` checks token acquisition for Graph. It cannot prove
+`Mail.Send` or the mailbox access policy without a real send.
 
 ## Use a delegated refresh token
 
@@ -71,7 +127,7 @@ Treat source configuration as immutable while sends are in progress.
 
 ## Refreshing and failures
 
-Each built-in source caches one `Token`: its `value` is the bearer credential,
+Each built-in source caches a `Token` per audience: its `value` is the bearer credential,
 and `expires` is a `std/time.Timestamp`. Never print `value`. The source reuses
 the token until sixty seconds before expiry, with one refresh in flight across
 concurrent senders. Reuse the same source object to share this cache.

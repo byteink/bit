@@ -1,0 +1,155 @@
+// Graph takes signed MIME; its recipients come from the headers, not an envelope (#6909).
+
+fn parseGraph(url: string): ApiTarget!MailError {
+  let t = parseApiUrl(
+    ApiSpec{
+      scheme = "graph://", defaultHost = "graph.microsoft.com",
+      secret = "mailbox", placeholder = "sender%40inkwell.dev",
+    },
+    url,
+  )?
+  let mailbox = parseField("graph mailbox", t.secret) catch _ {
+    fail MailError.Config("graph:// mailbox must be a bare address")
+  }
+  if (mailbox.email != t.secret) {
+    fail MailError.Config("graph:// mailbox must be a bare address")
+  }
+  return t
+}
+
+class GraphTransport {
+  t: ApiTarget
+  source: TokenSource
+  timeout: int
+
+  init(t: ApiTarget, opts: Options)!MailError {
+    if (opts.token == nil) {
+      fail MailError.Config("graph:// needs Options.token")
+    }
+    if (opts.redirect != "") {
+      fail MailError.Config("graph:// cannot redirect recipients without changing signed MIME headers")
+    }
+    this.t = t
+    this.source = opts.token
+    this.timeout = opts.timeout
+  }
+
+  export signs(): bool { return true }
+  export close() {}
+  export toString(): string { return this.t.display }
+
+  // There is no read endpoint that proves Mail.Send; this checks the token grant alone.
+  export check(): ()!MailError {
+    let token = sourceToken(this.source, this.timeout, 0, [], true)?
+    graphBearer(token)?
+  }
+
+  export deliver(d: Delivery): Receipt!MailError {
+    checkApiEnvelope(d, "graph://", "", false)?
+    graphRecipients(d)?
+    let start = monotonic().ns
+    let token = sourceToken(this.source, this.timeout, 0, [], true)?
+    let hidden = append([token.value], ...token.secrets)
+    let res = this.request(token, d.raw, this.remaining(start))?
+    if (res.status == 401) {
+      token = sourceToken(this.source, this.remaining(start), token.generation, hidden, true) catch e {
+        fail oauthError(e, hidden)
+      }
+      hidden = append(hidden, token.value)
+      hidden = append(hidden, ...token.secrets)
+      res = this.request(token, d.raw, this.remaining(start))?
+    }
+    if (res.status != 202) {
+      fail graphError(res, hidden)
+    }
+    return Receipt{
+      id = d.messageId, providerId = oauthScrub(httpHeader(res.headers, "request-id"), hidden),
+      accepted = d.envelope.to,
+    }
+  }
+
+  remaining(start: int): int { return this.timeout - (monotonic().ns - start) }
+
+  request(token: Token, raw: string, budget: int): HttpResponse!MailError {
+    if (budget < Millisecond) {
+      fail oauthTimeout()
+    }
+    graphBearer(token)?
+    let c = apiClient(this.t.insecure)
+    defer c.close()
+    c.setRedirects(Redirects.None)
+    c.setMaxBodyBytes(65536)
+    c.setHeader("Authorization", "Bearer ${token.value}") catch _ {
+      fail MailError.Config("graph:// bearer cannot be sent as a header")
+    }
+    c.setHeader("Content-Type", "text/plain") catch _ {
+      fail MailError.Config("graph:// Content-Type cannot be sent as a header")
+    }
+    let mailbox = replace(percentEncode(this.t.secret), "%40", "@")
+    return c.requestTimeout(
+      "POST", "${this.t.base}/v1.0/users/${mailbox}/sendMail", encodeBase64([]byte(raw)),
+      budget / Millisecond,
+    ) catch e {
+      fail apiNetError("graph: request failed", e, false)
+    }
+  }
+}
+
+fn graphBearer(token: Token): ()!MailError {
+  if (!apiSecretOk(token.value)) {
+    fail MailError.Auth(Reply{ text = "graph:// token source returned an invalid bearer token" })
+  }
+}
+
+fn graphError(res: HttpResponse, hidden: []string): MailError {
+  let body = Json.JsonObject([])
+  match (apiMember(res.body, "error")) {
+    Some(value) => body = value
+    None => {}
+  }
+  let code = unwrapOr(jsonAsString(unwrapOr(jsonGet(body, "code"), Json.JsonNull)), "")
+  let text = unwrapOr(jsonAsString(unwrapOr(jsonGet(body, "message"), Json.JsonNull)), "")
+  return apiReadError(res.status, res.headers, oauthScrub("${code}: ${text}", hidden))
+}
+
+// This also checks queued raw deliveries, whose Message no longer records blind recipients.
+fn graphRecipients(d: Delivery): ()!MailError {
+  if (len(d.message.bcc) > 0) {
+    fail MailError.Invalid("graph:// cannot send Bcc recipients in MIME mode; send them a separate message")
+  }
+  let recipients = graphHeaderRecipients(d.raw)?
+  if (len(recipients) != len(d.envelope.to)) {
+    fail MailError.Invalid("graph:// MIME recipients differ from the envelope")
+  }
+  for recipient of recipients {
+    if (!graphHasRecipient(d.envelope.to, recipient)) {
+      fail MailError.Invalid("graph:// MIME recipients differ from the envelope")
+    }
+  }
+}
+
+fn graphHeaderRecipients(raw: string): []string!MailError {
+  let (headers, _) = splitMessage(raw)?
+  let recipients: []string = []
+  for f of headers {
+    let name = toLower(f.0)
+    if (name == "bcc") {
+      fail MailError.Invalid("graph:// cannot send a Bcc header in MIME mode")
+    }
+    if (name == "to" || name == "cc") {
+      for address of parseAddressList(replace(f.1, "\r\n", ""))? {
+        recipients = appendNew(recipients, address.email)
+      }
+    }
+  }
+  return recipients
+}
+
+fn graphHasRecipient(recipients: []string, recipient: string): bool {
+  for address of recipients {
+    if (address == recipient) {
+      return true
+    }
+  }
+  return false
+}
