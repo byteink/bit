@@ -597,3 +597,95 @@ test "h2cmdAbort resets the stream with CANCEL, returns the held credit, and the
     "DATA on a never-aborted closed stream must be refused with RST_STREAM",
   )
 }
+
+test "DATA byte helpers preserve offsets, prefixes and independent copies" {
+  let source = []byte("_payload_tail")
+  let src = source[1:8]
+  let prefix = []byte("head:")
+  let grown = h2connAppendBytes(prefix, src)
+  assert(string(grown) == "head:payload", "append lost the prefix or source offset")
+  assert(string(prefix) == "head:", "append changed the saved destination")
+  let space = []byte(32)
+  let dst = space[3:5]
+  let framed = h2framePutBytes(dst, src)
+  assert(len(framed) == 9, "frame append lost bytes with spare capacity")
+  assert(framed[0] == 0 && framed[1] == 0, "frame append changed the prefix")
+  assert(string(framed[2:9]) == "payload", "frame append lost the source offset")
+  assert(len(dst) == 2, "frame append changed the saved destination length")
+  assert(len(h2connAppendBytes(grown, []byte(0))) == len(grown), "empty append grew")
+  assert(len(h2framePutBytes(framed, []byte(0))) == len(framed), "empty frame append grew")
+  let copied = h2connCopyN(src, 3)
+  src[0] = byte(0)
+  assert(string(copied) == "pay", "copy retained the source buffer")
+  assert(len(h2connCopyN(src, 0)) == 0, "zero-byte copy was not empty")
+}
+
+test "DATA encoding keeps payload bytes and padding across bulk-copy boundaries" {
+  for size of [0, 1, 7, 8, 9, 255, 4096, 16384] {
+    for padding of [0 - 1, 0, 7, 255] {
+      let data = btPattern(size)
+      let wire = encodeData(
+        DataFrame{ streamId = 3, data = data, endStream = true, padLength = padding },
+      ) catch e {
+        assert(false, "encoding DATA failed: ${e.message()}")
+        return
+      }
+      let frame = readFrame(wire, maxMaxFrameSize) catch e2 {
+        assert(false, "reading DATA failed: ${e2.message()}")
+        return
+      }
+      let decoded = decodeData(frame) catch e3 {
+        assert(false, "decoding DATA failed: ${e3.message()}")
+        return
+      }
+      assert(decoded.streamId == 3 && decoded.endStream, "DATA lost its stream flags")
+      assert(decoded.padLength == padding, "DATA changed its padding length")
+      assert(h2connBytesEqual(decoded.data, data), "DATA changed ${size} payload bytes")
+      if (size > 0) {
+        data[0] = byte(0)
+        assert(decoded.data[0] == byte(33), "encoded DATA retained the source buffer")
+      }
+    }
+  }
+}
+
+test "frame reader retains DATA payloads across partial and coalesced reads" {
+  let data = btPattern(4097)
+  let a = encodeData(
+    DataFrame{ streamId = 1, data = data, endStream = false, padLength = 0 - 1 },
+  ) catch e {
+    assert(false, "encoding the first DATA failed: ${e.message()}")
+    return
+  }
+  let b = encodeData(
+    DataFrame{ streamId = 1, data = []byte("tail"), endStream = true, padLength = 0 - 1 },
+  ) catch e2 {
+    assert(false, "encoding the second DATA failed: ${e2.message()}")
+    return
+  }
+  let wire = append(a, ...b)
+  let incoming = chan<btChunk>(4)
+  incoming <- btChunk{ data = wire[0:3], eof = false }
+  incoming <- btChunk{ data = wire[3:4096], eof = false }
+  incoming <- btChunk{ data = wire[4096:len(wire)], eof = false }
+  incoming <- btChunk{ data = []byte(0), eof = true }
+  let end = btEnd{
+    incoming = incoming,
+    outgoing = chan<btChunk>(1),
+    leftover = []byte(0),
+    closed = false,
+  }
+  let reader = h2connFrameReader{ read = btRead(end), buf = []byte(0) }
+  let got = h2connNextFrame(reader, defaultMaxFrameSize) catch e3 {
+    assert(false, "reading the first DATA failed: ${e3.message()}")
+    return
+  }
+  let tail = h2connNextFrame(reader, defaultMaxFrameSize) catch e4 {
+    assert(false, "reading the second DATA failed: ${e4.message()}")
+    return
+  }
+  wire[9] = byte(0)
+  assert(h2connBytesEqual(got.payload, data), "later reads changed the first DATA")
+  assert(string(tail.payload) == "tail", "coalesced DATA lost its payload")
+  assert((tail.header.flags & flagEndStream) != 0, "coalesced DATA lost END_STREAM")
+}
