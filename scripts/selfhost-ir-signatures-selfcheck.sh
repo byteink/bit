@@ -108,8 +108,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 
   expect "" "$(explainMismatch 'kw_in 0..2' 'ident 0..2' tokens)" 'retired token identity'
   for kind in ir iropt ast fmt types diags tokens doc; do
-    case "$kind" in iropt) want_registry=5909-nonnull-map-guard-thread ;; *) want_registry="" ;; esac
-    expect "$want_registry" "$(declaredSignatureNames "$kind")" "$kind registry"
+    expect "" "$(declaredSignatureNames "$kind")" "$kind registry"
   done
 
   /bin/bash "$ROOT/scripts/selfhost-diffiropt.sh" --literal-selfcheck || fail=1
