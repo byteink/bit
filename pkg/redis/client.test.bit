@@ -127,3 +127,81 @@ test "a -ERR reply surfaces as a failure" {
 
   assert(failed, "expected GET to fail on a -ERR reply")
 }
+
+class closeProbe { opens: int, closes: AtomicI64 }
+
+class countedCloseStream {
+  probe: closeProbe
+  readUp(n: int): string! { return "" }
+
+  write(s: string): ()! {}
+
+  setDeadline(deadlineNs: int) {}
+
+  close() { let _ = this.probe.closes.add(1) }
+}
+
+test "physical close is idempotent and rejects pool reuse" {
+  let probe = closeProbe{ closes = AtomicI64(0) }
+  let conn = redisConn{ s = countedCloseStream{ probe = probe }, closed = AtomicI64(0) }
+  assert(connClean(conn), "new connection must be clean")
+  conn.close()
+  conn.close()
+  assert(probe.closes.load() == 1, "stream closed more than once")
+  assert(!connClean(conn), "closed connection must not return to the pool")
+}
+
+test "physical close retires a withConn lease before replacement" {
+  let probe = closeProbe{ closes = AtomicI64(0) }
+  let pool = Pool<redisConn>(
+    () => {
+      probe.opens = probe.opens + 1
+      return redisConn{ s = countedCloseStream{ probe = probe }, closed = AtomicI64(0) }
+    },
+    (conn) => conn.close(),
+    (conn) => true,
+    PoolOptions{ maxSize = 1 },
+  )
+  let client = Client{ pool = pool, opts = Options{}, lastAttrs = []MapEntry(0), version = 0 }
+  defer client.close()
+  client.withConn<bool>((conn) => {
+    conn.close()
+    return true
+  }) catch e {
+    panic("close leased connection: ${e.message()}")
+  }
+  assert(probe.opens == 1 && probe.closes.load() == 1, "closed lease must retire exactly once")
+  client.withConn<bool>((conn) => {
+    assert(connClean(conn), "received a closed connection")
+    return true
+  }) catch e {
+    panic("replace closed connection: ${e.message()}")
+  }
+  assert(probe.opens == 2, "pool reused the closed lease")
+  client.close()
+  assert(probe.closes.load() == 2, "replacement connection was not closed")
+}
+
+fn closeTogether(conn: redisConn, ready: chan<bool>, start: chan<bool>, done: chan<bool>) {
+  ready <- true
+  <- start
+  conn.close()
+  done <- true
+}
+
+test "physical close converges from two concurrent callers" {
+  let probe = closeProbe{ closes = AtomicI64(0) }
+  let conn = redisConn{ s = countedCloseStream{ probe = probe }, closed = AtomicI64(0) }
+  let ready = chan<bool>(2)
+  let start = chan<bool>()
+  let done = chan<bool>(2)
+  spawn closeTogether(conn, ready, start, done)
+  spawn closeTogether(conn, ready, start, done)
+  <- ready
+  <- ready
+  close(start)
+  <- done
+  <- done
+  assert(probe.closes.load() == 1, "concurrent disposal closed the stream more than once")
+  assert(!connClean(conn), "concurrent disposal left a reusable connection")
+}
