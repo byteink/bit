@@ -1,0 +1,104 @@
+// Warm verified-TLS MySQL control (#8383), on one held public SQL lease.
+// Socket discovery uses only this process's bounded fd range and exact owned peer.
+import { adapter as mysqlAdapter } from "../../../pkg/mysql"
+import { pool, Datasource, SslMode, Executor, Value, asInt } from "std/sql"
+import { env } from "std/os"
+import { sysGetPeerName } from "../../../runtime/syscalls"
+
+fn mysqlPeer(fd: int): bool {
+  clear(saBytes(), 16)
+  *ptrOf(tcpOptSize) = i32(16)
+  let rc = syscall(sysGetPeerName(), i64(fd), i64(int(saBytes())), i64(int(ptrOf(tcpOptSize))))
+  if (rc != 0 || *ptrOf(tcpOptSize) != i32(16)) {
+    return false
+  }
+  return getByte(saBytes(), 0) == 2 &&
+    getByte(saBytes(), 1) == 0 &&
+    netSockAddrPort(saBytes()) == 3306 &&
+    getByte(saBytes(), 4) == 127 &&
+    getByte(saBytes(), 5) == 0 &&
+    getByte(saBytes(), 6) == 0 &&
+    getByte(saBytes(), 7) == 1
+}
+
+fn mysqlFd(): int {
+  let found = -1
+  let count = 0
+  let fd = 0
+  while (fd < 256) {
+    if (mysqlPeer(fd)) {
+      found = fd
+      count = count + 1
+    }
+    fd = fd + 1
+  }
+  assert(count == 1, "expected exactly one owned MySQL peer")
+  return found
+}
+
+fn warmQuery(c: Executor): ()! {
+  let rows = c.query("select $1", []Value{ Value.Int(1) })?
+  defer rows.close()
+  assert(len(rows.columns()) == 1, "expected one column")
+  assert(rows.next()?, "expected one row")
+  assert(asInt(rows.value(0))? == 1, "expected integer1")
+  let more = rows.next()?
+  assert(!more, "expected EOF after one row")
+}
+
+fn warmBlocks(c: Executor, fd: int): ()! {
+  let modes = [0, 1, 1, 0, 1, 0, 0, 1]
+  let block = 0
+  while (block < 8) {
+    assert(mysqlFd() == fd, "the physical connection changed")
+    setTcpOption(fd, 1, modes[block])
+    let query = 0
+    while (query < 8) {
+      let start = monoAdapt()
+      warmQuery(c)?
+      let elapsed = monoAdapt() - start
+      println("mysql-warm block=${block} nodelay=${modes[block]} query=${query} ns=${elapsed}")
+      query = query + 1
+    }
+    assert(tcpOption(fd, 1) == modes[block], "NODELAY changed within the block")
+    block = block + 1
+  }
+}
+
+fn warmDefault(c: Executor, fd: int): ()! {
+  assert(mysqlFd() == fd, "the physical connection changed")
+  assert(tcpOption(fd, 1) == 1, "the TCP default is not NODELAY1")
+  let query = 0
+  while (query < 32) {
+    let start = monoAdapt()
+    warmQuery(c)?
+    let elapsed = monoAdapt() - start
+    println("mysql-default query=${query} ns=${elapsed}")
+    query = query + 1
+  }
+  assert(mysqlFd() == fd, "the physical connection changed")
+  assert(tcpOption(fd, 1) == 1, "the TCP default changed")
+}
+
+fn warmTlsControl(): ()! {
+  let db = pool(
+    mysqlAdapter(),
+    Datasource{
+      host = "127.0.0.1", port = 3306, sslmode = SslMode.VerifyFull,
+      user = env("MY_TEST_MARIADB_USER"), password = env("MY_TEST_MARIADB_PASSWORD"),
+      database = "t8383", maxOpen = 1, maxIdle = 1, statementCache = 0,
+    },
+  )?
+  defer db.close()
+  let result = db.pinned<int>((c) => {
+    warmQuery(c)?
+    let fd = mysqlFd()
+    if (arg(1) == "mysql-default-control") {
+      warmDefault(c, fd)?
+    } else {
+      warmBlocks(c, fd)?
+    }
+    return 0
+  })?
+  assert(result == 0, "warm block result differs")
+}
