@@ -3098,6 +3098,7 @@ defined exactly once).
 | `bit_rt_os_argc`      | `() -> i64` (§19)                                      |
 | `bit_rt_os_arg_at`    | `(i: i64) -> *const RtBytes` (§19)                     |
 | `bit_rt_os_env`       | `(name: *const RtBytes) -> *const RtBytes` (§19)       |
+| `bit_rt_os_env_present` | `(name: *const RtBytes) -> bool` (§19)              |
 | `bit_rt_os_self_exe`  | `() -> *const RtBytes` (§19)                           |
 | `bit_rt_os_hostname`  | `(buf: *byte, room: i64) -> i64` (§19, #7192: writes the local host name NUL-terminated into the caller's `room`-byte buffer and returns its length, always `< room`; `-1` when the call fails or the name plus its NUL does not fit, never a truncated name (Darwin cannot tell a name of `room - 1` bytes from a truncated one, so it refuses that length too). Darwin `gethostname(2)`, Linux `uname(2)` `nodename`, Windows `GetComputerNameExW(ComputerNameDnsHostname)` re-encoded as UTF-8. A plain `extern fn` taking a caller buffer, not a compiler primitive: §11.7 admits no `string` return) |
 | `bit_rt_os_exit`      | `(code: i64) -> noreturn` (§19)                        |
@@ -4322,6 +4323,7 @@ retries on a torn read, with no lock to hold across an interruption.
 bit_rt_os_argc()           -> i64
 bit_rt_os_arg_at(i)        -> *const RtBytes   // "" when out of range
 bit_rt_os_env(name)        -> *const RtBytes   // "" when unset
+bit_rt_os_env_present(name) -> bool           // true for a defined empty value too
 bit_rt_os_self_exe()       -> *const RtBytes   // own path, symlinks resolved; "" if unknown
 bit_rt_os_hostname(buf, room) -> i64       // local host name NUL-terminated into buf; its length (< room), or -1 (failure or does not fit)
 bit_rt_os_exit(code)       -> noreturn         // deferred calls do not run
@@ -4336,6 +4338,17 @@ bit_rt_auxv()              -> i64              // ELF auxv address; 0 when none
 `argc`/`argv`/`envp` are captured by the process entry (§9) on both the raw-stack
 Linux path and the Darwin `machoMain` path; `boot` captures the environment block.
 Bit has no nil string, so an unset variable and one set to `""` both read empty.
+
+`bit_rt_os_env_present` distinguishes those cases without allocating a string.
+It and `bit_rt_os_env` share the bounded, first-match scan of the captured
+startup environment. An exact `name=` entry is present even when no bytes
+follow `=`; a longer key with the same prefix does not match. The captured
+environment stays alive and has no supported mutation API, so presence and
+value reads use the same snapshot. Linux and Darwin retain the startup array;
+Windows retains its UTF-8 copy before releasing the system environment block.
+The common `runtime/root/os.bit` provider serves all four supported targets.
+The compiler's internal `osEnvPresent(name: string): bool` primitive maps to
+this symbol. Public stdlib consumers must wait for a provider-bearing seed.
 
 `bit_rt_os_run` runs the executable at `path` as a child process, with `argv` (a
 `[]string`, or a null `SliceHeader` for the empty/default slice) appended to the
