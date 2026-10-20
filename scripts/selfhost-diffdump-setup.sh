@@ -222,5 +222,466 @@ DIFFDUMP_PARENT_LIBRARY
 # Only the fixed sibling framing source enters either proof process.
 diffdump_frame_libraries() {
   . "$1/selfhost-diffiropt.sh" || return 1
-  diffdump_parent_library && diffiropt_literal_library && diffdump_owned_append_library
+  . "$1/selfhost-ir-canon.sh" || return 1
+  diffdump_parent_library && diffiropt_literal_library && diffdump_owned_append_library &&
+    diffdump_aggregate_object_library && diffdump_aggregate_ir_library
+}
+
+# Aggregate proofs reuse the validated object readers, never symbol-name guesses.
+diffdump_aggregate_object_library() {
+  DIFFDUMP_AGGREGATE_OBJECT_PYTHON=
+  local aggregate_read_rc=0
+  IFS= builtin read -r -d '' DIFFDUMP_AGGREGATE_OBJECT_PYTHON <<'AGGREGATE_OBJECT' || aggregate_read_rc=$?
+def aggregate_pointer_rows(index, relative):
+    spend(16)
+    rows = []
+    for address in range(relative - 7, relative + 8):
+        entry = index.get(address)
+        if entry is not None and relative < address + entry[0]:
+            require(entry[1] is not None and entry[0] == 8)
+            rows.append((address, entry[1]))
+    return rows
+
+def aggregate_macho(data):
+    sections, symtab = literal_macho_commands(data)
+    symbols, unused = literal_macho_symbols(data, sections, symtab)
+    indexes = {}
+    def read(symbol, size):
+        return literal_macho_location(data, sections, symbol, size)[2]
+    def pointer(symbol, offset):
+        section, relative, unused = literal_macho_location(data, sections, symbol, offset + 8)
+        if symbol[2] not in indexes:
+            indexes[symbol[2]] = literal_macho_relocations(data, section)
+        rows = aggregate_pointer_rows(indexes[symbol[2]], relative + offset)
+        require(len(rows) == 1 and rows[0][0] == relative + offset)
+        bits = rows[0][1]
+        require(bits >> 24 == 14 and bits & 0xffffff < len(symbols))
+        return symbols[bits & 0xffffff]
+    def function(entry):
+        name, row = entry
+        require(row[1] & 0xee == 0x0e and 0 < row[2] <= len(sections))
+        require(sections[row[2] - 1][0].rstrip(b'\0') == b'__text')
+        require(name.startswith(b'_'))
+        return name[1:]
+    return symbols, read, pointer, function, b'___bittype_', aggregate_macho_refs(data, sections, symbols)
+
+def aggregate_elf(data):
+    machine, sections, names = literal_elf_sections(data)
+    table, symbols, unused = literal_elf_symbols(data, sections)
+    indexes = {}
+    def read(symbol, size):
+        require(size <= symbol[5])
+        unused, raw = literal_elf_location(data, sections, symbol, symbol[5])
+        return raw[:size]
+    def pointer(symbol, offset):
+        if symbol[3] not in indexes:
+            indexes[symbol[3]] = literal_elf_relocations(data, sections, table, machine, symbol[3])
+        relative = symbol[4] + offset
+        rows = aggregate_pointer_rows(indexes[symbol[3]], relative)
+        require(len(rows) == 1 and rows[0][0] == relative)
+        address, info, addend = rows[0][1]
+        require(address == relative and addend == 0 and info >> 32 < len(symbols))
+        return symbols[info >> 32]
+    def function(entry):
+        name, row = entry
+        require(row[1] & 15 == 2 and 0 < row[3] < len(sections))
+        require(sections[row[3]][2] & 4)
+        return name
+    return symbols, read, pointer, function, b'__bittype_', aggregate_elf_refs(data, sections, names, symbols, table, machine)
+
+def aggregate_macho_refs(data, sections, symbols):
+    result = []
+    for section in sections:
+        for index in range(section[7]):
+            spend()
+            address, bits = literal_unpack(data, section[6] + index * 8, '<iI')
+            require(0 <= address < section[3])
+            if not bits & (1 << 27):
+                continue
+            require(bits & 0xffffff < len(symbols))
+            name = symbols[bits & 0xffffff][0]
+            kind = 'other'
+            if bits >> 24 == 14:
+                kind = 'pointer'
+            if bits >> 24 == 45:
+                kind = 'call'
+            result.append((section[0].rstrip(b'\0'), kind, name[1:]))
+    return result
+
+def aggregate_elf_refs(data, sections, names, symbols, table, machine):
+    result = []
+    for section in sections:
+        if section[1] != 4:
+            continue
+        require(section[6] == table and section[9] == 24 and section[5] % 24 == 0)
+        require(section[7] < len(sections))
+        for index in range(section[5] // 24):
+            spend()
+            address, info, addend = literal_unpack(data, section[4] + index * 24, '<QQq')
+            require(info >> 32 < len(symbols) and address < sections[section[7]][5])
+            kind = aggregate_elf_ref_kind(machine, info & 0xffffffff, addend)
+            result.append((names[section[7]], kind, symbols[info >> 32][0]))
+    return result
+
+def aggregate_elf_ref_kind(machine, kind, addend):
+    if kind == (2 if machine == 62 else 283) and addend == (-4 if machine == 62 else 0):
+        return 'call'
+    if kind == (1 if machine == 62 else 257) and addend == 0:
+        return 'pointer'
+    return 'other'
+
+def aggregate_offsets(row, words, read, pointer):
+    count = words[2]
+    require(words[1] == 0)
+    if not count:
+        return ()
+    target = pointer(row, 8)
+    raw = read(target[1], count * 8)
+    offsets = struct.unpack('<' + 'Q' * count, raw)
+    require(tuple(sorted(set(offsets))) == offsets)
+    require(all(offset + 8 <= words[0] for offset in offsets))
+    return offsets
+
+def aggregate_methods(row, words, read, pointer, function):
+    count = words[6]
+    require(words[5] == 0)
+    if not count:
+        return ()
+    target = pointer(row, 40)
+    raw = read(target[1], count * 16)
+    result, seen = [], set()
+    for index in range(count):
+        spend(2)
+        method, address = struct.unpack_from('<QQ', raw, index * 16)
+        require(address == 0 and method not in seen)
+        seen.add(method)
+        result.append((method, function(pointer(target[1], index * 16 + 8))))
+    return tuple(result)
+
+def aggregate_object(data):
+    reader = aggregate_macho if data[:4] == b'\xcf\xfa\xed\xfe' else aggregate_elf
+    symbols, read, pointer, function, prefix, references = reader(data)
+    descriptors, methods = {}, {}
+    pattern = re.compile(re.escape(prefix) + rb'[0-9]+_[0-9]+(?:_[0-9]+)*')
+    for name, row in symbols:
+        spend()
+        if pattern.fullmatch(name) is None:
+            continue
+        require(name not in descriptors)
+        words = struct.unpack('<8Q', read(row, 64))
+        require(words[0] <= 8388608)
+        offsets = aggregate_offsets(row, words, read, pointer)
+        descriptors[name] = (words[0], offsets, words[7])
+        for method, target in aggregate_methods(row, words, read, pointer, function):
+            methods.setdefault(method, []).append((name, target))
+    require(descriptors)
+    return descriptors, {key: tuple(sorted(value)) for key, value in methods.items()}, references
+AGGREGATE_OBJECT
+  [ "$aggregate_read_rc" -eq 1 ]
+}
+
+# Fixed pure test constructors; never loaded by production proof dispatch.
+diffdump_aggregate_fixture_library() {
+  DIFFDUMP_AGGREGATE_FIXTURES=
+  local aggregate_fixture_rc=0
+  IFS= builtin read -r -d '' DIFFDUMP_AGGREGATE_FIXTURES <<'AGGREGATE_FIXTURES' || aggregate_fixture_rc=$?
+import struct
+def fixture_pool(raw):
+    remaining, found = raw, []
+    for value in sorted(values, key=len, reverse=True):
+        token = b'const_string "' + value + b'"'
+        if token in remaining:
+            found.append(value)
+            remaining = remaining.replace(token, b"FIXED_LITERAL")
+    assert b"const_string" not in remaining, "undeclared literal fixture"
+    return tuple(sorted(set(found)))
+
+def aggregate_fixture_entries(count, families):
+    entries = [(b'_take$t1', 15, 1, 0)]
+    if families:
+        entries.append((b'_other$t2', 15, 1, 4))
+    entries += [(b'___bittype_1_8_methods', 14, 3, 0), (b'___bittype_1_8', 15, 3, count * 16)]
+    return entries
+
+def aggregate_fixture_object(adjacent=False, overlap=False, families=False):
+    text = bytes.fromhex('c0035fd6') * (2 if families else 1)
+    count = 2 if adjacent or families else 1
+    data = struct.pack('<2Q', 1, 0)
+    if adjacent or families:
+        data += struct.pack('<2Q', 2, 0)
+    data += struct.pack('<8Q', 8, 0, 0, 0, 0, 0, count, 1)
+    strings, symbols = b'\0', []
+    entries = aggregate_fixture_entries(count, families)
+    for name, kind, section, value in entries:
+        symbols.append(struct.pack('<IBBHQ', len(strings), kind, section, 0, value))
+        strings += name + b'\0'
+    segment_size = 72 + 240
+    start = 32 + segment_size + 24
+    dataoff = (start + len(text) + 7) // 8 * 8
+    relocoff = dataoff + len(data)
+    relocs = struct.pack('<iI', 8, 0xe000000)
+    if adjacent or families:
+        relocs += struct.pack('<iI', 9 if overlap else 24, 0xe000000 + int(families))
+    relocs += struct.pack('<iI', count * 16 + 40, 0xe000001 + int(families))
+    symoff = relocoff + len(relocs)
+    head = struct.pack('<8I', 0xfeedfacf, 0x100000c, 0, 1, 2, segment_size + 24, 0, 0)
+    segment = struct.pack('<II16sQQQQiiII', 0x19, segment_size, b'', 0, 0, 0, 0, 0, 0, 3, 0)
+    sections = struct.pack('<16s16sQQIIIIIIII', b'__text', b'__TEXT', 0, len(text), start, 2, 0, 0, 0, 0, 0, 0)
+    sections += struct.pack('<16s16sQQIIIIIIII', b'__const', b'__TEXT', 0, 0, start, 0, 0, 0, 0, 0, 0, 0)
+    sections += struct.pack('<16s16sQQIIIIIIII', b'__data', b'__DATA', 0, len(data), dataoff, 3, relocoff, count + 1, 0, 0, 0, 0)
+    symtab = struct.pack('<6I', 2, 24, symoff, len(symbols), symoff + len(symbols) * 16, len(strings))
+    raw = head + segment + sections + symtab + text + bytes(dataoff - start - len(text))
+    return raw + data + relocs + b''.join(symbols) + strings, dataoff
+
+def aggregate_fixture_pair():
+    public = b'''func take$t1(%0: bool) Pair {
+bb0(%0: bool):
+  br %0, bb1(), bb2()
+bb1():
+  %1 = gc_alloc size=8 ptrs=[] Error
+  %2 = const_nil
+  ret %2, %1
+bb2():
+  %3 = const_int i64 7
+  %4 = const_bool true
+  %5 = gc_alloc size=16 ptrs=[] Pair
+  field_set %5[0] = %3
+  field_set %5[8] = %4
+  %8 = const_nil
+  ret %5, %8
+}
+
+func use(%0: Source, %1: bool) i64 {
+bb0(%0: Source, %1: bool):
+  %2 = call_iface %0.1(%1) Pair
+  %3 = call_word %2[1] error
+  %4 = const_nil
+  %5 = icmp_ne bool %3, %4
+  br %5, bb1(), bb2()
+bb1():
+  %7 = const_int i64 0
+  ret %7
+bb2():
+  %9 = field_get %2[0] i64
+  ret %9
+}
+'''
+    candidate = b'''func take$t1(%0: bool) Pair {
+bb0(%0: bool):
+  br %0, bb1(), bb2()
+bb1():
+  %1 = gc_alloc size=8 ptrs=[] Error
+  %2 = const_int i64 0
+  %3 = const_bool false
+  ret %2, %3, %1
+bb2():
+  %4 = const_int i64 7
+  %5 = const_bool true
+  %6 = const_nil
+  ret %4, %5, %6
+}
+
+func use(%0: Source, %1: bool) i64 {
+bb0(%0: Source, %1: bool):
+  %2 = call_iface %0.1(%1) i64
+  %3 = call_word %2[1] bool
+  %4 = call_word %2[2] error
+  %5 = const_nil
+  %6 = icmp_ne bool %4, %5
+  br %6, bb1(), bb2()
+bb1():
+  %8 = const_int i64 0
+  ret %8
+bb2():
+  ret %2
+}
+'''
+    return public, candidate
+
+def aggregate_fixture_words(types):
+    zero = lambda ty: b'const_float ' + ty + b' 0' if ty in (b'f32', b'f64') else b'const_int ' + ty + b' 0'
+    constants = [b'  %' + str(k + 4).encode() + b' = ' + zero(ty) for k, ty in enumerate(types)]
+    ids = [b'%' + str(k + 4).encode() for k in range(len(types))]
+    common = b'func take$t1(%0: bool) Pair {\nbb0(%0: bool):\n  br %0, bb1(), bb2()\nbb1():\n  %1 = gc_alloc size=8 ptrs=[] Error\n'
+    public = common + b'  %2 = const_nil\n  ret %2, %1\nbb2():\n' + b'\n'.join(constants)
+    public += b'\n  %20 = gc_alloc size=' + str(len(types) * 8).encode() + b' ptrs=[] Pair\n'
+    public += b''.join(b'  field_set %20[' + str(k * 8).encode() + b'] = ' + ident + b'\n' for k, ident in enumerate(ids))
+    public += b'  %21 = const_nil\n  ret %20, %21\n}\n\n'
+    failure = [b'  %' + str(k + 24).encode() + b' = ' + zero(ty) for k, ty in enumerate(types)]
+    failure_ids = [b'%' + str(k + 24).encode() for k in range(len(types))]
+    candidate = common + b'\n'.join(failure) + b'\n  ret ' + b', '.join(failure_ids + [b'%1'])
+    candidate += b'\nbb2():\n' + b'\n'.join(constants) + b'\n  %21 = const_nil\n  ret ' + b', '.join(ids + [b'%21']) + b'\n}\n\n'
+    caller = b'func use(%0: Source, %1: bool) ' + types[0] + b' {\nbb0(%0: Source, %1: bool):\n  %2 = call_iface %0.1(%1) '
+    public += caller + b'Pair\n  %3 = call_word %2[1] error\n  %4 = const_nil\n  %5 = icmp_ne bool %3, %4\n  br %5, bb1(), bb2()\nbb1():\n  %7 = ' + zero(types[0]) + b'\n  ret %7\nbb2():\n  %9 = field_get %2[0] ' + types[0] + b'\n  ret %9\n}\n'
+    candidate += caller + types[0] + b'\n'
+    candidate += b''.join(b'  %' + str(k + 2).encode() + b' = call_word %2[' + str(k).encode() + b'] ' + ty + b'\n' for k, ty in enumerate(types[1:], 1))
+    candidate += b'  %20 = call_word %2[' + str(len(types)).encode() + b'] error\n  %21 = const_nil\n  %22 = icmp_ne bool %20, %21\n  br %22, bb1(), bb2()\nbb1():\n  %23 = ' + zero(types[0]) + b'\n  ret %23\nbb2():\n  ret %2\n}\n'
+    return public, candidate
+
+def aggregate_fixture_word_controls(verdict):
+    for types, expected in [((b'i8', b'u16'), 0), ((b'f32', b'f64'), 0),
+            ((b'i64',) * 4, 0), ((b'i64',) * 5, 1),
+            ((b'f64',) * 6, 0), ((b'f64',) * 7, 1)]:
+        public, candidate = aggregate_fixture_words(types)
+        assert verdict(public, candidate, pools=((), ()))[0] == expected, ('word budget', types)
+    public, candidate = aggregate_fixture_words((b'f32', b'i8'))
+    for before, after in [(b'const_float f32 0', b'const_float f32 1'),
+            (b'call_word %2[1] i8', b'call_word %2[1] i16')]:
+        wrong = candidate.replace(before, after, 1)
+        assert verdict(public, wrong, pools=((), ()))[0] == 1, ('typed words', before)
+    wrong = public.replace(b'field_get %2[0] f32', b'field_get %2[8] f32')
+    assert verdict(wrong, candidate, pools=((), ()))[0] == 1, 'typed field offset'
+
+def aggregate_fixture_initializers(verdict, public, candidate):
+    before = b'  %3 = const_int i64 7\n  %4 = const_bool true\n  %5 = gc_alloc size=16 ptrs=[] Pair\n  field_set %5[0] = %3\n  field_set %5[8] = %4\n'
+    after = b'  %5 = gc_alloc size=16 ptrs=[] Pair\n  %3 = const_int i64 7\n  field_set %5[0] = %3\n  %4 = const_bool true\n  field_set %5[8] = %4\n'
+    interleaved = public.replace(before, after)
+    assert interleaved != public
+    assert verdict(interleaved, candidate, pools=((), ()))[0] == 0, 'interleaved constants'
+    for effect in (b'  %10 = rt_call blackbox(%0) void\n', b'  %10 = rt_call blackbox(%5) void\n',
+                   b'  %10 = const_int i64 123\n', b'  %10 = const_nil_bogus\n'):
+        wrong = interleaved.replace(b'  %3 = const_int i64 7\n', effect + b'  %3 = const_int i64 7\n')
+        assert verdict(wrong, candidate, pools=((), ()))[0] == 1, 'initializer effect/escape/unused/unknown'
+    for before, after in [(b'field_set %5[8] = %4', b'field_set %5[0] = %4'),
+                          (b'field_set %5[0] = %3', b'field_set %5[0] = %4')]:
+        assert verdict(interleaved.replace(before, after), candidate, pools=((), ()))[0] == 1, 'duplicate/uninitialized field'
+    old, new = [value.replace(b'Pair', b'(i64, bool)') for value in (interleaved, candidate)]
+    assert verdict(old, new, pools=((), ()))[0] == 0, 'parenthesized call result'
+    for before, after in [(b'%0.1(%1)', b'%0.1(%0)'), (b'call_iface %0.1(%1) i64', b'call_iface %0.1(%1) i32')]:
+        assert verdict(old, new.replace(before, after), pools=((), ()))[0] == 1, 'call argument/result changed'
+
+def aggregate_fixture_opaque(verdict, public, candidate):
+    opaque = b'\nfunc opaque(%0: []string, %1: i64) i64 {\nbb0(%0: []string, %1: i64):\n  %2 = slice_len %0\n  %3 = index_get %0[%1] string\n  %4 = slice_len %3\n  ret %4\n}\n'
+    renamed = re.sub(rb'%([234])\b', lambda match: b'%1' + match[1], opaque)
+    assert verdict(public + opaque, candidate + renamed, pools=((), ()))[0] == 0, 'opaque result SSA mapping'
+    wrong = renamed.replace(b'index_get %0[%1]', b'index_get %0[%12]')
+    assert verdict(public + opaque, candidate + wrong, pools=((), ()))[0] == 1, 'opaque operand changed'
+    unknown = b'  %10 = gc_alloc size=24 ptrs=[%0] []i64\n  %11 = slice_len %10\n'
+    wrong = public.replace(b'  %3 = const_int i64 7\n', unknown).replace(b'field_set %5[0] = %3', b'field_set %5[0] = %11')
+    assert verdict(wrong, candidate, pools=((), ()))[0] == 1, 'unknown result cannot authorize payload'
+
+def aggregate_fixture_families(verdict, objects, folder):
+    old, new = aggregate_fixture_pair()
+    other_old, other_new = aggregate_fixture_words((b'f32', b'i8'))
+    other_old, other_new = [value.replace(b'take$t1', b'other$t2').replace(b'func use(', b'func otherUse(').replace(b'%0.1(', b'%0.2(') for value in (other_old, other_new)]
+    raw, unused = aggregate_fixture_object(families=True)
+    path = os.path.join(folder, 'aggregate-families.o')
+    with open(path, 'wb') as output:
+        assert output.write(raw) == len(raw)
+    saved = objects[()]
+    objects[()] = path
+    assert verdict(old + other_old, new + other_new, pools=((), ()))[0] == 0, 'same erased family name'
+    wrong = other_new.replace(b'call_word %2[1] i8', b'call_word %2[1] bool')
+    assert verdict(old + other_old, new + wrong, pools=((), ()))[0] == 1, 'cross family word'
+    objects[()] = saved
+
+def aggregate_fixture_late_blocks(verdict, public, candidate):
+    late = b'\nfunc late() i64 {\nbb0():\n  jump bb2()\nbb1():\n  ret %1\nbb2():\n  %1 = const_int i64 1\n  jump bb1()\n}\n'
+    assert verdict(public + late, candidate + late, pools=((), ()))[0] == 0, 'late dominating definition'
+    bad = late.replace(b'jump bb2()', b'jump bb1()')
+    assert verdict(public + bad, candidate + bad, pools=((), ()))[0] == 1, 'nondominating definition'
+
+def aggregate_fixture_discovery(helper, public, candidate, raw):
+    packet = {"version": 3, "comparison": "ir", "work_left": 1000000,
+              "original": [base64.b64encode(value).decode() for value in (public, candidate)],
+              "objects": [base64.b64encode(raw).decode()] * 2}
+    child = os.path.join(os.path.dirname(helper), 'selfhost-ir-canon.sh')
+    def run(value):
+        wire = json.dumps(value, separators=(',', ':')).encode()
+        result = subprocess.run(['/bin/bash', child, '--prove-owned-appends'], input=wire,
+                                capture_output=True, timeout=5)
+        return result.returncode, result.stdout, result.stderr
+    rc, output, error = run(packet)
+    response = json.loads(output)
+    assert rc == 0 and error == b'' and set(response) == {'version', 'kind', 'work_left'}
+    assert response['version'] == 3 and response['kind'] == '6791-fallible-aggregate-words'
+    assert type(response['work_left']) is int and 0 <= response['work_left'] < 1000000
+    bads = [{'version': True}, {'version': 4}, {'work_left': True}, {'work_left': 0},
+            {'work_left': 1000001}, {'comparison': 'types'}, {'kind': 'canonical'},
+            {'framed_sha256': ['forged']}, {'original': ['?', '?']}, {'objects': []},
+            {'original': packet['original'][:1]}, {'original': [packet['original'][0]] * 2},
+            {'objects': [base64.b64encode(raw[:-1]).decode()] * 2}]
+    for change in bads:
+        assert run(dict(packet, **change)) == (1, b'', b''), ('v3 refusal', change.keys())
+    for key in packet:
+        wrong = dict(packet)
+        wrong.pop(key)
+        assert run(wrong) == (1, b'', b''), ('v3 missing', key)
+    wrong = dict(packet, original=[base64.b64encode(b'const_string "forged"\n').decode(), packet['original'][1]])
+    assert run(wrong) == (1, b'', b''), 'v3 literal framing'
+
+def aggregate_fixture_fake_child(helper, public, candidate, raw, folder):
+    script = os.path.join(folder, 'aggregate-fake-child.sh')
+    files = []
+    for index, value in enumerate((raw, raw, public, candidate)):
+        path = os.path.join(folder, 'aggregate-parent-' + str(index))
+        with open(path, 'wb') as output:
+            assert output.write(value) == len(value)
+        files.append(path)
+    with open(helper, encoding='utf8') as source:
+        parent = source.read().split("<<'PYTHON'", 1)[1].split('\n', 1)[1].split('\nPYTHON', 1)[0]
+    setup = os.path.join(os.path.dirname(helper), 'selfhost-diffdump-setup.sh')
+    with open(setup, encoding='utf8') as source:
+        library = source.read().split("<<'DIFFDUMP_PARENT_LIBRARY'", 1)[1].split('\n', 1)[1].split('\nDIFFDUMP_PARENT_LIBRARY', 1)[0]
+    code = library + '\n' + parent
+    response = {'version': 3, 'kind': 'canonical', 'work_left': 1000000}
+    cases = [(dict(response, version=True), '', 0), (dict(response, version=2), '', 0),
+             (dict(response, work_left=True), '', 0), (dict(response, work_left=1000001), '', 0),
+             (dict(response, kind='forged'), '', 0), (dict(response, extra=0), '', 0),
+             ({'version': 3, 'work_left': 1}, '', 0), (response, 'bad', 0),
+             (response, '', 1), ('X' * 65537, '', 0)]
+    for value, stderr, rc in cases:
+        text = value if type(value) is str else json.dumps(value)
+        shell = "#!/bin/bash\ncat >/dev/null\nprintf '%s' '" + text + "'\nprintf '%s' '" + stderr + "' >&2\nexit " + str(rc) + "\n"
+        with open(script, 'w', encoding='ascii') as output:
+            assert output.write(shell) == len(shell)
+        argv = [sys.executable, '-I', '-c', code, script, '', *files, 'ir']
+        result = subprocess.run(argv, input=public.rstrip(b'\n') + b'\0' + candidate.rstrip(b'\n'), capture_output=True, timeout=6)
+        assert result.returncode == 1 and result.stdout == b'', 'parent fake child refusal'
+
+def aggregate_fixture_controls(verdict, objects, store):
+    public, candidate = aggregate_fixture_pair()
+    raw, method = aggregate_fixture_object()
+    positive = os.path.join(store.name, 'aggregate-positive.o')
+    negative = os.path.join(store.name, 'aggregate-negative.o')
+    with open(positive, 'wb') as output:
+        assert output.write(raw) == len(raw)
+    bad = raw[:method] + struct.pack('<Q', 2) + raw[method + 8:]
+    with open(negative, 'wb') as output:
+        assert output.write(bad) == len(bad)
+    saved = objects.get(())
+    objects[()] = positive
+    objects[(b'aggregate-dispatch',)] = negative
+    expected = (0, b'6791-fallible-aggregate-words\n')
+    aggregate_fixture_discovery(helper, public, candidate, raw)
+    aggregate_fixture_fake_child(helper, public, candidate, raw, store.name)
+    aggregate_fixture_late_blocks(verdict, public, candidate)
+    aggregate_fixture_families(verdict, objects, store.name)
+    aggregate_fixture_opaque(verdict, public, candidate)
+    aggregate_fixture_initializers(verdict, public, candidate)
+    assert verdict(public, candidate, pools=((), ())) == expected, 'aggregate supported transport'
+    for suffix, overlap, expected_rc in [('adjacent', False, 0), ('overlap', True, 1)]:
+        object_raw, unused = aggregate_fixture_object(True, overlap)
+        path = os.path.join(store.name, 'aggregate-' + suffix + '.o')
+        with open(path, 'wb') as output:
+            assert output.write(object_raw) == len(object_raw)
+        objects[()] = path
+        assert verdict(public, candidate, pools=((), ()))[0] == expected_rc, suffix
+    objects[()] = positive
+    aggregate_fixture_word_controls(verdict)
+    for bad_return in (b'ret_bogus %2', b'ret %2, 123'):
+        wrong = candidate.replace(b'ret %2\n', bad_return + b'\n')
+        assert verdict(public, wrong, pools=((), ())) == (1, b''), 'exact return grammar'
+    wrong = candidate.replace(b'const_int i64 7', b'const_int i64 8')
+    assert verdict(public, wrong, pools=((), ())) == (1, b''), 'aggregate changed return'
+    wrong = candidate.replace(b'call_word %2[2] error', b'call_word %2[1] error')
+    assert verdict(public, wrong, pools=((), ())) == (1, b''), 'aggregate error index'
+    assert verdict(public, candidate, pools=((), (b'aggregate-dispatch',))) == (1, b''), 'aggregate dispatch closure'
+    objects.pop((b'aggregate-dispatch',))
+    if saved is None:
+        objects.pop(())
+    else:
+        objects[()] = saved
+AGGREGATE_FIXTURES
+  [ "$aggregate_fixture_rc" -eq 1 ]
 }

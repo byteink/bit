@@ -12,15 +12,15 @@ explainMismatch() {
   ROOT=${proof_dir%/scripts}
   [ "$proof_dir" != scripts ] || ROOT=.
   local DIFFIROPT_LITERAL_PYTHON DIFFDUMP_PARENT_PYTHON DIFFDUMP_PARENT_ENGINE
-  local parent_read_rc=0 parent_code
+  local parent_read_rc=0 parent_code DIFFDUMP_AGGREGATE_OBJECT_PYTHON DIFFDUMP_AGGREGATE_IR_PYTHON
   . "$proof_dir/selfhost-diffdump-setup.sh" || return 1
   diffdump_frame_libraries "$proof_dir" || return 1
   IFS= builtin read -r -d '' DIFFDUMP_PARENT_ENGINE <<'PYTHON' || parent_read_rc=$?
 import base64
-import hashlib
 import json
 import os
 import stat
+import struct
 import subprocess
 import sys
 
@@ -41,7 +41,6 @@ def unique_object(pairs):
     return result
 
 def prove(packet):
-    global remaining
     wire = json.dumps(packet, ensure_ascii=True, separators=(",", ":")).encode("ascii")
     require(len(wire) <= 8 * 1024 * 1024)
     environment = dict(os.environ)
@@ -52,12 +51,12 @@ def prove(packet):
     require(result.returncode == 0 and result.stderr == b"")
     require(len(result.stdout) <= 65536)
     response = json.loads(result.stdout, object_pairs_hook=unique_object)
-    require(type(response) is dict and set(response) == {"version", "query_ids", "work_left"})
-    require(type(response["version"]) is int and response["version"] == 2)
-    require(response["query_ids"] == [q["id"] for q in packet["proof"]["queries"]])
+    require(type(response) is dict and set(response) == {"version", "kind", "work_left"})
+    require(type(response["version"]) is int and response["version"] == 3)
+    require(response["kind"] in {"canonical", "6791-fallible-aggregate-words"})
     require(type(response["work_left"]) is int)
     require(0 <= response["work_left"] <= packet["work_left"])
-    remaining = response["work_left"]
+    return response["kind"]
 
 try:
     data = sys.stdin.buffer.read(8 * 1024 * 1024 + 1)
@@ -69,29 +68,26 @@ try:
     require(original[0] != original[1])
     objects = [file_snapshot(path) for path in sys.argv[3:5]]
     require(len(objects) == 2 and sum(map(len, original + objects)) <= 8 * 1024 * 1024)
-    memo = {}
-    framed = [literal_frames(raw, obj, memo) for raw, obj in zip(original, objects)]
-    normalized = [literal_canonical(raw) for raw in framed]
-    require(normalized[0] == normalized[1])
-    proof = {"version": 1, "work_left": remaining, "kind": "canonical", "queries": []}
-    packet = {"version": 2, "comparison": sys.argv[7], "work_left": remaining, "proof": proof,
+    packet = {"version": 3, "comparison": sys.argv[7], "work_left": remaining,
               "original": [base64.b64encode(r).decode("ascii") for r in original],
-              "objects": [base64.b64encode(r).decode("ascii") for r in objects],
-              "framed_sha256": [hashlib.sha256(r).hexdigest() for r in framed]}
-    prove(packet)
+              "objects": [base64.b64encode(r).decode("ascii") for r in objects]}
+    identity = prove(packet)
 except (ValueError, KeyError, IndexError, TypeError, RecursionError, OSError, OverflowError, struct.error, subprocess.TimeoutExpired):
     sys.exit(1)
-print("canonical-ir-match")
+if identity == "canonical":
+    print("canonical-ir-match")
+else:
+    print("6791-fallible-aggregate-words")
 PYTHON
   [ "$parent_read_rc" -eq 1 ] || return 1
-  parent_code="${DIFFIROPT_LITERAL_PYTHON}"$'\n'"${DIFFDUMP_PARENT_PYTHON}"$'\n'"${DIFFDUMP_OWNED_APPEND_PYTHON}"$'\n'"${DIFFDUMP_PARENT_ENGINE}"
+  parent_code="${DIFFDUMP_PARENT_PYTHON}"$'\n'"${DIFFDUMP_PARENT_ENGINE}"
   [ "${#parent_code}" -le 65536 ] || return 1
   { printf '%s\0%s' "$1" "$2"; } | python3 -I /dev/fd/3 "$proof_dir/selfhost-ir-canon.sh" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "$3" 3<<<"$parent_code"
 }
 
 # declaredSignatureNames [kind] -- the retirement audit still consults this table.
 declaredSignatureNames() {
-  :
+  case "${1:-ir}" in ir|iropt) printf '%s\n' 6791-fallible-aggregate-words ;; esac
 }
 
 # shellcheck source=scripts/selfhost-ir-canon.sh
