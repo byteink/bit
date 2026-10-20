@@ -41,7 +41,21 @@ class OwnDrafts {
     columns: []string,
     values: []Value,
   ): bool! {
-    return true
+    let i = 0
+    while (i < len(columns)) {
+      if (columns[i] == "authorId") {
+        match (values[i]) {
+          Int(id) => return "${id}" == actor.id
+          Null => return false
+          Float(_) => return false
+          Bool(_) => return false
+          Text(_) => return false
+          Blob(_) => return false
+        }
+      }
+      i = i + 1
+    }
+    return false
   }
 
   export denied(actor: Actor, op: GuardOp, table: string): error {
@@ -60,13 +74,18 @@ class OwnDrafts {
 fn main(): ()! {
   let guard: Guard = OwnDrafts{}
   let db = open("postgres://localhost/inkwell", Options{ authz = guard })?
-  let drafts = db.table<Draft>()
+  let drafts = db.as(Author{ id = "7" }).table<Draft>()
+  let draft = drafts.insert(Draft{ id = 0, authorId = 7, body = "First outline" })?
+  print(draft.body)
 }
 
-@table class Draft {
+class Author { export id: string }
+
+@table @softDelete class Draft {
   id: i64,
   authorId: i64,
   body: string,
+  deletedAt: Option<i64> = Option<i64>.None,
 }
 ```
 
@@ -268,6 +287,76 @@ fn startMany(mine: ScopedRepo<Draft>, who: i64, bodies: []string): []Draft! {
   row back from the call that made it.
 - A table the guard does not `protects` is not asked, and a `ScopedRepo`
   with no guard inserts like a plain `Repo<T>`.
+
+## Editing and removing your drafts
+
+Inkwell must let you edit a draft without letting you hand it to another
+author. `update` checks the proposed values first, then limits the write to
+rows your guard allows you to update. `delete` applies the delete rule in
+the same way.
+
+Continue with the `Draft` and guard above:
+
+```bit
+import { ScopedRepo } from "orm"
+
+fn revise(mine: ScopedRepo<Draft>, id: i64, body: string): Draft! {
+  let draft = mine.find(id)?
+  draft.body = body
+  mine.update(draft)?
+  return draft
+}
+
+fn saveOutline(mine: ScopedRepo<Draft>, authorId: i64, body: string): Draft! {
+  let draft = mine.save(Draft{ id = 0, authorId = authorId, body = body })?
+  draft.body = "Reviewed: " + draft.body
+  return mine.save(draft)?
+}
+
+fn discard(mine: ScopedRepo<Draft>, id: i64): ()! {
+  mine.delete(id)?
+}
+
+fn undoDiscard(mine: ScopedRepo<Draft>, id: i64): ()! {
+  mine.restore(id)?
+}
+
+fn erasePermanently(mine: ScopedRepo<Draft>, id: i64): ()! {
+  mine.forceDelete(id)?
+}
+```
+
+`save` chooses the create checks when the key is zero and the update checks
+when the key is set. An inserted row comes back with its generated values;
+an updated row comes back as the value you supplied.
+
+Because this `Draft` uses `@softDelete`, `delete` hides it from ordinary
+reads. `restore` checks the update rule and clears `deletedAt`;
+`forceDelete` checks the delete rule and permanently removes it. These two
+operations can address a deleted row without requiring `withDeleted()`.
+Use `withDeleted()` when you want to list the drafts in the trash.
+
+The same `allows` method that checked creates receives `GuardOp.Update`
+and the complete proposed values for `update` and the update branch of
+`save`. In this guard, changing `authorId` to another author's id is refused
+before any SQL runs. `restore` only clears the deletion marker; it asks for
+the update filter without a caller-supplied row to pass to `allows`.
+
+When the guarded statement changes no rows, the ORM checks whether you can
+read the row. If you cannot, it returns your guard's `notFound` error. If
+you can, it returns your guard's `denied` error for that write operation.
+Give those errors statuses 404 and 403 respectively. A readable row whose
+version no longer matches is also denied. The write and this visibility
+check share one transaction; there is no separate permission check followed
+by an unrestricted write.
+
+`GuardFilter.None` skips the write and makes the same visibility check.
+An error from either guard check is returned unchanged. No failed check
+falls back to an unrestricted statement. A guard that does not protect a
+table, or a repository with no guard, keeps the plain repository's behavior.
+
+Use `db.asSystem()` for a trusted maintenance job that must bypass these
+rules. Request handlers should keep using the actor's scoped handle.
 
 Where to go next: [Querying](query.md) for the chain a guard narrows, and
 [Raw SQL and transactions](raw.md) for the handles that carry it.

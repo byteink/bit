@@ -61,3 +61,143 @@ fn checkRows<T: Tabled>(self: ScopedRepo<T>, g: Guard, rows: []T): ()! {
     }
   }
 }
+
+// The new state is checked before a transaction or a statement can start.
+fn scopedUpdate<T: Tabled>(self: ScopedRepo<T>, v: T): ()! {
+  self.inner.checkErr()?
+  match (self.guard) {
+    Some(g) => {
+      if (g.protects(T.__tableName())) {
+        checkUpdateState<T>(self, g, v)?
+        let plan = repoUpdatePlan<T>(self.inner, v, true)?
+        guardedWrite<T>(self, g, plan, GuardOp.Update)?
+        return
+      }
+    }
+    None => {}
+  }
+  self.inner.update(v)?
+}
+
+fn checkUpdateState<T: Tabled>(self: ScopedRepo<T>, g: Guard, v: T): ()! {
+  let names = []string(0)
+  for f of self.inner.columnsForValues(v)? {
+    names = append(names, f.name)
+  }
+  let actor = scopedActor<T>(self)
+  if (!g.allows(actor, GuardOp.Update, T.__tableName(), names, v.__values())?) {
+    fail g.denied(actor, GuardOp.Update, T.__tableName())
+  }
+}
+
+fn scopedDelete<T: Tabled>(self: ScopedRepo<T>, id: Value, restore: bool, force: bool): ()! {
+  self.inner.checkErr()?
+  match (self.guard) {
+    Some(g) => {
+      if (g.protects(T.__tableName())) {
+        let plan = scopedDeletePlan<T>(self.inner, id, restore, force)?
+        let op = GuardOp.Delete
+        if (restore) {
+          op = GuardOp.Update
+        }
+        // Restore and force-delete can address rows already in the trash.
+        let scoped = self
+        if (restore || force) {
+          scoped = scopedWith<T>(self, self.inner.withDeleted())
+        }
+        guardedWrite<T>(scoped, g, plan, op)?
+        return
+      }
+    }
+    None => {}
+  }
+  plainScopedDelete<T>(self.inner, id, restore, force)?
+}
+
+fn plainScopedDelete<T: Tabled>(inner: Repo<T>, id: Value, restore: bool, force: bool): ()! {
+  if (restore) {
+    inner.restore(id)?
+    return
+  }
+  if (force) {
+    inner.forceDelete(id)?
+    return
+  }
+  inner.delete(id)?
+}
+
+fn scopedDeletePlan<T: Tabled>(
+  inner: Repo<T>,
+  id: Value,
+  restore: bool,
+  force: bool,
+): repoWritePlan! {
+  let col = inner.singleKeyColumn()?
+  let softCol = ""
+  if (!force) {
+    softCol = inner.trashColumn()
+  }
+  inner.checkErr()?
+  if (restore && softCol == "") {
+    fail newError("orm: restore called on the class mapped to '${T.__tableName()}', which does not carry '@softDelete'")
+  }
+  let args = cloneValues(inner.args)
+  let sqlText = "delete from ${T.__tableName()}"
+  if (softCol != "" && !force) {
+    let value = Value.Null
+    if (!restore) {
+      value = sqlValue(now().ns)
+    }
+    args = append(args, value)
+    sqlText = "update ${T.__tableName()} set ${softCol} = $${len(args)}"
+  }
+  args = append(args, id)
+  let conds = cloneStrings(inner.wheres)
+  conds = append(conds, "${col} = $${len(args)}")
+  return repoWritePlan{
+    sqlText = sqlText + " where " + join(conds, " and "), args = args, keys = [id],
+  }
+}
+
+// The permission predicate and mutation share one statement. A zero-row
+// result only reads visibility; it can never authorize a later mutation.
+fn guardedWrite<T: Tabled>(self: ScopedRepo<T>, g: Guard, plan: repoWritePlan, op: GuardOp): ()! {
+  let filter = g.filter(
+    scopedActor<T>(self),
+    op,
+    T.__tableName(),
+    self.inner.dialect,
+    len(plan.args) + 1,
+  )?
+  let write = true
+  match (filter) {
+    All => {}
+    None => write = false
+    Sql(fragment, args) => {
+      plan.sqlText = plan.sqlText + " and (${fragment})"
+      for a of args {
+        plan.args = append(plan.args, a)
+      }
+    }
+  }
+  runTx(self.inner.db, (db) => {
+    if (write) {
+      if (db.exec(plan.sqlText, plan.args)?.rowsAffected != 0) {
+        return
+      }
+    }
+    let inner = self.inner.next()
+    inner.db = db
+    let keys = keyFields(inner.desc())
+    let i = 0
+    while (i < len(keys)) {
+      inner = inner.where(keys[i].name, plan.keys[i])
+      i = i + 1
+    }
+    let visible = scopedCount<T>(scopedWith<T>(self, inner))?
+    if (visible == 0) {
+      fail g.notFound(T.__tableName())
+    }
+    fail g.denied(scopedActor<T>(self), op, T.__tableName())
+  })?
+}
