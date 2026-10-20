@@ -1,0 +1,339 @@
+// Inkwell's shared SessionStore (#6128). Both keys share one cluster slot;
+// index membership lives in hash fields, so Lua never discovers undeclared keys.
+import { jsonParse as sessionParse, jsonEncode as sessionEncode, jsonAsObject as sessionObject } from "std/json"
+
+const inkwellSessionHash = "inkwell:{sessions}:records"
+const inkwellSessionExpiry = "inkwell:{sessions}:expiry"
+const inkwellSessionMaxVersion: i64 = 9223372036854775806
+
+// Logical expiry uses Redis TIME, never the app host's clock. Each access
+// sweeps at most 64 expired records. Capacity includes tombstones: refusing
+// new writes is safer than evicting protection against stale writers.
+// All changes are planned before the first Redis write because a Lua error
+// does not roll back earlier redis.call writes.
+const inkwellSessionLua = `
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local count = redis.call('ZCARD', KEYS[2])
+local fields, expiry, decoded = {}, {}, {}
+local function read(field)
+  if fields[field] ~= nil then return fields[field] end
+  return redis.call('HGET', KEYS[1], field)
+end
+local function object(field)
+  if decoded[field] then return decoded[field] end
+  local raw = read(field)
+  local value = {}
+  if raw then value = cjson.decode(raw) end
+  decoded[field] = value
+  return value
+end
+local function slot(key, value)
+  return 'i:' .. string.len(key) .. ':' .. key .. value
+end
+local function members(field, sid, present)
+  local ids = object(field)
+  ids[sid] = present or nil
+  if next(ids) == nil then fields[field] = false; return end
+  fields[field] = ids
+end
+local function unindex(sid, entry)
+  for key, value in pairs(cjson.decode(entry.index)) do
+    members(slot(key, value), sid, false)
+  end
+end
+local function remove(sid)
+  local field = 's:' .. sid
+  local raw = read(field)
+  if not raw then return end
+  unindex(sid, cjson.decode(raw))
+  fields[field], expiry[sid] = false, false
+  count = count - 1
+end
+local function stored(sid)
+  local raw = read('s:' .. sid)
+  if not raw then return nil end
+  return cjson.decode(raw)
+end
+local function live(sid)
+  local entry = stored(sid)
+  if not entry or entry.expires <= now then return nil end
+  return entry
+end
+local function sweep()
+  local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', now, 'LIMIT', 0, 64)
+  for i = 1, #ids do remove(ids[i]) end
+end
+local function put(sid, entry)
+  local old = stored(sid)
+  if old then unindex(sid, old) else count = count + 1 end
+  fields['s:' .. sid] = cjson.encode(entry)
+  expiry[sid] = entry.expires
+  for key, value in pairs(cjson.decode(entry.index)) do
+    members(slot(key, value), sid, true)
+  end
+end
+-- Redis Lua numbers lose integer precision above 2^53. Versions stay decimal strings.
+local function increment(version)
+  if version == '9223372036854775807' then error('session version exhausted') end
+  local digits, carry = {}, 1
+  for i = #version, 1, -1 do
+    local n = string.byte(version, i) - 48 + carry
+    carry = 0
+    if n == 10 then n, carry = 0, 1 end
+    digits[i] = string.char(n + 48)
+  end
+  local prefix = ''
+  if carry == 1 then prefix = '1' end
+  return prefix .. table.concat(digits)
+end
+local function tombstone(sid, version, ttl)
+  put(sid, {data = '{}', index = '{}', version = increment(version),
+    tombstone = true, expires = now + ttl * 1000})
+end
+local function reserve(ids)
+  sweep()
+  local required = 0
+  for i = 1, #ids do
+    if not stored(ids[i]) then required = required + 1 end
+  end
+  if count + required > 10000 then error('session capacity exhausted') end
+end
+local function payload(version)
+  return {data = ARGV[4], index = ARGV[5], version = version,
+    tombstone = false, expires = now + tonumber(ARGV[6]) * 1000}
+end
+local function cas()
+  local sid, expected = ARGV[2], ARGV[3]
+  local entry = live(sid)
+  if entry and entry.tombstone then error('session was destroyed') end
+  local version = '0'
+  if entry then version = entry.version end
+  if version ~= expected then error('session compare-and-set conflict') end
+  reserve({sid})
+  local version = increment(expected)
+  put(sid, payload(version))
+  return {version}
+end
+local function rotation()
+  local sid, expected, destination = ARGV[2], ARGV[3], ARGV[7]
+  local entry = live(sid)
+  if live(destination) then error('session rotation destination exists') end
+  if expected == '0' then
+    if entry then error('session fresh rotation source exists') end
+  elseif not entry or entry.tombstone or entry.version ~= expected then
+    error('session rotation source changed or expired')
+  end
+  reserve({sid, destination})
+  tombstone(sid, expected, tonumber(ARGV[6]))
+  put(destination, payload('1'))
+  return {'1'}
+end
+local function destroy()
+  local entry = stored(ARGV[2])
+  local version = '0'
+  if entry then version = entry.version end
+  reserve({ARGV[2]})
+  tombstone(ARGV[2], version, tonumber(ARGV[6]))
+  return {}
+end
+local function revoke()
+  local indexed = object(slot(ARGV[2], ARGV[3]))
+  local ids = {}
+  for sid, _ in pairs(indexed) do
+    if #ids >= 10000 then error('session index exceeds capacity') end
+    ids[#ids + 1] = sid
+  end
+  local destroyed = 0
+  for i = 1, #ids do
+    local sid = ids[i]
+    local entry = live(sid)
+    if sid ~= ARGV[7] and entry and not entry.tombstone then
+      tombstone(sid, entry.version, tonumber(ARGV[6]))
+      destroyed = destroyed + 1
+    end
+    if not entry then remove(sid) end
+  end
+  sweep()
+  return {tostring(destroyed)}
+end
+local function load()
+  local entry = live(ARGV[2])
+  if not entry or entry.tombstone then sweep(); return {} end
+  local result = {entry.data, entry.version, entry.index}
+  sweep()
+  return result
+end
+local function run()
+  if ARGV[1] == 'load' then return load() end
+  if ARGV[1] == 'cas' then return cas() end
+  if ARGV[1] == 'rotate' then return rotation() end
+  if ARGV[1] == 'destroy' then return destroy() end
+  if ARGV[1] == 'revoke' then return revoke() end
+  error('unknown session operation')
+end
+local result = run()
+for field, value in pairs(fields) do
+  if type(value) == 'table' then fields[field] = cjson.encode(value) end
+end
+for field, value in pairs(fields) do
+  if value then redis.call('HSET', KEYS[1], field, value)
+  else redis.call('HDEL', KEYS[1], field) end
+end
+for sid, score in pairs(expiry) do
+  if score then redis.call('ZADD', KEYS[2], score, sid)
+  else redis.call('ZREM', KEYS[2], sid) end
+end
+return result
+`
+
+class InkwellSessionStore {
+  client: RedisClient
+  script: RedisScript
+
+  init(client: RedisClient) {
+    this.client = client
+    this.script = RedisScript(inkwellSessionLua)
+  }
+
+  call(args: []string): []string! {
+    return this.script.run(
+      this.client, luaStrings, keys = [inkwellSessionHash, inkwellSessionExpiry], args = args,
+    )?
+  }
+
+  export load(sid: string): Option<(map<string, string>, i64, map<string, string>)>! {
+    sessionId(sid)?
+    let reply = this.call(["load", sid])?
+    if (len(reply) == 0) {
+      return Option.None
+    }
+    if (len(reply) != 3) {
+      fail newError("inkwell: invalid Redis session reply")
+    }
+    return Option.Some(
+      (sessionMapRead(reply[0])?, i64(parseInt(reply[1])?), sessionMapRead(reply[2])?),
+    )
+  }
+
+  export compareAndSet(
+    sid: string,
+    expectedVersion: i64,
+    data: map<string, string>,
+    index: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    sessionId(sid)?
+    sessionWriteInput(expectedVersion, ttl)?
+    let reply = this.call(
+      [
+        "cas", sid, "${expectedVersion}", sessionMapWrite(data, false)?, sessionMapWrite(
+          index,
+          true,
+        )?, "${ttl}",
+      ],
+    )?
+    return sessionCount(reply)?
+  }
+
+  export rotate(
+    source: (string, i64),
+    destination: string,
+    data: map<string, string>,
+    index: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    let (sid, version) = source
+    sessionId(sid)?
+    sessionId(destination)?
+    sessionWriteInput(version, ttl)?
+    if (sid == destination) {
+      fail newError("inkwell: session rotation requires distinct ids")
+    }
+    let reply = this.call(
+      [
+        "rotate", sid, "${version}", sessionMapWrite(data, false)?, sessionMapWrite(index, true)?, "${ttl}", destination,
+      ],
+    )?
+    return sessionCount(reply)?
+  }
+
+  export destroy(sid: string, tombstoneTtl: i64): ()! {
+    sessionId(sid)?
+    sessionWriteInput(0, tombstoneTtl)?
+    this.call(["destroy", sid, "", "", "", "${tombstoneTtl}"])?
+  }
+
+  export destroyIndexed(key: string, value: string, except: string, tombstoneTtl: i64): int! {
+    sessionWriteInput(0, tombstoneTtl)?
+    if (len(key) == 0 || len(value) == 0) {
+      fail newError("inkwell: session index key and value must be non-empty")
+    }
+    let reply = this.call(["revoke", key, value, "", "", "${tombstoneTtl}", except])?
+    return int(sessionCount(reply)?)
+  }
+}
+
+fn sessionId(sid: string): ()! {
+  if (len(sid) == 0 || len(sid) > 256) {
+    fail newError("inkwell: session id must contain 1..256 bytes")
+  }
+}
+
+fn sessionWriteInput(version: i64, ttl: i64): ()! {
+  if (version < 0 || version > inkwellSessionMaxVersion) {
+    fail newError("inkwell: session version is out of range")
+  }
+  // Bound the expiry score while versions use decimal strings, not Lua doubles.
+  if (ttl <= 0 || ttl > 2147483647) {
+    fail newError("inkwell: session ttl must contain 1..2147483647 seconds")
+  }
+}
+
+fn sessionMapWrite(values: map<string, string>, indexed: bool): string! {
+  if (len(values) > 64) {
+    fail newError("inkwell: session map exceeds 64 entries")
+  }
+  let entries = []JsonEntry(0)
+  for (key, value) of values {
+    if (indexed && (len(key) == 0 || len(value) == 0)) {
+      fail newError("inkwell: session index key and value must be non-empty")
+    }
+    entries = append(entries, JsonEntry{ key = key, value = Json.JsonString(value) })
+  }
+  let encoded = sessionEncode(Json.JsonObject(entries))
+  if (len(encoded) > 65536) {
+    fail newError("inkwell: encoded session map exceeds 65536 bytes")
+  }
+  return encoded
+}
+
+fn sessionMapRead(encoded: string): map<string, string>! {
+  if (len(encoded) > 65536) {
+    fail newError("inkwell: Redis session map exceeds 65536 bytes")
+  }
+  let object = sessionObject(sessionParse(encoded)?)
+  if (!isSome(object)) {
+    fail newError("inkwell: Redis session map is not an object")
+  }
+  let entries = unwrap(object)
+  if (len(entries) > 64) {
+    fail newError("inkwell: Redis session map exceeds 64 entries")
+  }
+  let values = map<string, string>()
+  for entry of entries {
+    let value = jsonAsString(entry.value)
+    if (!isSome(value)) {
+      fail newError("inkwell: Redis session value is not a string")
+    }
+    values[entry.key] = unwrap(value)
+  }
+  return values
+}
+
+fn sessionCount(reply: []string): i64! {
+  if (len(reply) != 1) {
+    fail newError("inkwell: invalid Redis session count")
+  }
+  return i64(parseInt(reply[0])?)
+}

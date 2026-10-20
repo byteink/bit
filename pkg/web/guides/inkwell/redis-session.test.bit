@@ -1,0 +1,437 @@
+// Live Redis contracts for the guide adapter. The guide gate owns REDIS_URL;
+// random ids and owner values isolate tests without flushing shared state.
+fn sessionTestClient(): RedisClient {
+  let url = env("REDIS_URL")
+  assert(len(url) > 0, "REDIS_URL is required; run the owned web-guide gate")
+  return openRedis(url) catch e {
+    panic("Redis sessions: ${e.message()}")
+  }
+}
+
+const sessionCleanupLua = `
+for i = 1, #ARGV do
+  local sid = ARGV[i]
+  local raw = redis.call('HGET', KEYS[1], 's:' .. sid)
+  if raw then
+    local entry = cjson.decode(raw)
+    for key, value in pairs(cjson.decode(entry.index)) do
+      local field = 'i:' .. string.len(key) .. ':' .. key .. value
+      local packed = redis.call('HGET', KEYS[1], field)
+      if packed then
+        local ids = cjson.decode(packed)
+        ids[sid] = nil
+        if next(ids) then redis.call('HSET', KEYS[1], field, cjson.encode(ids))
+        else redis.call('HDEL', KEYS[1], field) end
+      end
+    end
+  end
+  redis.call('HDEL', KEYS[1], 's:' .. sid)
+  redis.call('ZREM', KEYS[2], sid)
+end
+return 1
+`
+
+fn sessionCleanup(client: RedisClient, ids: []string) {
+  RedisScript(sessionCleanupLua).run(
+    client, luaInt, keys = [inkwellSessionHash, inkwellSessionExpiry], args = ids,
+  ) catch e {
+    panic("Redis session cleanup: ${e.message()}")
+  }
+}
+
+fn sessionValues(key: string, value: string): map<string, string> {
+  let values = map<string, string>()
+  values[key] = value
+  return values
+}
+
+fn sessionEmpty(): map<string, string> {
+  return map<string, string>()
+}
+
+fn sessionPut(
+  store: InkwellSessionStore,
+  sid: string,
+  version: i64,
+  index: map<string, string>,
+): i64 {
+  return store.compareAndSet(sid, version, sessionValues("message", "saved"), index, 60) catch e {
+    panic("Redis session write: ${e.message()}")
+  }
+}
+
+fn sessionRead(
+  store: InkwellSessionStore,
+  sid: string,
+): Option<(map<string, string>, i64, map<string, string>)> {
+  return store.load(sid) catch e {
+    panic("Redis session read: ${e.message()}")
+  }
+}
+
+fn sessionRevoke(store: InkwellSessionStore, key: string, owner: string, except: string): int {
+  return store.destroyIndexed(key, owner, except, 60) catch e {
+    panic("Redis session revocation: ${e.message()}")
+  }
+}
+
+fn sessionExpire(client: RedisClient, sid: string) {
+  let source = `
+local entry = cjson.decode(redis.call('HGET', KEYS[1], 's:' .. ARGV[1]))
+entry.expires = 1
+redis.call('HSET', KEYS[1], 's:' .. ARGV[1], cjson.encode(entry))
+redis.call('ZADD', KEYS[2], 1, ARGV[1])
+return 1
+`
+  RedisScript(source).run(
+    client, luaInt, keys = [inkwellSessionHash, inkwellSessionExpiry], args = [sid],
+  ) catch e {
+    panic("Redis session expiry control: ${e.message()}")
+  }
+}
+
+test "Redis session data and indexes survive a second client including empty sessions" {
+  let client = sessionTestClient()
+  defer client.close()
+  let sid = uniqueName("session-persist")
+  let emptySid = uniqueName("session-empty")
+  defer sessionCleanup(client, [sid, emptySid])
+  let store = InkwellSessionStore(client)
+  assert(!isSome(sessionRead(store, sid)), "fresh id must miss")
+  let values = sessionValues("quote\"\n", "Arabic: مرحبا\n\u{0}")
+  store.compareAndSet(sid, 0, values, sessionValues("auth:sub", sid), 60) catch e {
+    panic(e.message())
+  }
+  store.compareAndSet(emptySid, 0, sessionEmpty(), sessionEmpty(), 60) catch e {
+    panic(e.message())
+  }
+  let second = sessionTestClient()
+  defer second.close()
+  let other = InkwellSessionStore(second)
+  let (data, version, index) = unwrap(sessionRead(other, sid))
+  let (text, _) = data["quote\"\n"]
+  let (owner, _) = index["auth:sub"]
+  assert(
+    text == "Arabic: مرحبا\n\u{0}" && owner == sid && version == 1,
+    "stored snapshot changed",
+  )
+  data["quote\"\n"] = "local mutation"
+  let (saved, _, _) = unwrap(sessionRead(store, sid))
+  let (unchanged, _) = saved["quote\"\n"]
+  assert(unchanged == text, "load must return detached maps")
+  let (empty, _, emptyIndex) = unwrap(sessionRead(other, emptySid))
+  assert(len(empty) == 0 && len(emptyIndex) == 0, "empty stored maps must remain present")
+}
+
+test "Redis compare-and-set rejects stale snapshots and tombstones including fresh writers" {
+  let client = sessionTestClient()
+  defer client.close()
+  let sid = uniqueName("session-cas")
+  defer sessionCleanup(client, [sid])
+  let store = InkwellSessionStore(client)
+  assert(sessionPut(store, sid, 0, sessionEmpty()) == 1, "first version")
+  assert(sessionPut(store, sid, 1, sessionEmpty()) == 2, "second version")
+  let stale = false
+  store.compareAndSet(sid, 1, sessionEmpty(), sessionEmpty(), 60) catch _ {
+    stale = true
+  }
+  assert(stale, "stale writer must fail")
+  store.destroy(sid, 60) catch e {
+    panic(e.message())
+  }
+  assert(!isSome(sessionRead(store, sid)), "destroyed id must miss")
+  for version of []i64{ 0, 2, 3 } {
+    let rejected = false
+    store.compareAndSet(sid, version, sessionEmpty(), sessionEmpty(), 60) catch _ {
+      rejected = true
+    }
+    assert(rejected, "tombstone must refuse every writer")
+  }
+}
+
+test "Redis rotation copies dirty maps and tombstones the old snapshot" {
+  let client = sessionTestClient()
+  defer client.close()
+  let sid = uniqueName("session-source")
+  let destination = uniqueName("session-destination")
+  let refusedDestination = uniqueName("session-refused")
+  defer sessionCleanup(client, [sid, destination, refusedDestination])
+  let store = InkwellSessionStore(client)
+  assert(
+    sessionPut(store, sid, 0, sessionValues("auth:sub", sid)) == 1,
+    "session setup must advance version to 1",
+  )
+  let version = store.rotate(
+    (sid, 1), destination, sessionValues("role", "admin"), sessionValues("auth:sub", destination), 60,
+  ) catch e {
+    panic(e.message())
+  }
+  assert(version == 1 && !isSome(sessionRead(store, sid)), "rotation must tombstone source")
+  let (data, savedVersion, index) = unwrap(sessionRead(store, destination))
+  let (role, _) = data["role"]
+  let (owner, _) = index["auth:sub"]
+  assert(
+    role == "admin" && owner == destination && savedVersion == 1,
+    "rotation lost dirty snapshot",
+  )
+  assert(sessionRevoke(store, "auth:sub", sid, "") == 0, "old source index must be removed")
+  assert(
+    sessionRevoke(store, "auth:sub", destination, "") == 1,
+    "new index must revoke destination",
+  )
+  for sourceVersion of []i64{ 0, 1, 2 } {
+    let refused = false
+    store.rotate((sid, sourceVersion), refusedDestination, sessionEmpty(), sessionEmpty(), 60) catch _ {
+      refused = true
+    }
+    assert(refused, "revoked source cannot rotate a cached authenticated snapshot")
+  }
+  assert(!isSome(sessionRead(store, refusedDestination)), "refused rotation created a session")
+}
+
+test "Redis refused rotations change neither source nor destination" {
+  let client = sessionTestClient()
+  defer client.close()
+  let sid = uniqueName("rotation-guard")
+  let destination = uniqueName("rotation-occupied")
+  let absent = uniqueName("rotation-absent")
+  defer sessionCleanup(client, [sid, destination, absent])
+  let store = InkwellSessionStore(client)
+  assert(sessionPut(store, sid, 0, sessionEmpty()) == 1, "session setup must advance version to 1")
+  assert(
+    sessionPut(store, destination, 0, sessionEmpty()) == 1,
+    "session setup must advance version to 1",
+  )
+  let refused = false
+  store.rotate((sid, 1), destination, sessionEmpty(), sessionEmpty(), 60) catch _ {
+    refused = true
+  }
+  assert(refused, "occupied destination must fail")
+  let (_, sourceVersion, _) = unwrap(sessionRead(store, sid))
+  let (_, destinationVersion, _) = unwrap(sessionRead(store, destination))
+  assert(sourceVersion == 1 && destinationVersion == 1, "refusal changed a stored version")
+  assert(sessionPut(store, sid, 1, sessionEmpty()) == 2, "session setup must advance version to 2")
+  refused = false
+  store.rotate((sid, 1), absent, sessionEmpty(), sessionEmpty(), 60) catch _ {
+    refused = true
+  }
+  assert(refused && !isSome(sessionRead(store, absent)), "stale rotation created a destination")
+}
+
+test "Redis fresh source rotation persists a keyless session and preserves its tombstone" {
+  let client = sessionTestClient()
+  defer client.close()
+  let sid = uniqueName("rotation-fresh")
+  let destination = uniqueName("rotation-keyless")
+  defer sessionCleanup(client, [sid, destination])
+  let store = InkwellSessionStore(client)
+  store.rotate((sid, 0), destination, sessionEmpty(), sessionEmpty(), 60) catch e {
+    panic(e.message())
+  }
+  assert(isSome(sessionRead(store, destination)), "fresh rotation must persist even an empty map")
+  let refused = false
+  store.compareAndSet(sid, 0, sessionEmpty(), sessionEmpty(), 60) catch _ {
+    refused = true
+  }
+  assert(refused, "fresh source now has a tombstone")
+}
+
+test "Redis indexed revocation preserves except and rewrites changed index membership" {
+  let client = sessionTestClient()
+  defer client.close()
+  let a = uniqueName("indexed-a")
+  let b = uniqueName("indexed-b")
+  let c = uniqueName("indexed-c")
+  let owner = uniqueName("indexed-owner")
+  let changed = uniqueName("indexed-changed")
+  defer sessionCleanup(client, [a, b, c])
+  let store = InkwellSessionStore(client)
+  assert(
+    sessionPut(store, a, 0, sessionValues("auth:sub", owner)) == 1,
+    "session setup must advance version to 1",
+  )
+  assert(
+    sessionPut(store, b, 0, sessionValues("auth:sub", owner)) == 1,
+    "session setup must advance version to 1",
+  )
+  assert(
+    sessionPut(store, c, 0, sessionValues("auth:sub", owner)) == 1,
+    "session setup must advance version to 1",
+  )
+  assert(
+    sessionPut(store, c, 1, sessionValues("auth:sub", changed)) == 2,
+    "session setup must advance version to 2",
+  )
+  assert(
+    sessionRevoke(store, "auth:sub", owner, b) == 1,
+    "revoke only matching non-except session",
+  )
+  assert(!isSome(sessionRead(store, a)), "matching session survives revocation")
+  assert(
+    isSome(sessionRead(store, b)) && isSome(sessionRead(store, c)),
+    "except or changed owner was revoked",
+  )
+  assert(sessionRevoke(store, "auth:sub", changed, "") == 1, "new index must be present")
+  assert(sessionPut(store, b, 1, sessionEmpty()) == 2, "session setup must advance version to 2")
+  assert(sessionRevoke(store, "auth:sub", owner, "") == 0, "removed index still matches")
+}
+
+test "Redis expired sessions do not load count as revoked or block fresh writes" {
+  let client = sessionTestClient()
+  defer client.close()
+  let sid = uniqueName("session-expired")
+  let owner = uniqueName("expired-owner")
+  defer sessionCleanup(client, [sid])
+  let store = InkwellSessionStore(client)
+  assert(
+    sessionPut(store, sid, 0, sessionValues("auth:sub", owner)) == 1,
+    "session setup must advance version to 1",
+  )
+  sessionExpire(client, sid)
+  assert(sessionRevoke(store, "auth:sub", owner, "") == 0, "expired session must not be counted")
+  assert(!isSome(sessionRead(store, sid)), "expired id must miss")
+  assert(sessionPut(store, sid, 0, sessionEmpty()) == 1, "expired id must accept a fresh snapshot")
+  store.destroy(sid, 60) catch e {
+    panic(e.message())
+  }
+  sessionExpire(client, sid)
+  assert(!isSome(sessionRead(store, sid)), "expired tombstone must miss")
+  assert(sessionPut(store, sid, 0, sessionEmpty()) == 1, "expired tombstone must release its slot")
+}
+
+test "Redis index pairs cannot collide when key and value concatenate equally" {
+  let client = sessionTestClient()
+  defer client.close()
+  let sid = uniqueName("index-pair")
+  let suffix = uniqueName("owner")
+  defer sessionCleanup(client, [sid])
+  let store = InkwellSessionStore(client)
+  assert(
+    sessionPut(store, sid, 0, sessionValues("ab", "c" + suffix)) == 1,
+    "session setup must advance version to 1",
+  )
+  assert(sessionRevoke(store, "a", "bc" + suffix, "") == 0, "different index pairs collided")
+  assert(sessionRevoke(store, "ab", "c" + suffix, "") == 1, "exact pair must match")
+}
+
+fn sessionRaceWrite(store: InkwellSessionStore, sid: string, out: chan<bool>) {
+  store.compareAndSet(sid, 1, sessionValues("winner", uniqueName("writer")), sessionEmpty(), 60) catch _ {
+    out <- false
+    return
+  }
+  out <- true
+}
+
+test "Redis simultaneous compare-and-set writers cannot both win" {
+  let client = sessionTestClient()
+  defer client.close()
+  let sid = uniqueName("session-race")
+  defer sessionCleanup(client, [sid])
+  let store = InkwellSessionStore(client)
+  assert(sessionPut(store, sid, 0, sessionEmpty()) == 1, "session setup must advance version to 1")
+  let out = chan<bool>(2)
+  spawn sessionRaceWrite(store, sid, out)
+  spawn sessionRaceWrite(store, sid, out)
+  let first = <- out
+  let second = <- out
+  assert(first != second, "exactly one concurrent writer must win")
+  let (_, version, _) = unwrap(sessionRead(store, sid))
+  assert(version == 2, "winning CAS must advance version once")
+}
+
+test "Redis session rejects invalid TTL and versions before writes" {
+  let client = sessionTestClient()
+  defer client.close()
+  let sid = uniqueName("session-invalid")
+  defer sessionCleanup(client, [sid])
+  let store = InkwellSessionStore(client)
+  for ttl of []i64{ 0, -1, 2147483648 } {
+    let refused = false
+    store.compareAndSet(sid, 0, sessionEmpty(), sessionEmpty(), ttl) catch _ {
+      refused = true
+    }
+    assert(refused, "invalid TTL accepted")
+  }
+  for version of []i64{ -1, 9223372036854775807 } {
+    let refused = false
+    store.compareAndSet(sid, version, sessionEmpty(), sessionEmpty(), 60) catch _ {
+      refused = true
+    }
+    assert(refused, "invalid version accepted")
+  }
+  assert(!isSome(sessionRead(store, sid)), "invalid version or TTL wrote a session")
+}
+
+test "Redis session refuses empty index keys and values" {
+  let client = sessionTestClient()
+  defer client.close()
+  let sid = uniqueName("session-invalid-index")
+  defer sessionCleanup(client, [sid])
+  let store = InkwellSessionStore(client)
+  let invalidIndex = false
+  store.compareAndSet(sid, 0, sessionEmpty(), sessionValues("auth:sub", ""), 60) catch _ {
+    invalidIndex = true
+  }
+  assert(invalidIndex && !isSome(sessionRead(store, sid)), "invalid index wrote a session")
+  let emptyKey = false
+  store.destroyIndexed("", sid, "", 60) catch _ {
+    emptyKey = true
+  }
+  let emptyValue = false
+  store.destroyIndexed("auth:sub", "", "", 60) catch _ {
+    emptyValue = true
+  }
+  assert(emptyKey && emptyValue, "empty revocation pair must fail")
+}
+
+test "Redis connection errors propagate instead of becoming session misses" {
+  let client = sessionTestClient()
+  let store = InkwellSessionStore(client)
+  client.close()
+  let failed = false
+  store.load(uniqueName("session-offline")) catch _ {
+    failed = true
+  }
+  assert(failed, "closed Redis connection must fail rather than report a miss")
+}
+
+fn sessionSetVersion(client: RedisClient, sid: string, version: string) {
+  let source = `
+local entry = cjson.decode(redis.call('HGET', KEYS[1], 's:' .. ARGV[1]))
+entry.version = ARGV[2]
+redis.call('HSET', KEYS[1], 's:' .. ARGV[1], cjson.encode(entry))
+return 1
+`
+  RedisScript(source).run(client, luaInt, keys = [inkwellSessionHash], args = [sid, version]) catch e {
+    panic("Redis session version control: ${e.message()}")
+  }
+}
+
+test "Redis session versions preserve i64 precision beyond Lua doubles" {
+  let client = sessionTestClient()
+  defer client.close()
+  let sid = uniqueName("session-precision")
+  defer sessionCleanup(client, [sid])
+  let store = InkwellSessionStore(client)
+  assert(sessionPut(store, sid, 0, sessionEmpty()) == 1, "session setup must advance version to 1")
+  sessionSetVersion(client, sid, "9007199254740992")
+  assert(
+    sessionPut(store, sid, 9007199254740992, sessionEmpty()) == 9007199254740993,
+    "Lua rounded the version",
+  )
+  let (_, version, _) = unwrap(sessionRead(store, sid))
+  assert(version == 9007199254740993, "load rounded the version")
+  sessionSetVersion(client, sid, "999999999999999999")
+  assert(
+    sessionPut(store, sid, 999999999999999999, sessionEmpty()) == 1000000000000000000,
+    "decimal carry changed version",
+  )
+  store.destroy(sid, 60) catch e {
+    panic(e.message())
+  }
+  let rejected = false
+  store.compareAndSet(sid, 1000000000000000001, sessionEmpty(), sessionEmpty(), 60) catch _ {
+    rejected = true
+  }
+  assert(rejected && !isSome(sessionRead(store, sid)), "high-version tombstone was overwritten")
+}
