@@ -21,7 +21,8 @@ whenever you want to see where a chapter's trimmed example is headed.
 
 ## Run the finished app
 
-Set `DATABASE_URL` to your PostgreSQL database and `APP_SECRET` to the
+Set `DATABASE_URL` to your PostgreSQL database, `REDIS_URL` to a dedicated
+Redis 7 or newer instance, and `APP_SECRET` to the
 session-cookie secret. Access tokens use a separate `JWT_SECRET` of at least
 32 bytes, plus required `JWT_ISSUER` and `JWT_AUDIENCE` values. Choose an issuer
 that identifies your deployment and an audience that identifies this API.
@@ -50,13 +51,16 @@ audience and access-token header are rejected; sign in again to get a new one.
 28. [Transactions](15-transactions.md)
 29. [Testing the API](16-testing-the-api.md)
 30. [Operations: health, graceful shutdown](17-operations.md)
-31. [Find articles by their words](28-full-text-search.md)
-32. [Keep deleted articles recoverable](29-soft-deletes.md)
-33. [Refuse an edit based on an old article](30-optimistic-locking.md)
-34. [API tokens with JWT](34-api-tokens-with-jwt.md)
-35. [Refresh tokens](35-refresh-tokens.md)
-36. [Sign in with Google](36-sign-in-with-google.md)
-37. [Idempotency keys: retry a write without doing it twice](40-idempotency-keys.md)
+31. [Run a nightly article digest](25-scheduled-jobs.md)
+32. [Cache article lists in Redis](26-caching-with-redis.md)
+33. [Share sessions across servers](27-sessions-in-redis.md)
+34. [Find articles by their words](28-full-text-search.md)
+35. [Keep deleted articles recoverable](29-soft-deletes.md)
+36. [Refuse an edit based on an old article](30-optimistic-locking.md)
+37. [API tokens with JWT](34-api-tokens-with-jwt.md)
+38. [Refresh tokens](35-refresh-tokens.md)
+39. [Sign in with Google](36-sign-in-with-google.md)
+40. [Idempotency keys: retry a write without doing it twice](40-idempotency-keys.md)
 
 Idempotency closes this part by making the app's two creating routes safe
 to retry. Part 5 starts with [Background jobs](../../../docs/book/31-background-jobs.md)

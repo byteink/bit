@@ -6,8 +6,55 @@
 // link them, all inside one `db.tx(...)` block.
 import { StaleWriteError } from "orm"
 import { httpError, page } from "web"
-import { Builder } from "std/strings"
+import { Builder, join } from "std/strings"
 import { uuidV4, format as uuidFormat } from "std/uuid"
+
+import { Client as RedisClient, Script as RedisScript, luaInt, luaStrings, open as openRedis } from "redis"
+import { Sha256 as CacheSha256, digest as cacheDigest, encodeHex as cacheHex } from "std/crypto"
+import { jsonParse as cacheJsonParse, jsonEncode as cacheJsonEncode } from "std/json"
+import { Second as CacheSecond } from "std/time"
+
+const articleCacheGeneration = "{inkwell:articles}:generation"
+const articleCacheTtl = 30 * CacheSecond
+
+class CachedArticlePage {
+  value: Json
+  toJson(): Json { return this.value }
+}
+
+fn articleCacheKey(c: Ctx, generation: i64): string {
+  let fields = []string(0)
+  for name of ["q", "author", "limit", "page", "sort"] {
+    let value = c.query(name)
+    fields = append(fields, "${len(value)}:${value}")
+  }
+  let hash = cacheHex(cacheDigest(CacheSha256(), []byte(join(fields, "|"))))
+  return "{inkwell:articles}:${generation}:${hash}"
+}
+
+fn cachedArticles(c: Ctx, db: Db, redis: RedisClient): Res! {
+  let generation = redis.counter(articleCacheGeneration).get()?
+  let key = articleCacheKey(c, generation)
+  match (redis.get(key)?) {
+    Some(body) => return c.json(CachedArticlePage{ value = cacheJsonParse(body)? })
+    None => {}
+  }
+  let result = listArticles(c, db)?
+  let body = [""]
+  result.mapValue((value) => {
+    body[0] = cacheJsonEncode(value)
+    return value
+  })
+  if (!redis.set(key, body[0], ttl = articleCacheTtl)?) {
+    fail newError("inkwell: article cache write was refused")
+  }
+  return result
+}
+
+// A concurrent old-generation fill expires normally and is never read again.
+fn invalidateArticles(redis: RedisClient): ()! {
+  redis.counter(articleCacheGeneration).incr()?
+}
 
 @table("articles") @timestamps @softDelete class Article {
   id: i64
@@ -232,7 +279,7 @@ fn insertArticle(tx: TxHandle, authorId: i64, input: CreateArticleInput): Articl
   return a
 }
 
-fn createArticle(c: Ctx, db: Db): Res! {
+fn createArticle(c: Ctx, db: Db, redis: RedisClient): Res! {
   let uid = currentUserId(c)?
   let input = c.body<CreateArticleInput>()?
   let newId = []i64{ 0 }
@@ -240,6 +287,7 @@ fn createArticle(c: Ctx, db: Db): Res! {
     let a = insertArticle(tx, uid, input)?
     newId[0] = a.id
   })?
+  invalidateArticles(redis)?
   return c.createdUrl("/articles/${newId[0]}")
 }
 
@@ -253,7 +301,7 @@ export @json class UpdateArticleInput {
 // UPDATE's `WHERE version = ...` and raises `StaleWriteError` — never
 // silence — when someone else's write landed first; that maps to 412, the
 // client's signal to reload and retry.
-fn updateArticle(c: Ctx, db: Db): Res! {
+fn updateArticle(c: Ctx, db: Db, redis: RedisClient): Res! {
   let id = parseId(c.param("id")) catch _ {
     fail badRequest("id must be an integer")
   }
@@ -280,11 +328,12 @@ fn updateArticle(c: Ctx, db: Db): Res! {
     }
     fail e
   }
+  invalidateArticles(redis)?
   let refreshed = findArticleById(db, id)?
   return c.json(toArticleView(refreshed))
 }
 
-fn deleteArticle(c: Ctx, db: Db): Res! {
+fn deleteArticle(c: Ctx, db: Db, redis: RedisClient): Res! {
   let id = parseId(c.param("id")) catch _ {
     fail badRequest("id must be an integer")
   }
@@ -293,6 +342,7 @@ fn deleteArticle(c: Ctx, db: Db): Res! {
   }
   requireOwnerOrAdmin(c, existing.authorId)?
   db.table<Article>().delete(id)?
+  invalidateArticles(redis)?
   return c.noContent()
 }
 
@@ -300,13 +350,13 @@ fn deleteArticle(c: Ctx, db: Db): Res! {
 // group so only `POST /articles` runs behind it: a client that sends an
 // `Idempotency-Key` gets one article however many times it retries, and a
 // request without the header is untouched.
-export fn mountArticles(app: App, db: Db, once: Middleware) {
+export fn mountArticles(app: App, db: Db, once: Middleware, redis: RedisClient) {
   let group = app.group("/articles")
-  group.get("/", (c) => listArticles(c, db))
+  group.get("/", (c) => cachedArticles(c, db, redis))
   group.get("/:id", (c) => showArticle(c, db))
   let publish = app.group("/articles")
   publish.use(once)
-  publish.post("/", (c) => createArticle(c, db))
-  group.put("/:id", (c) => updateArticle(c, db))
-  group.delete("/:id", (c) => deleteArticle(c, db))
+  publish.post("/", (c) => createArticle(c, db, redis))
+  group.put("/:id", (c) => updateArticle(c, db, redis))
+  group.delete("/:id", (c) => deleteArticle(c, db, redis))
 }
