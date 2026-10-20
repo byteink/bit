@@ -2,7 +2,7 @@
 # outlive this script (#7824). `windowssmoke.bit` ships it next to the fixtures and
 # starts every remote program through it:
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File runchild.ps1 <exe> <timeoutSec> [<redirectTo>]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File runchild.ps1 <exe> <timeoutSec> [<redirectTo>] [-EmptyEnvKey <key>]
 #
 # The child inherits this script's stdout and stderr, so its output reaches the
 # harness byte for byte. This script puts ITSELF into a job object with
@@ -16,8 +16,11 @@
 #
 # Exit code: the child's; 124 when it ran past <timeoutSec> and was killed, with a
 # `wsmoke-run: TIMEOUT` line on stderr; 125 when the job object could not be set up.
+# Invalid EmptyEnvKey also exits 125 before starting a child.
 # <redirectTo> runs the child as `cmd /c "<exe> > <redirectTo>"`, the raw handle
 # redirect the manyprints phase asserts on.
+# EmptyEnvKey defines one empty child value without deleting it from the block
+# or changing this runner's environment, including an inherited nonempty value.
 #
 # With WSMOKE_LAG set (#7829) the child's stdout is relayed through this script and
 # a final `wsmoke-run: lag-ms=<n>` line follows it: <n> is the wall clock when the
@@ -27,8 +30,16 @@
 param(
   [Parameter(Mandatory = $true)][string]$Exe,
   [Parameter(Mandatory = $true)][int]$TimeoutSec,
-  [string]$RedirectTo = ''
+  [string]$RedirectTo = '',
+  [AllowEmptyString()][string]$EmptyEnvKey = ''
 )
+
+$hasEmptyEnvKey = $PSBoundParameters.ContainsKey('EmptyEnvKey')
+if ($hasEmptyEnvKey -and ([string]::IsNullOrEmpty($EmptyEnvKey) -or
+    $EmptyEnvKey.IndexOf([char]0) -ge 0 -or $EmptyEnvKey.Contains('='))) {
+  [Console]::Error.WriteLine('wsmoke-run: invalid empty environment key')
+  exit 125
+}
 
 Add-Type -TypeDefinition @'
 using System;
@@ -73,6 +84,9 @@ if ($err -ne '') {
 $path = Join-Path $PWD.Path $Exe
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.UseShellExecute = $false
+if ($hasEmptyEnvKey) {
+  $psi.EnvironmentVariables[$EmptyEnvKey] = ''
+}
 if ($RedirectTo -eq '') {
   $psi.FileName = $path
 } else {
