@@ -6,54 +6,54 @@ The README carries the short version. This page keeps every table and the method
 
 | Benchmark | Bit | Go | C | Bit / Go | Bit / C |
 |---|--:|--:|--:|--:|--:|
-| fib | 1030.4 M | 963.0 M | 637.5 M | 1.07x | 1.62x |
-| mandelbrot | 2140.2 M | 1644.1 M | 1610.2 M | 1.30x | 1.33x |
-| collatz | 904.0 M | 619.7 M | 412.7 M | 1.46x | 2.19x |
-| alloc | 658.5 M | 385.7 M | 464.0 M | 1.71x | 1.42x |
-| allocflat | 168.6 M | 84.0 M | 18.4 M | 2.01x | 9.14x |
-| allocpar | 801.9 M | 704.8 M | 2095.6 M | 1.14x | 0.38x |
-| strings | 220.0 M | 397.5 M | 110.3 M | 0.55x | 1.99x |
-| map | 331.7 M | 425.5 M | 180.0 M | 0.78x | 1.84x |
-| strmap | 1228.2 M | 686.9 M | 261.0 M | 1.79x | 4.71x |
-| sort | 313.0 M | 358.0 M | 279.0 M | 0.87x | 1.12x |
-| matrix | 1386.2 M | 954.4 M | 399.9 M | 1.45x | 3.47x |
-| json | 735.4 M | 341.9 M | 230.1 M | 2.15x | 3.20x |
+| fib | 1032.6 M | 959.3 M | 637.1 M | 1.08x | 1.62x |
+| mandelbrot | 2140.2 M | 1644.0 M | 1609.7 M | 1.30x | 1.33x |
+| collatz | 903.9 M | 621.1 M | 414.0 M | 1.46x | 2.18x |
+| alloc | 669.5 M | 380.8 M | 471.5 M | 1.76x | 1.42x |
+| allocflat | 165.5 M | 83.6 M | 18.5 M | 1.98x | 8.94x |
+| allocpar | 822.9 M | 709.3 M | 2052.4 M | 1.16x | 0.40x |
+| strings | 221.4 M | 396.0 M | 110.6 M | 0.56x | 2.00x |
+| map | 366.9 M | 512.8 M | 182.9 M | 0.72x | 2.01x |
+| strmap | 1231.3 M | 687.9 M | 260.9 M | 1.79x | 4.72x |
+| sort | 314.3 M | 356.5 M | 278.7 M | 0.88x | 1.13x |
+| matrix | 1385.4 M | 953.4 M | 399.3 M | 1.45x | 3.47x |
+| json | 733.3 M | 341.0 M | 227.4 M | 2.15x | 3.22x |
 
 ### Instructions retired: work emitted, not time taken
 
 | Benchmark | Bit | Go | C |
 |---|--:|--:|--:|
-| fib | 5300.8 M | 5137.2 M | 3146.9 M |
-| mandelbrot | 4787.9 M | 2507.1 M | 2699.6 M |
-| collatz | 2581.7 M | 935.7 M | 930.7 M |
-| alloc | 5028.0 M | 2260.9 M | 3607.1 M |
-| allocflat | 1261.9 M | 359.8 M | 59.3 M |
-| allocpar | 5763.0 M | 3208.9 M | 3621.4 M |
-| strings | 1704.2 M | 1772.8 M | 643.4 M |
-| map | 759.5 M | 691.7 M | 230.8 M |
-| strmap | 5510.5 M | 2261.5 M | 534.3 M |
-| sort | 1730.9 M | 942.3 M | 503.8 M |
-| matrix | 12277.6 M | 7323.3 M | 1656.3 M |
-| json | 4657.7 M | 2150.8 M | 1340.6 M |
+| fib | 5301.2 M | 5137.4 M | 3146.9 M |
+| mandelbrot | 4788.4 M | 2507.2 M | 2699.4 M |
+| collatz | 2582.0 M | 935.9 M | 930.9 M |
+| alloc | 5029.0 M | 2163.7 M | 3607.2 M |
+| allocflat | 1262.0 M | 366.1 M | 59.3 M |
+| allocpar | 5767.8 M | 3204.8 M | 3621.7 M |
+| strings | 1704.4 M | 1761.9 M | 643.4 M |
+| map | 759.7 M | 691.5 M | 229.7 M |
+| strmap | 5509.6 M | 2262.1 M | 534.4 M |
+| sort | 1729.7 M | 942.1 M | 503.7 M |
+| matrix | 12278.0 M | 7323.3 M | 1656.3 M |
+| json | 4653.3 M | 2150.9 M | 1339.8 M |
 
 ### Wall clock: median of 15 runs, milliseconds
 
 | Benchmark | Bit | Go | C |
 |---|--:|--:|--:|
-| fib | 235.9 ms | 221.6 ms | 144.4 ms |
-| mandelbrot | 476.3 ms | 365.5 ms | 356.7 ms |
-| collatz | 201.0 ms | 139.2 ms | 92.9 ms |
-| alloc | 138.2 ms | 84.2 ms | 110.3 ms |
-| allocflat | 40.6 ms | 18.3 ms | 6.4 ms |
-| allocpar | 52.3 ms | 55.9 ms | 66.5 ms |
-| strings | 53.4 ms | 59.5 ms | 28.0 ms |
-| map | 81.1 ms | 99.0 ms | 45.8 ms |
-| strmap | 283.5 ms | 159.8 ms | 61.8 ms |
-| sort | 64.3 ms | 84.9 ms | 65.3 ms |
-| matrix | 324.0 ms | 224.5 ms | 95.3 ms |
-| json | 139.9 ms | 76.3 ms | 56.4 ms |
-| allocpar W1 | 175.0 ms | 105.8 ms | 66.5 ms |
-| allocpar W8 | 56.4 ms | 61.3 ms | 66.5 ms |
+| fib | 235.5 ms | 224.5 ms | 146.1 ms |
+| mandelbrot | 494.8 ms | 384.2 ms | 373.5 ms |
+| collatz | 205.2 ms | 138.9 ms | 92.7 ms |
+| alloc | 145.9 ms | 84.9 ms | 114.4 ms |
+| allocflat | 41.7 ms | 18.2 ms | 6.4 ms |
+| allocpar | 52.9 ms | 56.1 ms | 66.3 ms |
+| strings | 53.8 ms | 59.6 ms | 28.3 ms |
+| map | 87.6 ms | 124.6 ms | 47.8 ms |
+| strmap | 283.3 ms | 160.5 ms | 63.6 ms |
+| sort | 65.2 ms | 85.8 ms | 67.1 ms |
+| matrix | 323.7 ms | 223.7 ms | 94.5 ms |
+| json | 139.4 ms | 75.7 ms | 56.3 ms |
+| allocpar W1 | 178.1 ms | 106.5 ms | 66.3 ms |
+| allocpar W8 | 57.6 ms | 62.1 ms | 66.3 ms |
 
 ### GC pauses: one untimed run per case, share of that run's own wall clock
 
@@ -62,17 +62,17 @@ The README carries the short version. This page keeps every table and the method
 | fib | 0 | 0.0 ms (0.0%) | 0.0 ms | 0 | 0.0 ms (0.0%) | 0.0 ms | n/a |
 | mandelbrot | 0 | 0.0 ms (0.0%) | 0.0 ms | 0 | 0.0 ms (0.0%) | 0.0 ms | n/a |
 | collatz | 0 | 0.0 ms (0.0%) | 0.0 ms | 0 | 0.0 ms (0.0%) | 0.0 ms | n/a |
-| alloc | 133 | 9.0 ms (6.8%) | 0.1 ms | 65 | 1.6 ms (1.9%) | 0.1 ms | n/a |
-| allocflat | 66 | 0.4 ms (1.0%) | 0.0 ms | 74 | 1.7 ms (8.9%) | 0.0 ms | n/a |
-| allocpar | 158 | 18.7 ms (35.6%) | 0.2 ms | 84 | 4.8 ms (8.7%) | 0.1 ms | n/a |
-| strings | 3 | 0.5 ms (0.9%) | 0.4 ms | 12 | 0.2 ms (0.3%) | 0.0 ms | n/a |
+| alloc | 133 | 9.1 ms (6.6%) | 0.1 ms | 66 | 1.4 ms (1.7%) | 0.0 ms | n/a |
+| allocflat | 66 | 0.3 ms (0.7%) | 0.0 ms | 71 | 1.8 ms (9.8%) | 0.1 ms | n/a |
+| allocpar | 159 | 19.0 ms (27.3%) | 0.2 ms | 83 | 5.0 ms (9.0%) | 0.1 ms | n/a |
+| strings | 3 | 0.5 ms (0.9%) | 0.4 ms | 13 | 0.3 ms (0.5%) | 0.0 ms | n/a |
 | map | 1 | 0.1 ms (0.1%) | 0.1 ms | 4 | 0.1 ms (0.1%) | 0.0 ms | n/a |
-| strmap | 4 | 3.8 ms (1.3%) | 3.1 ms | 3 | 0.0 ms (0.0%) | 0.0 ms | n/a |
-| sort | 8 | 6.4 ms (10.1%) | 2.0 ms | 1 | 0.0 ms (0.0%) | 0.0 ms | n/a |
+| strmap | 4 | 4.0 ms (1.4%) | 3.3 ms | 3 | 0.1 ms (0.1%) | 0.0 ms | n/a |
+| sort | 8 | 6.9 ms (10.3%) | 2.0 ms | 1 | 0.0 ms (0.0%) | 0.0 ms | n/a |
 | matrix | 1 | 0.0 ms (0.0%) | 0.0 ms | 1 | 0.0 ms (0.0%) | 0.0 ms | n/a |
-| json | 19 | 7.5 ms (5.4%) | 4.7 ms | 10 | 0.2 ms (0.3%) | 0.0 ms | n/a |
-| allocpar W1 | 153 | 38.6 ms (22.4%) | 0.4 ms | 77 | 0.0 ms (0.0%) | 0.0 ms | n/a |
-| allocpar W8 | 176 | 34.4 ms (61.8%) | 0.3 ms | 82 | 7.4 ms (11.9%) | 0.1 ms | n/a |
+| json | 19 | 8.7 ms (5.8%) | 5.7 ms | 10 | 0.2 ms (0.2%) | 0.0 ms | n/a |
+| allocpar W1 | 153 | 38.3 ms (22.4%) | 0.4 ms | 79 | 0.3 ms (0.2%) | 0.0 ms | n/a |
+| allocpar W8 | 176 | 34.1 ms (61.9%) | 0.5 ms | 79 | 7.1 ms (11.6%) | 0.1 ms | n/a |
 
 ### Peak memory: max RSS, lower is better
 
@@ -81,15 +81,15 @@ The README carries the short version. This page keeps every table and the method
 | fib | 2.3 MB | 4.3 MB | 1.7 MB |
 | mandelbrot | 2.3 MB | 4.3 MB | 1.7 MB |
 | collatz | 2.3 MB | 4.3 MB | 1.7 MB |
-| alloc | 6.8 MB | 11.2 MB | 2.0 MB |
-| allocflat | 6.4 MB | 10.7 MB | 1.9 MB |
-| allocpar | 8.8 MB | 10.8 MB | 3.9 MB |
+| alloc | 6.9 MB | 10.3 MB | 2.0 MB |
+| allocflat | 6.4 MB | 10.9 MB | 1.9 MB |
+| allocpar | 8.8 MB | 10.9 MB | 3.8 MB |
 | strings | 63.0 MB | 61.0 MB | 31.0 MB |
 | map | 37.2 MB | 41.3 MB | 193.8 MB |
 | strmap | 35.9 MB | 30.4 MB | 41.1 MB |
 | sort | 17.8 MB | 14.6 MB | 11.3 MB |
-| matrix | 8.8 MB | 10.8 MB | 7.8 MB |
-| json | 129.4 MB | 55.9 MB | 125.5 MB |
+| matrix | 8.7 MB | 10.8 MB | 7.8 MB |
+| json | 129.3 MB | 56.1 MB | 125.5 MB |
 
 ### Heap allocations per run: the equivalence check, not a score
 
@@ -98,15 +98,15 @@ The README carries the short version. This page keeps every table and the method
 | fib | 2 | 183 | 0 |
 | mandelbrot | 2 | 183 | 0 |
 | collatz | 2 | 183 | 0 |
-| alloc | 10006002 | 10002212 | 10004000 |
-| allocflat | 4002 | 2228 | 2000 |
-| allocpar | 10006015 | 10002262 | 10004000 |
-| strings | 33 | 258 | 11 |
-| map | 10 | 4306 | 1 |
+| alloc | 10006002 | 10002214 | 10004000 |
+| allocflat | 4002 | 2218 | 2000 |
+| allocpar | 10006015 | 10002273 | 10004000 |
+| strings | 33 | 257 | 11 |
+| map | 10 | 4299 | 1 |
 | strmap | 400037 | 400718 | 400003 |
-| sort | 600018 | 150206 | 150002 |
-| matrix | 12 | 206 | 3 |
-| json | 3750060 | 1049903 | 2250021 |
+| sort | 600018 | 150208 | 150002 |
+| matrix | 12 | 205 | 3 |
+| json | 3750060 | 1049901 | 2250021 |
 
 ### Binary size: static, as emitted
 
@@ -129,11 +129,11 @@ The README carries the short version. This page keeps every table and the method
 
 | Metric | Bit | Go | C |
 |---|--:|--:|--:|
-| Process startup (per exec) | 5.580 ms | 5.775 ms | 4.941 ms |
+| Process startup (per exec) | 4.854 ms | 5.844 ms | 4.935 ms |
 
-Bit compile speed: **692 lines/sec** (769 lines across 12 cases, warm).
+Bit compile speed: **678 lines/sec** (769 lines across 12 cases, warm).
 
-> Machine: Apple M5 Max, macOS 27.0.1. Bit @ `3df84491b`, Go go1.27.2, Apple clang version 21.0.0 (clang-2100.3.34.2).
+> Machine: Apple M5 Max, macOS 27.0.1. Bit @ `ad286e278`, Go go1.27.2, Apple clang version 21.0.0 (clang-2100.3.34.2).
 > Method: 15 runs per case per language. Cycles and instructions are a trimmed mean of those runs, meaning the mean after dropping the slowest fifth, which was the most reproducible of four estimators measured over 40 samples per series; wall clock and RSS are the median. C built `cc -O2 -ffp-contract=off`, Go `go build`, Bit `bit build`, each language's standard optimized build.
 > Mandelbrot: Bit and C agree to the last bit; Go differs by ~0.0002% because it contracts `a*b+c` to a hardware FMA. Not a bug: cross-compiler float bit-identity is not guaranteed.
 > alloc measures the ALLOCATOR: 10M short-lived nodes, each its own heap object in all three languages (Bit's element class has a reference field, Go holds `[]*Node`, C mallocs per node). allocflat measures DATA LAYOUT: the same 10M nodes and the same printed total, stored by value in one buffer per batch (Bit packs `[]Node` inline, Go holds `[]Node`, C mallocs the batch once). The gap between the two rows is what per-node heap allocation costs a language.
@@ -141,10 +141,10 @@ Bit compile speed: **692 lines/sec** (769 lines across 12 cases, warm).
 > The allocation table above is how those two claims are checked rather than asserted: same order of magnitude across a row means the three sources still express the same data structure, which is exactly what `alloc` silently lost for a day. Bit's count is `swept+live` from `BIT_GC_STATS=1`; Go's is `runtime.MemStats.Mallocs` and C's a `malloc` counter, both opt-in (`BENCH_ALLOC_STATS`, `-DBENCH_ALLOC_STATS`) and both absent from every timed binary.
 > The ratios are built from CYCLES, not from wall clock. `/usr/bin/time` reports `real` in hundredths of a second and most of the C sides here finish in under 0.10s, so a wall-clock ratio for those rows would be quantisation: `map` published 7.50x C off 0.300s/0.040s where the counters say ~4.5x. Adding runs does not fix that, because it narrows the spread around a quantised value instead of removing the quantisation, so the unit changed. Cycles and instructions come from the same `/usr/bin/time -l` invocation that also produced the RSS; nothing extra is run and nothing extra is installed for those three. Wall clock is a separate one-decimal-millisecond measurement (`wall_run()`, one `fork`+`exec`+`waitpid` perl process per run, not `/usr/bin/time`'s own field) so it stays usable below `/usr/bin/time`'s 10ms floor; it still carries no ratio column and is kept as context.
 > GC pauses: one untimed run per case, separate from the timed runs above (BIT_GC_STATS/GODEBUG both add real overhead). Bit's fields are `pausens=`/`pausemaxns=`/`pauses=` from `BIT_GC_STATS=1`. Go's are parsed from one `GODEBUG=gctrace=1` run: each `gc N @Ts P%: A+B+C ms clock` line's A (sweep termination) and C (mark termination) are its two STW segments (`go doc runtime`, go1.27.1), summed for the STW total, maxed individually for the longest single pause; B (concurrent mark) is not a stop and is excluded. C has no collector (n/a). Share is that probe run's own `wall_run()` wall time, not the timed loop's median. `allocpar W1`/`W8` reruns the same probe with `BIT_WORKERS`/`GOMAXPROCS` set; C is unchanged (its worker count is a compile-time `#define`, never read from env) so its wall-table cell reuses the baseline `allocpar` row rather than a redundant rerun.
-> Cycles and instructions are startup-corrected: each figure has that language's own empty-program cost (`bench/cases/startup`, bit 5.4M, c 4.1M, go 6.0M) subtracted, because dyld and runtime init differ per language and are a fifth of C's `allocflat` row. Every other table is raw.
+> Cycles and instructions are startup-corrected: each figure has that language's own empty-program cost (`bench/cases/startup`, bit 5.2M, c 3.9M, go 6.0M) subtracted, because dyld and runtime init differ per language and are a fifth of C's `allocflat` row. Every other table is raw.
 
 > On `matrix`, read the Go column as the target and not the C one. The C side vectorises: it retires 2.06 instructions per inner-loop iteration against Go's 9.09, so the Bit:C ratio on this row compares a scalar loop against a vectorised one and is not a statement about codegen quality. A scalar `cc -O2 -fno-vectorize` control build of the same case retires 8.07, which is the like-for-like figure. Denominator for all three: `trials * n^3 = 6 * 512^3 = 805,306,368` inner iterations.
 > Reproducibility was measured rather than assumed: four independent regenerations of this table on this box held every ratio to 2.5% between adjacent runs and 8.5% at worst across all four. The loose rows are `alloc`, `map`, `allocflat` and `strings`, whose Go or C side is short enough that that language's own allocator and collector scheduling moves it by several percent from run to run; `matrix`, `mandelbrot`, `fib` and `sort` reproduce to about 1%. On those four loose rows, read a change under ~3% as noise.
-> Peak RSS above is a within-run median like every other figure in that table, but it can still swing further ACROSS separate regenerations than one run shows. From every regeneration recorded in `bench/history.csv`, restricted to the same four loose rows above and to the Go/C columns (the Bit column reflects real compiler/runtime changes over that history, not noise): `alloc` c: 1.5-2.2 MB (median 2.0 MB, N=66); `allocflat` go: 10.6-12.8 MB (median 11.5 MB, N=57); `allocflat` c: 1.5-1.9 MB (median 1.9 MB, N=57); `strings` go: 61.0-100.0 MB (median 70.4 MB, N=63). Read that cell's published number as representative of the stated range, not a fixed constant.
+> Peak RSS above is a within-run median like every other figure in that table, but it can still swing further ACROSS separate regenerations than one run shows. From every regeneration recorded in `bench/history.csv`, restricted to the same four loose rows above and to the Go/C columns (the Bit column reflects real compiler/runtime changes over that history, not noise): `alloc` c: 1.5-2.2 MB (median 2.0 MB, N=67); `allocflat` go: 10.6-12.8 MB (median 11.4 MB, N=58); `allocflat` c: 1.5-1.9 MB (median 1.9 MB, N=58); `strings` go: 61.0-100.0 MB (median 70.4 MB, N=64). Read that cell's published number as representative of the stated range, not a fixed constant.
 > Instructions are published beside cycles because a cycle gap alone does not say whether it is work emitted or work stalled, and the two ratios differ a lot here: Bit retires roughly 4-7 instructions per cycle against C's 1.4-1.8, so its instruction ratio always overstates its cycle ratio. Cycles are the time; instructions are the reason.
-> Generated by `bench/run.sh` on 2026-10-20T00:10:07Z. Do not edit by hand.
+> Generated by `bench/run.sh` on 2026-10-20T04:14:21Z. Do not edit by hand.
