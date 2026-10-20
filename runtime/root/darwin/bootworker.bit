@@ -30,6 +30,7 @@
 // no headroom for a new import, so this one lives here instead, next to its
 // only caller (workerBody, below) rather than beside boot.bit's other sched
 // imports.
+import { schedMaintenanceTurn } from "../../sched"
 import { schedGrowObserveBacklog, schedPollerArm, schedPollerDisarm, schedPollerHandoff } from "../../sched"
 import { wkSlot } from "../../sched"
 import { currentMutator } from "../../gc"
@@ -371,103 +372,30 @@ fn tryGrowPool(sched: *i64) {
 // `schedWorkerStepAt`'s race-loss retry below, unrelated to this change.
 // ../linux/bootworker.bit is NOT part of this ticket and still bounds its
 // own worker 0 with the ramped `backoff` exactly as before.
-fn workerBody(arg: *byte): *byte {
-  // ARM THIS THREAD'S CRASH DIAGNOSTIC FIRST (#2246, ./signal.bit): every
-  // green task this worker will ever run executes below this line, so the
-  // alternate signal stack must be live before any of them can fault.
-  installAltStackForThisWorker()
+// Keep signed wake classification poll-free while a raw task address is live.
+@nosplit fn workerNoWork(addr: int, woke: int): bool {
+  return addr == 0 && woke == 0
+}
 
-  // CLAIM THE MUTATOR SLOT EAGERLY, BEFORE ANY BIT CODE RUNS (#1677/#1699).
-  // Second only to arming the crash diagnostic above — installAltStackForThisWorker()
-  // allocates nothing and touches no safepoint, so the window this call closes
-  // is still shut. This is the thread's ENTRY function — the same place
-  // `gcThreadExit` below runs at exit, and `runtime/sched/`'s `Worker.run` calls
-  // `gc_hooks.threadEnter()` at the matching point. Lazy registration (claiming
-  // a slot on first allocation or first safepoint poll) leaves a real window:
-  // `schedWorkerStepAt`'s very first task dispatch can `schedSwitch` into a
-  // green task body BEFORE this thread's own loop back edge is ever reached,
-  // and #1677's reproducer proved a task that reads a live reference out of
-  // shared state before its own first allocation/loop is invisible to the
-  // rendezvous for that whole window — the object was swept 20/20 runs.
-  // Calling `gcThreadEnter()` here closes it: this thread is a mutator before
-  // it ever runs Bit code.
-  gcThreadEnter()
+@nosplit fn workerPrepareTurn(w: *i64, s: *i64): int {
+  // GROW-ON-DEMAND (#2593/#3569/#3726). At the TOP of the turn, not after the
+  // step it used to follow: a green task is not preemptible, so a worker that
+  // has committed to a long CPU-bound one does not reach the bottom of this
+  // loop again until that task ends. Growing first is what lets a freshly
+  // started worker pass the signal on before it takes work of its own, which
+  // turns a ramp of one doubling per task duration into a chain bounded by
+  // thread-create latency. Both calls are no-ops with no backlog: the
+  // observer walks peers with plain loads, and `schedGrowArm` returns on its
+  // first compare without taking a lock.
+  schedGrowObserveBacklog(w)
+  tryGrowPoolAt(s, workersCeiling, false)
+  // Arm BEFORE looking for work; see the Linux twin for the window this closes.
+  schedIdleArm(w)
+  let now = parkMonoNs()
+  return now
+}
 
-  let block = taskAt(int(arg))
-  let workerAddr = *block
-  let doneAddr = *(block + 1)
-
-  let w = taskAt(workerAddr)
-  // Record this thread's registry slot for the monitor's retake scan (#7128).
-  *(w + wkSlot) = currentMutator(0)
-  let s: *i64 = ptrOf(schedBlock)
-  let backoff = parkMinBackoffNs
-  // ANY IDLE WORKER MAY POLL (#6429, was "worker 0 polls, the rest park",
-  // #1902). The poller role is the token `schedPollerArm` takes
-  // (`runtime/sched/sleep.bit`): the idle worker that wins it blocks in
-  // `worker0Wait` until the next deadline, every other idle worker parks on its
-  // own word as before. A missed wake still costs latency, never a hang: the
-  // park backstop and the wait's ceiling bound every wake source not wired.
-  // The token holder leaves the poller before it runs a task (#6429).
-  let owed = false
-  // The spin budget (#3260, "THE IDLE SPIN" above). Starts false: a worker that
-  // has run nothing yet has no reason to believe work is moments away, and boot
-  // is exactly when N-1 workers find an empty scheduler.
-  let spin = false
-  while (true) {
-    // GROW-ON-DEMAND (#2593/#3569/#3726). At the TOP of the turn, not after the
-    // step it used to follow: a green task is not preemptible, so a worker that
-    // has committed to a long CPU-bound one does not reach the bottom of this
-    // loop again until that task ends. Growing first is what lets a freshly
-    // started worker pass the signal on before it takes work of its own, which
-    // turns a ramp of one doubling per task duration into a chain bounded by
-    // thread-create latency. Both calls are no-ops with no backlog: the
-    // observer walks peers with plain loads, and `schedGrowArm` returns on its
-    // first compare without taking a lock.
-    schedGrowObserveBacklog(w)
-    tryGrowPool(s)
-    // Arm BEFORE looking for work; see the Linux twin for the window this closes.
-    schedIdleArm(w)
-    let now = parkMonoNs()
-    let addr = schedFindWorkAt(w, now)
-    let woke = 0
-    if (addr == 0) {
-      woke = schedPollerDrain(s)
-    }
-    // `woke == 0`, NOT `woke <= 0`: a drain whose only event was this worker's
-    // own wake returns `pollDrainWakeOnly` (negative), and the whole point of
-    // that answer is that this branch must NOT be taken — the wake has already
-    // been consumed and `scPollWait` already claimed, so the wait below could
-    // only end on its ceiling.
-    if (addr == 0 && woke == 0) {
-      if (atomicLoad(s + scStopping) != 0) {
-        break
-      }
-      // THE TOKEN (#6429): the first idle worker to win the CAS blocks in the
-      // poller until the next deadline; the rest spin once and park. Taking it
-      // AFTER the failed pass is safe because `worker0Wait` re-checks for work
-      // and reads the deadline bound once the token is held: a producer that
-      // published before the take is seen there, one that publishes after finds
-      // the cell armed and claims it (`schedWakePoller`).
-      let holder = schedPollerArm(s)
-      // One bounded burst of userspace retries before the park — see "THE IDLE
-      // SPIN" above. A park clears the budget; only found work re-arms it.
-      addr = workerSpin(w, holder, spin)
-      if (addr == 0) {
-        idleWait(s, w, holder, spin, now)
-        spin = false
-        owed = holder
-        backoff = parkNextBackoff(backoff)
-        continue
-      }
-    }
-    backoff = workerRunTask(w, addr, woke, backoff, owed)
-    owed = false
-    spin = true
-    if (backoff == workerStepStop) {
-      break
-    }
-  }
+@nosplit fn workerExit(w: *i64, doneAddr: int) {
   // Leaving for good after normal shutdown (#7959). Drop the arm (#5744): a stale
   // 1 in worker 0's word would have producers trigger a descriptor teardown is
   // about to close.
@@ -497,9 +425,102 @@ fn workerBody(arg: *byte): *byte {
 
   let z: *i32 = nil
   atomicStore(z + doneAddr / 4, i32(0))
-  return nil
 }
 
+@nosplit fn workerEnter(arg: *byte): *i64 {
+  // ARM THIS THREAD'S CRASH DIAGNOSTIC FIRST (#2246, ./signal.bit): every
+  // green task this worker will ever run executes below this line, so the
+  // alternate signal stack must be live before any of them can fault.
+  installAltStackForThisWorker()
+
+  // CLAIM THE MUTATOR SLOT EAGERLY, BEFORE ANY BIT CODE RUNS (#1677/#1699).
+  // Second only to arming the crash diagnostic above — installAltStackForThisWorker()
+  // allocates nothing and touches no safepoint, so the window this call closes
+  // is still shut. This is the thread's ENTRY function — the same place
+  // `gcThreadExit` below runs at exit, and `runtime/sched/`'s `Worker.run` calls
+  // `gc_hooks.threadEnter()` at the matching point. Lazy registration (claiming
+  // a slot on first allocation or first safepoint poll) leaves a real window:
+  // `schedWorkerStepAt`'s very first task dispatch can `schedSwitch` into a
+  // green task body BEFORE this thread's own loop back edge is ever reached,
+  // and #1677's reproducer proved a task that reads a live reference out of
+  // shared state before its own first allocation/loop is invisible to the
+  // rendezvous for that whole window — the object was swept 20/20 runs.
+  // Calling `gcThreadEnter()` here closes it: this thread is a mutator before
+  // it ever runs Bit code.
+  gcThreadEnter()
+
+  return taskAt(int(arg))
+}
+
+fn workerBody(arg: *byte): *byte {
+  let block = workerEnter(arg)
+  let workerAddr = *block
+  let doneAddr = *(block + 1)
+
+  let w = taskAt(workerAddr)
+  // Record this thread's registry slot for the monitor's retake scan (#7128).
+  *(w + wkSlot) = currentMutator(0)
+  let s: *i64 = ptrOf(schedBlock)
+  let backoff = parkMinBackoffNs
+  // ANY IDLE WORKER MAY POLL (#6429, was "worker 0 polls, the rest park",
+  // #1902). The poller role is the token `schedPollerArm` takes
+  // (`runtime/sched/sleep.bit`): the idle worker that wins it blocks in
+  // `worker0Wait` until the next deadline, every other idle worker parks on its
+  // own word as before. A missed wake still costs latency, never a hang: the
+  // park backstop and the wait's ceiling bound every wake source not wired.
+  // The token holder leaves the poller before it runs a task (#6429).
+  let owed = false
+  // The spin budget (#3260, "THE IDLE SPIN" above). Starts false: a worker that
+  // has run nothing yet has no reason to believe work is moments away, and boot
+  // is exactly when N-1 workers find an empty scheduler.
+  let spin = false
+  while (true) {
+    let now = workerPrepareTurn(w, s)
+    let woke = 0
+    if (schedMaintenanceTurn(w, now)) {
+      woke = schedPollerDrain(s)
+    }
+    let addr = schedFindWorkAt(w, now)
+    if (workerNoWork(addr, woke)) {
+      woke = schedPollerDrain(s)
+    }
+    // `woke == 0`, NOT `woke <= 0`: a drain whose only event was this worker's
+    // own wake returns `pollDrainWakeOnly` (negative), and the whole point of
+    // that answer is that this branch must NOT be taken — the wake has already
+    // been consumed and `scPollWait` already claimed, so the wait below could
+    // only end on its ceiling.
+    if (workerNoWork(addr, woke)) {
+      if (atomicLoad(s + scStopping) != 0) {
+        break
+      }
+      // THE TOKEN (#6429): the first idle worker to win the CAS blocks in the
+      // poller until the next deadline; the rest spin once and park. Taking it
+      // AFTER the failed pass is safe because `worker0Wait` re-checks for work
+      // and reads the deadline bound once the token is held: a producer that
+      // published before the take is seen there, one that publishes after finds
+      // the cell armed and claims it (`schedWakePoller`).
+      let holder = schedPollerArm(s)
+      // One bounded burst of userspace retries before the park — see "THE IDLE
+      // SPIN" above. A park clears the budget; only found work re-arms it.
+      addr = workerSpin(w, holder, spin)
+      if (addr == 0) {
+        idleWait(s, w, holder, spin, now)
+        spin = false
+        owed = holder
+        backoff = parkNextBackoff(backoff)
+        continue
+      }
+    }
+    backoff = workerRunTask(w, addr, woke, backoff, owed)
+    owed = false
+    spin = true
+    if (backoff == workerStepStop) {
+      break
+    }
+  }
+  workerExit(w, doneAddr)
+  return nil
+}
 // Trip bound for `joinWorker`, `runtime/thread`'s `JOIN_MAX_POLLS` unchanged, so
 // the join is finite even if the deadline clock misbehaves (Power of 10, rule 2).
 const joinMaxPolls: int = 100000
