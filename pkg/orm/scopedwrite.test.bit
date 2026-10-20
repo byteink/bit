@@ -18,6 +18,13 @@
   body: string,
 }
 
+class swHttpError {
+  text: string
+  code: int
+  message(): string { return this.text }
+  status(): int { return this.code }
+}
+
 class swUser {
   id: string,
 }
@@ -31,9 +38,14 @@ class swGuard {
   lastTable: string
   lastCols: string
   lastBody: string
+  filterMode: int
+  readMode: int
+  filters: []GuardOp
+  firstParams: []int
+  lastValues: string
 
   protects(t: string): bool {
-    return t == "swposts"
+    return t == "swposts" || t == "swtrash"
   }
 
   filter(
@@ -43,6 +55,21 @@ class swGuard {
     dialect: ServerDialect,
     firstParam: int,
   ): GuardFilter! {
+    this.filters = append(this.filters, op)
+    this.firstParams = append(this.firstParams, firstParam)
+    let mode = this.filterMode
+    if (op == GuardOp.Read) {
+      mode = this.readMode
+    }
+    if (mode == 1) {
+      return GuardFilter.None
+    }
+    if (mode == 2) {
+      fail newError("authz: filter unavailable")
+    }
+    if (mode == 3) {
+      return GuardFilter.Sql("author_id = $${firstParam}", [Value.Int(7)])
+    }
     return GuardFilter.All
   }
 
@@ -53,11 +80,15 @@ class swGuard {
     this.lastTable = t
     this.lastCols = join(columns, ",")
     this.lastBody = srArgText(values[2])
+    this.lastValues = srArgsText(values)
     if (this.mode == 2) {
       fail newError("authz: rule store unavailable")
     }
     if (this.mode == 1) {
       return false
+    }
+    if (this.mode == 4) {
+      return srArgText(values[1]) == "i7"
     }
     if (this.mode == 3) {
       return this.lastBody != "tbad"
@@ -66,11 +97,11 @@ class swGuard {
   }
 
   denied(actor: Actor, op: GuardOp, t: string): error {
-    return newError("denied ${actor.id} ${t}")
+    return swHttpError{ text = "denied ${actor.id} ${t}", code = 403 }
   }
 
   notFound(t: string): error {
-    return newError("${t}: not found")
+    return swHttpError{ text = "${t}: not found", code = 404 }
   }
 
   check(): ()! {}
@@ -79,6 +110,7 @@ class swGuard {
 fn swGuardMode(mode: int): swGuard {
   return swGuard{
     mode = mode, asked = 0, lastActor = "", lastOp = GuardOp.Read, lastTable = "", lastCols = "", lastBody = "",
+    filterMode = 0, readMode = 0, filters = []GuardOp(0), firstParams = []int(0), lastValues = "",
   }
 }
 
@@ -254,127 +286,308 @@ test "a guest is checked with an empty id, an unprotected table is not asked, no
   assert(len(c.queries) == 1, "a ScopedRepo with no guard inserts like a plain Repo")
 }
 
-const swLiveSource: string = `import { args } from "std/os"
-import { Actor, GuardFilter, GuardOp, Options, ServerDialect, open } from "orm"
-import { Value } from "std/sql"
-
-@table("swposts") class SwPost {
+@table("swtrash") @softDelete class SwTrash {
   id: i64,
   authorId: i64,
-  body: string,
+  deletedAt: Option<i64>,
 }
 
-// Creates are allowed only for author 7: the proof is that the ORM asks
-// first and writes nothing when the answer is no.
-class OnlySeven {
-  protects(table: string): bool {
-    return table == "swposts"
-  }
+fn swWriteGuard(): swGuard {
+  let g = swGuardMode(4)
+  g.filterMode = 3
+  g.readMode = 3
+  return g
+}
 
-  filter(actor: Actor, op: GuardOp, table: string, dialect: ServerDialect, firstParam: int): GuardFilter! {
-    return GuardFilter.All
-  }
+fn swChanged(): SwPost {
+  return SwPost{ id = 5, authorId = 7, body = "changed" }
+}
 
-  allows(actor: Actor, op: GuardOp, table: string, columns: []string, values: []Value): bool! {
-    match (values[1]) {
-      Int(n) => return n == 7
-      Null => return false
-      Float(_) => return false
-      Bool(_) => return false
-      Text(_) => return false
-      Blob(_) => return false
+fn swExpectExec(a: rawAdapter, sqlText: string, args: string) {
+  assert(len(a.execs) == 1, "expected one write, got ${len(a.execs)}")
+  let q = lastExec(a)
+  assert(q.sql == sqlText, "sql: ${q.sql}")
+  assert(srArgsText(q.args) == args, "args: ${srArgsText(q.args)}")
+}
+
+fn swExpectStatus(e: error, want: int) {
+  let (http, ok) = e.(HttpError)
+  assert(ok, "guard error lost its status: ${e.message()}")
+  assert(http.status() == want, "status ${http.status()}, expected ${want}")
+}
+
+const swUpdateSql: string = "update swposts set author_id = $1, body = $2 where id = $3 and (author_id = $4)"
+const swDeleteSql: string = "delete from swposts where id = $1 and (author_id = $2)"
+const swVisibleSql: string = "select count(*) from swposts where id = $1 and (author_id = $2)"
+
+fn swUpdateAllowed(d: ServerDialect) {
+  let a = newRawAdapter()
+  a.affected = 1
+  let g = swWriteGuard()
+  swRepo(a, d, g).update(swChanged()) catch e {
+    panic(e.message())
+  }
+  swExpectExec(a, swUpdateSql, "i7,tchanged,i5,i7")
+  assert(len(a.queries) == 0, "successful update must not pre-read")
+  assert(
+    a.begins == 1 && a.commits == 1 && a.rollbacks == 0 && a.writeTransaction == 1,
+    "successful DML must run inside the committed transaction",
+  )
+  assert(
+    g.lastOp == GuardOp.Update && g.lastCols == "id,authorId,body",
+    "new-state operation/columns",
+  )
+  assert(g.lastValues == "i5,i7,tchanged", "new-state values: ${g.lastValues}")
+  assert(len(g.filters) == 1 && g.filters[0] == GuardOp.Update, "write filter operation")
+  assert(g.firstParams[0] == 4, "write filter starts after SET and key")
+}
+
+fn swWriteRefused(d: ServerDialect, deleting: bool, visible: bool) {
+  let a = newRawAdapter()
+  a.cols = ["n"]
+  let count = i64(0)
+  let status = 404
+  if (visible) {
+    count = 1
+    status = 403
+  }
+  a.rows = [[Value.Int(count)]]
+  let g = swWriteGuard()
+  let r = swRepo(a, d, g)
+  let refused = false
+  if (deleting) {
+    r.delete(i64(5)) catch e {
+      swExpectStatus(e, status)
+      refused = true
     }
+    swExpectExec(a, swDeleteSql, "i5,i7")
+  } else {
+    r.update(swChanged()) catch e {
+      swExpectStatus(e, status)
+      refused = true
+    }
+    swExpectExec(a, swUpdateSql, "i7,tchanged,i5,i7")
   }
-
-  denied(actor: Actor, op: GuardOp, table: string): error {
-    return newError("denied")
-  }
-
-  notFound(table: string): error {
-    return newError("not found")
-  }
-
-  check(): ()! {}
+  assert(refused, "zero affected rows must resolve to guard error")
+  srExpect(a, swVisibleSql, "i5,i7")
+  assert(a.begins == 1 && a.commits == 0 && a.rollbacks == 1, "refusal must roll back")
+  assert(
+    a.writeTransaction == 1 && a.readTransaction == a.writeTransaction,
+    "DML and visibility must share the same transaction handle",
+  )
+  assert(len(g.filters) == 2 && g.filters[1] == GuardOp.Read, "resolve with Read filter")
+  assert(g.firstParams[1] == 2, "visibility filter starts after key")
 }
 
-class Me {
-  export id: string,
+fn swNewStateRefused(d: ServerDialect) {
+  let a = newRawAdapter()
+  let g = swWriteGuard()
+  let v = swChanged()
+  v.authorId = 8
+  swRepo(a, d, g).update(v) catch e {
+    swExpectStatus(e, 403)
+    assert(g.lastValues == "i5,i8,tchanged", "must check proposed owner")
+    assert(
+      len(a.execs) == 0 && len(a.queries) == 0 && len(g.filters) == 0 && a.begins == 0,
+      "denial before SQL/filter/transaction",
+    )
+    return
+  }
+  assert(false, "owner reassignment must be denied")
 }
 
-fn main(): ()! {
-  let uri = args()[1]
-  let db = open(uri, Options{ authz = OnlySeven{} })?
-  db.exec("drop table if exists swposts")?
-  db.exec(args()[2])?
-  let mine = db.as(Me{ id = "7" }).table<SwPost>()
-  mine.insert(SwPost{ id = 0, authorId = 7, body = "ok" })?
-  mine.insert(SwPost{ id = 0, authorId = 8, body = "no" }) catch e {
-    mine.insertAll([SwPost{ id = 0, authorId = 7, body = "a" }, SwPost{ id = 0, authorId = 8, body = "b" }]) catch e2 {
-      let n = db.asSystem().table<SwPost>().count()?
-      if (n != 1) {
-        panic("LIVE PROOF FAILED: expected 1 row after one allowed and two refused writes")
-      }
-      print("LIVE_PROOF_OK")
+fn swDeleteAllowed(d: ServerDialect) {
+  let a = newRawAdapter()
+  a.affected = 1
+  let g = swWriteGuard()
+  swRepo(a, d, g).delete(i64(5)) catch e {
+    panic(e.message())
+  }
+  swExpectExec(a, swDeleteSql, "i5,i7")
+  assert(len(a.queries) == 0 && g.asked == 0, "delete needs no new-state check/pre-read")
+  assert(g.filters[0] == GuardOp.Delete, "delete filter operation")
+}
+
+fn swSixWrites(d: ServerDialect) {
+  swUpdateAllowed(d)
+  swWriteRefused(d, false, false)
+  swWriteRefused(d, false, true)
+  swNewStateRefused(d)
+  swDeleteAllowed(d)
+  swWriteRefused(d, true, true)
+}
+
+test "guarded writes Postgres: update ok/404/403/new-state denial, delete ok/403 (6 of 6)" {
+  swSixWrites(srPostgres())
+}
+
+test "guarded writes MySQL: update ok/404/403/new-state denial, delete ok/403 (6 of 6)" {
+  swSixWrites(srMysql())
+}
+
+fn swFilterClosed(d: ServerDialect, mode: int) {
+  let a = newRawAdapter()
+  a.cols = ["n"]
+  a.rows = [[Value.Int(1)]]
+  let g = swWriteGuard()
+  g.filterMode = mode
+  swRepo(a, d, g).update(swChanged()) catch e {
+    assert(len(a.execs) == 0, "None/error must never run DML")
+    if (mode == 1) {
+      swExpectStatus(e, 403)
+      srExpect(a, swVisibleSql, "i5,i7")
       return
     }
-    panic("LIVE PROOF FAILED: a batch with a denied row must fail")
+    assert(
+      e.message() == "authz: filter unavailable" && len(a.queries) == 0,
+      "filter error unchanged",
+    )
+    return
   }
-  panic("LIVE PROOF FAILED: a denied insert must fail")
+  assert(false, "None/error must fail closed")
 }
-`
 
-fn swRunLive(envVar: string, name: string, createTable: string) {
-  let uri = env(envVar)
-  if (uri == "") {
-    print("  skipped: ${envVar} is unset, no live server to talk to")
+fn swSavePaths(d: ServerDialect) {
+  let a = newRawAdapter()
+  swRows(a)
+  a.affected = 1
+  a.insertId = 5
+  let g = swWriteGuard()
+  let r = swRepo(a, d, g)
+  let made = r.save(swPost("hi")) catch e {
+    panic(e.message())
+  }
+  assert(made.id == 5 && g.lastOp == GuardOp.Create, "zero key saves through Create")
+  a.execs = []rawCall(0)
+  a.queries = []rawCall(0)
+  let saved = r.save(swChanged()) catch e {
+    panic(e.message())
+  }
+  assert(saved.body == "changed" && g.lastOp == GuardOp.Update, "set key saves through Update")
+  swExpectExec(a, swUpdateSql, "i7,tchanged,i5,i7")
+  assert(len(a.queries) == 0, "save update must not pre-read")
+}
+
+fn swSoftWrites(d: ServerDialect) {
+  let a = newRawAdapter()
+  a.affected = 1
+  let g = swWriteGuard()
+  let db = Db{ pool = newRawPool(a), dialect = d, guard = g }
+  let r = db.as(swUser{ id = "u7" }).table<SwTrash>()
+  r.restore(i64(5)) catch e {
+    panic(e.message())
+  }
+  swExpectExec(
+    a,
+    "update swtrash set deleted_at = $1 where id = $2 and (author_id = $3)",
+    "null,i5,i7",
+  )
+  assert(g.filters[0] == GuardOp.Update, "restore is Update")
+  a.execs = []rawCall(0)
+  r.forceDelete(i64(5)) catch e {
+    panic(e.message())
+  }
+  swExpectExec(a, "delete from swtrash where id = $1 and (author_id = $2)", "i5,i7")
+  assert(g.filters[1] == GuardOp.Delete, "forceDelete is Delete")
+}
+
+test "guarded writes None/error/save/restore/forceDelete use both dialects" {
+  for d of [srPostgres(), srMysql()] {
+    swFilterClosed(d, 1)
+    swFilterClosed(d, 2)
+    swSavePaths(d)
+    swSoftWrites(d)
+  }
+}
+
+@table("swplain") class SwPlainVersion {
+  id: i64
+  name: string
+  @version
+  version: i64
+}
+
+@table("swposts") class SwComposite {
+  @id
+  id: i64
+  @id
+  authorId: i64
+  body: string
+}
+
+@table("swposts") @timestamps class SwStamped {
+  id: i64
+  authorId: i64
+  body: string
+  @version
+  version: i64
+  createdAt: i64
+  updatedAt: i64
+}
+
+fn swPlainPreserved(d: ServerDialect) {
+  let a = newRawAdapter()
+  let db = Db{ pool = newRawPool(a), dialect = d }
+  db.table<SwPlainVersion>().update(SwPlainVersion{ id = 5, name = "old", version = 3 }) catch e {
+    let (stale, ok) = e.(StaleWriteError)
+    assert(
+      ok && stale.oldVersion == 3 && stale.newVersion == 4,
+      "plain stale-version error preserved",
+    )
+    swExpectExec(
+      a,
+      "update swplain set name = $1, version = $2 where id = $3 and version = $4",
+      "told,i4,i5,i3",
+    )
+    assert(a.begins == 0 && len(a.queries) == 0, "ordinary update adds no transaction/read")
     return
   }
-  let repoRoot = findRepoRoot()
-  if (repoRoot == "") {
-    print("  skipped: cannot locate the repo root; set BIT_REPO")
-    return
-  }
-  let ormAbs = "${repoRoot}/pkg/orm"
-  let postgresAbs = "${repoRoot}/pkg/postgres"
-  let mysqlAbs = "${repoRoot}/pkg/mysql"
-  let proj = scratchDir("liveproof7037${name}")
-  mkdir(proj) catch e {
-    panic("mkdir: ${e.message()}")
-  }
-  writeFile(
-    "${proj}/bit.json",
-    "{\"name\": \"liveproof7037${name}\", \"dependencies\": {\"orm\": \"${ormAbs}\", \"postgres\": \"${postgresAbs}\", \"mysql\": \"${mysqlAbs}\"}}\n",
+  assert(false, "plain stale update must fail")
+}
+
+fn swCompositeChain(d: ServerDialect) {
+  let a = newRawAdapter()
+  a.affected = 1
+  let g = swWriteGuard()
+  let db = Db{ pool = newRawPool(a), dialect = d, guard = g }
+  db.as(swUser{ id = "u7" }).table<SwComposite>().where("body", "old").update(
+    SwComposite{ id = 5, authorId = 7, body = "changed" },
   ) catch e {
-    panic("writeFile bit.json: ${e.message()}")
+    panic(e.message())
   }
-  writeFile(
-    "${proj}/bit.lock",
-    "{\"orm\": {\"path\": \"${ormAbs}\", \"requires\": {}}, \"postgres\": {\"path\": \"${postgresAbs}\", \"requires\": {}}, \"mysql\": {\"path\": \"${mysqlAbs}\", \"requires\": {}}}\n",
+  swExpectExec(
+    a, "update swposts set body = $2 where body = $1 and id = $3 and author_id = $4 and (author_id = $5)",
+    "told,tchanged,i5,i7,i7",
+  )
+  assert(g.firstParams[0] == 5, "filter follows chain, SET and both keys")
+}
+
+fn swVersionStamp(d: ServerDialect) {
+  let a = newRawAdapter()
+  a.affected = 1
+  let g = swWriteGuard()
+  let db = Db{ pool = newRawPool(a), dialect = d, guard = g }
+  db.as(swUser{ id = "u7" }).table<SwStamped>().update(
+    SwStamped{ id = 5, authorId = 7, body = "v", version = 3, createdAt = 12, updatedAt = 13 },
   ) catch e {
-    panic("writeFile bit.lock: ${e.message()}")
+    panic(e.message())
   }
-  writeFile("${proj}/main.bit", swLiveSource) catch e {
-    panic("writeFile main.bit: ${e.message()}")
-  }
-  let bin = envOr("BIT_BIN", "${repoRoot}/bit-out/bin/bit")
-  let rc = run(bin, ["run", "${proj}/main.bit", uri, createTable])
+  let q = lastExec(a)
   assert(
-    rc == 0,
-    "live proof against a real ${name} server failed, rc=${rc}; run manually: ${bin} run ${proj}/main.bit '${uri}' '<ddl>'",
+      q.sql ==
+      "update swposts set author_id = $1, body = $2, version = $3, created_at = $4, updated_at = $5 where id = $6 and version = $7 and (author_id = $8)",
+    "version/timestamp SQL: ${q.sql}",
   )
-  resetDir(proj)
+  assert(srArgsText(q.args[0:4]) == "i7,tv,i4,i12", "version increments and creation time stays")
+  assert(srArgsText(q.args[5:8]) == "i5,i3,i7", "key, old version, guard arguments")
+  assert(srArgText(q.args[4]) != "i13", "updatedAt must be stamped")
+  assert(g.lastValues == "i5,i7,tv,i3,i12,i13", "guard checks caller values before stamps")
 }
 
-test "live: a denied insert and a batch with a denied row write nothing on Postgres (#7037)" {
-  swRunLive(
-    "ORM_TEST_LIVE_PG_URI", "pg",
-    "create table swposts (id bigint generated always as identity primary key, author_id bigint not null, body text not null)",
-  )
-}
-
-test "live: a denied insert and a batch with a denied row write nothing on MySQL (#7037)" {
-  swRunLive(
-    "ORM_TEST_LIVE_MYSQL_URI", "mysql",
-    "create table swposts (id bigint auto_increment primary key, author_id bigint not null, body text not null)",
-  )
+test "guarded writes preserve ordinary stale errors, composite chain keys, versions and timestamps" {
+  for d of [srPostgres(), srMysql()] {
+    swPlainPreserved(d)
+    swCompositeChain(d)
+    swVersionStamp(d)
+  }
 }

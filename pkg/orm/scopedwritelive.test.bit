@@ -1,0 +1,234 @@
+// Guarded create and write proofs against the existing live ORM provider.
+// Shared test helpers and types come from sibling test files in this module.
+
+const swLiveSource: string = `import { args } from "std/os"
+import { Actor, Db, GuardFilter, GuardOp, Options, Repo, ScopedRepo, ServerDialect, open } from "orm"
+import { Value } from "std/sql"
+
+@table("swposts") class SwPost {
+  id: i64,
+  authorId: i64,
+  body: string,
+}
+
+// Author 7 owns the fixture; readers may see it without being allowed to write.
+class OnlySeven {
+  protects(table: string): bool {
+    return table == "swposts" || table == "swtrash"
+  }
+
+  filter(actor: Actor, op: GuardOp, table: string, dialect: ServerDialect, firstParam: int): GuardFilter! {
+    if (op == GuardOp.Read && actor.id != "hidden") { return GuardFilter.All }
+    let owner = i64(8)
+    if (actor.id == "7") { owner = 7 }
+    return GuardFilter.Sql("author_id = $@P@", [Value.Int(owner)])
+  }
+
+  allows(actor: Actor, op: GuardOp, table: string, columns: []string, values: []Value): bool! {
+    match (values[1]) {
+      Int(n) => return n == 7
+      Null => return false
+      Float(_) => return false
+      Bool(_) => return false
+      Text(_) => return false
+      Blob(_) => return false
+    }
+  }
+
+  denied(actor: Actor, op: GuardOp, table: string): error {
+    return LiveError{ code = 403 }
+  }
+
+  notFound(table: string): error {
+    return LiveError{ code = 404 }
+  }
+
+  check(): ()! {}
+}
+
+class LiveError {
+  code: int
+  message(): string { return "status @C@" }
+  status(): int { return this.code }
+}
+
+interface StatusError { message(): string, status(): int }
+
+class Me {
+  export id: string,
+}
+
+fn createProof(): ()! {
+  let uri = args()[1]
+  let db = open(uri, Options{ authz = OnlySeven{} })?
+  db.exec("drop table if exists swposts")?
+  db.exec(args()[2])?
+  let mine = db.as(Me{ id = "7" }).table<SwPost>()
+  mine.insert(SwPost{ id = 0, authorId = 7, body = "ok" })?
+  mine.insert(SwPost{ id = 0, authorId = 8, body = "no" }) catch e {
+    mine.insertAll([SwPost{ id = 0, authorId = 7, body = "a" }, SwPost{ id = 0, authorId = 8, body = "b" }]) catch e2 {
+      let n = db.asSystem().table<SwPost>().count()?
+      if (n != 1) {
+        panic("LIVE PROOF FAILED: expected 1 row after one allowed and two refused writes")
+      }
+      print("LIVE_PROOF_OK")
+      return
+    }
+    panic("LIVE PROOF FAILED: a batch with a denied row must fail")
+  }
+  panic("LIVE PROOF FAILED: a denied insert must fail")
+}
+fn expectStatus(e: error, code: int) {
+  let (http, ok) = e.(StatusError)
+  assert(ok, "guard error must keep HTTP status")
+  assert(http.status() == code, "wrong denial status")
+}
+
+fn unchanged(sys: Repo<SwPost>, before: SwPost): ()! {
+  let after = sys.find(before.id)?
+  assert(after.id == before.id && after.authorId == before.authorId && after.body == before.body,
+    "denial changed persisted row bytes")
+}
+
+fn refusedUpdate(mine: ScopedRepo<SwPost>, sys: Repo<SwPost>, before: SwPost, code: int): ()! {
+  let v = SwPost{ id = before.id, authorId = before.authorId, body = "forbidden ' bytes" }
+  mine.update(v) catch e {
+    expectStatus(e, code)
+    unchanged(sys, before)?
+    return
+  }
+  panic("unauthorized update succeeded")
+}
+
+fn refusedDelete(mine: ScopedRepo<SwPost>, sys: Repo<SwPost>, before: SwPost, code: int): ()! {
+  mine.delete(before.id) catch e {
+    expectStatus(e, code)
+    unchanged(sys, before)?
+    return
+  }
+  panic("unauthorized delete succeeded")
+}
+
+@table("swtrash") @softDelete class SwTrash {
+  id: i64,
+  authorId: i64,
+  deletedAt: Option<i64>,
+}
+
+fn softProof(db: Db): ()! {
+  db.exec("drop table if exists swtrash")?
+  db.exec("create table swtrash (id bigint primary key, author_id bigint not null, deleted_at bigint null)")?
+  db.exec("insert into swtrash (id, author_id, deleted_at) values (5, 7, 123)")?
+  let mine = db.as(Me{ id = "7" }).table<SwTrash>()
+  mine.restore(i64(5))?
+  let sys = db.asSystem().table<SwTrash>()
+  let row = sys.find(i64(5))?
+  match (row.deletedAt) {
+    None => {}
+    Some(_) => panic("restore must clear deletedAt")
+  }
+  mine.delete(i64(5))?
+  assert(mine.count()? == 0 && mine.withDeleted().count()? == 1, "delete hides row")
+  mine.restore(i64(5))?
+  mine.forceDelete(i64(5))?
+  assert(sys.withDeleted().count()? == 0, "forceDelete removes restored row")
+}
+
+fn main(): ()! {
+  createProof()?
+  let db = open(args()[1], Options{ authz = OnlySeven{} })?
+  let sys = db.asSystem().table<SwPost>()
+  let mine = db.as(Me{ id = "7" }).table<SwPost>()
+  let row = sys.first()?
+  match (row) {
+    Some(v) => {
+      v.body = "owner's changed bytes"
+      mine.update(v)?
+      unchanged(sys, v)?
+      print("GUARDED_LIVE_SCENARIO_1_OK")
+      refusedUpdate(db.as(Me{ id = "reader" }).table<SwPost>(), sys, v, 403)?
+      print("GUARDED_LIVE_SCENARIO_2_OK")
+      refusedUpdate(db.as(Me{ id = "hidden" }).table<SwPost>(), sys, v, 404)?
+      print("GUARDED_LIVE_SCENARIO_3_OK")
+      let reassigned = SwPost{ id = v.id, authorId = 8, body = v.body }
+      let refused = false
+      mine.update(reassigned) catch e { expectStatus(e, 403); refused = true }
+      assert(refused, "owner reassignment must fail")
+      unchanged(sys, v)?
+      print("GUARDED_LIVE_SCENARIO_4_OK")
+      refusedDelete(db.as(Me{ id = "reader" }).table<SwPost>(), sys, v, 403)?
+      refusedDelete(db.as(Me{ id = "hidden" }).table<SwPost>(), sys, v, 404)?
+      mine.delete(v.id)?
+      assert(sys.count()? == 0, "owner delete removes row")
+      print("GUARDED_LIVE_SCENARIO_5_OK")
+    }
+    None => panic("fixture row missing")
+  }
+  let fresh = mine.save(SwPost{ id = 0, authorId = 7, body = "saved new" })?
+  fresh.body = "saved existing"
+  mine.save(fresh)?
+  unchanged(sys, fresh)?
+  softProof(db)?
+  print("GUARDED_LIVE_5_OF_5_OK")
+}
+
+`
+
+fn swRunLive(envVar: string, name: string, createTable: string) {
+  let uri = env(envVar)
+  if (uri == "") {
+    print("  skipped: ${envVar} is unset, no live server to talk to")
+    return
+  }
+  let repoRoot = findRepoRoot()
+  if (repoRoot == "") {
+    print("  skipped: cannot locate the repo root; set BIT_REPO")
+    return
+  }
+  let ormAbs = "${repoRoot}/pkg/orm"
+  let postgresAbs = "${repoRoot}/pkg/postgres"
+  let mysqlAbs = "${repoRoot}/pkg/mysql"
+  let proj = scratchDir("liveproof7037${name}")
+  mkdir(proj) catch e {
+    panic("mkdir: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.json",
+    "{\"name\": \"liveproof7037${name}\", \"dependencies\": {\"orm\": \"${ormAbs}\", \"postgres\": \"${postgresAbs}\", \"mysql\": \"${mysqlAbs}\"}}\n",
+  ) catch e {
+    panic("writeFile bit.json: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.lock",
+    "{\"orm\": {\"path\": \"${ormAbs}\", \"requires\": {}}, \"postgres\": {\"path\": \"${postgresAbs}\", \"requires\": {}}, \"mysql\": {\"path\": \"${mysqlAbs}\", \"requires\": {}}}\n",
+  ) catch e {
+    panic("writeFile bit.lock: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/main.bit",
+    replace(replace(swLiveSource, "@P@", "$" + "{firstParam}"), "@C@", "$" + "{this.code}"),
+  ) catch e {
+    panic("writeFile main.bit: ${e.message()}")
+  }
+  let bin = envOr("BIT_BIN", "${repoRoot}/bit-out/bin/bit")
+  let rc = run(bin, ["run", "${proj}/main.bit", uri, createTable])
+  assert(
+    rc == 0,
+    "live proof against a real ${name} server failed, rc=${rc}; run manually: ${bin} run ${proj}/main.bit '${uri}' '<ddl>'",
+  )
+  resetDir(proj)
+}
+
+test "live: guarded create and five write scenarios leave denied rows unchanged on Postgres (#7038)" {
+  swRunLive(
+    "ORM_TEST_LIVE_PG_URI", "pg",
+    "create table swposts (id bigint generated always as identity primary key, author_id bigint not null, body text not null)",
+  )
+}
+
+test "live: guarded create and five write scenarios leave denied rows unchanged on MySQL (#7038)" {
+  swRunLive(
+    "ORM_TEST_LIVE_MYSQL_URI", "mysql",
+    "create table swposts (id bigint auto_increment primary key, author_id bigint not null, body text not null)",
+  )
+}
