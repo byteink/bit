@@ -1,0 +1,238 @@
+// Reuse the module's recording driver and guards; live proofs use the same
+// public package boundary as the other scoped repository tests.
+fn stxReads(dialect: ServerDialect) {
+  let a = newRawAdapter()
+  srPostRows(a)
+  let g = srGuardMode(2)
+  let db = srDb(a, dialect, g)
+  defer db.pool.close()
+  db.as(srUser{ id = "u7" }, "inkwell").tx((tx) => {
+    assert(tx.tenant == "inkwell", "transaction lost tenant")
+    let posts = tx.table<SPost>()
+    a.readTransaction = 0
+    posts.all()?
+    assert(a.readTransaction == 1, "all escaped the transaction")
+    a.readTransaction = 0
+    posts.find(5)?
+    assert(a.readTransaction == 1, "find escaped the transaction")
+    a.readTransaction = 0
+    posts.where("body", "hi").lock().find(5)?
+    assert(a.readTransaction == 1, "lock escaped the transaction")
+  }) catch e {
+    panic("scoped transaction: ${e.message()}")
+  }
+  assert(a.begins == 1 && a.commits == 1 && a.rollbacks == 0, "one transaction must commit")
+  assert(
+    g.asked == 3 && g.lastActor == "u7" && g.lastOp == GuardOp.Read,
+    "all three reads must be scoped",
+  )
+  assert(len(a.queries) == 3, "expected three filtered queries")
+  assert(a.queries[0].sql == "select * from sposts where (author_id = $1)", a.queries[0].sql)
+  assert(
+    a.queries[1].sql == "select * from sposts where id = $1 and (author_id = $2) limit 2",
+    a.queries[1].sql,
+  )
+  assert(
+      a.queries[2].sql ==
+      "select * from sposts where body = $1 and id = $2 and (author_id = $3) limit 2 for update",
+    a.queries[2].sql,
+  )
+  assert(srArgsText(a.queries[0].args) == "tu7", "all lost actor binding")
+  assert(srArgsText(a.queries[1].args) == "i5,tu7", "find lost actor binding")
+  assert(srArgsText(a.queries[2].args) == "thi,i5,tu7", "lock lost chain or actor binding")
+}
+
+test "ScopedTx filters all three transaction reads on Postgres (#7040)" {
+  stxReads(srPostgres())
+}
+
+test "ScopedTx filters all three transaction reads on MySQL (#7040)" {
+  stxReads(srMysql())
+}
+
+fn stxRefused(mode: int) {
+  let a = newRawAdapter()
+  let g = srGuardMode(mode)
+  let db = srDb(a, srPostgres(), g)
+  defer db.pool.close()
+  db.as(srUser{ id = "u7" }).tx((tx) => {
+    tx.table<SPost>().lock().find(5)?
+  }) catch e {
+    let expected = "sposts: not found"
+    if (mode == 3) {
+      expected = "authz: rule store unavailable"
+    }
+    assert(e.message() == expected, e.message())
+    assert(len(a.queries) == 0 && len(a.execs) == 0, "refused lock ran SQL")
+    assert(a.rollbacks == 1 && a.commits == 0, "failed closure must roll back")
+    return
+  }
+  panic("refused locking read succeeded")
+}
+
+test "ScopedTx locking None and filter errors fail closed and roll back (#7040)" {
+  stxRefused(1)
+  stxRefused(3)
+}
+
+test "ScopedTx locking preserves soft delete and rejects a forged pool handle (#7040)" {
+  let a = newRawAdapter()
+  let db = srDb(a, srPostgres(), srGuardMode(2))
+  defer db.pool.close()
+  a.cols = ["id", "author_id", "deleted_at"]
+  a.rows = [[Value.Int(5), Value.Int(7), Value.Null]]
+  db.as(srUser{ id = "u7" }).tx((tx) => {
+    tx.table<SDPost>().lock(LockMode.SkipLocked).find(5)?
+  }) catch e {
+    panic(e.message())
+  }
+  assert(contains(lastQuery(a).sql, "deleted_at is null"), lastQuery(a).sql)
+  assert(hasSuffix(lastQuery(a).sql, "for update skip locked"), lastQuery(a).sql)
+  let before = len(a.queries)
+  let forged = ScopedLockedRepo<SPost>{ inner = db.asGuest().table<SPost>(), opts = LockOpts{} }
+  forged.find(5) catch e {
+    let (lockError, ok) = e.(LockError)
+    assert(ok && lockError.cause == LockCause.NotInTransaction, e.message())
+    assert(len(a.queries) == before, "pool lock must not query")
+    return
+  }
+  panic("pool-backed scoped lock succeeded")
+}
+
+test "Scoped handles expose no raw SQL and pool ScopedRepo exposes no lock (#7040)" {
+  let root = findRepoRoot()
+  assert(root != "", "set BIT_REPO for scoped API surface proof")
+  let scoped = readFile("${root}/pkg/orm/scoped.bit") catch e {
+    panic(e.message())
+  }
+  let transaction = readFile("${root}/pkg/orm/scopedtx.bit") catch e {
+    panic(e.message())
+  }
+  let plain = readFile("${root}/pkg/orm/db.bit") catch e {
+    panic(e.message())
+  }
+  let scopedDb = split(split(scoped, "export class ScopedDb {")[1], "export class ScopedRepo<")[0]
+  let scopedTx = split(
+    split(transaction, "export class ScopedTx {")[1],
+    "export class ScopedTxRepo<",
+  )[0]
+  for src of [scopedDb, scopedTx] {
+    assert(
+      !contains(src, "export exec(") && !contains(src, "export query<"),
+      "scoped raw SQL bypass",
+    )
+  }
+  let poolRepo = split(split(scoped, "export class ScopedRepo<")[1], "export class SystemDb")[0]
+  assert(!contains(poolRepo, "export lock("), "pool ScopedRepo must not offer lock")
+  assert(
+    count(plain, "export exec(") == 2 && count(plain, "export query<") == 2,
+    "plain Db and TxHandle retain raw SQL",
+  )
+}
+
+const stxLiveSource: string = `import { args } from "std/os"
+import { Actor, Db, GuardFilter, GuardOp, Options, ServerDialect, open } from "orm"
+import { Value } from "std/sql"
+
+@table("stxposts") class StxPost { id: i64, authorId: i64, body: string }
+class StxUser { export id: string }
+class StxGuard {
+  protects(table: string): bool { return table == "stxposts" }
+  filter(actor: Actor, op: GuardOp, table: string, dialect: ServerDialect, firstParam: int): GuardFilter! {
+    return GuardFilter.Sql("author_id = $@P@", [Value.Text(actor.id)])
+  }
+  allows(actor: Actor, op: GuardOp, table: string, columns: []string, values: []Value): bool! {
+    match (values[1]) {
+      Int(id) => return "@ID@" == actor.id
+      Null => return false
+      Float(_) => return false
+      Bool(_) => return false
+      Text(_) => return false
+      Blob(_) => return false
+    }
+  }
+  denied(actor: Actor, op: GuardOp, table: string): error { return newError("stx denied") }
+  notFound(table: string): error { return newError("stx not found") }
+  check(): ()! {}
+}
+
+fn rollbackProof(db: Db): ()! {
+  db.as(StxUser{ id = "7" }, "inkwell").tx((tx) => {
+    let posts = tx.table<StxPost>()
+    let p = posts.lock().find(1)?
+    assert(p.body == "before", "lock did not read own row")
+    p.body = "rollback me"
+    posts.update(p)?
+    p.authorId = 8
+    posts.update(p)?
+  }) catch e {
+    assert(e.message() == "stx denied", e.message())
+    let all = db.asSystem().table<StxPost>().orderBy("id").all()?
+    assert(len(all) == 2 && all[0].body == "before" && all[1].body == "foreign", "denial failed to roll back allowed write")
+    print("SCOPED_TX_ROLLBACK_OK")
+    return
+  }
+  panic("denied update committed")
+}
+
+fn dropProofTable(db: Db) {
+  db.exec("drop table stxposts") catch e { panic(e.message()) }
+}
+
+fn main(): ()! {
+  let db = open(args()[1], Options{ authz = StxGuard{} })?
+  defer db.pool.close()
+  db.exec("drop table if exists stxposts")?
+  db.exec("create table stxposts (id bigint primary key, author_id bigint not null, body text not null)")?
+  defer dropProofTable(db)
+  db.exec("insert into stxposts (id, author_id, body) values (?, ?, ?)", i64(1), i64(7), "before")?
+  db.exec("insert into stxposts (id, author_id, body) values (?, ?, ?)", i64(2), i64(8), "foreign")?
+  rollbackProof(db)?
+  db.as(StxUser{ id = "7" }).tx((tx) => {
+    tx.table<StxPost>().lock().find(2)?
+  }) catch e {
+    assert(e.message() == "stx not found", e.message())
+    print("SCOPED_TX_HIDDEN_LOCK_OK")
+    return
+  }
+  panic("locking read exposed foreign row")
+}
+`
+
+fn stxLive(envName: string, label: string) {
+  let uri = env(envName)
+  if (uri == "") {
+    print("  skipped: ${envName} is unset")
+    return
+  }
+  let root = findRepoRoot()
+  assert(root != "", "set BIT_REPO for scoped transaction live proof")
+  let proj = scratchDir("scopedtx7040${label}")
+  mkdir(proj) catch e {
+    panic(e.message())
+  }
+  defer resetDir(proj)
+  let deps = "\"orm\": \"${root}/pkg/orm\", \"postgres\": \"${root}/pkg/postgres\", \"mysql\": \"${root}/pkg/mysql\""
+  writeFile("${proj}/bit.json", "{\"name\":\"scopedtx7040\",\"dependencies\":{${deps}}}") catch e {
+    panic(e.message())
+  }
+  let locks = "\"orm\":{\"path\":\"${root}/pkg/orm\",\"requires\":{}},\"postgres\":{\"path\":\"${root}/pkg/postgres\",\"requires\":{}},\"mysql\":{\"path\":\"${root}/pkg/mysql\",\"requires\":{}}"
+  writeFile("${proj}/bit.lock", "{${locks}}") catch e {
+    panic(e.message())
+  }
+  let source = replace(replace(stxLiveSource, "@P@", "$" + "{firstParam}"), "@ID@", "$" + "{id}")
+  writeFile("${proj}/main.bit", source) catch e {
+    panic(e.message())
+  }
+  let bin = envOr("BIT_BIN", "${root}/bit-out/bin/bit")
+  let rc = run(bin, ["run", "${proj}/main.bit", uri])
+  assert(rc == 0, "scoped transaction live ${label} failed: ${rc}")
+}
+
+test "live: scoped transaction denial rolls back and locking read hides foreign row on Postgres (#7040)" {
+  stxLive("ORM_TEST_LIVE_PG_URI", "pg")
+}
+
+test "live: scoped transaction denial rolls back and locking read hides foreign row on MySQL (#7040)" {
+  stxLive("ORM_TEST_LIVE_MYSQL_URI", "mysql")
+}

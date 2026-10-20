@@ -358,5 +358,47 @@ table, or a repository with no guard, keeps the plain repository's behavior.
 Use `db.asSystem()` for a trusted maintenance job that must bypass these
 rules. Request handlers should keep using the actor's scoped handle.
 
+## Editing together in one scoped transaction
+
+An edit may need to lock a draft before changing it. Start the transaction
+on the request's scoped handle so every repository inside it keeps the same
+author, tenant and guard:
+
+```bit
+import { Db, LockMode, ScopedLockedRepo, ScopedTx, ScopedTxRepo } from "orm"
+
+fn editInTransaction(tx: ScopedTx, id: i64, body: string): ()! {
+  let drafts: ScopedTxRepo<Draft> = tx.table<Draft>()
+  let locked: ScopedLockedRepo<Draft> = drafts.lock(LockMode.Update)
+  let draft = locked.find(id)?
+  draft.body = body
+  drafts.update(draft)?
+}
+
+fn editDraft(db: Db, author: Author, id: i64, body: string): ()! {
+  db.as(author, "inkwell").tx((tx) => {
+    editInTransaction(tx, id, body)?
+  })?
+}
+```
+
+`ScopedDb.tx` commits when its closure returns normally and rolls back on
+a failure or panic. Let a denial propagate with `?` to roll back earlier
+allowed writes in the same closure. Catching a denial inside the closure
+and returning normally still commits its earlier work, as with `Db.tx`.
+
+`ScopedTx.table<T>()` returns a `ScopedTxRepo<T>`. It forwards the scoped
+read and write methods and keeps its transaction type through `where`,
+`orderBy`, `limit`, `offset`, `after` and `withDeleted`. Only this
+transaction repository offers `lock`; a pool-backed `ScopedRepo` does not.
+`lock` returns a `ScopedLockedRepo<T>` whose `find` applies the read filter,
+the chain's conditions and the soft-delete condition before locking. An
+unreadable row returns the guard's `notFound` error. The existing dialect
+rules for `LockMode.SkipLocked` and `LockMode.NoWait` still apply.
+
+Neither `ScopedDb` nor `ScopedTx` offers `exec` or `query`: raw SQL cannot
+be checked against row rules. Trusted raw SQL still uses `Db` or
+`TxHandle`; keep those handles outside request helpers that need the guard.
+
 Where to go next: [Querying](query.md) for the chain a guard narrows, and
 [Raw SQL and transactions](raw.md) for the handles that carry it.
