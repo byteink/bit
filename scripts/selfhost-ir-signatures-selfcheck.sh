@@ -108,11 +108,14 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 
   expect "" "$(explainMismatch 'kw_in 0..2' 'ident 0..2' tokens)" 'retired token identity'
   for kind in ir iropt ast fmt types diags tokens doc; do
-    expect "" "$(declaredSignatureNames "$kind")" "$kind registry"
+    case "$kind" in ir|iropt) want=6791-fallible-aggregate-words ;; *) want= ;; esac
+    expect "$want" "$(declaredSignatureNames "$kind")" "$kind registry"
   done
 
   /bin/bash "$ROOT/scripts/selfhost-diffiropt.sh" --literal-selfcheck || fail=1
-  python3 - "$ROOT/scripts/selfhost-ir-signatures.sh" <<'PYTHON'
+  . "$ROOT/scripts/selfhost-diffdump-setup.sh"
+  diffdump_aggregate_fixture_library || exit 1
+  python3 - "$ROOT/scripts/selfhost-ir-signatures.sh" "$DIFFDUMP_AGGREGATE_FIXTURES" <<'PYTHON'
 import atexit
 import base64
 import json
@@ -122,6 +125,7 @@ import subprocess
 import sys
 import tempfile
 helper = sys.argv[1]
+exec(sys.argv[2])
 old = b"""func tail$t59(%0: Builder, %1: i64) string {
 bb0(%0: Builder, %1: i64):
   %2 = const_int i64 0
@@ -161,15 +165,6 @@ objects = {}
 clean_env = {k: v for k, v in os.environ.items()
              if not k.startswith(("BIT", "LIBBITRT", "DIFFALL", "BOXLOCK"))
              and k not in ("ORACLE", "TIMEOUT_S", "BASH_ENV", "ENV")}
-def fixture_pool(raw):
-    remaining, found = raw, []
-    for value in sorted(values, key=len, reverse=True):
-        token = b'const_string "' + value + b'"'
-        if token in remaining:
-            found.append(value)
-            remaining = remaining.replace(token, b"FIXED_LITERAL")
-    assert b"const_string" not in remaining, "undeclared literal fixture"
-    return tuple(sorted(set(found)))
 def fixture_object(pool):
     if pool not in objects:
         wrapper = os.path.join(os.path.dirname(helper), "selfhost-diffiropt.sh")
@@ -691,6 +686,7 @@ scalar = b"  %9 = const_int i64 1\n  %10 = rt_call slice_append_fresh(%7, %9, %3
 mixed_field = field.replace(b"  %8 = rt_call", scalar + b"  %8 = rt_call").replace(b"slice_append_slice_fresh(%7,", b"slice_append_slice_fresh(%10,")
 field_check(field_source.replace(b"    h.items =", b"    h.items = append(h.items, 1)\n    h.items ="), body=mixed_field)
 print("retired 6175 identity: field/scalar/bulk cases and strict refusals passed")
+aggregate_fixture_controls(verdict, objects, store)
 PYTHON
   rc=$?
   [ "$rc" -eq 0 ] || fail=1
