@@ -513,6 +513,13 @@ class stmtServer {
     let payload = s[4:len(s)]
     let cmd = int([]byte(payload)[0])
     this.seq = int([]byte(s)[3]) + 1
+    if (cmd == comQuery) {
+      this.sent = append(this.sent, "query ${payload[1:len(payload)]}")
+      for p of this.executeReply {
+        this.reply(p)
+      }
+      return
+    }
     if (cmd == comStmtPrepare) {
       this.sent = append(this.sent, "prepare")
       // 0x00, statement id 7, 0 columns, 0 params, filler, 0 warnings.
@@ -646,4 +653,96 @@ test "a cached statement stays open and is reused without a second prepare" {
     i = i + 1
   }
   assert(sentIs(s, []string{ "prepare", "execute 7", "execute 7" }), "sent: ${join(s.sent, " | ")}")
+}
+
+test "parameterless exec sends savepoint controls over COM_QUERY (#8399)" {
+  let s = stmtServerReplying([]string{ stmtOkPacket() })
+  let c = stmtConn(s, 4)
+  for sqlText of [
+    "SAVEPOINT bit_sp_1",
+    "ROLLBACK TO SAVEPOINT bit_sp_1",
+    "RELEASE SAVEPOINT bit_sp_1",
+  ] {
+    let result = c.exec(sqlText, []Value(0)) catch e {
+      panic(e.message())
+    }
+    assert(result.rowsAffected == 0, "transaction control changed rows")
+    assert(!c.cache.has(sqlText), "parameterless exec entered the statement cache")
+  }
+  assert(
+    sentIs(
+      s,
+      [
+        "query SAVEPOINT bit_sp_1",
+        "query ROLLBACK TO SAVEPOINT bit_sp_1",
+        "query RELEASE SAVEPOINT bit_sp_1",
+      ],
+    ),
+    join(s.sent, " | "),
+  )
+  assert(len(s.out) == 0, "transaction replies left unread")
+}
+
+test "parameterless exec retains affected rows and generated id (#8399)" {
+  let s = stmtServerReplying([]string{ bytesOf([]int{ 0, 3, 252, 52, 18, 2, 0, 0, 0 }) })
+  let c = stmtConn(s, 0)
+  let result = c.exec("insert into t (n) values (1), (2), (3)", []Value(0)) catch e {
+    panic(e.message())
+  }
+  assert(result.rowsAffected == 3, "text exec lost affected rows")
+  match (result.lastInsertId) {
+    Some(id) => assert(id == 4660, "text exec lost generated id")
+    None => panic("text exec dropped last_insert_id")
+  }
+  assert(sentIs(s, ["query insert into t (n) values (1), (2), (3)"]), join(s.sent, " | "))
+  assert(len(s.out) == 0, "OK packet left unread")
+}
+
+test "parameterless exec drains a text rowset before the next command (#8399)" {
+  let def = bytesOf([]int{ 1, 100, 0, 0, 0, 2, 105, 100, 0 }) +
+    bytesOf([]int{ 12, 63, 0, 4, 0, 0, 0, 3, 32, 0, 0, 0, 0 })
+  let eof = bytesOf([]int{ 254, 0, 0, 0, 0 })
+  let s = stmtServerReplying([bytesOf([]int{ 1 }), def, eof, bytesOf([]int{ 1, 53 }), eof])
+  let c = stmtConn(s, 0)
+  let result = c.exec("select id from t", []Value(0)) catch e {
+    panic(e.message())
+  }
+  assert(result.rowsAffected == 0 && len(s.out) == 0, "exec did not consume text rows")
+  s.executeReply = [stmtOkPacket()]
+  c.exec("SAVEPOINT bit_sp_1", []Value(0)) catch e {
+    panic(e.message())
+  }
+  assert(sentIs(s, ["query select id from t", "query SAVEPOINT bit_sp_1"]), join(s.sent, " | "))
+  assert(len(s.out) == 0, "next command did not consume its own reply")
+}
+
+test "parameterless exec preserves server errors and the next reply (#8399)" {
+  let s = stmtServerReplying([serverErrPacket()])
+  let c = stmtConn(s, 0)
+  let failed = false
+  let _ = c.exec("bad statement", []Value(0)) catch e {
+    failed = true
+    let (my, ok) = e.(sqlError)
+    assert(ok && my.errorCode() == 1062 && my.sqlState() == "42000", e.message())
+    ExecResult{ rowsAffected = 0 }
+  }
+  assert(failed && len(s.out) == 0, "server error must be returned and consumed")
+  s.executeReply = [stmtOkPacket()]
+  c.exec("SAVEPOINT bit_sp_1", []Value(0)) catch e {
+    panic(e.message())
+  }
+  assert(sentIs(s, ["query bad statement", "query SAVEPOINT bit_sp_1"]), join(s.sent, " | "))
+}
+
+test "bound exec keeps the prepared protocol and arity checks (#8399)" {
+  let s = stmtServerReplying([stmtOkPacket()])
+  let c = stmtConn(s, 0)
+  let failed = false
+  // This server advertises zero parameters. The mismatch must be caught
+  // after PREPARE, before EXECUTE, and the prepared statement must close.
+  c.exec("update t set n = $1", [Value.Int(9)]) catch _ {
+    failed = true
+  }
+  assert(failed, "bound exec skipped prepared arity validation")
+  assert(sentIs(s, ["prepare", "close 7"]), join(s.sent, " | "))
 }
