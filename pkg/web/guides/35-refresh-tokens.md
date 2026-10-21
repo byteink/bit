@@ -8,16 +8,16 @@ for a new pair. Each exchange must retire the old refresh token, so a copied
 credential cannot keep creating fresh access unnoticed.
 
 Against the [finished app](README.md#run-the-finished-app), send the
-`refreshToken` returned by `/auth/token`:
+`refreshToken` returned by `/v1/auth/token`:
 
 ```text
-curl -s http://127.0.0.1:8080/auth/token/refresh \
+curl -s http://127.0.0.1:8080/v1/auth/token/refresh \
   -H 'Content-Type: application/json' \
   -d "{\"refreshToken\":\"$REFRESH_TOKEN\"}"
 ```
 
 The `data` object holds a new `accessToken` and a new `refreshToken`. Replace
-both saved values together. The new access token works on `/api/me`; the old
+both saved values together. The new access token works on `/v1/api/me`; the old
 refresh token must never be sent again.
 
 ## Keep the credential out of the database
@@ -209,7 +209,7 @@ fn refreshTokenRoute(c: Ctx, db: Db, tokens: RefreshTokens, access: AccessTokens
 }
 ```
 
-`mountAuth` registers this handler at `POST /auth/token/refresh`, passing the
+`mountAuth` registers this handler at `POST /v1/auth/token/refresh`, passing the
 same database, refresh service and access-token service used for issuance.
 It reloads the user before making the access token, so the current role goes
 into the new claims.
@@ -251,7 +251,7 @@ The refresh response is the only place you receive the new credential.
 Only its hash is stored, so a lost response cannot be recovered by asking
 the database for the token. Reauthenticate when the client loses it.
 
-`/auth/logout` only destroys Inkwell's cookie session. Although the store has
+`/v1/auth/logout` only destroys Inkwell's cookie session. Although the store has
 `revokeFamily` and `revokeSubject` for the package to call, Inkwell has no
 refresh-token sign-out endpoint. Revoking a refresh family also leaves
 already-issued access tokens valid until their own expiry and clock skew.

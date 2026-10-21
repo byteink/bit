@@ -4,7 +4,7 @@
 
 A reader remembers a word from an article but has forgotten its title.
 Exact title filters cannot help them. Inkwell lets them search the title
-and body together through `GET /articles?q=...`.
+and body together through `GET /v1/articles?q=...`.
 
 ## Try the existing search
 
@@ -13,7 +13,7 @@ applied. Publish an article containing a distinctive word through the
 [article route](08-querying-and-crud.md), then search for that word:
 
 ```text
-curl -i --get http://127.0.0.1:8080/articles --data-urlencode 'q=PostgreSQL'
+curl -i --get http://127.0.0.1:8080/v1/articles --data-urlencode 'q=PostgreSQL'
 ```
 
 The request needs no session. The result uses the same list-item fields as
@@ -159,7 +159,7 @@ in the app; there is no second search-only model.
 
 ## Check the behavior
 
-The test named `GET /articles?q= runs a full-text search and returns the matching article`
+The test named `GET /v1/articles?q= runs a full-text search and returns the matching article`
 in [`app.test.bit`](inkwell/app.test.bit) publishes an article with a unique
 term, searches for it, and checks the response contains that term. Run the
 app tests against the migrated PostgreSQL database from

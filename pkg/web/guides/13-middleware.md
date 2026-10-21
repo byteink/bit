@@ -54,6 +54,10 @@ middleware wraps everything registered after it, so `recover()` has to come
 first to catch a panic anywhere downstream, and `logger()` has to come right
 after it to time everything that follows.
 
+The requests below use the [finished app](README.md#run-the-finished-app),
+whose routes are mounted under `/v1`. The smaller code examples keep the
+local paths they register.
+
 ## Logging every request
 
 `logger()` writes one `INFO` record per request through the app's
@@ -61,12 +65,12 @@ after it to time everything that follows.
 method, the matched route, the status and how long the whole chain took.
 
 ```
-$ curl -s http://127.0.0.1:8080/health
+$ curl -s http://127.0.0.1:8080/v1/health
 $ tail -1 inkwell.log
-time=2026-09-27T19:55:43Z level=INFO msg=request method=GET path=/health status=200 took=412us
+time=2026-09-27T19:55:43Z level=INFO msg=request method=GET path=/v1/health status=200 took=412us
 ```
 
-It logs the route *pattern* (`/articles/:id`), never the concrete request
+It logs the route *pattern* (`/v1/articles/:id`), never the concrete request
 path, so a route like `/reset/:token` never leaks a credential into a log
 file. If you want to know which article id was requested, log that
 yourself, deliberately, at the place you decide it is safe to.
@@ -77,7 +81,7 @@ yourself, deliberately, at the place you decide it is safe to.
 and almost none remember to:
 
 ```
-$ curl -s -i http://127.0.0.1:8080/health | grep -E '^(HTTP|X-|Referrer|Cross-Origin|Content-Security)'
+$ curl -s -i http://127.0.0.1:8080/v1/health | grep -E '^(HTTP|X-|Referrer|Cross-Origin|Content-Security)'
 HTTP/1.1 200 OK
 X-Content-Type-Options: nosniff
 X-Frame-Options: DENY
@@ -104,7 +108,7 @@ every origin has to be spelled out. A preflight from the allowed origin gets
 answered directly, before the route ever runs:
 
 ```
-$ curl -s -i -X OPTIONS http://127.0.0.1:8080/articles \
+$ curl -s -i -X OPTIONS http://127.0.0.1:8080/v1/articles \
     -H "Origin: http://localhost:3000" \
     -H "Access-Control-Request-Method: POST" \
     -H "Access-Control-Request-Headers: Content-Type"
@@ -122,7 +126,7 @@ An origin that is not on the list is not an error. It just gets no
 refuse to hand the response to the page:
 
 ```
-$ curl -s -i -X OPTIONS http://127.0.0.1:8080/articles \
+$ curl -s -i -X OPTIONS http://127.0.0.1:8080/v1/articles \
     -H "Origin: http://evil.example.com" \
     -H "Access-Control-Request-Method: POST"
 HTTP/1.1 405 Method Not Allowed
@@ -140,7 +144,7 @@ default) and rejects once the quota is spent. Every response carries the
 quota so a well behaved client can back off on its own:
 
 ```
-$ curl -s -i http://127.0.0.1:8080/health | grep -i ratelimit
+$ curl -s -i http://127.0.0.1:8080/v1/health | grep -i ratelimit
 RateLimit-Limit: 120
 RateLimit-Remaining: 119
 RateLimit-Reset: 60
@@ -151,7 +155,7 @@ RateLimit-Reset: 60
 rejection carries the same headers plus one more:
 
 ```
-$ curl -s -i http://127.0.0.1:8080/health
+$ curl -s -i http://127.0.0.1:8080/v1/health
 HTTP/1.1 429 Too Many Requests
 RateLimit-Limit: 120
 RateLimit-Remaining: 0

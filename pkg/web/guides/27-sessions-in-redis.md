@@ -10,17 +10,17 @@ Start the [finished app](README.md#run-the-finished-app), register a user,
 then keep the cookie returned by login:
 
 ```sh
-curl -X POST http://localhost:8080/auth/register \
+curl -X POST http://localhost:8080/v1/auth/register \
   -H 'Content-Type: application/json' \
   -d '{"username":"writer","email":"writer@example.test","password":"correct horse battery"}'
-curl -c /tmp/inkwell-cookies -X POST http://localhost:8080/auth/login \
+curl -c /tmp/inkwell-cookies -X POST http://localhost:8080/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"writer","password":"correct horse battery"}'
-curl -b /tmp/inkwell-cookies http://localhost:8080/me
+curl -b /tmp/inkwell-cookies http://localhost:8080/v1/me
 ```
 
 Run another app instance on a different `PORT` with the same database,
-Redis and secrets. Send the same cookie to its `/me` route. It returns the
+Redis and secrets. Send the same cookie to its `/v1/me` route. It returns the
 same signed-in user. Logging out through either instance revokes that
 session for both.
 

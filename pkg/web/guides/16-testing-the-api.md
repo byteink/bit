@@ -82,8 +82,8 @@ fn jsonReq(method: string, path: string, cookie: string, body: string): Request 
 }
 
 fn register(app: App, username: string): Response! {
-  let body = "{\"username\":\"${username}\",\"password\":\"correct horse\"}"
-  let res = app.handle(jsonReq("POST", "/auth/register", "", body))
+  let body = "{\"username\":\"${username}\",\"email\":\"${username}@example.test\",\"password\":\"correct horse\"}"
+  let res = app.handle(jsonReq("POST", "/v1/auth/register", "", body))
   if (res.status != 201) {
     fail newError("register: want 201, got ${res.status}")
   }
@@ -165,7 +165,7 @@ examples. A run includes:
 ```
 $ bit test app.test.bit
 ok   health and readiness answer without authentication
-ok   register, login, and read back the caller's own profile with /me
+ok   register, login, and read back the caller's own profile with /v1/me
 ok   a duplicate username registers 409, and a wrong password logs in 401
 ok   creating an article attaches its tags atomically, and the detail route shows both
 ok   only the article's own author (or an admin) may update or delete it

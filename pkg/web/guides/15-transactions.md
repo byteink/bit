@@ -135,20 +135,24 @@ transaction with no extra plumbing to wire them together.
 
 ## Proving it
 
+The requests below use the [finished app](README.md#run-the-finished-app),
+whose routes are mounted under `/v1`. The smaller code examples keep the
+local paths they register.
+
 Four articles already exist. Send one more, naming a tag name over 60
 characters, which is longer than the `tag.name` column allows:
 
 ```
-$ curl -s "http://127.0.0.1:8080/articles?limit=1" | grep -o '"total":[0-9]*'
+$ curl -s "http://127.0.0.1:8080/v1/articles?limit=1" | grep -o '"total":[0-9]*'
 "total":4
 
-$ curl -s -i -b ada.cookies -X POST http://127.0.0.1:8080/articles \
+$ curl -s -i -b ada.cookies -X POST http://127.0.0.1:8080/v1/articles \
     -H "Content-Type: application/json" \
     -d '{"title":"This one should not be saved","body":"rollback proof","tags":["ok","xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]}'
 HTTP/1.1 500 Internal Server Error
 {"error":{"code":"internal_error","message":"Internal Server Error"}}
 
-$ curl -s "http://127.0.0.1:8080/articles?limit=1" | grep -o '"total":[0-9]*'
+$ curl -s "http://127.0.0.1:8080/v1/articles?limit=1" | grep -o '"total":[0-9]*'
 "total":4
 ```
 
@@ -158,7 +162,7 @@ now. It is not: `total` is unchanged. The `"ok"` tag, which was successfully
 inserted moments before the long one failed, is gone too:
 
 ```
-$ curl -s "http://127.0.0.1:8080/tags"
+$ curl -s "http://127.0.0.1:8080/v1/tags"
 {"data":[{"id":1,"name":"bit"},{"id":2,"name":"tutorial"},{"id":3,"name":"web"},{"id":4,"name":"database"}]}
 ```
 

@@ -20,22 +20,22 @@ Google documents the [client and redirect setup](https://developers.google.com/i
 a mismatch produces `redirect_uri_mismatch`.
 
 For an app running locally on port 8080, register
-`http://127.0.0.1:8080/auth/google/callback`, then set:
+`http://127.0.0.1:8080/v1/auth/google/callback`, then set:
 
 ```text
 export GOOGLE_CLIENT_ID='your-client-id.apps.googleusercontent.com'
 export GOOGLE_CLIENT_SECRET='your-client-secret'
-export GOOGLE_REDIRECT_URL='http://127.0.0.1:8080/auth/google/callback'
+export GOOGLE_REDIRECT_URL='http://127.0.0.1:8080/v1/auth/google/callback'
 ```
 
 Use HTTPS for a deployed application and register that deployment's callback
 instead. Keep the secret on the server. Restart Inkwell after changing these
 values: [`loadConfig`](inkwell/config.bit) reads them once at startup.
 
-Open `http://127.0.0.1:8080/auth/google` in your browser. After Google's
-consent step, the browser returns to `/auth/google/callback`. Successful
+Open `http://127.0.0.1:8080/v1/auth/google` in your browser. After Google's
+consent step, the browser returns to `/v1/auth/google/callback`. Successful
 application code returns `204 No Content`, so there is no welcome page.
-Visit `/me` in the same browser to fetch the local public user.
+Visit `/v1/me` in the same browser to fetch the local public user.
 
 This is the intended configured flow. Local signed callback fixtures check
 account binding, and the disabled-route test checks `404`. A real Google
@@ -62,6 +62,7 @@ const sessionRoleKey = "inkwell:role"
 
 export class AppConfig {
   export databaseUrl: string,
+  export redisUrl: string,
   export secret: string,
   export host: string,
   export port: int,
@@ -241,7 +242,8 @@ for signature, issuer, audience, nonce, state and PKCE checks. Only after those
 checks and local account validation does the app set its user id and role.
 
 These route registrations are excerpted from `mountAuth`, where `app`, `db`
-and `cfg` already exist:
+and `cfg` already exist. Here `app: Routes` is the `/v1` group passed by
+`main.bit`; the paths below are relative to that group:
 
 ```text
 app.get("/auth/google", (c) => googleBegin(c, cfg))
@@ -262,7 +264,7 @@ link flow must verify the local account and require explicit consent.
 
 ## Check what can be checked without Google
 
-The test `GET /auth/google is disabled (404) when Google sign-in is not configured`
+The test `GET /v1/auth/google is disabled (404) when Google sign-in is not configured`
 in [`app.test.bit`](inkwell/app.test.bit) keeps the feature optional. With
 the PostgreSQL setup from [Testing the API](16-testing-the-api.md), run:
 
@@ -278,7 +280,7 @@ rollback after a binding insert fails, and the real foreign key. The auth packag
 tests its OIDC callback verification. Neither suite needs Google credentials
 or performs a real Google redirect.
 A configured deployment still needs the browser round trip described above,
-including checking `/me` after the callback.
+including checking `/v1/me` after the callback.
 
 ## Sharp edges
 
@@ -286,7 +288,7 @@ Google sign-in creates an Inkwell cookie session. It does not return the
 access/refresh pair from the previous chapters, and Google's ID token is not
 an Inkwell bearer access token.
 
-`POST /auth/logout` ends the local session only. It does not sign the browser
+`POST /v1/auth/logout` ends the local session only. It does not sign the browser
 out of Google, so a later Google sign-in may complete without another
 password prompt. See the [package's OIDC guide](../../auth/docs/oidc.md)
 for the provider flow and logout behavior.

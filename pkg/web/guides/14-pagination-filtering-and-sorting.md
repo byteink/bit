@@ -142,10 +142,14 @@ into one shape.
 
 ## Trying it
 
+The requests below use the [finished app](README.md#run-the-finished-app),
+whose routes are mounted under `/v1`. The smaller code examples keep the
+local paths they register.
+
 Four articles exist: two by user 1, two by user 2. Ask for two at a time:
 
 ```
-$ curl -s "http://127.0.0.1:8080/articles?limit=2&page=1"
+$ curl -s "http://127.0.0.1:8080/v1/articles?limit=2&page=1"
 {
   "data": [
     { "id": 4, "title": "Filtering and sorting lists", "slug": "filtering-and-sorting-lists-f36c1a8b", "authorId": 2, "createdAt": 1790538920604367000 },
@@ -154,21 +158,21 @@ $ curl -s "http://127.0.0.1:8080/articles?limit=2&page=1"
   "meta": { "total": 4, "limit": 2, "cursor": "2" }
 }
 
-$ curl -s "http://127.0.0.1:8080/articles?limit=2&page=2"
+$ curl -s "http://127.0.0.1:8080/v1/articles?limit=2&page=2"
 {"data":[{"id":2,"title":"Writing your first middleware","slug":"writing-your-first-middleware-5cf2890f","authorId":1,"createdAt":1790538916470255000},{"id":1,"title":"Getting started with Bit","slug":"getting-started-with-bit-76b48683","authorId":1,"createdAt":1790538916281701000}],"meta":{"total":4,"limit":2,"cursor":"3"}}
 ```
 
 Filter to one author, and `total` drops to that author's own count:
 
 ```
-$ curl -s "http://127.0.0.1:8080/articles?author=1"
+$ curl -s "http://127.0.0.1:8080/v1/articles?author=1"
 {"data":[{"id":2, ...},{"id":1, ...}],"meta":{"total":2,"limit":20,"cursor":"2"}}
 ```
 
 Ask for the oldest first instead of the newest:
 
 ```
-$ curl -s "http://127.0.0.1:8080/articles?sort=oldest&limit=1"
+$ curl -s "http://127.0.0.1:8080/v1/articles?sort=oldest&limit=1"
 {"data":[{"id":1,"title":"Getting started with Bit", ...}],"meta":{"total":4,"limit":1,"cursor":"2"}}
 ```
 
