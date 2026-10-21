@@ -1,0 +1,252 @@
+import {
+  FormBuilder as CoverForm,
+  Header as CoverHeader,
+  get as fetchCover,
+  requestWith as fetchCoverWith,
+} from "std/http"
+import { repeat as coverRepeat } from "std/strings"
+import { list as coverList, S3Error as CoverS3Error } from "s3"
+
+// A complete one-pixel RGBA PNG with valid chunk checksums.
+const testCoverPng = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0d\x49\x44\x41\x54\x78\x9c\x63\x60\x60\x60\xf8\x0f\x00\x01\x04\x01\x00\x5f\xe5\xc3\x4b\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82"
+
+fn coverRequest(id: string, cookie: string, body: string, contentType: string): Request {
+  return Request{
+    method = "POST", path = "/v1/articles/${id}/cover", body = body,
+    headers = "Cookie: ${cookie}\r\nContent-Type: ${contentType}",
+  }
+}
+
+fn postCover(app: App, id: string, cookie: string, body: string): Response {
+  let form = CoverForm()
+  form.file("cover", "../../untrusted.png", "image/png", []byte(body)) catch e {
+    panic(e.message())
+  }
+  let encoded = form.build() catch e {
+    panic(e.message())
+  }
+  return app.handle(coverRequest(id, cookie, string(encoded.body), encoded.contentType))
+}
+
+fn coverDb(): Db {
+  return redisGuideDb() catch e {
+    panic(e.message())
+  }
+}
+
+fn currentCoverKey(db: Db, id: string): string {
+  let article = findArticleById(
+    db,
+    parseId(id) catch e {
+      panic(e.message())
+    },
+  ) catch e {
+    panic(e.message())
+  }
+  assert(isSome(article.coverImageKey), "cover key was not stored")
+  return unwrap(article.coverImageKey)
+}
+
+fn coverTestClient(): CoverClient {
+  return coverClient(
+    testConfig() catch e {
+      panic(e.message())
+    },
+  ) catch e {
+    panic(e.message())
+  }
+}
+
+fn assertNoCoverObjects(id: string) {
+  let rows = coverList(coverTestClient(), "articles/${id}/covers/")
+  let first = rows.next() catch e {
+    panic(e.message())
+  }
+  assert(isNone(first), "failed save left an unreferenced object")
+}
+
+test "cover image: owner uploads and public readers fetch a genuine signed object and byte range" {
+  let app = testApp()
+  let cookie = registerAndLogin(app, uniqueName("cover-owner"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let id = postArticle(app, cookie, "An illustrated article", "[]") catch e {
+    panic(e.message())
+  }
+  let path = "/v1/articles/${id}/cover"
+  let absent = app.handle(Request{ method = "GET", path = path, headers = "", body = "" })
+  assert(absent.status == 404, "an article without a cover must return 404")
+  let saved = postCover(app, id, cookie, testCoverPng)
+  assert(saved.status == 204, "cover upload failed: ${saved.status}: ${saved.body}")
+  let db = coverDb()
+  defer db.pool.close()
+  let key = currentCoverKey(db, id)
+  assert(
+    contains(key, "articles/${id}/covers/") && !contains(key, ".."),
+    "untrusted filename reached storage key",
+  )
+  let read = app.handle(Request{ method = "GET", path = path, headers = "", body = "" })
+  assert(read.status == 302, "public cover read must redirect")
+  let url = read.getHeader("Location")
+  assert(contains(url, "X-Amz-Expires=300"), "presigned lifetime changed")
+  let object = fetchCover(url) catch e {
+    panic(e.message())
+  }
+  assert(object.status == 200 && object.body == testCoverPng, "signed cover roundtrip failed")
+  let range = fetchCoverWith("GET", url, [CoverHeader{ name = "Range", value = "bytes=0-7" }], "") catch e {
+    panic(e.message())
+  }
+  assert(
+    range.status == 206 && range.body == testCoverPng[:8],
+    "storage did not serve the byte range",
+  )
+  let replaced = postCover(app, id, cookie, testCoverPng)
+  assert(replaced.status == 204, "cover replacement failed: ${replaced.body}")
+  assert(currentCoverKey(db, id) != key, "replacement reused an untrusted or stable object key")
+  let old = coverTestClient().get(key) catch e {
+    let (missing, ok) = e.(CoverS3Error)
+    assert(ok && missing.status == 404, "old-object probe failed without a storage404")
+    return
+  }
+  panic("old cover survived replacement: ${len(old)} bytes")
+}
+
+test "cover image: authentication and ownership precede body parsing or storage" {
+  let app = testApp()
+  let owner = registerAndLogin(app, uniqueName("cover-author"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let other = registerAndLogin(app, uniqueName("cover-other"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let id = postArticle(app, owner, "Private writes", "[]") catch e {
+    panic(e.message())
+  }
+  let anonymous = app.handle(coverRequest(id, "", "malformed", "text/plain"))
+  assert(anonymous.status == 401, "anonymous upload must require authentication")
+  let refused = app.handle(coverRequest(id, other, "malformed", "text/plain"))
+  assert(refused.status == 403, "another author must be refused before body parsing")
+  assertNoCoverObjects(id)
+}
+
+test "cover image: malformed, mismatched and oversized files leave no object" {
+  let app = testApp()
+  let cookie = registerAndLogin(app, uniqueName("cover-limits"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let id = postArticle(app, cookie, "Safe uploads", "[]") catch e {
+    panic(e.message())
+  }
+  let malformed = app.handle(coverRequest(id, cookie, "malformed", "text/plain"))
+  assert(malformed.status == 400, "non-multipart upload must fail")
+  let mismatch = postCover(app, id, cookie, "<svg>not a PNG</svg>")
+  assert(mismatch.status == 415, "declared image type must agree with its signature")
+  let oversized = postCover(app, id, cookie, testCoverPng + coverRepeat("x", coverMaxBytes))
+  assert(oversized.status == 400, "oversized image must fail")
+  let overBody = app.handle(
+    coverRequest(
+      id,
+      cookie,
+      coverRepeat("x", coverMaxBytes + 4097),
+      "multipart/form-data; boundary=large",
+    ),
+  )
+  assert(overBody.status == 413, "the request-body cap must run before multipart parsing")
+  assertNoCoverObjects(id)
+}
+
+test "cover image: database refusal compensates the uploaded object" {
+  let app = testApp()
+  let cookie = registerAndLogin(app, uniqueName("cover-rollback"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let id = postArticle(app, cookie, "Rollback cover", "[]") catch e {
+    panic(e.message())
+  }
+  let db = coverDb()
+  defer db.pool.close()
+  let constraint = "reject_cover_${id}"
+  db.exec("alter table articles add constraint ${constraint} check (id <> ${id} or cover_image_key is null)") catch e {
+    panic(e.message())
+  }
+  defer {
+    db.exec("alter table articles drop constraint ${constraint}") catch e {
+      panic(e.message())
+    }
+  }
+  let refused = postCover(app, id, cookie, testCoverPng)
+  assert(refused.status == 500, "database refusal must not report successful upload")
+  let article = findArticleById(
+    db,
+    parseId(id) catch e {
+      panic(e.message())
+    },
+  ) catch e {
+    panic(e.message())
+  }
+  assert(isNone(article.coverImageKey), "failed database update retained a cover reference")
+  assertNoCoverObjects(id)
+}
+
+test "cover image: an administrator can replace another author's cover" {
+  let app = testApp()
+  let owner = registerAndLogin(app, uniqueName("cover-original"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let id = postArticle(app, owner, "Editorial cover", "[]") catch e {
+    panic(e.message())
+  }
+  let name = uniqueName("cover-admin")
+  let _ = registerAndLogin(app, name, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let db = coverDb()
+  defer db.pool.close()
+  db.exec("update users set role = ? where username = ?", "admin", name) catch e {
+    panic(e.message())
+  }
+  let login = app.handle(
+    jsonReq(
+      "POST",
+      "/v1/auth/login",
+      "",
+      "{\"username\":\"${name}\",\"password\":\"correct horse battery\"}",
+    ),
+  )
+  assert(login.status == 204, "administrator login failed")
+  let saved = postCover(app, id, cookiePair(login.getHeader("Set-Cookie")), testCoverPng)
+  assert(saved.status == 204, "administrator cover write was refused")
+}
+
+test "cover image: storage failure leaves the database reference empty" {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  cfg.s3SecretKey = "wrong-secret"
+  let app = buildApp(cfg) catch e {
+    panic(e.message())
+  }
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  let cookie = registerAndLogin(app, uniqueName("cover-storage-failure"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let id = postArticle(app, cookie, "Storage refusal", "[]") catch e {
+    panic(e.message())
+  }
+  let refused = postCover(app, id, cookie, testCoverPng)
+  assert(refused.status == 500, "storage refusal must not report successful upload")
+  let db = coverDb()
+  defer db.pool.close()
+  let article = findArticleById(
+    db,
+    parseId(id) catch e {
+      panic(e.message())
+    },
+  ) catch e {
+    panic(e.message())
+  }
+  assert(isNone(article.coverImageKey), "storage refusal changed the database reference")
+  assertNoCoverObjects(id)
+}
