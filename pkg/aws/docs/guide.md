@@ -97,6 +97,45 @@ precedence. Its `role_session_name` takes precedence over
 keeps the result in its cache. A configured token-file or STS failure is an
 error; the provider does not silently choose another identity.
 
+### A workstation identity for Inkwell
+
+When Inkwell runs on a developer's workstation, use its IAM Identity Center
+profile rather than copying temporary keys into the application. The existing
+profile resolver reads the token cache created by AWS's sign-in tools:
+
+```ini
+[profile inkwell]
+sso_session = workplace
+sso_account_id = 123456789012
+sso_role_name = Developer
+
+[sso-session workplace]
+sso_start_url = https://example.awsapps.com/start
+sso_region = eu-west-1
+```
+
+```bit
+import { Credentials } from "aws"
+
+fn main()! {
+  let identity = Credentials.Profile("inkwell").resolver()?
+  let credential = identity.resolve()?
+  println(credential.show())
+}
+```
+
+The resolver reads `~/.aws/sso/cache/<SHA1 of the session name>.json`.
+Session tokens inside the five-minute refresh window use OIDC's refresh grant
+and replace the cache atomically with owner-only permissions. The application
+never starts a browser or an interactive login. If a session cannot refresh
+and its token has expired, the error directs the operator to `aws sso login`.
+A still-valid token remains usable when a proactive refresh fails.
+
+Legacy profiles put `sso_start_url`, `sso_region`, `sso_account_id` and
+`sso_role_name` together in the profile. Their cache name hashes the start URL;
+legacy tokens must be renewed externally after expiration. Existing static
+keys and web identity retain their precedence over SSO settings.
+
 ### A task role for Inkwell
 
 Inkwell deployed as an ECS task or EKS pod uses the task's temporary identity

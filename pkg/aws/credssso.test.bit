@@ -1,0 +1,257 @@
+// Cache layout follows smithy getSSOTokenFilepath at 5d104567b718.
+// Its upstream test mocks SHA1; these real digests use independent SHA1 vectors.
+class SsoSeen {
+  refreshStatus: int,
+  roleStatus: int,
+  refreshes: int,
+  roles: int,
+  grant: string,
+  bearer: string,
+  path: string,
+  roleMethod: string,
+  expires: int,
+  roleExpiry: int,
+}
+
+fn ssoFake(seen: SsoSeen, req: Request): Response {
+  if (req.path == "/token") {
+    seen.refreshes = seen.refreshes + 1
+    seen.grant = req.body
+    return ssoFakeRefresh(seen, req)
+  }
+  seen.roles = seen.roles + 1
+  seen.bearer = req.headers
+  seen.path = req.path
+  seen.roleMethod = req.method
+  return reply(
+    seen.roleStatus,
+    "{\"roleCredentials\":{\"accessKeyId\":\"ASIAEXAMPLE\",\"secretAccessKey\":\"test-secret\",\"sessionToken\":\"role-token\",\"expiration\":${seen.roleExpiry}}}",
+  )
+}
+
+fn ssoFakeRefresh(seen: SsoSeen, req: Request): Response {
+  let value = jsonParse(req.body) catch _ {
+    return reply(400, "{}")
+  }
+  let grant = ssoText(value, "grantType") catch _ {
+    return reply(400, "{}")
+  }
+  if (req.method != "POST" || grant != "refresh_token") {
+    return reply(400, "{}")
+  }
+  return reply(
+    seen.refreshStatus,
+    "{\"accessToken\":\"fresh-access\",\"expiresIn\":${seen.expires},\"refreshToken\":\"rotated-refresh\"}",
+  )
+}
+
+fn ssoServe(seen: SsoSeen): (Server, string) {
+  let server = serve("127.0.0.1", 0) catch e {
+    panic(e.message())
+  }
+  let port = server.port() catch e {
+    server.close()
+    panic(e.message())
+  }
+  spawn ssoListen(server, seen)
+  return (server, "http://127.0.0.1:${port}")
+}
+
+fn ssoListen(server: Server, seen: SsoSeen) {
+  listenAndServeOn(server, (req) => ssoFake(seen, req)) catch _ {
+    return
+  }
+}
+
+fn ssoFixtureConfig(session: string = "demo"): SsoConfig {
+  return SsoConfig{
+    session = session, startUrl = "https://d-1234567890.awsapps.com/start",
+    region = "us-east-1", account = "123456789012", role = "Reader",
+  }
+}
+
+fn ssoFixtureToken(expiry: string): string {
+  return "{\"accessToken\":\"old-access\",\"expiresAt\":\"${expiry}\",\"clientId\":\"test-client\",\"clientSecret\":\"test-client-secret\",\"refreshToken\":\"old-refresh\",\"registrationExpiresAt\":\"2099-01-01T00:00:00Z\"}"
+}
+
+fn ssoCleanup(path: string) {
+  remove(path) catch _ {}
+}
+
+fn ssoFixturePath(): string {
+  return envOr("TMPDIR", "/tmp") + "/t6617-${ssoUuidText(ssoUuid())}.json"
+}
+
+fn ssoFailure(call: () => AwsCredential!): string {
+  call() catch e {
+    return e.message()
+  }
+  return ""
+}
+
+test "SSO cache paths use exact SHA1 names for three session and start URL inputs" {
+  let inputs = ["mock_sso_start_url", "my-sso", "https://d-1234567890.awsapps.com/start"]
+  let hashes = [
+    "1960230a565be412b03e60169a116616f76a25ff",
+    "0ad374308c5a4e22f723adf10145eafad7c4031c",
+    "7487b5b67d5fa1132cf33fa93ae51ef38cc37752",
+  ]
+  let i = 0
+  while (i < len(inputs)) {
+    assert(
+      ssoCachePath("/home/fixture", inputs[i]) == "/home/fixture/.aws/sso/cache/${hashes[i]}.json",
+      "cache filename",
+    )
+    i = i + 1
+  }
+}
+
+test "SSO session and legacy configuration validate account region role and matching overrides" {
+  let profiles = configData(parsed("[profile app]\nsso_session = demo\nsso_account_id = 123456789012\nsso_role_name = Reader\n[sso-session demo]\nsso_start_url = https://example.com/start\nsso_region = eu-west-1\n"))
+  let (profile, found) = profiles.sections["app"]
+  assert(found, "profile fixture")
+  let config = ssoProfileConfig(profile, profiles) catch e {
+    panic(e.message())
+  }
+  assert(config.session == "demo" && config.region == "eu-west-1", "session config")
+  profile["sso_region"] = "us-east-1"
+  let mismatch = false
+  ssoProfileConfig(profile, profiles) catch _ {
+    mismatch = true
+  }
+  assert(mismatch, "conflicting session region accepted")
+  assert(!ssoRegionValid("us-east-1/../evil") && !ssoRegionValid("x.y"), "region injection")
+  assert(
+    !ssoIdentityValid("123", "Reader") && !ssoIdentityValid("123456789012", "../role"),
+    "identity validation",
+  )
+  let legacy = ssoFixtureConfig("")
+  assert(legacy.session == "", "legacy token must not refresh")
+}
+
+test "SSO expired session refreshes once and atomically preserves registration and rotates tokens" {
+  let time = at("2026-10-03T12:00:00Z").ns
+  let seen = SsoSeen{
+    refreshStatus = 200,
+    roleStatus = 200,
+    expires = 3600,
+    roleExpiry = time / Millisecond + 3600000,
+  }
+  let (server, endpoint) = ssoServe(seen)
+  defer server.close()
+  let path = ssoFixturePath()
+  defer ssoCleanup(path)
+  write(path, ssoFixtureToken("2026-10-03T11:59:59Z"))
+  let credential = ssoResolve(ssoFixtureConfig(), path, endpoint, endpoint, time) catch e {
+    panic("role exchange failed: refresh=${seen.refreshes} role=${seen.roles} ${e.message()}")
+  }
+  assert(credential.accessKeyId == "ASIAEXAMPLE", "role credentials")
+  assert(seen.refreshes == 1 && seen.roles == 1, "request counts")
+  assert(
+    seen.roleMethod == "GET" && contains(seen.path, "/federation/credentials"),
+    "portal request",
+  )
+  assert(
+    contains(seen.grant, "refresh_token") && contains(seen.grant, "test-client"),
+    "refresh grant",
+  )
+  assert(
+    contains(seen.bearer, "fresh-access") && !contains(seen.bearer, "old-access"),
+    "refreshed bearer",
+  )
+  let cached = ssoRead(path) catch e {
+    panic(e.message())
+  }
+  let refreshed = ssoText(cached, "refreshToken") catch e {
+    panic(e.message())
+  }
+  let registration = ssoText(cached, "registrationExpiresAt") catch e {
+    panic(e.message())
+  }
+  let expiration = ssoTokenExpiry(cached) catch e {
+    panic(e.message())
+  }
+  assert(refreshed == "rotated-refresh", "refresh rotation")
+  assert(registration == "2099-01-01T00:00:00Z", "registration retained")
+  assert(expiration == time + 3600000000000, "token expiry")
+  let info = stat(path) catch e {
+    panic(e.message())
+  }
+  assert((info.mode & 0o777) == 0o600, "private token permissions")
+}
+
+test "SSO legacy uses a valid cached token without OIDC and rejects expired tokens with login guidance" {
+  let time = at("2026-10-03T12:00:00Z").ns
+  let seen = SsoSeen{
+    refreshStatus = 200,
+    roleStatus = 200,
+    expires = 3600,
+    roleExpiry = time / Millisecond + 3600000,
+  }
+  let (server, endpoint) = ssoServe(seen)
+  defer server.close()
+  let path = ssoFixturePath()
+  defer ssoCleanup(path)
+  write(path, ssoFixtureToken("2026-10-03T12:01:00Z"))
+  let credential = ssoResolve(ssoFixtureConfig(""), path, endpoint, endpoint, time) catch e {
+    panic("role exchange failed: refresh=${seen.refreshes} role=${seen.roles} ${e.message()}")
+  }
+  assert(credential.accessKeyId == "ASIAEXAMPLE" && seen.refreshes == 0, "legacy exchange")
+  write(path, ssoFixtureToken("1678-01-01T00:00:00Z"))
+  let message = ssoFailure(() => ssoResolve(ssoFixtureConfig(""), path, endpoint, endpoint, time))
+  assert(
+    contains(message, "run aws sso login") && seen.refreshes == 0 && seen.roles == 1,
+    "expired legacy",
+  )
+}
+
+test "SSO refresh failure preserves the cache and serves only still valid access tokens" {
+  let time = at("2026-10-03T12:00:00Z").ns
+  let seen = SsoSeen{
+    refreshStatus = 400,
+    roleStatus = 200,
+    expires = 3600,
+    roleExpiry = time / Millisecond + 3600000,
+  }
+  let (server, endpoint) = ssoServe(seen)
+  defer server.close()
+  let path = ssoFixturePath()
+  defer ssoCleanup(path)
+  let original = ssoFixtureToken("2026-10-03T11:59:59Z")
+  write(path, original)
+  let message = ssoFailure(() => ssoResolve(ssoFixtureConfig(), path, endpoint, endpoint, time))
+  assert(contains(message, "run aws sso login"), "refresh failure guidance")
+  assert(
+    !contains(message, "test-client-secret") && !contains(message, "old-refresh"),
+    "secret in error",
+  )
+  let retained = readFile(path) catch e {
+    panic(e.message())
+  }
+  assert(retained == original && seen.roles == 0, "failed refresh altered cache")
+  write(path, ssoFixtureToken("2026-10-03T12:01:00Z"))
+  let credential = ssoResolve(ssoFixtureConfig(), path, endpoint, endpoint, time) catch e {
+    panic(e.message())
+  }
+  assert(
+    credential.accessKeyId == "ASIAEXAMPLE" && contains(seen.bearer, "old-access"),
+    "valid token fallback",
+  )
+}
+
+test "SSO missing malformed and oversized token inputs fail before a network exchange" {
+  let time = at("2026-10-03T12:00:00Z").ns
+  let path = ssoFixturePath()
+  let missing = ssoFailure(
+    () => ssoResolve(ssoFixtureConfig(), path, "http://127.0.0.1:1", "http://127.0.0.1:1", time),
+  )
+  assert(contains(missing, "run aws sso login"), "missing cache")
+  defer ssoCleanup(path)
+  for text of ["not-json", "[]", repeat("x", ssoMaxBytes + 1)] {
+    write(path, text)
+    let message = ssoFailure(
+      () => ssoResolve(ssoFixtureConfig(), path, "http://127.0.0.1:1", "http://127.0.0.1:1", time),
+    )
+    assert(message != "", "invalid cache accepted")
+  }
+}

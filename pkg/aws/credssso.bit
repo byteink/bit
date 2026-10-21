@@ -1,0 +1,226 @@
+// IAM Identity Center's portal and OIDC contracts, AWS API 2019-06-10.
+// Token refresh follows token-providers/fromSso.ts at SDK 054298b1520f.
+import { jsonEncode as ssoEncode, JsonEntry, jsonDecIntKey } from "std/json"
+
+class SsoConfig {
+  session: string,
+  startUrl: string,
+  region: string,
+  account: string,
+  role: string,
+}
+
+fn ssoConfigured(profile: map<string, string>): bool {
+  for key of ["sso_session", "sso_start_url", "sso_region", "sso_account_id", "sso_role_name"] {
+    if (hasKey(profile, key)) {
+      return true
+    }
+  }
+  return false
+}
+
+fn ssoRequired(profile: map<string, string>, key: string): string! {
+  let (value, found) = profile[key]
+  if (!found || value == "" || len(value) > 8192 || hasControl([]byte(value))) {
+    fail newError("aws: sso: missing or invalid ${key}")
+  }
+  return value
+}
+
+fn ssoRegionValid(region: string): bool {
+  if (len(region) < 3 || len(region) > 63) {
+    return false
+  }
+  for c of []byte(region) {
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) {
+      return false
+    }
+  }
+  return region[0] != '-' && region[len(region) - 1] != '-'
+}
+
+fn ssoIdentityValid(account: string, role: string): bool {
+  if (len(account) != 12 || len(role) == 0 || len(role) > 64) {
+    return false
+  }
+  for c of []byte(account) {
+    if (c < '0' || c > '9') {
+      return false
+    }
+  }
+  for c of []byte(role) {
+    if (!isSessionNameByte(c)) {
+      return false
+    }
+  }
+  return true
+}
+
+fn ssoProfileConfig(profile: map<string, string>, profiles: IniData): SsoConfig! {
+  let source = profile
+  let (session, _) = profile["sso_session"]
+  if (session != "") {
+    let (section, found) = profiles.sections["sso-session.${session}"]
+    if (!found) {
+      fail newError("aws: sso: sso-session section is missing")
+    }
+    source = section
+  }
+  let config = SsoConfig{
+    session = session,
+    startUrl = ssoRequired(source, "sso_start_url")?,
+    region = ssoRequired(source, "sso_region")?,
+    account = ssoRequired(profile, "sso_account_id")?,
+    role = ssoRequired(profile, "sso_role_name")?,
+  }
+  ssoCheckConfig(config, profile)?
+  return config
+}
+
+fn ssoCheckConfig(config: SsoConfig, profile: map<string, string>): ()! {
+  if (!ssoRegionValid(config.region) || !ssoIdentityValid(config.account, config.role)) {
+    fail newError("aws: sso: invalid region, account or role")
+  }
+  if (!hasPrefix(config.startUrl, "https://")) {
+    fail newError("aws: sso: sso_start_url must use HTTPS")
+  }
+  for key of ["sso_region", "sso_start_url"] {
+    let (value, found) = profile[key]
+    let expected = config.region
+    if (key == "sso_start_url") {
+      expected = config.startUrl
+    }
+    if (config.session != "" && found && value != expected) {
+      fail newError("aws: sso: profile and sso-session ${key} differ")
+    }
+  }
+}
+
+fn ssoLoginError(): error {
+  return newError("aws: sso: session is missing, expired or cannot refresh; run aws sso login with this profile")
+}
+
+fn ssoText(value: Json, key: string): string! {
+  match (jsonGet(value, key)) {
+    Some(member) => match (member) {
+      JsonString(text) => {
+        checkField("SSO ${key}", text)?
+        return text
+      }
+      _ => { fail newError("aws: sso: invalid ${key}") }
+    }
+    None => { fail newError("aws: sso: missing ${key}") }
+  }
+}
+
+fn ssoNumber(value: Json, key: string): i64! {
+  match (jsonGet(value, key)) {
+    Some(member) => return jsonDecIntKey(member, "SSO", key)?
+    None => { fail ssoLoginError() }
+  }
+}
+
+fn ssoResponse(response: Response): Json! {
+  if (response.status != 200 || len(response.body) > ssoMaxBytes) {
+    fail ssoLoginError()
+  }
+  return jsonParse(response.body) catch _ {
+    fail ssoLoginError()
+  }
+}
+
+fn ssoRequest(method: string, url: string, body: string, token: string): Json! {
+  let client = ContainerHttp()
+  defer client.close()
+  client.setRedirects(Redirects.None)
+  client.setMaxBodyBytes(ssoMaxBytes)
+  client.setHeader("Content-Type", "application/json")?
+  if (token != "") {
+    client.setHeader("x-amz-sso_bearer_token", token)?
+  }
+  let response = client.requestTimeout(method, url, body, stsTimeoutMs) catch _ {
+    fail ssoLoginError()
+  }
+  return ssoResponse(response)?
+}
+
+fn ssoRefresh(value: Json, endpoint: string, timestamp: int): Json! {
+  let request = Json.JsonObject(
+    [
+      JsonEntry{ key = "clientId", value = Json.JsonString(ssoText(value, "clientId")?) },
+      JsonEntry{ key = "clientSecret", value = Json.JsonString(ssoText(value, "clientSecret")?) },
+      JsonEntry{ key = "refreshToken", value = Json.JsonString(ssoText(value, "refreshToken")?) },
+      JsonEntry{ key = "grantType", value = Json.JsonString("refresh_token") },
+    ],
+  )
+  let response = ssoRequest("POST", endpoint + "/token", ssoEncode(request), "")?
+  let seconds = ssoNumber(response, "expiresIn") catch _ {
+    fail ssoLoginError()
+  }
+  if (seconds <= 0 || seconds > (neverExpires - timestamp) / 1000000000) {
+    fail ssoLoginError()
+  }
+  let expiry = Timestamp{ ns = timestamp + int(seconds) * 1000000000 }
+  let updated = ssoSet(value, "accessToken", Json.JsonString(ssoText(response, "accessToken")?))
+  updated = ssoSet(updated, "expiresAt", Json.JsonString(expiry.toString()))
+  match (jsonGet(response, "refreshToken")) {
+    Some(_) => updated = ssoSet(
+      updated,
+      "refreshToken",
+      Json.JsonString(ssoText(response, "refreshToken")?),
+    )
+    None => {}
+  }
+  return updated
+}
+
+fn ssoRole(value: Json, account: string, timestamp: int): AwsCredential! {
+  let role = Json.JsonNull
+  match (jsonGet(value, "roleCredentials")) {
+    Some(v) => role = v
+    None => { fail ssoLoginError() }
+  }
+  let expiry = ssoNumber(role, "expiration") catch _ {
+    fail ssoLoginError()
+  }
+  if (expiry <= timestamp / Millisecond || expiry > neverExpires / Millisecond) {
+    fail ssoLoginError()
+  }
+  return AwsCredential(
+    accessKeyId = ssoText(role, "accessKeyId")?,
+    secretAccessKey = ssoText(role, "secretAccessKey")?,
+    sessionToken = Option.Some(ssoText(role, "sessionToken")?),
+    expiration = Option.Some(Timestamp{ ns = int(expiry) * Millisecond }),
+    accountId = Option.Some(account),
+  )?
+}
+
+fn ssoResolve(
+  config: SsoConfig,
+  path: string,
+  portal: string,
+  oidc: string,
+  timestamp: int,
+): AwsCredential! {
+  let token = ssoAccessToken(config, path, oidc, timestamp)?
+  let url = portal +
+    "/federation/credentials?account_id=" +
+    percentEncode(config.account) +
+    "&role_name=" +
+    percentEncode(config.role)
+  return ssoRole(ssoRequest("GET", url, "", token)?, config.account, timestamp)?
+}
+
+fn ssoProfile(profile: map<string, string>, profiles: IniData): AwsCredential! {
+  let config = ssoProfileConfig(profile, profiles)?
+  let key = config.startUrl
+  if (config.session != "") {
+    key = config.session
+  }
+  let path = ssoCachePath(homeDir()?, key)
+  let suffix = awsPartition(config.region).dnsSuffix
+  return ssoResolve(
+    config, path, "https://portal.sso.${config.region}.${suffix}",
+    "https://oidc.${config.region}.${suffix}", now().ns,
+  )?
+}
