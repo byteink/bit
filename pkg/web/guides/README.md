@@ -88,9 +88,12 @@ articles, and articles without a cover, return `404`.
 
 Replacing a cover writes a fresh key and updates the article with its
 existing optimistic revision check; a concurrent edit returns `412`.
-A refused save removes the new object;
-a failed compensation remains an error. After a successful database update,
-the app deletes the old object. If that deletion fails, the request reports
+After a failed save, the app locks and reads the current article before
+cleanup. It removes the new object only when that row proves the object is
+unreferenced. A lost database response can follow a committed write: if the
+row points to the new key, or its state cannot be read, the object stays and
+the original error reaches the caller. A failed compensation also remains
+an error. After a successful database update, the app deletes the old object. If that deletion fails, the request reports
 an error while the new database reference remains valid. Retry only after
 checking the article's current cover. The integration gate runs this flow
 against its own PostgreSQL, Redis and SeaweedFS containers.
