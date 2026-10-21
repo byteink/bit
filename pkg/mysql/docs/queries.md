@@ -38,9 +38,11 @@ parameters goes through `COM_STMT_PREPARE`/`COM_STMT_EXECUTE`, which binds
 values server-side in the binary protocol and reports each column's real type
 (`Value.Int`, `Value.Float`, `Value.Text`, `Value.Blob`) - see
 [Limitations](limitations.md) for where that typing is still incomplete.
-`Conn.exec` always takes the prepared path, even with nothing to bind, because
-only the binary protocol's OK packet carries an affected-row count the text
-protocol's own result-set framing would otherwise hide.
+`Conn.exec` uses `COM_QUERY` when the rewritten statement has no placeholders
+and no parameters. It consumes the complete text result and retains the OK
+packet's affected-row count and last insert ID. Statements with parameters
+keep the prepared path. This lets nested transactions send `SAVEPOINT`,
+`ROLLBACK TO SAVEPOINT` and `RELEASE SAVEPOINT` through the same executor.
 
 `Conn.prepare` returns a `Stmt` that can be run more than once. Set
 `Datasource.statementCache` above 0 to keep prepared statements across calls
