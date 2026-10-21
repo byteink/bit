@@ -125,6 +125,60 @@ A provider's rotated refresh token replaces `source.refreshToken` in memory.
 Persist it in your secret store when your application needs it across restarts.
 Treat source configuration as immutable while sends are in progress.
 
+## Send as a Google Workspace user
+
+Inkwell can send as a Workspace mailbox without retaining a user's refresh
+token. A Workspace administrator must grant the service account domain-wide
+delegation for `https://mail.google.com/`. Choose the authorized user with
+`subject`; a service account does not have its own Gmail mailbox. Follow
+[Google's service-account authorization guide](https://developers.google.com/identity/protocols/oauth2/service-account#delegatingauthority)
+before calling `sendWorkspaceWelcome()` from `main`:
+
+```bit
+import { GoogleServiceAccount, Message, Options, open } from "mail"
+import { env } from "std/os"
+import { readFile } from "std/fs"
+
+fn sendWorkspaceWelcome(): ()! {
+  let source = GoogleServiceAccount(
+    key = readFile(env("MAIL_SERVICE_ACCOUNT_FILE"))?,
+    subject = "hello@inkwell.dev",
+    scope = "https://mail.google.com/",
+  )
+  let mailer = open(
+    "smtps://hello%40inkwell.dev@smtp.gmail.com:465",
+    Options{ from = "Inkwell <hello@inkwell.dev>", token = source },
+  )?
+  defer mailer.close()
+  mailer.send(
+    Message{
+      to = ["sara@example.com"], subject = "Welcome to Inkwell",
+      text = "Your account is ready.",
+    },
+  )?
+}
+```
+
+`GoogleServiceAccount` takes `key`, the JSON file's contents, and `subject`,
+the Workspace user. `scope` defaults to `https://mail.google.com/`; the example
+sets it explicitly. Pass this source to `inspectExpiry(source)` from the
+previous example to call its exported `token()` method and inspect the cached
+`Token` without printing its value. The SMTP username must identify the delegated user.
+
+`Mailer(...)` and `open(...)` validate and load the RSA key before a send.
+The JSON must contain `type = "service_account"`, `client_email`, `private_key`
+and an HTTPS `token_uri` without credentials or a fragment. `private_key` must
+be an unencrypted PKCS#8 RSA PEM with at least 2048 bits. Invalid configuration
+names the field without quoting credential contents. Keep the file in your
+secret store and treat the source fields as immutable during use.
+
+Each refresh signs an RS256 assertion for that endpoint with the service
+account as issuer, the delegated user as subject, the requested scope, and a
+one-hour lifetime. It exchanges the assertion with the JWT bearer grant over
+verified HTTPS. Both the key and assertion are scrubbed from provider errors;
+never log the key or the returned token. The shared refresh and SMTP retry
+rules below apply to this source too.
+
 ## Refreshing and failures
 
 Each built-in source caches a `Token` per audience: its `value` is the bearer credential,

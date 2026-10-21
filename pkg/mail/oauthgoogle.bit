@@ -1,0 +1,130 @@
+// A delegated service account shares the same bounded refresh as other sources.
+import { RsaPrivateKey, bigintBitLen, pemDecode, rsaParsePrivateKey } from "std/crypto"
+import { Json, jsonAsString, jsonGet, jsonParse } from "std/json"
+import { SigningKey, sign } from "std/jwt"
+import { percentEncode } from "std/http"
+import { trimSpace } from "std/strings"
+import { Second, monotonic } from "std/time"
+
+class GoogleAccount {
+  email: string,
+  endpoint: string,
+  pem: string,
+  rsa: RsaPrivateKey,
+}
+
+export class GoogleServiceAccount {
+  export key: string
+  export subject: string
+  export scope: string
+  cache: TokenCache
+  account: Option<GoogleAccount>
+
+  init(key: string, subject: string, scope: string = "https://mail.google.com/") {
+    this.key = key
+    this.subject = subject
+    this.scope = scope
+    this.cache = TokenCache()
+    this.account = Option<GoogleAccount>.None
+  }
+
+  export token(): Token!MailError {
+    return this.getToken(30 * Second, 0)?
+  }
+
+  check(): ()!MailError {
+    if (!apiSecretOk(this.subject) || trimSpace(this.scope) == "") {
+      fail MailError.Config("GoogleServiceAccount needs subject and scope")
+    }
+    match (this.account) {
+      Some(_) => return
+      None => {}
+    }
+    this.account = Option<GoogleAccount>.Some(googleAccount(this.key)?)
+  }
+
+  assertion(): string!MailError {
+    this.check()?
+    let account = unwrap(this.account)
+    let ns = this.cache.clock().ns
+    if (ns < 0) {
+      fail MailError.Config("GoogleServiceAccount needs a non-negative clock")
+    }
+    let at = ns / Second
+    let payload = Json.JsonObject(
+      [
+        apiEntry("iss", Json.JsonString(account.email)),
+        apiEntry("sub", Json.JsonString(this.subject)),
+        apiEntry("scope", Json.JsonString(this.scope)),
+        apiEntry("aud", Json.JsonString(account.endpoint)),
+        apiEntry("iat", Json.JsonInt(i64(at))),
+        apiEntry("exp", Json.JsonInt(i64(at + 3600))),
+      ],
+    )
+    return sign(SigningKey.Rs256Key(account.rsa), payload) catch _ {
+      fail MailError.Config("GoogleServiceAccount could not sign its assertion")
+    }
+  }
+
+  getToken(timeout: int, failed: int, attempted: []string = []): Token!MailError {
+    return this.cache.get(
+      (budget, cached) => {
+        let start = monotonic().ns
+        let assertion = this.assertion()?
+        let account = unwrap(this.account)
+        let form = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${percentEncode(assertion)}"
+        let (token, _) = oauthPost(
+          this.cache, account.endpoint, form, budget - (monotonic().ns - start),
+          OAuthSecrets{
+            current = [this.key, account.pem, assertion], prior = append(cached, ...attempted),
+          },
+        )?
+        return token
+      },
+      failed, timeout,
+    )?
+  }
+}
+
+fn googleField(doc: Json, name: string): string!MailError {
+  let value = unwrapOr(jsonAsString(unwrapOr(jsonGet(doc, name), Json.JsonNull)), "")
+  if (value == "") {
+    fail MailError.Config("GoogleServiceAccount.key needs ${name}")
+  }
+  return value
+}
+
+fn googleAccount(key: string): GoogleAccount!MailError {
+  if (len(key) > 65536) {
+    fail MailError.Config("GoogleServiceAccount.key exceeds 64 KiB")
+  }
+  let doc = jsonParse(key) catch _ {
+    fail MailError.Config("GoogleServiceAccount.key must be valid JSON")
+  }
+  if (googleField(doc, "type")? != "service_account") {
+    fail MailError.Config("GoogleServiceAccount.key type must be service_account")
+  }
+  let email = googleField(doc, "client_email")?
+  let pem = googleField(doc, "private_key")?
+  let endpoint = googleField(doc, "token_uri")?
+  oauthEndpoint(endpoint) catch _ {
+    fail MailError.Config("GoogleServiceAccount.key token_uri must be HTTPS without credentials or fragment")
+  }
+  return GoogleAccount{ email = email, endpoint = endpoint, pem = pem, rsa = googleRsa(pem)? }
+}
+
+fn googleRsa(pem: string): RsaPrivateKey!MailError {
+  let blocks = pemDecode(pem) catch _ {
+    fail MailError.Config("GoogleServiceAccount.key private_key must be PKCS#8 PEM")
+  }
+  if (len(blocks) != 1 || blocks[0].label != "PRIVATE KEY") {
+    fail MailError.Config("GoogleServiceAccount.key private_key must be PKCS#8 PEM")
+  }
+  let rsa = rsaParsePrivateKey(blocks[0].der) catch _ {
+    fail MailError.Config("GoogleServiceAccount.key private_key must be RSA PKCS#8")
+  }
+  if (bigintBitLen(rsa.n) < 2048) {
+    fail MailError.Config("GoogleServiceAccount.key private_key needs at least 2048 bits")
+  }
+  return rsa
+}
