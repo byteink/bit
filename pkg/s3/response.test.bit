@@ -8,6 +8,7 @@
 
 import { contains, toLower } from "std/strings"
 import { Timestamp } from "std/time"
+import { exists, readDir } from "std/fs"
 
 const nsPerSecond: int = 1000000000
 
@@ -168,4 +169,170 @@ test "attempts and retry delay travel into the metadata" {
 // Adds the header `name: value` to `h`, its name lower-cased as `responseHead` keeps it.
 fn vecAdd(h: ResponseHead, name: string, value: string) {
   h.fields = append(h.fields, HeaderField{ name = toLower(name), value = value })
+}
+
+fn responseTestBody(route: int, h: ResponseHead): ByteStream! {
+  if (route == 0) {
+    return deserializeGetObjectOutput(h)?.body
+  }
+  if (route == 1) {
+    return deserializeGetObjectAnnotationOutput(h)?.annotationPayload
+  }
+  return deserializeGetObjectTorrentOutput(h)?.body
+}
+
+fn responseTestReject(status: int, headers: string) {
+  for route of [0, 1, 2] {
+    let pulls = 0
+    let closes = 0
+    let h = responseHead(status, headers)
+    h.stream = Option.Some((n) => {
+      pulls = pulls + 1
+      return "abc"
+    })
+    h.streamClose = Option.Some(() => {
+      closes = closes + 1
+    })
+    let refused = false
+    let _ = responseTestBody(route, h) catch _ {
+      refused = true
+      emptyStream()
+    }
+    closeResponseHead(h)
+    assert(refused, "route ${route} accepted status ${status}, headers ${headers}")
+    assert(pulls == 0 && closes == 1, "rejection never pulls and releases exactly once")
+  }
+}
+
+fn responseTestSave(h: ResponseHead, path: string): ()! {
+  let body = deserializeGetObjectOutput(h)?.body
+  body.saveTo(path)?
+}
+
+test "header-only streaming errors preserve redirect region and support IDs without a body pull" {
+  for status of [301, 404] {
+    for route of [0, 1, 2] {
+      let pulls = 0
+      let closes = 0
+      let h = responseHead(
+        status,
+          "X-Amz-Request-Id: support-request\r\nX-Amz-Id-2: support-host\r\n" +
+          "X-Amz-Bucket-Region: eu-west-1\r\n",
+      )
+      h.stream = Option.Some((n) => {
+        pulls = pulls + 1
+        return "abc"
+      })
+      h.streamClose = Option.Some(() => {
+        closes = closes + 1
+      })
+      let refused = false
+      let _ = responseTestBody(route, h) catch e {
+        let service = e.(S3Error)
+        assert(service.status == status, "service status survives")
+        assert(service.requestId == "support-request", "request ID survives")
+        assert(service.extendedId == "support-host", "extended ID survives")
+        assert(service.bucketRegion == "eu-west-1", "redirect region survives")
+        refused = true
+        emptyStream()
+      }
+      closeResponseHead(h)
+      assert(refused && pulls == 0 && closes == 1, "error preserves lazy read and single release")
+    }
+  }
+}
+
+test "streaming deserializers reject error status before pulling or saving object bytes" {
+  bodyTestRun(() => {
+    let dir = bodyTestDir()?
+    defer bodyTestCleanup(dir)
+    for status of [199, 300, 404, 500] {
+      responseTestReject(status, "Content-Length: 3\r\n")
+      let h = responseHead(status, "Content-Length: 3\r\n")
+      h.stream = Option.Some(bodyTestSource("abc"))
+      let refused = false
+      responseTestSave(h, dir + "/cover") catch _ {
+        refused = true
+      }
+      assert(refused, "error status cannot produce a saveable output")
+      assert(!exists(dir + "/cover") && len(readDir(dir)?) == 0, "no object or temporary file")
+    }
+  })
+}
+
+test "streaming construction rejects invalid lengths and checksum headers without a pull" {
+  for header of [
+    "Content-Length: ten\r\n",
+    "Content-Length: -1\r\n",
+    "Content-Length: ${maxStreamGetBytes + 1}\r\n",
+    "Content-Length: 3\r\nContent-Length: 3\r\n",
+    "x-amz-checksum-crc32: \r\n",
+    "x-amz-checksum-crc32: !!!!!!!!\r\n",
+    "x-amz-checksum-crc32: YWJj\r\n",
+    "x-amz-checksum-crc32: NSRBwh==\r\n",
+    "x-amz-checksum-crc32: NSRBwg==\r\nx-amz-checksum-crc32: NSRBwg==\r\n",
+    "x-amz-checksum-crc32: NSRBwg==\r\nx-amz-checksum-type: COMPOSITE\r\n",
+    "x-amz-checksum-crc32: NSRBwg==\r\nx-amz-checksum-type: UNKNOWN\r\n",
+  ] {
+    responseTestReject(200, header)
+  }
+}
+
+test "a header failure after stream construction releases the response once" {
+  let closes = 0
+  let h = responseHead(200, "Content-Length: 3\r\nx-amz-delete-marker: invalid\r\n")
+  h.stream = Option.Some(bodyTestSource("abc"))
+  h.streamClose = Option.Some(() => {
+    closes = closes + 1
+  })
+  let refused = false
+  let _ = deserializeGetObjectOutput(h) catch _ {
+    refused = true
+    GetObjectOutput{ body = emptyStream() }
+  }
+  closeResponseHead(h)
+  assert(refused && closes == 1, "later typed header failure closes once")
+}
+
+test "generated streaming responses validate length and checksum at EOF and release once" {
+  bodyTestRun(() => {
+    for route of [0, 1, 2] {
+      let closes = 0
+      let h = bodyTestHead("abc", "NSRBwg==")
+      h.streamClose = Option.Some(() => {
+        closes = closes + 1
+      })
+      let body = responseTestBody(route, h)?
+      assert(closes == 0, "successful construction retains the source")
+      assert(body.text(3)? == "abc", "validated response data")
+      body.close()
+      closeResponseHead(h)
+      assert(closes == 1, "EOF and explicit close share one release")
+    }
+  })
+}
+
+test "generated response EOF failures reach the caller and close the source" {
+  bodyTestRun(() => {
+    for headers of [
+      "Content-Length: 4\r\n",
+      "Content-Length: 2\r\n",
+      "Content-Length: 3\r\nx-amz-checksum-crc32: AAAAAA==\r\n",
+    ] {
+      let closes = 0
+      let h = responseHead(200, headers)
+      h.stream = Option.Some(bodyTestSource("abc"))
+      h.streamClose = Option.Some(() => {
+        closes = closes + 1
+      })
+      let body = deserializeGetObjectOutput(h)?.body
+      let refused = false
+      let _ = body.text(4) catch _ {
+        refused = true
+        ""
+      }
+      body.close()
+      assert(refused && body.failed && closes == 1, "EOF failure reaches caller and closes once")
+    }
+  })
 }
