@@ -1,0 +1,351 @@
+// #6249: a single-word enum payload can hold an owned slice header only
+// while its box has one persistent holder. A class field can own the box;
+// a parameter can transfer it only when every visible caller moves it.
+// Payload reads still obey field ownership, including rule 4 escape copies.
+// A saved enum, a saved payload, an unknown call or an unseen entry fails
+// closed. Enum variants with more than one payload word stay unsupported.
+
+fn enumOwnKey(ctx: TypeContext, ty: int): int {
+  if (!enumOwnType(ctx, ty) || !enumSinglePayload(ctx, ty)) {
+    return -1
+  }
+  return ty * fieldKeyShift + enumPayloadBase
+}
+
+fn enumOwnType(ctx: TypeContext, ty: int): bool {
+  if (ty <= 0 || ty >= len(ctx.types)) {
+    return false
+  }
+  return ctx.types[ty].kind == TypeKind.Enum && ctx.types[ty].enumBoxed
+}
+
+fn enumSinglePayload(ctx: TypeContext, ty: int): bool {
+  let slice = false
+  for (name, payload) of ctx.variantPayloads {
+    if (!startsWith(name, "${ty}.")) {
+      continue
+    }
+    if (len(payload) > 1) {
+      return false
+    }
+    if (len(payload) == 1) {
+      let kind = ctx.types[payload[0]].kind
+      if (kind == TypeKind.TypeParam) {
+        return false
+      }
+      slice = slice || kind == TypeKind.Slice
+    }
+  }
+  return slice
+}
+
+// Enum carrier reads consult borrowing facts, so solve them before any
+// field scan rather than observe a partially scanned parameter table.
+fn enumBorrowedNew(fo: FieldOwn, funcs: []IrFunc): Borrow {
+  let b = borrowNew(funcs)
+  for f of funcs {
+    borrowScanFunc(b, newOwnFn(f, fo))
+  }
+  borrowSolve(b)
+  return b
+}
+
+fn enumFieldBase(ctx: TypeContext, ty: int, offset: int): bool {
+  if (ty <= 0 || ty >= len(ctx.types)) {
+    return false
+  }
+  return ctx.types[ty].kind == TypeKind.Struct ||
+    (offset == enumPayloadBase && enumOwnKey(ctx, ty) >= 0)
+}
+
+// A payload may be mutated only through a class field whose box accesses
+// enumScanCarrier checks. A bare parameter or arbitrary load stays cloning.
+fn enumPayloadSource(ctx: TypeContext, f: IrFunc, ins: IrInstr): bool {
+  let ty = f.instrs[ins.lhs].ty
+  if (ctx.types[ty].kind != TypeKind.Enum) {
+    return true
+  }
+  let box = f.instrs[ins.lhs]
+  return box.op == Op.FieldGet && enumClassBase(ctx, f, box)
+}
+
+fn enumClassBase(ctx: TypeContext, f: IrFunc, ins: IrInstr): bool {
+  let ty = f.instrs[ins.lhs].ty
+  return ty > 0 && ty < len(ctx.types) && ctx.types[ty].kind == TypeKind.Struct
+}
+
+// Borrow's slot table and bounded dependency solver also express moves:
+// each destination parameter depends on every caller's transferred source.
+fn enumMovedNew(fo: FieldOwn, m: IrModule): Borrow {
+  let b = borrowNew(m.funcs)
+  for f of m.funcs {
+    let o = newOwnFn(f, fo)
+    ownLinkEdges(o)
+    if (f.isPinned || isPinnedName(f.name)) {
+      enumPoisonMove(b, f.name)
+    }
+    let at = 0
+    while (at < len(f.instrs)) {
+      enumScanMove(b, o, at)
+      at = at + 1
+    }
+  }
+  for table of m.methodTables {
+    for method of table.methods {
+      enumPoisonMove(b, method.func)
+    }
+  }
+  for global of m.globals {
+    for reloc of global.relocs {
+      enumPoisonMove(b, reloc.symbol)
+    }
+  }
+  borrowSolve(b)
+  return b
+}
+
+fn enumPoisonMove(b: Borrow, name: string) {
+  let base = b.base[name]
+  if (base <= 0) {
+    return
+  }
+  let i = 0
+  while (i < b.arity[name]) {
+    b.ok[base - 1 + i] = false
+    i = i + 1
+  }
+}
+
+fn enumScanMove(b: Borrow, o: OwnFn, at: int) {
+  let ins = o.f.instrs[at]
+  if (ins.op == Op.MakeClosure || ins.op == Op.FuncAddr) {
+    enumPoisonMove(b, ins.name)
+  }
+  let base = b.base[ins.name]
+  if (ins.op != Op.Call || base <= 0) {
+    return
+  }
+  if (b.arity[ins.name] != len(ins.args)) {
+    enumPoisonMove(b, ins.name)
+    return
+  }
+  let i = 0
+  while (i < len(ins.args)) {
+    let v = ins.args[i]
+    if (enumOwnKey(o.fields.ctx, o.f.instrs[v].ty) >= 0 &&
+      !enumTransferred(b, o, v, at, base - 1 + i)) {
+      b.ok[base - 1 + i] = false
+    }
+    i = i + 1
+  }
+}
+
+// All members are followed, including loop-carried aliases. Liveness is
+// checked after the transfer; an earlier escape also rejects the move.
+fn enumTransferred(b: Borrow, o: OwnFn, v: int, at: int, slot: int): bool {
+  if (len(o.f.instrs) * len(o.f.blocks) > ownBudget) {
+    return false
+  }
+  let root = ownFind(o.parent, v)
+  let m = 0
+  while (m < len(o.f.instrs)) {
+    if (ownFind(o.parent, m) == root && !enumTransferMember(b, o, m, at, slot)) {
+      return false
+    }
+    m = m + 1
+  }
+  return true
+}
+
+fn enumTransferMember(b: Borrow, o: OwnFn, m: int, at: int, slot: int): bool {
+  if (!enumTransferSource(b, o, m, slot)) {
+    return false
+  }
+  ownMarkLive(o, m)
+  if (ownLiveAfter(o, at, m)) {
+    return false
+  }
+  let u = o.useStart[m]
+  while (u < o.useStart[m + 1]) {
+    let use = o.useList[u]
+    if (enumUseBefore(o, use, at) && !enumTransferUse(o, use, m, at)) {
+      return false
+    }
+    u = u + 1
+  }
+  return true
+}
+
+// An escape on a mutually exclusive path cannot leave a holder at this
+// transfer. Later uses still fail the separate liveness check above.
+fn enumUseBefore(o: OwnFn, use: int, at: int): bool {
+  let src = o.blockOf[use]
+  let dst = o.blockOf[at]
+  return src == dst || bceReachAvoiding(o.f, src, -1, -1)[dst]
+}
+
+fn enumTransferSource(b: Borrow, o: OwnFn, m: int, slot: int): bool {
+  let block = o.blockOf[m]
+  let blk = o.f.blocks[block]
+  if (m >= blk.instsStart + blk.paramCount) {
+    return o.f.instrs[m].op == Op.GcAlloc
+  }
+  if (block != 0) {
+    return predCount(o.pm, block) > 0
+  }
+  let base = b.base[o.f.name]
+  if (base <= 0) {
+    return false
+  }
+  let source = base - 1 + m - blk.instsStart
+  if (slot < 0) {
+    return b.ok[source]
+  }
+  b.depFrom = append(b.depFrom, slot)
+  b.depTo = append(b.depTo, source)
+  return true
+}
+
+fn enumTransferUse(o: OwnFn, use: int, m: int, at: int): bool {
+  let ins = o.f.instrs[use]
+  if (use == at) {
+    if (ins.op == Op.Call) {
+      return enumSingleArg(o, ins, m)
+    }
+    return ins.op == Op.FieldSet && ins.rhs == m && ins.lhs != m
+  }
+  if (ins.op == Op.Jump || ins.op == Op.KeepAlive) {
+    return true
+  }
+  if (ins.op == Op.Br) {
+    return ins.lhs != m
+  }
+  return ins.op == Op.FieldSet && ins.lhs == m && ins.rhs != m
+}
+
+// Two positions cannot receive aliases of the same transferred box.
+fn enumSingleArg(o: OwnFn, ins: IrInstr, m: int): bool {
+  let root = ownFind(o.parent, m)
+  let count = 0
+  for arg of ins.args {
+    if (ownFind(o.parent, arg) == root) {
+      count = count + 1
+    }
+  }
+  return count == 1
+}
+
+fn enumScanCarrier(o: OwnFn, at: int) {
+  let ins = o.f.instrs[at]
+  let ty = ins.op == Op.FieldGet ? ins.ty : ins.ival2
+  if (ins.op != Op.FieldGet && ins.op != Op.FieldSet) {
+    return
+  }
+  let key = enumOwnKey(o.fields.ctx, ty)
+  if (key < 0) {
+    return
+  }
+  let ok = false
+  if (enumClassBase(o.fields.ctx, o.f, ins)) {
+    ok = ins.op == Op.FieldGet ? enumCarrierRead(o, at, key) : enumTransferred(
+      o.fields.moved,
+      o,
+      ins.rhs,
+      at,
+      -1,
+    )
+  }
+  if (!ok) {
+    o.fields.poison[key] = 1
+  }
+}
+
+// A box can lend its payload to field rules, which copy any escaping
+// header. Keeping or returning the box itself has no copy rule.
+fn enumCarrierRead(o: OwnFn, g: int, key: int): bool {
+  let u = o.useStart[g]
+  while (u < o.useStart[g + 1]) {
+    let ins = o.f.instrs[o.useList[u]]
+    if (!enumCarrierUse(o, ins, g, key)) {
+      return false
+    }
+    u = u + 1
+  }
+  return !fieldSeparated(o, g, key)
+}
+
+// A suspended callee can hold the box while another path appends to its
+// payload. The call must spare this enum's payload, even at the last use.
+fn enumCarrierUse(o: OwnFn, ins: IrInstr, g: int, key: int): bool {
+  if (ins.op == Op.FieldGet) {
+    return ins.lhs == g
+  }
+  if (ins.op == Op.KeepAlive) {
+    return true
+  }
+  return borrowedArg(o.fields.borrow, ins, g) && calmCall(o.fields.calm, ins, key)
+}
+
+// The append's sole result store fills a fresh enum. Its sole persistent
+// holder replaces the same class field that supplied the old enum.
+fn enumRmwStore(o: OwnFn, g: int, r: int, s: int, key: int): bool {
+  let box = enumRmwBox(o, g, r, s, key)
+  if (box < 0) {
+    return false
+  }
+  let owner = enumBoxOwner(o, box)
+  let old = o.f.instrs[o.f.instrs[g].lhs]
+  if (owner < 0 || !enumSameOwner(o, old, owner)) {
+    return false
+  }
+  return o.blockOf[r] == o.blockOf[owner] &&
+    enumOnlyBuild(o.f, box, r + 1, owner) &&
+    !fieldSeparated(o, g, key)
+}
+
+fn enumRmwBox(o: OwnFn, g: int, r: int, s: int, key: int): int {
+  let src = o.f.instrs[g]
+  let old = o.f.instrs[src.lhs]
+  if (enumOwnKey(o.fields.ctx, old.ty) != key || !enumPayloadSource(o.fields.ctx, o.f, src)) {
+    return -1
+  }
+  let fill = o.f.instrs[s]
+  if (fill.op != Op.FieldSet || fill.rhs != r || fill.ival != enumPayloadBase) {
+    return -1
+  }
+  let box = o.f.instrs[fill.lhs]
+  return box.op == Op.GcAlloc && box.ty == old.ty ? fill.lhs : -1
+}
+
+fn enumBoxOwner(o: OwnFn, box: int): int {
+  let u = o.useStart[box]
+  while (u < o.useStart[box + 1]) {
+    let at = o.useList[u]
+    let ins = o.f.instrs[at]
+    if (ins.op == Op.FieldSet &&
+      ins.rhs == box &&
+      enumTransferred(o.fields.moved, o, box, at, -1)) {
+      return at
+    }
+    u = u + 1
+  }
+  return -1
+}
+
+fn enumSameOwner(o: OwnFn, old: IrInstr, owner: int): bool {
+  let store = o.f.instrs[owner]
+  return store.lhs == old.lhs && store.ival == old.ival && store.ival2 == old.ty
+}
+
+fn enumOnlyBuild(f: IrFunc, box: int, lo: int, hi: int): bool {
+  let i = lo
+  while (i < hi) {
+    let ins = f.instrs[i]
+    let fill = ins.op == Op.FieldSet && ins.lhs == box
+    if (i != box && !fill && !fieldOnlyConsts(f, i, i + 1)) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
