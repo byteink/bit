@@ -6,6 +6,98 @@ When Inkwell saves a storage setting, save the value the service expects.
 `wire()` gives you that value. `fromWire()` reads it back without losing a
 value a service adds later.
 
+## Prepare and save an article cover
+
+An Inkwell device may download a cover larger than its memory budget. Keep
+that body as a `ByteStream`, process one chunk at a time, and close it when
+you stop early. `saveTo` creates a private temporary file beside the target.
+It replaces the target only after EOF, length checks, and any supported
+response checksum succeed. A failure removes the temporary file and keeps
+an existing target.
+
+This complete local example saves a cover, opens the file separately for
+two request attempts, and reads a preview with a fixed buffer limit. It
+does not require a storage server.
+
+```bit
+import { Body, ByteStream, bodyStream, isReplayable } from "s3"
+import { remove } from "std/fs"
+import { BodySource } from "std/http"
+import { envOr } from "std/os"
+import { uuidV4, format } from "std/uuid"
+
+fn main(): ()! {
+  let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\"><title>Inkwell cover</title></svg>"
+  let path = envOr("TMPDIR", "/tmp") + "/inkwell-cover-" + format(uuidV4()) + ".svg"
+  let cover: ByteStream = bodyStream(Body.Text(svg))?
+  defer cover.close()
+  cover.saveTo(path)?
+  defer {
+    remove(path) catch e {
+      panic(e.message())
+    }
+  }
+
+  let upload = Body.File(path)
+  assert(isReplayable(upload), "file body can reopen for a retry")
+  for attempt of [1, 2] {
+    let body = bodyStream(upload)?
+    defer body.close()
+    assert(body.text(len(svg))? == svg, "attempt ${attempt} reads from byte zero")
+  }
+
+  let preview = bodyStream(Body.Bytes([]byte(svg)))?
+  defer preview.close()
+  println(string(preview.read(5)?))
+  preview.pipeTo((part) => {
+    println(part)
+  })?
+
+  let empty = bodyStream(Body.Empty)?
+  assert(len(empty.bytes(0)?) == 0, "empty body needs no buffer")
+
+  let at = 0
+  let source: BodySource = (max) => {
+    let count = len(svg) - at
+    if (count > max) {
+      count = max
+    }
+    let part = svg[at:at + count]
+    at = at + count
+    return part
+  }
+  let once = Body.Stream(source, Option.Some(len(svg)))
+  assert(!isReplayable(once), "a caller source belongs to one request attempt")
+  let streamed = bodyStream(once)?
+  defer streamed.close()
+  println(streamed.text(len(svg))?)
+}
+```
+
+`bodyStream` opens one attempt. `Body.Empty`, `Body.Text`, `Body.Bytes`, and
+`Body.File` are replayable. A file body opens a fresh descriptor and offset
+for each attempt; keep the file unchanged until the request finishes.
+`Body.Stream` takes the existing `std/http` `BodySource` and an optional byte
+length. Use `Option<int>.None` when the length is unknown. The source must
+return at most the requested bytes and return an empty string only at EOF.
+
+`read(max)` returns at most the requested amount, capped at 64 KiB per pull.
+`bytes(max)` requires an explicit limit and fails when the remaining body
+exceeds it. `text(max)` uses the same check, with a 32 MiB default. Both read
+the remaining body, not bytes consumed earlier. Use `pipeTo` or `saveTo`
+instead of collecting a large body. Call `close` to abandon a body; repeated
+close calls are safe. A failed stream keeps reporting failure on later reads.
+`saveTo` rejects an already closed stream before touching the target.
+
+Generated streaming response deserializers reject error status before any
+body pull. They validate declared lengths and supported full-object checksums;
+checksum mismatches reach the caller at EOF. Malformed checksum headers and
+composite checksums fail before a body is handed over. The body library and
+the generated deserializers are available to custom transports. The modeled
+network pipeline is separate work; these examples do not add network behavior
+to the current client. Continue with [Storing article covers](guide.md) for
+the existing HTTP operations.
+
 ## Keep signing time in step with storage
 
 When an unattended Inkwell device drifts from its storage server, a request

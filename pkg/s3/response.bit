@@ -6,6 +6,7 @@
 // XML deserializer fills those members from `text` after it.
 
 import { BodySource } from "std/http"
+import { decodeBase64, encodeBase64 } from "std/crypto"
 import { hasPrefix, join, parseInt, split, toLower, trimSpace } from "std/strings"
 import { Timestamp, parseEpochSeconds, parseHttpDate, parseRfc3339 } from "std/time"
 
@@ -24,6 +25,7 @@ class ResponseHead {
   fields: []HeaderField,
   text: string,
   stream: Option<BodySource>,
+  streamClose: Option<() => ()>,
   attempts: int,
   totalRetryDelay: int,
 }
@@ -201,6 +203,78 @@ fn responseMetadataOf(h: ResponseHead): ResponseMetadata {
 // deserializer builds an output with before `fill*` sets the real stream.
 fn emptyStream(): ByteStream {
   return ByteStream{ source = Option.None }
+}
+
+// A service error never becomes object data. Each checksum covers the full
+// object; composite multipart checksums need the separate part metadata.
+fn responseStream(h: ResponseHead): ByteStream! {
+  let body = buildResponseStream(h) catch e {
+    closeResponseHead(h)
+    fail e
+  }
+  body.onClose = Option.Some(() => {
+    closeResponseHead(h)
+  })
+  return body
+}
+
+fn closeResponseHead(h: ResponseHead) {
+  let release = h.streamClose
+  h.streamClose = Option.None
+  h.stream = Option.None
+  match (release) {
+    Some(releaseSource) => releaseSource()
+    None => {}
+  }
+}
+
+fn responseChecksum(h: ResponseHead, alg: ChecksumAlgorithm, expected: string): bodyChecksum! {
+  match (headerText(h, "x-amz-checksum-type")) {
+    Some(kind) => {
+      if (kind != "FULL_OBJECT") {
+        fail invalidInput("body: checksum requires a full object, not ${kind}")
+      }
+    }
+    None => {}
+  }
+  let hash = checksumHasher(alg)?
+  if (len(expected) != base64Length(hash.size())) {
+    fail invalidInput("body: invalid response checksum length")
+  }
+  let decoded = decodeBase64(expected) catch _ {
+    fail invalidInput("body: invalid response checksum encoding")
+  }
+  if (len(decoded) != hash.size() || encodeBase64(decoded) != expected) {
+    fail invalidInput("body: invalid response checksum encoding")
+  }
+  return bodyChecksum{ hash = hash, expected = expected }
+}
+
+fn buildResponseStream(h: ResponseHead): ByteStream! {
+  if (h.status < 200 || h.status >= 300) {
+    let e = s3ErrorOf(h.status, "", h.text)
+    e.requestId = firstNonEmpty(unwrapOr(headerText(h, "x-amz-request-id"), ""), e.requestId)
+    e.extendedId = firstNonEmpty(unwrapOr(headerText(h, "x-amz-id-2"), ""), e.extendedId)
+    e.bucketRegion = unwrapOr(headerText(h, "x-amz-bucket-region"), "")
+    fail e
+  }
+  let source: BodySource = (n) => {
+    match (h.stream) {
+      Some(read) => return read(n)?
+      None => return ""
+    }
+  }
+  let body = checkedBodyStream(source, headerInt(h, "content-length")?)?
+  for alg of checksumAlgorithms() {
+    let name = checksumHeaderPrefix + toLower(checksumAlgorithmId(alg)?)
+    match (headerText(h, name)) {
+      Some(expected) => {
+        body.checksums = append(body.checksums, responseChecksum(h, alg, expected)?)
+      }
+      None => {}
+    }
+  }
+  return body
 }
 
 // An enum-valued header: `parse` turns the wire text into the variant, an

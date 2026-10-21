@@ -1,0 +1,290 @@
+import { exists, mkdir, readDir, readFile, remove, stat, writeFile } from "std/fs"
+import { envOr } from "std/os"
+import { contains, repeat } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+fn bodyTestSource(data: string): BodySource {
+  let at = 0
+  return (n) => {
+    let size = len(data) - at
+    if (size > n) {
+      size = n
+    }
+    let part = data[at:at + size]
+    at = at + size
+    return part
+  }
+}
+
+fn bodyTestDir(): string! {
+  let path = envOr("TMPDIR", "/tmp") + "/bit-s3-body-" + uuidFormat(uuidV4())
+  mkdir(path)?
+  return path
+}
+
+fn bodyTestCleanup(path: string) {
+  let names = readDir(path) catch e {
+    panic(e.message())
+  }
+  for name of names {
+    remove(path + "/" + name) catch e {
+      panic(e.message())
+    }
+  }
+  remove(path) catch e {
+    panic(e.message())
+  }
+}
+
+fn bodyTestHead(data: string, checksum: string): ResponseHead {
+  let h = responseHead(200, "Content-Length: ${len(data)}\r\nx-amz-checksum-crc32: ${checksum}\r\n")
+  h.stream = Option.Some(bodyTestSource(data))
+  return h
+}
+
+fn bodyTestRun(checkBody: () => ()!) {
+  checkBody() catch e {
+    panic(e.message())
+  }
+}
+
+test "body request variants open one bounded attempt and files reopen for retries" {
+  bodyTestRun(() => {
+    for input of [Body.Empty, Body.Text("abc"), Body.Bytes([]byte("abc"))] {
+      let stream = bodyStream(input)?
+      let data = stream.text()?
+      assert(data == "" || data == "abc", "memory body")
+      assert(isReplayable(input), "memory bodies replay")
+    }
+    let dir = bodyTestDir()?
+    defer bodyTestCleanup(dir)
+    let path = dir + "/cover"
+    writeFile(path, "article-cover")?
+    let input = Body.File(path)
+    let first = bodyStream(input)?
+    let second = bodyStream(input)?
+    assert(first.text()? == "article-cover", "first attempt")
+    assert(second.text()? == "article-cover", "second attempt starts from byte zero")
+    assert(isReplayable(input), "files replay")
+    let streamed = Body.Stream(bodyTestSource("abc"), Option.Some(3))
+    assert(!isReplayable(streamed), "caller streams do not replay")
+    assert(bodyStream(streamed)?.text()? == "abc", "known-length stream")
+  })
+}
+
+test "body lazy bounded reads and close release the source once" {
+  bodyTestRun(() => {
+    let pulls = 0
+    let closes = 0
+    let source: BodySource = (n) => {
+      pulls = pulls + 1
+      assert(n <= bodyChunkBytes, "source request remains bounded")
+      return repeat("a", n)
+    }
+    let stream = checkedBodyStream(source, Option<int>.None)?
+    stream.onClose = Option.Some(() => {
+      closes = closes + 1
+    })
+    assert(pulls == 0, "no eager pull")
+    assert(len(stream.read(bodyChunkBytes + 1)?) == bodyChunkBytes, "read is capped")
+    stream.close()
+    stream.close()
+    assert(closes == 1 && pulls == 1, "one release")
+    assert(len(stream.read(1)?) == 0, "closed stream stays closed")
+  })
+}
+
+test "body explicit buffer ceiling includes empty and exact-size boundaries" {
+  bodyTestRun(() => {
+    assert(len(bodyStream(Body.Empty)?.bytes(0)?) == 0, "empty zero-byte limit")
+    assert(bodyStream(Body.Text("abc"))?.text(3)? == "abc", "exact limit")
+    let stream = bodyStream(Body.Text("abcd"))?
+    let refused = false
+    let _ = stream.bytes(3) catch e {
+      refused = contains(e.message(), "buffered byte limit")
+      []byte(0)
+    }
+    assert(refused, "one byte over the limit fails")
+    let invalid = false
+    let _ = bodyStream(Body.Empty)?.bytes(-1) catch _ {
+      invalid = true
+      []byte(0)
+    }
+    assert(invalid, "negative ceiling fails")
+  })
+}
+
+test "body length mismatch and oversized source fail closed" {
+  bodyTestRun(() => {
+    for input of [
+      Body.Stream(bodyTestSource("ab"), Option.Some(3)),
+      Body.Stream(bodyTestSource("abcd"), Option.Some(3)),
+    ] {
+      let stream = bodyStream(input)?
+      let refused = false
+      let _ = stream.bytes(10) catch e {
+        refused = contains(e.message(), "content length mismatch")
+        []byte(0)
+      }
+      assert(refused, "declared length is enforced")
+      assert(stream.failed && stream.closed, "failure closes the source")
+    }
+    let bad: BodySource = (n) => {
+      return repeat("x", n + 1)
+    }
+    let stream = checkedBodyStream(bad, Option<int>.None)?
+    let refused = false
+    let _ = stream.read(1) catch _ {
+      refused = true
+      []byte(0)
+    }
+    assert(refused && stream.closed, "oversized source fails")
+  })
+}
+
+test "body save validates checksum before atomic replacement" {
+  bodyTestRun(() => {
+    let dir = bodyTestDir()?
+    defer bodyTestCleanup(dir)
+    let path = dir + "/cover"
+    writeFile(path, "old-cover")?
+    let stream = deserializeGetObjectOutput(bodyTestHead("abc", "NSRBwg=="))?.body
+    stream.saveTo(path)?
+    assert(readFile(path)? == "abc", "validated replacement")
+    assert(len(readDir(dir)?) == 1, "no successful temporary file remains")
+    let invalid = deserializeGetObjectOutput(bodyTestHead("abc", "AAAAAA=="))?.body
+    let refused = false
+    invalid.saveTo(path) catch e {
+      refused = contains(e.message(), "response checksum mismatch")
+    }
+    assert(refused, "bad checksum fails at EOF")
+    assert(readFile(path)? == "abc", "previous target survives checksum failure")
+    assert(len(readDir(dir)?) == 1, "checksum failure removes its temporary file")
+  })
+}
+
+test "body disconnect removes temporary file and preserves absent or existing target" {
+  bodyTestRun(() => {
+    let dir = bodyTestDir()?
+    defer bodyTestCleanup(dir)
+    for existing of [false, true] {
+      let path = dir + "/cover"
+      if (existing) {
+        writeFile(path, "old-cover")?
+      }
+      let pulls = 0
+      let source: BodySource = (n) => {
+        pulls = pulls + 1
+        if (pulls == 1) {
+          return "abc"
+        }
+        fail newError("disconnected")
+      }
+      let stream = checkedBodyStream(source, Option<int>.None)?
+      let refused = false
+      stream.saveTo(path) catch e {
+        refused = contains(e.message(), "disconnected")
+      }
+      assert(refused, "disconnect reaches caller")
+      if (existing) {
+        assert(readFile(path)? == "old-cover", "old target survives")
+        assert(len(readDir(dir)?) == 1, "only old target remains")
+      } else {
+        assert(!exists(path) && len(readDir(dir)?) == 0, "no target or temporary file")
+      }
+    }
+  })
+}
+
+test "body 300 MiB save uses bounded chunks" {
+  bodyTestRun(() => {
+    let dir = bodyTestDir()?
+    defer bodyTestCleanup(dir)
+    let total = 300 * 1024 * 1024
+    let sent = 0
+    let chunk = repeat("c", bodyChunkBytes)
+    let source: BodySource = (n) => {
+      assert(n == bodyChunkBytes, "fixed bounded demand")
+      if (sent == total) {
+        return ""
+      }
+      sent = sent + len(chunk)
+      return chunk
+    }
+    let stream = checkedBodyStream(source, Option.Some(total))?
+    let path = dir + "/cover"
+    stream.saveTo(path)?
+    assert(sent == total && stat(path)?.size == total, "all bytes saved")
+    assert(len(readDir(dir)?) == 1, "only final target remains")
+  })
+}
+
+test "body sink failure closes once and cannot become a successful empty read" {
+  bodyTestRun(() => {
+    let closes = 0
+    let body = checkedBodyStream(bodyTestSource("abc"), Option.Some(3))?
+    body.onClose = Option.Some(() => {
+      closes = closes + 1
+    })
+    let refused = false
+    body.pipeTo((part) => {
+      fail newError("sink refused")
+    }) catch e {
+      refused = contains(e.message(), "sink refused")
+    }
+    let failedRead = false
+    let _ = body.read(1) catch _ {
+      failedRead = true
+      []byte(0)
+    }
+    body.close()
+    assert(refused && failedRead && closes == 1, "sink failure remains a failure and releases once")
+  })
+}
+
+test "body save cannot create a temporary file and still releases its source" {
+  bodyTestRun(() => {
+    let dir = bodyTestDir()?
+    defer bodyTestCleanup(dir)
+    let pulls = 0
+    let closes = 0
+    let source: BodySource = (n) => {
+      pulls = pulls + 1
+      return "abc"
+    }
+    let body = checkedBodyStream(source, Option.Some(3))?
+    body.onClose = Option.Some(() => {
+      closes = closes + 1
+    })
+    let refused = false
+    body.saveTo(dir + "/missing/cover") catch _ {
+      refused = true
+    }
+    body.close()
+    assert(refused && pulls == 0 && closes == 1, "open failure releases without pulling")
+    assert(len(readDir(dir)?) == 0, "no temporary file remains")
+  })
+}
+
+test "body save refuses a closed stream and preserves the target" {
+  bodyTestRun(() => {
+    let dir = bodyTestDir()?
+    defer bodyTestCleanup(dir)
+    let path = dir + "/cover"
+    writeFile(path, "old-cover")?
+    let closes = 0
+    let body = bodyStream(Body.Text("new-cover"))?
+    body.onClose = Option.Some(() => {
+      closes = closes + 1
+    })
+    body.close()
+    let refused = false
+    body.saveTo(path) catch e {
+      refused = contains(e.message(), "closed")
+    }
+    assert(readFile(path)? == "old-cover", "closed save must preserve the target")
+    assert(refused, "closed body save must fail")
+    assert(closes == 1, "closed save releases its source once")
+    assert(len(readDir(dir)?) == 1, "closed save leaves no temporary file")
+  })
+}

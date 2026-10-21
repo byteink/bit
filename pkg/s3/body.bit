@@ -1,10 +1,12 @@
-// pkg/s3/body.bit — the request and response body types the generated shapes
-// name (gen_shapes_*.bit): `Body` on every input, `ByteStream` on every
-// output. #6605 gives both their full behaviour (retry rules, lazy reads,
-// checksum validation, atomic saveTo); until then they carry the data and
-// nothing else, so the generated surface compiles and tests can build inputs.
+// Request bodies reopen for each attempt; response bodies validate at EOF
+// before an atomic save becomes visible (#6605).
 
-import { BodySource } from "std/http"
+import { File as BodyFile, open as openBodyFile, remove, rename } from "std/fs"
+import { createExclusive } from "std/fs/secure"
+import { BodySink, BodySource } from "std/http"
+import { Hash } from "std/crypto"
+import { Builder } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
 
 // A request body. Text, Bytes and File are re-readable, so a retry can send
 // them again; a Stream is pulled once. Empty is the zero value.
@@ -16,7 +18,240 @@ export enum Body {
   Stream(BodySource, Option<int>),
 }
 
-// A response body, delivered by the response deserializer.
+const bodyChunkBytes: int = 64 * 1024
+
+class bodyChecksum {
+  hash: Hash,
+  expected: string,
+}
+
+// A response body. A source returns an empty string only at true EOF.
+// Call close when abandoning a body before EOF.
 export class ByteStream {
-  export source: Option<BodySource>,
+  export source: Option<BodySource>
+  onClose: Option<() => ()>
+  expectedBytes: Option<int>
+  checksums: []bodyChecksum
+  consumed: int
+  closed: bool
+  failed: bool
+
+  export read(max: int): []byte! {
+    if (max <= 0) {
+      fail invalidInput("body: read size must be positive")
+    }
+    if (this.failed) {
+      fail invalidInput("body: stream has failed")
+    }
+    if (this.closed) {
+      return []byte(0)
+    }
+    let data = readBodyPart(this, max) catch e {
+      this.failed = true
+      this.close()
+      fail e
+    }
+    return []byte(data)
+  }
+
+  export bytes(max: int): []byte! {
+    if (max < 0 || max > maxStreamGetBytes) {
+      fail invalidInput("body: byte limit is outside the supported range")
+    }
+    let out = Builder()
+    while (int(out.length()) <= max) {
+      let part = this.read(minBodyRead(max - int(out.length()) + 1))?
+      if (len(part) == 0) {
+        return []byte(out.toString())
+      }
+      if (len(part) > max - int(out.length())) {
+        this.failed = true
+        this.close()
+        fail invalidInput("body: buffered byte limit exceeded")
+      }
+      out.write(string(part))
+    }
+    fail invalidInput("body: buffered byte limit exceeded")
+  }
+
+  export text(max: int = 32 * 1024 * 1024): string! {
+    return string(this.bytes(max)?)
+  }
+
+  export pipeTo(sink: BodySink): ()! {
+    defer this.close()
+    while (this.consumed <= maxStreamGetBytes) {
+      let part = this.read(bodyChunkBytes)?
+      if (len(part) == 0) {
+        return
+      }
+      sink(string(part)) catch e {
+        this.failed = true
+        fail e
+      }
+    }
+    fail invalidInput("body: stream byte limit exceeded")
+  }
+
+  export saveTo(path: string): ()! {
+    if (this.closed) {
+      fail invalidInput("body: cannot save a closed stream")
+    }
+    defer this.close()
+    let temp = path + ".s3-" + uuidFormat(uuidV4()) + ".tmp"
+    let file = createBodyTemp(temp)?
+    saveBodyFile(this, file, temp, path) catch e {
+      this.failed = true
+      remove(temp) catch cleanup {
+        fail newError("${e.message()}; body: temporary file cleanup failed: ${cleanup.message()}")
+      }
+      fail e
+    }
+  }
+
+  export close() {
+    if (this.closed) {
+      return
+    }
+    this.closed = true
+    this.source = Option.None
+    let release = this.onClose
+    this.onClose = Option.None
+    match (release) {
+      Some(releaseSource) => releaseSource()
+      None => {}
+    }
+  }
+}
+
+fn minBodyRead(n: int): int {
+  if (n < bodyChunkBytes) {
+    return n
+  }
+  return bodyChunkBytes
+}
+
+fn readBodyPart(body: ByteStream, max: int): string! {
+  let data = ""
+  match (body.source) {
+    Some(source) => data = source(minBodyRead(max))?
+    None => {}
+  }
+  if (len(data) > minBodyRead(max) || len(data) > maxStreamGetBytes - body.consumed) {
+    fail invalidInput("body: source exceeded its byte limit")
+  }
+  body.consumed = body.consumed + len(data)
+  checkBodyLength(body, data == "")?
+  for check of body.checksums {
+    check.hash.write([]byte(data))
+  }
+  if (data != "") {
+    return data
+  }
+  validateBodyEnd(body)?
+  body.close()
+  return ""
+}
+
+fn checkBodyLength(body: ByteStream, end: bool): ()! {
+  match (body.expectedBytes) {
+    Some(n) => {
+      if (body.consumed > n || (end && body.consumed != n)) {
+        fail invalidInput("body: content length mismatch")
+      }
+    }
+    None => {}
+  }
+}
+
+fn validateBodyEnd(body: ByteStream): ()! {
+  for check of body.checksums {
+    if (checksumValue(check.hash) != check.expected) {
+      fail clientError(ErrorKind.ChecksumMismatch, "body: response checksum mismatch")
+    }
+  }
+}
+
+fn createBodyTemp(path: string): BodyFile! {
+  match (createExclusive(path, 0o600)?) {
+    Some(file) => return file
+    None => fail invalidInput("body: temporary file already exists")
+  }
+}
+
+fn writeBodyFile(body: ByteStream, file: BodyFile): ()! {
+  defer file.close()
+  let sink: BodySink = (part) => {
+    file.write(part)?
+  }
+  body.pipeTo(sink)?
+  file.sync()?
+}
+
+fn saveBodyFile(body: ByteStream, file: BodyFile, temp: string, path: string): ()! {
+  writeBodyFile(body, file)?
+  rename(temp, path)?
+}
+
+// Open one attempt. A file gets a fresh descriptor and cursor each time;
+// a Stream keeps the caller's source and is never replayable (isReplayable).
+export fn bodyStream(body: Body): ByteStream! {
+  return match (body) {
+    Empty => memoryBodyStream("")
+    Text(text) => memoryBodyStream(text)
+    Bytes(data) => memoryBodyStream(string(data))
+    File(path) => fileBodyStream(path)?
+    Stream(source, length) => checkedBodyStream(source, length)?
+  }
+}
+
+fn checkedBodyStream(source: BodySource, length: Option<int>): ByteStream! {
+  match (length) {
+    Some(n) => {
+      if (n < 0 || n > maxStreamGetBytes) {
+        fail invalidInput("body: content length is outside the supported range")
+      }
+    }
+    None => {}
+  }
+  return ByteStream{ source = Option.Some(source), expectedBytes = length }
+}
+
+fn memoryBodyStream(data: string): ByteStream {
+  let at = 0
+  let source: BodySource = (n) => {
+    let size = len(data) - at
+    if (size > n) {
+      size = n
+    }
+    let part = data[at:at + size]
+    at = at + size
+    return part
+  }
+  return ByteStream{ source = Option.Some(source), expectedBytes = Option.Some(len(data)) }
+}
+
+fn fileBodyStream(path: string): ByteStream! {
+  let file = openBodyFile(path)?
+  let size = file.size() catch e {
+    file.close()
+    fail e
+  }
+  if (size < 0 || size > i64(maxStreamGetBytes)) {
+    file.close()
+    fail invalidInput("body: file exceeds the stream byte limit")
+  }
+  let at: i64 = 0
+  let source: BodySource = (n) => {
+    let data = []byte(n)
+    let count = file.readAt(data, at)?
+    at = at + i64(count)
+    return string(data[0:count])
+  }
+  return ByteStream{
+    source = Option.Some(source), expectedBytes = Option.Some(int(size)),
+    onClose = Option.Some(() => {
+      file.close()
+    }),
+  }
 }

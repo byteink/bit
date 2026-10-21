@@ -67,3 +67,12 @@ policies, lifecycle rules) are in [`docs/`](docs/README.md).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
+
+## Prepare or save an article cover
+
+Inkwell can prepare a retryable file body or save a body without collecting
+the cover in memory. [`Body` and `ByteStream`](docs/models.md#prepare-and-save-an-article-cover)
+shows bounded reads, an explicit buffer limit, a sink, and atomic file replacement.
+These library helpers also serve custom transports. The modeled request pipeline
+does not yet connect them to network operations; the existing client streaming
+methods remain described in [Storing article covers](docs/guide.md).
