@@ -38,6 +38,66 @@ The finished app uses [`pkg/auth` bearer tokens](../../auth/docs/bearer-tokens.m
 for login and refresh. Older access tokens without the required issuer,
 audience and access-token header are rejected; sign in again to get a new one.
 
+### Give an article a cover image
+
+Keep images in an S3-compatible bucket instead of sending each download
+through the API. Create a private bucket, then add these settings before
+starting the finished app:
+
+```sh
+export S3_ENDPOINT="https://YOUR_STORAGE_ENDPOINT"
+export S3_BUCKET="YOUR_PRIVATE_BUCKET"
+export S3_ACCESS_KEY_ID="YOUR_ACCESS_KEY"
+export S3_SECRET_KEY="YOUR_SECRET_KEY"
+export S3_REGION="us-east-1"
+```
+
+Use your bucket's actual signing region. Without the storage settings, the
+other API routes work; a cover request that needs storage returns `503`.
+Apply the app's migrations before restarting it, as for every schema change.
+The new nullable cover column keeps existing articles readable.
+
+Sign in and create an article first. Replace `42` with its id and use your
+session cookie jar. Its author or an administrator can attach one PNG,
+JPEG or WebP file, up to 2 MiB:
+
+```sh
+curl -i -b cookies.txt -F 'cover=@cover.png;type=image/png' \
+  http://127.0.0.1:8080/v1/articles/42/cover
+```
+
+A successful upload returns `204`. The app checks the image signature,
+ignores the submitted filename, and stores the object under a random key.
+A malformed form or over-limit file returns `400`; a request body above
+2 MiB plus 4 KiB of form overhead returns `413`. An unsupported or mismatched
+image type returns `415`. Another author gets `403`, and an unsigned
+request gets `401`, before its body reaches storage.
+
+Anyone who can read the public article can read its cover. Follow its
+short-lived signed redirect to download the object, or ask storage for a
+byte range:
+
+```sh
+curl -L -o downloaded.png http://127.0.0.1:8080/v1/articles/42/cover
+curl -L -H 'Range: bytes=0-7' http://127.0.0.1:8080/v1/articles/42/cover
+```
+
+The signed URL expires after five minutes. Storage serves the bytes and
+ranges directly; the API keeps no download buffer. Missing or deleted
+articles, and articles without a cover, return `404`.
+
+Replacing a cover writes a fresh key and updates the article with its
+existing optimistic revision check; a concurrent edit returns `412`.
+After a failed save, the app locks and reads the current article before
+cleanup. It removes the new object only when that row proves the object is
+unreferenced. A lost database response can follow a committed write: if the
+row points to the new key, or its state cannot be read, the object stays and
+the original error reaches the caller. A failed compensation also remains
+an error. After a successful database update, the app deletes the old object. If that deletion fails, the request reports
+an error while the new database reference remains valid. Retry only after
+checking the article's current cover. The integration gate runs this flow
+against its own PostgreSQL, Redis and SeaweedFS containers.
+
 ## Chapters
 
 14. [First endpoint](01-first-endpoint.md)

@@ -1,0 +1,164 @@
+// Cover requests keep object bytes off the application read path (#6126).
+import { Client as CoverClient, Config as CoverConfig, presignGet as coverPresign } from "s3"
+import { Limits as CoverLimits, FormFile as CoverFile, parseMultipart as coverParse } from "std/http"
+import {
+  split as coverParts,
+  trimSpace as coverTrim,
+  toLower as coverLower,
+  indexOf as coverIndex,
+  hasPrefix as coverPrefix,
+} from "std/strings"
+
+const coverMaxBytes = 2 * 1024 * 1024
+const coverUrlSeconds = 300
+
+class CoverUpload { article: Article, key: string, body: string, contentType: string }
+
+fn coverClient(cfg: AppConfig): CoverClient! {
+  if (cfg.s3Endpoint == "" ||
+    cfg.s3Bucket == "" ||
+    cfg.s3AccessKeyId == "" ||
+    cfg.s3SecretKey == "") {
+    fail httpError(503, "cover storage is not configured")
+  }
+  return CoverClient(
+    CoverConfig{
+      endpoint = cfg.s3Endpoint, region = cfg.s3Region, bucket = cfg.s3Bucket,
+      accessKeyId = cfg.s3AccessKeyId, secretKey = cfg.s3SecretKey,
+    },
+  )
+}
+
+// The multipart parser validates the resulting boundary's byte alphabet.
+fn coverBoundary(contentType: string): string {
+  let parts = coverParts(contentType, ";")
+  if (coverLower(coverTrim(parts[0])) != "multipart/form-data") {
+    return ""
+  }
+  for part of parts {
+    let eq = coverIndex(part, "=")
+    if (eq < 0) {
+      continue
+    }
+    if (coverLower(coverTrim(part[:eq])) != "boundary") {
+      continue
+    }
+    let value = coverTrim(part[eq + 1:])
+    if (len(value) >= 2 && value[0] == '"' && value[len(value) - 1] == '"') {
+      return value[1:len(value) - 1]
+    }
+    return value
+  }
+  return ""
+}
+
+// The declared type must agree with the image signature; SVG is executable.
+fn coverExtension(file: CoverFile): string! {
+  let body = string(file.content)
+  if (file.contentType == "image/png" && coverPrefix(body, "\x89PNG\r\n\x1a\n")) {
+    return "png"
+  }
+  if (file.contentType == "image/jpeg" && coverPrefix(body, "\xff\xd8\xff")) {
+    return "jpg"
+  }
+  if (file.contentType == "image/webp" &&
+    len(body) >= 12 &&
+    body[:4] == "RIFF" &&
+    body[8:12] == "WEBP") {
+    return "webp"
+  }
+  fail httpError(415, "cover must be a PNG, JPEG or WebP image")
+}
+
+fn parseCover(c: Ctx, article: Article): CoverUpload! {
+  let limits = CoverLimits{
+    maxBodyBytes = coverMaxBytes + 4096, maxFileBytes = coverMaxBytes, maxParts = 1,
+    maxHeaderLineBytes = 1024, maxPartHeaderBytes = 2048,
+  }
+  let form = coverParse([]byte(c.rawBody()?), coverBoundary(c.header("Content-Type")), limits) catch _ {
+    fail badRequest("invalid or oversized cover form")
+  }
+  let file = form.file("cover") catch _ {
+    fail badRequest("cover file is required")
+  }
+  let ext = coverExtension(file)?
+  // Ignore the untrusted filename; only an article id and a random id form a key.
+  let key = "articles/${article.id}/covers/${uuidFormat(uuidV4())}.${ext}"
+  return CoverUpload{
+    article = article,
+    key = key,
+    body = string(file.content),
+    contentType = file.contentType,
+  }
+}
+
+fn storeCover(client: CoverClient, upload: CoverUpload, db: Db): ()! {
+  client.put(upload.key, upload.body, upload.contentType)?
+  upload.article.coverImageKey = Option<string>.Some(upload.key)
+  upload.article.updatedAt = now().ns
+  db.table<Article>().update(upload.article)?
+}
+
+// Lock the current row before deleting bytes after an uncertain write outcome.
+fn removeUnreferencedCover(client: CoverClient, upload: CoverUpload, db: Db): ()! {
+  db.tx((tx) => {
+    let current = tx.table<Article>().lock().find(upload.article.id)?
+    if (isSome(current.coverImageKey) && unwrap(current.coverImageKey) == upload.key) {
+      return
+    }
+    client.delete(upload.key)?
+  })?
+}
+
+fn coverSaveFailure(client: CoverClient, upload: CoverUpload, db: Db, cause: error): ()! {
+  removeUnreferencedCover(client, upload, db) catch _ {
+    // An unreadable outcome cannot prove that the uploaded object is unreferenced.
+    fail cause
+  }
+  let (_, stale) = cause.(StaleWriteError)
+  if (stale) {
+    fail httpError(412, "the article changed during upload; reload and retry")
+  }
+  fail cause
+}
+
+fn uploadCover(c: Ctx, db: Db, cfg: AppConfig, redis: RedisClient): Res! {
+  let id = parseId(c.param("id")) catch _ {
+    fail badRequest("id must be an integer")
+  }
+  let article = findArticleById(db, id) catch _ {
+    fail notFound("no article with that id")
+  }
+  requireOwnerOrAdmin(c, article.authorId)?
+  let client = coverClient(cfg)?
+  let upload = parseCover(c, article)?
+  let oldKey = article.coverImageKey
+  storeCover(client, upload, db) catch e {
+    coverSaveFailure(client, upload, db, e)?
+  }
+  if (isSome(oldKey)) {
+    client.delete(unwrap(oldKey))?
+  }
+  invalidateArticles(redis)?
+  return c.noContent()
+}
+
+fn readCover(c: Ctx, db: Db, cfg: AppConfig): Res! {
+  let id = parseId(c.param("id")) catch _ {
+    fail badRequest("id must be an integer")
+  }
+  let article = findArticleById(db, id) catch _ {
+    fail notFound("no article with that id")
+  }
+  if (isNone(article.coverImageKey)) {
+    fail notFound("article has no cover")
+  }
+  let client = coverClient(cfg)?
+  return c.redirect(coverPresign(client.cfg, unwrap(article.coverImageKey), coverUrlSeconds)?)
+}
+
+fn mountImages(app: Routes, db: Db, cfg: AppConfig, redis: RedisClient) {
+  // The redirect delegates streaming and byte ranges to storage, without a proxy buffer.
+  app.post("/articles/:id/cover", (c) => uploadCover(c, db, cfg, redis))
+  app.get("/articles/:id/cover", (c) => readCover(c, db, cfg))
+}
