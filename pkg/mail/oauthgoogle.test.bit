@@ -1,0 +1,234 @@
+import { decodeBase64Url, rsaVerifyPkcs1v15, RsaPublicKey, HashAlg, rsaDigestInfoSha256 } from "std/crypto"
+import { Json, JsonEntry, jsonEncode, jsonParse, jsonGet, jsonAsString, jsonAsInt } from "std/json"
+import { percentEncode } from "std/http"
+import { contains, hasPrefix, split } from "std/strings"
+import { Second } from "std/time"
+import { listen as tlsListen } from "std/tls"
+
+fn gtKey(endpoint: string, pem: string = rsaPkcs8Pem): string {
+  return jsonEncode(
+    Json.JsonObject(
+      [
+        apiEntry("type", Json.JsonString("service_account")),
+        apiEntry("client_email", Json.JsonString("inkwell@project.iam.gserviceaccount.com")),
+        apiEntry("private_key", Json.JsonString(pem)),
+        apiEntry("token_uri", Json.JsonString(endpoint)),
+      ],
+    ),
+  )
+}
+
+fn gtSource(endpoint: string): GoogleServiceAccount {
+  let source = GoogleServiceAccount(gtKey(endpoint), "hello@inkwell.dev")
+  source.cache.client = otClient
+  return source
+}
+
+fn gtAssertion(source: GoogleServiceAccount): string {
+  return source.assertion() catch e {
+    panic(e.message())
+  }
+}
+
+fn gtString(doc: Json, field: string): string {
+  return unwrap(jsonAsString(unwrap(jsonGet(doc, field))))
+}
+
+fn gtInt(doc: Json, field: string): int {
+  return int(unwrap(jsonAsInt(unwrap(jsonGet(doc, field)))))
+}
+
+fn gtClaims(assertion: string): Json {
+  let parts = split(assertion, ".")
+  assert(len(parts) == 3)
+  let head = decodeBase64Url(parts[0]) catch e {
+    panic(e.message())
+  }
+  assert(string(head) == "{\"alg\":\"RS256\",\"typ\":\"JWT\"}")
+  let payload = decodeBase64Url(parts[1]) catch e {
+    panic(e.message())
+  }
+  let signature = decodeBase64Url(parts[2]) catch e {
+    panic(e.message())
+  }
+  let key = googleRsa(rsaPkcs8Pem) catch e {
+    panic(e.message())
+  }
+  assert(
+    rsaVerifyPkcs1v15(
+      RsaPublicKey{ n = key.n, e = key.e }, HashAlg.Sha256, rsaDigestInfoSha256(),
+      []byte(parts[0] + "." + parts[1]), signature,
+    ),
+  )
+  return jsonParse(string(payload)) catch e {
+    panic(e.message())
+  }
+}
+
+fn gtForm(assertion: string): string {
+  return "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${percentEncode(assertion)}"
+}
+
+fn gtRequest(request: string, assertion: string) {
+  assert(hasPrefix(request, "POST /token HTTP/1.1\r\n"))
+  assert(contains(request, "Content-Type: application/x-www-form-urlencoded"))
+  assert(contains(request, "\r\n\r\n" + gtForm(assertion)))
+}
+
+test "GoogleServiceAccount fixed clock assertion has exact claims and verified RS256 signature" {
+  let endpoint = "https://oauth2.googleapis.com/token"
+  let source = gtSource(endpoint)
+  let clock = OtClock{ at = 1700000000 * Second }
+  source.cache.clock = () => clock.read()
+  let assertion = gtAssertion(source)
+  let claims = gtClaims(assertion)
+  assert(gtString(claims, "iss") == "inkwell@project.iam.gserviceaccount.com")
+  assert(gtString(claims, "sub") == source.subject)
+  assert(gtString(claims, "scope") == "https://mail.google.com/")
+  assert(gtString(claims, "aud") == endpoint)
+  assert(gtInt(claims, "iat") == 1700000000 && gtInt(claims, "exp") == 1700003600)
+  assert(
+      jsonEncode(claims) ==
+      "{\"iss\":\"inkwell@project.iam.gserviceaccount.com\",\"sub\":\"hello@inkwell.dev\",\"scope\":\"https://mail.google.com/\",\"aud\":\"https://oauth2.googleapis.com/token\",\"iat\":1700000000,\"exp\":1700003600}",
+  )
+}
+
+test "GoogleServiceAccount HTTPS bearer grant shares early refresh and failed generation cache" {
+  let (port, requests) = rsStart([otAnswer("first"), otAnswer("second"), otAnswer("third")]) catch e {
+    panic(e.message())
+  }
+  let source = gtSource("https://127.0.0.1:${port}/token")
+  let clock = OtClock{ at = 1700000000 * Second }
+  source.cache.clock = () => clock.read()
+  let firstAssertion = gtAssertion(source)
+  let first = otToken(source)
+  assert(first.value == "first" && otToken(source).generation == first.generation)
+  gtRequest(<- requests, firstAssertion)
+  clock.at = clock.at + 59 * Second
+  assert(otToken(source).value == "first")
+  clock.at = clock.at + Second
+  let second = otToken(source)
+  assert(second.value == "second" && second.generation != first.generation)
+  gtRequest(<- requests, gtAssertion(source))
+  let third = sourceToken(source, 10 * Second, second.generation) catch e {
+    panic(e.message())
+  }
+  assert(third.value == "third" && third.generation != second.generation)
+  gtRequest(<- requests, gtAssertion(source))
+  let shared = sourceToken(source, 10 * Second, second.generation) catch e {
+    panic(e.message())
+  }
+  assert(shared.generation == third.generation && source.cache.generation == 3)
+}
+
+fn gtConfig(source: GoogleServiceAccount, field: string) {
+  Mailer(Outbox(), Options{ token = source }) catch e {
+    match (e) {
+      Config(text) => assert(contains(text, field))
+      _ => panic("expected GoogleServiceAccount Config error")
+    }
+    assert(!contains(e.message(), "DO-NOT-LOG") && !contains(e.message(), "PRIVATE KEY"))
+    return
+  }
+  panic("Mailer accepted invalid service account credentials")
+}
+
+test "GoogleServiceAccount rejects absent fields and invalid RSA before Mailer sends" {
+  for field of ["type", "client_email", "private_key", "token_uri"] {
+    let members = [
+      apiEntry("type", Json.JsonString("service_account")),
+      apiEntry("client_email", Json.JsonString("DO-NOT-LOG@example.com")),
+      apiEntry("private_key", Json.JsonString("DO-NOT-LOG")),
+      apiEntry("token_uri", Json.JsonString("https://oauth2.googleapis.com/token")),
+    ]
+    let kept: []JsonEntry = []
+    for member of members {
+      if (member.key != field) {
+        kept = append(kept, member)
+      }
+    }
+    gtConfig(GoogleServiceAccount(jsonEncode(Json.JsonObject(kept)), "hello@inkwell.dev"), field)
+  }
+  gtConfig(GoogleServiceAccount("DO-NOT-LOG", "hello@inkwell.dev"), "JSON")
+  gtConfig(GoogleServiceAccount(gtKey("http://127.0.0.1/token"), "hello@inkwell.dev"), "token_uri")
+  gtConfig(
+    GoogleServiceAccount(
+      gtKey("https://oauth2.googleapis.com/token", "DO-NOT-LOG"),
+      "hello@inkwell.dev",
+    ),
+    "private_key",
+  )
+  gtConfig(
+    GoogleServiceAccount(
+      gtKey("https://oauth2.googleapis.com/token", rsa1024Pem),
+      "hello@inkwell.dev",
+    ),
+    "2048",
+  )
+  gtConfig(GoogleServiceAccount(gtKey("https://oauth2.googleapis.com/token"), ""), "subject")
+  gtConfig(
+    GoogleServiceAccount(
+      gtKey("https://oauth2.googleapis.com/token"),
+      "hello@inkwell.dev",
+      scope = "",
+    ),
+    "scope",
+  )
+}
+
+test "GoogleServiceAccount redacts the signed assertion and key from provider errors" {
+  let ln = tlsListen(
+    "127.0.0.1",
+    0,
+    smServerConfig() catch e {
+      panic(e.message())
+    },
+  ) catch e {
+    panic(e.message())
+  }
+  defer ln.close()
+  let port = ln.port() catch e {
+    panic(e.message())
+  }
+  let source = gtSource("https://127.0.0.1:${port}/token")
+  let clock = OtClock{ at = 1700000000 * Second }
+  source.cache.clock = () => clock.read()
+  let assertion = gtAssertion(source)
+  let body = jsonEncode(
+    Json.JsonObject(
+      [
+        apiEntry("error", Json.JsonString("invalid_grant")),
+        apiEntry(
+          "error_description",
+          Json.JsonString(assertion + " " + rsaPkcs8Pem + " " + source.key),
+        ),
+      ],
+    ),
+  )
+  let requests = chan<string>(2)
+  spawn rsServe(rsFake{ ln = ln, log = requests, replies = [rsReply(400, "", body)] })
+  source.token() catch e {
+    match (e) {
+      Auth(r) => assert(r.code == 400)
+      _ => panic("expected GoogleServiceAccount Auth error")
+    }
+    assert(!contains(e.message(), assertion) && !contains(e.message(), "MIIEvg"))
+    assert(!contains(e.message(), "private_key"))
+    gtRequest(<- requests, assertion)
+    return
+  }
+  panic("GoogleServiceAccount accepted a refused grant")
+}
+
+test "GoogleServiceAccount exhausted caller budget fails before any grant" {
+  let source = gtSource("https://127.0.0.1:1/token")
+  sourceToken(source, 0) catch e {
+    match (e) {
+      Transient(r) => assert(contains(r.text, "timed out"))
+      _ => panic("expected caller timeout")
+    }
+    assert(source.cache.generation == 0)
+    return
+  }
+  panic("GoogleServiceAccount ignored exhausted caller budget")
+}
