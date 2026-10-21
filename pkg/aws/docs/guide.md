@@ -117,7 +117,7 @@ sso_region = eu-west-1
 ```bit
 import { Credentials } from "aws"
 
-fn main()! {
+fn main(): ()! {
   let identity = Credentials.Profile("inkwell").resolver()?
   let credential = identity.resolve()?
   println(credential.show())
