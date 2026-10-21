@@ -10,6 +10,7 @@ just gets killed mid-request. This part covers all three: health, readiness
 and shutting down without dropping what is already in flight.
 
 <!-- doctest: per-block -->
+<!-- doctest: deps orm -->
 
 ## Health versus readiness
 
@@ -26,17 +27,18 @@ mistake in a service's ops surface:
   and a platform that respects readiness stops routing to it without
   killing the process, which gives it a chance to recover on its own.
 
-Inkwell registers both, unauthenticated, ahead of every other route:
+Inkwell registers both, unauthenticated, on the `/v1` group before its
+resources. The mount accepts `Routes`, so the same function works on an
+app or a group:
 
 ```bit
-import { App, Config, Ctx, Res } from "web"
-import { Pool, Value } from "std/sql"
+import { Ctx, Res, Routes } from "web"
+import { Db } from "orm"
 
-fn probeDb(p: Pool): bool {
-  let rows = p.query("select 1", []Value(0)) catch _ {
+fn probeDb(db: Db): bool {
+  db.exec("select 1") catch _ {
     return false
   }
-  rows.close()
   return true
 }
 
@@ -44,31 +46,31 @@ fn health(c: Ctx): Res! {
   return c.text("ok")
 }
 
-fn ready(c: Ctx, p: Pool): Res! {
-  if (!probeDb(p)) {
+fn ready(c: Ctx, db: Db): Res! {
+  if (!probeDb(db)) {
     return c.text("database unavailable").status(503)
   }
   return c.text("ready")
 }
 
-fn mountOperations(app: App, p: Pool) {
+fn mountOperations(app: Routes, db: Db) {
   app.get("/health", health)
-  app.get("/ready", (c) => ready(c, p))
+  app.get("/ready", (c) => ready(c, db))
 }
 ```
 
-`/health` never touches `p`; it only proves the process can answer HTTP.
-`/ready` runs the cheapest query that proves the connection Inkwell
+`/v1/health` never touches `db`; it only proves the process can answer HTTP.
+`/v1/ready` runs the cheapest query that proves the connection Inkwell
 actually uses still works - `select 1`, not a real table, because the
 question is "can I reach Postgres", not "does my schema look right".
 
 ```
-$ curl -i http://127.0.0.1:8080/health
+$ curl -i http://127.0.0.1:8080/v1/health
 HTTP/1.1 200 OK
 Content-Type: text/plain; charset=utf-8
 
 ok
-$ curl -i http://127.0.0.1:8080/ready
+$ curl -i http://127.0.0.1:8080/v1/ready
 HTTP/1.1 200 OK
 Content-Type: text/plain; charset=utf-8
 
@@ -131,7 +133,7 @@ Sending the signal by hand shows the sequence:
 
 ```
 $ ./inkwell &
-$ curl http://127.0.0.1:8080/health
+$ curl http://127.0.0.1:8080/v1/health
 ok
 $ kill -TERM %1
 inkwell: shutting down

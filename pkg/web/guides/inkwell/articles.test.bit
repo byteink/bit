@@ -1,0 +1,201 @@
+// Exercise the finished app's representation validators and versioned routes
+// through the same real PostgreSQL/Redis fixture as app.test.bit.
+const articleHttpCachePolicy = "private, max-age=0, must-revalidate"
+
+fn readCachedArticle(app: App, id: string, validator: string): Response {
+  let headers = ""
+  if (validator != "") {
+    headers = "If-None-Match: " + validator
+  }
+  return app.handle(
+    Request{ method = "GET", path = "/v1/articles/${id}", headers = headers, body = "" },
+  )
+}
+
+fn articleReadTag(res: Response): string {
+  assert(res.status == 200, "article read failed: ${res.status}: ${res.body}")
+  let tag = res.getHeader("ETag")
+  assert(
+    len(tag) >= 2 && tag[0] == '"' && tag[len(tag) - 1] == '"',
+    "article ETag must be quoted: ${tag}",
+  )
+  assert(res.getHeader("Cache-Control") == articleHttpCachePolicy, "article cache policy changed")
+  return tag
+}
+
+fn assertArticleNotModified(res: Response, tag: string) {
+  assert(
+    res.status == 304,
+    "matching representation must return 304, got ${res.status}: ${res.body}",
+  )
+  assert(res.body == "", "304 must have no body, including no response envelope")
+  assert(res.getHeader("ETag") == tag, "304 lost the current ETag")
+  assert(res.getHeader("Cache-Control") == articleHttpCachePolicy, "304 lost the cache policy")
+}
+
+test "article HTTP cache: matching, weak, listed and wildcard validators return empty 304" {
+  let app = testApp()
+  let cookie = registerAndLogin(app, uniqueName("validator"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let id = postArticle(app, cookie, "Conditional draft", "[]") catch e {
+    panic(e.message())
+  }
+  let first = readCachedArticle(app, id, "")
+  let tag = articleReadTag(first)
+  assertArticleNotModified(readCachedArticle(app, id, tag), tag)
+  assertArticleNotModified(readCachedArticle(app, id, "W/" + tag), tag)
+  assertArticleNotModified(readCachedArticle(app, id, "\"unrelated\", W/" + tag), tag)
+  assertArticleNotModified(readCachedArticle(app, id, " * "), tag)
+  let changed = readCachedArticle(app, id, "\"unrelated\"")
+  assert(
+    articleReadTag(changed) == tag && changed.body == first.body,
+    "nonmatching validator must return the current representation",
+  )
+}
+
+test "article HTTP cache: a write invalidates the tag and retains numeric If-Match" {
+  let app = testApp()
+  let cookie = registerAndLogin(app, uniqueName("cached-edit"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let id = postArticle(app, cookie, "Before conditional edit", "[]") catch e {
+    panic(e.message())
+  }
+  let before = readCachedArticle(app, id, "")
+  let tag = articleReadTag(before)
+  let revision = articleRevision(before)
+  let updated = putWithIfMatch(app, cookie, id, "After conditional edit", "${revision}")
+  assert(updated.status == 200, "numeric If-Match must still permit an edit: ${updated.body}")
+  let after = readCachedArticle(app, id, tag)
+  let next = articleReadTag(after)
+  assert(
+    next != tag && contains(after.body, "After conditional edit"),
+    "edit did not invalidate cached representation",
+  )
+  assertArticleNotModified(readCachedArticle(app, id, next), next)
+  let stale = putWithIfMatch(app, cookie, id, "Stale edit", "${revision}")
+  assert(stale.status == 412, "numeric stale-write refusal changed")
+}
+
+test "article HTTP cache: related author and tag changes invalidate the representation without a revision change" {
+  let app = testApp()
+  let name = uniqueName("representation")
+  let cookie = registerAndLogin(app, name, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let tagName = uniqueName("tag")
+  let id = postArticle(app, cookie, "Related draft", "[\"${tagName}\"]") catch e {
+    panic(e.message())
+  }
+  let before = readCachedArticle(app, id, "")
+  let tag = articleReadTag(before)
+  let revision = articleRevision(before)
+  let db = redisGuideDb() catch e {
+    panic(e.message())
+  }
+  defer db.pool.close()
+  let nextName = uniqueName("renamed-author")
+  db.exec("update users set username = ? where username = ?", nextName, name) catch e {
+    panic(e.message())
+  }
+  let authorChanged = readCachedArticle(app, id, tag)
+  let authorTag = articleReadTag(authorChanged)
+  assert(
+    authorTag != tag && contains(authorChanged.body, nextName),
+    "author representation did not invalidate ETag",
+  )
+  assert(articleRevision(authorChanged) == revision, "fixture must not change article revision")
+  let nextTag = uniqueName("renamed-tag")
+  db.exec("update tags set name = ? where name = ?", nextTag, tagName) catch e {
+    panic(e.message())
+  }
+  let tagChanged = readCachedArticle(app, id, authorTag)
+  let tagTag = articleReadTag(tagChanged)
+  assert(
+    tagTag != authorTag && contains(tagChanged.body, nextTag),
+    "tag representation did not invalidate ETag",
+  )
+  assert(articleRevision(tagChanged) == revision, "related tag must not change article revision")
+}
+
+test "article HTTP cache: wildcard never hides a missing or deleted article" {
+  let app = testApp()
+  let missing = readCachedArticle(app, "9223372036854775807", "*")
+  assert(missing.status == 404, "wildcard must not turn a missing resource into 304")
+  let cookie = registerAndLogin(app, uniqueName("cache-delete"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let id = postArticle(app, cookie, "Deleted representation", "[]") catch e {
+    panic(e.message())
+  }
+  let tag = articleReadTag(readCachedArticle(app, id, ""))
+  let removed = app.handle(jsonReq("DELETE", "/v1/articles/${id}", cookie, ""))
+  assert(removed.status == 204, "delete failed: ${removed.body}")
+  assert(
+    readCachedArticle(app, id, tag).status == 404,
+    "deleted representation must not return 304",
+  )
+}
+
+test "versioned API: operational and article routes use v1 and old paths are absent" {
+  let app = testApp()
+  for path of ["/v1/health", "/v1/ready", "/v1/articles", "/v1/tags"] {
+    let res = app.handle(Request{ method = "GET", path = path, headers = "", body = "" })
+    assert(res.status == 200, "versioned route failed: ${path}: ${res.status}")
+  }
+  for path of ["/health", "/ready", "/articles", "/tags", "/me", "/api/me", "/auth/login"] {
+    let res = app.handle(Request{ method = "GET", path = path, headers = "", body = "" })
+    assert(res.status == 404, "unversioned route remains reachable: ${path}: ${res.status}")
+  }
+  let oldLogin = app.handle(jsonReq("POST", "/auth/login", "", "{}"))
+  assert(oldLogin.status == 404, "unversioned login must not remain mounted")
+}
+
+fn articleApiField(doc: Json, key: string): Json {
+  let field = jsonGet(doc, key)
+  assert(isSome(field), "OpenAPI field missing: ${key}")
+  return unwrap(field)
+}
+
+test "OpenAPI: root document describes real versioned paths without the response envelope" {
+  let app = testApp()
+  let res = app.handle(Request{ method = "GET", path = "/openapi.json", headers = "", body = "" })
+  assert(res.status == 200, "OpenAPI route failed: ${res.status}: ${res.body}")
+  assert(contains(res.contentType, "application/json"), "OpenAPI must be JSON")
+  let doc = jsonParse(res.body) catch e {
+    panic(e.message())
+  }
+  let version = jsonAsString(articleApiField(doc, "openapi"))
+  assert(
+    isSome(version) && len(unwrap(version)) >= 2 && unwrap(version)[0:2] == "3.",
+    "OpenAPI version must be 3.x",
+  )
+  assert(
+    !isSome(jsonGet(doc, "data")),
+    "OpenAPI document must not be wrapped by envelope middleware",
+  )
+  let paths = articleApiField(doc, "paths")
+  let detail = articleApiField(paths, "/v1/articles/{id}")
+  assert(
+    isSome(jsonGet(detail, "get")) && isSome(jsonGet(detail, "put")),
+    "document lost real article operations",
+  )
+  let _ = articleApiField(paths, "/v1/health")
+  let _ = articleApiField(paths, "/v1/auth/login")
+  assert(!isSome(jsonGet(paths, "/articles/{id}")), "OpenAPI documented an old unversioned path")
+}
+
+fn articleRevision(res: Response): i64 {
+  assert(res.status == 200, "article response: ${res.status}: ${res.body}")
+  let doc = jsonParse(res.body) catch e {
+    panic(e.message())
+  }
+  let data = jsonGet(doc, "data")
+  assert(isSome(data), "article data missing: ${res.body}")
+  let field = jsonGet(unwrap(data), "version")
+  assert(isSome(field), "article version missing: ${res.body}")
+  let revision = jsonAsInt(unwrap(field))
+  assert(isSome(revision), "article version is not an integer: ${res.body}")
+  return unwrap(revision)
+}

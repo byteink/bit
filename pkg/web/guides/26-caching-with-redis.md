@@ -10,8 +10,8 @@ Start the [finished app](README.md#run-the-finished-app), then request the
 same list twice:
 
 ```sh
-curl 'http://localhost:8080/articles?limit=10&page=1&sort=newest'
-curl 'http://localhost:8080/articles?limit=10&page=1&sort=newest'
+curl 'http://localhost:8080/v1/articles?limit=10&page=1&sort=newest'
+curl 'http://localhost:8080/v1/articles?limit=10&page=1&sort=newest'
 ```
 
 The first request queries PostgreSQL. The second returns the cached page
@@ -21,7 +21,7 @@ never reuses another query's cached body.
 
 ## Publish, edit and delete
 
-Successful `POST /articles`, `PUT /articles/:id` and `DELETE /articles/:id`
+Successful `POST /v1/articles`, `PUT /v1/articles/:id` and `DELETE /v1/articles/:id`
 advance the list-cache generation. The next list request uses the new
 generation and queries PostgreSQL. A request already filling an older
 generation cannot make that old page visible again after invalidation.

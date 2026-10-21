@@ -9,24 +9,24 @@ sensible thing: it sends the request again. The first one had reached the
 server after all.
 
 ```text
-$ curl -i -X POST http://127.0.0.1:8080/articles/42/comments \
+$ curl -i -X POST http://127.0.0.1:8080/v1/articles/42/comments \
     -H 'Cookie: sid=9f2c...' -H 'Content-Type: application/json' \
     -d '{"body":"great read"}'
 HTTP/1.1 201 Created
-Location: /articles/42/comments/17
+Location: /v1/articles/42/comments/17
 
-$ curl -i -X POST http://127.0.0.1:8080/articles/42/comments \
+$ curl -i -X POST http://127.0.0.1:8080/v1/articles/42/comments \
     -H 'Cookie: sid=9f2c...' -H 'Content-Type: application/json' \
     -d '{"body":"great read"}'
 HTTP/1.1 201 Created
-Location: /articles/42/comments/18
+Location: /v1/articles/42/comments/18
 ```
 
 Two requests, two comments, and the article now shows "great read" twice. The
 server did nothing wrong: from where it sits, two identical requests look like
 a reader who meant to post twice. The client is the only one who knows the
 second request is a retry of the first, so the client has to say so. This part
-adds that to Inkwell for `POST /articles` and `POST /articles/:id/comments`,
+adds that to Inkwell for `POST /v1/articles` and `POST /v1/articles/:id/comments`,
 the two routes where a repeat does damage.
 
 ## The idea: one key per intent
@@ -81,31 +81,31 @@ Run the same comment again, this time with a key. The first request runs the
 handler:
 
 ```text
-$ curl -i -X POST http://127.0.0.1:8080/articles/42/comments \
+$ curl -i -X POST http://127.0.0.1:8080/v1/articles/42/comments \
     -H 'Cookie: sid=9f2c...' -H 'Content-Type: application/json' \
     -H 'Idempotency-Key: 7c1f0d1a-0b52-4f55-9d1e-2d2f9c5b8a10' \
     -d '{"body":"great read"}'
 HTTP/1.1 201 Created
-Location: /articles/42/comments/17
+Location: /v1/articles/42/comments/17
 ```
 
 The retry, with the same key and the same body, gets the first answer back, and
 no second comment exists. The `Location` still says `17`:
 
 ```text
-$ curl -i -X POST http://127.0.0.1:8080/articles/42/comments \
+$ curl -i -X POST http://127.0.0.1:8080/v1/articles/42/comments \
     -H 'Cookie: sid=9f2c...' -H 'Content-Type: application/json' \
     -H 'Idempotency-Key: 7c1f0d1a-0b52-4f55-9d1e-2d2f9c5b8a10' \
     -d '{"body":"great read"}'
 HTTP/1.1 201 Created
-Location: /articles/42/comments/17
+Location: /v1/articles/42/comments/17
 ```
 
 The same key with a different body is a mistake, and the server says so instead
 of answering with a stale `17`:
 
 ```text
-$ curl -i -X POST http://127.0.0.1:8080/articles/42/comments \
+$ curl -i -X POST http://127.0.0.1:8080/v1/articles/42/comments \
     -H 'Cookie: sid=9f2c...' -H 'Content-Type: application/json' \
     -H 'Idempotency-Key: 7c1f0d1a-0b52-4f55-9d1e-2d2f9c5b8a10' \
     -d '{"body":"a different comment"}'
@@ -116,7 +116,7 @@ Unprocessable Entity: this Idempotency-Key was already used with a different req
 ```
 
 The middleware compares the key together with a fingerprint of the method, the
-path and the body, so the same key aimed at `POST /articles` instead is also a
+path and the body, so the same key aimed at `POST /v1/articles` instead is also a
 `422`, never article 17's answer replayed.
 
 And a retry that arrives before the first request has finished, say a client
@@ -124,7 +124,7 @@ that gave up after a second while the handler needed three, is refused rather
 than run in parallel:
 
 ```text
-$ curl -i -X POST http://127.0.0.1:8080/articles \
+$ curl -i -X POST http://127.0.0.1:8080/v1/articles \
     -H 'Cookie: sid=9f2c...' -H 'Content-Type: application/json' \
     -H 'Idempotency-Key: 31d6e0a4-5b7e-4c0b-8f3a-6a1d0c9e2b77' \
     -d '{"title":"Hello Inkwell","body":"body text","tags":[]}'
@@ -216,8 +216,8 @@ let once = idempotency(IdempotencyPolicy{ store = keys, ttl = idempotencyTtlSeco
 The excerpt uses the app's existing `keys` argument; it is not a standalone
 program. The complete app supplies its store, routes and configuration.
 
-Each module puts the middleware on a group that holds only its creating
-route. Here is the write group copied from
+Each module receives the `/v1` group as `app: Routes` and puts the
+middleware on a child group that holds only its creating route. Here is the write group copied from
 [`mountComments`](inkwell/comments.bit):
 
 ```text
@@ -228,8 +228,8 @@ write.post("/", (c) => createComment(c, db))
 
 The real `createComment` checks the article, reads the signed-in user,
 validates the body and inserts the comment. Two groups can share a prefix,
-so the separate read group serves `GET /articles/:id/comments` without
-reserving a key. `mountArticles` does the same for `POST /articles`.
+so the separate read group serves `GET /v1/articles/:id/comments` without
+reserving a key. `mountArticles` does the same for `POST /v1/articles`.
 
 Because the middleware sits in front of the handler, a handler that fails, say
 a `401` for a missing session or a `400` for a body that does not validate,
@@ -270,7 +270,7 @@ class HeldStore {
 
 `HeldStore` has the three methods of an idempotency store, so `buildAppWith(cfg,
 store)`, the variant of `buildApp` that takes the store as an argument, accepts
-it. The test named `POST /articles: a duplicate sent while the first is still
+it. The test named `POST /v1/articles: a duplicate sent while the first is still
 running is 409` in
 [`idempotency.test.bit`](inkwell/idempotency.test.bit) calls
 `expectInFlightConflict` with a real signed-in request. Read that helper
@@ -302,7 +302,7 @@ $ bit test pkg/web/guides/inkwell
   the [operational middleware chapter](../docs/operations.md#whose-key-is-it).
 - **A handler that outlives `ttl` can run twice.** Its reservation expires, a
   retry takes the key, and now two copies run. Keep `ttl` far longer than the
-  slowest `POST /articles`.
+  slowest `POST /v1/articles`.
 - **A panic leaves the key at `409` until `ttl` ends.** A handler that fails
   releases its key, but a handler that panics cannot, so a retry with that key
   gets `409` for the whole window, a day as Inkwell sets it. This is the safe
@@ -319,7 +319,7 @@ $ bit test pkg/web/guides/inkwell
 
 Skip it on routes where a repeat is harmless: `GET` reads, and `PUT` or `DELETE`
 on a known id, which already give the same result however often they run.
-`POST /articles` and `POST /articles/:id/comments` are the ones that create a
+`POST /v1/articles` and `POST /v1/articles/:id/comments` are the ones that create a
 new row each time, which is why they carry it.
 
 ## What we built

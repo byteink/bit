@@ -5,14 +5,14 @@
 Inkwell's browser signs in with a session cookie. A phone app or command-line
 client needs a credential it can send with each API request instead. Give it
 a short-lived access token after the same password check, then accept that
-token on `/api/me`.
+token on `/v1/api/me`.
 
 Run the [finished app](README.md#run-the-finished-app) with its migrations and
 register a user through [Registering users](10-registering-users-and-hashing-passwords.md).
 Use that user's credentials to ask for tokens:
 
 ```text
-curl -s http://127.0.0.1:8080/auth/token \
+curl -s http://127.0.0.1:8080/v1/auth/token \
   -H 'Content-Type: application/json' \
   -d '{"username":"ada","password":"correct horse battery"}'
 ```
@@ -21,7 +21,7 @@ Inkwell's response envelope puts `accessToken`, `refreshToken`, `tokenType`
 and `expiresIn` under `data`. Send the access token with the next request:
 
 ```text
-curl -i http://127.0.0.1:8080/api/me \
+curl -i http://127.0.0.1:8080/v1/api/me \
   -H "Authorization: Bearer $ACCESS_TOKEN"
 ```
 
@@ -52,6 +52,7 @@ const accessTokenTtlSeconds = 900
 
 export class AppConfig {
   export databaseUrl: string,
+  export redisUrl: string,
   export secret: string,
   export host: string,
   export port: int,
@@ -170,7 +171,9 @@ its storage and rotation.
 ## Guard only the API group
 
 These lines are excerpted from [`mountAuth`](inkwell/auth.bit). They use its
-existing `app`, `db`, `access`, `tokens` and password `strategy` values:
+existing `app: Routes`, `db`, `access`, `tokens` and password `strategy`
+values. `main.bit` passes the `/v1` group as `app`, so these paths stay
+relative to that prefix:
 
 ```text
 let bearer = BearerStrategy(access)
@@ -192,14 +195,14 @@ fn showApiMe(c: Ctx, db: Db): Res! {
 }
 ```
 
-A browser cookie does not replace the bearer header on `/api/me`. Conversely,
-this group does not convert `/articles` or `/me` into bearer routes; those
+A browser cookie does not replace the bearer header on `/v1/api/me`. Conversely,
+this group does not convert `/v1/articles` or `/v1/me` into bearer routes; those
 still use Inkwell's session helpers. Authentication also does not replace the
 ownership checks from [Authorization](12-authorization.md).
 
 ## Check the refusal as well as the success
 
-The test `POST /auth/token issues a bearer token, and GET /api/me accepts it`
+The test `POST /v1/auth/token issues a bearer token, and GET /v1/api/me accepts it`
 in [`app.test.bit`](inkwell/app.test.bit) checks issuance, the response
 fields, refusal without a token and acceptance with the issued token. Run
 the finished app's tests with the PostgreSQL setup from
@@ -225,5 +228,5 @@ through its expiry and allowed clock skew. For immediate server-controlled
 sign-out, the cookie session from [Sessions and logging in](11-sessions-and-logging-in.md)
 is simpler; use tokens when the client needs this API credential flow.
 
-Previous: [Optimistic locking](30-optimistic-locking.md).
+Previous: [Generate the API document from its routes](33-generated-openapi.md).
 Next: [Refresh tokens](35-refresh-tokens.md).

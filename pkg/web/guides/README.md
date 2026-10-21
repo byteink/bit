@@ -28,6 +28,12 @@ session-cookie secret. Access tokens use a separate `JWT_SECRET` of at least
 that identifies your deployment and an audience that identifies this API.
 Missing token settings or a short signing key stop startup.
 
+The finished app mounts its existing API, including health and readiness,
+under `/v1`; the generated document stays at `/openapi.json`. Early chapters
+contain smaller standalone programs with their own unprefixed routes. Use
+those paths when running that chapter, and `/v1` when running `inkwell/`.
+[API versioning](32-api-versioning.md) explains the shared route mounts.
+
 The finished app uses [`pkg/auth` bearer tokens](../../auth/docs/bearer-tokens.md)
 for login and refresh. Older access tokens without the required issuer,
 audience and access-token header are rejected; sign in again to get a new one.
@@ -57,10 +63,13 @@ audience and access-token header are rejected; sign in again to get a new one.
 34. [Find articles by their words](28-full-text-search.md)
 35. [Keep deleted articles recoverable](29-soft-deletes.md)
 36. [Refuse an edit based on an old article](30-optimistic-locking.md)
-37. [API tokens with JWT](34-api-tokens-with-jwt.md)
-38. [Refresh tokens](35-refresh-tokens.md)
-39. [Sign in with Google](36-sign-in-with-google.md)
-40. [Idempotency keys: retry a write without doing it twice](40-idempotency-keys.md)
+37. [Reuse an article until its representation changes](31-conditional-client-caching.md)
+38. [Give the API a versioned address](32-api-versioning.md)
+39. [Generate the API document from its routes](33-generated-openapi.md)
+40. [API tokens with JWT](34-api-tokens-with-jwt.md)
+41. [Refresh tokens](35-refresh-tokens.md)
+42. [Sign in with Google](36-sign-in-with-google.md)
+43. [Idempotency keys: retry a write without doing it twice](40-idempotency-keys.md)
 
 Idempotency closes this part by making the app's two creating routes safe
 to retry. Part 5 starts with [Background jobs](../../../docs/book/31-background-jobs.md)

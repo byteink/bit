@@ -14,11 +14,11 @@ applied. Use a real article id and the session cookie of its author or an
 admin. The route returns `204` after it marks the row:
 
 ```text
-curl -i -X DELETE http://127.0.0.1:8080/articles/42 \
+curl -i -X DELETE http://127.0.0.1:8080/v1/articles/42 \
   -H 'Cookie: sid=YOUR_SESSION_COOKIE'
 ```
 
-That article disappears from `GET /articles`, `GET /articles/42` and
+That article disappears from `GET /v1/articles`, `GET /v1/articles/42` and
 [full-text search](28-full-text-search.md). Deleting it again returns `404`
 because the handler's initial lookup no longer sees it.
 

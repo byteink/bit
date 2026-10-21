@@ -98,7 +98,7 @@ inkwell: could not reach the database
 
 `probeDb` never leaks the driver's own error - a wrong password or an
 unreachable host both fail the same `catch _`. Part 17 wires this same
-probe into the app's real `/ready` route.
+probe into the app's real `/v1/ready` route.
 
 Remove the container once you are done:
 
