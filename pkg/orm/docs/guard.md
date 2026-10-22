@@ -383,14 +383,22 @@ For a narrowed chain, `None` returns zero without SQL; a guard error returns
 unchanged without SQL. `All`, an unprotected table, or no guard retains the
 plain bulk-delete behavior. The call leaves the source chain unchanged.
 
-## Removing a tag from a draft
+## Changing a draft's tags
 
-Removing a relation requires permission to update its owner. Keep using the
+Adding or removing a relation requires permission to update its owner. Keep using the
 author's scoped repository, even when the caller already has the draft:
 
 ```bit
+fn addTag(mine: ScopedRepo<Draft>, draft: Draft, tagId: i64): ()! {
+  mine.link(draft, "tags", [tagId])?
+}
+
 fn removeTag(mine: ScopedRepo<Draft>, draft: Draft, tagId: i64): ()! {
   mine.unlink(draft, "tags", [tagId])?
+}
+
+fn addTagInTransaction(tx: ScopedTx, draft: Draft, tagId: i64): ()! {
+  tx.table<Draft>().link(draft, "tags", [tagId])?
 }
 
 fn removeTagInTransaction(tx: ScopedTx, draft: Draft, tagId: i64): ()! {
@@ -398,13 +406,14 @@ fn removeTagInTransaction(tx: ScopedTx, draft: Draft, tagId: i64): ()! {
 }
 ```
 
-`unlink` reads the owner's key from `draft`, then locks the stored owner
-through its `Update` filter before deleting the selected relation pairs.
-The lock and deletion share one transaction. Fields on the supplied draft
+`link` and `unlink` read the owner's key from `draft`, then lock the stored owner
+through its `Update` filter before writing the selected relation pairs.
+The lock and relation write share one transaction. `link` inserts only missing
+pairs, so repeating the same call is safe; `unlink` deletes the requested pairs. Fields on the supplied draft
 cannot grant permission. The chain's conditions and soft-delete condition
 still narrow the owner lookup. An unreadable owner returns `notFound`;
 a readable owner refused by the update rule returns `denied`. A guard error
-leaves the relation unchanged. Empty target ids remove no pairs.
+leaves the relation unchanged. Empty target ids change no pairs.
 
 The same call on `ScopedTxRepo` uses the caller's transaction. No guard or
 an unprotected owner table keeps the plain repository's behavior.
