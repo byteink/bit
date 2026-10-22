@@ -1,0 +1,187 @@
+// SNS envelope checks precede certificate fetch and signature verification.
+// This private result is untrusted until the caller verifies its signature.
+
+import { decodeBase64, encodeBase64 } from "std/crypto"
+import { jsonAsObject, jsonAsString, jsonGet, jsonParse, Json } from "std/json"
+import { hasPrefix, hasSuffix, indexOf, split } from "std/strings"
+import { Hour, parseRfc3339 } from "std/time"
+
+class SnsEnvelope {
+  data: Json,
+  canonical: string,
+  certificate: string,
+  signature: []byte,
+  version: string,
+}
+
+fn snsText(data: Json, key: string): string!MailError {
+  let value = jsonGet(data, key)
+  if (!isSome(value)) {
+    fail webhookRejected("SNS requires ${key}")
+  }
+  let text = jsonAsString(unwrap(value))
+  if (!isSome(text)) {
+    fail webhookRejected("SNS requires a string ${key}")
+  }
+  return unwrap(text)
+}
+
+fn snsRequired(data: Json, key: string): string!MailError {
+  let value = snsText(data, key)?
+  if (value == "") {
+    fail webhookRejected("SNS requires a nonempty ${key}")
+  }
+  return value
+}
+
+fn snsObject(body: string): Json!MailError {
+  if (len(body) > maxWebhookBody) {
+    fail MailError.Invalid("webhook body is over 1 MiB")
+  }
+  let data = jsonParse(body) catch _ {
+    fail MailError.Invalid("SNS body is not JSON")
+  }
+  let fields = jsonAsObject(data)
+  if (!isSome(fields)) {
+    fail MailError.Invalid("SNS body is not an object")
+  }
+  let entries = unwrap(fields)
+  // Cap extension work as well as the signed fields before duplicate checks.
+  if (len(entries) > 32) {
+    fail webhookRejected("SNS has too many envelope fields")
+  }
+  let i = 0
+  while (i < len(entries)) {
+    let j = 0
+    while (j < i) {
+      if (entries[i].key == entries[j].key) {
+        fail webhookRejected("SNS has duplicate envelope fields")
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return data
+}
+
+fn snsRegion(region: string): bool {
+  if (region == "") {
+    return false
+  }
+  for c of []byte(region) {
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) {
+      return false
+    }
+  }
+  return true
+}
+
+fn snsHost(host: string): bool {
+  let parts = split(host, ".")
+  if (len(parts) != 4 && len(parts) != 5) {
+    return false
+  }
+  if (len(parts) == 5 && parts[4] != "cn") {
+    return false
+  }
+  return parts[0] == "sns" && snsRegion(parts[1]) && parts[2] == "amazonaws" && parts[3] == "com"
+}
+
+fn snsCertificatePath(path: string): bool {
+  for c of []byte(path) {
+    if (c <= ' ' || c >= 127 || c == '?' || c == '#' || c == '\\') {
+      return false
+    }
+  }
+  return true
+}
+
+fn snsCertificateUrl(url: string): bool {
+  if (len(url) > 2048 || !hasPrefix(url, "https://") || !hasSuffix(url, ".pem")) {
+    return false
+  }
+  let rest = url[8:]
+  let slash = indexOf(rest, "/")
+  if (slash < 0 || !snsHost(rest[:slash])) {
+    return false
+  }
+  return snsCertificatePath(rest[slash:])
+}
+
+fn snsCanonical(data: Json): string!MailError {
+  let kind = snsRequired(data, "Type")?
+  let fields = ["Message", "MessageId"]
+  if (kind == "Notification") {
+    if (isSome(jsonGet(data, "Subject"))) {
+      fields = append(fields, "Subject")
+    }
+    fields = append(fields, "Timestamp", "TopicArn", "Type")
+  } else {
+    if (kind != "SubscriptionConfirmation" && kind != "UnsubscribeConfirmation") {
+      fail webhookRejected("SNS message type is not supported")
+    }
+    fields = append(fields, "SubscribeURL", "Timestamp", "Token", "TopicArn", "Type")
+  }
+  let text = ""
+  for key of fields {
+    let value = snsText(data, key)?
+    if (value == "" && key != "Subject") {
+      fail webhookRejected("SNS requires a nonempty ${key}")
+    }
+    text = text + key + "\n" + value + "\n"
+  }
+  return text
+}
+
+fn snsFresh(data: Json, at: Timestamp): ()!MailError {
+  let text = snsRequired(data, "Timestamp")?
+  let sent = parseRfc3339(text) catch _ {
+    fail webhookRejected("SNS timestamp is invalid")
+  }
+  if (sent.ns < 0 || at.ns < 0) {
+    fail webhookRejected("SNS timestamp is outside the accepted window")
+  }
+  // The mail contract bounds freshness separately from signature validity.
+  let skew = at.ns - sent.ns
+  if (skew > Hour || skew < 0 - Hour) {
+    fail webhookRejected("SNS timestamp is outside the accepted window")
+  }
+}
+
+fn snsSignature(data: Json): []byte!MailError {
+  let text = snsRequired(data, "Signature")?
+  // This admits RSA signatures up to 8192 bits without unbounded decoding.
+  if (len(text) > 1368) {
+    fail webhookRejected("SNS signature is too large")
+  }
+  let signature = decodeBase64(text) catch _ {
+    fail webhookRejected("SNS signature is not base64")
+  }
+  if (len(signature) == 0 || len(signature) > 1024 || encodeBase64(signature) != text) {
+    fail webhookRejected("SNS signature is not canonical base64")
+  }
+  return signature
+}
+
+fn snsEnvelope(body: string, topic: string, at: Timestamp): SnsEnvelope!MailError {
+  if (topic == "") {
+    fail MailError.Invalid("SNS needs the expected TopicArn")
+  }
+  let data = snsObject(body)?
+  if (snsRequired(data, "TopicArn")? != topic) {
+    fail webhookRejected("SNS topic does not match")
+  }
+  let version = snsRequired(data, "SignatureVersion")?
+  if (version != "1" && version != "2") {
+    fail webhookRejected("SNS signature version is not supported")
+  }
+  let certificate = snsRequired(data, "SigningCertURL")?
+  if (!snsCertificateUrl(certificate)) {
+    fail webhookRejected("SNS certificate URL is not allowed")
+  }
+  snsFresh(data, at)?
+  return SnsEnvelope{
+    data = data, canonical = snsCanonical(data)?, certificate = certificate,
+    signature = snsSignature(data)?, version = version,
+  }
+}
