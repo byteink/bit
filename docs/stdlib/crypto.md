@@ -8,6 +8,12 @@ who wrote it, or generating an id nobody can guess.
 
 <!-- doctest: per-block -->
 
+Choose the task you are working on:
+
+- [Hash passwords and fingerprint content](crypto/hashing.md).
+- [Encrypt data and verify signatures](crypto/encryption-and-signatures.md).
+- [Check certificates and encoded keys](crypto/certificates-and-primitives.md).
+
 ## What to reach for
 
 | Task | Use |
@@ -21,302 +27,19 @@ who wrote it, or generating an id nobody can guess.
 | Check a passkey's public key and signature | `parseCoseKey` / `coseVerify` (see [Check a passkey signature](#check-a-passkey-signature)) |
 
 ## Hash a password
-
-Never store a password itself, and never hash it with a plain, fast hash like
-SHA-256: a leaked database of fast hashes can be brute-forced on ordinary
-hardware in hours. `argon2Hash` runs a hash that is deliberately slow and
-memory-hungry, and returns one self-contained string that carries the salt and
-cost alongside the result, so you do not have to store them separately.
-
-```bit
-import { argon2Hash, argon2Verify, randomBytes } from "std/crypto"
-
-// t (time cost), m (memory in KiB), p (parallelism) and the 32-byte output
-// length are the Argon2id defaults: 64 MiB and three passes is a reasonable
-// floor for a server; raise m if the hardware and login volume allow it.
-fn hashPassword(password: string): string {
-  let salt = randomBytes(16)
-  return argon2Hash([]byte(password), salt, 3, 65536, 1, 32)
-}
-
-fn checkPassword(password: string, stored: string): bool {
-  return argon2Verify([]byte(password), stored)
-}
-```
-
-`argon2Verify` re-derives the hash from the stored parameters and compares it
-in constant time, so it never leaks timing information about *how much* of
-the password was wrong. It returns `false` for any malformed input rather
-than failing, so a corrupted stored value reads as "wrong password", never as
-a crash.
-
-`bcryptHash`/`bcryptVerify` and `scrypt` are the same shape for interop with
-older systems; prefer Argon2id for anything new.
-
+See the [full section](crypto/hashing.md#hash-a-password).
 ## Encrypt and decrypt data
-
-An AEAD cipher (an authenticated cipher: one call both encrypts your data and
-produces a tag proving it was not tampered with) is the right tool whenever
-you need to keep data secret and be sure nobody altered it while it was out
-of your hands, for example a drafts backup written to a shared disk.
-
-`std/crypto` has two: `XChaChaPoly` (a 24-byte nonce, safe to pick at random)
-and `AesGcm` (a 12-byte nonce, which needs a counter or a very low volume of
-messages per key to stay unique - see [Sharp edges](#sharp-edges)). Reach for
-`XChaChaPoly` unless you specifically need AES.
-
-```bit
-import { randomBytes, XChaChaPoly } from "std/crypto"
-
-// The nonce travels with the ciphertext; only the 32-byte key is secret.
-class Sealed {
-  nonce: []byte,
-  ciphertext: []byte,
-}
-
-fn encryptDraft(key: []byte, body: string): Sealed! {
-  let cipher = XChaChaPoly(key)?
-  let nonce = randomBytes(24)
-  let ciphertext = cipher.seal(nonce, []byte(body), []byte(0))
-  return Sealed{ nonce = nonce, ciphertext = ciphertext }
-}
-
-fn decryptDraft(key: []byte, sealed: Sealed): string! {
-  let cipher = XChaChaPoly(key)?
-  let plaintext = cipher.open(sealed.nonce, sealed.ciphertext, []byte(0))?
-  return string(plaintext)
-}
-```
-
-`seal`'s third argument is associated data: bytes that are authenticated but
-not encrypted, such as a draft id, so a ciphertext cannot be silently swapped
-onto a different record. Pass `[]byte(0)` (empty) when there is none. `open`
-fails on any tampering, wrong key, or wrong nonce; it never returns
-unauthenticated plaintext.
-
+See the [full section](crypto/encryption-and-signatures.md#encrypt-and-decrypt-data).
 ## Sign and verify data
-
-A signature lets anyone holding a public key confirm that the holder of the
-matching private key produced a message, and that the message was not
-changed afterward. Use it to let readers verify an exported article came
-from you, or to check a payload before you act on it.
-
-```bit
-import { randomBytes, ed25519PublicKey, ed25519Sign, ed25519Verify } from "std/crypto"
-
-// A 32-byte random seed IS the private key. Keep it secret; publish only
-// ed25519PublicKey(seed).
-fn newIdentity(): []byte {
-  return randomBytes(32)
-}
-
-fn signExport(seed: []byte, article: string): []byte {
-  return ed25519Sign(seed, []byte(article))
-}
-
-fn verifyExport(seed: []byte, article: string, sig: []byte): bool {
-  return ed25519Verify(ed25519PublicKey(seed), []byte(article), sig)
-}
-```
-
-Ed25519 is the default: fast, small keys and signatures, and no parameters to
-get wrong. `ecdsaSign`/`ecdsaVerify` (NIST curves) and the RSA-PKCS1v15/PSS
-functions exist for interop with systems that require them.
-
+See the [full section](crypto/encryption-and-signatures.md#sign-and-verify-data).
 ## Check a passkey signature
-
-When an Inkwell author signs in with a passkey, the browser hands the server
-a public key once, at registration, and a signature on every sign-in after
-it. The public key arrives as a COSE_Key: a CBOR map whose small integer keys
-name the key type, the algorithm and the curve. `parseCoseKey` turns those
-bytes into a `CoseKey` you can store and verify with, and `coseVerify` checks
-one signature.
-
-```bit
-import { CoseKey, coseAlg, coseVerify, parseCoseKey } from "std/crypto"
-
-// At registration: keep only a key this server can verify. ES256 (-7) is
-// what most authenticators make; this server also takes ES384, EdDSA, RS256
-// and PS256, and parseCoseKey has already refused everything else.
-fn registerKey(credentialPublicKey: []byte): CoseKey! {
-  let key = parseCoseKey(credentialPublicKey)?
-  println("registered a key for alg ${coseAlg(key)}")
-  return key
-}
-
-// At sign-in: the signature covers the authenticator data followed by the
-// SHA-256 of the client data. WebAuthn sends ECDSA signatures in DER.
-fn signedIn(key: CoseKey, authData: []byte, clientDataHash: []byte, sig: []byte): bool {
-  let signed = []byte(0)
-  for b of authData {
-    signed = append(signed, b)
-  }
-  for b of clientDataHash {
-    signed = append(signed, b)
-  }
-  return coseVerify(key, coseAlg(key), signed, sig) catch _ {
-    return false
-  }
-}
-```
-
-`parseCoseKey` does all its checking up front, so a key that parses is a key
-that verifies. It accepts these and nothing else:
-
-| Key type | Curve | `alg` |
-| --- | --- | --- |
-| EC2 (`kty` 2) | P-256 (`crv` 1) | -7 ES256 |
-| EC2 (`kty` 2) | P-384 (`crv` 2) | -35 ES384 |
-| OKP (`kty` 1) | Ed25519 (`crv` 6) | -8 EdDSA |
-| RSA (`kty` 3) | modulus 2048 to 8192 bits | -257 RS256 or -37 PS256 |
-
-Anything else fails with an error that names what it found: `cose:
-unsupported kty 4`, `cose: unsupported alg -36`, `cose: alg -35 does not fit
-EC2 crv 1`. So do a coordinate of the wrong length, a point that is not on
-the curve, an Ed25519 key that is not a point, a modulus under 2048 bits, an
-RSA exponent that is even or under 17 bits, a missing `alg` (WebAuthn
-requires it, and an RSA key is ambiguous without it), a label that appears
-twice, and a key whose `key_ops` does not allow verify.
-
-A key that carries a private parameter is refused too. A server that stored
-one would be holding a secret by accident, and a credential public key never
-has one.
-
-`coseVerify` takes the `alg` you expect and refuses one that is not the
-key's, so a signature made for one algorithm cannot be checked under another.
-A signature that does not verify, or is not even well formed, is `false`, not
-an error. ECDSA signatures are DER, as WebAuthn sends them; RFC 9053 puts raw
-`r || s` on the wire in other COSE uses, and that form has to go through
-`EcdsaSignature` and `ecdsaSignatureToDer` first.
-
-The bytes may be in any valid CBOR encoding, not only the canonical one
-authenticators write. They must be exactly one key: an attested credential
-carries extension data after the key, so split it off first with
-`decodePrefix` from [std/cbor](/std/cbor).
-
+See the [full section](crypto/encryption-and-signatures.md#check-a-passkey-signature).
 ## Generate random tokens
-
-`randomBytes` reads from the operating system's secure random source, never
-a plain pseudo-random generator, so its output is safe to use as a key, a
-nonce, or an unguessable id.
-
-```bit
-import { randomBytes, encodeHex } from "std/crypto"
-
-// A 16-byte random id, printed as 32 hex characters.
-fn newDraftId(): string {
-  return encodeHex(randomBytes(16))
-}
-```
-
-`encodeBase64Url` is a shorter alternative when the token goes in a URL.
-
+See the [full section](crypto/hashing.md#generate-random-tokens).
 ## Fingerprint content
-
-A hash turns any amount of data into a short, fixed-size fingerprint: the
-same input always produces the same output, and changing even one byte
-changes the whole result. Use it to detect whether a draft's body changed
-since it was last saved, not to protect a password (see
-[Hash a password](#hash-a-password)).
-
-```bit
-import { digest, Sha256 } from "std/crypto"
-
-fn contentHash(body: string): []byte {
-  return digest(Sha256(), []byte(body))
-}
-```
-
-`Sha256()` builds a hasher that satisfies `Hash`, the streaming interface every
-digest in this module satisfies: call `write` any number of times and `sum` when
-you are done, or use `digest` for the common single-buffer case. Every digest is
-a class built by calling its name: `Sha256(Sha256Bits.B224)` is SHA-224,
-`Sha512(Sha512Bits.B384)` is SHA-384, `Sha3(Sha3Bits.B512)` is SHA3-512. `Blake3`
-(`Blake3()`/`blake3Hash`) is faster on large inputs and also supports keyed
-hashing and a variable-length output; `Blake2b`, SHA-512, SHA-3, and the
-legacy SHA-1 and MD5 (interop only, never for anything security-relevant) are
-also available. Content hashes are not secret, so comparing them with `==` is
-fine; a MAC or password hash is different (see below).
-
-Another width, or another algorithm in the same family, is an option on the same
-constructor, never a different function name:
-
-```bit
-import {
-  digest, encodeHex, Md5, Sha1, Sha256, Sha256Bits, Sha512, Sha512Bits, Sha3, Sha3Bits,
-  Shake, ShakeSecurity, Blake2b, Blake2s, Blake3, Blake3Mode,
-} from "std/crypto"
-
-// A cache validator for an exported draft: nobody attacks it, so the cheap,
-// legacy MD5 is enough. Anything a stranger could forge needs SHA-256 or better.
-fn etag(body: string): string {
-  return encodeHex(digest(Md5(), []byte(body)))
-}
-
-// Each variant is the same call with one option.
-fn variants(body: string): []string! {
-  let data = []byte(body)
-  let author = [32]byte([]byte("32 bytes of secret key material!"))?
-  let keyed = Blake3(Blake3Mode.Keyed(author))
-  let sketch = Shake(ShakeSecurity.S256)
-  sketch.absorb(data)
-  return []string{
-    encodeHex(digest(Sha1(), data)),
-    encodeHex(digest(Sha256(Sha256Bits.B224), data)),
-    encodeHex(digest(Sha512(Sha512Bits.B384), data)),
-    encodeHex(digest(Sha3(Sha3Bits.B512), data)),
-    encodeHex(digest(Blake2b(32, []byte(0)), data)),
-    encodeHex(digest(Blake2s(16, []byte(0)), data)),
-    encodeHex(digest(keyed, data)),
-    encodeHex(sketch.squeeze(16)),
-  }
-}
-```
-
-When a draft MAC key arrives as bytes, validate it once with `[32]byte(bytes)?`
-or `catch`. A length other than 32 fails with
-`array conversion length mismatch: expected 32, found N`; the converted key
-is an independent copy. `Blake3(Blake3Mode.Keyed(key))` then cannot fail.
-
-For a single draft, the slice-taking helper checks the key for you and keeps
-its existing error message, `Blake3: key must be 32 bytes, got N`:
-
-```bit
-import { blake3KeyedHash } from "std/crypto"
-
-fn draftMac(keyBytes: []byte, body: string): []byte! {
-  return blake3KeyedHash(keyBytes, []byte(body))?
-}
-```
-
+See the [full section](crypto/hashing.md#fingerprint-content).
 ### Name the hash with a `HashAlg`
-
-`hmac`, `hkdf`, `pbkdf2` and `ecdsaSign` take the hash as a `HashAlg` value, the
-way Node's `createHmac("sha256", key)` and .NET's `HashAlgorithmName` do, so a
-call reads `hmac(HashAlg.Sha256, key, msg)`. The variants are `Md5`, `Sha1`,
-`Sha224`, `Sha256`, `Sha384`, `Sha512`, `Sha512_256` and `Blake3`. A value picked
-at run time (for example a protocol's negotiated cipher suite) is passed along
-unchanged, and `make()` builds a fresh hasher of that algorithm when you want
-to hash directly:
-
-```bit
-import { HashAlg, digest, hmac, hkdf, encodeHex } from "std/crypto"
-
-// The same API for every digest: only the `HashAlg` value changes.
-fn tag(alg: HashAlg, key: []byte, body: string): string {
-  return encodeHex(hmac(alg, key, []byte(body)))
-}
-
-// HashAlg.Sha384.make() is Sha512(Sha512Bits.B384); both satisfy `Hash`.
-fn fingerprint(body: string): string {
-  return encodeHex(digest(HashAlg.Sha384.make(), []byte(body)))
-}
-
-fn sessionKey(secret: []byte, context: string): []byte! {
-  return hkdf(HashAlg.Sha256, []byte(0), secret, []byte(context), 32)?
-}
-```
-
+See the [full section](crypto/hashing.md#name-the-hash-with-a-hashalg).
 ## Security notes
 
 **Compare secrets in constant time.** `==` on two byte slices can return as
@@ -376,1467 +99,657 @@ almost never be reached for directly; use an AEAD cipher instead.
 
 ## Reference
 
-Every exported name in `std/crypto`, grouped by area. The guide above covers
+Every exported name in `std/crypto`, grouped by area. The task guides cover
 the common path through each group; this section is for finding the exact
 signature of something you already know you need.
 
 ## Hashing
-
+See the [full section](crypto/hashing.md#hashing).
 ### `Hash`
-
-The streaming digest interface every hash in this module satisfies: `write` any number of times, then `sum` when you are done. `reset` starts over, `size` is the digest length in bytes, and `blockSize` is the algorithm's internal block size.
-
+See the [full section](crypto/hashing.md#hash).
 ### `HashAlg`
-
-Names a hash algorithm as a value: `Md5`, `Sha1`, `Sha224`, `Sha256`, `Sha384`, `Sha512`, `Sha512_256` or `Blake3`. `hmac`, `hkdf`, `pbkdf2` and `ecdsaSign` take one, and `HashAlg.Sha256.make()` builds a fresh `Hash` of that algorithm.
-
+See the [full section](crypto/hashing.md#hashalg).
 ### `HashAlg.make(): Hash`
-
-Builds a new, empty hasher for this algorithm: `HashAlg.Sha384.make()` is `Sha512(Sha512Bits.B384)`.
-
+See the [full section](crypto/hashing.md#hashalg-make-hash).
 ### `digest(h: Hash, data: []byte): []byte`
-
-Resets `h`, writes `data` once, and returns `h.sum()`. The convenience call for hashing one buffer in a single line.
-
+See the [full section](crypto/hashing.md#digest-h-hash-data-byte-byte).
 ### `Sha256`
-
-A SHA-256 or SHA-224 hasher. `Sha256()` starts a new SHA-256 hash; `Sha256(Sha256Bits.B224)` starts SHA-224, SHA-256's shorter sibling. It satisfies `Hash`.
-
+See the [full section](crypto/hashing.md#sha256).
 ### `Sha256Bits`
-
-Which SHA-2 digest a `Sha256` computes: `B256` (the default) or `B224`.
-
+See the [full section](crypto/hashing.md#sha256bits).
 ### `Sha256.write(data: []byte)`
-
-Feeds more data into the running SHA-256/SHA-224 state. Call it any number of times before `sum`.
-
+See the [full section](crypto/hashing.md#sha256-write-data-byte).
 ### `Sha256.sum(): []byte`
-
-Returns the SHA-256/SHA-224 digest for everything written so far, without resetting the state.
-
+See the [full section](crypto/hashing.md#sha256-sum-byte).
 ### `Sha256.reset()`
-
-Returns this SHA-256/SHA-224 hash to its empty starting state, so the same value can hash another message.
-
+See the [full section](crypto/hashing.md#sha256-reset).
 ### `Sha256.size(): int`
-
-The SHA-256/SHA-224 digest length in bytes.
-
+See the [full section](crypto/hashing.md#sha256-size-int).
 ### `Sha256.blockSize(): int`
-
-The SHA-256/SHA-224 algorithm's internal block size in bytes.
-
+See the [full section](crypto/hashing.md#sha256-blocksize-int).
 ### `Sha1`
-
-A SHA-1 hasher: `Sha1()` starts a new hash. Kept for reading data written by older systems; do not use it to protect anything new. It satisfies `Hash`.
-
+See the [full section](crypto/hashing.md#sha1).
 ### `Sha1.write(data: []byte)`
-
-Feeds more data into the running SHA-1 state. Call it any number of times before `sum`.
-
+See the [full section](crypto/hashing.md#sha1-write-data-byte).
 ### `Sha1.sum(): []byte`
-
-Returns the SHA-1 digest for everything written so far, without resetting the state.
-
+See the [full section](crypto/hashing.md#sha1-sum-byte).
 ### `Sha1.reset()`
-
-Returns this SHA-1 hash to its empty starting state, so the same value can hash another message.
-
+See the [full section](crypto/hashing.md#sha1-reset).
 ### `Sha1.size(): int`
-
-The SHA-1 digest length in bytes.
-
+See the [full section](crypto/hashing.md#sha1-size-int).
 ### `Sha1.blockSize(): int`
-
-The SHA-1 algorithm's internal block size in bytes.
-
+See the [full section](crypto/hashing.md#sha1-blocksize-int).
 ### `Md5`
-
-An MD5 hasher: `Md5()` starts a new hash. Kept for reading data written by older systems; do not use it to protect anything new. It satisfies `Hash`.
-
+See the [full section](crypto/hashing.md#md5).
 ### `Md5.write(data: []byte)`
-
-Feeds more data into the running MD5 state. Call it any number of times before `sum`.
-
+See the [full section](crypto/hashing.md#md5-write-data-byte).
 ### `Md5.sum(): []byte`
-
-Returns the MD5 digest for everything written so far, without resetting the state.
-
+See the [full section](crypto/hashing.md#md5-sum-byte).
 ### `Md5.reset()`
-
-Returns this MD5 hash to its empty starting state, so the same value can hash another message.
-
+See the [full section](crypto/hashing.md#md5-reset).
 ### `Md5.size(): int`
-
-The MD5 digest length in bytes.
-
+See the [full section](crypto/hashing.md#md5-size-int).
 ### `Md5.blockSize(): int`
-
-The MD5 algorithm's internal block size in bytes.
-
+See the [full section](crypto/hashing.md#md5-blocksize-int).
 ### `Sha512`
-
-A SHA-512-family hasher. `Sha512()` starts a new SHA-512 hash; `Sha512(Sha512Bits.B384)` starts SHA-384, SHA-512's shorter sibling; `Sha512(Sha512Bits.B256)` starts SHA-512/256, SHA-512's internal state truncated to a 256-bit output. It satisfies `Hash`.
-
+See the [full section](crypto/hashing.md#sha512).
 ### `Sha512Bits`
-
-Which SHA-512-family digest a `Sha512` computes: `B512` (the default), `B384`, or `B256` for SHA-512/256.
-
+See the [full section](crypto/hashing.md#sha512bits).
 ### `Sha512.write(data: []byte)`
-
-Feeds more data into the running SHA-512 state. Call it any number of times before `sum`.
-
+See the [full section](crypto/hashing.md#sha512-write-data-byte).
 ### `Sha512.sum(): []byte`
-
-Returns the SHA-512 digest for everything written so far, without resetting the state.
-
+See the [full section](crypto/hashing.md#sha512-sum-byte).
 ### `Sha512.reset()`
-
-Returns this SHA-512 hash to its empty starting state, so the same value can hash another message.
-
+See the [full section](crypto/hashing.md#sha512-reset).
 ### `Sha512.size(): int`
-
-The SHA-512 digest length in bytes.
-
+See the [full section](crypto/hashing.md#sha512-size-int).
 ### `Sha512.blockSize(): int`
-
-The SHA-512 algorithm's internal block size in bytes.
-
+See the [full section](crypto/hashing.md#sha512-blocksize-int).
 ### `Sha3`
-
-A SHA-3 hasher. `Sha3()` starts SHA3-256; pass a `Sha3Bits` for another width, for example `Sha3(Sha3Bits.B512)`. Use it through `write`/`sum` like any `Hash`.
-
+See the [full section](crypto/hashing.md#sha3).
 ### `Sha3Bits`
-
-The SHA-3 digest width: `B224`, `B256` (the default), `B384`, or `B512`.
-
+See the [full section](crypto/hashing.md#sha3bits).
 ### `Sha3.write(data: []byte)`
-
-Feeds more data into the running SHA-3 state. Call it any number of times before `sum`.
-
+See the [full section](crypto/hashing.md#sha3-write-data-byte).
 ### `Sha3.sum(): []byte`
-
-Returns the SHA-3 digest for everything written so far, without resetting the state.
-
+See the [full section](crypto/hashing.md#sha3-sum-byte).
 ### `Sha3.reset()`
-
-Returns this SHA-3 hash to its empty starting state, so the same value can hash another message.
-
+See the [full section](crypto/hashing.md#sha3-reset).
 ### `Sha3.size(): int`
-
-The SHA-3 digest length in bytes.
-
+See the [full section](crypto/hashing.md#sha3-size-int).
 ### `Sha3.blockSize(): int`
-
-The SHA-3 algorithm's internal block size in bytes.
-
+See the [full section](crypto/hashing.md#sha3-blocksize-int).
 ### `Shake`
-
-SHAKE, a hash whose output length you choose (`Shake()` is SHAKE128, `Shake(ShakeSecurity.S256)` is SHAKE256): `absorb` input, then `squeeze(n)` as many times as you like for `n` more bytes of output.
-
+See the [full section](crypto/hashing.md#shake).
 ### `Shake.absorb(data: []byte)`
-
-Feeds more data into the running SHAKE state. Call `squeeze` once you are done absorbing input.
-
+See the [full section](crypto/hashing.md#shake-absorb-data-byte).
 ### `Shake.squeeze(n: int): []byte`
-
-Draws `n` more bytes of output from this SHAKE state. Call it again for more output; the stream continues from where the last call left off.
-
+See the [full section](crypto/hashing.md#shake-squeeze-n-int-byte).
 ### `ShakeSecurity`
-
-The SHAKE security level: `S128` (the default) or `S256`.
-
+See the [full section](crypto/hashing.md#shakesecurity).
 ### `Blake2b`
-
-A BLAKE2b hasher. `Blake2b()` starts a 64-byte unkeyed hash; `Blake2b(outLen, key)` picks the output length (1 to 64 bytes) and an optional key (up to 64 bytes) for use as a MAC, and panics on an out-of-range length. Use it through `write`/`sum` like any `Hash`.
-
+See the [full section](crypto/hashing.md#blake2b).
 ### `Blake2b.write(data: []byte)`
-
-Feeds more data into the running BLAKE2b state. Call it any number of times before `sum`.
-
+See the [full section](crypto/hashing.md#blake2b-write-data-byte).
 ### `Blake2b.sum(): []byte`
-
-Returns the BLAKE2b digest for everything written so far, without resetting the state.
-
+See the [full section](crypto/hashing.md#blake2b-sum-byte).
 ### `Blake2b.reset()`
-
-Returns this BLAKE2b hash to its empty starting state, so the same value can hash another message.
-
+See the [full section](crypto/hashing.md#blake2b-reset).
 ### `Blake2b.size(): int`
-
-The BLAKE2b digest length in bytes.
-
+See the [full section](crypto/hashing.md#blake2b-size-int).
 ### `Blake2b.blockSize(): int`
-
-The BLAKE2b algorithm's internal block size in bytes.
-
+See the [full section](crypto/hashing.md#blake2b-blocksize-int).
 ### `blake2b(data: []byte): []byte`
-
-The one-shot BLAKE2b hash of `data`, 64 bytes long.
-
+See the [full section](crypto/hashing.md#blake2b-data-byte-byte).
 ### `Blake2s`
-
-BLAKE2b's sibling, tuned for 32-bit hardware. `Blake2s()` starts a 32-byte unkeyed hash; `Blake2s(outLen, key)` picks the output length (1 to 32 bytes) and an optional key (up to 32 bytes), and panics on an out-of-range length. The same shape as `Blake2b`: `write`/`sum`/`reset`.
-
+See the [full section](crypto/hashing.md#blake2s).
 ### `Blake2s.write(data: []byte)`
-
-Feeds more data into the running BLAKE2s state. Call it any number of times before `sum`.
-
+See the [full section](crypto/hashing.md#blake2s-write-data-byte).
 ### `Blake2s.sum(): []byte`
-
-Returns the BLAKE2s digest for everything written so far, without resetting the state.
-
+See the [full section](crypto/hashing.md#blake2s-sum-byte).
 ### `Blake2s.reset()`
-
-Returns this BLAKE2s hash to its empty starting state, so the same value can hash another message.
-
+See the [full section](crypto/hashing.md#blake2s-reset).
 ### `Blake2s.size(): int`
-
-The BLAKE2s digest length in bytes.
-
+See the [full section](crypto/hashing.md#blake2s-size-int).
 ### `Blake2s.blockSize(): int`
-
-The BLAKE2s algorithm's internal block size in bytes.
-
+See the [full section](crypto/hashing.md#blake2s-blocksize-int).
 ### `Blake3`
-
-For a draft digest, use `Blake3()`; for a draft MAC, use
-`Blake3(Blake3Mode.Keyed(key))` with a `[32]byte` key.
-`Blake3(Blake3Mode.DeriveKey(context))` derives keys for the given context
-string. All three constructors are infallible. Convert a dynamic byte slice
-with `[32]byte(bytes)?` before keyed construction.
-
+See the [full section](crypto/hashing.md#blake3).
 ### `Blake3Mode`
-
-How a `Blake3` hasher is keyed: `Hash` (the default, unkeyed), `Keyed(key)` or `DeriveKey(context)`. One constructor takes exactly one mode, so a hasher cannot be both keyed and derive-key.
-
+See the [full section](crypto/hashing.md#blake3mode).
 ### `Blake3.write(data: []byte)`
-
-Feeds more data into the running BLAKE3 state. Call it any number of times before `sum`.
-
+See the [full section](crypto/hashing.md#blake3-write-data-byte).
 ### `Blake3.sum(): []byte`
-
-Returns the BLAKE3 digest for everything written so far, without resetting the state.
-
+See the [full section](crypto/hashing.md#blake3-sum-byte).
 ### `Blake3.reset()`
-
-Returns this BLAKE3 hash to its empty starting state, so the same value can hash another message.
-
+See the [full section](crypto/hashing.md#blake3-reset).
 ### `Blake3.size(): int`
-
-The BLAKE3 digest length in bytes.
-
+See the [full section](crypto/hashing.md#blake3-size-int).
 ### `Blake3.blockSize(): int`
-
-The BLAKE3 algorithm's internal block size in bytes.
-
+See the [full section](crypto/hashing.md#blake3-blocksize-int).
 ### `Blake3.finalize(n: int): []byte`
-
-Draws `n` bytes of output from this BLAKE3 state, beyond the default 32-byte `sum()`. Call it again for more output from the same point.
-
+See the [full section](crypto/hashing.md#blake3-finalize-n-int-byte).
 ### `blake3KeyedHash(key: []byte, data: []byte): []byte!`
-
-The one-shot keyed BLAKE3 hash of `data` under `key`. Fails if `key` is not 32 bytes.
-
+See the [full section](crypto/hashing.md#blake3keyedhash-key-byte-data-byte-byte).
 ### `blake3DeriveKey(context: string, keyMaterial: []byte): []byte`
-
-Derives a key from `keyMaterial` in the given `context` using BLAKE3's key-derivation mode, in one call.
-
+See the [full section](crypto/hashing.md#blake3derivekey-context-string-keymaterial-byte-byte).
 ### `blake3Hash(data: []byte): []byte`
-
-The one-shot, unkeyed BLAKE3 hash of `data`, 32 bytes long.
-
+See the [full section](crypto/hashing.md#blake3hash-data-byte-byte).
 ### `blake3Xof(data: []byte, n: int): []byte`
-
-`n` bytes of BLAKE3's extendable output for `data`, in one call.
-
+See the [full section](crypto/hashing.md#blake3xof-data-byte-n-int-byte).
 ## MACs and key derivation
-
+See the [full section](crypto/hashing.md#macs-and-key-derivation).
 ### `hmac(alg: HashAlg, key: []byte, msg: []byte): []byte`
-
-The HMAC of `msg` under `key`, using the hash `alg` names (for example `HashAlg.Sha256`). Use it to prove a message came from someone who holds `key`.
-
+See the [full section](crypto/hashing.md#hmac-alg-hashalg-key-byte-msg-byte-byte).
 ### `hmacEqual(a: []byte, b: []byte): bool`
-
-Compares two MAC tags in constant time (an alias for `ctEq`, see [Compare secrets in constant time](#security-notes)). Always use this, never `==`, to check a MAC.
-
+See the [full section](crypto/hashing.md#hmacequal-a-byte-b-byte-bool).
 ### `hkdf(alg: HashAlg, salt: []byte, ikm: []byte, info: []byte, outLen: int): []byte!`
-
-RFC 5869 HKDF: derives `outLen` bytes of key material from `ikm`, in one call. `salt` may be empty; `info` binds the output to how it will be used, so two different purposes never share a key.
-
+See the [full section](crypto/hashing.md#hkdf-alg-hashalg-salt-byte-ikm-byte-info-byte-outlen-int-byte).
 ### `hkdfExtract(alg: HashAlg, salt: []byte, ikm: []byte): []byte`
-
-HKDF's extract step alone: turns `ikm` into a single fixed-length pseudorandom key. Most programs call `hkdf` instead of this and `hkdfExpand` separately.
-
+See the [full section](crypto/hashing.md#hkdfextract-alg-hashalg-salt-byte-ikm-byte-byte).
 ### `hkdfExpand(alg: HashAlg, prk: []byte, info: []byte, outLen: int): []byte!`
-
-HKDF's expand step alone: stretches an already-extracted key `prk` into `outLen` bytes bound to `info`. Most programs call `hkdf` instead.
-
+See the [full section](crypto/hashing.md#hkdfexpand-alg-hashalg-prk-byte-info-byte-outlen-int-byte).
 ### `pbkdf2(alg: HashAlg, password: []byte, salt: []byte, iters: int, outLen: int): []byte`
-
-PBKDF2 key derivation: stretches `password` and `salt` over `iters` rounds of the hash `alg` names, into `outLen` bytes. Prefer `argon2Hash` for new passwords; PBKDF2 is for interop.
-
+See the [full section](crypto/hashing.md#pbkdf2-alg-hashalg-password-byte-salt-byte-iters-int-outlen-int-byte).
 ## Password hashing
-
+See the [full section](crypto/hashing.md#password-hashing).
 ### `argon2Hash(password: []byte, salt: []byte, t: int, m: int, p: int, outLen: int): string`
-
-Hashes `password` with Argon2id, returning one self-describing string that carries the salt and cost parameters `t`, `m`, `p` alongside the result. See [Hash a password](#hash-a-password).
-
+See the [full section](crypto/hashing.md#argon2hash-password-byte-salt-byte-t-int-m-int-p-int-outlen-int-string).
 ### `argon2Verify(password: []byte, encoded: string): bool`
-
-Checks `password` against a string `argon2Hash` produced, re-deriving the hash and comparing it in constant time. Returns `false`, never fails, on a malformed `encoded` value.
-
+See the [full section](crypto/hashing.md#argon2verify-password-byte-encoded-string-bool).
 ### `argon2id(password: []byte, salt: []byte, secret: []byte, ad: []byte, t: int, m: int, p: int, outLen: int): []byte`
-
-The raw Argon2 variant (the recommended hybrid mode) that `argon2Hash` builds on. Most programs call `argon2Hash` instead, which also encodes the parameters into the result string.
-
+See the [full section](crypto/hashing.md#argon2id-password-byte-salt-byte-secret-byte-ad-byte-t-int-m-int-p-int-outlen-int-byte).
 ### `argon2i(password: []byte, salt: []byte, secret: []byte, ad: []byte, t: int, m: int, p: int, outLen: int): []byte`
-
-The raw Argon2 variant (the data-independent mode, safer on a shared or observable host) that `argon2Hash` builds on. Most programs call `argon2Hash` instead, which also encodes the parameters into the result string.
-
+See the [full section](crypto/hashing.md#argon2i-password-byte-salt-byte-secret-byte-ad-byte-t-int-m-int-p-int-outlen-int-byte).
 ### `argon2d(password: []byte, salt: []byte, secret: []byte, ad: []byte, t: int, m: int, p: int, outLen: int): []byte`
-
-The raw Argon2 variant (the data-dependent mode) that `argon2Hash` builds on. Most programs call `argon2Hash` instead, which also encodes the parameters into the result string.
-
+See the [full section](crypto/hashing.md#argon2d-password-byte-salt-byte-secret-byte-ad-byte-t-int-m-int-p-int-outlen-int-byte).
 ### `bcryptHash(password: []byte, cost: int): string`
-
-Hashes `password` with bcrypt at the given `cost`, for interop with systems that require it. Prefer `argon2Hash` for anything new.
-
+See the [full section](crypto/hashing.md#bcrypthash-password-byte-cost-int-string).
 ### `bcryptVerify(password: []byte, encoded: string): bool`
-
-Checks `password` against a string `bcryptHash` produced. Returns `false`, never fails, on a malformed `encoded` value.
-
+See the [full section](crypto/hashing.md#bcryptverify-password-byte-encoded-string-bool).
 ### `scrypt(password: []byte, salt: []byte, N: int, r: int, p: int, outLen: int): []byte!`
-
-scrypt key derivation: stretches `password` and `salt` with cost parameters `N`, `r`, `p` into `outLen` bytes. Prefer `argon2Hash` for new passwords; scrypt is for interop.
-
+See the [full section](crypto/hashing.md#scrypt-password-byte-salt-byte-n-int-r-int-p-int-outlen-int-byte).
 ## Randomness
-
+See the [full section](crypto/hashing.md#randomness).
 ### `randomBytes(n: int): []byte`
-
-`n` bytes read from the operating system's secure random source. Safe to use as a key, a nonce, or an unguessable id. See [Generate random tokens](#generate-random-tokens).
-
+See the [full section](crypto/hashing.md#randombytes-n-int-byte).
 ### `randomU64(): uint`
-
-A uniformly random 64-bit value from the secure random source.
-
+See the [full section](crypto/hashing.md#randomu64-uint).
 ### `randomUintBelow(n: uint): uint`
-
-A uniformly random value in the range `[0, n)`, with no bias toward smaller numbers - unlike `randomU64(...) % n`.
-
+See the [full section](crypto/hashing.md#randomuintbelow-n-uint-uint).
 ### `fillRandom(buf: []byte)`
-
-Overwrites `buf` in place with secure random bytes, without allocating a new slice.
-
+See the [full section](crypto/hashing.md#fillrandom-buf-byte).
 ## Encoding
-
+See the [full section](crypto/hashing.md#encoding).
 ### `encodeHex(b: []byte): string`
-
-Encodes `b` as lowercase hex text.
-
+See the [full section](crypto/hashing.md#encodehex-b-byte-string).
 ### `encodeHexUpper(b: []byte): string`
-
-Encodes `b` as uppercase hex text.
-
+See the [full section](crypto/hashing.md#encodehexupper-b-byte-string).
 ### `decodeHex(s: string): []byte!`
-
-Decodes hex text `s` back to bytes. Fails on any character outside `0-9a-fA-F` or an odd-length string.
-
+See the [full section](crypto/hashing.md#decodehex-s-string-byte).
 ### `encodeBase64(b: []byte): string`
-
-Encodes `b` as standard base64 text, with `=` padding.
-
+See the [full section](crypto/hashing.md#encodebase64-b-byte-string).
 ### `decodeBase64(s: string): []byte!`
-
-Decodes standard, padded base64 text `s` back to bytes. Fails on invalid input.
-
+See the [full section](crypto/hashing.md#decodebase64-s-string-byte).
 ### `encodeBase64Url(b: []byte): string`
-
-Encodes `b` as URL-safe base64 text, with no padding - safe to place directly in a URL path or query string.
-
+See the [full section](crypto/hashing.md#encodebase64url-b-byte-string).
 ### `decodeBase64Url(s: string): []byte!`
-
-Decodes URL-safe, unpadded base64 text `s` back to bytes. Fails on invalid input.
-
+See the [full section](crypto/hashing.md#decodebase64url-s-string-byte).
 ### `encodeBase32(b: []byte): string`
-
-Encodes `b` as base32 text.
-
+See the [full section](crypto/hashing.md#encodebase32-b-byte-string).
 ### `decodeBase32(s: string): []byte!`
-
-Decodes base32 text `s` back to bytes. Fails on invalid input.
-
+See the [full section](crypto/hashing.md#decodebase32-s-string-byte).
 ### `PemBlock`
-
-One decoded PEM block: its `label` (for example `CERTIFICATE`) and the raw `der` bytes it wraps.
-
+See the [full section](crypto/hashing.md#pemblock).
 ### `pemEncode(label: string, der: []byte): string`
-
-Wraps `der` in RFC 7468 PEM text, tagged with `label` (for example `"CERTIFICATE"`).
-
+See the [full section](crypto/hashing.md#pemencode-label-string-der-byte-string).
 ### `pemDecode(pem: string): []PemBlock!`
-
-Parses every PEM block out of `pem` text, in order. Fails if `pem` holds no valid block.
-
+See the [full section](crypto/hashing.md#pemdecode-pem-string-pemblock).
 ## Constant-time helpers
-
+See the [full section](crypto/hashing.md#constant-time-helpers).
 ### `ctEq(a: []byte, b: []byte): bool`
-
-Compares `a` and `b` for equality, always scanning the full length before deciding. Use this, never `==`, for any secret comparison - see [Compare secrets in constant time](#security-notes).
-
+See the [full section](crypto/hashing.md#cteq-a-byte-b-byte-bool).
 ### `ctSelect(v: int, a: int, b: int): int`
-
-Branchless select: returns `a` when `v == 1`, `b` when `v == 0`, without a conditional branch that could leak `v` through timing.
-
+See the [full section](crypto/hashing.md#ctselect-v-int-a-int-b-int-int).
 ### `secureZero(b: []byte)`
-
-Overwrites `b` with zeros through a barrier the compiler cannot optimize away, unlike an ordinary loop a dead-store pass could drop. Use it to wipe key material when you are done with it.
-
+See the [full section](crypto/hashing.md#securezero-b-byte).
 ## Symmetric ciphers and AEAD
-
+See the [full section](crypto/encryption-and-signatures.md#symmetric-ciphers-and-aead).
 ### `Aead`
-
-The interface `seal`, `open`, `nonceSize`, and `overhead` every AEAD cipher below satisfies. See [Encrypt and decrypt data](#encrypt-and-decrypt-data).
-
+See the [full section](crypto/encryption-and-signatures.md#aead).
 ### `Aes`
-
-A key-scheduled AES block cipher. `Aes(key)` builds one from a 16, 24, or 32-byte key (AES-128, -192 or -256) and fails on any other length. It enciphers one 16-byte block at a time; use a mode below (`AesGcm`, `ctr`, `cbcEncrypt`) rather than this alone.
-
+See the [full section](crypto/encryption-and-signatures.md#aes).
 ### `Aes.encryptBlock(block: []byte): []byte`
-
-Enciphers one 16-byte `block`, returning a fresh 16-byte ciphertext block.
-
+See the [full section](crypto/encryption-and-signatures.md#aes-encryptblock-block-byte-byte).
 ### `Aes.decryptBlock(block: []byte): []byte`
-
-Deciphers one 16-byte `block`, the inverse of `encryptBlock` under the same key.
-
+See the [full section](crypto/encryption-and-signatures.md#aes-decryptblock-block-byte-byte).
 ### `Aes.encryptBlockInto(dst: []byte, block: []byte)`
-
-Like `encryptBlock`, writing into the caller-owned buffer `dst` instead of returning a new one - for a hot loop that cannot allocate per block.
-
+See the [full section](crypto/encryption-and-signatures.md#aes-encryptblockinto-dst-byte-block-byte).
 ### `ctr(cipher: Aes, iv: []byte, data: []byte): []byte`
-
-AES-CTR mode: encrypts or decrypts `data` under `cipher` with initialization vector `iv`. Not authenticated; prefer `AesGcm` unless you specifically need CTR.
-
+See the [full section](crypto/encryption-and-signatures.md#ctr-cipher-aes-iv-byte-data-byte-byte).
 ### `cbcEncrypt(cipher: Aes, iv: []byte, data: []byte): []byte`
-
-AES-CBC mode encryption of `data` under `cipher` with initialization vector `iv`. Not authenticated; prefer `AesGcm` unless you specifically need CBC.
-
+See the [full section](crypto/encryption-and-signatures.md#cbcencrypt-cipher-aes-iv-byte-data-byte-byte).
 ### `cbcDecrypt(cipher: Aes, iv: []byte, data: []byte): []byte!`
-
-AES-CBC mode decryption, the inverse of `cbcEncrypt`. Fails on a malformed ciphertext length.
-
+See the [full section](crypto/encryption-and-signatures.md#cbcdecrypt-cipher-aes-iv-byte-data-byte-byte).
 ### `ecbEncryptBlock(cipher: Aes, block: []byte): []byte`
-
-Raw, single-block ECB encryption. Leaks patterns in the plaintext; almost never the right call directly - use an AEAD cipher instead.
-
+See the [full section](crypto/encryption-and-signatures.md#ecbencryptblock-cipher-aes-block-byte-byte).
 ### `AesGcm`
-
-AES-GCM, an AEAD cipher with a 12-byte nonce. `AesGcm(key)` builds one from a 16, 24, or 32-byte key and fails on any other length. See [Sharp edges](#sharp-edges) for its nonce requirement.
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcm).
 ### `AesGcm.seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte`
-
-Encrypts and authenticates data under this cipher - see `Aead.seal`.
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcm-seal-nonce-byte-plaintext-byte-aad-byte-byte).
 ### `AesGcm.open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!`
-
-Decrypts and checks data under this cipher - see `Aead.open`.
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcm-open-nonce-byte-ciphertext-byte-aad-byte-byte).
 ### `AesGcm.sealInto(dst: []byte, nonce: []byte, plaintext: []byte, aad: []byte)`
-
-`seal` allocates a new slice for every message. `sealInto` writes
-`ciphertext ‖ tag` into a `dst` the caller owns, so a sender that seals
-thousands of messages reuses one buffer. `dst` must be exactly
-`len(plaintext) + 16` bytes (slice a larger buffer to size), and `plaintext`
-may be `dst[0:len(plaintext)]` to seal in place. The nonce rules and panics are
-those of `seal`: the nonce must be 12 bytes and must never repeat under one key.
-
-```bit
-import { AesGcm } from "std/crypto"
-
-// Seal `msg` into the front of the caller's reusable `frame`.
-fn sealFrame(c: AesGcm, nonce: []byte, msg: []byte, frame: []byte): []byte {
-  let out = frame[0:len(msg) + c.overhead()]
-  c.sealInto(out, nonce, msg, []byte(0))
-  return out
-}
-```
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcm-sealinto-dst-byte-nonce-byte-plaintext-byte-aad-byte).
 ### `AesGcm.sealFrame(frame: []byte, aadLen: int, nonce: []byte, body: []byte, n: int)`
-
-A framed protocol sends `header ‖ ciphertext ‖ tag`, with the header as the
-AAD. With `sealInto` the sender first copies the message body into the frame
-and then slices the frame three ways, and each slice is an allocation.
-`sealFrame` takes the frame and offsets instead: `frame[0:aadLen]` is the
-AAD, the `n`-byte plaintext is `body` followed by the `n - len(body)` bytes
-already at `frame[aadLen + len(body):aadLen + n]`, and `ciphertext ‖ tag`
-overwrites `frame[aadLen:aadLen + n + 16]`. `body` may be
-`frame[aadLen:aadLen + len(body)]` to seal in place; any other overlap with
-the bytes written panics, as does a frame too short to hold the AAD, the
-plaintext and the tag. The nonce rules and panics are those of `seal`.
-
-```bit
-import { AesGcm } from "std/crypto"
-
-// Seal `msg` behind a 2-byte length header, with a type byte after it.
-fn sealTyped(c: AesGcm, nonce: []byte, msg: []byte, frame: []byte): int {
-  let n = len(msg) + 1
-  frame[0] = byte(n >> 8)
-  frame[1] = byte(n)
-  frame[2 + len(msg)] = 0x17
-  c.sealFrame(frame, 2, nonce, msg, n)
-  return 2 + n + c.overhead()
-}
-```
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcm-sealframe-frame-byte-aadlen-int-nonce-byte-body-byte-n-int).
 ### `AesGcm.openInto(dst: []byte, nonce: []byte, ciphertext: []byte, aad: []byte): ()!`
-
-`open` allocates a new slice for every message. `openInto` writes the
-plaintext into a `dst` the caller owns, which must be exactly
-`len(ciphertext) - 16` bytes; `dst` may be
-`ciphertext[0:len(ciphertext) - 16]` to open in place. The tag is checked
-before a single byte of `dst` is written, so a failed open leaves `dst`
-untouched and never exposes unauthenticated plaintext. It fails and panics as
-`open` does.
-
-```bit
-import { AesGcm } from "std/crypto"
-
-// Open in place: the plaintext replaces the front of `sealed`.
-fn openFrame(c: AesGcm, nonce: []byte, sealed: []byte): []byte! {
-  let plain = sealed[0:len(sealed) - c.overhead()]
-  c.openInto(plain, nonce, sealed, []byte(0))?
-  return plain
-}
-```
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcm-openinto-dst-byte-nonce-byte-ciphertext-byte-aad-byte).
 ### `AesGcm.nonceSize(): int`
-
-The nonce length this cipher requires, in bytes.
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcm-noncesize-int).
 ### `AesGcm.overhead(): int`
-
-The number of extra bytes `seal` adds beyond the plaintext length.
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcm-overhead-int).
 ### `AesGcmSiv`
-
-AES-GCM-SIV, an AEAD cipher that stays safe even if a nonce repeats, at a performance cost over plain `AesGcm`. `AesGcmSiv(key)` builds one from a 16 or 32-byte key and fails on any other length.
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcmsiv).
 ### `AesGcmSiv.seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte`
-
-Encrypts and authenticates data under this cipher - see `Aead.seal`.
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcmsiv-seal-nonce-byte-plaintext-byte-aad-byte-byte).
 ### `AesGcmSiv.open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!`
-
-Decrypts and checks data under this cipher - see `Aead.open`.
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcmsiv-open-nonce-byte-ciphertext-byte-aad-byte-byte).
 ### `AesGcmSiv.nonceSize(): int`
-
-The nonce length this cipher requires, in bytes.
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcmsiv-noncesize-int).
 ### `AesGcmSiv.overhead(): int`
-
-The number of extra bytes `seal` adds beyond the plaintext length.
-
+See the [full section](crypto/encryption-and-signatures.md#aesgcmsiv-overhead-int).
 ### `ChaChaPoly`
-
-ChaCha20-Poly1305, an AEAD cipher with a 12-byte nonce. `ChaChaPoly(key)` builds one from a 32-byte key and fails on any other length; prefer `XChaChaPoly` unless you specifically need a 12-byte nonce.
-
+See the [full section](crypto/encryption-and-signatures.md#chachapoly).
 ### `ChaChaPoly.seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte`
-
-Encrypts and authenticates data under this cipher - see `Aead.seal`.
-
+See the [full section](crypto/encryption-and-signatures.md#chachapoly-seal-nonce-byte-plaintext-byte-aad-byte-byte).
 ### `ChaChaPoly.open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!`
-
-Decrypts and checks data under this cipher - see `Aead.open`.
-
+See the [full section](crypto/encryption-and-signatures.md#chachapoly-open-nonce-byte-ciphertext-byte-aad-byte-byte).
 ### `ChaChaPoly.sealInto(dst: []byte, nonce: []byte, plaintext: []byte, aad: []byte)`
-
-`seal` allocates a new slice for every message. `sealInto` writes
-`ciphertext ‖ tag` into a `dst` the caller owns, so a sender that seals
-thousands of messages reuses one buffer. `dst` must be exactly
-`len(plaintext) + 16` bytes (slice a larger buffer to size), and `plaintext`
-may be `dst[0:len(plaintext)]` to seal in place. The nonce rules and panics are
-those of `seal`: the nonce must be 12 bytes and must never repeat under one key.
-
-```bit
-import { ChaChaPoly } from "std/crypto"
-
-// Seal `msg` into the front of the caller's reusable `frame`.
-fn sealFrame(c: ChaChaPoly, nonce: []byte, msg: []byte, frame: []byte): []byte {
-  let out = frame[0:len(msg) + c.overhead()]
-  c.sealInto(out, nonce, msg, []byte(0))
-  return out
-}
-```
-
+See the [full section](crypto/encryption-and-signatures.md#chachapoly-sealinto-dst-byte-nonce-byte-plaintext-byte-aad-byte).
 ### `ChaChaPoly.sealFrame(frame: []byte, aadLen: int, nonce: []byte, body: []byte, n: int)`
-
-A framed protocol sends `header ‖ ciphertext ‖ tag`, with the header as the
-AAD. With `sealInto` the sender first copies the message body into the frame
-and then slices the frame three ways, and each slice is an allocation.
-`sealFrame` takes the frame and offsets instead: `frame[0:aadLen]` is the
-AAD, the `n`-byte plaintext is `body` followed by the `n - len(body)` bytes
-already at `frame[aadLen + len(body):aadLen + n]`, and `ciphertext ‖ tag`
-overwrites `frame[aadLen:aadLen + n + 16]`. `body` may be
-`frame[aadLen:aadLen + len(body)]` to seal in place; any other overlap with
-the bytes written panics, as does a frame too short to hold the AAD, the
-plaintext and the tag. The nonce rules and panics are those of `seal`.
-
-```bit
-import { ChaChaPoly } from "std/crypto"
-
-// Seal `msg` behind a 2-byte length header, with a type byte after it.
-fn sealTyped(c: ChaChaPoly, nonce: []byte, msg: []byte, frame: []byte): int {
-  let n = len(msg) + 1
-  frame[0] = byte(n >> 8)
-  frame[1] = byte(n)
-  frame[2 + len(msg)] = 0x17
-  c.sealFrame(frame, 2, nonce, msg, n)
-  return 2 + n + c.overhead()
-}
-```
-
+See the [full section](crypto/encryption-and-signatures.md#chachapoly-sealframe-frame-byte-aadlen-int-nonce-byte-body-byte-n-int).
 ### `ChaChaPoly.openInto(dst: []byte, nonce: []byte, ciphertext: []byte, aad: []byte): ()!`
-
-`open` allocates a new slice for every message. `openInto` writes the
-plaintext into a `dst` the caller owns, which must be exactly
-`len(ciphertext) - 16` bytes; `dst` may be
-`ciphertext[0:len(ciphertext) - 16]` to open in place. The tag is checked
-before a single byte of `dst` is written, so a failed open leaves `dst`
-untouched and never exposes unauthenticated plaintext. It fails and panics as
-`open` does.
-
-```bit
-import { ChaChaPoly } from "std/crypto"
-
-// Open in place: the plaintext replaces the front of `sealed`.
-fn openFrame(c: ChaChaPoly, nonce: []byte, sealed: []byte): []byte! {
-  let plain = sealed[0:len(sealed) - c.overhead()]
-  c.openInto(plain, nonce, sealed, []byte(0))?
-  return plain
-}
-```
-
+See the [full section](crypto/encryption-and-signatures.md#chachapoly-openinto-dst-byte-nonce-byte-ciphertext-byte-aad-byte).
 ### `ChaChaPoly.nonceSize(): int`
-
-The nonce length this cipher requires, in bytes.
-
+See the [full section](crypto/encryption-and-signatures.md#chachapoly-noncesize-int).
 ### `ChaChaPoly.overhead(): int`
-
-The number of extra bytes `seal` adds beyond the plaintext length.
-
+See the [full section](crypto/encryption-and-signatures.md#chachapoly-overhead-int).
 ### `XChaChaPoly`
-
-XChaCha20-Poly1305, an AEAD cipher with a 24-byte nonce, safe to pick at random. `XChaChaPoly(key)` builds one from a 32-byte key and fails on any other length. See [Encrypt and decrypt data](#encrypt-and-decrypt-data).
-
+See the [full section](crypto/encryption-and-signatures.md#xchachapoly).
 ### `XChaChaPoly.seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte`
-
-Encrypts and authenticates data under this cipher - see `Aead.seal`.
-
+See the [full section](crypto/encryption-and-signatures.md#xchachapoly-seal-nonce-byte-plaintext-byte-aad-byte-byte).
 ### `XChaChaPoly.open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!`
-
-Decrypts and checks data under this cipher - see `Aead.open`.
-
+See the [full section](crypto/encryption-and-signatures.md#xchachapoly-open-nonce-byte-ciphertext-byte-aad-byte-byte).
 ### `XChaChaPoly.nonceSize(): int`
-
-The nonce length this cipher requires, in bytes.
-
+See the [full section](crypto/encryption-and-signatures.md#xchachapoly-noncesize-int).
 ### `XChaChaPoly.overhead(): int`
-
-The number of extra bytes `seal` adds beyond the plaintext length.
-
+See the [full section](crypto/encryption-and-signatures.md#xchachapoly-overhead-int).
 ### `chacha20(key: []byte, nonce: []byte, counter: u32, data: []byte): []byte`
-
-The raw ChaCha20 stream cipher underneath `ChaChaPoly`, not authenticated. Almost never called directly.
-
+See the [full section](crypto/encryption-and-signatures.md#chacha20-key-byte-nonce-byte-counter-u32-data-byte-byte).
 ### `hchacha20(key: []byte, nonce16: []byte): []byte`
-
-HChaCha20, the sub-key derivation `XChaChaPoly` uses internally to extend a 12-byte nonce to 24 bytes.
-
+See the [full section](crypto/encryption-and-signatures.md#hchacha20-key-byte-nonce16-byte-byte).
 ### `poly1305(key: []byte, msg: []byte): []byte`
-
-The raw Poly1305 MAC of `msg` under `key`, underneath the ChaCha AEADs. Almost never called directly.
-
+See the [full section](crypto/encryption-and-signatures.md#poly1305-key-byte-msg-byte-byte).
 ### `poly1305Verify(key: []byte, msg: []byte, tag: []byte): bool`
-
-Checks a raw Poly1305 `tag` for `msg` under `key`, in constant time.
-
+See the [full section](crypto/encryption-and-signatures.md#poly1305verify-key-byte-msg-byte-tag-byte-bool).
 ## Signing and key exchange
-
+See the [full section](crypto/encryption-and-signatures.md#signing-and-key-exchange).
 ### `ed25519PublicKey(priv: []byte): []byte`
-
-The public key matching the 32-byte private seed `priv`. Publish this; keep `priv` secret.
-
+See the [full section](crypto/encryption-and-signatures.md#ed25519publickey-priv-byte-byte).
 ### `ed25519Sign(priv: []byte, msg: []byte): []byte`
-
-Signs `msg` with the private seed `priv`. See [Sign and verify data](#sign-and-verify-data).
-
+See the [full section](crypto/encryption-and-signatures.md#ed25519sign-priv-byte-msg-byte-byte).
 ### `ed25519Verify(pub: []byte, msg: []byte, sig: []byte): bool`
-
-Checks that `sig` is a valid Ed25519 signature of `msg` under public key `pub`.
-
+See the [full section](crypto/encryption-and-signatures.md#ed25519verify-pub-byte-msg-byte-sig-byte-bool).
 ### `ed25519ParsePrivateKey(der: []byte): []byte!`
-
-Reads the 32-byte seed out of a PKCS#8 Ed25519 private key (RFC 8410, RFC 5958 `OneAsymmetricKey`), the `PRIVATE KEY` PEM that `openssl genpkey -algorithm ed25519` writes. DER is read strictly: trailing data, an OID other than 1.3.101.112 (`ed25519: not an Ed25519 private key`), algorithm parameters, a key that is not 32 bytes, and a version above 1 all fail. A version 1 key may carry attributes and an embedded public key; if the public key is present it must be the one derived from the seed, else the call fails with `ed25519: the embedded public key does not match`. Error text never contains key bytes.
-
-```bit
-import { pemDecode, ed25519ParsePrivateKey, ed25519Sign } from "std/crypto"
-
-// pem is the text of a key file made by `openssl genpkey -algorithm ed25519`.
-fn signWithPemKey(pem: string, msg: []byte): []byte! {
-  let blocks = pemDecode(pem)?
-  if (len(blocks) != 1 || blocks[0].label != "PRIVATE KEY") {
-    fail newError("expected one PRIVATE KEY block")
-  }
-  let seed = ed25519ParsePrivateKey(blocks[0].der)?
-  return ed25519Sign(seed, msg)
-}
-```
-
+See the [full section](crypto/encryption-and-signatures.md#ed25519parseprivatekey-der-byte-byte).
 ### `EcdsaPublicKey`
-
-An ECDSA public key on a given `Curve`.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdsapublickey).
 ### `EcdsaPrivateKey`
-
-An ECDSA private key on a given `Curve`.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdsaprivatekey).
 ### `EcdsaSignature`
-
-An ECDSA signature: its `r` and `s` components.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdsasignature).
 ### `ecdsaGenerateKey(curve: Curve): EcdsaPrivateKey`
-
-Generates a new random ECDSA private key on `curve`.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdsageneratekey-curve-curve-ecdsaprivatekey).
 ### `ecdsaPublicKey(curve: Curve, sec1: []byte): EcdsaPublicKey!`
-
-Builds an `EcdsaPublicKey` on `curve` from raw point bytes. Fails on an invalid point.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdsapublickey-curve-curve-sec1-byte-ecdsapublickey).
 ### `ecdsaPrivateKey(curve: Curve, scalar: []byte): EcdsaPrivateKey!`
-
-Builds an `EcdsaPrivateKey` on `curve` from a raw scalar. Fails on an invalid scalar.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdsaprivatekey-curve-curve-scalar-byte-ecdsaprivatekey).
 ### `ecdsaSign(priv: EcdsaPrivateKey, hash: []byte, alg: HashAlg): EcdsaSignature!`
-
-Signs a pre-hashed `hash` with `priv`, using `alg` for the signature's internal randomness. Fails only on an unusable key.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdsasign-priv-ecdsaprivatekey-hash-byte-alg-hashalg-ecdsasignature).
 ### `ecdsaVerify(pub: EcdsaPublicKey, hash: []byte, sig: EcdsaSignature): bool`
-
-Checks that `sig` is a valid ECDSA signature of pre-hashed `hash` under public key `pub`.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdsaverify-pub-ecdsapublickey-hash-byte-sig-ecdsasignature-bool).
 ### `ecdsaSignatureToDer(sig: EcdsaSignature): []byte`
-
-Encodes an `EcdsaSignature` as DER bytes, the form most interop wire formats expect.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdsasignaturetoder-sig-ecdsasignature-byte).
 ### `ecdsaSignatureFromDer(der: []byte): EcdsaSignature!`
-
-Decodes DER-encoded bytes back into an `EcdsaSignature`. Fails on malformed input.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdsasignaturefromder-der-byte-ecdsasignature).
 ### `RsaPublicKey`
-
-An RSA public key: its modulus and public exponent.
-
+See the [full section](crypto/encryption-and-signatures.md#rsapublickey).
 ### `RsaPrivateKey`
-
-An RSA private key.
-
+See the [full section](crypto/encryption-and-signatures.md#rsaprivatekey).
 ### `rsaSignPkcs1v15(priv: RsaPrivateKey, alg: HashAlg, digestInfoPrefix: []byte, message: []byte): []byte!`
-
-Signs `message` with `priv` using PKCS#1 v1.5 padding and the hash `alg` names. `digestInfoPrefix` identifies the hash algorithm in the signature - use `rsaDigestInfoSha256()` and friends below.
-
+See the [full section](crypto/encryption-and-signatures.md#rsasignpkcs1v15-priv-rsaprivatekey-alg-hashalg-digestinfoprefix-byte-message-byte-byte).
 ### `rsaVerifyPkcs1v15(pub: RsaPublicKey, alg: HashAlg, digestInfoPrefix: []byte, message: []byte, sig: []byte): bool`
-
-Checks a PKCS#1 v1.5 signature `sig` of `message` under public key `pub`, for the hash identified by `digestInfoPrefix`.
-
+See the [full section](crypto/encryption-and-signatures.md#rsaverifypkcs1v15-pub-rsapublickey-alg-hashalg-digestinfoprefix-byte-message-byte-sig-byte-bool).
 ### `rsaSignPss(priv: RsaPrivateKey, alg: HashAlg, message: []byte, saltLen: int): []byte!`
-
-Signs `message` with `priv` using PSS padding and the hash `alg` names, with a `saltLen`-byte salt. PSS is the modern choice over PKCS#1 v1.5 for new signatures.
-
+See the [full section](crypto/encryption-and-signatures.md#rsasignpss-priv-rsaprivatekey-alg-hashalg-message-byte-saltlen-int-byte).
 ### `rsaVerifyPss(pub: RsaPublicKey, alg: HashAlg, message: []byte, sig: []byte, saltLen: int): bool`
-
-Checks a PSS signature `sig` of `message` under public key `pub`, with a `saltLen`-byte salt.
-
+See the [full section](crypto/encryption-and-signatures.md#rsaverifypss-pub-rsapublickey-alg-hashalg-message-byte-sig-byte-saltlen-int-bool).
 ### `rsaEncryptOaep(pub: RsaPublicKey, alg: HashAlg, message: []byte, label: []byte): []byte!`
-
-Encrypts `message` to public key `pub` using OAEP padding and the hash `alg` names. `label` binds the ciphertext to a context; pass an empty slice when there is none. Prefer an AEAD cipher for new data; RSA encryption is for interop or wrapping a small key.
-
+See the [full section](crypto/encryption-and-signatures.md#rsaencryptoaep-pub-rsapublickey-alg-hashalg-message-byte-label-byte-byte).
 ### `rsaDecryptOaep(priv: RsaPrivateKey, alg: HashAlg, ciphertext: []byte, label: []byte): []byte!`
-
-Decrypts `ciphertext` with private key `priv` using OAEP padding, the inverse of `rsaEncryptOaep`. Fails on a mismatched `label` or malformed ciphertext.
-
+See the [full section](crypto/encryption-and-signatures.md#rsadecryptoaep-priv-rsaprivatekey-alg-hashalg-ciphertext-byte-label-byte-byte).
 ### `rsaEncryptPkcs1v15(pub: RsaPublicKey, message: []byte): []byte!`
-
-Encrypts `message` to public key `pub` using PKCS#1 v1.5 padding, for interop. Prefer `rsaEncryptOaep` for new data.
-
+See the [full section](crypto/encryption-and-signatures.md#rsaencryptpkcs1v15-pub-rsapublickey-message-byte-byte).
 ### `rsaDecryptPkcs1v15(priv: RsaPrivateKey, ciphertext: []byte): []byte!`
-
-Decrypts `ciphertext` with private key `priv` using PKCS#1 v1.5 padding, the inverse of `rsaEncryptPkcs1v15`.
-
+See the [full section](crypto/encryption-and-signatures.md#rsadecryptpkcs1v15-priv-rsaprivatekey-ciphertext-byte-byte).
 ### `rsaParsePublicKey(der: []byte): RsaPublicKey!`
-
-Parses an `RsaPublicKey` from its standard SubjectPublicKeyInfo DER encoding. Fails on malformed input.
-
+See the [full section](crypto/encryption-and-signatures.md#rsaparsepublickey-der-byte-rsapublickey).
 ### `rsaParsePkcs1PublicKey(der: []byte): RsaPublicKey!`
-
-Parses an `RsaPublicKey` from its older, RSA-specific PKCS#1 DER encoding. Fails on malformed input.
-
+See the [full section](crypto/encryption-and-signatures.md#rsaparsepkcs1publickey-der-byte-rsapublickey).
 ### `rsaParsePrivateKey(der: []byte): RsaPrivateKey!`
-
-Parses an `RsaPrivateKey` from its standard PKCS#8 DER encoding. Fails on malformed input.
-
+See the [full section](crypto/encryption-and-signatures.md#rsaparseprivatekey-der-byte-rsaprivatekey).
 ### `rsaParsePkcs1PrivateKey(der: []byte): RsaPrivateKey!`
-
-Parses an `RsaPrivateKey` from its older, RSA-specific PKCS#1 DER encoding. Fails on malformed input.
-
+See the [full section](crypto/encryption-and-signatures.md#rsaparsepkcs1privatekey-der-byte-rsaprivatekey).
 ### `rsaDigestInfoSha256(): []byte`
-
-The DigestInfo prefix PKCS#1 v1.5 signing needs to identify SHA-256 as the hash used.
-
+See the [full section](crypto/encryption-and-signatures.md#rsadigestinfosha256-byte).
 ### `rsaDigestInfoSha384(): []byte`
-
-The DigestInfo prefix PKCS#1 v1.5 signing needs to identify SHA-384 as the hash used.
-
+See the [full section](crypto/encryption-and-signatures.md#rsadigestinfosha384-byte).
 ### `rsaDigestInfoSha512(): []byte`
-
-The DigestInfo prefix PKCS#1 v1.5 signing needs to identify SHA-512 as the hash used.
-
+See the [full section](crypto/encryption-and-signatures.md#rsadigestinfosha512-byte).
 ### `CoseKey`
-
-A verify key read from a COSE_Key: `Ec2(EcdsaPublicKey)` for a P-256 or P-384
-key, `Okp([]byte)` for the 32-byte Ed25519 public key, and `Rsa(RsaPublicKey,
-int)` for an RSA key with its alg (-257 or -37).
-
+See the [full section](crypto/encryption-and-signatures.md#cosekey).
 ### `parseCoseKey(data: []byte): CoseKey!`
-
-Decodes one COSE_Key map (RFC 9052 section 7) into a `CoseKey`. Fails on
-CBOR that is truncated, malformed or followed by more bytes, on an unsupported
-`kty`, `alg` or `crv`, an `alg` that does not fit the key type, a missing or
-repeated label, a coordinate of the wrong length, a point off the curve, an
-RSA modulus outside 2048 to 8192 bits, and any private parameter.
-
+See the [full section](crypto/encryption-and-signatures.md#parsecosekey-data-byte-cosekey).
 ### `coseAlg(key: CoseKey): int`
-
-The key's COSE algorithm number (-7, -35, -8, -37 or -257), for matching
-against the algorithms a WebAuthn credential was asked for.
-
+See the [full section](crypto/encryption-and-signatures.md#cosealg-key-cosekey-int).
 ### `coseVerify(key: CoseKey, alg: int, message: []byte, signature: []byte): bool!`
-
-Whether `signature` is valid for `message` under `key`. `alg` must be the
-key's own. Fails on an unsupported `alg` or one the key does not carry; a bad
-signature is `false`. ECDSA signatures are DER.
-
+See the [full section](crypto/encryption-and-signatures.md#coseverify-key-cosekey-alg-int-message-byte-signature-byte-bool).
 ### `X25519Keypair`
-
-An X25519 key exchange keypair: its private scalar and public point.
-
+See the [full section](crypto/encryption-and-signatures.md#x25519keypair).
 ### `x25519GenerateKeypair(): X25519Keypair`
-
-Generates a new random X25519 keypair.
-
+See the [full section](crypto/encryption-and-signatures.md#x25519generatekeypair-x25519keypair).
 ### `x25519(scalar: []byte, uCoord: []byte): []byte`
-
-The raw X25519 function: applies `scalar` to point `uCoord`. Most programs call `x25519SharedSecret` instead.
-
+See the [full section](crypto/encryption-and-signatures.md#x25519-scalar-byte-ucoord-byte-byte).
 ### `x25519Base(scalar: []byte): []byte`
-
-Applies `scalar` to X25519's fixed base point, producing the matching public key.
-
+See the [full section](crypto/encryption-and-signatures.md#x25519base-scalar-byte-byte).
 ### `x25519SharedSecret(scalar: []byte, uCoord: []byte): []byte!`
-
-Computes the shared secret from your `scalar` and a peer's public `uCoord`. Fails if the result is the all-zero point, which means the peer's key was invalid.
-
+See the [full section](crypto/encryption-and-signatures.md#x25519sharedsecret-scalar-byte-ucoord-byte-byte).
 ### `X448Keypair`
-
-An X448 key exchange keypair, X25519's equivalent at a higher security margin.
-
+See the [full section](crypto/encryption-and-signatures.md#x448keypair).
 ### `x448GenerateKeypair(): X448Keypair`
-
-Generates a new random X448 keypair.
-
+See the [full section](crypto/encryption-and-signatures.md#x448generatekeypair-x448keypair).
 ### `x448(scalar: []byte, uCoord: []byte): []byte`
-
-The raw X448 function: applies `scalar` to point `uCoord`. Most programs call `x448SharedSecret` instead.
-
+See the [full section](crypto/encryption-and-signatures.md#x448-scalar-byte-ucoord-byte-byte).
 ### `x448Base(scalar: []byte): []byte`
-
-Applies `scalar` to X448's fixed base point, producing the matching public key.
-
+See the [full section](crypto/encryption-and-signatures.md#x448base-scalar-byte-byte).
 ### `x448SharedSecret(scalar: []byte, uCoord: []byte): []byte!`
-
-Computes the shared secret from your `scalar` and a peer's public `uCoord`. Fails if the result is the all-zero point.
-
+See the [full section](crypto/encryption-and-signatures.md#x448sharedsecret-scalar-byte-ucoord-byte-byte).
 ### `EcdhKeypair`
-
-An ECDH key exchange keypair on a NIST curve.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdhkeypair).
 ### `ecdhnistGenerateKeypair(curve: Curve): EcdhKeypair`
-
-Generates a new random ECDH keypair on `curve`.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdhnistgeneratekeypair-curve-curve-ecdhkeypair).
 ### `ecdhnistSharedSecret(priv: []byte, peerPub: []byte, curve: Curve): []byte!`
-
-Computes the ECDH shared secret from your private `priv` and a peer's public `peerPub`, on `curve`. Fails on an invalid peer key.
-
+See the [full section](crypto/encryption-and-signatures.md#ecdhnistsharedsecret-priv-byte-peerpub-byte-curve-curve-byte).
 ## Post-quantum
-
+See the [full section](crypto/encryption-and-signatures.md#post-quantum).
 ### `MlkemKeypair`
-
-An ML-KEM (FIPS 203) key encapsulation keypair: its encapsulation key (public) and decapsulation key (private).
-
+See the [full section](crypto/encryption-and-signatures.md#mlkemkeypair).
 ### `MlkemEncapsulated`
-
-The result of `mlkemEncaps`: the shared secret and the ciphertext to send the other party.
-
+See the [full section](crypto/encryption-and-signatures.md#mlkemencapsulated).
 ### `mlkemKeygen(): MlkemKeypair`
-
-Generates a new random ML-KEM keypair.
-
+See the [full section](crypto/encryption-and-signatures.md#mlkemkeygen-mlkemkeypair).
 ### `mlkemEncaps(ek: []byte): MlkemEncapsulated!`
-
-Encapsulates a fresh shared secret to encapsulation key `ek`, returning it alongside the ciphertext to send. Fails on a malformed key.
-
+See the [full section](crypto/encryption-and-signatures.md#mlkemencaps-ek-byte-mlkemencapsulated).
 ### `mlkemDecaps(dk: []byte, ct: []byte): []byte`
-
-Recovers the shared secret from ciphertext `ct` using decapsulation key `dk`.
-
+See the [full section](crypto/encryption-and-signatures.md#mlkemdecaps-dk-byte-ct-byte-byte).
 ### `mlkemKeygenDerand(d: []byte, z: []byte): MlkemKeypair`
-
-Deterministic ML-KEM key generation from caller-supplied randomness, for testing. Pass real randomness in production - use `mlkemKeygen` there instead.
-
+See the [full section](crypto/encryption-and-signatures.md#mlkemkeygenderand-d-byte-z-byte-mlkemkeypair).
 ### `mlkemEncapsDerand(ek: []byte, m: []byte): MlkemEncapsulated!`
-
-Deterministic ML-KEM encapsulation from caller-supplied randomness, for testing. Pass real randomness in production - use `mlkemEncaps` there instead.
-
+See the [full section](crypto/encryption-and-signatures.md#mlkemencapsderand-ek-byte-m-byte-mlkemencapsulated).
 ### `mlkemEkSize: int`
-
-The fixed byte size of an ML-KEM encapsulation key.
-
+See the [full section](crypto/encryption-and-signatures.md#mlkemeksize-int).
 ### `mlkemDkSize: int`
-
-The fixed byte size of an ML-KEM decapsulation key.
-
+See the [full section](crypto/encryption-and-signatures.md#mlkemdksize-int).
 ### `mlkemCtSize: int`
-
-The fixed byte size of an ML-KEM ciphertext.
-
+See the [full section](crypto/encryption-and-signatures.md#mlkemctsize-int).
 ### `mlkemSsSize: int`
-
-The fixed byte size of an ML-KEM shared secret.
-
+See the [full section](crypto/encryption-and-signatures.md#mlkemsssize-int).
 ### `MldsaKeypair`
-
-An ML-DSA (FIPS 204) signing keypair.
-
+See the [full section](crypto/encryption-and-signatures.md#mldsakeypair).
 ### `mldsaKeygen(): MldsaKeypair`
-
-Generates a new random ML-DSA keypair.
-
+See the [full section](crypto/encryption-and-signatures.md#mldsakeygen-mldsakeypair).
 ### `mldsaSign(sk: []byte, msg: []byte): []byte`
-
-Signs `msg` with ML-DSA secret key `sk`.
-
+See the [full section](crypto/encryption-and-signatures.md#mldsasign-sk-byte-msg-byte-byte).
 ### `mldsaVerify(pk: []byte, msg: []byte, sig: []byte): bool`
-
-Checks ML-DSA signature `sig` of `msg` under public key `pk`.
-
+See the [full section](crypto/encryption-and-signatures.md#mldsaverify-pk-byte-msg-byte-sig-byte-bool).
 ### `mldsaSignCtx(sk: []byte, msg: []byte, ctx: []byte): []byte`
-
-Like `mldsaSign`, with an explicit context string binding the signature to how it will be used.
-
+See the [full section](crypto/encryption-and-signatures.md#mldsasignctx-sk-byte-msg-byte-ctx-byte-byte).
 ### `mldsaVerifyCtx(pk: []byte, msg: []byte, sig: []byte, ctx: []byte): bool`
-
-Like `mldsaVerify`, checking a signature made with the matching context string.
-
+See the [full section](crypto/encryption-and-signatures.md#mldsaverifyctx-pk-byte-msg-byte-sig-byte-ctx-byte-bool).
 ### `mldsaKeygenSeed(seed: []byte): MldsaKeypair`
-
-Deterministic ML-DSA key generation from a caller-supplied seed, for testing. Pass real randomness in production - use `mldsaKeygen` there instead.
-
+See the [full section](crypto/encryption-and-signatures.md#mldsakeygenseed-seed-byte-mldsakeypair).
 ## Certificates and trust
-
-Inkwell can receive a signing certificate as well as connect to HTTPS servers.
-A trusted certificate path answers who issued a certificate. The application
-must also check the expected signer and permitted key use before it accepts a
-document signature. A TLS connection additionally needs the server's DNS name
-and server authentication purpose.
-
-Save the signing certificate as DER in `inkwell-signer.der` and your configured
-root certificates as PEM in `inkwell-roots.pem`. This complete program checks
-that path at the current time and prints the certificate's subject:
-
-```bit
-import { fromPem, x509Parse, x509VerifyPath } from "std/crypto"
-import { readFile } from "std/fs"
-import { now, Second } from "std/time"
-
-fn main(): ()! {
-  let signer = x509Parse([]byte(readFile("inkwell-signer.der")?))?
-  let trust = fromPem(readFile("inkwell-roots.pem")?)?
-  x509VerifyPath(signer, [], trust.roots, now().ns / Second)?
-  println(signer.subject)
-}
-```
-
-`x509VerifyPath` checks certificate signatures, validity times, issuer CA and
-key-use restrictions, critical extensions, name constraints and path lengths.
-An issuer sent with the certificate is not a trust anchor. Supply intermediate
-certificates in the second argument and select roots from your own policy.
-Success does not authenticate the document or select the signer's identity or
-purpose. Check those separately. For HTTPS, use `std/tls`, which calls
-`x509VerifyChain` and keeps the DNS-name and server-purpose checks.
-
+See the [full section](crypto/certificates-and-primitives.md#certificates-and-trust).
 ### `TrustStore`
-
-A set of trust-anchor certificates. Build one from a PEM bundle with `fromPem`, from the operating system with `systemRoots`, or use `bundled` for a small built-in set.
-
+See the [full section](crypto/certificates-and-primitives.md#truststore).
 ### `fromPem(pem: string): TrustStore!`
-
-Builds a `TrustStore` from every `CERTIFICATE` block in `pem`, in order.
-
+See the [full section](crypto/certificates-and-primitives.md#frompem-pem-string-truststore).
 ### `TrustStore.verifyChain(leaf: Certificate, intermediates: []Certificate, hostname: string, nowUnix: int): ()!`
-
-Verifies `leaf` against this store's trusted roots, for `hostname`, as of `nowUnix` (Unix seconds). Fails with the first problem found: hostname mismatch, expiry, a broken signature, or an unbuildable chain.
-
+See the [full section](crypto/certificates-and-primitives.md#truststore-verifychain-leaf-certificate-intermediates-certificate-hostname-string-nowunix-int).
 ### `systemRoots(): TrustStore!`
-
-The operating system's own certificate authority trust store. Fails if none is found on this host.
-
+See the [full section](crypto/certificates-and-primitives.md#systemroots-truststore).
 ### `bundled(): TrustStore`
-
-A small built-in set of public trust roots, for when no system trust store is available.
-
+See the [full section](crypto/certificates-and-primitives.md#bundled-truststore).
 ### `Certificate`
-
-A parsed X.509 certificate. Build one with `x509Parse`.
-
+See the [full section](crypto/certificates-and-primitives.md#certificate).
 ### `x509Parse(der: []byte): Certificate!`
-
-Parses `der` as a DER-encoded X.509 certificate. Fails on malformed input.
-
+See the [full section](crypto/certificates-and-primitives.md#x509parse-der-byte-certificate).
 ### `x509MatchHostname(cert: Certificate, hostname: string): bool`
-
-Whether `hostname` matches `cert`'s subject-alternative names. The subject common name is not used.
-
+See the [full section](crypto/certificates-and-primitives.md#x509matchhostname-cert-certificate-hostname-string-bool).
 ### `x509VerifyChain(leaf: Certificate, intermediates: []Certificate, roots: []Certificate, hostname: string, nowUnix: int): ()!`
-
-Verifies certificate `leaf` up through `intermediates` to a trusted root in `roots`, for `hostname`, as of `nowUnix`. `std/tls` calls this for you during a handshake.
-
+See the [full section](crypto/certificates-and-primitives.md#x509verifychain-leaf-certificate-intermediates-certificate-roots-certificate-hostname-string-nowunix-int).
 ### `x509VerifyPath(leaf: Certificate, intermediates: []Certificate, roots: []Certificate, nowUnix: int): ()!`
-
-Checks the trusted certificate path shown above. Your application selects the
-leaf identity and purpose; this function does not apply TLS server policy.
-
+See the [full section](crypto/certificates-and-primitives.md#x509verifypath-leaf-certificate-intermediates-certificate-roots-certificate-nowunix-int).
 ### `x509VerifySignature(cert: Certificate, issuer: Certificate): bool`
-
-Whether `issuer` signed `cert` - one link in a chain, checked in isolation.
-
+See the [full section](crypto/certificates-and-primitives.md#x509verifysignature-cert-certificate-issuer-certificate-bool).
 ### `x509KeyRSA: int`
-
-The `Certificate.pubKeyAlg` value meaning the certificate's key is RSA.
-
+See the [full section](crypto/certificates-and-primitives.md#x509keyrsa-int).
 ### `x509KeyECDSA: int`
-
-The `Certificate.pubKeyAlg` value meaning the certificate's key is ECDSA.
-
+See the [full section](crypto/certificates-and-primitives.md#x509keyecdsa-int).
 ### `x509KeyEd25519: int`
-
-The `Certificate.pubKeyAlg` value meaning the certificate's key is Ed25519.
-
+See the [full section](crypto/certificates-and-primitives.md#x509keyed25519-int).
 ## ASN.1 and DER
-
-Low-level building blocks for reading and writing the DER encoding
-certificates and keys use. Most programs reach for `x509Parse` or `pemDecode`
-instead of these directly.
-
+See the [full section](crypto/certificates-and-primitives.md#asn-1-and-der).
 ### `Element`
-
-One parsed DER element: its tag class, tag number, and raw content bytes.
-
+See the [full section](crypto/certificates-and-primitives.md#element).
 ### `BitString`
-
-The decoded content of a BIT STRING element. `unusedBits` (0 to 7) counts the padding bits in the final byte; `bytes` is the value.
-
+See the [full section](crypto/certificates-and-primitives.md#bitstring).
 ### `asn1Parse(der: []byte): Element!`
-
-Parses `der` as one top-level DER element. Fails on malformed input.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1parse-der-byte-element).
 ### `asn1Encode(e: Element): []byte`
-
-Re-encodes a parsed `Element` back to DER bytes.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1encode-e-element-byte).
 ### `asn1Boolean(v: bool): Element`
-
-Builds an `Element` holding a BOOLEAN.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1boolean-v-bool-element).
 ### `asn1Integer(v: int): Element`
-
-Builds an `Element` holding an INTEGER (fits in an `int`).
-
+See the [full section](crypto/certificates-and-primitives.md#asn1integer-v-int-element).
 ### `asn1BigInteger(mag: []byte): Element`
-
-Builds an `Element` holding an INTEGER too large for an `int`, given as its big-endian magnitude.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1biginteger-mag-byte-element).
 ### `asn1BitString(unusedBits: int, data: []byte): Element`
-
-Builds an `Element` holding a BIT STRING.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1bitstring-unusedbits-int-data-byte-element).
 ### `asn1OctetString(data: []byte): Element`
-
-Builds an `Element` holding an OCTET STRING.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1octetstring-data-byte-element).
 ### `asn1Null(): Element`
-
-Builds an `Element` holding a NULL.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1null-element).
 ### `asn1Oid(arcs: []int): Element!`
-
-Builds an `Element` holding an OBJECT IDENTIFIER from its dotted arcs.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1oid-arcs-int-element).
 ### `asn1Utf8String(s: string): Element`
-
-Builds an `Element` holding a UTF8String.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1utf8string-s-string-element).
 ### `asn1PrintableString(s: string): Element`
-
-Builds an `Element` holding a PrintableString.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1printablestring-s-string-element).
 ### `asn1IA5String(s: string): Element`
-
-Builds an `Element` holding an IA5String.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1ia5string-s-string-element).
 ### `asn1UtcTime(s: string): Element`
-
-Builds an `Element` holding a UTCTime.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1utctime-s-string-element).
 ### `asn1GeneralizedTime(s: string): Element`
-
-Builds an `Element` holding a GeneralizedTime.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1generalizedtime-s-string-element).
 ### `asn1Sequence(children: []Element): Element`
-
-Builds an `Element` holding a SEQUENCE from its elements.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1sequence-children-element-element).
 ### `asn1Set(children: []Element): Element`
-
-Builds an `Element` holding a SET from its elements.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1set-children-element-element).
 ### `asn1ExplicitTag(tag: int, inner: Element): Element`
-
-Wraps `e` in an explicit context tag numbered `tagNum`, the DER convention for optional or choice fields.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1explicittag-tag-int-inner-element-element).
 ### `asn1ImplicitTag(tag: int, inner: Element): Element`
-
-Wraps `e` in an implicit context tag numbered `tagNum`, replacing its universal tag rather than nesting a new one.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1implicittag-tag-int-inner-element-element).
 ### `asn1ReadBoolean(e: Element): bool!`
-
-Reads `e` back out as a BOOLEAN. Fails if `e` is not that type or is malformed.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1readboolean-e-element-bool).
 ### `asn1ReadInteger(e: Element): int!`
-
-Reads `e` back out as an INTEGER as an `int`. Fails if `e` is not that type or is malformed.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1readinteger-e-element-int).
 ### `asn1ReadBigInteger(e: Element): []byte!`
-
-Reads `e` back out as an INTEGER too large for an `int`, as its big-endian magnitude. Fails if `e` is not that type or is malformed.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1readbiginteger-e-element-byte).
 ### `asn1ReadBitString(e: Element): BitString!`
-
-Reads `e` back out as a BIT STRING as a `BitString`. Fails if `e` is not that type or is malformed.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1readbitstring-e-element-bitstring).
 ### `asn1ReadOctetString(e: Element): []byte!`
-
-Reads `e` back out as an OCTET STRING. Fails if `e` is not that type or is malformed.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1readoctetstring-e-element-byte).
 ### `asn1ReadNull(e: Element): ()!`
-
-Reads `e` back out as a NULL, checking only that it is present. Fails if `e` is not that type or is malformed.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1readnull-e-element).
 ### `asn1ReadOid(e: Element): []int!`
-
-Reads `e` back out as an OBJECT IDENTIFIER as its dotted arcs. Fails if `e` is not that type or is malformed.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1readoid-e-element-int).
 ### `asn1ReadString(e: Element): string!`
-
-Reads `e` back out as any of the text string types as a plain `string`. Fails if `e` is not that type or is malformed.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1readstring-e-element-string).
 ### `asn1ReadSequence(e: Element): []Element!`
-
-Reads `e` back out as a SEQUENCE as its elements. Fails if `e` is not that type or is malformed.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1readsequence-e-element-element).
 ### `asn1ReadSet(e: Element): []Element!`
-
-Reads `e` back out as a SET as its elements. Fails if `e` is not that type or is malformed.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1readset-e-element-element).
 ### `asn1ReadExplicit(e: Element, tag: int): Element!`
-
-Reads `e` back out of an explicit context tag numbered `tagNum`, the inverse of `asn1ExplicitTag`. Fails if the tag does not match.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1readexplicit-e-element-tag-int-element).
 ### `asn1OidString(arcs: []int): string`
-
-Formats an object identifier's `arcs` as a dotted string, for example `"1.2.840.113549"`.
-
+See the [full section](crypto/certificates-and-primitives.md#asn1oidstring-arcs-int-string).
 ### `classUniversal: int`
-
-One of DER's four ASN.1 tag classes, used with `asn1ExplicitTag`/`asn1ImplicitTag` and when reading an `Element`'s tag directly.
-
+See the [full section](crypto/certificates-and-primitives.md#classuniversal-int).
 ### `classApplication: int`
-
-One of DER's four ASN.1 tag classes, used with `asn1ExplicitTag`/`asn1ImplicitTag` and when reading an `Element`'s tag directly.
-
+See the [full section](crypto/certificates-and-primitives.md#classapplication-int).
 ### `classContext: int`
-
-One of DER's four ASN.1 tag classes, used with `asn1ExplicitTag`/`asn1ImplicitTag` and when reading an `Element`'s tag directly.
-
+See the [full section](crypto/certificates-and-primitives.md#classcontext-int).
 ### `classPrivate: int`
-
-One of DER's four ASN.1 tag classes, used with `asn1ExplicitTag`/`asn1ImplicitTag` and when reading an `Element`'s tag directly.
-
+See the [full section](crypto/certificates-and-primitives.md#classprivate-int).
 ### `tagBoolean: int`
-
-The universal DER tag number for BOOLEAN.
-
+See the [full section](crypto/certificates-and-primitives.md#tagboolean-int).
 ### `tagInteger: int`
-
-The universal DER tag number for INTEGER.
-
+See the [full section](crypto/certificates-and-primitives.md#taginteger-int).
 ### `tagBitString: int`
-
-The universal DER tag number for BIT STRING.
-
+See the [full section](crypto/certificates-and-primitives.md#tagbitstring-int).
 ### `tagOctetString: int`
-
-The universal DER tag number for OCTET STRING.
-
+See the [full section](crypto/certificates-and-primitives.md#tagoctetstring-int).
 ### `tagNull: int`
-
-The universal DER tag number for NULL.
-
+See the [full section](crypto/certificates-and-primitives.md#tagnull-int).
 ### `tagOid: int`
-
-The universal DER tag number for OBJECT IDENTIFIER.
-
+See the [full section](crypto/certificates-and-primitives.md#tagoid-int).
 ### `tagUtf8String: int`
-
-The universal DER tag number for UTF8String.
-
+See the [full section](crypto/certificates-and-primitives.md#tagutf8string-int).
 ### `tagSequence: int`
-
-The universal DER tag number for SEQUENCE.
-
+See the [full section](crypto/certificates-and-primitives.md#tagsequence-int).
 ### `tagSet: int`
-
-The universal DER tag number for SET.
-
+See the [full section](crypto/certificates-and-primitives.md#tagset-int).
 ### `tagPrintableString: int`
-
-The universal DER tag number for PrintableString.
-
+See the [full section](crypto/certificates-and-primitives.md#tagprintablestring-int).
 ### `tagIA5String: int`
-
-The universal DER tag number for IA5String.
-
+See the [full section](crypto/certificates-and-primitives.md#tagia5string-int).
 ### `tagUtcTime: int`
-
-The universal DER tag number for UTCTime.
-
+See the [full section](crypto/certificates-and-primitives.md#tagutctime-int).
 ### `tagGeneralizedTime: int`
-
-The universal DER tag number for GeneralizedTime.
-
+See the [full section](crypto/certificates-and-primitives.md#taggeneralizedtime-int).
 ## Big-integer and elliptic-curve building blocks
-
-The arithmetic RSA, ECDSA, and ECDH are built from. Exported for advanced use
-(implementing another curve-based scheme); reach for the signing and key
-exchange functions above first.
-
+See the [full section](crypto/certificates-and-primitives.md#big-integer-and-elliptic-curve-building-blocks).
 ### `Nat`
-
-An arbitrary-precision non-negative integer, the type RSA, ECDSA, and ECDH build their arithmetic from.
-
+See the [full section](crypto/certificates-and-primitives.md#nat).
 ### `bigintZero(): Nat`
-
-The `Nat` value zero.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintzero-nat).
 ### `bigintFromU64(v: u64): Nat`
-
-Builds a `Nat` from a 64-bit unsigned integer.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintfromu64-v-u64-nat).
 ### `bigintToU64(n: Nat): u64!`
-
-Converts a `Nat` to a 64-bit unsigned integer. Fails if the value does not fit.
-
+See the [full section](crypto/certificates-and-primitives.md#biginttou64-n-nat-u64).
 ### `bigintFromBytes(be: []byte): Nat`
-
-Builds a `Nat` from its big-endian byte encoding.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintfrombytes-be-byte-nat).
 ### `bigintToBytes(n: Nat, outLen: int): []byte!`
-
-Encodes a `Nat` as `n` big-endian bytes. Fails if the value does not fit in `n` bytes.
-
+See the [full section](crypto/certificates-and-primitives.md#biginttobytes-n-nat-outlen-int-byte).
 ### `bigintIsZero(n: Nat): bool`
-
-Whether a `Nat` is zero.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintiszero-n-nat-bool).
 ### `bigintBitLen(n: Nat): int`
-
-The number of bits needed to represent a `Nat`, not counting leading zeros.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintbitlen-n-nat-int).
 ### `bigintCmp(a: Nat, b: Nat): int`
-
-Compares two `Nat` values: negative, zero, or positive, the same convention as any three-way comparator.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintcmp-a-nat-b-nat-int).
 ### `bigintAdd(a: Nat, b: Nat): Nat`
-
-Adds two `Nat` values.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintadd-a-nat-b-nat-nat).
 ### `bigintSub(a: Nat, b: Nat): Nat!`
-
-Subtracts two `Nat` values. Fails if the result would be negative.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintsub-a-nat-b-nat-nat).
 ### `bigintMul(a: Nat, b: Nat): Nat`
-
-Multiplies two `Nat` values.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintmul-a-nat-b-nat-nat).
 ### `bigintSqr(a: Nat): Nat`
-
-Squares a `Nat` value, faster than `bigintMul` with itself.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintsqr-a-nat-nat).
 ### `QuotRem`
-
-A division result: its `quot`ient and `rem`ainder.
-
+See the [full section](crypto/certificates-and-primitives.md#quotrem).
 ### `bigintDivMod(a: Nat, b: Nat): QuotRem!`
-
-Divides one `Nat` by another, returning the quotient and remainder. Fails on division by zero.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintdivmod-a-nat-b-nat-quotrem).
 ### `bigintMod(a: Nat, b: Nat): Nat!`
-
-The remainder of one `Nat` divided by another. Fails on division by zero.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintmod-a-nat-b-nat-nat).
 ### `bigintGcd(a: Nat, b: Nat): Nat`
-
-The greatest common divisor of two `Nat` values.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintgcd-a-nat-b-nat-nat).
 ### `bigintModInverse(a: Nat, n: Nat): Nat!`
-
-The modular inverse of a `Nat` modulo another. Fails if no inverse exists.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintmodinverse-a-nat-n-nat-nat).
 ### `bigintModExp(base: Nat, exp: Nat, modN: Nat): Nat!`
-
-Modular exponentiation, `base^exp mod modN`, in constant time - use this when `exp` is secret, such as an RSA private exponent.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintmodexp-base-nat-exp-nat-modn-nat-nat).
 ### `bigintModExpPublic(base: Nat, exp: Nat, modN: Nat): Nat!`
-
-Modular exponentiation, `base^exp mod modN`, faster than `bigintModExp` but not constant-time - use this only when `exp` is public.
-
+See the [full section](crypto/certificates-and-primitives.md#bigintmodexppublic-base-nat-exp-nat-modn-nat-nat).
 ### `Curve`
-
-A NIST elliptic curve's parameters. Build one with `nistecP256` or `nistecP384`.
-
+See the [full section](crypto/certificates-and-primitives.md#curve).
 ### `Point`
-
-A point on a `Curve`.
-
+See the [full section](crypto/certificates-and-primitives.md#point).
 ### `nistecP256(): Curve`
-
-The NIST P-256 curve.
-
+See the [full section](crypto/certificates-and-primitives.md#nistecp256-curve).
 ### `nistecP384(): Curve`
-
-The NIST P-384 curve.
-
+See the [full section](crypto/certificates-and-primitives.md#nistecp384-curve).
 ### `nistecIsOnCurve(curve: Curve, point: Point): bool`
-
-Whether `p` is a valid point on `curve`.
-
+See the [full section](crypto/certificates-and-primitives.md#nistecisoncurve-curve-curve-point-point-bool).
 ### `nistecScalarBaseMult(curve: Curve, scalar: Nat): Point`
-
-Multiplies `curve`'s fixed base point by scalar `k`, producing the matching public point.
-
+See the [full section](crypto/certificates-and-primitives.md#nistecscalarbasemult-curve-curve-scalar-nat-point).
 ### `nistecScalarMult(curve: Curve, point: Point, scalar: Nat): Point!`
-
-Multiplies point `p` by scalar `k` on `curve`. Fails if `p` is not on the curve.
-
+See the [full section](crypto/certificates-and-primitives.md#nistecscalarmult-curve-curve-point-point-scalar-nat-point).
 ### `nistecPointEncode(curve: Curve, point: Point, compressed: bool): []byte!`
-
-Encodes a curve point as bytes, compressed when `compressed` is true.
-
+See the [full section](crypto/certificates-and-primitives.md#nistecpointencode-curve-curve-point-point-compressed-bool-byte).
 ### `nistecPointDecode(curve: Curve, data: []byte): Point!`
-
-Decodes bytes back into a point on `curve`. Fails if the bytes do not encode a valid point.
-
+See the [full section](crypto/certificates-and-primitives.md#nistecpointdecode-curve-curve-data-byte-point).
 ### `fe25519FromBytes(s: []byte): []u64`
-
-Decodes a Curve25519 field element from its byte encoding.
-
+See the [full section](crypto/certificates-and-primitives.md#fe25519frombytes-s-byte-u64).
 ### `fe25519ToBytes(f: []u64): []byte`
-
-Encodes a Curve25519 field element as bytes.
-
+See the [full section](crypto/certificates-and-primitives.md#fe25519tobytes-f-u64-byte).
 ### `fe25519Add(f: []u64, g: []u64): []u64`
-
-Adds two Curve25519 field elements.
-
+See the [full section](crypto/certificates-and-primitives.md#fe25519add-f-u64-g-u64-u64).
 ### `fe25519Sub(f: []u64, g: []u64): []u64`
-
-Subtracts two Curve25519 field elements.
-
+See the [full section](crypto/certificates-and-primitives.md#fe25519sub-f-u64-g-u64-u64).
 ### `fe25519Mul(f: []u64, g: []u64): []u64`
-
-Multiplies two Curve25519 field elements.
-
+See the [full section](crypto/certificates-and-primitives.md#fe25519mul-f-u64-g-u64-u64).
 ### `fe25519Sqr(f: []u64): []u64`
-
-Squares a Curve25519 field element, faster than `fe25519Mul` with itself.
-
+See the [full section](crypto/certificates-and-primitives.md#fe25519sqr-f-u64-u64).
 ### `fe25519Mul121666(f: []u64): []u64`
-
-Multiplies a Curve25519 field element by the curve constant 121666, a step in the X25519 ladder.
-
+See the [full section](crypto/certificates-and-primitives.md#fe25519mul121666-f-u64-u64).
 ### `fe25519Invert(z: []u64): []u64`
-
-The multiplicative inverse of a Curve25519 field element.
-
+See the [full section](crypto/certificates-and-primitives.md#fe25519invert-z-u64-u64).
 ## Hardware acceleration diagnostics
-
-Report whether a fast hardware code path is active on this host. Informational
-only: every function above dispatches to the fast path automatically when it
-is available, and falls back to a software path when it is not.
-
+See the [full section](crypto/certificates-and-primitives.md#hardware-acceleration-diagnostics).
 ### `hwAvailable(): bool`
-
-Whether any relevant hardware acceleration is available on this host. Every function above dispatches to the fast path automatically; this is informational only.
-
+See the [full section](crypto/certificates-and-primitives.md#hwavailable-bool).
 ### `hwAes(): bool`
-
-Whether AES hardware instructions are active for this process.
-
+See the [full section](crypto/certificates-and-primitives.md#hwaes-bool).
 ### `hwAvailableAes(): bool`
-
-Whether AES hardware instructions are available on this host.
-
+See the [full section](crypto/certificates-and-primitives.md#hwavailableaes-bool).
 ### `hwPmull(): bool`
-
-Whether the carry-less multiply instruction GCM's authentication uses is active for this process.
-
+See the [full section](crypto/certificates-and-primitives.md#hwpmull-bool).
 ### `hwAvailableGhash(): bool`
-
-Whether the carry-less multiply instruction GCM's authentication uses is available on this host.
-
+See the [full section](crypto/certificates-and-primitives.md#hwavailableghash-bool).
 ### `hwSha2(): bool`
-
-Whether SHA-2 hardware instructions are active for this process.
-
+See the [full section](crypto/certificates-and-primitives.md#hwsha2-bool).
 ### `hwAvailableSha256(): bool`
-
-Whether SHA-2 hardware instructions are available on this host.
-
+See the [full section](crypto/certificates-and-primitives.md#hwavailablesha256-bool).
 ## Specification
-
-RFC 9106 (Argon2), RFC 7914 (scrypt), RFC 8018 (PBKDF2), RFC 5869 (HKDF), RFC
-8439 (ChaCha20-Poly1305), RFC 8032 (Ed25519), RFC 9052 and RFC 9053 (COSE
-keys), RFC 7468 (PEM), RFC 5280
-(X.509), FIPS 203 (ML-KEM), and FIPS 204 (ML-DSA) are the standards this
-module implements.
+See the [full section](crypto/certificates-and-primitives.md#specification).
