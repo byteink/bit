@@ -177,3 +177,117 @@ test "scoped unlink preserves passthrough empty targets and existing transaction
     assert(failed && len(a.queries) == before && a.begins == 2, "chain error before any statement")
   }
 }
+
+fn slLinkSuffix(d: ServerDialect): string {
+  match (d) {
+    Postgres => return " on conflict (sl_owner_id, mtm_role_id) do nothing"
+    Mysql(_) => return " on duplicate key update sl_owner_id = sl_owner_id"
+  }
+}
+
+fn slLinkAllowed(d: ServerDialect): ()! {
+  let a = newRawAdapter()
+  a.rows = [[Value.Int(5)]]
+  let g = slGuard{ updateMode = 2, readMode = 0 }
+  let base = slRepo(a, d, g)
+  let chain = base.where("tenant", "acme")
+  let supplied = slValue()
+  g.owner = Option.Some(supplied)
+  chain.link(supplied, "roles", [9, 10])?
+  assert(supplied.id == 99, "link guard changed the aliased supplied row")
+  assert(a.begins == 1 && a.commits == 1 && a.rollbacks == 0, "one link transaction")
+  assert(
+    a.readTransaction == a.writeTransaction && a.readTransaction != 0,
+    "owner lock and INSERT share transaction",
+  )
+  assert(len(a.queries) == 1 && len(a.execs) == 1, "one owner lock then one INSERT")
+  assert(
+      a.queries[0].sql ==
+      "select * from slowners where tenant = $1 and id = $2 and (tenant = $3 or tenant = $4) and deleted_at is null limit 2 for update",
+    "link Update predicate must protect owner lock",
+  )
+  assert(srArgsText(a.queries[0].args) == "tacme,i5,tacme,tshared", "link stored owner selection")
+  let suffix = slLinkSuffix(d)
+  assert(
+      a.execs[0].sql ==
+      "insert into sl_owner_roles (sl_owner_id, mtm_role_id) values ($1, $2), ($3, $4)" + suffix,
+    "scoped link must INSERT only requested pairs: ${a.execs[0].sql}",
+  )
+  assert(srArgsText(a.execs[0].args) == "i5,i9,i5,i10", "link retains captured owner id")
+  assert(g.actor == "actor7" && g.first == 3 && g.updates == 1, "link actor and offset")
+  assert(
+    chain.tenant == "acme" && len(chain.inner.args) == 1 && len(base.inner.args) == 0,
+    "link chain unchanged",
+  )
+}
+
+test "scoped link locks Update-filtered owner and inserts on both dialects" {
+  for d of [srPostgres(), srMysql()] {
+    slLinkAllowed(d) catch e {
+      panic(e.message())
+    }
+  }
+}
+
+fn slLinkDenied(d: ServerDialect, update: int, read: int, present: bool, want: string) {
+  let a = newRawAdapter()
+  a.cols = ["count"]
+  if (present) {
+    a.rows = [[Value.Int(1)]]
+  }
+  let g = slGuard{ updateMode = update, readMode = read }
+  let observed = "no failure"
+  slRepo(a, d, g).where("tenant", "acme").link(slValue(), "roles", [9]) catch e {
+    observed = e.message()
+  }
+  assert(observed == want && len(a.execs) == 0, "denied owner cannot INSERT: ${observed}")
+  assert(a.commits == 0 && a.rollbacks == 1, "link denial rolls back")
+}
+
+test "scoped link refuses stale cross-tenant missing owners and guard errors" {
+  for d of [srPostgres(), srMysql()] {
+    slLinkDenied(d, 1, 0, true, "unlink denied")
+    slLinkDenied(d, 1, 1, true, "unlink missing")
+    slLinkDenied(d, 2, 1, false, "unlink missing")
+    slLinkDenied(d, 3, 0, true, "unlink rules unavailable")
+    slLinkDenied(d, 1, 3, true, "unlink rules unavailable")
+  }
+}
+
+test "scoped link preserves empty targets passthrough and transaction forwarding" {
+  for d of [srPostgres(), srMysql()] {
+    let a = newRawAdapter()
+    a.rows = [[Value.Int(5)]]
+    let g = slGuard{ updateMode = 0, readMode = 0 }
+    let repo = slRepo(a, d, g)
+    repo.link(slValue(), "roles", []i64(0)) catch e {
+      panic(e.message())
+    }
+    assert(len(a.execs) == 0 && a.commits == 1, "empty link writes nothing")
+    let db = Db{ pool = newRawPool(a), dialect = d, guard = g }
+    db.as(srUser{ id = "actor7" }).tx((tx) => {
+      tx.table<slOwner>().link(slValue(), "roles", [9])?
+    }) catch e {
+      panic(e.message())
+    }
+    assert(a.begins == 2 && a.commits == 2, "link reuses caller transaction")
+    assert(a.readTransaction == a.writeTransaction, "caller transaction covers INSERT")
+    assert(srArgsText(a.execs[0].args) == "i5,i9", "transaction link owner and target")
+    g.protected = false
+    let before = len(a.queries)
+    repo.link(slValue(), "roles", [9]) catch e {
+      panic(e.message())
+    }
+    assert(len(a.queries) == before && a.begins == 2, "unprotected link passthrough")
+    let plain = Db{ pool = newRawPool(a), dialect = d }.asGuest().table<slOwner>()
+    plain.link(slValue(), "roles", [9]) catch e {
+      panic(e.message())
+    }
+    assert(len(a.queries) == before && a.begins == 2, "absent guard link passthrough")
+    let failed = false
+    repo.where("unknown", 1).link(slValue(), "roles", [9]) catch _ {
+      failed = true
+    }
+    assert(failed && len(a.queries) == before && a.begins == 2, "link chain error before SQL")
+  }
+}
