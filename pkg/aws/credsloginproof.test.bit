@@ -1,0 +1,223 @@
+import {
+  asn1Integer, asn1OctetString, asn1ExplicitTag, asn1Oid, asn1Sequence,
+  asn1BitString, asn1Encode, pemEncode, decodeBase64Url, ecdsaVerify,
+} from "std/crypto"
+import { ecdsaSigFromRaw, es256PublicKeyFromCoords } from "std/jwt"
+import { parse as loginUuidParse } from "std/uuid"
+
+const loginProofUrl = "https://us-east-1.signin.aws.amazon.com/v1/token"
+const loginProofTime: int = 1700000000
+
+fn loginTestScalar(last: byte = 1): []byte {
+  let scalar = []byte(32)
+  scalar[31] = last
+  return scalar
+}
+
+fn loginTestMembers(): []LoginElement {
+  let curve = asn1Oid([1, 2, 840, 10045, 3, 1, 7]) catch e {
+    panic(e.message())
+  }
+  return [asn1Integer(1), asn1OctetString(loginTestScalar()), asn1ExplicitTag(0, curve)]
+}
+
+fn loginTestPem(members: []LoginElement): string {
+  return pemEncode("EC PRIVATE KEY", asn1Encode(asn1Sequence(members)))
+}
+
+fn loginTestSign(pem: string): string {
+  return loginDpop(pem, loginProofUrl, loginProofTime) catch e {
+    panic(e.message())
+  }
+}
+
+fn loginTestMember(value: Json, name: string): Json {
+  match (jsonGet(value, name)) {
+    Some(v) => return v
+    None => { panic("missing ${name}") }
+  }
+}
+
+fn loginTestJson(encoded: string): Json {
+  let raw = decodeBase64Url(encoded) catch e {
+    panic(e.message())
+  }
+  return jsonParse(string(raw)) catch e {
+    panic(e.message())
+  }
+}
+
+// Verify from the emitted public coordinates, independently of the signing-key parser.
+fn loginTestVerified(token: string): Json! {
+  let parts = split(token, ".")
+  assert(len(parts) == 3)
+  let header = loginTestJson(parts[0])
+  assert(ssoText(header, "typ")? == "dpop+jwt")
+  assert(ssoText(header, "alg")? == "ES256")
+  let jwk = loginTestMember(header, "jwk")
+  match (jwk) {
+    JsonObject(members) => assert(len(members) == 4)
+    _ => { panic("JWK is not an object") }
+  }
+  assert(ssoText(jwk, "kty")? == "EC")
+  assert(ssoText(jwk, "crv")? == "P-256")
+  let x = decodeBase64Url(ssoText(jwk, "x")?)?
+  let y = decodeBase64Url(ssoText(jwk, "y")?)?
+  assert(encodeHex(x) == "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
+  assert(encodeHex(y) == "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+  let key = es256PublicKeyFromCoords(x, y)?
+  let signature = ecdsaSigFromRaw(decodeBase64Url(parts[2])?)?
+  assert(ecdsaVerify(key, digest(Sha256(), []byte(parts[0] + "." + parts[1])), signature))
+  return loginTestJson(parts[1])
+}
+
+fn loginTestFailure(
+  pem: string,
+  url: string = loginProofUrl,
+  timestamp: int = loginProofTime,
+): string {
+  loginDpop(pem, url, timestamp) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+fn loginClaimsCase(): ()! {
+  let pem = loginTestPem(loginTestMembers())
+  let token = loginTestSign(pem)
+  let claims = loginTestVerified(token)?
+  assert(ssoText(claims, "htm")? == "POST")
+  assert(ssoText(claims, "htu")? == loginProofUrl)
+  assert(ssoNumber(claims, "iat")? == i64(loginProofTime))
+  assert(!contains(token, "PRIVATE KEY"))
+}
+
+test "AWS login DPoP signs a public-only P256 JWK and exact POST endpoint and time" {
+  loginClaimsCase() catch e {
+    panic(e.message())
+  }
+}
+
+fn loginNonceCase(): ()! {
+  let pem = loginTestPem(loginTestMembers())
+  let first = ssoText(loginTestVerified(loginTestSign(pem))?, "jti")?
+  let second = ssoText(loginTestVerified(loginTestSign(pem))?, "jti")?
+  loginUuidParse(first)?
+  loginUuidParse(second)?
+  assert(first != second)
+  assert(first[14] == '4' && second[14] == '4')
+}
+
+test "AWS login DPoP generates a fresh valid UUID4 for each signed proof" {
+  loginNonceCase() catch e {
+    panic(e.message())
+  }
+}
+
+fn loginPublicCase(): ()! {
+  let key = ecdsaPrivateKey(nistecP256(), loginTestScalar())?
+  for compressed of [false, true] {
+    let point = nistecPointEncode(key.curve, key.q, compressed)?
+    let members = append(loginTestMembers(), asn1ExplicitTag(1, asn1BitString(0, point)))
+    loginTestVerified(loginTestSign(loginTestPem(members)))?
+  }
+}
+
+test "AWS login DPoP accepts matching compressed and uncompressed optional public keys" {
+  loginPublicCase() catch e {
+    panic(e.message())
+  }
+}
+
+fn loginEndpointCase(): ()! {
+  let pem = loginTestPem(loginTestMembers())
+  let bad = [
+    "", "https://v1/token", "https:///v1/token", "http://a.b/v1/token",
+    "https://user@a.b/v1/token", "https://a.b:443/v1/token", "https://a..b/v1/token",
+    "https://-a.b/v1/token", "https://a.b-/v1/token", "https://a.b/v1/token?x=1",
+    "https://a.b/v1/token#fragment", "https://a.b/other", "https://a b/v1/token",
+    "https://a.b\r\n/v1/token",
+  ]
+  for url of bad {
+    assert(loginTestFailure(pem, url) == loginProofError().message())
+  }
+  assert(loginTestFailure(pem, loginProofUrl, -1) == loginProofError().message())
+}
+
+test "AWS login DPoP rejects malformed HTTPS token endpoints before signing" {
+  loginEndpointCase() catch e {
+    panic(e.message())
+  }
+}
+
+fn loginKeyCase(): ()! {
+  let members = loginTestMembers()
+  members[0] = asn1Integer(2)
+  assert(loginTestFailure(loginTestPem(members)) != "")
+  members = loginTestMembers()
+  members[1] = asn1OctetString([]byte(32))
+  assert(loginTestFailure(loginTestPem(members)) != "")
+  members[1] = asn1OctetString([]byte(31))
+  assert(loginTestFailure(loginTestPem(members)) != "")
+  members[1] = asn1OctetString([]byte(33))
+  assert(loginTestFailure(loginTestPem(members)) != "")
+  members = loginTestMembers()
+  members[2] = asn1ExplicitTag(0, asn1Oid([1, 3, 132, 0, 34])?)
+  assert(loginTestFailure(loginTestPem(members)) != "")
+  assert(loginTestFailure(loginTestPem([members[0], members[1]])) != "")
+  members = append(loginTestMembers(), asn1Integer(1))
+  assert(loginTestFailure(loginTestPem(members)) != "")
+}
+
+test "AWS login DPoP rejects wrong SEC1 version curve scalar and extra members" {
+  loginKeyCase() catch e {
+    panic(e.message())
+  }
+}
+
+fn loginMismatchCase(): ()! {
+  let other = ecdsaPrivateKey(nistecP256(), loginTestScalar(2))?
+  let point = nistecPointEncode(other.curve, other.q, false)?
+  let members = append(loginTestMembers(), asn1ExplicitTag(1, asn1BitString(0, point)))
+  assert(loginTestFailure(loginTestPem(members)) == loginProofError().message())
+}
+
+test "AWS login DPoP rejects mismatched optional public key" {
+  loginMismatchCase() catch e {
+    panic(e.message())
+  }
+}
+
+fn loginPemCase(): ()! {
+  let pem = loginTestPem(loginTestMembers())
+  let der = asn1Encode(asn1Sequence(loginTestMembers()))
+  let bad = [
+    "secret-value", "secret-value" + pem, pem + "secret-value", pem + pem,
+    pemEncode("PRIVATE KEY", der), pemEncode("EC PRIVATE KEY", append(der, byte(0))),
+    "-----BEGIN EC PRIVATE KEY-----\nsecret-value\n-----END EC PRIVATE KEY-----",
+  ]
+  for value of bad {
+    assert(loginTestFailure(value) == loginProofError().message())
+  }
+}
+
+test "AWS login DPoP rejects ambiguous PEM framing trailing DER and redacts input" {
+  loginPemCase() catch e {
+    panic(e.message())
+  }
+}
+
+fn loginTamperCase(): ()! {
+  let token = loginTestSign(loginTestPem(loginTestMembers()))
+  let parts = split(token, ".")
+  let key = ecdsaPrivateKey(nistecP256(), loginTestScalar())?
+  let publicKey = ecdsaPublicKey(key.curve, nistecPointEncode(key.curve, key.q, false)?)?
+  let signature = ecdsaSigFromRaw(decodeBase64Url(parts[2])?)?
+  assert(!ecdsaVerify(publicKey, digest(Sha256(), []byte("changed." + parts[1])), signature))
+}
+
+test "AWS login DPoP signature rejects altered signing input" {
+  loginTamperCase() catch e {
+    panic(e.message())
+  }
+}
