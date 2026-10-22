@@ -1,0 +1,179 @@
+@table("slowners") @softDelete class slOwner {
+  id: i64
+  tenant: string
+  deletedAt: Option<i64>
+  @manyToMany("sl_owner_roles")
+  roles: []mtmRole
+}
+
+class slGuard {
+  updateMode: int
+  readMode: int
+  protected: bool = true
+  actor: string
+  first: int
+  updates: int
+  owner: Option<slOwner> = Option<slOwner>.None
+
+  protects(table: string): bool { return this.protected }
+
+  filter(actor: Actor, op: GuardOp, table: string, d: ServerDialect, first: int): GuardFilter! {
+    let mode = this.readMode
+    if (op == GuardOp.Update) {
+      mode = this.updateMode
+      this.updates = this.updates + 1
+      this.actor = actor.id
+      this.first = first
+      match (this.owner) {
+        Some(row) => row.id = 99
+        None => {}
+      }
+    }
+    if (mode == 0) {
+      return GuardFilter.All
+    }
+    if (mode == 1) {
+      return GuardFilter.None
+    }
+    if (mode == 3) {
+      fail newError("unlink rules unavailable")
+    }
+    return GuardFilter.Sql(
+      "tenant = $${first} or tenant = $${first + 1}",
+      [Value.Text("acme"), Value.Text("shared")],
+    )
+  }
+
+  allows(actor: Actor, op: GuardOp, table: string, cols: []string, values: []Value): bool! {
+    fail newError("supplied owner must not authorize unlink")
+  }
+
+  denied(actor: Actor, op: GuardOp, table: string): error { return newError("unlink denied") }
+  notFound(table: string): error { return newError("unlink missing") }
+  check(): ()! {}
+}
+
+fn slRepo(a: rawAdapter, d: ServerDialect, g: slGuard): ScopedRepo<slOwner> {
+  let db = Db{ pool = newRawPool(a), dialect = d, guard = g }
+  return db.as(srUser{ id = "actor7" }, "acme").table<slOwner>()
+}
+
+fn slValue(): slOwner {
+  return slOwner{ id = 5, tenant = "forged-owner", deletedAt = Option<i64>.None }
+}
+
+fn slAllowed(d: ServerDialect): ()! {
+  let a = newRawAdapter()
+  a.rows = [[Value.Int(5)]]
+  let g = slGuard{ updateMode = 2, readMode = 0 }
+  let base = slRepo(a, d, g)
+  let chain = base.where("tenant", "acme")
+  let supplied = slValue()
+  g.owner = Option.Some(supplied)
+  chain.unlink(supplied, "roles", [9, 10])?
+  assert(supplied.id == 99, "guard callback changed the aliased supplied row")
+  assert(a.begins == 1 && a.commits == 1 && a.rollbacks == 0, "one committed transaction")
+  assert(
+    a.readTransaction == a.writeTransaction && a.readTransaction != 0,
+    "lock and detach share transaction",
+  )
+  assert(len(a.queries) == 1 && len(a.execs) == 1, "one owner lock then one detach")
+  assert(
+      a.queries[0].sql ==
+      "select * from slowners where tenant = $1 and id = $2 and (tenant = $3 or tenant = $4) and deleted_at is null limit 2 for update",
+    "Update predicate must protect owner lock: ${a.queries[0].sql}",
+  )
+  assert(
+    srArgsText(a.queries[0].args) == "tacme,i5,tacme,tshared",
+    "stored owner selection ignores supplied tenant",
+  )
+  assert(
+      a.execs[0].sql ==
+      "delete from sl_owner_roles where sl_owner_id = $1 and mtm_role_id in ($2, $3)",
+    a.execs[0].sql,
+  )
+  assert(srArgsText(a.execs[0].args) == "i5,i9,i10", "only requested relation pairs")
+  assert(
+    g.actor == "actor7" && g.first == 3 && g.updates == 1,
+    "actor and parameter offset retained",
+  )
+  assert(
+    chain.tenant == "acme" && len(chain.inner.args) == 1 && len(base.inner.args) == 0,
+    "scoped chain unchanged",
+  )
+}
+
+test "scoped unlink locks Update-filtered owner before detach on both dialects" {
+  for d of [srPostgres(), srMysql()] {
+    slAllowed(d) catch e {
+      panic(e.message())
+    }
+  }
+}
+
+fn slDenied(d: ServerDialect, update: int, read: int, present: bool, want: string) {
+  let a = newRawAdapter()
+  a.cols = ["count"]
+  if (present) {
+    a.rows = [[Value.Int(1)]]
+  }
+  let g = slGuard{ updateMode = update, readMode = read }
+  let failed = false
+  let observed = "no failure"
+  slRepo(a, d, g).where("tenant", "acme").unlink(slValue(), "roles", [9]) catch e {
+    observed = e.message()
+    failed = e.message() == want
+  }
+  assert(
+    failed && len(a.execs) == 0,
+    "denied stale or cross-tenant owner cannot detach: Update=${update} Read=${read} present=${present} got=${observed} expected=${want}",
+  )
+  assert(a.commits == 0 && a.rollbacks == 1, "denial rolls back")
+}
+
+test "scoped unlink refuses stale cross-tenant missing owners and guard errors" {
+  for d of [srPostgres(), srMysql()] {
+    slDenied(d, 1, 0, true, "unlink denied")
+    slDenied(d, 1, 1, true, "unlink missing")
+    slDenied(d, 2, 1, false, "unlink missing")
+    slDenied(d, 3, 0, true, "unlink rules unavailable")
+    slDenied(d, 1, 3, true, "unlink rules unavailable")
+  }
+}
+
+test "scoped unlink preserves passthrough empty targets and existing transaction" {
+  for d of [srPostgres(), srMysql()] {
+    let a = newRawAdapter()
+    a.rows = [[Value.Int(5)]]
+    let g = slGuard{ updateMode = 0, readMode = 0 }
+    let repo = slRepo(a, d, g)
+    repo.unlink(slValue(), "roles", []i64(0)) catch e {
+      panic(e.message())
+    }
+    assert(len(a.execs) == 0 && a.commits == 1, "empty target writes nothing")
+    let db = Db{ pool = newRawPool(a), dialect = d, guard = g }
+    db.as(srUser{ id = "actor7" }).tx((tx) => {
+      tx.table<slOwner>().unlink(slValue(), "roles", [9])?
+    }) catch e {
+      panic(e.message())
+    }
+    assert(a.begins == 2 && a.commits == 2, "reuse caller transaction")
+    assert(a.readTransaction == a.writeTransaction, "caller transaction covers detach")
+    g.protected = false
+    let before = len(a.queries)
+    repo.unlink(slValue(), "roles", [9]) catch e {
+      panic(e.message())
+    }
+    assert(len(a.queries) == before && a.begins == 2, "unprotected plain behavior")
+    let plain = Db{ pool = newRawPool(a), dialect = d }.asGuest().table<slOwner>()
+    plain.unlink(slValue(), "roles", [9]) catch e {
+      panic(e.message())
+    }
+    assert(len(a.queries) == before && a.begins == 2, "absent guard plain behavior")
+    let failed = false
+    repo.where("unknown", 1).unlink(slValue(), "roles", [9]) catch _ {
+      failed = true
+    }
+    assert(failed && len(a.queries) == before && a.begins == 2, "chain error before any statement")
+  }
+}
