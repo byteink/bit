@@ -84,12 +84,12 @@ class Author { export id: string }
 @table class DraftTag { id: i64 }
 
 @table @softDelete class Draft {
-  id: i64,
-  authorId: i64,
-  body: string,
-  deletedAt: Option<i64> = Option<i64>.None,
+  id: i64
+  authorId: i64
+  body: string
+  deletedAt: Option<i64> = Option<i64>.None
   @manyToMany("draft_tags")
-  tags: []DraftTag,
+  tags: []DraftTag
 }
 ```
 
