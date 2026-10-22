@@ -92,8 +92,9 @@ After a failed save, the app locks and reads the current article before
 cleanup. It removes the new object only when that row proves the object is
 unreferenced. A lost database response can follow a committed write: if the
 row points to the new key, or its state cannot be read, the object stays and
-the original error reaches the caller. A failed compensation also remains
-an error. After a successful database update, the app deletes the old object. If that deletion fails, the request reports
+the original cause reaches the app's error handler. HTTP responses still
+hide internal details with the normal generic `500`. A failed compensation
+also remains an error. After a successful database update, the app deletes the old object. If that deletion fails, the request reports
 an error while the new database reference remains valid. Retry only after
 checking the article's current cover. The integration gate runs this flow
 against its own PostgreSQL, Redis and SeaweedFS containers.
@@ -117,19 +118,22 @@ against its own PostgreSQL, Redis and SeaweedFS containers.
 28. [Transactions](15-transactions.md)
 29. [Testing the API](16-testing-the-api.md)
 30. [Operations: health, graceful shutdown](17-operations.md)
-31. [Run a nightly article digest](25-scheduled-jobs.md)
-32. [Cache article lists in Redis](26-caching-with-redis.md)
-33. [Share sessions across servers](27-sessions-in-redis.md)
-34. [Find articles by their words](28-full-text-search.md)
-35. [Keep deleted articles recoverable](29-soft-deletes.md)
-36. [Refuse an edit based on an old article](30-optimistic-locking.md)
-37. [Reuse an article until its representation changes](31-conditional-client-caching.md)
-38. [Give the API a versioned address](32-api-versioning.md)
-39. [Generate the API document from its routes](33-generated-openapi.md)
-40. [API tokens with JWT](34-api-tokens-with-jwt.md)
-41. [Refresh tokens](35-refresh-tokens.md)
-42. [Sign in with Google](36-sign-in-with-google.md)
-43. [Idempotency keys: retry a write without doing it twice](40-idempotency-keys.md)
+31. [Add a cover image to an article](19-file-uploads.md)
+32. [Read a cover without buffering the download](20-serving-and-streaming-files.md)
+33. [Keep cover bytes in object storage](21-object-storage.md)
+34. [Run a nightly article digest](25-scheduled-jobs.md)
+35. [Cache article lists in Redis](26-caching-with-redis.md)
+36. [Share sessions across servers](27-sessions-in-redis.md)
+37. [Find articles by their words](28-full-text-search.md)
+38. [Keep deleted articles recoverable](29-soft-deletes.md)
+39. [Refuse an edit based on an old article](30-optimistic-locking.md)
+40. [Reuse an article until its representation changes](31-conditional-client-caching.md)
+41. [Give the API a versioned address](32-api-versioning.md)
+42. [Generate the API document from its routes](33-generated-openapi.md)
+43. [API tokens with JWT](34-api-tokens-with-jwt.md)
+44. [Refresh tokens](35-refresh-tokens.md)
+45. [Sign in with Google](36-sign-in-with-google.md)
+46. [Idempotency keys: retry a write without doing it twice](40-idempotency-keys.md)
 
 Idempotency closes this part by making the app's two creating routes safe
 to retry. Part 5 starts with [Background jobs](../../../docs/book/31-background-jobs.md)
