@@ -288,3 +288,269 @@ test "body save refuses a closed stream and preserves the target" {
     assert(len(readDir(dir)?) == 1, "closed save leaves no temporary file")
   })
 }
+
+fn bodyTestChecked(
+  source: BodySource,
+  length: Option<int>,
+  alg: ChecksumAlgorithm,
+  expected: string,
+): ByteStream! {
+  let body = checkedBodyStream(source, length)?
+  body.checksums = [bodyChecksum{ hash = checksumHasher(alg)?, expected = expected }]
+  return body
+}
+
+fn bodyTestChecksumFailure(body: ByteStream, max: int) {
+  let refused = false
+  let _ = body.read(max) catch e {
+    match (e.(S3Error).kind) {
+      ChecksumMismatch => refused = true
+      _ => panic("wrong checksum error: ${e.message()}")
+    }
+    []byte(0)
+  }
+  assert(refused && body.failed && body.closed, "checksum failure closes the body")
+  assert(body.pending == "", "failed final data is discarded")
+}
+
+test "body checked final chunk is withheld for every checksum algorithm" {
+  bodyTestRun(() => {
+    for alg of checksumAlgorithms() {
+      let closes = 0
+      let body = bodyTestChecked(
+        bodyTestSource("Hello worle"), Option.Some(11), alg, valueOf(alg, []byte(hello)),
+      )?
+      body.onClose = Option.Some(() => {
+        closes = closes + 1
+      })
+      assert(string(body.read(6)?) == "Hello ", "only a nonfinal chunk escapes")
+      assert(body.consumed == 11 && !body.closed, "known length alone is not EOF")
+      bodyTestChecksumFailure(body, 6)
+      body.close()
+      assert(closes == 1, "one checksum-failure release")
+    }
+  })
+}
+
+test "body checked valid and empty streams hash every byte once under changing reads" {
+  bodyTestRun(() => {
+    for alg of checksumAlgorithms() {
+      for data of ["", hello] {
+        let at = 0
+        let eof = false
+        let source: BodySource = (n) => {
+          let size = minBodyRead(n)
+          if (size > 3) {
+            size = 3
+          }
+          if (size > len(data) - at) {
+            size = len(data) - at
+          }
+          let part = data[at:at + size]
+          at = at + size
+          eof = part == ""
+          return part
+        }
+        let body = bodyTestChecked(source, Option<int>.None, alg, valueOf(alg, []byte(data)))?
+        let out = ""
+        for max of [8, 1, 7, 2, 1, 20, 1, 8, 8, 8, 8, 8] {
+          let part = body.read(max)?
+          assert(len(part) <= max, "changing demand remains a ceiling")
+          assert(len(body.pending) <= bodyChunkBytes, "pending remains one bounded chunk")
+          out = out + string(part)
+        }
+        assert(out == data && eof && body.verified, "valid data only finishes after true EOF")
+        assert(body.consumed == len(data) && body.closed, "exact byte count and successful close")
+      }
+    }
+  })
+}
+
+test "body checked exact length still waits for source EOF and catches a late disconnect" {
+  bodyTestRun(() => {
+    let pulls = 0
+    let closes = 0
+    let source: BodySource = (n) => {
+      pulls = pulls + 1
+      if (pulls == 1) {
+        return "abc"
+      }
+      fail newError("late disconnect")
+    }
+    let body = bodyTestChecked(source, Option.Some(3), ChecksumAlgorithm.Crc32, "NSRBwg==")?
+    body.onClose = Option.Some(() => {
+      closes = closes + 1
+    })
+    let refused = false
+    let _ = body.read(3) catch e {
+      refused = contains(e.message(), "late disconnect")
+      []byte(0)
+    }
+    assert(refused && pulls == 2 && closes == 1, "EOF failure cannot expose final data")
+    assert(body.failed && body.pending == "", "disconnect discards pending data")
+  })
+}
+
+test "body checked known length cannot hide extra bytes or a short body" {
+  bodyTestRun(() => {
+    for length of [2, 4] {
+      let closes = 0
+      let body = bodyTestChecked(
+        bodyTestSource("abc"), Option.Some(length), ChecksumAlgorithm.Crc32, "NSRBwg==",
+      )?
+      body.onClose = Option.Some(() => {
+        closes = closes + 1
+      })
+      let refused = false
+      let _ = body.read(3) catch e {
+        refused = contains(e.message(), "content length mismatch")
+        []byte(0)
+      }
+      body.close()
+      assert(
+        refused && body.failed && body.pending == "" && closes == 1,
+        "length failure closes once",
+      )
+    }
+  })
+}
+
+test "body checked lookahead rejects an oversized source and explicit close discards pending" {
+  bodyTestRun(() => {
+    let pulls = 0
+    let bad: BodySource = (n) => {
+      pulls = pulls + 1
+      if (pulls == 1) {
+        return "a"
+      }
+      return repeat("b", n + 1)
+    }
+    let body = bodyTestChecked(bad, Option<int>.None, ChecksumAlgorithm.Crc32, "AAAAAA==")?
+    let refused = false
+    let _ = body.read(1) catch _ {
+      refused = true
+      []byte(0)
+    }
+    assert(
+      refused && body.failed && body.closed && body.pending == "",
+      "oversize lookahead fails closed",
+    )
+    let closes = 0
+    let pending = bodyTestChecked(
+      bodyTestSource(hello),
+      Option.Some(11),
+      ChecksumAlgorithm.Crc32,
+      "i9aeUg==",
+    )?
+    pending.onClose = Option.Some(() => {
+      closes = closes + 1
+    })
+    assert(
+      string(pending.read(6)?) == "Hello " && pending.pending == "world",
+      "one final chunk pending",
+    )
+    pending.close()
+    pending.close()
+    assert(
+      closes == 1 && pending.pending == "" && len(pending.read(1)?) == 0,
+      "abandonment releases once",
+    )
+  })
+}
+
+test "body checked pipe and atomic save cannot expose a corrupt final chunk" {
+  bodyTestRun(() => {
+    let delivered = ""
+    let body = deserializeGetObjectOutput(bodyTestHead("abc", "AAAAAA=="))?.body
+    let refused = false
+    body.pipeTo((part) => {
+      delivered = delivered + part
+    }) catch e {
+      refused = contains(e.message(), "response checksum mismatch")
+    }
+    assert(refused && delivered == "" && body.pending == "", "pipe withholds corrupt final data")
+    let dir = bodyTestDir()?
+    defer bodyTestCleanup(dir)
+    let path = dir + "/cover"
+    writeFile(path, "previous")?
+    let saved = deserializeGetObjectOutput(bodyTestHead("abc", "AAAAAA=="))?.body
+    refused = false
+    saved.saveTo(path) catch _ {
+      refused = true
+    }
+    assert(refused && readFile(path)? == "previous", "atomic save preserves its target")
+    assert(saved.pending == "" && len(readDir(dir)?) == 1, "no failed final data or temporary file")
+  })
+}
+
+test "body checked sink failure discards pending and releases once" {
+  bodyTestRun(() => {
+    let closes = 0
+    let source: BodySource = (n) => {
+      return "abc"
+    }
+    let body = bodyTestChecked(source, Option<int>.None, ChecksumAlgorithm.Crc32, "AAAAAA==")?
+    body.onClose = Option.Some(() => {
+      closes = closes + 1
+    })
+    let refused = false
+    body.pipeTo((part) => {
+      fail newError("checked sink refused")
+    }) catch e {
+      refused = contains(e.message(), "checked sink refused")
+    }
+    body.close()
+    assert(
+      refused && closes == 1 && body.failed && body.pending == "",
+      "sink failure discards lookahead",
+    )
+  })
+}
+
+fn bodyTestLargeChecked(): ()! {
+  let total = 50 * 1024 * 1024
+  let chunk = repeat("c", bodyChunkBytes)
+  let hash = checksumHasher(ChecksumAlgorithm.Crc32)?
+  let chunks = total / bodyChunkBytes
+  let i = 0
+  while (i < chunks) {
+    hash.write([]byte(chunk))
+    i = i + 1
+  }
+  let sent = 0
+  let received = 0
+  let eof = false
+  let source: BodySource = (n) => {
+    assert(n == bodyChunkBytes, "fixed bounded source demand")
+    if (sent == total) {
+      eof = true
+      return ""
+    }
+    sent = sent + len(chunk)
+    return chunk
+  }
+  let body = bodyTestChecked(
+    source,
+    Option.Some(total),
+    ChecksumAlgorithm.Crc32,
+    checksumValue(hash),
+  )?
+  body.pipeTo((part) => {
+    received = received + len(part)
+    assert(len(body.pending) <= bodyChunkBytes, "pending storage is independent of object size")
+    if (received == total) {
+      assert(eof && body.verified, "the final chunk follows true EOF and checksum validation")
+    }
+  })?
+  assert(
+    sent == total && received == total && body.consumed == total,
+    "50 MiB counted exactly once",
+  )
+  assert(body.closed && body.pending == "", "successful stream releases pending storage")
+}
+
+test "body checked 50 MiB stream retains only fixed chunks" {
+  bodyTestRun(() => {
+    bodyTestLargeChecked()?
+  })
+}
