@@ -1,0 +1,148 @@
+// AWS Sign-In binds a refresh to this key and the exact token endpoint (RFC 9449).
+import {
+  Element as LoginElement, EcdsaPrivateKey, asn1Parse, asn1ReadSequence,
+  asn1ReadInteger, asn1ReadOctetString, asn1ReadExplicit, asn1ReadOid,
+  asn1OidString, asn1ReadBitString, pemDecode, ecdsaPrivateKey, nistecP256,
+  nistecPointEncode, ecdsaSign, encodeBase64Url, ecdsaPublicKey, bigintCmp,
+} from "std/crypto"
+import { ecdsaSigToRaw } from "std/jwt"
+
+fn loginProofError(): error {
+  return newError("aws: login: invalid DPoP proof input")
+}
+
+fn loginHostByte(c: byte): bool {
+  return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.'
+}
+
+// Sign-In's token URL has no credentials, port, query or fragment to normalize.
+fn loginProofEndpoint(endpoint: string): bool {
+  if (len(endpoint) < 20 ||
+    len(endpoint) > 270 ||
+    !hasPrefix(endpoint, "https://") ||
+    !hasSuffix(endpoint, "/v1/token")) {
+    return false
+  }
+  let host = endpoint[8:len(endpoint) - 9]
+  if (indexOf(host, ".") < 0) {
+    return false
+  }
+  for c of []byte(host) {
+    if (!loginHostByte(c)) {
+      return false
+    }
+  }
+  return loginProofLabels(host)
+}
+
+fn loginProofLabels(host: string): bool {
+  for label of split(host, ".") {
+    if (len(label) == 0 || len(label) > 63) {
+      return false
+    }
+    if (label[0] == '-' || label[len(label) - 1] == '-') {
+      return false
+    }
+  }
+  return true
+}
+
+fn loginProofMembers(pem: string): []LoginElement! {
+  if (len(pem) > 4096) {
+    fail loginProofError()
+  }
+  let text = trimSpace(pem)
+  let end = "-----END EC PRIVATE KEY-----"
+  if (!hasPrefix(text, "-----BEGIN EC PRIVATE KEY-----") ||
+    indexOf(text, end) != len(text) - len(end)) {
+    fail loginProofError()
+  }
+  let blocks = pemDecode(text)?
+  if (len(blocks) != 1 || blocks[0].label != "EC PRIVATE KEY") {
+    fail loginProofError()
+  }
+  let members = asn1ReadSequence(asn1Parse(blocks[0].der)?)?
+  if (len(members) < 3 || len(members) > 4) {
+    fail loginProofError()
+  }
+  return members
+}
+
+fn loginProofKey(pem: string): EcdsaPrivateKey! {
+  let members = loginProofMembers(pem)?
+  if (asn1ReadInteger(members[0])? != 1) {
+    fail loginProofError()
+  }
+  let scalar = asn1ReadOctetString(members[1])?
+  if (len(scalar) != 32) {
+    fail loginProofError()
+  }
+  let curve = asn1ReadOid(asn1ReadExplicit(members[2], 0)?)?
+  if (asn1OidString(curve) != "1.2.840.10045.3.1.7") {
+    fail loginProofError()
+  }
+  let key = ecdsaPrivateKey(nistecP256(), scalar)?
+  if (len(members) == 4) {
+    loginProofPublic(members[3], key)?
+  }
+  return key
+}
+
+fn loginProofPublic(member: LoginElement, key: EcdsaPrivateKey): ()! {
+  let bits = asn1ReadBitString(asn1ReadExplicit(member, 1)?)?
+  if (bits.unusedBits != 0) {
+    fail loginProofError()
+  }
+  let publicKey = ecdsaPublicKey(key.curve, bits.bytes)?
+  if (bigintCmp(publicKey.q.x, key.q.x) != 0 || bigintCmp(publicKey.q.y, key.q.y) != 0) {
+    fail loginProofError()
+  }
+}
+
+fn loginProofJwk(key: EcdsaPrivateKey): Json! {
+  let point = nistecPointEncode(key.curve, key.q, false)?
+  return Json.JsonObject(
+    [
+      JsonEntry{ key = "kty", value = Json.JsonString("EC") },
+      JsonEntry{ key = "crv", value = Json.JsonString("P-256") },
+      JsonEntry{ key = "x", value = Json.JsonString(encodeBase64Url(point[1:33])) },
+      JsonEntry{ key = "y", value = Json.JsonString(encodeBase64Url(point[33:65])) },
+    ],
+  )
+}
+
+fn loginProofToken(key: EcdsaPrivateKey, endpoint: string, timestamp: int): string! {
+  let header = Json.JsonObject(
+    [
+      JsonEntry{ key = "typ", value = Json.JsonString("dpop+jwt") },
+      JsonEntry{ key = "alg", value = Json.JsonString("ES256") },
+      JsonEntry{ key = "jwk", value = loginProofJwk(key)? },
+    ],
+  )
+  let claims = Json.JsonObject(
+    [
+      JsonEntry{ key = "jti", value = Json.JsonString(ssoUuidText(ssoUuid())) },
+      JsonEntry{ key = "htm", value = Json.JsonString("POST") },
+      JsonEntry{ key = "htu", value = Json.JsonString(endpoint) },
+      JsonEntry{ key = "iat", value = Json.JsonInt(i64(timestamp)) },
+    ],
+  )
+  let message = encodeBase64Url([]byte(ssoEncode(header))) +
+    "." +
+    encodeBase64Url([]byte(ssoEncode(claims)))
+  let signature = ecdsaSign(key, digest(Sha256(), []byte(message)), HashAlg.Sha256)?
+  return message + "." + encodeBase64Url(ecdsaSigToRaw(signature)?)
+}
+
+// Parser errors stay private: the input contains the cached refresh signing key.
+fn loginDpop(pem: string, endpoint: string, timestamp: int): string! {
+  if (timestamp < 0 || !loginProofEndpoint(endpoint)) {
+    fail loginProofError()
+  }
+  let key = loginProofKey(pem) catch _ {
+    fail loginProofError()
+  }
+  return loginProofToken(key, endpoint, timestamp) catch _ {
+    fail loginProofError()
+  }
+}
