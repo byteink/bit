@@ -49,5 +49,5 @@ restart. Saving the user in PostgreSQL and enqueueing in Redis are separate
 operations: an enqueue failure returns an error even though the user may already
 exist. This example does not provide a transactional outbox or exactly-once mail.
 
-Email verification and password-reset routes remain separate work under #6127;
+Email verification and password-reset routes are not implemented here;
 a welcome message does not verify the recipient's address.
