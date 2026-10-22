@@ -164,12 +164,17 @@ See the [full section](http/clients.md#posttls-url-string-body-string-config-tls
 ### `requestTls(method: string, url: string, body: string, config: TlsConfig): Response!`
 
 See the [full section](http/clients.md#requesttls-method-string-url-string-body-string-config-tlsconfig-response).
-### `getStreaming(url: string, headers: []Header, sink: BodySink, maxBodyBytes: int): Response!`
+### `getStreaming(url: string, headers: []Header, sink: BodySink, maxBodyBytes: int, timeoutMs: int = 0): Response!`
 
-See the [full section](http/clients.md#getstreaming-url-string-headers-header-sink-bodysink-maxbodybytes-int-response).
-### `requestWithStreamingBody(method: string, url: string, headers: []Header, body: StreamBody): Response!`
+See the [full section](http/clients.md#getstreaming-url-string-headers-header-sink-bodysink-maxbodybytes-int-timeoutms-int-0-response).
+### `requestWithStreamingBody(method: string, url: string, headers: []Header, body: StreamBody, timeoutMs: int = 0): Response!`
 
-See the [full section](http/clients.md#requestwithstreamingbody-method-string-url-string-headers-header-body-streambody-response).
+See the [full section](http/clients.md#requestwithstreamingbody-method-string-url-string-headers-header-body-streambody-timeoutms-int-0-response).
+Pass a positive `timeoutMs` to either streaming call to bound the connect,
+each read and each write. Zero keeps the existing unbounded behavior. A slow
+transfer can continue while it makes progress; a stalled operation fails with
+`TimeoutError`. The example below allows 5000 ms per I/O.
+
 ### Wait before uploading a draft
 
 Set `Expect: 100-continue` when you want the server to reject an upload before
@@ -199,7 +204,7 @@ fn uploadDraft(url: string): int! {
     },
   }
   let res = requestWithStreamingBody(
-    "PUT", url, [Header{ name = "Expect", value = "100-continue" }], body,
+    "PUT", url, [Header{ name = "Expect", value = "100-continue" }], body, 5000,
   )?
   return res.status
 }

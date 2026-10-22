@@ -122,6 +122,122 @@ fn streamingTlsConfig(): TlsConfig {
   return cfg
 }
 
+// Rearm each I/O, but never extend Expect's shorter, absolute wait.
+class streamDeadline {
+  inner: byteStream
+  secure: Option<TlsConn>
+  waitDeadline: int
+  armed: int
+  timeoutMs: int
+
+  arm(): ()! {
+    this.armed = streamingDeadline(this.timeoutMs)?
+    let next = this.armed
+    if (this.waitDeadline > 0 && this.waitDeadline < next) {
+      next = this.waitDeadline
+    }
+    this.inner.setIdleDeadline(next)
+  }
+
+  failure(e: error, op: string): error {
+    if (e.message() == "${op} timed out" && monotonic().ns >= this.armed) {
+      return TimeoutError{ op = op, ms = this.timeoutMs }
+    }
+    return e
+  }
+
+  readUp(n: int): string! {
+    this.arm()?
+    let piece = this.inner.readUp(n) catch e {
+      fail this.failure(e, "read")
+    }
+    // TLS exposes the actual timeout separately from its empty EOF result.
+    if (len(piece) == 0 && this.tlsExpired()) {
+      fail TimeoutError{ op = "read", ms = this.timeoutMs }
+    }
+    return piece
+  }
+
+  tlsExpired(): bool {
+    match (this.secure) {
+      Some(conn) => { return conn.readTimedOut() && monotonic().ns >= this.armed }
+      None => { return false }
+    }
+  }
+
+  writeStr(data: string): ()! {
+    this.arm()?
+    this.inner.writeStr(data) catch e {
+      fail this.failure(e, "write")
+    }
+  }
+
+  writeBytes(data: []byte): ()! {
+    this.arm()?
+    this.inner.writeBytes(data) catch e {
+      fail this.failure(e, "write")
+    }
+  }
+
+  shut() { this.inner.shut() }
+  forceClose() { this.inner.forceClose() }
+  peer(): string { return this.inner.peer() }
+  unread(extra: string) { this.inner.unread(extra) }
+
+  // The next I/O applies this bound; clearing it restores the idle budget.
+  setIdleDeadline(deadlineNs: int) { this.waitDeadline = deadlineNs }
+}
+
+fn streamingDeadline(timeoutMs: int): int! {
+  let now = monotonic().ns
+  if (timeoutMs < 0 || timeoutMs > (9223372036854775807 - now) / Millisecond) {
+    fail newError("streaming timeoutMs is out of range")
+  }
+  if (timeoutMs == 0) {
+    return 0
+  }
+  return now + timeoutMs * Millisecond
+}
+
+fn streamingTransport(u: Url, deadline: int, timeoutMs: int): byteStream! {
+  if (u.https) {
+    let conn = dialTlsConn(u, streamingTlsConfig(), deadline)?
+    let inner = tlsStream{ conn = conn }
+    if (deadline == 0) {
+      return inner
+    }
+    return streamDeadline{ inner = inner, secure = Option.Some(conn), timeoutMs = timeoutMs }
+  }
+  let inner = netStream{ conn = dialConn(u, deadline)? }
+  if (deadline == 0) {
+    return inner
+  }
+  return streamDeadline{ inner = inner, timeoutMs = timeoutMs }
+}
+
+fn streamingConnectTimedOut(e: error): bool {
+  let msg = e.message()
+  if (msg == "read timed out" || msg == "write timed out") {
+    return true
+  }
+  // TLS resolves a DNS name before dialing, so the sentinel names its IP.
+  return hasPrefix(msg, "dial ") && len(msg) >= 10 && msg[len(msg) - 10:len(msg)] == " timed out"
+}
+
+fn dialStreaming(u: Url, timeoutMs: int): byteStream! {
+  let deadline = streamingDeadline(timeoutMs)?
+  if (deadline == 0) {
+    return streamingTransport(u, 0, 0)?
+  }
+  let stream = streamingTransport(u, deadline, timeoutMs) catch e {
+    if (streamingConnectTimedOut(e) && monotonic().ns >= deadline) {
+      fail TimeoutError{ op = "connect", ms = timeoutMs }
+    }
+    fail e
+  }
+  return stream
+}
+
 // Pulls trailer fields once the request body is complete (RFC 9112 section
 // 7.1.2): called by `requestWithStreamingBody` exactly once, after `source` has
 // returned "", so a value computed over the streamed bytes (a checksum, a
@@ -422,12 +538,14 @@ fn exchangeStreaming(s: byteStream, method: string, head: string, body: StreamBo
 // and then `body.trailers` (announce them with a `Trailer` header in
 // `headers`, RFC 9110 section 6.5.2). http:// and https:// are both
 // supported, same as `requestWith`; `https+h3://` is not (see the file
-// header).
+// header). `timeoutMs` bounds connect (including TLS), each read and each
+// write; 0 keeps the existing unbounded behavior. Timeouts are `TimeoutError`.
 export fn requestWithStreamingBody(
   method: string,
   url: string,
   headers: []Header,
   body: StreamBody,
+  timeoutMs: int = 0,
 ): Response! {
   let framing = framingLine(body)?
   let block = serializeHeaders(headers)?
@@ -436,12 +554,7 @@ export fn requestWithStreamingBody(
     fail newError("requestWithStreamingBody: https+h3:// is not supported")
   }
   let head = buildStreamingRequestHead(method, u, block, framing)
-  if (u.https) {
-    let s = tlsStream{ conn = tlsDial(u.host, u.port, streamingTlsConfig())? }
-    defer s.shut()
-    return exchangeStreaming(s, method, head, body)?
-  }
-  let s = netStream{ conn = dial(u.host, u.port)? }
+  let s = dialStreaming(u, timeoutMs)?
   defer s.shut()
   return exchangeStreaming(s, method, head, body)?
 }
@@ -579,12 +692,14 @@ fn readResponseStreaming(
 // whole-body-in-memory case) would refuse it before a single chunk reached
 // `sink` (#6078/#6104: caught live against a 220 MiB object, not found by
 // any unit test — nothing before this exercised a Content-Length anywhere
-// near that boundary).
+// near that boundary). `timeoutMs` bounds connect (including TLS), each read
+// and each write, with 0 preserving unbounded I/O. Progress rearms the budget.
 export fn getStreaming(
   url: string,
   headers: []Header,
   sink: BodySink,
   maxBodyBytes: int,
+  timeoutMs: int = 0,
 ): Response! {
   let block = serializeHeaders(headers)?
   let u = parseUrl(url)?
@@ -592,13 +707,7 @@ export fn getStreaming(
     fail newError("getStreaming: https+h3:// is not supported")
   }
   let req = buildRequest("GET", u, block, noBody, true)
-  if (u.https) {
-    let s = tlsStream{ conn = tlsDial(u.host, u.port, streamingTlsConfig())? }
-    defer s.shut()
-    s.writeStr(req)?
-    return readResponseStreaming(s, "GET", maxBodyBytes, sink)?
-  }
-  let s = netStream{ conn = dial(u.host, u.port)? }
+  let s = dialStreaming(u, timeoutMs)?
   defer s.shut()
   s.writeStr(req)?
   return readResponseStreaming(s, "GET", maxBodyBytes, sink)?

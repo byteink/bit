@@ -57,16 +57,26 @@ As `post`, with an explicit TLS configuration.
 As `request`, with an explicit TLS configuration. Fails if `url` is not
 `https`.
 
-### `getStreaming(url: string, headers: []Header, sink: BodySink, maxBodyBytes: int): Response!`
+### `getStreaming(url: string, headers: []Header, sink: BodySink, maxBodyBytes: int, timeoutMs: int = 0): Response!`
 
 Fetches `url`, delivering the response body to `sink` in bounded chunks
 instead of returning it whole. `Response.body` is always `""`.
 
-### `requestWithStreamingBody(method: string, url: string, headers: []Header, body: StreamBody): Response!`
+Pass `timeoutMs` to bound the connect (including the TLS handshake), each
+read and each write. Each new I/O gets a fresh budget, so a transfer that
+keeps progressing may last longer than `timeoutMs` overall. Zero preserves
+unbounded I/O; negative or overflowing values fail before dialing. A deadline
+fails with `TimeoutError`, whose `op` is `"connect"`, `"read"` or `"write"`.
+A genuine peer close or other network or TLS failure keeps its original error.
+
+### `requestWithStreamingBody(method: string, url: string, headers: []Header, body: StreamBody, timeoutMs: int = 0): Response!`
 
 Sends a request body pulled from `body.source` one chunk at a time and
 returns the response: `Content-Length` framing when `body.length` is set,
 `Transfer-Encoding: chunked` with the optional `body.trailers` when it is not.
+`timeoutMs` has the same per-I/O contract as `getStreaming` above. The shorter
+of its read budget and `expectContinueTimeoutMs` bounds an Expect wait.
+An Expect fallback restores bounded I/O rather than clearing the timeout.
 
 ### `StreamBody`
 

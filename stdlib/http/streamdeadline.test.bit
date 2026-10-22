@@ -1,0 +1,419 @@
+// #6612: one idle budget per connect/read/write, not a total transfer limit.
+class streamingDeadlineProbe {
+  deadline: int
+  readUp(n: int): string! { return "" }
+  writeStr(data: string): ()! {}
+  writeBytes(data: []byte): ()! {}
+  shut() {}
+  forceClose() {}
+  peer(): string { return "" }
+  unread(extra: string) {}
+  setIdleDeadline(deadlineNs: int) { this.deadline = deadlineNs }
+}
+
+fn assertStreamingTimeout(e: error, op: string, start: int, timeoutMs: int) {
+  let (timeout, ok) = e.(TimeoutError)
+  assert(ok, "expected TimeoutError, got '${e.message()}'")
+  assert(timeout.op == op && timeout.ms == timeoutMs, "wrong timeout phase or budget")
+  let elapsed = monotonic().ns - start
+  assert(elapsed >= timeoutMs * Millisecond, "timeout fired early")
+  assert(elapsed <= timeoutMs * Millisecond * 11 / 10, "timeout exceeded its 10% margin")
+}
+
+test "stream deadline restores idle budget after a shorter Expect wait" {
+  let probe = streamingDeadlineProbe{}
+  let bounded = streamDeadline{ inner = probe, timeoutMs = 500 }
+  let wait = monotonic().ns + 100 * Millisecond
+  bounded.setIdleDeadline(wait)
+  bounded.arm() catch e {
+    assert(false, e.message())
+  }
+  assert(probe.deadline == wait, "Expect wait was extended")
+  bounded.setIdleDeadline(0)
+  bounded.arm() catch e {
+    assert(false, e.message())
+  }
+  assert(probe.deadline > wait, "clearing Expect did not restore idle budget")
+  assert(probe.deadline == bounded.armed, "clearing Expect left unbounded I/O")
+}
+
+test "stream deadline preserves ordinary EOF and non-timeout failures" {
+  let probe = streamingDeadlineProbe{}
+  let bounded = streamDeadline{ inner = probe, timeoutMs = 500 }
+  let piece = bounded.readUp(1) catch e {
+    assert(false, e.message())
+    return
+  }
+  assert(piece == "", "ordinary EOF changed")
+  bounded.armed = 1
+  let other = bounded.failure(newError("read failed"), "read")
+  let (_, timedOut) = other.(TimeoutError)
+  assert(!timedOut && other.message() == "read failed", "network failure became a timeout")
+  let expired = bounded.failure(newError("read timed out"), "read")
+  let (timeout, ok) = expired.(TimeoutError)
+  assert(ok && timeout.op == "read", "deadline sentinel lost its type")
+}
+
+test "stream deadline rejects negative and overflowing budgets before dialing" {
+  for ms of [0 - 1, 9223372036854775807] {
+    streamingDeadline(ms) catch e {
+      assert(e.message() == "streaming timeoutMs is out of range", e.message())
+      continue
+    }
+    assert(false, "invalid timeout accepted")
+  }
+}
+
+fn waitStreamingRelease(release: chan<int>): string {
+  select {
+    case _ = <- release:
+      return ""
+    case _ = <- after(3 * Second):
+      return "streaming fixture release timed out"
+  }
+}
+
+fn joinStreamingDeadline(done: chan<string>): string {
+  select {
+    case err = <- done:
+      return err
+    case _ = <- after(4 * Second):
+      return "streaming fixture join timed out"
+  }
+}
+
+// The socket stays open until the client finishes; no sleep can fake a timeout.
+fn stalledStreamingOrigin(l: Listener, mode: int, release: chan<int>, done: chan<string>) {
+  let c = l.accept() catch e {
+    done <- e.message()
+    return
+  }
+  defer c.close()
+  if (mode == 0) {
+    done <- waitStreamingRelease(release)
+    return
+  }
+  let s = netStream{ conn = c }
+  s.setIdleDeadline(monotonic().ns + 3 * Second)
+  readHeadBlock(s) catch e {
+    done <- e.message()
+    return
+  }
+  if (mode == 1) {
+    s.writeStr("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n") catch e {
+      done <- e.message()
+      return
+    }
+  }
+  done <- waitStreamingRelease(release)
+}
+
+fn streamingDeadlineCall(url: string, upload: bool, timeoutMs: int): Response! {
+  if (!upload) {
+    let sink: BodySink = (part) => {}
+    return getStreaming(url, []Header(0), sink, 1024, timeoutMs)?
+  }
+  let body = StreamBody{ length = Option.Some(0), source = sourceOver("") }
+  return requestWithStreamingBody("PUT", url, []Header(0), body, timeoutMs)?
+}
+
+fn stalledStreamingRead(upload: bool): ()! {
+  let l = listen("127.0.0.1", 0)?
+  defer l.close()
+  let port = l.port()?
+  let release = chan<int>(1)
+  let done = chan<string>(1)
+  spawn stalledStreamingOrigin(l, 1, release, done)
+  let start = monotonic().ns
+  streamingDeadlineCall("http://127.0.0.1:${port}/stall", upload, 500) catch e {
+    release <- 1
+    let serverError = joinStreamingDeadline(done)
+    assert(serverError == "", serverError)
+    assertStreamingTimeout(e, "read", start, 500)
+    return
+  }
+  release <- 1
+  assert(joinStreamingDeadline(done) == "", "streaming server join failed")
+  assert(false, "stalled response completed")
+}
+
+test "both streaming entry points bound a stalled response read" {
+  for upload of [false, true] {
+    stalledStreamingRead(upload) catch e {
+      assert(false, e.message())
+    }
+  }
+}
+
+fn stalledStreamingWrite(chunked: bool): ()! {
+  let l = listen("127.0.0.1", 0)?
+  defer l.close()
+  let port = l.port()?
+  let release = chan<int>(1)
+  let done = chan<string>(1)
+  spawn stalledStreamingOrigin(l, 2, release, done)
+  let left = 256 * 1024 * 1024
+  let lastPull = 0
+  let source: BodySource = (n) => {
+    let take = n
+    if (take > left) {
+      take = left
+    }
+    left = left - take
+    lastPull = monotonic().ns
+    return repeat("x", take)
+  }
+  let body = StreamBody{ source = source }
+  if (!chunked) {
+    body.length = Option.Some(left)
+  }
+  let start = monotonic().ns
+  requestWithStreamingBody("PUT", "http://127.0.0.1:${port}/stall", []Header(0), body, 500) catch e {
+    release <- 1
+    let serverError = joinStreamingDeadline(done)
+    assert(serverError == "", serverError)
+    // Rearming after successful writes gives the final blocked write its own budget.
+    assertStreamingTimeout(e, "write", lastPull, 500)
+    assert(left > 0, "fixture did not fill the send buffer")
+    assert(monotonic().ns - start < 3 * Second, "write timeout hung")
+    return
+  }
+  release <- 1
+  assert(joinStreamingDeadline(done) == "", "streaming server join failed")
+  assert(false, "full send buffer completed without a timeout")
+}
+
+test "declared and chunked uploads bound writes to a full send buffer" {
+  for chunked of [false, true] {
+    stalledStreamingWrite(chunked) catch e {
+      assert(false, e.message())
+    }
+  }
+}
+
+class streamingBacklog {
+  held: []Conn
+  close() {
+    for c of this.held {
+      c.close()
+    }
+  }
+}
+
+// Fail setup rather than claiming a connect test when the queue never filled.
+fn fillStreamingBacklog(port: int, backlog: streamingBacklog): ()! {
+  let count = 0
+  while (count < 1024) {
+    let c = dialDeadline("127.0.0.1", port, monotonic().ns + 50 * Millisecond) catch e {
+      if (e.message() == "dial 127.0.0.1:${port} timed out") {
+        return
+      }
+      fail e
+    }
+    backlog.held = append(backlog.held, c)
+    count = count + 1
+  }
+  fail newError("connect fixture could not saturate the listener backlog")
+}
+
+fn stalledStreamingConnect(upload: bool): ()! {
+  let l = listen("127.0.0.1", 0)?
+  defer l.close()
+  let port = l.port()?
+  let backlog = streamingBacklog{ held = []Conn(0, 1024) }
+  defer backlog.close()
+  fillStreamingBacklog(port, backlog)?
+  let start = monotonic().ns
+  streamingDeadlineCall("http://127.0.0.1:${port}/stall", upload, 500) catch e {
+    assertStreamingTimeout(e, "connect", start, 500)
+    return
+  }
+  assert(false, "full listener backlog accepted another connection")
+}
+
+test "both streaming entry points bound connect to a full listener backlog" {
+  for upload of [false, true] {
+    stalledStreamingConnect(upload) catch e {
+      assert(false, e.message())
+    }
+  }
+}
+
+fn stalledStreamingHandshake(upload: bool): ()! {
+  let l = listen("127.0.0.1", 0)?
+  defer l.close()
+  let port = l.port()?
+  let release = chan<int>(1)
+  let done = chan<string>(1)
+  spawn stalledStreamingOrigin(l, 0, release, done)
+  let start = monotonic().ns
+  streamingDeadlineCall("https://127.0.0.1:${port}/stall", upload, 500) catch e {
+    release <- 1
+    let serverError = joinStreamingDeadline(done)
+    assert(serverError == "", serverError)
+    assertStreamingTimeout(e, "connect", start, 500)
+    return
+  }
+  release <- 1
+  assert(joinStreamingDeadline(done) == "", "streaming server join failed")
+  assert(false, "stalled TLS handshake completed")
+}
+
+test "both streaming entry points include TLS handshake in connect budget" {
+  for upload of [false, true] {
+    stalledStreamingHandshake(upload) catch e {
+      assert(false, e.message())
+    }
+  }
+}
+
+fn progressingStreamingOrigin(l: Listener, done: chan<string>) {
+  let c = l.accept() catch e {
+    done <- e.message()
+    return
+  }
+  defer c.close()
+  let s = netStream{ conn = c }
+  s.setIdleDeadline(monotonic().ns + 3 * Second)
+  readHeadBlock(s) catch e {
+    done <- e.message()
+    return
+  }
+  s.writeStr("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n") catch e {
+    done <- e.message()
+    return
+  }
+  for part of ["a", "b", "c"] {
+    sleep(60 * Millisecond)
+    s.writeStr(part) catch e {
+      done <- e.message()
+      return
+    }
+  }
+  done <- ""
+}
+
+test "progress rearms streaming reads beyond one idle budget in total" {
+  let l = listen("127.0.0.1", 0) catch e {
+    assert(false, e.message())
+    return
+  }
+  defer l.close()
+  let port = l.port() catch e {
+    assert(false, e.message())
+    return
+  }
+  let done = chan<string>(1)
+  spawn progressingStreamingOrigin(l, done)
+  let received = ""
+  let sink: BodySink = (part) => {
+    received = received + part
+  }
+  let start = monotonic().ns
+  let res = getStreaming("http://127.0.0.1:${port}/slow", []Header(0), sink, 3, 100) catch e {
+    let serverError = joinStreamingDeadline(done)
+    assert(false, "${e.message()}; server: ${serverError}")
+    return
+  }
+  let serverError = joinStreamingDeadline(done)
+  assert(serverError == "", serverError)
+  assert(res.status == 200 && received == "abc", "progressing response lost bytes")
+  assert(monotonic().ns - start > 100 * Millisecond, "fixture did not outlast one budget")
+}
+
+fn joinStreamingContinue(done: chan<continueReport>): continueReport {
+  select {
+    case report = <- done:
+      return report
+    case _ = <- after(4 * Second):
+      return continueReport{ err = "streaming Expect fixture join timed out" }
+  }
+}
+
+fn boundedStreamingContinue(mode: int): ()! {
+  let l = listen("127.0.0.1", 0)?
+  defer l.close()
+  let port = l.port()?
+  let done = chan<continueReport>(1)
+  spawn continuePlain(l, mode, done)
+  let pulls = 0
+  let body = StreamBody{
+    length = Option.Some(5), expectContinueTimeoutMs = 100,
+    source = (n) => {
+      pulls = pulls + 1
+      return "abcde"
+    },
+  }
+  let headers = [Header{ name = "Expect", value = "100-continue" }]
+  let res = requestWithStreamingBody("PUT", "http://127.0.0.1:${port}/continue", headers, body, 500) catch e {
+    let server = joinStreamingContinue(done)
+    assert(server.err == "", server.err)
+    fail e
+  }
+  let server = joinStreamingContinue(done)
+  assert(server.err == "", server.err)
+  if (mode == 403) {
+    assert(res.status == 403 && pulls == 0 && server.bytes == "", "early final uploaded a body")
+    return
+  }
+  assert(res.status == 200 && res.body == "ok", "final response lost")
+  assert(pulls == 1 && server.bytes == "abcde", "upload body changed")
+}
+
+test "bounded uploads retain Expect 403, 100 and silence fallback" {
+  for mode of [403, 100, 0] {
+    boundedStreamingContinue(mode) catch e {
+      assert(false, e.message())
+    }
+  }
+}
+
+fn deadlineTlsOrigin(l: TlsListener, stall: bool, release: chan<int>, done: chan<string>) {
+  let conn = l.accept() catch e {
+    done <- e.message()
+    return
+  }
+  defer conn.close()
+  conn.setDeadline(monotonic().ns + 3 * Second)
+  conn.handshake() catch e {
+    done <- e.message()
+    return
+  }
+  if (stall) {
+    done <- waitStreamingRelease(release)
+    return
+  }
+  done <- ""
+}
+
+fn streamingTlsRead(stall: bool): ()! {
+  let listener = tlsListen("127.0.0.1", 0, tls5916ServerConfig()?)?
+  defer listener.close()
+  let release = chan<int>(1)
+  let done = chan<string>(1)
+  spawn deadlineTlsOrigin(listener, stall, release, done)
+  let conn = tlsDial("127.0.0.1", listener.port()?, tls5916ClientConfig())?
+  defer conn.close()
+  let bounded = streamDeadline{
+    inner = tlsStream{ conn = conn }, secure = Option.Some(conn), timeoutMs = 500,
+  }
+  let start = monotonic().ns
+  let data = bounded.readUp(1) catch e {
+    release <- 1
+    assert(joinStreamingDeadline(done) == "", "TLS server failed")
+    assert(stall, "ordinary TLS EOF became an error")
+    assertStreamingTimeout(e, "read", start, 500)
+    return
+  }
+  release <- 1
+  assert(joinStreamingDeadline(done) == "", "TLS server failed")
+  assert(!stall && data == "", "stalled TLS read looked like ordinary EOF")
+}
+
+test "streaming TLS read distinguishes actual timeout from genuine EOF" {
+  for stall of [false, true] {
+    streamingTlsRead(stall) catch e {
+      assert(false, e.message())
+    }
+  }
+}
