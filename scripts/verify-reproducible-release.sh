@@ -3,10 +3,11 @@
 # culture (scripts/selfhost-fixpoint.sh) to the artifacts dist/release.sh
 # actually ships.
 #
-# Rebuilds all 3 shipping targets (x86_64-linux, aarch64-linux, aarch64-macos)
+# Rebuilds the tag's shipping targets (x86_64-linux, aarch64-linux,
+# aarch64-macos, plus x86_64-windows for tags whose producer includes it)
 # from a tag's source in a throwaway git worktree, repackages with
-# dist/package.sh, and diffs the EXTRACTED tarball contents + per-file sha256
-# against the published release. Compressed .tar.xz bytes are deliberately not
+# dist/package.sh, and diffs the EXTRACTED archive contents + per-file sha256
+# against the published release. Compressed archive bytes are deliberately not
 # compared: xz version/thread-count changes the container's metadata without
 # changing what unpacks (dist/package.sh already fixes uid/gid/mtime/member
 # order so the container is close, but xz itself is out of this repo's
@@ -59,11 +60,11 @@
 #   scripts/verify-reproducible-release.sh <tag> [published_dir]
 #
 # <tag> is a published `v*` tag, already fetched (`git fetch --tags`).
-# Without [published_dir], the published SHA256SUMS + tarballs are pulled via
+# Without [published_dir], the published SHA256SUMS + archives are pulled via
 # `gh release download`. Pass [published_dir] to compare against artifacts
 # already on disk instead (e.g. a local test tag with no real GitHub release) —
 # same shape `gh release download` produces: SHA256SUMS plus one
-# bit-<version>-<os>-<arch>.tar.xz per target, all in one directory.
+# bit-<version>-<os>-<arch>.tar.xz per Unix target and the Windows .zip.
 #
 # A clean git worktree isolates the rebuild from the caller's working tree, so
 # this is safe to run against an in-progress checkout. Any content difference
@@ -126,7 +127,7 @@ if [ -z "${PUBLISHED_DIR}" ]; then
   }
   PUBLISHED_DIR="${WORK}/published"
   mkdir -p "${PUBLISHED_DIR}"
-  gh release download "${TAG}" --dir "${PUBLISHED_DIR}" --pattern '*.tar.xz' --pattern 'SHA256SUMS'
+  gh release download "${TAG}" --dir "${PUBLISHED_DIR}" --pattern '*.tar.xz' --pattern '*.zip' --pattern 'SHA256SUMS'
 fi
 [ -f "${PUBLISHED_DIR}/SHA256SUMS" ] || {
   echo "verify-reproducible-release.sh: no SHA256SUMS in ${PUBLISHED_DIR}" >&2
@@ -389,8 +390,24 @@ esac
   exit 1
 }
 
+extractArtifact() {
+  case "$1" in
+    *.zip) python3 -m zipfile -e "$1" "$2" ;;
+    *) tar -C "$2" -xf "$1" ;;
+  esac
+}
+
 LIB1="${WORK}/lib1"
-for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
+# The producer defines the expected set; published files cannot hide a missing SDK.
+TARGETS_DECLARATION="$(sed -n '/^[[:space:]]*#/d; /TARGETS\(\[[^]]*\]\)\{0,1\}[+]\{0,1\}=/p' "${WORK}/src/dist/release.sh")"
+case "${TARGETS_DECLARATION}" in
+  'TARGETS=(x86_64-linux aarch64-linux aarch64-macos)'|'TARGETS=(x86_64-linux aarch64-linux aarch64-macos x86_64-windows)') ;;
+  *) echo "verify-reproducible-release.sh: unsupported target declaration in tag's dist/release.sh" >&2; exit 2 ;;
+esac
+TARGETS_TEXT="${TARGETS_DECLARATION#TARGETS=(}"
+TARGETS_TEXT="${TARGETS_TEXT%)}"
+read -r -a TARGETS <<< "${TARGETS_TEXT}"
+for TARGET in "${TARGETS[@]}"; do
   echo "L1: building runtime archive for ${TARGET} with bit1..."
   mkdir -p "${LIB1}/${TARGET}"
   BIT="${BIT1}" BIT_STDLIB="${STDLIB1}" bash "${WORK}/src/scripts/g2archive.sh" "${TARGET}" "${LIB1}/${TARGET}/libbitrt.a" ||
@@ -398,29 +415,32 @@ for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
 done
 
 FAIL=0
-for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
+for TARGET in "${TARGETS[@]}"; do
+  EXT=tar.xz
+  BIN_NAME=bit
   case "${TARGET}" in
     x86_64-linux)  OS=linux;  ARCH=x86_64 ;;
     aarch64-linux) OS=linux;  ARCH=aarch64 ;;
     aarch64-macos) OS=macos;  ARCH=aarch64 ;;
+    x86_64-windows) OS=windows; ARCH=x86_64; EXT=zip; BIN_NAME=bit.exe ;;
   esac
   NAME="bit-${VERSION}-${OS}-${ARCH}"
-  published_tar="${PUBLISHED_DIR}/${NAME}.tar.xz"
+  published_artifact="${PUBLISHED_DIR}/${NAME}.${EXT}"
 
-  if [ ! -f "${published_tar}" ]; then
-    echo "verify-reproducible-release.sh: ${TARGET}: missing published ${NAME}.tar.xz" >&2
+  if [ ! -f "${published_artifact}" ]; then
+    echo "verify-reproducible-release.sh: ${TARGET}: missing published ${NAME}.${EXT}" >&2
     FAIL=1
     continue
   fi
-  expected_sum="$(grep " ${NAME}.tar.xz\$" "${PUBLISHED_DIR}/SHA256SUMS" | awk '{print $1}')"
+  expected_sum="$(awk -v name="${NAME}.${EXT}" '$2 == name { print $1 }' "${PUBLISHED_DIR}/SHA256SUMS")"
   [ -n "${expected_sum}" ] || {
-    echo "verify-reproducible-release.sh: ${TARGET}: ${NAME}.tar.xz not listed in SHA256SUMS" >&2
+    echo "verify-reproducible-release.sh: ${TARGET}: ${NAME}.${EXT} not listed in SHA256SUMS" >&2
     FAIL=1
     continue
   }
-  actual_sum="$(shasum -a 256 "${published_tar}" | awk '{print $1}')"
+  actual_sum="$(shasum -a 256 "${published_artifact}" | awk '{print $1}')"
   if [ "${expected_sum}" != "${actual_sum}" ]; then
-    echo "verify-reproducible-release.sh: ${TARGET}: ${NAME}.tar.xz FAILS its own SHA256SUMS check (expected ${expected_sum}, got ${actual_sum}) — corrupt or tampered download, refusing to diff it" >&2
+    echo "verify-reproducible-release.sh: ${TARGET}: ${NAME}.${EXT} FAILS its own SHA256SUMS check (expected ${expected_sum}, got ${actual_sum}) — corrupt or tampered download, refusing to diff it" >&2
     FAIL=1
     continue
   fi
@@ -450,19 +470,19 @@ for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
   echo "C2: rebuilding ${TARGET} with bit1..."
   mkdir -p "${WORK}/build-${TARGET}/stage/bin"
   BIT_LIBBITRT="${archive}" BIT_STDLIB="${STDLIB1}" "${BIT1}" build "${STAGE_SRC}" --target "${TARGET}" \
-    -o "${WORK}/build-${TARGET}/stage/bin/bit"
-  chmod +x "${WORK}/build-${TARGET}/stage/bin/bit"
+    -o "${WORK}/build-${TARGET}/stage/bin/${BIN_NAME}"
+  chmod +x "${WORK}/build-${TARGET}/stage/bin/${BIN_NAME}"
   # [archivedir] passed EXPLICITLY as ${LIB1}, not left to package.sh's
   # default `bit-out/lib` — that default resolves (relative to package.sh's
   # own location inside ${WORK}/src) to the L0, stage0-built archive this
   # script deliberately never packages. Passing nothing here would silently
   # ship the wrong runtime family and compare against it.
   ( cd "${WORK}/src" && bash dist/package.sh "${VERSION}" "${TARGET}" "${WORK}/build-${TARGET}" "${LIB1}" ) >/dev/null
-  rebuilt_tar="${WORK}/build-${TARGET}/${NAME}.tar.xz"
+  rebuilt_artifact="${WORK}/build-${TARGET}/${NAME}.${EXT}"
 
   mkdir -p "${WORK}/extract-${TARGET}/published" "${WORK}/extract-${TARGET}/rebuilt"
-  tar -C "${WORK}/extract-${TARGET}/published" -xf "${published_tar}"
-  tar -C "${WORK}/extract-${TARGET}/rebuilt" -xf "${rebuilt_tar}"
+  extractArtifact "${published_artifact}" "${WORK}/extract-${TARGET}/published"
+  extractArtifact "${rebuilt_artifact}" "${WORK}/extract-${TARGET}/rebuilt"
 
   tree_diff="$(diff <(cd "${WORK}/extract-${TARGET}/published" && find . | sort) \
                      <(cd "${WORK}/extract-${TARGET}/rebuilt" && find . | sort) || true)"
@@ -481,11 +501,11 @@ for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
     FAIL=1
     continue
   fi
-  echo "${TARGET}: OK — bit-identical to published ${NAME}.tar.xz"
+  echo "${TARGET}: OK — bit-identical to published ${NAME}.${EXT}"
 done
 
 [ "${FAIL}" -eq 0 ] || {
   echo "verify-reproducible-release.sh: FAILED — see differing file(s) above" >&2
   exit 1
 }
-echo "all 3 shipping artifacts rebuild bit-identical to ${TAG}"
+echo "all ${#TARGETS[@]} shipping artifacts rebuild bit-identical to ${TAG}"
