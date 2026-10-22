@@ -1,0 +1,294 @@
+class RfStore {
+  hashes: []string,
+  stale: []string,
+  useStale: bool,
+  loads: int,
+  saves: int,
+  commits: int,
+  loadDown: bool,
+  saveDown: bool,
+  failAfterSave: bool,
+  breakAfterSave: bool,
+  counters: FakeStore,
+}
+
+fn rfStore(counters: FakeStore): RfStore {
+  return RfStore{
+    hashes = recoveryFakeEntries(2),
+    stale = recoveryFakeEntries(2),
+    counters = counters,
+  }
+}
+
+fn rfSame(a: []string, b: []string): bool {
+  if (len(a) != len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn rfLoad(store: RfStore): (string) => []string! {
+  let load: (string) => []string! = (id) => {
+    store.loads = store.loads + 1
+    if (store.loadDown) {
+      fail newError("recovery load down")
+    }
+    if (store.useStale) {
+      return store.stale
+    }
+    return store.hashes
+  }
+  return load
+}
+
+fn rfSave(store: RfStore): (string, []string, []string) => bool! {
+  let save: (string, []string, []string) => bool! = (id, expected, remaining) => {
+    store.saves = store.saves + 1
+    if (store.saveDown) {
+      fail newError("recovery save down")
+    }
+    if (!rfSame(store.hashes, expected)) {
+      return false
+    }
+    store.hashes = remaining
+    store.commits = store.commits + 1
+    if (store.failAfterSave) {
+      fail newError("recovery commit acknowledgement lost")
+    }
+    if (store.breakAfterSave) {
+      store.counters.broken = true
+    }
+    return true
+  }
+  return save
+}
+
+fn rfFactor(store: RfStore, throttle: LoginThrottle): RecoveryFactor {
+  return RecoveryFactor(rfLoad(store), rfSave(store), throttle) catch e {
+    panic(e.message())
+  }
+}
+
+fn rfAttempt(
+  factor: RecoveryFactor,
+  verify: Verify,
+  id: string,
+  input: string,
+  ip: string = mfIp,
+): Response {
+  let app = App(Config{ secret = "test-secret" })
+  app.post("/attempt", (c) => {
+    let hit = factor.verifyWith(c, id, input, verify)?
+    return c.text("${hit}")
+  })
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  return app.handle(Request{ method = "POST", path = "/attempt", peer = ip })
+}
+
+test "RecoveryFactor: first use consumes and second use fails" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  let factor = rfFactor(store, defaultThrottle(clock))
+  let box = VerifyCounter{}
+  let verify = matchingVerify(box, "secret")
+  assert(factor.name() == "recovery", "factor name")
+  assert(rfAttempt(factor, verify, "u1", "aaa1-secret").body == "true", "first use")
+  assert(rfAttempt(factor, verify, "u1", "aaa1-secret").body == "false", "second use")
+  assert(store.commits == 1 && store.saves == 1, "one commit")
+  assert(box.calls == 2, "one verifier call per attempt, including used code")
+}
+
+test "RecoveryFactor: two stale snapshots have one CAS winner" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  store.useStale = true
+  let seen = Seen{ kinds = []string{}, accounts = []string{} }
+  let throttle = throttleOn(store.counters, clock, ThrottleOptions{ onEvent = recorder(seen) })
+  let first = rfFactor(store, throttle)
+  let second = rfFactor(store, throttle)
+  let box = VerifyCounter{}
+  let verify = matchingVerify(box, "secret")
+  assert(rfAttempt(first, verify, "u1", "aaa1-secret").body == "true", "first snapshot")
+  assert(rfAttempt(second, verify, "u1", "aaa1-secret").body == "false", "stale CAS must lose")
+  assert(store.saves == 2 && store.commits == 1, "exactly one persistent update")
+  assert(len(seen.kinds) == 2, "one record per attempt")
+  assert(seen.kinds[0] == "Cleared" && seen.kinds[1] == "Failed", "success only after CAS")
+}
+
+test "RecoveryFactor: throttle refuses before load or hash" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  let throttle = throttleOn(store.counters, clock, ThrottleOptions{})
+  fail1(throttle, "recovery:u1", mfIp)
+  let factor = rfFactor(store, throttle)
+  let box = VerifyCounter{}
+  let res = rfAttempt(factor, matchingVerify(box, "secret"), "u1", "aaa1-secret")
+  assert(res.status == 429, "locked before recovery")
+  assert(store.loads == 0 && store.saves == 0 && box.calls == 0, "no load, hash or save")
+  assert(waitFor(throttle, "u1", mfIp) == 0, "recovery namespace must not lock password")
+}
+
+test "RecoveryFactor: load failure never verifies or saves" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  store.loadDown = true
+  let box = VerifyCounter{}
+  let res = rfAttempt(
+    rfFactor(store, defaultThrottle(clock)),
+    matchingVerify(box, "secret"),
+    "u1",
+    "aaa1-secret",
+  )
+  assert(res.status == 500, "load error fails closed")
+  assert(box.calls == 0 && store.saves == 0, "load before hash")
+}
+
+test "RecoveryFactor: save failure never authenticates or clears counters" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  store.saveDown = true
+  let seen = Seen{ kinds = []string{}, accounts = []string{} }
+  let t = throttleOn(store.counters, clock, ThrottleOptions{ onEvent = recorder(seen) })
+  let res = rfAttempt(
+    rfFactor(store, t),
+    matchingVerify(VerifyCounter{}, "secret"),
+    "u1",
+    "aaa1-secret",
+  )
+  assert(res.status == 500 && store.commits == 0, "failed save")
+  assert(len(seen.kinds) == 0, "no success before persistent commit")
+}
+
+test "RecoveryFactor: invalid and oversized input count once without a save" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  let seen = Seen{ kinds = []string{}, accounts = []string{} }
+  let t = throttleOn(store.counters, clock, ThrottleOptions{ onEvent = recorder(seen) })
+  let factor = rfFactor(store, t)
+  let inputs = []string{ "aaa1-wrong", "zzzz-secret", "", "-", repeat("a", recoveryMaxInput + 1) }
+  let box = VerifyCounter{}
+  for input of inputs {
+    let res = rfAttempt(factor, matchingVerify(box, "secret"), "u1", input)
+    assert(res.status == 200 && res.body == "false", "invalid code")
+    clock.t = clock.t + 1000
+  }
+  assert(store.saves == 0 && box.calls == len(inputs), "one bounded verifier run per miss")
+  assert(len(seen.kinds) == len(inputs), "no double throttle recording")
+}
+
+test "RecoveryFactor: oversized stored snapshot refuses before verification" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  store.hashes = recoveryFakeEntries(recoveryMaxCount + 1)
+  let box = VerifyCounter{}
+  let res = rfAttempt(
+    rfFactor(store, defaultThrottle(clock)),
+    matchingVerify(box, "secret"),
+    "u1",
+    "aaa1-secret",
+  )
+  assert(res.status == 500 && box.calls == 0 && store.saves == 0, "stored bound")
+}
+
+test "RecoveryFactor: missing callbacks refuse construction" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  let rejected = 0
+  RecoveryFactor(nil, rfSave(store), defaultThrottle(clock)) catch _ {
+    rejected = rejected + 1
+  }
+  RecoveryFactor(rfLoad(store), nil, defaultThrottle(clock)) catch _ {
+    rejected = rejected + 1
+  }
+  assert(rejected == 2, "both callbacks required")
+}
+
+test "RecoveryFactor: empty identity and peer never reach the store" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  let res = rfAttempt(
+    rfFactor(store, defaultThrottle(clock)),
+    countingVerify(VerifyCounter{}),
+    "",
+    "aaa1-secret",
+  )
+  assert(res.body == "false" && store.loads == 0, "empty identity")
+  let blind = rfAttempt(
+    rfFactor(store, defaultThrottle(clock)),
+    countingVerify(VerifyCounter{}),
+    "u1",
+    "aaa1-secret",
+    "",
+  )
+  assert(blind.status == 500 && store.loads == 0, "empty peer")
+}
+
+test "RecoveryFactor: failure counter error refuses authentication" {
+  let clock = freshClock()
+  let store = fakeStore(clock)
+  let load: (string) => []string! = (id) => {
+    store.broken = true
+    return recoveryFakeEntries(1)
+  }
+  let save: (string, []string, []string) => bool! = (id, expected, remaining) => true
+  let factor = RecoveryFactor(load, save, throttleOn(store, clock, ThrottleOptions{})) catch e {
+    panic(e.message())
+  }
+  let res = rfAttempt(factor, countingVerify(VerifyCounter{}), "u1", "wrong")
+  assert(res.status == 500, "failed counter write must refuse")
+}
+
+test "RecoveryFactor: ambiguous committed save error never grants access" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  store.failAfterSave = true
+  let factor = rfFactor(store, defaultThrottle(clock))
+  let verify = matchingVerify(VerifyCounter{}, "secret")
+  let first = rfAttempt(factor, verify, "u1", "aaa1-secret")
+  assert(first.status == 500 && store.commits == 1, "spent code with no authentication")
+  assert(rfAttempt(factor, verify, "u1", "aaa1-secret").body == "false", "spent code stays spent")
+}
+
+test "RecoveryFactor: throttle store failure refuses before code load" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  store.counters.broken = true
+  let factor = rfFactor(store, throttleOn(store.counters, clock, ThrottleOptions{}))
+  let res = rfAttempt(factor, countingVerify(VerifyCounter{}), "u1", "aaa1-secret")
+  assert(res.status == 500 && store.loads == 0, "throttle down")
+}
+
+test "RecoveryFactor: counter failure after commit refuses authentication" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  store.breakAfterSave = true
+  let factor = rfFactor(store, throttleOn(store.counters, clock, ThrottleOptions{}))
+  let res = rfAttempt(factor, matchingVerify(VerifyCounter{}, "secret"), "u1", "aaa1-secret")
+  assert(res.status == 500 && store.commits == 1, "spent code, failed authentication")
+}
+
+test "RecoveryFactor: public redemption completes only a pending second factor" {
+  let clock = freshClock()
+  let store = rfStore(fakeStore(clock))
+  let set = recoveryMustGenerate(RecoveryOptions{ count = 1 })
+  store.hashes = set.hashes
+  let factor = rfFactor(store, defaultThrottle(clock))
+  let app = mfApp(factor, CompleteOptions{}, 300)
+  let pending = mfPending(app)
+  let accepted = app.handle(mfCodeReq(pending, set.codes[0]))
+  assert(accepted.status == 200 && accepted.body == "u1", "real code promotes same user")
+  assert(len(store.hashes) == 0 && store.commits == 1, "code consumed")
+  let next = mfPending(app)
+  let used = app.handle(mfCodeReq(next, set.codes[0]))
+  assert(used.status == 401, "used code cannot complete another session")
+  assert(app.handle(mfReq("GET", "/me", next, "")).status == 401, "failed attempt remains pending")
+}

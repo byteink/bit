@@ -246,6 +246,10 @@ protected route that is not itself doing the authenticating just reads
   recovery codes for a lost authenticator: generated from the CSPRNG, stored
   as Argon2id hashes, redeemed at the cost of one hash, optionally throttled
   with a `LoginThrottle`, and replaced wholesale by regenerating.
+- `RecoveryFactor` - a self-throttled second factor that accepts a code only
+  after your store atomically consumes it. Two attempts with the same stored
+  snapshot have at most one winner. See the running recovery route in
+  [Two-factor authentication with TOTP](docs/totp.md#using-a-recovery-code-at-login).
 
 Every one of these is used in a full example in [`docs/`](docs/README.md),
 along with the security properties this package enforces (PKCE, constant-time

@@ -341,12 +341,81 @@ batch of ten takes about as long as ten password hashes.
 
 ## Using a recovery code at login
 
+Two requests can present the same unused code at the same time. A normal
+read followed by a save lets both in. Inkwell uses `RecoveryFactor` to make
+the second-factor route wait for an atomic database update before it accepts
+the code. It also checks the required `LoginThrottle` before loading hashes
+or doing password-hash work.
+
+Your store must compare the complete saved list with `expected` and replace
+it with `remaining` in **one persistent atomic operation**. Return `true`
+only when that update commits. Return `false` when the saved list changed.
+Do not implement this as a separate read and write, or with a lock in one
+web process: another process can accept the same code between those steps.
+
+```bit
+import { LoginThrottle, RecoveryFactor, completeSecondFactor } from "auth"
+import { App } from "web"
+
+interface InkwellRecoveryStore {
+  loadHashes(userId: string): []string!,
+  replaceIfUnchanged(userId: string, expected: []string, remaining: []string): bool!,
+}
+
+fn inkwellRecoveryFactor(store: InkwellRecoveryStore, throttle: LoginThrottle): RecoveryFactor! {
+  let load: (string) => []string! = (userId) => store.loadHashes(userId)?
+  let save: (string, []string, []string) => bool! = (userId, expected, remaining) => {
+    return store.replaceIfUnchanged(userId, expected, remaining)?
+  }
+  return RecoveryFactor(load, save, throttle)?
+}
+
+@json class InkwellRecoveryInput {
+  code: string,
+}
+
+fn mountRecoveryLogin(app: App, factor: RecoveryFactor) {
+  app.post("/login/recovery", (c) => {
+    let form = c.body<InkwellRecoveryInput>()?
+    let who = completeSecondFactor(c, factor, form.code)?
+    return c.text("welcome ${who.id}")
+  })
+}
+```
+
+The store implementation is your database adapter. It must return a snapshot,
+keep callback arguments unchanged, and enforce that comparison across all
+workers. A transaction can lock the user's recovery record, compare its stored
+list with `expected`, replace it, and commit before returning `true`.
+The interface alone does not provide atomic persistence.
+
+Mount this route beside the TOTP route after the first factor creates a pending
+session. The factor uses that pending user's ID, never an ID from the recovery
+form. A successful persistent update promotes the same pending identity through
+`completeSecondFactor`. Wrong, malformed, used codes and stale snapshots all
+refuse the login. Counters use `recovery:<userId>` and the request's peer address.
+Leave `CompleteOptions.throttle` empty because this factor already counts once.
+
+The factor accepts at most 32 stored hashes and preserves the redemption
+primitive's input bound. Missing callbacks fail construction with
+`auth: RecoveryFactor(): \`hashesFor\` and atomic \`save\` are required`.
+An oversized stored list fails with `auth: RecoveryFactor: stored hashes exceed 32`.
+Store and throttle errors refuse authentication. If a save commits and then
+reports an error, the code can be spent without a login; do not retry it as a
+successful authentication. The same refusal applies if counter reset fails
+after the code was consumed. Re-enroll the authenticator after recovery and
+replace the recovery set through your application's recovery policy.
+
+### When you need the lower-level redemption result
+
 The login form takes the code in the same box as a TOTP code. When
 `checkCode` fails, try `redeemRecoveryCode`. It ignores case, spaces and
 dashes, and reads `0`/`o` and `1`/`i`/`l` as the same character, so a code
 retyped from a printout still works. A match returns `remaining`, the
 stored list without the code that was just used - **persist it**, or the
-code works again.
+code works again. This primitive does not provide an atomic store update.
+Use it for a custom flow only when that flow supplies the same persistent
+compare-and-set guarantee before it grants access.
 
 A recovery code is a guessable secret in a way a TOTP code never is: it does
 not expire. Hand `redeemRecoveryCode` the same `LoginThrottle` your password
