@@ -169,6 +169,11 @@ protected route that is not itself doing the authenticating just reads
   verified proof, optionally from a named second factor, and confirm a new
   proof without changing the current identity or session id; see
   [Confirm an author before a sensitive change](docs/mfa.md).
+- `SecondFactorPolicy`, `FactorsFor`, `needsSecondFactor`, `beginSession` -
+  choose the second step after a verified first credential. Required accounts
+  without a factor remain enrollment-only; ordinary completion cannot promote
+  them. A trusted enrollment route uses `CompleteOptions.enrollment`; see
+  [Choose the first login's second step](docs/mfa.md#choose-the-first-logins-second-step).
 - `WebAuthn`, `RelyingParty`, `UserEntity`, `WebAuthnOptions`, `UserVerification`,
   `ResidentKey`, `Attachment`, `AttestationConveyance`, `Credential`,
   `CredentialStore`, `MemoryCredentialStore` - passkey registration: `WebAuthn(rp,

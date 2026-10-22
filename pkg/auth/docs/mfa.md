@@ -152,6 +152,90 @@ updates the proof time. An ordinary `requireAuth` pass using `InkwellSession`
 preserves that time too. A custom strategy calls `bindSession` only after it
 has verified new credentials, not while reading an existing session.
 
+## Choose the first login's second step
+
+An Inkwell deployment can require every author to enroll a second factor.
+An author with no authenticator yet must reach enrollment, not a full account.
+Choose `SecondFactorPolicy.Required` for that rule. `Optional` asks for a
+second proof only when a factor is enrolled. `Off` completes the first login
+without calling the factor lookup.
+
+`FactorsFor` loads the verified author's enrolled factors and can fail. A
+failed lookup refuses the login; it is never treated as an empty list.
+`needsSecondFactor` is the same pure policy decision for a settings screen.
+`beginSession` applies it to a verified first credential and rotates the
+session once. Call it **before any full session is bound**. Its caller must
+not rotate separately or wrap `PasswordStrategy.authenticate`: that existing
+method already binds its own session.
+
+For a custom first-credential flow, connect these routes to Inkwell's trusted
+credential verifier and enrollment service:
+
+```bit
+import { FactorsFor, SecondFactorPolicy, beginSession, needsSecondFactor, CompleteOptions } from "auth"
+
+fn mountPolicyLogin(
+  app: App,
+  verifyCredential: (Ctx) => Identity!,
+  factors: FactorsFor,
+  finishEnrollment: (Ctx) => SecondFactor!,
+  policy: SecondFactorPolicy = SecondFactorPolicy.Required,
+) {
+  app.post("/login/policy", (c) => {
+    let author = verifyCredential(c)?
+    beginSession(c, author, policy, factors)?
+    return c.text(author.id)
+  })
+  app.get("/account/second-step", (c) => {
+    let author = currentIdentity(c)?
+    return c.text("second step required: ${needsSecondFactor(policy, factors(author.id)?)}")
+  })
+  app.post("/login/enrollment", (c) => {
+    let factor = finishEnrollment(c)?
+    let form = c.body<ConfirmationCode>()?
+    let opts = CompleteOptions{ enrollment = true }
+    let author = completeSecondFactor(c, factor, form.code, opts)?
+    return c.text(author.id)
+  })
+}
+```
+
+`verifyCredential` must validate the first credential and return its identity
+without creating a full login. The enrollment service must validate its
+server-owned ceremony, bind it to that verified subject, persist the enrolled
+factor, and return a verifier for it. It must not select a subject from a
+client-supplied user ID. These callbacks are application code, not additional
+authentication implementations supplied by this package.
+
+For Required accounts with no factors, `beginSession` saves one pending
+identity of kind `enroll` and answers 401 `second_factor_required`.
+Normal protected routes and ordinary `completeSecondFactor` calls refuse
+it. Only the server's enrollment route sets `enrollment = true`, after
+enrollment is persisted. Do not accept that flag from a request. Its factor
+must verify the proof for the pending subject before the session is promoted.
+Use a self-throttled factor, or supply `CompleteOptions.throttle` for a custom
+factor as described in [Two-factor authentication with TOTP](totp.md).
+
+A Required or Optional account with enrolled factors gets `verify` pending
+instead. Ordinary completion uses the default `enrollment = false`; an
+enrollment-only completion refuses a verify-pending login. Existing pending
+sessions with no kind keep their original verification behavior. Unknown,
+empty or malformed stored kinds refuse completion. Both kinds retain the
+existing pending expiry and prevent a freshness guard from granting access.
+
+A successful completion rotates once, clears pending state and records the
+new proof through the same session writer as the existing second-factor flow.
+A wrong proof or factor error leaves the pending state unchanged. Factor
+lookup errors happen before the initial session rotation. For Required and
+Optional, a missing callback fails with
+`auth: beginSession(): \`factors\` is required for this policy`.
+An empty verified identity fails with
+`auth: beginSession(): the Identity has an empty id`.
+The settings preview is informational; the server always applies the policy
+again before login. Your enrollment transaction and session promotion are
+separate operations, so a later session-store error can leave enrollment
+saved without completing that login.
+
 ## Refusals and boundaries
 
 - A wrong code answers 401 and leaves the old proof unchanged. A verifier or
