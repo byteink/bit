@@ -1,0 +1,175 @@
+// The caller supplies a trusted endpoint and bounded transport; this layer never redirects.
+class LoginRefreshReply {
+  status: int,
+  body: string,
+}
+
+fn loginRefreshError(): error {
+  return newError("aws: login: session cannot refresh; run aws login")
+}
+
+fn loginRefreshExpiry(cache: LoginCache): int {
+  match (cache.credential.expiration) {
+    Some(expiry) => return expiry.ns
+    None => return 0
+  }
+}
+
+fn loginRefreshNeeded(cache: LoginCache, timestamp: int): bool {
+  let expiry = loginRefreshExpiry(cache)
+  return expiry <= timestamp || expiry - timestamp <= refreshWindow
+}
+
+fn loginRefreshFallback(cache: LoginCache, timestamp: int): LoginCache! {
+  if (timestamp < 0 || loginRefreshExpiry(cache) <= timestamp) {
+    fail loginRefreshError()
+  }
+  return cache
+}
+
+fn loginRefreshReread(path: string, cache: LoginCache, timestamp: int): LoginCache {
+  let disk = loginCacheRead(path) catch _ {
+    return cache
+  }
+  if (loginRefreshExpiry(disk) <= timestamp && loginRefreshExpiry(cache) > timestamp) {
+    return cache
+  }
+  return disk
+}
+
+fn loginRefreshGrant(cache: LoginCache): string {
+  return ssoEncode(
+    Json.JsonObject(
+      [
+        JsonEntry{ key = "clientId", value = Json.JsonString(cache.clientId) },
+        JsonEntry{ key = "refreshToken", value = Json.JsonString(cache.refreshToken) },
+        JsonEntry{ key = "grantType", value = Json.JsonString("refresh_token") },
+      ],
+    ),
+  )
+}
+
+fn loginRefreshErrorType(value: string): string {
+  let code = value
+  let colon = indexOf(code, ":")
+  if (colon >= 0) {
+    code = code[0:colon]
+  }
+  let namespace = indexOf(code, "#")
+  if (namespace >= 0) {
+    code = code[namespace + 1:len(code)]
+  }
+  return code
+}
+
+fn loginRefreshDeniedCode(code: string): bool {
+  for denied of [
+    "AccessDeniedException", "TOKEN_EXPIRED", "USER_CREDENTIALS_CHANGED",
+    "INSUFFICIENT_PERMISSIONS", "invalid_grant", "access_denied",
+  ] {
+    if (code == denied) {
+      return true
+    }
+  }
+  return false
+}
+
+fn loginRefreshDenied(reply: LoginRefreshReply): bool {
+  if (reply.status == 401 || reply.status == 403) {
+    return true
+  }
+  if (len(reply.body) > 1048576) {
+    return false
+  }
+  let value = jsonParse(reply.body) catch _ {
+    return false
+  }
+  for key of ["code", "__type", "error"] {
+    let code = ssoText(value, key) catch _ {
+      ""
+    }
+    if (loginRefreshDeniedCode(loginRefreshErrorType(code))) {
+      return true
+    }
+  }
+  return false
+}
+
+fn loginRefreshSeconds(value: Json, timestamp: int): int! {
+  if (timestamp < 0) {
+    fail loginRefreshError()
+  }
+  let seconds: i64 = 900
+  match (jsonGet(value, "expiresIn")) {
+    Some(member) => seconds = jsonDecIntKey(member, "login", "expiresIn") catch _ {
+      fail loginRefreshError()
+    }
+    None => {}
+  }
+  if (seconds <= 0 || seconds > 2147483647 || seconds > (neverExpires - timestamp) / 1000000000) {
+    fail loginRefreshError()
+  }
+  return int(seconds)
+}
+
+fn loginRefreshValue(cache: LoginCache, reply: LoginRefreshReply, timestamp: int): Json! {
+  if (reply.status != 200 || len(reply.body) > 1048576) {
+    fail loginRefreshError()
+  }
+  let value = jsonParse(reply.body) catch _ {
+    fail loginRefreshError()
+  }
+  let seconds = loginRefreshSeconds(value, timestamp)?
+  let token = loginCacheMember(value, "accessToken")?
+  let access = loginCacheMember(cache.value, "accessToken")?
+  for key of ["accessKeyId", "secretAccessKey", "sessionToken"] {
+    access = ssoSet(access, key, Json.JsonString(loginCacheText(token, key)?))
+  }
+  let expiry = Timestamp{ ns = timestamp + seconds * 1000000000 }
+  access = ssoSet(access, "expiresAt", Json.JsonString(expiry.toString()))
+  let updated = ssoSet(cache.value, "accessToken", access)
+  return ssoSet(updated, "refreshToken", Json.JsonString(loginCacheText(value, "refreshToken")?))
+}
+
+fn loginRefreshRequest(
+  cache: LoginCache,
+  endpoint: string,
+  timestamp: int,
+  post: (string, string, string) => LoginRefreshReply!,
+): LoginRefreshReply! {
+  let proof = loginDpop(cache.dpopKey, endpoint, timestamp / 1000000000)?
+  return post(endpoint, loginRefreshGrant(cache), proof)?
+}
+
+fn loginRefresh(
+  path: string,
+  cache: LoginCache,
+  endpoint: string,
+  post: (string, string, string) => LoginRefreshReply!,
+  clock: () => int,
+): LoginCache! {
+  let timestamp = clock()
+  if (timestamp < 0) {
+    fail loginRefreshError()
+  }
+  if (!loginRefreshNeeded(cache, timestamp)) {
+    return cache
+  }
+  let selected = loginRefreshReread(path, cache, timestamp)
+  if (!loginRefreshNeeded(selected, timestamp)) {
+    return selected
+  }
+  let reply = loginRefreshRequest(selected, endpoint, timestamp, post) catch _ {
+    return loginRefreshFallback(selected, clock())?
+  }
+  // A revoked session cannot use the ordinary still-valid fallback.
+  if (loginRefreshDenied(reply)) {
+    fail loginRefreshError()
+  }
+  let value = loginRefreshValue(selected, reply, clock()) catch _ {
+    return loginRefreshFallback(selected, clock())?
+  }
+  return loginCacheWrite(path, value) catch _ {
+    return loginRefreshFallback(selected, clock())?
+  }
+}

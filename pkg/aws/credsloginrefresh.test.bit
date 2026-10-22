@@ -1,0 +1,285 @@
+const loginRefreshTime: int = 1700000000000000000
+
+fn loginRefreshFixture(expiry: int): LoginCache {
+  let value = loginCacheFixture()
+  let access = loginTestMember(value, "accessToken")
+  access = ssoSet(access, "expiresAt", Json.JsonString(Timestamp{ ns = expiry }.toString()))
+  return loginCacheParse(ssoSet(value, "accessToken", access)) catch e {
+    panic(e.message())
+  }
+}
+
+fn loginRefreshReply(): LoginRefreshReply {
+  return LoginRefreshReply{
+    status = 200,
+    body = "{\"accessToken\":{\"accessKeyId\":\"ASIAREFRESHED\",\"secretAccessKey\":\"new-secret\",\"sessionToken\":\"new-session\"},\"refreshToken\":\"rotated-refresh\",\"expiresIn\":900}",
+  }
+}
+
+class LoginRefreshTest {
+  calls: int = 0
+  timestamp: int = loginRefreshTime
+  after: int = loginRefreshTime
+  transportFails: bool = false
+  expectedRefresh: string = "fixture-refresh"
+  reply: Option<LoginRefreshReply> = Option.None
+
+  request(endpoint: string, body: string, proof: string): LoginRefreshReply! {
+    this.calls = this.calls + 1
+    assert(endpoint == loginProofUrl, "exact trusted endpoint")
+    let grant = jsonParse(body)?
+    match (grant) {
+      JsonObject(members) => assert(len(members) == 3, "flat grant has three members")
+      _ => { panic("grant object") }
+    }
+    assert(ssoText(grant, "clientId")? == "fixture-client", "client binding")
+    assert(ssoText(grant, "refreshToken")? == this.expectedRefresh, "selected refresh binding")
+    assert(ssoText(grant, "grantType")? == "refresh_token", "refresh grant")
+    let claims = loginTestVerified(proof)?
+    assert(ssoText(claims, "htm")? == "POST", "signed POST method")
+    assert(ssoText(claims, "htu")? == endpoint, "signed exact URI")
+    assert(ssoNumber(claims, "iat")? == i64(this.timestamp / 1000000000), "proof clock")
+    this.timestamp = this.after
+    if (this.transportFails) {
+      fail newError("sentinel-transport-secret")
+    }
+    match (this.reply) {
+      Some(reply) => return reply
+      None => return loginRefreshReply()
+    }
+  }
+
+  run(path: string, cache: LoginCache): LoginCache! {
+    return loginRefresh(
+      path, cache, loginProofUrl,
+      (url, body, proof) => this.request(url, body, proof),
+      () => this.timestamp,
+    )?
+  }
+}
+
+fn loginRefreshRejected(state: LoginRefreshTest, path: string, cache: LoginCache) {
+  let message = ""
+  state.run(path, cache) catch e {
+    message = e.message()
+  }
+  assert(message == loginRefreshError().message(), "fixed redacted refresh error")
+  assert(state.calls == 1, "one attempted POST and no redirects or retries")
+}
+
+test "login refresh outside window skips disk and transport" {
+  let path = ssoFixturePath()
+  defer ssoCleanup(path)
+  let state = LoginRefreshTest{}
+  let cached = loginRefreshFixture(loginRefreshTime + refreshWindow + 1)
+  let result = state.run(path, cached) catch e {
+    panic(e.message())
+  }
+  assert(state.calls == 0 && result.refreshToken == cached.refreshToken, "outside window shortcut")
+}
+
+test "login refresh exact boundary rereads and fresh disk wins" {
+  let path = ssoFixturePath()
+  defer ssoCleanup(path)
+  let cached = loginRefreshFixture(loginRefreshTime + refreshWindow)
+  let fresh = loginRefreshFixture(loginRefreshTime + 3600000000000)
+  let value = ssoSet(fresh.value, "refreshToken", Json.JsonString("disk-refresh"))
+  loginCacheWrite(path, value) catch e {
+    panic(e.message())
+  }
+  let state = LoginRefreshTest{}
+  let result = state.run(path, cached) catch e {
+    panic(e.message())
+  }
+  assert(result.refreshToken == "disk-refresh", "boundary must reread fresh replacement")
+  assert(state.calls == 0, "fresh disk avoids POST")
+}
+
+test "login refresh expired disk does not replace valid memory and failed reread preserves it" {
+  let path = ssoFixturePath()
+  defer ssoCleanup(path)
+  let cached = loginRefreshFixture(loginRefreshTime + refreshWindow)
+  loginCacheWrite(path, loginRefreshFixture(loginRefreshTime - 1).value) catch e {
+    panic(e.message())
+  }
+  let state = LoginRefreshTest{ transportFails = true }
+  let result = state.run(path, cached) catch e {
+    panic(e.message())
+  }
+  assert(
+    loginRefreshExpiry(result) == loginRefreshExpiry(cached),
+    "valid memory survives expired disk",
+  )
+  assert(state.calls == 1)
+  let missing = LoginRefreshTest{ transportFails = true }
+  let fallback = missing.run(path + ".missing", cached) catch e {
+    panic(e.message())
+  }
+  assert(loginRefreshExpiry(fallback) == loginRefreshExpiry(cached) && missing.calls == 1)
+}
+
+test "login refresh rotates expired session and preserves private cache fields" {
+  let path = ssoFixturePath()
+  defer ssoCleanup(path)
+  let cached = loginRefreshFixture(loginRefreshTime - 1)
+  loginCacheWrite(path, cached.value) catch e {
+    panic(e.message())
+  }
+  let state = LoginRefreshTest{}
+  let result = state.run(path, cached) catch e {
+    panic(e.message())
+  }
+  assert(state.calls == 1 && result.refreshToken == "rotated-refresh", "one rotated refresh")
+  assert(result.credential.accessKeyId == "ASIAREFRESHED" && result.credential.token() == "new-session")
+  assert(loginRefreshExpiry(result) == loginRefreshTime + 900000000000)
+  assert(result.credential.accountId == cached.credential.accountId && result.dpopKey == cached.dpopKey)
+  assert(
+      (ssoText(result.value, "extra") catch _ {
+        ""
+      }) ==
+      "root-extra",
+  )
+  let access = loginTestMember(result.value, "accessToken")
+  assert(
+      (ssoText(access, "extra") catch _ {
+        ""
+      }) ==
+      "access-extra",
+  )
+  let loaded = loginCacheRead(path) catch e {
+    panic(e.message())
+  }
+  assert(ssoEncode(loaded.value) == ssoEncode(result.value), "complete rotation persisted")
+  let info = stat(path) catch e {
+    panic(e.message())
+  }
+  assert((info.mode & 0o777) == 0o600, "private atomic cache")
+}
+
+test "login refresh invalid replies redact errors and cannot revive expired credentials" {
+  let path = ssoFixturePath()
+  defer ssoCleanup(path)
+  let cached = loginRefreshFixture(loginRefreshTime - 1)
+  for body of [
+    "sentinel-body-secret", "{}", repeat("x", 1048577),
+    "{\"expiresIn\":0}", "{\"expiresIn\":-1}", "{\"expiresIn\":2147483648}",
+    "{\"expiresIn\":1.5}", "{\"expiresIn\":\"900\"}",
+  ] {
+    loginRefreshRejected(
+      LoginRefreshTest{ reply = Option.Some(LoginRefreshReply{ status = 200, body = body }) },
+      path,
+      cached,
+    )
+  }
+  loginRefreshRejected(
+    LoginRefreshTest{
+      reply = Option.Some(LoginRefreshReply{ status = 302, body = "sentinel-redirect" }),
+    },
+    path,
+    cached,
+  )
+  loginRefreshRejected(LoginRefreshTest{ transportFails = true }, path, cached)
+}
+
+test "login refresh denied sessions never use valid fallback" {
+  let path = ssoFixturePath()
+  defer ssoCleanup(path)
+  let cached = loginRefreshFixture(loginRefreshTime + refreshWindow)
+  for status of [401, 403] {
+    loginRefreshRejected(
+      LoginRefreshTest{
+        reply = Option.Some(LoginRefreshReply{ status = status, body = "sentinel-denied" }),
+      },
+      path,
+      cached,
+    )
+  }
+  for code of [
+    "AccessDeniedException", "TOKEN_EXPIRED", "USER_CREDENTIALS_CHANGED",
+    "INSUFFICIENT_PERMISSIONS", "invalid_grant", "access_denied",
+  ] {
+    let body = ssoEncode(Json.JsonObject([JsonEntry{ key = "error", value = Json.JsonString(code) }]))
+    loginRefreshRejected(
+      LoginRefreshTest{ reply = Option.Some(LoginRefreshReply{ status = 400, body = body }) },
+      path,
+      cached,
+    )
+  }
+}
+
+test "login refresh fallback uses post attempt clock and failed persistence stays private" {
+  let path = ssoFixturePath()
+  defer ssoCleanup(path)
+  let cached = loginRefreshFixture(loginRefreshTime + 1)
+  loginRefreshRejected(
+    LoginRefreshTest{ transportFails = true, after = loginRefreshTime + 1 },
+    path,
+    cached,
+  )
+  let state = LoginRefreshTest{
+    reply = Option.Some(LoginRefreshReply{ status = 500, body = "sentinel-error" }),
+  }
+  let result = state.run(path, cached) catch e {
+    panic(e.message())
+  }
+  assert(
+    loginRefreshExpiry(result) == loginRefreshExpiry(cached),
+    "ordinary failure valid fallback",
+  )
+  let persistence = LoginRefreshTest{}
+  let old = persistence.run(path + "/absent/cache", cached) catch e {
+    panic(e.message())
+  }
+  assert(
+    loginRefreshExpiry(old) == loginRefreshExpiry(cached),
+    "failed atomic write preserves selected value",
+  )
+}
+
+test "login refresh expiry default and overflow checks are bounded" {
+  assert(
+      (loginRefreshSeconds(Json.JsonObject([]JsonEntry(0)), loginRefreshTime) catch _ {
+        0
+      }) ==
+      900,
+  )
+  let rejected = false
+  loginRefreshSeconds(Json.JsonObject([]JsonEntry(0)), neverExpires - 1) catch _ {
+    rejected = true
+  }
+  assert(rejected, "expiry addition cannot overflow")
+}
+
+test "login refresh restJson denial fields cannot use valid fallback" {
+  let path = ssoFixturePath()
+  defer ssoCleanup(path)
+  let cached = loginRefreshFixture(loginRefreshTime + refreshWindow)
+  for body of [
+    "{\"code\":\"AccessDeniedException\",\"error\":\"OTHER\"}",
+    "{\"__type\":\"com.amazonaws.signin#AccessDeniedException\"}",
+    "{\"code\":\"AccessDeniedException:sentinel-secret\"}",
+    "{\"__type\":\"com.amazonaws.signin#AccessDeniedException:sentinel-secret\"}",
+  ] {
+    loginRefreshRejected(
+      LoginRefreshTest{ reply = Option.Some(LoginRefreshReply{ status = 400, body = body }) },
+      path,
+      cached,
+    )
+  }
+}
+
+test "login refresh restJson error normalization preserves unknown fallback" {
+  assert(loginRefreshErrorType("ns#OTHER:sentinel-secret") == "OTHER")
+  let path = ssoFixturePath()
+  defer ssoCleanup(path)
+  let cached = loginRefreshFixture(loginRefreshTime + refreshWindow)
+  let state = LoginRefreshTest{
+    reply = Option.Some(
+      LoginRefreshReply{ status = 400, body = "{\"__type\":\"ns#OTHER:sentinel-secret\"}" },
+    ),
+  }
+  let result = state.run(path, cached) catch e {
+    panic(e.message())
+  }
+  assert(state.calls == 1 && loginRefreshExpiry(result) == loginRefreshExpiry(cached))
+}
