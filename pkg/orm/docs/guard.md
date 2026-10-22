@@ -358,6 +358,27 @@ table, or a repository with no guard, keeps the plain repository's behavior.
 Use `db.asSystem()` for a trusted maintenance job that must bypass these
 rules. Request handlers should keep using the actor's scoped handle.
 
+## Removing a group of drafts
+
+To discard every outline you may delete, narrow the batch explicitly:
+
+```bit
+fn discardOutlines(mine: ScopedRepo<Draft>): int! {
+  return mine.where("body", "outline").deleteAll()?
+}
+```
+
+`deleteAll` asks for `GuardOp.Delete`, ANDs its parenthesized filter with
+that caller condition, and returns the affected-row count. On `Draft`, it
+sets `deletedAt` instead of removing rows. Ordinary reads exclude those
+rows; `withDeleted()` includes them.
+
+A caller must supply `where()` even when the guard would add a condition.
+A bare call fails before the guard runs, including with `All` or `None`.
+For a narrowed chain, `None` returns zero without SQL; a guard error returns
+unchanged without SQL. `All`, an unprotected table, or no guard retains the
+plain bulk-delete behavior. The call leaves the source chain unchanged.
+
 ## Editing together in one scoped transaction
 
 An edit may need to lock a draft before changing it. Start the transaction
