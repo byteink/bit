@@ -81,11 +81,15 @@ fn main(): ()! {
 
 class Author { export id: string }
 
+@table class DraftTag { id: i64 }
+
 @table @softDelete class Draft {
-  id: i64,
-  authorId: i64,
-  body: string,
-  deletedAt: Option<i64> = Option<i64>.None,
+  id: i64
+  authorId: i64
+  body: string
+  deletedAt: Option<i64> = Option<i64>.None
+  @manyToMany("draft_tags")
+  tags: []DraftTag
 }
 ```
 
@@ -378,6 +382,32 @@ A bare call fails before the guard runs, including with `All` or `None`.
 For a narrowed chain, `None` returns zero without SQL; a guard error returns
 unchanged without SQL. `All`, an unprotected table, or no guard retains the
 plain bulk-delete behavior. The call leaves the source chain unchanged.
+
+## Removing a tag from a draft
+
+Removing a relation requires permission to update its owner. Keep using the
+author's scoped repository, even when the caller already has the draft:
+
+```bit
+fn removeTag(mine: ScopedRepo<Draft>, draft: Draft, tagId: i64): ()! {
+  mine.unlink(draft, "tags", [tagId])?
+}
+
+fn removeTagInTransaction(tx: ScopedTx, draft: Draft, tagId: i64): ()! {
+  tx.table<Draft>().unlink(draft, "tags", [tagId])?
+}
+```
+
+`unlink` reads the owner's key from `draft`, then locks the stored owner
+through its `Update` filter before deleting the selected relation pairs.
+The lock and deletion share one transaction. Fields on the supplied draft
+cannot grant permission. The chain's conditions and soft-delete condition
+still narrow the owner lookup. An unreadable owner returns `notFound`;
+a readable owner refused by the update rule returns `denied`. A guard error
+leaves the relation unchanged. Empty target ids remove no pairs.
+
+The same call on `ScopedTxRepo` uses the caller's transaction. No guard or
+an unprotected owner table keeps the plain repository's behavior.
 
 ## Editing together in one scoped transaction
 
