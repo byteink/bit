@@ -1385,7 +1385,7 @@ Parses `der` as a DER-encoded X.509 certificate. Fails on malformed input.
 
 ### `x509MatchHostname(cert: Certificate, hostname: string): bool`
 
-Whether `cert` is valid for `hostname`, checking its subject and subject-alternative names.
+Whether `hostname` matches `cert`'s subject-alternative names. The subject common name is not used.
 
 ### `x509VerifyChain(leaf: Certificate, intermediates: []Certificate, roots: []Certificate, hostname: string, nowUnix: int): ()!`
 
