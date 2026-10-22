@@ -1,0 +1,161 @@
+import { listen, Listener, Conn } from "std/net"
+import { AtomicI64 } from "std/sync"
+import { Millisecond, sleep } from "std/time"
+import { hasSuffix } from "std/strings"
+
+class MailCapture {
+  listener: Listener,
+  transcript: chan<string>,
+  done: AtomicI64,
+}
+
+fn mailCaptureChunk(conn: Conn, suffix: string): string! {
+  let text = ""
+  for (let i = 0; i < 32; i = i + 1) {
+    let chunk = conn.readDeadline(1024)?
+    if (len(chunk) == 0) {
+      fail newError("SMTP capture closed before command")
+    }
+    text = text + chunk
+    if (hasSuffix(text, suffix)) {
+      return text
+    }
+  }
+  fail newError("SMTP capture command exceeds finite input bound")
+}
+
+fn mailCaptureSession(conn: Conn, rejected: bool): string! {
+  conn.setDeadline(now().ns + 5 * Second)
+  conn.writeDeadline("220 capture.example.test\r\n")?
+  let replies = [
+    "250 capture.example.test\r\n",
+    "250 sender accepted\r\n",
+    "250 recipient accepted\r\n",
+    "354 send message\r\n",
+    "250 queued\r\n",
+    "221 bye\r\n",
+  ]
+  if (rejected) {
+    replies = [
+      "250 capture.example.test\r\n",
+      "250 sender accepted\r\n",
+      "550 recipient refused\r\n",
+    ]
+  }
+  let text = ""
+  for (let i = 0; i < len(replies); i = i + 1) {
+    let suffix = "\r\n"
+    if (i == 4) {
+      suffix = "\r\n.\r\n"
+    }
+    text = text + mailCaptureChunk(conn, suffix)?
+    conn.writeDeadline(replies[i])?
+  }
+  return text
+}
+
+fn serveMailCapture(capture: MailCapture, rejected: bool) {
+  defer capture.done.store(1)
+  let conn = capture.listener.accept() catch e {
+    capture.transcript <- "capture accept: ${e.message()}"
+    return
+  }
+  defer conn.close()
+  let text = mailCaptureSession(conn, rejected) catch e {
+    capture.transcript <- "capture session: ${e.message()}"
+    return
+  }
+  capture.transcript <- text
+}
+
+fn beginMailCapture(rejected: bool): MailCapture! {
+  let capture = MailCapture{
+    listener = listen("127.0.0.1", 0)?,
+    transcript = chan<string>(1),
+    done = AtomicI64(0),
+  }
+  spawn serveMailCapture(capture, rejected)
+  return capture
+}
+
+fn finishMailCapture(capture: MailCapture): string {
+  for (let i = 0; i < 600 && capture.done.load() == 0; i = i + 1) {
+    sleep(10 * Millisecond)
+  }
+  assert(capture.done.load() == 1, "bounded SMTP capture did not drain")
+  return <- capture.transcript
+}
+
+fn capturedMailConfig(capture: MailCapture): AppConfig! {
+  let cfg = testConfig()?
+  cfg.smtpHost = "127.0.0.1"
+  cfg.smtpPort = capture.listener.port()?
+  cfg.smtpFrom = "welcome@example.test"
+  return cfg
+}
+
+test "registration enqueues welcome mail before the existing worker delivers it" {
+  let capture = beginMailCapture(false) catch e {
+    panic(e.message())
+  }
+  defer capture.listener.close()
+  let cfg = capturedMailConfig(capture) catch e {
+    panic(e.message())
+  }
+  let redis = openRedis(cfg.redisUrl) catch e {
+    panic(e.message())
+  }
+  defer redis.close()
+  let app = buildApp(cfg) catch e {
+    panic(e.message())
+  }
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  let username = uniqueName("welcome")
+  let email = "${username}@example.test"
+  let body = "{\"username\":\"${username}\",\"email\":\"${email}\",\"password\":\"mail-password-123\"}"
+  let response = app.handle(jsonReq("POST", "/v1/auth/register", "", body))
+  assert(response.status == 201, "registration failed: ${response.status} ${response.body}")
+  assert(capture.done.load() == 0, "registration sent mail inline instead of enqueueing")
+  let queue = openMailQueue(cfg, redis) catch e {
+    panic(e.message())
+  }
+  queue.start()
+  defer queue.stop()
+  let sent = finishMailCapture(capture)
+  queue.stop()
+  assert(contains(sent, "RCPT TO:<${email}>"), "welcome addressed to wrong user: ${sent}")
+  assert(contains(sent, "Subject: Welcome to Inkwell"), sent)
+  assert(contains(sent, "Welcome to Inkwell, ${username}!"), sent)
+}
+
+test "SMTP recipient refusal reaches the welcome handler caller" {
+  let capture = beginMailCapture(true) catch e {
+    panic(e.message())
+  }
+  defer capture.listener.close()
+  let cfg = capturedMailConfig(capture) catch e {
+    panic(e.message())
+  }
+  let rejected = false
+  sendWelcome(cfg, "rejected@example.test", "Rejected") catch _ {
+    rejected = true
+  }
+  assert(rejected, "SMTP refusal was swallowed")
+  let sent = finishMailCapture(capture)
+  assert(contains(sent, "RCPT TO:<rejected@example.test>"), sent)
+  assert(!contains(sent, "DATA\r\n"), "recipient refusal must not send message body")
+}
+
+test "partial mail configuration fails before registration can accept it" {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  cfg.smtpHost = "127.0.0.1"
+  let rejected = false
+  validateMailConfig(cfg) catch _ {
+    rejected = true
+  }
+  assert(rejected, "partial SMTP configuration silently disabled mail")
+}
