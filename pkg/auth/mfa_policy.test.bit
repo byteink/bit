@@ -1,0 +1,339 @@
+class PolicyLookup {
+  enrolled: []SecondFactor,
+  calls: int,
+  broken: bool,
+  subject: string,
+}
+
+fn policyFactors(state: PolicyLookup): FactorsFor {
+  let lookup: FactorsFor = (id) => {
+    state.calls = state.calls + 1
+    state.subject = id
+    if (state.broken) {
+      fail newError("enrollment store down")
+    }
+    return state.enrolled
+  }
+  return lookup
+}
+
+class PolicyStore {
+  inner: MemoryStore
+  rotations: int
+
+  export load(sid: string): Option<(map<string, string>, i64, map<string, string>)>! {
+    return this.inner.load(sid)?
+  }
+  export compareAndSet(
+    sid: string,
+    version: i64,
+    data: map<string, string>,
+    index: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    return this.inner.compareAndSet(sid, version, data, index, ttl)?
+  }
+  export rotate(
+    source: (string, i64),
+    destination: string,
+    data: map<string, string>,
+    index: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    this.rotations = this.rotations + 1
+    return this.inner.rotate(source, destination, data, index, ttl)?
+  }
+  export destroy(sid: string, ttl: i64): ()! { this.inner.destroy(sid, ttl)? }
+  export destroyIndexed(key: string, value: string, except: string, ttl: i64): int! {
+    return this.inner.destroyIndexed(key, value, except, ttl)?
+  }
+}
+
+fn policyStore(): PolicyStore {
+  return PolicyStore{ inner = MemoryStore(1000) }
+}
+
+@json class PolicyKindInput {
+  value: Json,
+}
+
+fn policyApp(
+  policy: SecondFactorPolicy,
+  lookup: FactorsFor,
+  factor: FreshFactor,
+  store: PolicyStore,
+): App {
+  let app = App(Config{ secret = "test-secret", sessions = store })
+  app.post("/login", (c) => {
+    beginSession(c, freshIdentity(), policy, lookup)?
+    return c.text("u1")
+  })
+  app.post("/empty", (c) => {
+    beginSession(c, Identity{ id = "", claims = Json.JsonNull }, policy, lookup)?
+    return c.text("empty")
+  })
+  app.post("/legacy", (c) => {
+    c.session()?.regenerate()?
+    bindSession(c, freshIdentity(), BindOptions{ second = true })?
+    return c.text("pending")
+  })
+  app.post("/kind", (c) => {
+    let input = c.body<PolicyKindInput>()?
+    bindSession(c, freshIdentity(), BindOptions{ second = true })?
+    let fields = jsonDecObject(jsonParse(encodeIdentity(freshIdentity()))?, "identity", 0)?
+    fields = append(fields, JsonEntry{ key = "kind", value = input.value })
+    c.session()?.set(pendingSessionKey, jsonEncode(Json.JsonObject(fields)))
+    c.session()?.save()?
+    return c.text("pending")
+  })
+  app.post("/expire", (c) => {
+    c.session()?.set(pendingExpiryKey, "1")
+    c.session()?.save()?
+    return c.text("expired")
+  })
+  app.post("/complete", (c) => {
+    let form = c.body<MfCode>()?
+    let id = completeSecondFactor(c, factor, form.code)?
+    return c.text(id.id)
+  })
+  app.post("/enroll", (c) => {
+    let form = c.body<MfCode>()?
+    let id = completeSecondFactor(c, factor, form.code, CompleteOptions{ enrollment = true })?
+    return c.text(id.id)
+  })
+  app.get("/me", (c) => {
+    let id = currentIdentity(c) catch _ {
+      fail unauthorized()
+    }
+    return c.text(encodeIdentity(id))
+  })
+  app.get("/pending", (c) => c.text(c.session()?.get(pendingSessionKey)))
+  app.get("/state", (c) => c.text(freshState(c)?))
+  let guarded = app.group("/guarded")
+  guarded.use(requireAuth([]Strategy{ AlwaysFail{} }))
+  guarded.get("/", (c) => c.text("protected"))
+  let readers = app.group("/readers")
+  readers.use(requireAuth([]Strategy{ MfReader{ label = "reader" } }))
+  readers.get("/", (c) => c.text("protected"))
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  return app
+}
+
+fn policyRequest(
+  app: App,
+  method: string,
+  path: string,
+  cookie: string,
+  body: string = "",
+): Response {
+  return app.handle(mfReq(method, path, cookie, body))
+}
+
+fn policyPending(app: App): string {
+  let res = policyRequest(app, "POST", "/login", "")
+  assert(res.status == 401, "policy must hold login: ${res.status}")
+  let cookie = mfCookie(res)
+  assert(cookie != "", "pending session must be saved")
+  return cookie
+}
+
+fn policyComplete(app: App, path: string, cookie: string): Response {
+  return policyRequest(app, "POST", path, cookie, "{\"code\":\"proof\"}")
+}
+
+fn policyRaw(app: App, cookie: string): string {
+  return policyRequest(app, "GET", "/pending", cookie).body
+}
+
+fn policyKind(app: App, cookie: string): string {
+  return pendingSessionKind(policyRaw(app, cookie)) catch e {
+    panic(e.message())
+  }
+}
+
+test "MFA policy: pure decision matrix" {
+  let empty = []SecondFactor(0)
+  let enrolled = []SecondFactor{ FreshFactor{} }
+  assert(!needsSecondFactor(SecondFactorPolicy.Off, empty))
+  assert(!needsSecondFactor(SecondFactorPolicy.Off, enrolled))
+  assert(!needsSecondFactor(SecondFactorPolicy.Optional, empty))
+  assert(needsSecondFactor(SecondFactorPolicy.Optional, enrolled))
+  assert(needsSecondFactor(SecondFactorPolicy.Required, empty))
+  assert(needsSecondFactor(SecondFactorPolicy.Required, enrolled))
+}
+
+test "MFA policy: Off skips nil lookup and rotates once for a full login" {
+  let store = policyStore()
+  let app = policyApp(SecondFactorPolicy.Off, nil, FreshFactor{}, store)
+  let res = policyRequest(app, "POST", "/login", "")
+  assert(res.status == 200, "Off login")
+  assert(store.rotations == 1, "one first-factor rotation")
+  let cookie = mfCookie(res)
+  assert(policyRaw(app, cookie) == "", "no pending state")
+  assert(policyRequest(app, "GET", "/me", cookie).status == 200, "full identity")
+}
+
+test "MFA policy: Optional empty completes but enrolled stays verify-pending" {
+  let state = PolicyLookup{ enrolled = []SecondFactor(0) }
+  let plain = policyApp(
+    SecondFactorPolicy.Optional,
+    policyFactors(state),
+    FreshFactor{},
+    policyStore(),
+  )
+  assert(policyRequest(plain, "POST", "/login", "").status == 200, "empty Optional")
+  assert(state.calls == 1 && state.subject == "u1", "one subject lookup")
+  state.enrolled = []SecondFactor{ FreshFactor{} }
+  let app = policyApp(
+    SecondFactorPolicy.Optional,
+    policyFactors(state),
+    FreshFactor{},
+    policyStore(),
+  )
+  let cookie = policyPending(app)
+  assert(policyKind(app, cookie) == "verify", "enrolled Optional")
+  assert(policyComplete(app, "/complete", cookie).status == 200, "ordinary proof completes")
+}
+
+test "MFA policy: Required enrolled uses verify-pending" {
+  let state = PolicyLookup{ enrolled = []SecondFactor{ FreshFactor{} } }
+  let app = policyApp(
+    SecondFactorPolicy.Required,
+    policyFactors(state),
+    FreshFactor{},
+    policyStore(),
+  )
+  let cookie = policyPending(app)
+  assert(policyKind(app, cookie) == "verify", "required enrolled")
+  assert(policyComplete(app, "/enroll", cookie).status == 401, "wrong route kind")
+  assert(policyComplete(app, "/complete", cookie).status == 200, "verified promotion")
+}
+
+test "MFA policy: Required empty refuses three ordinary routes and normal completion" {
+  let state = PolicyLookup{ enrolled = []SecondFactor(0) }
+  let factor = FreshFactor{}
+  let store = policyStore()
+  let app = policyApp(SecondFactorPolicy.Required, policyFactors(state), factor, store)
+  let cookie = policyPending(app)
+  assert(policyKind(app, cookie) == "enroll", "enroll-only kind")
+  for path of []string{ "/me", "/guarded", "/readers" } {
+    assert(policyRequest(app, "GET", path, cookie).status == 401, "ordinary route ${path}")
+  }
+  assert(
+    policyComplete(app, "/complete", cookie).status == 401,
+    "ordinary completion refuses enroll",
+  )
+  assert(factor.asked == 0 && store.rotations == 1, "refuse before factor or second rotation")
+}
+
+test "MFA policy: explicit enrollment proof promotes once and retains provenance" {
+  let state = PolicyLookup{ enrolled = []SecondFactor(0) }
+  let factor = FreshFactor{}
+  let store = policyStore()
+  let app = policyApp(SecondFactorPolicy.Required, policyFactors(state), factor, store)
+  let pending = policyPending(app)
+  let idBefore = decodeIdentity(policyRaw(app, pending)) catch e {
+    panic(e.message())
+  }
+  assert(idBefore.oidcIssuer == freshIdentity().oidcIssuer, "pending provenance")
+  let res = policyComplete(app, "/enroll", pending)
+  assert(res.status == 200 && res.body == "u1", "same verified subject")
+  let cookie = mfCookie(res)
+  assert(
+    cookie != "" && cookie != pending && store.rotations == 2,
+    "exactly one promotion rotation",
+  )
+  assert(factor.asked == 1 && factor.user == "u1", "one proof for the pending subject")
+  assert(policyRaw(app, cookie) == "", "pending cleared")
+  let who = decodeIdentity(policyRequest(app, "GET", "/me", cookie).body) catch e {
+    panic(e.message())
+  }
+  assert(
+      who.oidcIssuer == idBefore.oidcIssuer &&
+      who.oidcSub == idBefore.oidcSub &&
+      who.oidcSid == idBefore.oidcSid,
+    "OIDC provenance preserved",
+  )
+  let proof = split(policyRequest(app, "GET", "/state", cookie).body, "\n")
+  assert(proof[0] != "" && proof[1] == factor.name(), "shared freshness writer")
+  assert(policyRequest(app, "GET", "/me", pending).status == 401, "old session invalidated")
+  assert(
+    policyComplete(app, "/enroll", cookie).status == 401 && factor.asked == 1,
+    "cannot promote twice",
+  )
+}
+
+test "MFA policy: wrong and failed enrollment proof leave pending unchanged" {
+  let state = PolicyLookup{ enrolled = []SecondFactor(0) }
+  let factor = FreshFactor{ accepted = false }
+  let store = policyStore()
+  let app = policyApp(SecondFactorPolicy.Required, policyFactors(state), factor, store)
+  let cookie = policyPending(app)
+  let before = policyRaw(app, cookie)
+  assert(policyComplete(app, "/enroll", cookie).status == 401, "wrong proof")
+  factor.broken = true
+  assert(policyComplete(app, "/enroll", cookie).status == 500, "store error")
+  assert(
+    policyRaw(app, cookie) == before && store.rotations == 1,
+    "pending identity and sid unchanged",
+  )
+  assert(policyRequest(app, "GET", "/me", cookie).status == 401, "no full login")
+}
+
+test "MFA policy: nil and failed lookups refuse before session rotation" {
+  for policy of []SecondFactorPolicy{ SecondFactorPolicy.Required, SecondFactorPolicy.Optional } {
+    let store = policyStore()
+    let app = policyApp(policy, nil, FreshFactor{}, store)
+    assert(policyRequest(app, "POST", "/login", "").status == 500, "nil lookup")
+    let state = PolicyLookup{ enrolled = []SecondFactor(0), broken = true }
+    let failed = policyApp(policy, policyFactors(state), FreshFactor{}, store)
+    assert(policyRequest(failed, "POST", "/login", "").status == 500, "failed lookup")
+    assert(store.rotations == 0, "no session created on undecided policy")
+  }
+}
+
+test "MFA policy: legacy missing kind completes through the ordinary route" {
+  let factor = FreshFactor{}
+  let app = policyApp(SecondFactorPolicy.Required, nil, factor, policyStore())
+  let res = policyRequest(app, "POST", "/legacy", "")
+  let cookie = mfCookie(res)
+  assert(!contains(policyRaw(app, cookie), "kind"), "original pending encoding stays unchanged")
+  assert(
+    policyComplete(app, "/complete", cookie).status == 200 && factor.asked == 1,
+    "legacy verification",
+  )
+}
+
+test "MFA policy: malformed and unknown kinds refuse before proof" {
+  let factor = FreshFactor{}
+  let app = policyApp(SecondFactorPolicy.Required, nil, factor, policyStore())
+  for value of []string{ "null", "42", "true", "\"\"", "\"unknown\"" } {
+    let res = policyRequest(app, "POST", "/kind", "", "{\"value\":${value}}")
+    let cookie = mfCookie(res)
+    assert(policyComplete(app, "/complete", cookie).status == 401, "ordinary malformed kind")
+    assert(policyComplete(app, "/enroll", cookie).status == 401, "enrollment malformed kind")
+  }
+  assert(factor.asked == 0, "invalid kind never calls a factor")
+}
+
+test "MFA policy: enrollment pending still expires" {
+  let state = PolicyLookup{ enrolled = []SecondFactor(0) }
+  let factor = FreshFactor{}
+  let app = policyApp(SecondFactorPolicy.Required, policyFactors(state), factor, policyStore())
+  let cookie = policyPending(app)
+  assert(policyRequest(app, "POST", "/expire", cookie).status == 200, "expiry setup")
+  assert(
+    policyComplete(app, "/enroll", cookie).status == 401 && factor.asked == 0,
+    "expired pending",
+  )
+}
+
+test "MFA policy: empty subject refuses before lookup" {
+  let state = PolicyLookup{ enrolled = []SecondFactor(0) }
+  let store = policyStore()
+  let app = policyApp(SecondFactorPolicy.Required, policyFactors(state), FreshFactor{}, store)
+  assert(policyRequest(app, "POST", "/empty", "").status == 500, "empty subject")
+  assert(state.calls == 0 && store.rotations == 0, "no lookup or session rotation")
+}
