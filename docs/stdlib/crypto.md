@@ -1355,6 +1355,37 @@ Deterministic ML-DSA key generation from a caller-supplied seed, for testing. Pa
 
 ## Certificates and trust
 
+Inkwell can receive a signing certificate as well as connect to HTTPS servers.
+A trusted certificate path answers who issued a certificate. The application
+must also check the expected signer and permitted key use before it accepts a
+document signature. A TLS connection additionally needs the server's DNS name
+and server authentication purpose.
+
+Save the signing certificate as DER in `inkwell-signer.der` and your configured
+root certificates as PEM in `inkwell-roots.pem`. This complete program checks
+that path at the current time and prints the certificate's subject:
+
+```bit
+import { fromPem, x509Parse, x509VerifyPath } from "std/crypto"
+import { readFile } from "std/fs"
+import { now, Second } from "std/time"
+
+fn main(): ()! {
+  let signer = x509Parse([]byte(readFile("inkwell-signer.der")?))?
+  let trust = fromPem(readFile("inkwell-roots.pem")?)?
+  x509VerifyPath(signer, [], trust.roots, now().ns / Second)?
+  println(signer.subject)
+}
+```
+
+`x509VerifyPath` checks certificate signatures, validity times, issuer CA and
+key-use restrictions, critical extensions, name constraints and path lengths.
+An issuer sent with the certificate is not a trust anchor. Supply intermediate
+certificates in the second argument and select roots from your own policy.
+Success does not authenticate the document or select the signer's identity or
+purpose. Check those separately. For HTTPS, use `std/tls`, which calls
+`x509VerifyChain` and keeps the DNS-name and server-purpose checks.
+
 ### `TrustStore`
 
 A set of trust-anchor certificates. Build one from a PEM bundle with `fromPem`, from the operating system with `systemRoots`, or use `bundled` for a small built-in set.
@@ -1390,6 +1421,11 @@ Whether `hostname` matches `cert`'s subject-alternative names. The subject commo
 ### `x509VerifyChain(leaf: Certificate, intermediates: []Certificate, roots: []Certificate, hostname: string, nowUnix: int): ()!`
 
 Verifies certificate `leaf` up through `intermediates` to a trusted root in `roots`, for `hostname`, as of `nowUnix`. `std/tls` calls this for you during a handshake.
+
+### `x509VerifyPath(leaf: Certificate, intermediates: []Certificate, roots: []Certificate, nowUnix: int): ()!`
+
+Checks the trusted certificate path shown above. Your application selects the
+leaf identity and purpose; this function does not apply TLS server policy.
 
 ### `x509VerifySignature(cert: Certificate, issuer: Certificate): bool`
 
