@@ -451,6 +451,42 @@ lists them. `spellcheck(query, opts)` (`FT.SPELLCHECK`) answers a `Misspelled`
 per unknown term with `Scored` suggestions; `SpellOptions` has `distance`,
 `include` and `exclude` (dictionaries) and `dialect`.
 
+## Keep spelling terms in a dictionary
+
+Teach spellcheck your product vocabulary before you pass its dictionary name
+in `SpellOptions.include`. A spelling dictionary is separate from an index and
+from autocomplete: `search(name)` uses that name for all three dictionary calls.
+
+```bit
+import { open } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let vocabulary = r.search("spelling:articles")
+  let added = vocabulary.dictAdd(["memoization", "prefetch"])?
+  for term of vocabulary.dictDump()? {
+    println(term)
+  }
+  let removed = vocabulary.dictDel(["prefetch", "absent"])?
+  println("${added} new terms; ${removed} removed")
+  let p = r.pipeline()
+  let queuedAdd = p.search("spelling:articles").dictAdd(["prefetch"])
+  let queuedTerms = p.search("spelling:articles").dictDump()
+  let queuedDel = p.search("spelling:articles").dictDel(["prefetch"])
+  p.exec()?
+  println("${queuedAdd.get()?} added; ${len(queuedTerms.get()?)} terms; ${queuedDel.get()?} removed")
+  r.close()
+  return
+}
+```
+
+`dictAdd(terms)` (`FT.DICTADD`) counts new terms; repeated terms do not increase
+that count. `dictDel(terms)` (`FT.DICTDEL`) counts terms actually removed.
+`dictDump()` (`FT.DICTDUMP`) returns all terms without an ordering guarantee,
+accepting the RESP2 array and RESP3 set replies. The same methods on
+`SearchBatch` return futures. `tx.read.search(name).dictDump()` is allowed;
+queue dictionary writes through `tx.search(name)`.
+
 ## In a pipeline and in a transaction
 
 `p.search(index)` and `tx.search(index)` queue the same calls (a
