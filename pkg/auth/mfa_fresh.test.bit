@@ -1,0 +1,349 @@
+class FreshFactor {
+  label: string = "confirm"
+  accepted: bool = true
+  broken: bool
+  asked: int
+  user: string
+
+  export name(): string { return this.label }
+  export verify(c: Ctx, userId: string, input: string): bool! {
+    this.asked = this.asked + 1
+    this.user = userId
+    if (this.broken) {
+      fail newError("factor store down")
+    }
+    return this.accepted && input == "proof"
+  }
+}
+
+class FreshStore {
+  inner: MemoryStore
+  broken: bool
+  loadBroken: bool
+
+  export load(sid: string): Option<(map<string, string>, i64, map<string, string>)>! {
+    if (this.loadBroken) {
+      fail newError("session load down")
+    }
+    return this.inner.load(sid)?
+  }
+  export compareAndSet(
+    sid: string,
+    version: i64,
+    data: map<string, string>,
+    index: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    // This control rejects before persistence; commit-then-error is ambiguous.
+    if (this.broken) {
+      fail newError("session store down")
+    }
+    return this.inner.compareAndSet(sid, version, data, index, ttl)?
+  }
+  export rotate(
+    source: (string, i64),
+    destination: string,
+    data: map<string, string>,
+    index: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    return this.inner.rotate(source, destination, data, index, ttl)?
+  }
+  export destroy(sid: string, ttl: i64): ()! { this.inner.destroy(sid, ttl)? }
+  export destroyIndexed(key: string, value: string, except: string, ttl: i64): int! {
+    return this.inner.destroyIndexed(key, value, except, ttl)?
+  }
+}
+
+@json class FreshSeed {
+  at: string,
+  factor: string,
+  pending: bool,
+}
+
+fn freshState(c: Ctx): string! {
+  let session = c.session()?
+  return session.get(authenticatedAtKey) +
+    "\n" +
+    session.get(authenticatedFactorKey) +
+    "\n" +
+    session.id() +
+    "\n" +
+    session.get(identitySessionKey)
+}
+
+fn freshIdentity(): Identity {
+  return Identity{
+    id = "u1", claims = sampleClaims(), oidcIssuer = "https://issuer.example",
+    oidcSub = "provider-user", oidcSid = "provider-session",
+  }
+}
+
+fn freshApp(store: SessionStore, factor: SecondFactor, required: Option<SecondFactor>): App {
+  let app = App(Config{ secret = "test-secret", sessions = store })
+  app.post("/seed", (c) => {
+    let seed = c.body<FreshSeed>()?
+    bindSession(c, freshIdentity(), BindOptions{ second = seed.pending })?
+    let session = c.session()?
+    setFreshValue(session, authenticatedAtKey, seed.at)
+    setFreshValue(session, authenticatedFactorKey, seed.factor)
+    session.save()?
+    return c.text(freshState(c)?)
+  })
+  app.post("/empty-id", (c) => {
+    let session = c.session()?
+    session.set(identitySessionKey, encodeIdentity(Identity{ id = "", claims = sampleClaims() }))
+    writeFreshProof(session, factor.name())
+    session.save()?
+    return c.text(freshState(c)?)
+  })
+  app.post("/login", (c) => {
+    c.session()?.regenerate()?
+    bindSession(c, freshIdentity())?
+    return c.text(freshState(c)?)
+  })
+  app.get("/state", (c) => c.text(freshState(c)?))
+  app.post("/verify", (c) => {
+    let input = c.body<MfCode>()?
+    reauthenticate(c, factor, input.code)?
+    return c.text(freshState(c)?)
+  })
+  app.post("/pending", (c) => {
+    bindSession(c, freshIdentity(), BindOptions{ second = true })?
+    return c.text(freshState(c)?)
+  })
+  app.post("/complete", (c) => {
+    let _ = completeSecondFactor(c, factor, "proof")?
+    return c.text(freshState(c)?)
+  })
+  let guarded = app.group("/protected")
+  guarded.use(requireAuth([]Strategy{ MfReader{ label = "cached" } }))
+  guarded.use(requireFresh(300, required))
+  guarded.get("/", (c) => c.text("ok"))
+  let direct = app.group("/fresh")
+  direct.use(requireFresh(300, required))
+  direct.get("/", (c) => c.text("ok"))
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  return app
+}
+
+fn freshSeed(app: App, at: string, factor: string = "", pending: bool = false): (string, string) {
+  let body = jsonEncode(
+    Json.JsonObject(
+      []JsonEntry{
+        JsonEntry{ key = "at", value = Json.JsonString(at) },
+        JsonEntry{ key = "factor", value = Json.JsonString(factor) },
+        JsonEntry{ key = "pending", value = Json.JsonBool(pending) },
+      },
+    ),
+  )
+  let response = app.handle(mfReq("POST", "/seed", "", body))
+  assert(response.status == 200, "seed: ${response.body}")
+  return (mfCookie(response), response.body)
+}
+
+fn freshTestApp(factor: SecondFactor, required: Option<SecondFactor> = Option.None): App {
+  return freshApp(MemoryStore(100), factor, required)
+}
+
+fn freshVerify(app: App, cookie: string, input: string = "proof"): Response {
+  return app.handle(mfReq("POST", "/verify", cookie, "{\"code\":\"${input}\"}"))
+}
+
+test "fresh proof accepts the exact maxAge boundary" {
+  assert(freshProofAt("1000", 1300, 300), "maxAge is inclusive")
+  assert(freshProofAt("1000", 1000, 0), "same-second proof at zero age")
+}
+
+test "fresh proof refuses one second beyond maxAge" {
+  assert(!freshProofAt("1000", 1301, 300), "maxAge+1 refuses")
+}
+
+test "fresh proof refuses missing malformed and negative timestamps" {
+  for raw of ["", "bad", "-1", "999999999999999999999999"] {
+    assert(!freshProofAt(raw, 1300, 300), "invalid proof ${raw}")
+  }
+}
+
+test "fresh proof refuses future time and negative age" {
+  assert(!freshProofAt("1301", 1300, 300), "future proof")
+  assert(!freshProofAt("1000", 1300, -1), "negative age")
+}
+
+test "fresh middleware cannot renew stale proof through repeated requireAuth rebinds" {
+  let app = freshTestApp(FreshFactor{})
+  let (cookie, before) = freshSeed(app, "1")
+  let unregistered = app.handle(mfReq("GET", "/protected/", cookie, ""))
+  assert(unregistered.status == 404, "original trailing-slash fixture is a route miss")
+  for _ of [1, 2, 3] {
+    let response = app.handle(mfReq("GET", "/protected", cookie, ""))
+    assert(
+      response.status == 401 && contains(response.body, reauthenticationCode),
+      "stale cached identity",
+    )
+    assert(
+      app.handle(mfReq("GET", "/state", cookie, "")).body == before,
+      "request preserved age and identity",
+    )
+  }
+}
+
+test "fresh explicit verified login renews proof for the same user" {
+  let app = freshTestApp(FreshFactor{})
+  let (cookie, _) = freshSeed(app, "1", "old-factor")
+  let logged = app.handle(mfReq("POST", "/login", cookie, ""))
+  let current = mfCookie(logged)
+  assert(logged.status == 200 && split(logged.body, "\n")[0] != "1", "new proof recorded")
+  assert(app.handle(mfReq("GET", "/protected", current, "")).status == 200, "new proof is fresh")
+  assert(split(logged.body, "\n")[1] == "", "password login clears old factor assurance")
+}
+
+test "fresh required factor refuses a different recent proof" {
+  let factor = FreshFactor{}
+  let app = freshTestApp(factor, Option<SecondFactor>.Some(factor))
+  let (cookie, _) = freshSeed(app, "${now().ns / Second}", "other")
+  assert(app.handle(mfReq("GET", "/protected", cookie, "")).status == 401, "wrong factor")
+  assert(factor.asked == 0, "middleware does not verify input")
+}
+
+test "fresh required factor cannot use an empty name as first-factor assurance" {
+  let factor = FreshFactor{ label = "" }
+  let app = freshTestApp(factor, Option<SecondFactor>.Some(factor))
+  let (cookie, _) = freshSeed(app, "${now().ns / Second}")
+  assert(app.handle(mfReq("GET", "/fresh", cookie, "")).status == 401, "empty required factor")
+  assert(freshVerify(app, cookie).status == 500, "invalid factor cannot reauthenticate")
+  assert(factor.asked == 0, "invalid name refuses before verification")
+}
+
+test "fresh matching factor passes without changing proof or invoking the verifier" {
+  let factor = FreshFactor{}
+  let app = freshTestApp(factor, Option<SecondFactor>.Some(factor))
+  let (cookie, before) = freshSeed(app, "${now().ns / Second}", factor.name())
+  assert(app.handle(mfReq("GET", "/protected", cookie, "")).status == 200, "matching factor")
+  assert(app.handle(mfReq("GET", "/state", cookie, "")).body == before, "proof unchanged")
+  assert(factor.asked == 0, "no implicit verifier or request-body consumption")
+}
+
+test "fresh middleware and reauthentication refuse pending or missing identities" {
+  let factor = FreshFactor{}
+  let app = freshTestApp(factor)
+  let missing = app.handle(mfReq("GET", "/fresh", "", ""))
+  assert(missing.status == 401 && contains(missing.body, reauthenticationCode), "missing identity")
+  let (cookie, _) = freshSeed(app, "${now().ns / Second}", "confirm", true)
+  assert(app.handle(mfReq("GET", "/fresh", cookie, "")).status == 401, "pending identity")
+  assert(
+    freshVerify(app, cookie).status == 401 && factor.asked == 0,
+    "pending proof cannot promote",
+  )
+}
+
+test "fresh wrong proof leaves exact timestamp identity and session id unchanged" {
+  let factor = FreshFactor{ accepted = false }
+  let app = freshTestApp(factor)
+  let (cookie, before) = freshSeed(app, "1", "previous")
+  assert(freshVerify(app, cookie).status == 401, "wrong proof")
+  assert(app.handle(mfReq("GET", "/state", cookie, "")).body == before, "failure preserves state")
+}
+
+test "fresh verifier store failure leaves the old proof unchanged" {
+  let app = freshTestApp(FreshFactor{ broken = true })
+  let (cookie, before) = freshSeed(app, "1", "previous")
+  assert(freshVerify(app, cookie).status == 500, "verifier store error")
+  assert(app.handle(mfReq("GET", "/state", cookie, "")).body == before, "error preserves state")
+}
+
+test "fresh successful reauthentication keeps identity provenance and sid" {
+  let factor = FreshFactor{}
+  let app = freshTestApp(factor, Option<SecondFactor>.Some(factor))
+  let (cookie, before) = freshSeed(app, "1")
+  let response = freshVerify(app, cookie)
+  assert(response.status == 200 && mfCookie(response) == "", "reauthentication does not rotate")
+  let old = split(before, "\n")
+  let current = split(response.body, "\n")
+  assert(current[0] != "1" && current[1] == factor.name(), "verified proof metadata")
+  assert(current[2] == old[2] && current[3] == old[3], "same sid and identity encoding")
+  assert(factor.asked == 1 && factor.user == "u1", "verifier received the current identity")
+  assert(app.handle(mfReq("GET", "/protected", cookie, "")).status == 200, "proof now authorizes")
+}
+
+test "fresh pending bind clears proof and second-factor completion records the verified factor" {
+  let factor = FreshFactor{}
+  let app = freshTestApp(factor, Option<SecondFactor>.Some(factor))
+  let (cookie, _) = freshSeed(app, "1", "previous")
+  let pending = app.handle(mfReq("POST", "/pending", cookie, ""))
+  assert(
+    split(pending.body, "\n")[0] == "" && split(pending.body, "\n")[1] == "",
+    "pending clears proof",
+  )
+  let done = app.handle(mfReq("POST", "/complete", cookie, ""))
+  assert(done.status == 200 && split(done.body, "\n")[1] == factor.name(), "second factor recorded")
+  let current = mfCookie(done)
+  assert(current != "" && current != cookie, "second-factor promotion still rotates once")
+  assert(
+    app.handle(mfReq("GET", "/protected", current, "")).status == 200,
+    "factor-specific freshness",
+  )
+}
+
+test "fresh session persistence failure cannot autosave new proof metadata" {
+  let store = FreshStore{ inner = MemoryStore(100) }
+  let app = freshApp(store, FreshFactor{}, Option<SecondFactor>.None)
+  let (cookie, before) = freshSeed(app, "1", "previous")
+  store.broken = true
+  assert(freshVerify(app, cookie).status == 500, "session save failed")
+  store.broken = false
+  assert(
+    app.handle(mfReq("GET", "/state", cookie, "")).body == before,
+    "old proof remains persisted",
+  )
+}
+
+test "fresh exports refuse a stored identity with an empty subject" {
+  let factor = FreshFactor{}
+  let app = freshTestApp(factor)
+  let seeded = app.handle(mfReq("POST", "/empty-id", "", ""))
+  assert(seeded.status == 200, "corrupt identity fixture persisted")
+  let cookie = mfCookie(seeded)
+  let guarded = app.handle(mfReq("GET", "/fresh", cookie, ""))
+  assert(
+    guarded.status == 401 && contains(guarded.body, reauthenticationCode),
+    "empty subject refused",
+  )
+  let reauth = freshVerify(app, cookie)
+  assert(
+    reauth.status == 401 && contains(reauth.body, reauthenticationCode),
+    "empty subject cannot confirm",
+  )
+  assert(factor.asked == 0, "invalid subject refused before verifier")
+  assert(
+    app.handle(mfReq("GET", "/state", cookie, "")).body == seeded.body,
+    "invalid proof unchanged",
+  )
+}
+
+test "fresh reauthentication maps a missing identity to the step-up response" {
+  let factor = FreshFactor{}
+  let app = freshTestApp(factor)
+  let response = freshVerify(app, "")
+  assert(
+    response.status == 401 && contains(response.body, reauthenticationCode),
+    "missing identity refused",
+  )
+  assert(factor.asked == 0, "missing subject never reaches verifier")
+}
+
+test "fresh exports preserve session-load infrastructure failures" {
+  let store = FreshStore{ inner = MemoryStore(100) }
+  let factor = FreshFactor{}
+  let app = freshApp(store, factor, Option<SecondFactor>.None)
+  let (cookie, _) = freshSeed(app, "1")
+  store.loadBroken = true
+  assert(
+    app.handle(mfReq("GET", "/fresh", cookie, "")).status == 500,
+    "load failure is a service error",
+  )
+  assert(freshVerify(app, cookie).status == 500, "confirmation preserves load failure")
+  assert(factor.asked == 0, "failed load never reaches verifier")
+}

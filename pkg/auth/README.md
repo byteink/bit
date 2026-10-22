@@ -165,6 +165,10 @@ protected route that is not itself doing the authenticating just reads
   without a `LoginThrottle`), regenerates the session id and promotes the
   identity; the pending state expires after `pendingTtl` (300 seconds); see
   [Two-factor authentication with TOTP](docs/totp.md).
+- `requireFresh`, `reauthenticate` - guard a sensitive action with a recent
+  verified proof, optionally from a named second factor, and confirm a new
+  proof without changing the current identity or session id; see
+  [Confirm an author before a sensitive change](docs/mfa.md).
 - `WebAuthn`, `RelyingParty`, `UserEntity`, `WebAuthnOptions`, `UserVerification`,
   `ResidentKey`, `Attachment`, `AttestationConveyance`, `Credential`,
   `CredentialStore`, `MemoryCredentialStore` - passkey registration: `WebAuthn(rp,
