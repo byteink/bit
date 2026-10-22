@@ -1,0 +1,292 @@
+import { OneTimeTokens, OneTimeOptions, Live, InvalidToken } from "auth"
+
+class AccountTokenFixture {
+  db: Db,
+  store: InkwellOneTimeStore,
+  user: User,
+}
+
+fn accountTokenUser(db: Db): User {
+  let name = uniqueName("account-token")
+  return insertUser(db, name, "${name}@example.test", "unused", "author") catch e {
+    panic(e.message())
+  }
+}
+
+fn accountTokenFixture(): AccountTokenFixture {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let db = open(cfg.databaseUrl) catch e {
+    panic(e.message())
+  }
+  return AccountTokenFixture{
+    db = db,
+    store = InkwellOneTimeStore(db),
+    user = accountTokenUser(db),
+  }
+}
+
+fn accountTokenHash(value: string): string {
+  return cacheHex(cacheDigest(CacheSha256(), []byte(value)))
+}
+
+fn accountTokenSample(user: User, purpose: string = "verify-email"): OneTimeRecord {
+  return OneTimeRecord{
+    subject = "${user.id}", purpose = purpose, expiresAt = 1000, data = user.email,
+  }
+}
+
+fn accountTokenInvalid(tokens: OneTimeTokens, token: string, purpose: string) {
+  tokens.redeem(token, purpose) catch e {
+    let (_, invalid) = e.(InvalidToken)
+    assert(invalid, "token refusal must be InvalidToken")
+    return
+  }
+  panic("account token unexpectedly redeemed")
+}
+
+test "account tokens persist only the digest and redeem once" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let tokens = OneTimeTokens(f.store, OneTimeOptions{ clock = () => 100 }) catch e {
+    panic(e.message())
+  }
+  let token = tokens.issue("verify-email", "${f.user.id}", 10, f.user.email, live = Live.One) catch e {
+    panic(e.message())
+  }
+  let rows = f.db.table<AccountTokenRow>().where("userId", f.user.id).all() catch e {
+    panic(e.message())
+  }
+  assert(len(rows) == 1, "one digest row")
+  assert(rows[0].tokenHash == accountTokenHash(token), "stored SHA-256 digest")
+  assert(!contains(rows[0].data, token), "raw token must not be stored in record metadata")
+  let rec = tokens.redeem(token, "verify-email") catch e {
+    panic(e.message())
+  }
+  assert(rec.subject == "${f.user.id}" && rec.data == f.user.email, "account binding")
+  accountTokenInvalid(tokens, token, "verify-email")
+}
+
+test "account tokens retain purpose and exact expiry boundaries" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let at = []i64{ 100 }
+  let tokens = OneTimeTokens(f.store, OneTimeOptions{ clock = () => at[0] }) catch e {
+    panic(e.message())
+  }
+  let valid = tokens.issue("verify-email", "${f.user.id}", 10) catch e {
+    panic(e.message())
+  }
+  at[0] = 109
+  tokens.redeem(valid, "verify-email") catch e {
+    panic(e.message())
+  }
+  at[0] = 100
+  let expired = tokens.issue("verify-email", "${f.user.id}", 10) catch e {
+    panic(e.message())
+  }
+  at[0] = 110
+  accountTokenInvalid(tokens, expired, "verify-email")
+  let wrong = tokens.issue("verify-email", "${f.user.id}", 10) catch e {
+    panic(e.message())
+  }
+  accountTokenInvalid(tokens, wrong, "password-reset")
+  accountTokenInvalid(tokens, wrong, "verify-email")
+}
+
+fn accountTokenPutRejected(f: AccountTokenFixture, hash: string, subject: string) {
+  let rec = accountTokenSample(f.user)
+  rec.subject = subject
+  f.store.put(hash, rec, 10) catch _ {
+    return
+  }
+  panic("account token store accepted an invalid hash or account")
+}
+
+test "account tokens reject raw hashes and nonexistent or noncanonical accounts" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  for hash of [
+    "",
+    "plaintext-token",
+    "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+  ] {
+    accountTokenPutRejected(f, hash, "${f.user.id}")
+  }
+  for subject of ["", "0", "-1", "0${f.user.id}", "9223372036854775807"] {
+    accountTokenPutRejected(f, accountTokenHash("refused"), subject)
+  }
+  let count = f.db.table<AccountTokenRow>().where("userId", f.user.id).count() catch e {
+    panic(e.message())
+  }
+  assert(count == 0, "invalid inputs must leave no records")
+}
+
+fn accountTokenTakeWorker(
+  store: InkwellOneTimeStore,
+  hash: string,
+  wins: chan<int>,
+  wg: WaitGroup,
+) {
+  defer wg.done()
+  let rec = store.take(hash) catch _ {
+    wins <- -1
+    return
+  }
+  let result = 0
+  if (isSome(rec)) {
+    result = 1
+  }
+  wins <- result
+}
+
+test "account tokens allow exactly one concurrent take" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let hash = accountTokenHash("${f.user.id}-take")
+  f.store.put(hash, accountTokenSample(f.user), 10) catch e {
+    panic(e.message())
+  }
+  let wins = chan<int>(8)
+  let wg = WaitGroup()
+  wg.add(8)
+  let i = 0
+  while (i < 8) {
+    spawn accountTokenTakeWorker(f.store, hash, wins, wg)
+    i = i + 1
+  }
+  wg.wait()
+  let count = 0
+  i = 0
+  while (i < 8) {
+    let result = <- wins
+    assert(result >= 0, "concurrent take must not fail")
+    count = count + result
+    i = i + 1
+  }
+  assert(count == 1, "concurrent take must have one winner")
+}
+
+fn accountTokenReplaceWorker(
+  store: InkwellOneTimeStore, hash: string, rec: OneTimeRecord, errors: chan<bool>, wg: WaitGroup,
+) {
+  defer wg.done()
+  store.replace(hash, rec, 10) catch _ {
+    errors <- true
+    return
+  }
+  errors <- false
+}
+
+test "account tokens serialize concurrent replacement and preserve other purposes" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let other = accountTokenHash("${f.user.id}-other-purpose")
+  f.store.put(other, accountTokenSample(f.user, "password-reset"), 10) catch e {
+    panic(e.message())
+  }
+  let errors = chan<bool>(8)
+  let wg = WaitGroup()
+  wg.add(8)
+  let i = 0
+  while (i < 8) {
+    spawn accountTokenReplaceWorker(
+      f.store, accountTokenHash("${f.user.id}-replace-${i}"), accountTokenSample(f.user), errors, wg,
+    )
+    i = i + 1
+  }
+  wg.wait()
+  i = 0
+  while (i < 8) {
+    assert(!<- errors, "replacement must not fail")
+    i = i + 1
+  }
+  let count = f.db.table<AccountTokenRow>().where("userId", f.user.id).where(
+    "purpose",
+    "verify-email",
+  ).count() catch e {
+    panic(e.message())
+  }
+  assert(count == 1, "concurrent replacements must leave exactly one token")
+  let preserved = f.store.take(other) catch e {
+    panic(e.message())
+  }
+  assert(isSome(preserved), "replacement must preserve another purpose")
+}
+
+test "account tokens roll back replacement when the new hash collides" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let old = accountTokenHash("${f.user.id}-old")
+  let collision = accountTokenHash("${f.user.id}-collision")
+  let other = accountTokenUser(f.db)
+  f.store.put(old, accountTokenSample(f.user), 10) catch e {
+    panic(e.message())
+  }
+  f.store.put(collision, accountTokenSample(other), 10) catch e {
+    panic(e.message())
+  }
+  let failed = false
+  f.store.replace(collision, accountTokenSample(f.user), 10) catch _ {
+    failed = true
+  }
+  assert(failed, "duplicate digest must fail replacement")
+  let before = f.store.take(old) catch e {
+    panic(e.message())
+  }
+  let untouched = f.store.take(collision) catch e {
+    panic(e.message())
+  }
+  assert(isSome(before), "failed replacement must preserve old token")
+  assert(isSome(untouched) && unwrap(untouched).subject == "${other.id}", "other account preserved")
+}
+
+fn accountTokenOperation(f: AccountTokenFixture, operation: int, hash: string): ()! {
+  if (operation == 0) {
+    f.store.put(hash, accountTokenSample(f.user), 10)?
+    return
+  }
+  if (operation == 1) {
+    f.store.replace(hash, accountTokenSample(f.user), 10)?
+    return
+  }
+  f.store.revokeSubject("verify-email", "${f.user.id}")?
+}
+
+fn accountTokenLockedWorker(
+  f: AccountTokenFixture, operation: int, started: chan<bool>, finished: AtomicI64, wg: WaitGroup,
+) {
+  defer wg.done()
+  started <- true
+  let hash = accountTokenHash("${f.user.id}-lock-${operation}")
+  accountTokenOperation(f, operation, hash) catch e {
+    panic(e.message())
+  }
+  finished.store(1)
+}
+
+test "account tokens put replace and revoke wait for the account row lock" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let operation = 0
+  while (operation < 3) {
+    let started = chan<bool>(1)
+    let finished = AtomicI64(0)
+    let wg = WaitGroup()
+    wg.add(1)
+    f.db.tx((tx) => {
+      let locked = tx.table<User>().lock().find(f.user.id)?
+      assert(locked.id == f.user.id, "fixture user exists")
+      spawn accountTokenLockedWorker(f, operation, started, finished, wg)
+      let _ = <- started
+      sleep(50 * Millisecond)
+      assert(finished.load() == 0, "store mutation must wait for account lock")
+    }) catch e {
+      panic(e.message())
+    }
+    wg.wait()
+    assert(finished.load() == 1, "mutation must complete after account lock releases")
+    operation = operation + 1
+  }
+}
