@@ -1,0 +1,214 @@
+import { Guard, GuardOp, GuardFilter, Options, open as ormOpen } from "orm"
+import { env } from "std/os"
+import { contains } from "std/strings"
+
+@table("guard_docs") class SgDoc {
+  @id
+  id: i64
+  author: string
+  note: Option<string>
+}
+
+@table("guard_docs") class SgAlias {
+  @id
+  id: i64
+}
+
+class SgUser { export id: string, export roles: []string }
+class SgActor { export id: string }
+enum SgMissing { Read, Create, Update }
+
+fn sgUser(id: string = "sara"): SgUser {
+  return SgUser{ id = id, roles = ["author"] }
+}
+
+fn sgAuth(c: Cond = eq("author", Value.Text("sara"))): Authz<Action>! {
+  let a = Authz<Action>()?
+  a.resource<SgDoc>()?
+  a.role<SgUser>(
+    "author",
+    [
+      Policy<SgUser, Action>("Own", (p, user) => {
+        p.can<SgDoc>([Action.Manage], c)
+      }),
+    ],
+  )?
+  return a
+}
+
+fn sgSql(g: Guard, d: ServerDialect, first: int): SqlFragment! {
+  match (g.filter(sgUser(), GuardOp.Read, "guard_docs", d, first)?) {
+    Sql(sql, args) => return SqlFragment{ sql = sql, args = args }
+    _ => {}
+  }
+  fail newError("expected scoped SQL")
+}
+
+fn sgRow(author: string, note: Option<string> = Option<string>.None): SgDoc {
+  return SgDoc{ id = 1, author = author, note = note }
+}
+
+fn sgAllows(g: Guard, op: GuardOp, row: SgDoc): bool! {
+  return g.allows(sgUser(), op, "guard_docs", ["id", "author", "note"], row.__values())?
+}
+
+fn sgTest1(): ()! {
+  let a = sgAuth()?
+  let g: Guard = OrmGuard<Action>(a)?
+  assert(g.protects("guard_docs") && !g.protects("other"), "registration opts tables in")
+  g.check()?
+  a.check(Option<Subject>.Some(sgUser()), Action.Read, sgRow("sara"))?
+  for op of [GuardOp.Read, GuardOp.Create, GuardOp.Update, GuardOp.Delete] {
+    assert(sgAllows(g, op, sgRow("sara"))?, "owner allowed for ${guardAction(op)}")
+    assert(!sgAllows(g, op, sgRow("bob"))?, "foreign row denied for ${guardAction(op)}")
+  }
+  let pg = sgSql(g, csPg(), 3)?
+  let my = sgSql(g, csMy(), 7)?
+  assert(contains(pg.sql, "\"author\" = $3"), pg.sql)
+  assert(contains(my.sql, "`author` = $7"), my.sql)
+  assert(csArgs(my) == "T:sara", "one bound value")
+  assert(g.denied(sgUser(), GuardOp.Update, "guard_docs").message() == "forbidden", "redacted")
+  assert(g.notFound("guard_docs").message() == "not found", "hidden row")
+}
+
+fn sgTest2(): ()! {
+  let a = sgAuth(not(eq("note", Value.Text("private"))))?
+  let g = OrmGuard<Action>(a)?
+  assert(!sgAllows(g, GuardOp.Create, sgRow("sara"))?, "unknown does not grant")
+  assert(sgAllows(g, GuardOp.Create, sgRow("sara", Option.Some("public")))?, "known allows")
+  let guest = g.filter(SgActor{ id = "" }, GuardOp.Read, "guard_docs", csPg(), 1)?
+  let noGuest = match (guest) {
+    None => true
+    _ => false
+  }
+  assert(noGuest, "guest gets no subject roles")
+  let rejected = 0
+  let actors: []Actor = [SgActor{ id = "sara" }, sgUser("")]
+  for actor of actors {
+    let _ = g.filter(actor, GuardOp.Read, "guard_docs", csPg(), 1) catch _ {
+      rejected = rejected + 1
+      GuardFilter.None
+    }
+  }
+  assert(rejected == 2, "invalid actors fail closed")
+}
+
+fn sgTest3(): ()! {
+  let a = sgAuth()?
+  let g = OrmGuard<Action>(a)?
+  let rejected = false
+  let _ = g.allows(
+    sgUser(),
+    GuardOp.Create,
+    "guard_docs",
+    ["author", "id", "note"],
+    sgRow("sara").__values(),
+  ) catch _ {
+    rejected = true
+    false
+  }
+  assert(rejected, "out-of-order columns rejected")
+  let missing = Authz<SgMissing>()?
+  missing.resource<SgDoc>()?
+  rejected = false
+  let _ = OrmGuard<SgMissing>(missing) catch _ {
+    rejected = true
+    OrmGuard<SgMissing>{ authz = missing }
+  }
+  assert(rejected, "missing Delete rejected")
+  a.resource<SgAlias>()?
+  rejected = false
+  g.check() catch _ {
+    rejected = true
+  }
+  assert(rejected && g.protects("guard_docs"), "ambiguous registration cannot bypass guard")
+  let fresh = sgAuth()?
+  let down = OrmGuard<Action>(fresh)?
+  fresh.storeSync.down.store(1)
+  rejected = false
+  down.check() catch _ {
+    rejected = true
+  }
+  assert(rejected, "store outage refused at startup")
+}
+
+fn sgTest4(): ()! {
+  let c = Cond.Related("id", "SgDoc", "editor")
+  let a = sgAuth()?
+  let g = OrmGuard<Action>(a)?
+  for blocked of [
+    Cond.Not(c),
+    Cond.Known(c),
+    Cond.Or([Cond.True, c]),
+    custom<SgDoc>("code", (row) => true),
+  ] {
+    let slot = slotFor<Action>(a, Option<Subject>.Some(sgUser()), "SgDoc", Action.Read)
+    slot.rules[0].cond = blocked
+    let rejected = false
+    let _ = g.filter(sgUser(), GuardOp.Read, "guard_docs", csPg(), 1) catch _ {
+      rejected = true
+      GuardFilter.None
+    }
+    assert(rejected, "unsupported matching rule must not be optimized away")
+    slot.rules[0].cond = eq("author", Value.Text("sara"))
+  }
+}
+
+fn sgTest5(): ()! {
+  let uri = env("AUTHZ_TEST_LIVE_PG_URI")
+  if (uri == "") {
+    print("skipped: AUTHZ_TEST_LIVE_PG_URI is unset")
+    return
+  }
+  let a = sgAuth()?
+  let g: Guard = OrmGuard<Action>(a)?
+  let db = ormOpen(uri, Options{ authz = Option.Some(g) })?
+  defer db.pool.close()
+  db.exec("drop table if exists guard_docs")?
+  db.exec("create table guard_docs (id bigint generated by default as identity (start with 3) primary key, author text not null, note text)")?
+
+  db.exec("insert into guard_docs values (1, 'sara', null), (2, 'bob', null)")?
+  let scoped = db.as(sgUser()).table<SgDoc>()
+  let rows = scoped.all()?
+  assert(len(rows) == 1 && rows[0].author == "sara", "only permitted rows returned")
+  let denied = false
+  let _ = scoped.insert(SgDoc{ id = 3, author = "bob" }) catch _ {
+    denied = true
+    sgRow("bob")
+  }
+  assert(denied, "foreign insert denied before SQL")
+  let inserted = scoped.insert(SgDoc{ id = 3, author = "sara" })?
+  assert(inserted.id == 3 && len(scoped.all()?) == 2, "allowed insert remains visible")
+  assert(len(db.asGuest().table<SgDoc>().all()?) == 0, "guest list denied")
+  db.exec("drop table guard_docs")?
+}
+
+test "ORM guard maps all CRUD actions and both SQL dialects without renaming row check" {
+  sgTest1() catch e {
+    panic(e.message())
+  }
+}
+
+test "ORM guard preserves default denial, NULL and guest identity boundaries" {
+  sgTest2() catch e {
+    panic(e.message())
+  }
+}
+
+test "ORM guard checks row shape, action setup, ambiguous resources and store outage" {
+  sgTest3() catch e {
+    panic(e.message())
+  }
+}
+
+test "ORM guard refuses unsupported matching conditions before folding" {
+  sgTest4() catch e {
+    panic(e.message())
+  }
+}
+
+test "ORM guard live PostgreSQL scopes reads and denies writes" {
+  sgTest5() catch e {
+    panic(e.message())
+  }
+}
