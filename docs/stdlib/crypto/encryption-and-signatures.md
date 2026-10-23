@@ -512,13 +512,39 @@ Signs `message` with `priv` using PSS padding and the hash `alg` names, with a `
 
 Checks a PSS signature `sig` of `message` under public key `pub`, with a `saltLen`-byte salt.
 
-### `rsaEncryptOaep(pub: RsaPublicKey, alg: HashAlg, message: []byte, label: []byte): []byte!`
+### `rsaEncryptOaep(pub: RsaPublicKey, alg: HashAlg, message: []byte, label: []byte, mgfAlg: Option<HashAlg> = Option.None): []byte!`
 
 Encrypts `message` to public key `pub` using OAEP padding and the hash `alg` names. `label` binds the ciphertext to a context; pass an empty slice when there is none. Prefer an AEAD cipher for new data; RSA encryption is for interop or wrapping a small key.
 
-### `rsaDecryptOaep(priv: RsaPrivateKey, alg: HashAlg, ciphertext: []byte, label: []byte): []byte!`
+### `rsaDecryptOaep(priv: RsaPrivateKey, alg: HashAlg, ciphertext: []byte, label: []byte, mgfAlg: Option<HashAlg> = Option.None): []byte!`
 
 Decrypts `ciphertext` with private key `priv` using OAEP padding, the inverse of `rsaEncryptOaep`. Fails on a mismatched `label` or malformed ciphertext.
+
+Both functions use `alg` for the label hash, seed length, and message limit.
+Omit `mgfAlg` (or pass `Option.None`) to keep MGF1 on `alg`, as existing callers do.
+Pass `Option.Some(HashAlg.Sha1)` for SHA-256 OAEP with MGF1 SHA-1, required by some
+[XML Encryption profiles](https://www.w3.org/TR/xmlenc-core1/#sec-RSA-OAEP).
+[RFC 8017 section 7.1](https://www.rfc-editor.org/rfc/rfc8017#section-7.1) defines these choices separately.
+
+Wrap a small key for a peer that selects those mixed hashes. Read its key from your
+key store. This example expects an unencrypted PKCS#8 DER file.
+
+```bit
+import { readFile } from "std/fs"
+import { rsaParsePrivateKey, RsaPublicKey, HashAlg, rsaEncryptOaep, rsaDecryptOaep, ctEq } from "std/crypto"
+
+fn main(): ()! {
+  let privateKey = rsaParsePrivateKey([]byte(readFile("recipient.pk8")?))?
+  let publicKey = RsaPublicKey{ n = privateKey.n, e = privateKey.e }
+  let secret = []byte{ 0, 1, 2, 3 }
+  let label = []byte(0)
+  let mgf: Option<HashAlg> = Option.Some(HashAlg.Sha1)
+  let ciphertext = rsaEncryptOaep(publicKey, HashAlg.Sha256, secret, label, mgf)?
+  let plaintext = rsaDecryptOaep(privateKey, HashAlg.Sha256, ciphertext, label, mgf)?
+  assert(ctEq(plaintext, secret), "wrapped key round trip")
+}
+```
+
 
 ### `rsaEncryptPkcs1v15(pub: RsaPublicKey, message: []byte): []byte!`
 
