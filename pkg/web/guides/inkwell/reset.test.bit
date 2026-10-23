@@ -1,0 +1,406 @@
+import { ClaimedJob } from "jobs"
+
+fn resetPost(app: App, token: string, password: string = "new-password-123"): Response {
+  return app.handle(
+    jsonReq(
+      "POST",
+      "/v1/auth/reset-password",
+      "",
+      "{\"token\":\"${token}\",\"password\":\"${password}\"}",
+    ),
+  )
+}
+
+fn resetIssue(
+  f: AccountTokenFixture,
+  purpose: string = "password-reset",
+  address: string = "",
+): string {
+  let data = address
+  if (data == "") {
+    data = f.user.email
+  }
+  let tokens = OneTimeTokens(f.store) catch e {
+    panic(e.message())
+  }
+  return tokens.issue(purpose, "${f.user.id}", 3600, data) catch e {
+    panic(e.message())
+  }
+}
+
+fn resetAssertUnchanged(f: AccountTokenFixture) {
+  let user = findUserById(f.db, f.user.id) catch e {
+    panic(e.message())
+  }
+  assert(user.passwordHash == f.user.passwordHash, "invalid reset must preserve credentials")
+}
+
+fn resetQueue(cfg: AppConfig, redis: RedisClient, db: Db, prefix: string): Queue! {
+  let q = openJobs(
+    RedisStore(redis, prefix = prefix)?,
+    JobOptions{
+      workers = 1, locker = RedisLocker(redis, prefix = prefix)?,
+    },
+  )?
+  q.register<SendPasswordResetEmail>((job) => deliverPasswordReset(db, cfg, job))?
+  return q
+}
+
+test "forgot password queues identical jobs and responses for known and unknown accounts" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  cfg.smtpHost = "127.0.0.1"
+  cfg.resetPasswordUrl = "https://inkwell.example.test/reset"
+  let redis = openRedis(cfg.redisUrl) catch e {
+    panic(e.message())
+  }
+  defer redis.close()
+  let prefix = "{reset-${uniqueName("queue")}}"
+  let queue = resetQueue(cfg, redis, f.db, prefix) catch e {
+    panic(e.message())
+  }
+  let app = App(Config{ secret = "reset", sessions = MemoryStore(100) })
+  mountAuth(app, f.db, cfg, queue) catch e {
+    panic(e.message())
+  }
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  let unknown = "${uniqueName("unknown")}@example.test"
+  let first = app.handle(
+    jsonReq("POST", "/auth/forgot-password", "", "{\"email\":\"${f.user.email}\"}"),
+  )
+  let second = app.handle(jsonReq("POST", "/auth/forgot-password", "", "{\"email\":\"${unknown}\"}"))
+  assert(
+    first.status == 204 && second.status == first.status && first.body == second.body,
+    "indistinguishable acceptance",
+  )
+  let store = RedisStore(redis, prefix = prefix) catch e {
+    panic(e.message())
+  }
+  for email of [f.user.email, unknown] {
+    let job = resetClaim(store)
+    assert(job.name == "send-password-reset-email", "same job type")
+    assert(job.payload == "{\"email\":\"${email}\"}", "same payload shape without token or user id")
+    store.complete(job.id) catch e {
+      panic(e.message())
+    }
+  }
+  assert(
+      (f.db.table<AccountTokenRow>().where("userId", f.user.id).count() catch e {
+        panic(e.message())
+      }) ==
+      0,
+    "HTTP route must not issue tokens",
+  )
+}
+
+test "reset worker sends the queued recipient a digest-backed one-hour token" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let capture = beginMailCapture(false) catch e {
+    panic(e.message())
+  }
+  defer capture.listener.close()
+  let cfg = capturedMailConfig(capture) catch e {
+    panic(e.message())
+  }
+  let redis = openRedis(cfg.redisUrl) catch e {
+    panic(e.message())
+  }
+  defer redis.close()
+  let queue = resetQueue(cfg, redis, f.db, "{reset-${uniqueName("mail")}}") catch e {
+    panic(e.message())
+  }
+  queue.enqueue(SendPasswordResetEmail{ email = f.user.email }, 0, 1) catch e {
+    panic(e.message())
+  }
+  queue.start()
+  defer queue.stop()
+  let sent = finishMailCapture(capture)
+  queue.stop()
+  assert(contains(sent, "RCPT TO:<${f.user.email}>"), "reset recipient")
+  assert(contains(sent, "Subject: Reset your Inkwell password"), "reset subject")
+  let start = indexOf(sent, "?token=")
+  assert(start >= 0 && start + 50 <= len(sent), "reset mail token")
+  let token = sent[start + 7:start + 50]
+  let rows = f.db.table<AccountTokenRow>().where("userId", f.user.id).all() catch e {
+    panic(e.message())
+  }
+  assert(len(rows) == 1 && rows[0].tokenHash == accountTokenHash(token), "digest-only persistence")
+  assert(
+    rows[0].data == f.user.email && !contains(rows[0].data, token),
+    "bound email excludes bearer",
+  )
+  let ttl = rows[0].expiresAt - i64(now().ns / Second)
+  assert(ttl > 3500 && ttl <= 3600, "one-hour expiry")
+  assert(resetPost(testApp(), token).status == 204, "mailed token is usable")
+}
+
+test "reset worker ignores an unknown address without minting a token or sending mail" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let before = f.db.table<AccountTokenRow>().count() catch e {
+    panic(e.message())
+  }
+  deliverPasswordReset(
+    f.db,
+    cfg,
+    SendPasswordResetEmail{ email = "${uniqueName("missing")}@example.test" },
+  ) catch e {
+    panic(e.message())
+  }
+  assert(
+      (f.db.table<AccountTokenRow>().count() catch e {
+        panic(e.message())
+      }) ==
+      before,
+    "unknown issues no token",
+  )
+}
+
+test "reset changes only the bound account and accepts new credentials instead of old" {
+  let app = testApp()
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let other = accountTokenUser(f.db)
+  f.db.table<User>().where("id", f.user.id).set("passwordHash", hashPassword("old-password-123")).updateAll() catch e {
+    panic(e.message())
+  }
+  assert(resetPost(app, resetIssue(f)).status == 204, "valid reset")
+  for password of ["old-password-123", "new-password-123"] {
+    let response = app.handle(
+      jsonReq(
+        "POST",
+        "/v1/auth/login",
+        "",
+        "{\"username\":\"${f.user.username}\",\"password\":\"${password}\"}",
+      ),
+    )
+    if (password == "new-password-123") {
+      assert(response.status == 204, "new password authenticates")
+    } else {
+      assert(response.status == 401, "old password fails")
+    }
+  }
+  let untouched = findUserById(f.db, other.id) catch e {
+    panic(e.message())
+  }
+  assert(untouched.passwordHash == other.passwordHash, "other account unchanged")
+}
+
+test "reset refuses an invalid token without a credential change" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  assert(resetPost(testApp(), "invalid").status == 401, "invalid token")
+  resetAssertUnchanged(f)
+}
+
+test "reset refuses expired tokens without a credential change" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let token = resetIssue(f)
+  f.db.table<AccountTokenRow>().where("userId", f.user.id).set("expiresAt", 1).updateAll() catch e {
+    panic(e.message())
+  }
+  assert(resetPost(testApp(), token).status == 401, "expired reset")
+  resetAssertUnchanged(f)
+}
+
+test "reset refuses verification tokens without a credential change" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  assert(resetPost(testApp(), resetIssue(f, "verify-email")).status == 401, "wrong purpose")
+  resetAssertUnchanged(f)
+}
+
+test "reset refuses changed account addresses without a credential change" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  assert(
+    resetPost(testApp(), resetIssue(f, address = "other@example.test")).status == 401,
+    "wrong account address",
+  )
+  resetAssertUnchanged(f)
+}
+
+test "reset password policy failure preserves a usable token" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let app = testApp()
+  let token = resetIssue(f)
+  assert(resetPost(app, token, "short").status == 422, "existing minimum password policy")
+  resetAssertUnchanged(f)
+  assert(resetPost(app, token).status == 204, "policy rejection must not spend token")
+}
+
+test "reset revokes remaining reset links and refresh credentials and rejects replay" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let app = testApp()
+  let tokens = RefreshTokens(OrmRefreshStore(f.db)) catch e {
+    panic(e.message())
+  }
+  let refresh = tokens.issue("${f.user.id}") catch e {
+    panic(e.message())
+  }
+  let first = resetIssue(f)
+  let second = resetIssue(f)
+  assert(resetPost(app, first).status == 204, "reset succeeds")
+  assert(resetPost(app, first).status == 401, "replay rejected")
+  assert(resetPost(app, second).status == 401, "other reset token revoked")
+  let response = app.handle(
+    jsonReq("POST", "/v1/auth/token/refresh", "", "{\"refreshToken\":\"${refresh}\"}"),
+  )
+  assert(response.status == 401, "existing refresh credential revoked")
+}
+
+test "reset rolls back token consumption and password if refresh revocation fails" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let token = resetIssue(f)
+  f.db.exec("create function reset_test_refuse() returns trigger language plpgsql as 'begin raise exception ''forced reset refusal''; end'") catch e {
+    panic(e.message())
+  }
+  defer resetDropTrigger(f.db)
+  f.db.exec("create trigger reset_test_refuse before update on refresh_tokens for each statement execute function reset_test_refuse()") catch e {
+    panic(e.message())
+  }
+  assert(resetPost(testApp(), token).status == 500, "database failure surfaces")
+  resetAssertUnchanged(f)
+  let rows = f.db.table<AccountTokenRow>().where("tokenHash", accountTokenHash(token)).all() catch e {
+    panic(e.message())
+  }
+  assert(len(rows) == 1, "redemption rolled back")
+  f.db.exec("drop trigger reset_test_refuse on refresh_tokens") catch e {
+    panic(e.message())
+  }
+  assert(resetPost(testApp(), token).status == 204, "token remains usable after rollback")
+}
+
+test "reset worker store errors are surfaced without account or token data" {
+  let f = accountTokenFixture()
+  f.db.pool.close()
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let failed = false
+  deliverPasswordReset(f.db, cfg, SendPasswordResetEmail{ email = "private@example.test" }) catch e {
+    failed = true
+    assert(
+      e.message() == "inkwell: password reset email delivery failed",
+      "sanitized fallible lookup",
+    )
+  }
+  assert(failed, "lookup failure must not become unknown account success")
+}
+
+test "forgot password propagates queue failure equally for known and unknown accounts" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  cfg.smtpHost = "127.0.0.1"
+  cfg.resetPasswordUrl = "https://inkwell.example.test/reset"
+  let redis = openRedis(cfg.redisUrl) catch e {
+    panic(e.message())
+  }
+  let queue = resetQueue(cfg, redis, f.db, "{reset-${uniqueName("closed")}}") catch e {
+    panic(e.message())
+  }
+  redis.close()
+  let app = App(Config{ secret = "closed", sessions = MemoryStore(100) })
+  mountAuth(app, f.db, cfg, queue) catch e {
+    panic(e.message())
+  }
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  for email of [f.user.email, "unknown@example.test"] {
+    let response = app.handle(
+      jsonReq("POST", "/auth/forgot-password", "", "{\"email\":\"${email}\"}"),
+    )
+    assert(
+      response.status == 500 && !contains(response.body, "token"),
+      "queue failure is explicit without enumeration",
+    )
+  }
+}
+
+test "queued reset relay failures cannot echo their bearer token into worker logs" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let capture = beginMailCapture(false, "echo-reset-token") catch e {
+    panic(e.message())
+  }
+  defer capture.listener.close()
+  let cfg = capturedMailConfig(capture) catch e {
+    panic(e.message())
+  }
+  let redis = openRedis(cfg.redisUrl) catch e {
+    panic(e.message())
+  }
+  defer redis.close()
+  let prefix = "{reset-${uniqueName("private")}}"
+  let sink = MailLogSink{ lines = chan<string>(4), count = AtomicI64(0) }
+  let q = openJobs(
+    RedisStore(redis, prefix = prefix) catch e {
+      panic(e.message())
+    },
+    JobOptions{
+      workers = 1,
+      locker = RedisLocker(redis, prefix = prefix) catch e {
+        panic(e.message())
+      },
+      logger = Option.Some(MailLogger(MailTextHandler(sink, MailWarn, false))),
+    },
+  ) catch e {
+    panic(e.message())
+  }
+  q.register<SendPasswordResetEmail>((job) => deliverPasswordReset(f.db, cfg, job)) catch e {
+    panic(e.message())
+  }
+  q.enqueue(SendPasswordResetEmail{ email = f.user.email }, 0, 1) catch e {
+    panic(e.message())
+  }
+  q.start()
+  defer q.stop()
+  let sent = finishMailCapture(capture)
+  q.stop()
+  let start = indexOf(sent, "?token=")
+  assert(start >= 0 && start + 50 <= len(sent), "relay received bearer")
+  let token = sent[start + 7:start + 50]
+  assert(sink.count.load() == 1, "one permanent failure")
+  let record = <- sink.lines
+  assert(contains(record, "password reset email delivery failed"), "delivery error remains visible")
+  assert(
+    !contains(record, token) && !contains(record, f.user.email),
+    "reset token and address excluded from logs",
+  )
+}
+
+fn resetDropTrigger(db: Db) {
+  db.exec("drop function reset_test_refuse() cascade") catch e {
+    panic(e.message())
+  }
+}
+
+fn resetClaim(store: RedisStore): ClaimedJob {
+  for (let attempt = 0; attempt < 100; attempt = attempt + 1) {
+    let found = store.claim(Second) catch e {
+      panic(e.message())
+    }
+    if (isSome(found)) {
+      return unwrap(found)
+    }
+    sleep(5 * Millisecond)
+  }
+  panic("queued reset job must become ready within 500ms")
+}
