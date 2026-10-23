@@ -223,164 +223,10 @@ DIFFDUMP_PARENT_LIBRARY
 diffdump_frame_libraries() {
   . "$1/selfhost-diffiropt.sh" || return 1
   . "$1/selfhost-ir-canon.sh" || return 1
-  diffdump_parent_library && diffiropt_literal_library && diffdump_owned_append_library &&
-    diffdump_aggregate_object_library && diffdump_aggregate_ir_library
+  diffdump_parent_library && diffiropt_literal_library && diffdump_owned_append_library
 }
 
-# Aggregate proofs reuse the validated object readers, never symbol-name guesses.
-diffdump_aggregate_object_library() {
-  DIFFDUMP_AGGREGATE_OBJECT_PYTHON=
-  local aggregate_read_rc=0
-  IFS= builtin read -r -d '' DIFFDUMP_AGGREGATE_OBJECT_PYTHON <<'AGGREGATE_OBJECT' || aggregate_read_rc=$?
-def aggregate_pointer_rows(index, relative):
-    spend(16)
-    rows = []
-    for address in range(relative - 7, relative + 8):
-        entry = index.get(address)
-        if entry is not None and relative < address + entry[0]:
-            require(entry[1] is not None and entry[0] == 8)
-            rows.append((address, entry[1]))
-    return rows
-
-def aggregate_macho(data):
-    sections, symtab = literal_macho_commands(data)
-    symbols, unused = literal_macho_symbols(data, sections, symtab)
-    indexes = {}
-    def read(symbol, size):
-        return literal_macho_location(data, sections, symbol, size)[2]
-    def pointer(symbol, offset):
-        section, relative, unused = literal_macho_location(data, sections, symbol, offset + 8)
-        if symbol[2] not in indexes:
-            indexes[symbol[2]] = literal_macho_relocations(data, section)
-        rows = aggregate_pointer_rows(indexes[symbol[2]], relative + offset)
-        require(len(rows) == 1 and rows[0][0] == relative + offset)
-        bits = rows[0][1]
-        require(bits >> 24 == 14 and bits & 0xffffff < len(symbols))
-        return symbols[bits & 0xffffff]
-    def function(entry):
-        name, row = entry
-        require(row[1] & 0xee == 0x0e and 0 < row[2] <= len(sections))
-        require(sections[row[2] - 1][0].rstrip(b'\0') == b'__text')
-        require(name.startswith(b'_'))
-        return name[1:]
-    return symbols, read, pointer, function, b'___bittype_', aggregate_macho_refs(data, sections, symbols)
-
-def aggregate_elf(data):
-    machine, sections, names = literal_elf_sections(data)
-    table, symbols, unused = literal_elf_symbols(data, sections)
-    indexes = {}
-    def read(symbol, size):
-        require(size <= symbol[5])
-        unused, raw = literal_elf_location(data, sections, symbol, symbol[5])
-        return raw[:size]
-    def pointer(symbol, offset):
-        if symbol[3] not in indexes:
-            indexes[symbol[3]] = literal_elf_relocations(data, sections, table, machine, symbol[3])
-        relative = symbol[4] + offset
-        rows = aggregate_pointer_rows(indexes[symbol[3]], relative)
-        require(len(rows) == 1 and rows[0][0] == relative)
-        address, info, addend = rows[0][1]
-        require(address == relative and addend == 0 and info >> 32 < len(symbols))
-        return symbols[info >> 32]
-    def function(entry):
-        name, row = entry
-        require(row[1] & 15 == 2 and 0 < row[3] < len(sections))
-        require(sections[row[3]][2] & 4)
-        return name
-    return symbols, read, pointer, function, b'__bittype_', aggregate_elf_refs(data, sections, names, symbols, table, machine)
-
-def aggregate_macho_refs(data, sections, symbols):
-    result = []
-    for section in sections:
-        for index in range(section[7]):
-            spend()
-            address, bits = literal_unpack(data, section[6] + index * 8, '<iI')
-            require(0 <= address < section[3])
-            if not bits & (1 << 27):
-                continue
-            require(bits & 0xffffff < len(symbols))
-            name = symbols[bits & 0xffffff][0]
-            kind = 'other'
-            if bits >> 24 == 14:
-                kind = 'pointer'
-            if bits >> 24 == 45:
-                kind = 'call'
-            result.append((section[0].rstrip(b'\0'), kind, name[1:]))
-    return result
-
-def aggregate_elf_refs(data, sections, names, symbols, table, machine):
-    result = []
-    for section in sections:
-        if section[1] != 4:
-            continue
-        require(section[6] == table and section[9] == 24 and section[5] % 24 == 0)
-        require(section[7] < len(sections))
-        for index in range(section[5] // 24):
-            spend()
-            address, info, addend = literal_unpack(data, section[4] + index * 24, '<QQq')
-            require(info >> 32 < len(symbols) and address < sections[section[7]][5])
-            kind = aggregate_elf_ref_kind(machine, info & 0xffffffff, addend)
-            result.append((names[section[7]], kind, symbols[info >> 32][0]))
-    return result
-
-def aggregate_elf_ref_kind(machine, kind, addend):
-    if kind == (2 if machine == 62 else 283) and addend == (-4 if machine == 62 else 0):
-        return 'call'
-    if kind == (1 if machine == 62 else 257) and addend == 0:
-        return 'pointer'
-    return 'other'
-
-def aggregate_offsets(row, words, read, pointer):
-    count = words[2]
-    require(words[1] == 0)
-    if not count:
-        return ()
-    target = pointer(row, 8)
-    raw = read(target[1], count * 8)
-    offsets = struct.unpack('<' + 'Q' * count, raw)
-    require(tuple(sorted(set(offsets))) == offsets)
-    require(all(offset + 8 <= words[0] for offset in offsets))
-    return offsets
-
-def aggregate_methods(row, words, read, pointer, function):
-    count = words[6]
-    require(words[5] == 0)
-    if not count:
-        return ()
-    target = pointer(row, 40)
-    raw = read(target[1], count * 16)
-    result, seen = [], set()
-    for index in range(count):
-        spend(2)
-        method, address = struct.unpack_from('<QQ', raw, index * 16)
-        require(address == 0 and method not in seen)
-        seen.add(method)
-        result.append((method, function(pointer(target[1], index * 16 + 8))))
-    return tuple(result)
-
-def aggregate_object(data):
-    reader = aggregate_macho if data[:4] == b'\xcf\xfa\xed\xfe' else aggregate_elf
-    symbols, read, pointer, function, prefix, references = reader(data)
-    descriptors, methods = {}, {}
-    pattern = re.compile(re.escape(prefix) + rb'[0-9]+_[0-9]+(?:_[0-9]+)*')
-    for name, row in symbols:
-        spend()
-        if pattern.fullmatch(name) is None:
-            continue
-        require(name not in descriptors)
-        words = struct.unpack('<8Q', read(row, 64))
-        require(words[0] <= 8388608)
-        offsets = aggregate_offsets(row, words, read, pointer)
-        descriptors[name] = (words[0], offsets, words[7])
-        for method, target in aggregate_methods(row, words, read, pointer, function):
-            methods.setdefault(method, []).append((name, target))
-    require(descriptors)
-    return descriptors, {key: tuple(sorted(value)) for key, value in methods.items()}, references
-AGGREGATE_OBJECT
-  [ "$aggregate_read_rc" -eq 1 ]
-}
-
-# Fixed pure test constructors; never loaded by production proof dispatch.
+# Retired aggregate fixtures keep former transformations unexplained.
 diffdump_aggregate_fixture_library() {
   DIFFDUMP_AGGREGATE_FIXTURES=
   local aggregate_fixture_rc=0
@@ -519,9 +365,9 @@ def aggregate_fixture_words(types):
     return public, candidate
 
 def aggregate_fixture_word_controls(verdict):
-    for types, expected in [((b'i8', b'u16'), 0), ((b'f32', b'f64'), 0),
-            ((b'i64',) * 4, 0), ((b'i64',) * 5, 1),
-            ((b'f64',) * 6, 0), ((b'f64',) * 7, 1)]:
+    for types, expected in [((b'i8', b'u16'), 1), ((b'f32', b'f64'), 1),
+            ((b'i64',) * 4, 1), ((b'i64',) * 5, 1),
+            ((b'f64',) * 6, 1), ((b'f64',) * 7, 1)]:
         public, candidate = aggregate_fixture_words(types)
         assert verdict(public, candidate, pools=((), ()))[0] == expected, ('word budget', types)
     public, candidate = aggregate_fixture_words((b'f32', b'i8'))
@@ -537,7 +383,7 @@ def aggregate_fixture_initializers(verdict, public, candidate):
     after = b'  %5 = gc_alloc size=16 ptrs=[] Pair\n  %3 = const_int i64 7\n  field_set %5[0] = %3\n  %4 = const_bool true\n  field_set %5[8] = %4\n'
     interleaved = public.replace(before, after)
     assert interleaved != public
-    assert verdict(interleaved, candidate, pools=((), ()))[0] == 0, 'interleaved constants'
+    assert verdict(interleaved, candidate, pools=((), ()))[0] == 1, 'retired interleaved constants'
     for effect in (b'  %10 = rt_call blackbox(%0) void\n', b'  %10 = rt_call blackbox(%5) void\n',
                    b'  %10 = const_int i64 123\n', b'  %10 = const_nil_bogus\n'):
         wrong = interleaved.replace(b'  %3 = const_int i64 7\n', effect + b'  %3 = const_int i64 7\n')
@@ -546,14 +392,14 @@ def aggregate_fixture_initializers(verdict, public, candidate):
                           (b'field_set %5[0] = %3', b'field_set %5[0] = %4')]:
         assert verdict(interleaved.replace(before, after), candidate, pools=((), ()))[0] == 1, 'duplicate/uninitialized field'
     old, new = [value.replace(b'Pair', b'(i64, bool)') for value in (interleaved, candidate)]
-    assert verdict(old, new, pools=((), ()))[0] == 0, 'parenthesized call result'
+    assert verdict(old, new, pools=((), ()))[0] == 1, 'retired parenthesized call result'
     for before, after in [(b'%0.1(%1)', b'%0.1(%0)'), (b'call_iface %0.1(%1) i64', b'call_iface %0.1(%1) i32')]:
         assert verdict(old, new.replace(before, after), pools=((), ()))[0] == 1, 'call argument/result changed'
 
 def aggregate_fixture_opaque(verdict, public, candidate):
     opaque = b'\nfunc opaque(%0: []string, %1: i64) i64 {\nbb0(%0: []string, %1: i64):\n  %2 = slice_len %0\n  %3 = index_get %0[%1] string\n  %4 = slice_len %3\n  ret %4\n}\n'
     renamed = re.sub(rb'%([234])\b', lambda match: b'%1' + match[1], opaque)
-    assert verdict(public + opaque, candidate + renamed, pools=((), ()))[0] == 0, 'opaque result SSA mapping'
+    assert verdict(public + opaque, candidate + renamed, pools=((), ()))[0] == 1, 'retired opaque result SSA mapping'
     wrong = renamed.replace(b'index_get %0[%1]', b'index_get %0[%12]')
     assert verdict(public + opaque, candidate + wrong, pools=((), ()))[0] == 1, 'opaque operand changed'
     unknown = b'  %10 = gc_alloc size=24 ptrs=[%0] []i64\n  %11 = slice_len %10\n'
@@ -570,14 +416,14 @@ def aggregate_fixture_families(verdict, objects, folder):
         assert output.write(raw) == len(raw)
     saved = objects[()]
     objects[()] = path
-    assert verdict(old + other_old, new + other_new, pools=((), ()))[0] == 0, 'same erased family name'
+    assert verdict(old + other_old, new + other_new, pools=((), ()))[0] == 1, 'retired same erased family name'
     wrong = other_new.replace(b'call_word %2[1] i8', b'call_word %2[1] bool')
     assert verdict(old + other_old, new + wrong, pools=((), ()))[0] == 1, 'cross family word'
     objects[()] = saved
 
 def aggregate_fixture_late_blocks(verdict, public, candidate):
     late = b'\nfunc late() i64 {\nbb0():\n  jump bb2()\nbb1():\n  ret %1\nbb2():\n  %1 = const_int i64 1\n  jump bb1()\n}\n'
-    assert verdict(public + late, candidate + late, pools=((), ()))[0] == 0, 'late dominating definition'
+    assert verdict(public + late, candidate + late, pools=((), ()))[0] == 1, 'retired late dominating definition'
     bad = late.replace(b'jump bb2()', b'jump bb1()')
     assert verdict(public + bad, candidate + bad, pools=((), ()))[0] == 1, 'nondominating definition'
 
@@ -591,10 +437,13 @@ def aggregate_fixture_discovery(helper, public, candidate, raw):
         result = subprocess.run(['/bin/bash', child, '--prove-owned-appends'], input=wire,
                                 capture_output=True, timeout=5)
         return result.returncode, result.stdout, result.stderr
-    rc, output, error = run(packet)
+    assert run(packet) == (1, b'', b''), 'retired aggregate discovery'
+    canonical = dict(packet, original=[packet['original'][0],
+        base64.b64encode(public.replace(b'$t1', b'$t2')).decode()])
+    rc, output, error = run(canonical)
     response = json.loads(output)
     assert rc == 0 and error == b'' and set(response) == {'version', 'kind', 'work_left'}
-    assert response['version'] == 3 and response['kind'] == '6791-fallible-aggregate-words'
+    assert response['version'] == 3 and response['kind'] == 'canonical'
     assert type(response['work_left']) is int and 0 <= response['work_left'] < 1000000
     bads = [{'version': True}, {'version': 4}, {'work_left': True}, {'work_left': 0},
             {'work_left': 1000001}, {'comparison': 'types'}, {'kind': 'canonical'},
@@ -627,7 +476,7 @@ def aggregate_fixture_fake_child(helper, public, candidate, raw, folder):
     response = {'version': 3, 'kind': 'canonical', 'work_left': 1000000}
     cases = [(dict(response, version=True), '', 0), (dict(response, version=2), '', 0),
              (dict(response, work_left=True), '', 0), (dict(response, work_left=1000001), '', 0),
-             (dict(response, kind='forged'), '', 0), (dict(response, extra=0), '', 0),
+             (dict(response, kind='forged'), '', 0), (dict(response, kind='6791-fallible-aggregate-words'), '', 0), (dict(response, extra=0), '', 0),
              ({'version': 3, 'work_left': 1}, '', 0), (response, 'bad', 0),
              (response, '', 1), ('X' * 65537, '', 0)]
     for value, stderr, rc in cases:
@@ -638,6 +487,14 @@ def aggregate_fixture_fake_child(helper, public, candidate, raw, folder):
         argv = [sys.executable, '-I', '-c', code, script, '', *files, 'ir']
         result = subprocess.run(argv, input=public.rstrip(b'\n') + b'\0' + candidate.rstrip(b'\n'), capture_output=True, timeout=6)
         assert result.returncode == 1 and result.stdout == b'', 'parent fake child refusal'
+
+def aggregate_fixture_bucket(helper, folder):
+    path = os.path.join(os.path.dirname(helper), 'selfhost-diffdump.sh')
+    with open(path, encoding='utf8') as source:
+        bucket = 'ir_signature_bucket() {' + source.read().split('ir_signature_bucket() {', 1)[1].split('\n}', 1)[0] + '\n}'
+    command = bucket + '\nmatch=0; : >"$1/mismatch"; : >"$1/explained"; ir_signature_bucket 0 6791-fallible-aggregate-words fixture ir sep "$1"; test "$match" = 0 && test -s "$1/mismatch" && ! test -s "$1/explained"'
+    result = subprocess.run(['/bin/bash', '-c', command, 'retired-bucket', folder], capture_output=True, timeout=5)
+    assert result.returncode == 0 and result.stdout == result.stderr == b'', 'retired aggregate bucket'
 
 def aggregate_fixture_controls(verdict, objects, store):
     public, candidate = aggregate_fixture_pair()
@@ -652,15 +509,16 @@ def aggregate_fixture_controls(verdict, objects, store):
     saved = objects.get(())
     objects[()] = positive
     objects[(b'aggregate-dispatch',)] = negative
-    expected = (0, b'6791-fallible-aggregate-words\n')
+    expected = (1, b'')
+    aggregate_fixture_bucket(helper, store.name)
     aggregate_fixture_discovery(helper, public, candidate, raw)
     aggregate_fixture_fake_child(helper, public, candidate, raw, store.name)
     aggregate_fixture_late_blocks(verdict, public, candidate)
     aggregate_fixture_families(verdict, objects, store.name)
     aggregate_fixture_opaque(verdict, public, candidate)
     aggregate_fixture_initializers(verdict, public, candidate)
-    assert verdict(public, candidate, pools=((), ())) == expected, 'aggregate supported transport'
-    for suffix, overlap, expected_rc in [('adjacent', False, 0), ('overlap', True, 1)]:
+    assert verdict(public, candidate, pools=((), ())) == expected, 'retired aggregate transport'
+    for suffix, overlap, expected_rc in [('adjacent', False, 1), ('overlap', True, 1)]:
         object_raw, unused = aggregate_fixture_object(True, overlap)
         path = os.path.join(store.name, 'aggregate-' + suffix + '.o')
         with open(path, 'wb') as output:

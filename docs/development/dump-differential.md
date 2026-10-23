@@ -128,13 +128,14 @@ cannot disappear through Bash substitution: differing captures containing
 NUL decline, while byte-identical captures match through the driver's raw
 file comparison. In the version-three flow, the parent submits only the
 immutable raw and object snapshots, comparison and work allowance. A fresh
-trusted child alone performs complete literal framing and the canonical or
-aggregate proof, selecting the identity itself. No parent-provided identity,
+trusted child alone performs complete literal framing and the canonical
+comparison, selecting the identity itself. No parent-provided identity,
 framed hash or certificate authorizes acceptance. The parent strictly checks
 the bounded reply, exit status and empty stderr. All proof work shares the
 unchanged 1,000,000-unit budget, 5-second child bound, 8 MiB request and decoded
 input bounds, and 65,536-byte code/output bounds. Version-two direct protocol
-behavior stays unchanged; the former witness-free protocol is rejected.
+canonical behavior stays unchanged; retired semantic identities and the former
+witness-free protocol are rejected.
 
 These identities compare typed SSA text before machine instruction
 selection. They establish the stated text transformation, rather than a
@@ -160,31 +161,13 @@ multiple candidates, a backedge, an effectful join, a zero-valued miss and a
 present null value. Former guard-threading differences must remain unexplained.
 Object-backed canonical framing and the permanent compiler controls remain.
 
-For #6791, `6791-fallible-aggregate-words` may explain an `ir` or `iropt`
-difference only by proving the complete fallible aggregate return conversion.
-It derives an ordered vector of typed words from the existing enum or tuple
-layout, including mixed scalar, float and reference members. Field offsets,
-widths, GC slots and the existing return-register budget stay exact; the error
-word follows the complete ok vector. A string tuple member remains one handle.
-The relation covers both direct calls and interface dispatch, every concrete
-target and every return arm, using both objects' complete method-table and
-descriptor records. A missing target body or an opaque dispatch use declines.
-
-The proof preserves success, None and error paths, typed failure zeros,
-typed-IR payload layouts and def-use liveness under the existing backend
-contract, all aggregate uses and escapes, and the paired SSA definitions,
-CFG edges and call/write order. It does not prove emitted machine-stackmap
-equivalence: emitted stack-map, runtime and GC-stress gates remain independently
-required. Only fully accounted aggregate reconstruction and reads may disappear;
-unrelated differences still fail. The fresh trusted child alone proves this
-relation from immutable raw captures and object witnesses within the existing
-bounds. Unsupported layouts,
-error-slot relations or incomplete evidence remain unexplained; no file,
-method, target or feature waiver substitutes for proof.
-
-Retire this identity only when a future public stage0 repin contains #6791 and
-the actual oracle/tree comparison confirms agreement. Keep its unrelated-change
-and unsupported-shape controls rejecting differences after retirement.
+The public 0.48.0 stage0 repin (#8521) retires
+`6791-fallible-aggregate-words`: the published compiler contains the fallible
+aggregate return conversion. Former direct-call, interface-dispatch, typed-word,
+initializer and multi-family proof positives must now refuse semantic differences.
+The unrelated-change and unsupported-shape controls remain refusals. Object-backed
+canonical framing, the retirement audit and the permanent compiler allocation,
+GC and runtime controls remain active.
 
 Unknown differences still fail closed. Both plain and JSON documentation
 output must match exactly. The retirement audit and the shared oracle-coverage

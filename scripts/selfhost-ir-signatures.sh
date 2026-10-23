@@ -12,7 +12,7 @@ explainMismatch() {
   ROOT=${proof_dir%/scripts}
   [ "$proof_dir" != scripts ] || ROOT=.
   local DIFFIROPT_LITERAL_PYTHON DIFFDUMP_PARENT_PYTHON DIFFDUMP_PARENT_ENGINE
-  local parent_read_rc=0 parent_code DIFFDUMP_AGGREGATE_OBJECT_PYTHON DIFFDUMP_AGGREGATE_IR_PYTHON
+  local parent_read_rc=0 parent_code
   . "$proof_dir/selfhost-diffdump-setup.sh" || return 1
   diffdump_frame_libraries "$proof_dir" || return 1
   IFS= builtin read -r -d '' DIFFDUMP_PARENT_ENGINE <<'PYTHON' || parent_read_rc=$?
@@ -53,7 +53,7 @@ def prove(packet):
     response = json.loads(result.stdout, object_pairs_hook=unique_object)
     require(type(response) is dict and set(response) == {"version", "kind", "work_left"})
     require(type(response["version"]) is int and response["version"] == 3)
-    require(response["kind"] in {"canonical", "6791-fallible-aggregate-words"})
+    require(response["kind"] == "canonical")
     require(type(response["work_left"]) is int)
     require(0 <= response["work_left"] <= packet["work_left"])
     return response["kind"]
@@ -74,10 +74,7 @@ try:
     identity = prove(packet)
 except (ValueError, KeyError, IndexError, TypeError, RecursionError, OSError, OverflowError, struct.error, subprocess.TimeoutExpired):
     sys.exit(1)
-if identity == "canonical":
-    print("canonical-ir-match")
-else:
-    print("6791-fallible-aggregate-words")
+print("canonical-ir-match")
 PYTHON
   [ "$parent_read_rc" -eq 1 ] || return 1
   parent_code="${DIFFDUMP_PARENT_PYTHON}"$'\n'"${DIFFDUMP_PARENT_ENGINE}"
@@ -87,7 +84,7 @@ PYTHON
 
 # declaredSignatureNames [kind] -- the retirement audit still consults this table.
 declaredSignatureNames() {
-  case "${1:-ir}" in ir|iropt) printf '%s\n' 6791-fallible-aggregate-words ;; esac
+  :
 }
 
 # shellcheck source=scripts/selfhost-ir-canon.sh
