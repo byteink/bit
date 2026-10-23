@@ -435,10 +435,10 @@ See the [full section](crypto/encryption-and-signatures.md#rsaverifypkcs1v15-pub
 See the [full section](crypto/encryption-and-signatures.md#rsasignpss-priv-rsaprivatekey-alg-hashalg-message-byte-saltlen-int-byte).
 ### `rsaVerifyPss(pub: RsaPublicKey, alg: HashAlg, message: []byte, sig: []byte, saltLen: int): bool`
 See the [full section](crypto/encryption-and-signatures.md#rsaverifypss-pub-rsapublickey-alg-hashalg-message-byte-sig-byte-saltlen-int-bool).
-### `rsaEncryptOaep(pub: RsaPublicKey, alg: HashAlg, message: []byte, label: []byte): []byte!`
-See the [full section](crypto/encryption-and-signatures.md#rsaencryptoaep-pub-rsapublickey-alg-hashalg-message-byte-label-byte-byte).
-### `rsaDecryptOaep(priv: RsaPrivateKey, alg: HashAlg, ciphertext: []byte, label: []byte): []byte!`
-See the [full section](crypto/encryption-and-signatures.md#rsadecryptoaep-priv-rsaprivatekey-alg-hashalg-ciphertext-byte-label-byte-byte).
+### `rsaEncryptOaep(pub: RsaPublicKey, alg: HashAlg, message: []byte, label: []byte, mgfAlg: Option<HashAlg> = Option.None): []byte!`
+See the [full section](crypto/encryption-and-signatures.md#rsaencryptoaep-pub-rsapublickey-alg-hashalg-message-byte-label-byte-mgfalg-option-hashalg-option-none-byte).
+### `rsaDecryptOaep(priv: RsaPrivateKey, alg: HashAlg, ciphertext: []byte, label: []byte, mgfAlg: Option<HashAlg> = Option.None): []byte!`
+See the [full section](crypto/encryption-and-signatures.md#rsadecryptoaep-priv-rsaprivatekey-alg-hashalg-ciphertext-byte-label-byte-mgfalg-option-hashalg-option-none-byte).
 ### `rsaEncryptPkcs1v15(pub: RsaPublicKey, message: []byte): []byte!`
 See the [full section](crypto/encryption-and-signatures.md#rsaencryptpkcs1v15-pub-rsapublickey-message-byte-byte).
 ### `rsaDecryptPkcs1v15(priv: RsaPrivateKey, ciphertext: []byte): []byte!`
