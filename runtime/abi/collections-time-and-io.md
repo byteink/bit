@@ -321,7 +321,8 @@ value reads use the same snapshot. Linux and Darwin retain the startup array;
 Windows retains its UTF-8 copy before releasing the system environment block.
 The common `runtime/root/os.bit` provider serves all four supported targets.
 The compiler's internal `osEnvPresent(name: string): bool` primitive maps to
-this symbol. Public stdlib consumers must wait for a provider-bearing seed.
+this symbol. The released seed provides it; `std/os.lookupEnv` uses it to return
+`None` for absence and `Some(osEnv(name))` for a present variable.
 
 `bit_rt_os_run` runs the executable at `path` as a child process, with `argv` (a
 `[]string`, or a null `SliceHeader` for the empty/default slice) appended to the
