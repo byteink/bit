@@ -1,0 +1,236 @@
+fn skTrust(at: int = svNow): SnsTrust {
+  return svTrust([svCert(svRoot)], at)
+}
+
+fn skCall(url: string = scUrl): ScCall {
+  let response = scResponse(200, spPem())
+  response.url = url
+  return ScCall{ response = response }
+}
+
+fn skGet(cache: SnsCertificateCache, call: ScCall, at: int = svNow): Certificate {
+  return cache.get(call.response.url, skTrust(at), () => scTransport(call)) catch e {
+    panic(e.message())
+  }
+}
+
+fn skVerdict(cache: SnsCertificateCache, call: ScCall, trust: SnsTrust): string {
+  cache.get(call.response.url, trust, () => scTransport(call)) catch e {
+    match (e) {
+      Signature(why) => return why
+      _ => return "wrong error type"
+    }
+  }
+  return "ok"
+}
+
+fn skCount(cache: SnsCertificateCache, url: string = ""): int {
+  let count = 0
+  for slot of cache.slots {
+    if (isSome(slot) && (url == "" || unwrap(slot).url == url)) {
+      count = count + 1
+    }
+  }
+  return count
+}
+
+test "SNS cache repeats exact URLs and separates distinct URLs" {
+  let cache = SnsCertificateCache()
+  let first = skCall()
+  let _ = skGet(cache, first)
+  let _ = skGet(cache, first)
+  scClosed(first)
+  let second = skCall("https://sns.us-east-1.amazonaws.com/other.pem")
+  let _ = skGet(cache, second)
+  scClosed(second)
+  assert(skCount(cache) == 2 && len(cache.slots) == 16)
+  assert(first.timeoutMs == 5000 && second.timeoutMs == 5000)
+}
+
+test "SNS cache exact expiry refetches at age 3600" {
+  let cache = SnsCertificateCache()
+  let call = skCall()
+  let _ = skGet(cache, call)
+  let _ = skGet(cache, call, svNow + 3599)
+  assert(call.opens == 1, "age 3599 is fresh")
+  let _ = skGet(cache, call, svNow + 3600)
+  assert(call.opens == 2 && call.closes == 2, "age 3600 must refetch")
+  assert(skCount(cache) == 1 && cache.next == 1, "replacement stays in its existing slot")
+}
+
+test "SNS cache rejects negative time and refetches after backward time" {
+  let cache = SnsCertificateCache()
+  let call = skCall()
+  let _ = skGet(cache, call)
+  assert(skVerdict(cache, call, skTrust(-1)) == "SNS certificate cache time is invalid")
+  assert(call.opens == 1, "negative time never opens a transport")
+  let _ = skGet(cache, call, svNow - 1)
+  assert(call.opens == 2 && call.closes == 2, "backward time cannot extend a hit")
+}
+
+test "SNS cache bounds seventeen URLs with deterministic FIFO replacement" {
+  let cache = SnsCertificateCache()
+  let i = 0
+  while (i < 17) {
+    let call = skCall("https://sns.us-east-1.amazonaws.com/${i}.pem")
+    let _ = skGet(cache, call)
+    scClosed(call)
+    i = i + 1
+  }
+  assert(len(cache.slots) == 16 && skCount(cache) == 16 && cache.next == 1)
+  assert(skCount(cache, "https://sns.us-east-1.amazonaws.com/0.pem") == 0, "oldest URL evicted")
+  assert(unwrap(cache.slots[0]).url == "https://sns.us-east-1.amazonaws.com/16.pem")
+  let retained = skCall("https://sns.us-east-1.amazonaws.com/1.pem")
+  let _ = skGet(cache, retained)
+  assert(retained.opens == 0, "FIFO retains the second URL")
+}
+
+test "SNS cache does not cache failed fetches or malformed PEM" {
+  for body of ["", "malformed certificate"] {
+    let cache = SnsCertificateCache()
+    let call = skCall()
+    call.response.body = body
+    assert(skVerdict(cache, call, skTrust()) != "ok")
+    assert(skCount(cache) == 0 && cache.next == 0)
+    scClosed(call)
+    call.response.body = spPem()
+    let _ = skGet(cache, call)
+    assert(call.opens == 2 && call.closes == 2 && skCount(cache) == 1)
+  }
+  let cache = SnsCertificateCache()
+  let call = skCall()
+  call.raises = true
+  assert(skVerdict(cache, call, skTrust()) == "SNS certificate request failed")
+  assert(skCount(cache) == 0)
+  scClosed(call)
+  call.raises = false
+  let _ = skGet(cache, call)
+  assert(call.opens == 2 && call.closes == 2 && skCount(cache) == 1)
+}
+
+test "SNS cache rejects untrusted expired non-RSA and unsuitable signing certificates" {
+  let trust = skTrust()
+  let expired = skTrust(svCert(svLeaf).notAfter + 1)
+  for current of [svTrust([]Certificate(0), svNow), expired] {
+    let cache = SnsCertificateCache()
+    let call = skCall()
+    assert(skVerdict(cache, call, current) == "SNS certificate path is not trusted")
+    assert(skCount(cache) == 0)
+    scClosed(call)
+    let _ = skGet(cache, call)
+    assert(call.opens == 2 && skCount(cache) == 1, "valid trust retries")
+  }
+  for hex of [svEcLeaf, svWrongUsage] {
+    let cache = SnsCertificateCache()
+    let call = skCall()
+    call.response.body = pemEncode("CERTIFICATE", svBytes(hex))
+    assert(skVerdict(cache, call, trust) != "ok" && skCount(cache) == 0)
+    scClosed(call)
+  }
+}
+
+test "SNS cache hits recheck current roots time RSA and KeyUsage without refreshing failures" {
+  let cache = SnsCertificateCache()
+  let call = skCall()
+  let leaf = skGet(cache, call)
+  let insertedAt = unwrap(cache.slots[0]).insertedAt
+  assert(skVerdict(cache, call, svTrust([]Certificate(0), svNow)) == "SNS certificate path is not trusted")
+  assert(skVerdict(cache, call, skTrust(leaf.notBefore - 1)) == "SNS certificate path is not trusted")
+  assert(unwrap(cache.slots[0]).insertedAt == insertedAt, "failure never refreshes entry")
+  let opens = call.opens
+  leaf.pubKeyAlg = 0
+  assert(skVerdict(cache, call, skTrust()) == "SNS signing certificate is not RSA")
+  leaf.pubKeyAlg = x509KeyRSA
+  leaf.keyUsage = 0
+  assert(skVerdict(cache, call, skTrust()) == "SNS signing certificate cannot sign messages")
+  leaf.keyUsage = 1
+  assert(skVerdict(cache, call, skTrust()) == "ok" && call.opens == opens, "hits recheck the key")
+  let lateCache = SnsCertificateCache()
+  let lateCall = skCall()
+  let _ = skGet(lateCache, lateCall, leaf.notAfter - 100)
+  assert(
+      skVerdict(lateCache, lateCall, skTrust(leaf.notAfter + 1)) ==
+      "SNS certificate path is not trusted",
+  )
+  assert(lateCall.opens == 1, "a fresh cache hit still checks certificate expiry")
+}
+
+test "SNS cache preserves allowlist redirect body deadline and close controls" {
+  let cache = SnsCertificateCache()
+  let _ = skGet(cache, skCall())
+  let invalid = skCall("https://evil.example/cert.pem")
+  assert(skVerdict(cache, invalid, skTrust()) == "SNS certificate URL is not allowed")
+  assert(invalid.opens == 0)
+  for body of [spPem(), repeat("A", snsCertMaxBytes + 1)] {
+    let call = skCall("https://sns.us-east-1.amazonaws.com/control.pem")
+    call.response.body = body
+    call.response.redirects = 1
+    assert(skVerdict(cache, call, skTrust()) == "SNS certificate response changed its URL")
+    scClosed(call)
+  }
+  let oversized = skCall("https://sns.us-east-1.amazonaws.com/large.pem")
+  oversized.response.body = repeat("A", snsCertMaxBytes + 1)
+  assert(skVerdict(cache, oversized, skTrust()) == "SNS certificate response body is outside its limit")
+  scClosed(oversized)
+  assert(skCount(cache) == 1)
+}
+
+class SkConcurrent {
+  cache: SnsCertificateCache,
+  entered: chan<bool>,
+  release: chan<bool>,
+  closed: AtomicI64,
+}
+
+fn skConcurrentWorker(state: SkConcurrent, url: string, wg: WaitGroup) {
+  defer wg.done()
+  let get: (string, int) => HttpResponse! = (requested, timeoutMs) => {
+    assert(requested == url && timeoutMs == 5000)
+    state.entered <- true
+    <- state.release
+    let response = scResponse(200, spPem())
+    response.url = url
+    return response
+  }
+  let finish = () => {
+    state.closed.add(1)
+  }
+  state.cache.get(url, skTrust(), () => SnsCertTransport{ get = get, close = finish }) catch e {
+    panic(e.message())
+  }
+}
+
+test "SNS cache eight concurrent cold lookups join without duplicate slots or held network lock" {
+  let workers = parseInt(envOr("BIT_WORKERS", "1")) catch e {
+    panic(e.message())
+  }
+  assert(workers >= 2, "cache race requires at least two workers")
+  let state = SkConcurrent{
+    cache = SnsCertificateCache(), entered = chan<bool>(8), release = chan<bool>(8),
+    closed = AtomicI64(0),
+  }
+  let wg = WaitGroup()
+  wg.add(8)
+  let i = 0
+  while (i < 8) {
+    spawn skConcurrentWorker(state, "https://sns.us-east-1.amazonaws.com/${i % 2}.pem", wg)
+    i = i + 1
+  }
+  i = 0
+  while (i < 8) {
+    <- state.entered
+    i = i + 1
+  }
+  i = 0
+  while (i < 8) {
+    state.release <- true
+    i = i + 1
+  }
+  wg.wait()
+  assert(state.closed.load() == 8, "every cold transport closed")
+  assert(len(state.cache.slots) == 16 && skCount(state.cache) == 2 && state.cache.next == 2)
+  assert(skCount(state.cache, "https://sns.us-east-1.amazonaws.com/0.pem") == 1)
+  assert(skCount(state.cache, "https://sns.us-east-1.amazonaws.com/1.pem") == 1)
+  state.cache.mu.lock()
+  state.cache.mu.unlock()
+}
