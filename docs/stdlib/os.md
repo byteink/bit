@@ -47,22 +47,39 @@ fn echoArgs() {
 
 ### `env(name: string): string`
 
-The value of `name`, or `""` when it is unset. An unset variable and one set to
-the empty string are indistinguishable - use `envOr` when that matters.
+The value of `name`, or `""` when it is unset. Use `lookupEnv` when you need to
+distinguish an unset variable from one set to the empty string.
 
 ### `envOr(name: string, fallback: string): string`
 
-The value of `name`, or `fallback` when it is unset.
+The value of `name`, or `fallback` when it is unset or empty.
+
+### `lookupEnv(name: string): Option<string>`
+
+Inkwell can disable its editor with an explicitly empty `EDITOR`. An unset
+variable uses the default editor instead. `lookupEnv` returns `None` only when
+the variable is absent, and `Some("")` when it is present but empty.
 
 ```bit
-import { env, envOr } from "std/os"
+import { env, envOr, lookupEnv } from "std/os"
 
 fn editor(): string {
-  return envOr("EDITOR", "vi")
+  match (lookupEnv("EDITOR")) {
+    None => return "vi"
+    Some(value) => return value
+  }
+}
+
+fn draftsDir(): string {
+  return envOr("INKWELL_DRAFTS", "drafts")
 }
 
 fn isDebug(): bool {
   return env("BIT_DEBUG") != ""
+}
+
+fn main() {
+  println("editor=${editor()} drafts=${draftsDir()} debug=${isDebug()}")
 }
 ```
 
