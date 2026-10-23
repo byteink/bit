@@ -74,5 +74,34 @@ public user and registration responses never contain the token. Confirmation
 consumes the token and marks its bound account inside one PostgreSQL transaction;
 a store failure rolls both changes back. Registration commits the account and digest together before
 queueing the mail. Invalid-address validation rolls both changes back. If enqueueing fails, the user and digest may remain, and retrying
-registration can return a conflict. Resending mail and password reset are separate
-features. The confirmation page itself is not supplied by this example.
+registration can return a conflict. Resending verification mail is separate. The confirmation page itself is not supplied by this example.
+
+## Recover a forgotten password
+
+Set `RESET_PASSWORD_URL=https://inkwell.example.test/reset` to your trusted reset
+page. It follows the same origin rules as `VERIFY_EMAIL_URL`. The page reads the
+link token and submits a new password only after the user chooses to reset it.
+
+```sh
+curl --fail-with-body http://127.0.0.1:8080/v1/auth/forgot-password \
+  -H 'Content-Type: application/json' -d '{"email":"author@example.test"}'
+curl --fail-with-body http://127.0.0.1:8080/v1/auth/reset-password \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"TOKEN_FROM_THE_RESET_EMAIL","password":"replacement-password"}'
+```
+
+Forgot-password returns the same `204` for known and unknown accounts after
+queueing the same email-only job. The worker looks up the address; an unknown
+address sends no mail. A known account receives one usable link, replacing its
+previous reset link. Its digest expires after one hour. Reset validates the
+existing eight-character minimum before consuming the token, updates only its
+bound account and revokes other reset links and refresh credentials in one
+PostgreSQL transaction. Invalid, expired, used or changed-address tokens return
+`401`. Queue and store failures remain errors. PostgreSQL and Redis remain
+separate, without an outbox or exactly-once delivery guarantee.
+
+Existing cookie sessions retain their current expiry and logout behavior.
+Already issued access JWTs remain valid for their remaining lifetime, at most
+900 seconds; resetting a password does not provide global session logout.
+Protect mail, Redis jobs and backups: the worker must send the usable link.
+Tokens stay out of public JSON and worker failure logs.
