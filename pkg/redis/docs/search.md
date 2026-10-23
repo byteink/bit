@@ -13,6 +13,11 @@ answers from the index. `r.search(index)` is one index. The handle is a cheap
 value, like every handle in this package; it holds the index name, and the
 same name is the key of an autocomplete dictionary (see "Suggestions" below).
 
+The same typed search and aggregation results work with RESP2 and RESP3. Set
+`Options.protocol` to `2` or `3` before `connect`; the default is RESP3.
+The live tests cover returned fields, scores, IDs, grouped reducers and cursors
+under both protocols.
+
 ## The smallest index
 
 An index has a **schema**: which fields are searchable and how. `schema()`
