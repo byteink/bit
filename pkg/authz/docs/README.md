@@ -11,3 +11,5 @@
 | [Deciding](decisions.md) | `can` and `check` on `Authz`: deny wins, default deny, `Manage`, the guest as `None`, `logTo`, the decision log and `Denied`, rules that are wrong at request time |
 | [Stored policies](stored.md) | Policies an admin saves at runtime: `savePolicy` with a `PolicyDoc`, `attach` and `detach` to a role, a group or one `Target` user, `policy`, how they combine with code policies, `subject`, and `PolicyStore` with `MemoryStore`; `condToJson` for canonical stored conditions |
 | [Tenants](tenants.md) | `forTenant` views for multi-tenant apps: global and per-tenant attachments, what a view may write, per-tenant relationship tuples and the tenant argument of `RelationStore` |
+
+Use [the ORM adapter](conditions.md#put-the-same-rules-on-an-orm-handle) to apply flat programmatic conditions to scoped reads and writes.
