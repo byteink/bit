@@ -10,7 +10,7 @@ the application.
 A slow mail relay should not hold an HTTP registration request open. With mail
 enabled, `POST /v1/auth/register` saves the user, enqueues `SendWelcomeEmail` through
 the existing jobs queue, and returns `201`. The application's existing worker
-delivers a plain-text welcome message addressed to that saved user. The same
+delivers one plain-text welcome message with a verification link addressed to that saved user. The same
 worker still runs the nightly article digest.
 
 First configure the application's existing `DATABASE_URL`, `REDIS_URL`,
@@ -21,6 +21,7 @@ services and a development SMTP relay already running, start from this directory
 export SMTP_HOST=127.0.0.1
 export SMTP_PORT=1025
 export SMTP_FROM=welcome@example.test
+export VERIFY_EMAIL_URL=http://localhost:8080/confirm
 bit migrate
 bit run main.bit
 ```
@@ -49,5 +50,29 @@ restart. Saving the user in PostgreSQL and enqueueing in Redis are separate
 operations: an enqueue failure returns an error even though the user may already
 exist. This example does not provide a transactional outbox or exactly-once mail.
 
-Email verification and password-reset routes are not implemented here;
-a welcome message does not verify the recipient's address.
+The configured `VERIFY_EMAIL_URL` is the trusted confirmation page, never a
+request's Host header. It must be HTTPS (HTTP is allowed only for localhost or
+loopback), with no query, fragment or credentials. The application validates it
+when mail is enabled. Supply your own confirmation page at that URL: reading a
+link must not change account state, because mail scanners may open links.
+After the recipient chooses to confirm, the page submits the token from the link:
+
+```sh
+curl --fail-with-body http://127.0.0.1:8080/v1/auth/verify-email \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"TOKEN_FROM_THE_EMAIL"}'
+```
+
+Previously queued welcome messages still deliver their original welcome text;
+they do not gain a verification link retroactively.
+
+The POST returns `204` once. Unknown, expired, used, wrong-purpose or changed-address
+tokens all return `401` without marking an account. A link expires after 24 hours.
+Only its SHA-256 digest is stored in PostgreSQL; the mail job in Redis necessarily
+contains the usable link, so restrict Redis access and protect its backups. The
+public user and registration responses never contain the token. Confirmation
+consumes the token and marks its bound account inside one PostgreSQL transaction;
+a store failure rolls both changes back. Registration commits the account and digest together before
+queueing the mail. Invalid-address validation rolls both changes back. If enqueueing fails, the user and digest may remain, and retrying
+registration can return a conflict. Resending mail and password reset are separate
+features. The confirmation page itself is not supplied by this example.

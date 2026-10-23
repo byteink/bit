@@ -21,11 +21,11 @@
 // `currentIdentity` read or write it), so `currentUserId`/`currentRole`
 // below read back exactly what `login` wrote, with no dependency on the
 // broken path.
-import { conflict, forbidden, minLen, unauthorized } from "web"
+import { conflict, forbidden, minLen, unauthorized, email as emailAddress } from "web"
 import {
   AccessTokens, BearerStrategy, Identity, KeySet, TokenOptions, Lookup, LookupResult, OidcOptions, OidcStrategy, Provider, Strategy, beginAuthorization,
   InvalidRefreshToken, RefreshRecord, RefreshTokens, currentIdentity, handleCallback, hashPassword,
-  PasswordStrategy, requireAuth,
+  PasswordStrategy, requireAuth, EmailVerification, VerifyOptions, OneTimeTokens, Deliver, InvalidToken, verifyLink,
 } from "auth"
 import { UniqueViolation, classify } from "orm"
 import { jsonAsBool, jsonAsString, jsonDecString, jsonGet } from "std/json"
@@ -61,25 +61,92 @@ export @json class RegisterInput {
   password: string
 }
 
+fn insertUserError(e: error): error {
+  let cause = classify(e, "users")
+  let (_, ok) = cause.(UniqueViolation)
+  if (ok) {
+    return conflict("that username or email is already registered")
+  }
+  return cause
+}
+
 fn insertUser(db: Db, username: string, email: string, passwordHash: string, role: string): User! {
   return db.table<User>().insert(newUser(username, email, passwordHash, role)) catch e {
-    let cause = classify(e, "users")
-    let (_, ok) = cause.(UniqueViolation)
-    if (ok) {
-      fail conflict("that username or email is already registered")
-    }
-    fail cause
+    fail insertUserError(e)
   }
 }
 
 fn register(c: Ctx, db: Db, cfg: AppConfig, jobs: Queue): Res! {
   let input = c.body<RegisterInput>()?
-  let saved = insertUser(db, input.username, input.email, hashPassword(input.password), "author")?
+  if (mailConfigured(cfg)) {
+    emailAddress(input.email)?
+  }
+  let saved = newUser(input.username, input.email, hashPassword(input.password), "author")
+  let link = ""
+  db.tx((tx) => {
+    saved = tx.table<User>().insert(saved) catch e {
+      fail insertUserError(e)
+    }
+    if (mailConfigured(cfg)) {
+      let verification = inkwellVerification(tx, (_, token, _) => {
+        link = verifyLink(cfg.verifyEmailUrl, token)?
+      })?
+      verification.send("${saved.id}", saved.email)?
+    }
+  })?
   // Redis cannot join the PostgreSQL transaction: enqueue errors remain visible.
   if (mailConfigured(cfg)) {
-    jobs.enqueue(SendWelcomeEmail{ email = saved.email, username = saved.username })?
+    jobs.enqueue(
+      SendWelcomeEmail{
+        email = saved.email,
+        username = saved.username,
+        verificationLink = Option.Some(link),
+      },
+    )?
   }
   return c.created("${saved.id}").header("Location", "${apiPrefix}/users/${saved.id}")
+}
+
+// Keep token consumption and the conditional account update in the same transaction.
+fn inkwellVerification(tx: TxHandle, deliver: Deliver): EmailVerification! {
+  return EmailVerification(
+    OneTimeTokens(InkwellOneTimeTxStore(tx))?,
+    VerifyOptions{
+      deliver = deliver,
+      currentEmail = (subject) => {
+        let users = tx.query<User>("select * from users where id = ?", parseId(subject)?)?
+        if (len(users) == 0) {
+          return ""
+        }
+        return users[0].email
+      },
+      markVerified = (subject, email) => {
+        let changed = tx.exec(
+          "update users set email_verified_at = ? where id = ? and email = ? and email_verified_at is null",
+          now().ns, parseId(subject)?, email,
+        )?
+        if (changed != 1) {
+          fail InvalidToken{}
+        }
+      },
+    },
+  )?
+}
+
+@json class VerifyEmailInput { token: string }
+
+fn verifyEmail(c: Ctx, db: Db): Res! {
+  let input = c.body<VerifyEmailInput>()?
+  db.tx((tx) => {
+    inkwellVerification(tx, (_, _, _) => {})?.confirm(input.token)?
+  }) catch e {
+    let (_, invalid) = e.(InvalidToken)
+    if (invalid) {
+      fail unauthorized("invalid verification token")
+    }
+    fail e
+  }
+  return c.noContent()
 }
 
 // Verifies the POST body's credentials via `PasswordStrategy` directly
@@ -391,6 +458,7 @@ export fn mountAuth(app: Routes, db: Db, cfg: AppConfig, jobs: Queue): ()! {
   let strategy = PasswordStrategy(userLookup(db))
   let bearer = BearerStrategy(access)
   app.post("/auth/register", (c) => register(c, db, cfg, jobs))
+  app.post("/auth/verify-email", (c) => verifyEmail(c, db))
   app.post("/auth/login", (c) => login(c, strategy))
   app.post("/auth/logout", (c) => logout(c))
   app.post("/auth/token", (c) => issueTokens(c, db, tokens, strategy, access))
