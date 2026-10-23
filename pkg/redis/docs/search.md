@@ -102,7 +102,8 @@ class; omitting it keeps the defaults.
   `VecMetric.Cosine` (the default), `L2` or `InnerProduct`, `elem` is
   `VecType.Float32` (the default), `Float64`, `Bfloat16` or `Float16`.
   `Hnsw` also takes `m`, `efConstruction`, `efRuntime` and `epsilon`;
-  `initialCap` and `blockSize` apply to both.
+  `initialCap` and `blockSize` apply to both. `VecAlgo.SvsVamana` selects
+  SVS-VAMANA with server defaults; use `Float32` or `Float16`.
 
 `sortable` keeps a field's value so `SortBy` and `AGGREGATE` read it without
 touching the document; `unf` keeps it un-normalized too; `noIndex` stores it
@@ -338,6 +339,48 @@ fn main(): ()! {
   println("${nearby.total} within 0.1")
   r.close()
   return
+}
+```
+
+### Select an SVS-VAMANA index
+
+To use an SVS-VAMANA index for the article embeddings, choose
+`VecAlgo.SvsVamana` in the same vector schema. This requires Redis 8.2 or
+later and accepts `FLOAT32` or `FLOAT16`; the server rejects `FLOAT64`.
+The example uses server defaults, without compression or algorithm tuning.
+Keep `Flat` when exact search is required; choosing a different index does
+not by itself establish better performance for your workload.
+
+```bit
+import { open, schema, VecAlgo, VectorOptions, CreateOptions, knn, SearchOptions, SortBy } from "redis"
+import { f32sToLe } from "std/math"
+import { envOr } from "std/os"
+
+fn main(): ()! {
+  let r = open(envOr("REDIS_URL", "redis://localhost:6379"))?
+  defer r.close()
+  let articles = r.search("idx:svs:articles")
+  articles.create(
+    schema().vector("embedding", 2, VectorOptions{ algo = VecAlgo.SvsVamana }),
+    CreateOptions{ prefixes = ["svs:article:"] },
+  )?
+  defer {
+    articles.drop() catch _ {}
+  }
+  r.hash("svs:article:1").set(
+    map<string, string>{
+      "embedding": string(f32sToLe([1.0, 0.0])),
+    },
+  )?
+  defer {
+    r.del(["svs:article:1"]) catch _ {}
+  }
+  let similar = articles.find(
+    knn("embedding", [1.0, 0.0], 1, score = "dist"),
+    SearchOptions{ sortBy = Option.Some(SortBy{ field = "dist" }) },
+  )?
+  assert(similar.total == 1 && similar.hits[0].id == "svs:article:1")
+  println(similar.hits[0].id)
 }
 ```
 
