@@ -177,7 +177,7 @@ will send (`host` included) and the payload hash. `signV4` returns the headers
 to add.
 
 ```bit
-import { AwsCredential, SigHeader, SigV4Request, sha256Hex, signV4 } from "aws"
+import { AwsCredential, SigHeader, SigV4Request, SigV4aConfig, sha256Hex, signV4, signV4a } from "aws"
 
 fn main(): ()! {
   let key = AwsCredential(
@@ -192,6 +192,17 @@ fn main(): ()! {
     payloadHash = sha256Hex("raw image bytes"),
   }
   let signed = signV4(key.sigV4Config("us-east-1", "s3"), req, "20260101T000000Z")?
+  let multiRegion = signV4a(
+    SigV4aConfig{
+      credential = key,
+      service = "s3",
+      regionSet = "us-east-1,us-west-*",
+      contentSha256Header = true,
+    },
+    req,
+    "20260101T000000Z",
+  )?
+  println(multiRegion.authorization)
   for h of signed.headers {
     println("${h.name}: ${h.value}")
   }
@@ -210,6 +221,19 @@ A body that is not hashed up front is signed as `unsignedPayload`
 spellings AWS accepts, and `streamingUnsignedTrailer`, `streamingSigned`,
 `streamingSignedTrailer`, `streamingSigV4a` and `streamingSigV4aTrailer` are the
 markers of an aws-chunked body.
+
+For an endpoint that accepts SigV4a, `signV4a` signs the same cover request
+with ECDSA. Set all four `SigV4aConfig` fields explicitly. Its generated headers
+include exactly one `x-amz-region-set`; replace caller headers with the same
+names before sending. The credential scope contains the date and service,
+without a region. The request and its header array remain unchanged.
+
+`regionSet` preserves order and accepts lowercase letters, digits, hyphens and
+wildcards in nonempty comma-separated items. This API limits it to 8192 bytes
+and rejects spaces and uppercase letters. These are local input limits.
+A malformed signing input fails with `aws: sigv4a: invalid signing input`
+without quoting credentials or header values. This function signs headers;
+the S3 client still selects its own signing pipeline.
 
 ## Presigning a URL
 
