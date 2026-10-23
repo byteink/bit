@@ -1,12 +1,18 @@
 import { listen, Listener, Conn } from "std/net"
 import { AtomicI64 } from "std/sync"
 import { Millisecond, sleep } from "std/time"
+import {
+  Logger as MailLogger,
+  TextHandler as MailTextHandler,
+  LevelWarn as MailWarn,
+} from "std/log"
 import { hasSuffix } from "std/strings"
 
 class MailCapture {
   listener: Listener,
   transcript: chan<string>,
   done: AtomicI64,
+  reflection: string,
 }
 
 fn mailCaptureChunk(conn: Conn, suffix: string): string! {
@@ -24,7 +30,7 @@ fn mailCaptureChunk(conn: Conn, suffix: string): string! {
   fail newError("SMTP capture command exceeds finite input bound")
 }
 
-fn mailCaptureSession(conn: Conn, rejected: bool): string! {
+fn mailCaptureSession(conn: Conn, rejected: bool, reflection: string): string! {
   conn.setDeadline(now().ns + 5 * Second)
   conn.writeDeadline("220 capture.example.test\r\n")?
   let replies = [
@@ -41,6 +47,10 @@ fn mailCaptureSession(conn: Conn, rejected: bool): string! {
       "250 sender accepted\r\n",
       "550 recipient refused\r\n",
     ]
+  }
+  if (reflection != "") {
+    replies[4] = "550 " + reflection + "\r\n"
+    replies = replies[0:5]
   }
   let text = ""
   for (let i = 0; i < len(replies); i = i + 1) {
@@ -61,18 +71,19 @@ fn serveMailCapture(capture: MailCapture, rejected: bool) {
     return
   }
   defer conn.close()
-  let text = mailCaptureSession(conn, rejected) catch e {
+  let text = mailCaptureSession(conn, rejected, capture.reflection) catch e {
     capture.transcript <- "capture session: ${e.message()}"
     return
   }
   capture.transcript <- text
 }
 
-fn beginMailCapture(rejected: bool): MailCapture! {
+fn beginMailCapture(rejected: bool, reflection: string = ""): MailCapture! {
   let capture = MailCapture{
     listener = listen("127.0.0.1", 0)?,
     transcript = chan<string>(1),
     done = AtomicI64(0),
+    reflection = reflection,
   }
   spawn serveMailCapture(capture, rejected)
   return capture
@@ -91,6 +102,7 @@ fn capturedMailConfig(capture: MailCapture): AppConfig! {
   cfg.smtpHost = "127.0.0.1"
   cfg.smtpPort = capture.listener.port()?
   cfg.smtpFrom = "welcome@example.test"
+  cfg.verifyEmailUrl = "https://inkwell.example.test/confirm"
   return cfg
 }
 
@@ -115,7 +127,14 @@ test "registration enqueues welcome mail before the existing worker delivers it"
   let username = uniqueName("welcome")
   let email = "${username}@example.test"
   let body = "{\"username\":\"${username}\",\"email\":\"${email}\",\"password\":\"mail-password-123\"}"
+  let before = redis.zset("{inkwell:jobs}:ready").card() catch e {
+    panic(e.message())
+  }
   let response = app.handle(jsonReq("POST", "/v1/auth/register", "", body))
+  let after = redis.zset("{inkwell:jobs}:ready").card() catch e {
+    panic(e.message())
+  }
+  assert(after == before + 1, "registration must enqueue exactly one welcome job")
   assert(response.status == 201, "registration failed: ${response.status} ${response.body}")
   assert(capture.done.load() == 0, "registration sent mail inline instead of enqueueing")
   let queue = openMailQueue(cfg, redis) catch e {
@@ -125,9 +144,39 @@ test "registration enqueues welcome mail before the existing worker delivers it"
   defer queue.stop()
   let sent = finishMailCapture(capture)
   queue.stop()
-  assert(contains(sent, "RCPT TO:<${email}>"), "welcome addressed to wrong user: ${sent}")
-  assert(contains(sent, "Subject: Welcome to Inkwell"), sent)
-  assert(contains(sent, "Welcome to Inkwell, ${username}!"), sent)
+  assert(contains(sent, "RCPT TO:<${email}>"), "welcome addressed to wrong user")
+  assert(contains(sent, "Subject: Welcome to Inkwell"), "welcome subject")
+  assert(contains(sent, "Welcome to Inkwell, ${username}!"), "welcome body")
+  let start = indexOf(sent, "?token=")
+  assert(start >= 0 && start + 50 <= len(sent), "mail must carry a verification token")
+  let token = sent[start + 7:start + 50]
+  assert(!contains(response.body, token), "registration must not expose its token")
+  let db = open(cfg.databaseUrl) catch e {
+    panic(e.message())
+  }
+  defer db.pool.close()
+  let user = findUserByUsername(db, username) catch e {
+    panic(e.message())
+  }
+  let rows = db.table<AccountTokenRow>().where("userId", user.id).all() catch e {
+    panic(e.message())
+  }
+  assert(len(rows) == 1 && rows[0].tokenHash == accountTokenHash(token), "persist digest only")
+  assert(rows[0].data == email && !contains(rows[0].data, token), "bound address without raw token")
+  let remaining = rows[0].expiresAt - i64(now().ns / Second)
+  assert(remaining > 86300 && remaining <= 86400, "verification expiry must be one day")
+  let confirmation = verificationPost(app, token)
+  assert(confirmation.status == 204, "mailed token must confirm its saved account")
+  let loaded = findUserById(db, user.id) catch e {
+    panic(e.message())
+  }
+  assert(isSome(loaded.emailVerifiedAt), "mail recipient account must be marked")
+  assert(verificationPost(app, token).status == 401, "mailed token replay must fail")
+  let publicUser = app.handle(jsonReq("GET", "/v1/users/${user.id}", "", ""))
+  assert(
+    !contains(publicUser.body, token) && !contains(publicUser.body, "token"),
+    "public JSON excludes token",
+  )
 }
 
 test "SMTP recipient refusal reaches the welcome handler caller" {
@@ -139,7 +188,12 @@ test "SMTP recipient refusal reaches the welcome handler caller" {
     panic(e.message())
   }
   let rejected = false
-  sendWelcome(cfg, "rejected@example.test", "Rejected") catch _ {
+  sendWelcome(
+    cfg,
+    "rejected@example.test",
+    "Rejected",
+    Option.Some("https://inkwell.example.test/confirm?token=unused"),
+  ) catch _ {
     rejected = true
   }
   assert(rejected, "SMTP refusal was swallowed")
@@ -158,4 +212,203 @@ test "partial mail configuration fails before registration can accept it" {
     rejected = true
   }
   assert(rejected, "partial SMTP configuration silently disabled mail")
+}
+
+test "registration surfaces a closed Redis queue after committing the account token" {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  cfg.smtpHost = "127.0.0.1"
+  cfg.smtpFrom = "welcome@example.test"
+  cfg.verifyEmailUrl = "https://inkwell.example.test/confirm"
+  let db = open(cfg.databaseUrl) catch e {
+    panic(e.message())
+  }
+  defer db.pool.close()
+  let redis = openRedis(cfg.redisUrl) catch e {
+    panic(e.message())
+  }
+  let queue = openMailQueue(cfg, redis) catch e {
+    panic(e.message())
+  }
+  redis.close()
+  let app = App(Config{ secret = "queue-failure", sessions = MemoryStore(100) })
+  app.post("/v1/auth/register", (c) => register(c, db, cfg, queue))
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  let name = uniqueName("queue-refusal")
+  let body = "{\"username\":\"${name}\",\"email\":\"${name}@example.test\",\"password\":\"queue-password-123\"}"
+  let response = app.handle(jsonReq("POST", "/v1/auth/register", "", body))
+  assert(response.status == 500, "queue persistence error must reach HTTP caller")
+  let user = findUserByUsername(db, name) catch e {
+    panic(e.message())
+  }
+  let rows = db.table<AccountTokenRow>().where("userId", user.id).all() catch e {
+    panic(e.message())
+  }
+  assert(
+    len(rows) == 1 && !isSome(user.emailVerifiedAt),
+    "PG commits before the failed Redis enqueue",
+  )
+  assert(
+    !contains(response.body, "tokenHash") && !contains(response.body, "?token="),
+    "failure hides token",
+  )
+}
+
+test "mail configuration rejects an untrusted verification origin" {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  cfg.smtpHost = "127.0.0.1"
+  cfg.smtpFrom = "welcome@example.test"
+  for base of ["", "http://attacker.example/confirm", "https://inkwell.example/confirm?next=evil"] {
+    cfg.verifyEmailUrl = base
+    let rejected = false
+    validateMailConfig(cfg) catch _ {
+      rejected = true
+    }
+    assert(rejected, "unsafe configured confirmation URL must fail startup")
+  }
+}
+
+test "invalid registration addresses leave neither an account nor queued mail" {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  cfg.smtpHost = "127.0.0.1"
+  cfg.smtpFrom = "welcome@example.test"
+  cfg.verifyEmailUrl = "https://inkwell.example.test/confirm"
+  let redis = openRedis(cfg.redisUrl) catch e {
+    panic(e.message())
+  }
+  defer redis.close()
+  let db = open(cfg.databaseUrl) catch e {
+    panic(e.message())
+  }
+  defer db.pool.close()
+  let app = buildApp(cfg) catch e {
+    panic(e.message())
+  }
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  let before = redis.zset("{inkwell:jobs}:ready").card() catch e {
+    panic(e.message())
+  }
+  for address of ["x", "", "a,b@example.test"] {
+    let name = uniqueName("invalid-address")
+    let body = "{\"username\":\"${name}\",\"email\":\"${address}\",\"password\":\"mail-password-123\"}"
+    let response = app.handle(jsonReq("POST", "/v1/auth/register", "", body))
+    assert(response.status >= 400, "malformed registration address must fail")
+    let users = db.table<User>().where("username", name).all() catch e {
+      panic(e.message())
+    }
+    assert(len(users) == 0, "invalid address must not persist an unusable account")
+  }
+  let after = redis.zset("{inkwell:jobs}:ready").card() catch e {
+    panic(e.message())
+  }
+  assert(after == before, "invalid address must not queue mail")
+}
+
+class MailLogSink {
+  lines: chan<string>
+  count: AtomicI64
+
+  export write(s: string): ()! {
+    this.lines <- s
+    this.count.store(this.count.load() + 1)
+  }
+}
+
+test "queued mail failures hide a relay-reflected verification token from worker logs" {
+  let token = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+  let capture = beginMailCapture(false, token) catch e {
+    panic(e.message())
+  }
+  defer capture.listener.close()
+  let cfg = capturedMailConfig(capture) catch e {
+    panic(e.message())
+  }
+  let redis = openRedis(cfg.redisUrl) catch e {
+    panic(e.message())
+  }
+  defer redis.close()
+  let sink = MailLogSink{ lines = chan<string>(4), count = AtomicI64(0) }
+  let queue = openJobs(
+    RedisStore(redis, prefix = "{inkwell:jobs}") catch e {
+      panic(e.message())
+    },
+    JobOptions{
+      workers = 1,
+      locker = RedisLocker(redis, prefix = "{inkwell:jobs}") catch e {
+        panic(e.message())
+      },
+      logger = Option.Some(MailLogger(MailTextHandler(sink, MailWarn, false))),
+    },
+  ) catch e {
+    panic(e.message())
+  }
+  queue.register<SendWelcomeEmail>((job) => deliverWelcome(cfg, job)) catch e {
+    panic(e.message())
+  }
+  queue.enqueue(
+    SendWelcomeEmail{
+      email = "private@example.test", username = "Private",
+      verificationLink = Option.Some(
+        verifyLink(cfg.verifyEmailUrl, token) catch e {
+          panic(e.message())
+        },
+      ),
+    },
+    0, 1,
+  ) catch e {
+    panic(e.message())
+  }
+  queue.start()
+  defer queue.stop()
+  let sent = finishMailCapture(capture)
+  queue.stop()
+  assert(contains(sent, token), "relay must receive token before reflecting it")
+  assert(sink.count.load() == 1, "one surfaced permanent delivery failure")
+  let record = <- sink.lines
+  assert(contains(record, "welcome email delivery failed"), "delivery failure remains visible")
+  assert(!contains(record, token), "relay-reflected verification token must not reach logs")
+}
+
+test "welcome jobs queued before verification still deliver without a broken link" {
+  let capture = beginMailCapture(false) catch e {
+    panic(e.message())
+  }
+  defer capture.listener.close()
+  let cfg = capturedMailConfig(capture) catch e {
+    panic(e.message())
+  }
+  let redis = openRedis(cfg.redisUrl) catch e {
+    panic(e.message())
+  }
+  defer redis.close()
+  let queue = openMailQueue(cfg, redis) catch e {
+    panic(e.message())
+  }
+  let store = RedisStore(redis, prefix = "{inkwell:jobs}") catch e {
+    panic(e.message())
+  }
+  store.enqueue(
+    "send-welcome-email",
+    "{\"email\":\"legacy@example.test\",\"username\":\"Legacy\"}",
+    now().ns,
+    1,
+  ) catch e {
+    panic(e.message())
+  }
+  queue.start()
+  defer queue.stop()
+  let sent = finishMailCapture(capture)
+  queue.stop()
+  assert(contains(sent, "RCPT TO:<legacy@example.test>"), "legacy recipient")
+  assert(contains(sent, "Welcome to Inkwell, Legacy!"), "legacy welcome body")
+  assert(!contains(sent, "Confirm your email:"), "legacy job has no verification link to send")
 }
