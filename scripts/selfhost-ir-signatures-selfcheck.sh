@@ -108,8 +108,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 
   expect "" "$(explainMismatch 'kw_in 0..2' 'ident 0..2' tokens)" 'retired token identity'
   for kind in ir iropt ast fmt types diags tokens doc; do
-    case "$kind" in ir|iropt) want=6791-fallible-aggregate-words ;; *) want= ;; esac
-    expect "$want" "$(declaredSignatureNames "$kind")" "$kind registry"
+    expect "" "$(declaredSignatureNames "$kind")" "$kind registry"
   done
 
   /bin/bash "$ROOT/scripts/selfhost-diffiropt.sh" --literal-selfcheck || fail=1
@@ -506,7 +505,7 @@ ir_mismatch_signature() { printf '%s\n' "$MOCK_SIG"; return "$MOCK_RC"; }
 declaredSignatureNames() { :; }
 '''
 for code, token in [(1, "canonical-ir-match"), (1, "6175-owned-append-local"), (0, "6175-owned-append-local"),
-                     (0, "unknown-success-token"), (2, "canonical-ir-match")]:
+                     (0, "unknown-success-token"), (0, "6791-fallible-aggregate-words"), (2, "canonical-ir-match")]:
     result = subprocess.run(["/bin/bash", "-s", "--", str(code), token],
                             input=mocks + driver.encode() + b"\nrun_ir\n", capture_output=True, timeout=10, env=clean_env)
     assert result.returncode == 1 and b"IR differential: MATCH=0 " in result.stdout and b"EXPLAINED=0 " in result.stdout
@@ -687,6 +686,7 @@ mixed_field = field.replace(b"  %8 = rt_call", scalar + b"  %8 = rt_call").repla
 field_check(field_source.replace(b"    h.items =", b"    h.items = append(h.items, 1)\n    h.items ="), body=mixed_field)
 print("retired 6175 identity: field/scalar/bulk cases and strict refusals passed")
 aggregate_fixture_controls(verdict, objects, store)
+print("retired 6791 identity: former aggregate positives and strict refusals passed")
 PYTHON
   rc=$?
   [ "$rc" -eq 0 ] || fail=1

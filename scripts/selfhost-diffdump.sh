@@ -507,8 +507,6 @@ ir_signature_bucket() {
   local rc=$1 sig=$2 source=$3 kind=$4 separator=$5 directory=$6
   if [ "$rc" -eq 0 ] && [ "$sig" = canonical-ir-match ]; then
     match=$((match + 1))
-  elif [ "$rc" -eq 0 ] && [ "$sig" = 6791-fallible-aggregate-words ]; then
-    echo "$source${separator}declared signature '${sig}'" >>"$directory/explained"
   else
     echo "$source" >>"$directory/mismatch"
   fi
