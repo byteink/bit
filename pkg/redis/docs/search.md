@@ -334,8 +334,8 @@ fn main(): ()! {
   for hit of similar.hits {
     println("${hit.id} ${unwrapOr(hit.field("dist"), "?")}")
   }
-  let close = articles.find(vectorRange("embedding", mine, 0.1))?
-  println("${close.total} within 0.1")
+  let nearby = articles.find(vectorRange("embedding", mine, 0.1))?
+  println("${nearby.total} within 0.1")
   r.close()
   return
 }
