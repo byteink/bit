@@ -1,4 +1,4 @@
-import { OneTimeTokens, OneTimeOptions, Live, InvalidToken } from "auth"
+import { OneTimeTokens, OneTimeOptions, Live, InvalidToken, EmailVerification, VerifyOptions } from "auth"
 
 class AccountTokenFixture {
   db: Db,
@@ -289,4 +289,213 @@ test "account tokens put replace and revoke wait for the account row lock" {
     assert(finished.load() == 1, "mutation must complete after account lock releases")
     operation = operation + 1
   }
+}
+
+fn accountVerificationIssue(f: AccountTokenFixture, purpose: string = "verify-email"): string {
+  let tokens = OneTimeTokens(f.store, OneTimeOptions{ clock = () => 100 }) catch e {
+    panic(e.message())
+  }
+  return tokens.issue(purpose, "${f.user.id}", 10, f.user.email, live = Live.One) catch e {
+    panic(e.message())
+  }
+}
+
+fn accountVerificationMark(tx: TxHandle, subject: string, email: string): ()! {
+  let id = parseId(subject)?
+  let changed = tx.exec(
+    "update users set email_verified_at = ? where id = ? and email = ? and email_verified_at is null",
+    123456789, id, email,
+  )?
+  if (changed != 1) {
+    fail InvalidToken{}
+  }
+}
+
+fn accountVerificationConfirm(
+  f: AccountTokenFixture, token: string, at: i64 = 100, failAfterMark: bool = false,
+): ()! {
+  f.db.tx((tx) => {
+    tx.exec("set local statement_timeout = '2s'")?
+    let tokens = OneTimeTokens(InkwellOneTimeTxStore(tx), OneTimeOptions{ clock = () => at })?
+    let verification = EmailVerification(
+      tokens,
+      VerifyOptions{
+        deliver = (_, _, _) => {},
+        currentEmail = (subject) => {
+          let users = tx.query<User>("select * from users where id = ?", parseId(subject)?)?
+          if (len(users) == 0) {
+            return ""
+          }
+          return users[0].email
+        },
+        markVerified = (subject, email) => {
+          accountVerificationMark(tx, subject, email)?
+          if (failAfterMark) {
+            fail newError("account verification rollback control")
+          }
+        },
+      },
+    )?
+    verification.confirm(token)?
+  })?
+}
+
+fn accountVerificationState(f: AccountTokenFixture, tokens: int, marked: bool) {
+  let rows = f.db.table<AccountTokenRow>().where("userId", f.user.id).where(
+    "purpose", "verify-email",
+  ).all() catch e {
+    panic(e.message())
+  }
+  assert(len(rows) == tokens, "committed verification token consumption")
+  let user = findUserById(f.db, f.user.id) catch e {
+    panic(e.message())
+  }
+  assert(isSome(user.emailVerifiedAt) == marked, "committed verification timestamp presence")
+  if (marked) {
+    assert(unwrap(user.emailVerifiedAt) == 123456789, "exact committed verification timestamp")
+  }
+}
+
+fn accountVerificationInvalid(f: AccountTokenFixture, token: string, at: i64 = 100) {
+  accountVerificationConfirm(f, token, at) catch e {
+    let (_, invalid) = e.(InvalidToken)
+    assert(invalid, "verification refusal must be InvalidToken")
+    return
+  }
+  panic("account verification unexpectedly succeeded")
+}
+
+test "account verification commits token and bound timestamp once and refuses replay" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let other = accountTokenUser(f.db)
+  let otherHash = accountTokenHash("${other.id}-verification-control")
+  let resetHash = accountTokenHash("${f.user.id}-verification-reset-control")
+  f.store.put(otherHash, accountTokenSample(other), 10) catch e {
+    panic(e.message())
+  }
+  f.store.put(resetHash, accountTokenSample(f.user, "password-reset"), 10) catch e {
+    panic(e.message())
+  }
+  let token = accountVerificationIssue(f)
+  accountVerificationConfirm(f, token) catch e {
+    panic(e.message())
+  }
+  accountVerificationState(f, 0, true)
+  accountVerificationInvalid(f, token)
+  accountVerificationState(f, 0, true)
+  let untouched = findUserById(f.db, other.id) catch e {
+    panic(e.message())
+  }
+  assert(!isSome(untouched.emailVerifiedAt), "another account remains unverified")
+  for hash of [otherHash, resetHash] {
+    let rows = f.db.table<AccountTokenRow>().where("tokenHash", hash).all() catch e {
+      panic(e.message())
+    }
+    assert(len(rows) == 1, "another account and purpose remain unchanged")
+  }
+}
+
+test "account verification rolls back consumption and marking then retries once" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let token = accountVerificationIssue(f)
+  let failed = false
+  accountVerificationConfirm(f, token, failAfterMark = true) catch e {
+    assert(e.message() == "account verification rollback control", "failure occurs after marking")
+    failed = true
+  }
+  assert(failed, "rollback control must fail")
+  accountVerificationState(f, 1, false)
+  let rows = f.db.table<AccountTokenRow>().where("userId", f.user.id).all() catch e {
+    panic(e.message())
+  }
+  assert(rows[0].tokenHash == accountTokenHash(token), "rollback restores the original token")
+  accountVerificationConfirm(f, token) catch e {
+    panic(e.message())
+  }
+  accountVerificationState(f, 0, true)
+  accountVerificationInvalid(f, token)
+}
+
+test "account verification refuses expiry wrong purpose and changed email without marking" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let expired = accountVerificationIssue(f)
+  accountVerificationInvalid(f, expired, 110)
+  accountVerificationState(f, 1, false)
+  let wrong = accountVerificationIssue(f, "password-reset")
+  accountVerificationInvalid(f, wrong)
+  accountVerificationState(f, 1, false)
+  let token = accountVerificationIssue(f)
+  let changed = f.db.exec(
+    "update users set email = ? where id = ?",
+    "changed@example.test",
+    f.user.id,
+  ) catch e {
+    panic(e.message())
+  }
+  assert(changed == 1, "fixture changes one current email")
+  accountVerificationInvalid(f, token)
+  accountVerificationState(f, 1, false)
+}
+
+fn accountVerificationRaceWorker(
+  f: AccountTokenFixture, token: string, replace: bool, results: chan<int>, wg: WaitGroup,
+) {
+  defer wg.done()
+  if (replace) {
+    f.db.tx((tx) => {
+      tx.exec("set local statement_timeout = '2s'")?
+      InkwellOneTimeTxStore(tx).replace(
+        accountTokenHash("${f.user.id}-confirm-replace"), accountTokenSample(f.user), 10,
+      )?
+    }) catch _ {
+      results <- -1
+      return
+    }
+    results <- 0
+    return
+  }
+  accountVerificationConfirm(f, token) catch e {
+    let (_, invalid) = e.(InvalidToken)
+    if (!invalid) {
+      results <- -1
+      return
+    }
+    results <- 0
+    return
+  }
+  results <- 1
+}
+
+test "account verification and replacement finish with one committed winner at most" {
+  let f = accountTokenFixture()
+  defer f.db.pool.close()
+  let token = accountVerificationIssue(f)
+  let wg = WaitGroup()
+  let results = chan<int>(3)
+  wg.add(3)
+  spawn accountVerificationRaceWorker(f, token, false, results, wg)
+  spawn accountVerificationRaceWorker(f, token, false, results, wg)
+  spawn accountVerificationRaceWorker(f, token, true, results, wg)
+  wg.wait()
+  let wins = 0
+  let i = 0
+  while (i < 3) {
+    let result = <- results
+    assert(result >= 0, "confirmation and replacement must finish without database failure")
+    wins = wins + result
+    i = i + 1
+  }
+  assert(wins <= 1, "at most one confirmation marks the account")
+  accountVerificationState(f, 1, wins == 1)
+  let rows = f.db.table<AccountTokenRow>().where("userId", f.user.id).all() catch e {
+    panic(e.message())
+  }
+  assert(
+    rows[0].tokenHash == accountTokenHash("${f.user.id}-confirm-replace"),
+    "replacement token survives",
+  )
+  accountVerificationInvalid(f, token)
 }
