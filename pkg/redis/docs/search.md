@@ -243,6 +243,42 @@ fn main(): ()! {
 `params` and `dialect`. `SortBy.withCount` makes `total` count every match,
 not only the sorted page.
 
+## See where a query spends time
+
+Use `profile` when a search returns the right articles but takes too long.
+It runs `FT.PROFILE SEARCH` with the same query and `SearchOptions` as `find`.
+`ProfileResult.result` is the typed `SearchResult`; `profile` preserves the
+server's original `Reply` container because its metric keys vary by version.
+`ProfileOptions.limited` omits reader iterator details inside built-in unions.
+
+```bit
+import { open, everything, ProfileOptions, ProfileResult, SearchOptions, Page } from "redis"
+
+fn main(): ()! {
+  let r = open("redis://localhost:6379")?
+  let opts = ProfileOptions{
+    search = SearchOptions{ noContent = true, page = Option.Some(Page{ offset = 0, num = 2 }) },
+    limited = true,
+  }
+  let measured: ProfileResult = r.search("idx:articles").profile(everything(), opts)?
+  println("${measured.result.total} matching articles")
+  for hit of measured.result.hits {
+    println(hit.id)
+  }
+  let p = r.pipeline()
+  let queued = p.search("idx:articles").profile(everything())
+  p.exec()?
+  println("${queued.get()?.result.total} matches in the queued profile")
+  r.close()
+  return
+}
+```
+
+`SearchBatch.profile` returns `Future<ProfileResult>` in a pipeline or a queued
+transaction. `tx.read.search(index).profile(..)` runs immediately on the pinned
+transaction connection. Profiling supports SEARCH; use `aggregate` for grouped
+queries without a profile.
+
 ## JSON articles
 
 For an index `over` `IndexOn.Json` the document comes back as one field, `$`,
@@ -298,8 +334,8 @@ fn main(): ()! {
   for hit of similar.hits {
     println("${hit.id} ${unwrapOr(hit.field("dist"), "?")}")
   }
-  let close = articles.find(vectorRange("embedding", mine, 0.1))?
-  println("${close.total} within 0.1")
+  let nearby = articles.find(vectorRange("embedding", mine, 0.1))?
+  println("${nearby.total} within 0.1")
   r.close()
   return
 }
