@@ -249,7 +249,7 @@ Use `profile` when a search returns the right articles but takes too long.
 It runs `FT.PROFILE SEARCH` with the same query and `SearchOptions` as `find`.
 `ProfileResult.result` is the typed `SearchResult`; `profile` preserves the
 server's original `Reply` container because its metric keys vary by version.
-`ProfileOptions.limited` omits details of union iterator children.
+`ProfileOptions.limited` omits reader iterator details inside built-in unions.
 
 ```bit
 import { open, everything, ProfileOptions, ProfileResult, SearchOptions, Page } from "redis"
