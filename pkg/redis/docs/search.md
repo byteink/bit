@@ -23,7 +23,7 @@ Here are the articles as hashes, one per key.
 
 ```bit
 import {
-  open, schema, CreateOptions, TextOptions, qfield, SearchOptions, SortBy, Page, Returned,
+  open, schema, CreateOptions, TextOptions, NumericOptions, qfield, SearchOptions, SortBy, Page, Returned,
 } from "redis"
 
 fn main(): ()! {
@@ -43,7 +43,7 @@ fn main(): ()! {
   articles.create(
     schema().text("title", TextOptions{ weight = 2.0 }).tag("author").numeric(
       "words",
-      sortable = true,
+      NumericOptions{ sortable = true },
     ),
     CreateOptions{ prefixes = ["article:"] },
   )?
@@ -77,9 +77,8 @@ the named ones, `alias` renaming a field on the way out (`RETURN ... AS`).
 Each schema method is one `FT.CREATE` field type, and its options are the
 keywords redis.io lists for it, in the same order. The first argument is the
 hash field, or the JSON path of a JSON document; `alias` is the name queries
-use (`AS`), which a JSON path needs. The kinds with many options take an
-options class (`TextOptions`, `TagOptions`, `VectorOptions`); `numeric`,
-`geo` and `geoShape` take named arguments (`numeric("words", sortable = true)`).
+use (`AS`), which a JSON path needs. Each field kind takes a typed options
+class; omitting it keeps the defaults.
 
 - `text(name, opts)` is full-text: words are stemmed and stop words dropped.
   `weight` scales its share of the score, `noStem` keeps words as typed,
@@ -88,9 +87,10 @@ options class (`TextOptions`, `TagOptions`, `VectorOptions`); `numeric`,
   `indexEmpty` and `indexMissing` let a query find empty and absent values.
 - `tag(name, opts)` is an exact value: an author id, a category. A field holding
   several is split on `separator` (`,` by default); `caseSensitive` keeps case.
-- `numeric(name)` supports range queries and sorting.
-- `geo(name)` is a `lon,lat` position, queried by radius.
-- `geoShape(name)` is a WKT point or polygon; `Coords.Spherical` (the default)
+- `numeric(name, opts)` supports range queries and sorting; use `NumericOptions`.
+- `geo(name, opts)` is a `lon,lat` position, queried by radius; use `GeoOptions`.
+- `geoShape(name, opts)` is a WKT point or polygon; `GeoShapeOptions.coords` selects
+  `Coords.Spherical` (the default)
   or `Coords.Flat`.
 - `vector(name, dim, opts)` is a vector of `dim` numbers. `algo` is `VecAlgo.Hnsw`
   (approximate, fast) or `VecAlgo.Flat` (exact), `metric` is
@@ -114,7 +114,7 @@ the index after that many idle seconds), `noOffsets`, `noHl`, `noFields`,
 ```bit
 import {
   open, schema, CreateOptions, IndexOn, TextOptions, TagOptions, VectorOptions, Phonetic, VecAlgo,
-  VecMetric, VecType, Coords,
+  VecMetric, VecType, Coords, NumericOptions, GeoOptions, GeoShapeOptions,
 } from "redis"
 
 fn main(): ()! {
@@ -124,13 +124,14 @@ fn main(): ()! {
     TextOptions{ alias = "title", weight = 2.0, phonetic = Phonetic.English, sortable = true },
   ).tag("$.tags[*]", TagOptions{ alias = "tags", separator = "|" }).numeric(
     "$.words",
-    alias = "words",
-    sortable = true,
+    NumericOptions{ alias = "words", indexMissing = true, sortable = true, noIndex = false },
   )
-  let full = base.geo("$.origin", alias = "origin").geoShape(
+  let full = base.geo(
+    "$.origin",
+    GeoOptions{ alias = "origin", indexMissing = true, sortable = true, noIndex = false },
+  ).geoShape(
     "$.area",
-    alias = "area",
-    coords = Coords.Flat,
+    GeoShapeOptions{ alias = "area", coords = Coords.Flat, indexMissing = true },
   ).vector(
     "$.embedding",
     384,
