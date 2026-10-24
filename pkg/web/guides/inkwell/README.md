@@ -105,3 +105,42 @@ Already issued access JWTs remain valid for their remaining lifetime, at most
 900 seconds; resetting a password does not provide global session logout.
 Protect mail, Redis jobs and backups: the worker must send the usable link.
 Tokens stay out of public JSON and worker failure logs.
+
+## Restrict an administrative user lookup
+
+Some routes need a role check before they read data. Inkwell stores the signed-in
+account's role in its existing session. `requireRole(c, roles)` allows an exact
+match from the supplied list; anonymous callers, missing roles and an empty list
+are forbidden. Names are case-sensitive: `Admin` does not match `admin`.
+
+The application mounts `GET /v1/admin/users/:id` with `requireRole(c, ["admin"])`
+before the existing user lookup. A forbidden request cannot query a user. An
+allowed request returns the same public `id`, `username` and `role` as
+`GET /v1/users/:id`; email, password hashes and tokens stay private. Invalid IDs
+still return `400`, and missing users return `404`.
+
+With the application running as above, sign in using an existing administrator
+account and request its public profile. Registration always creates authors;
+this example does not provide an endpoint for granting administrative roles.
+
+```sh
+curl --fail-with-body -c admin.cookies http://127.0.0.1:8080/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"existing-admin","password":"ADMIN_PASSWORD"}'
+curl --fail-with-body -b admin.cookies http://127.0.0.1:8080/v1/admin/users/1
+```
+
+Inside this application, use the same helper when a route accepts several roles:
+
+```bit
+fn mountEditorial(app: App) {
+  app.get("/editorial", (c) => {
+    requireRole(c, ["editor", "admin"])?
+    return c.text("editorial access")
+  })
+}
+```
+
+The existing `requireAdmin` and owner-or-admin checks retain their behavior.
+Role changes take effect after a new login; this change does not add live role
+refresh, TOTP or an audit log.
