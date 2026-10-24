@@ -53,10 +53,14 @@ with the reason on the job's hash. With the default prefix the keys are:
 
 Every step that touches more than one of these is one Lua script, run
 atomically on the server. A claim is one round trip: the script takes a
-job whose claim ran out (a worker that crashed mid-job) or else the oldest
-ready one, moves it to `flight` for the visibility timeout and raises its
-attempt count. Two workers can never take the same job, on one instance or
-fifty.
+job whose visibility lease expired or else the oldest ready one, moves it
+to `flight` for the visibility timeout and raises its attempt count.
+Another worker cannot claim that job while its lease is still valid.
+
+Expiry does not cancel the original handler. If it is still running, a
+second worker can reclaim the job and run it at the same time. Delivery
+can therefore repeat or overlap, including without a worker crash; make
+the handler idempotent rather than relying on exactly-once execution.
 
 The script reads the time from the server (`TIME`), so a worker whose own
 clock is wrong can neither claim a job early nor take over another worker's
