@@ -103,7 +103,10 @@ class; omitting it keeps the defaults.
   `VecType.Float32` (the default), `Float64`, `Bfloat16` or `Float16`.
   `Hnsw` also takes `m`, `efConstruction`, `efRuntime` and `epsilon`;
   `initialCap` and `blockSize` apply to both. `VecAlgo.SvsVamana` selects
-  SVS-VAMANA with server defaults; use `Float32` or `Float16`.
+  SVS-VAMANA; use `Float32` or `Float16`. Its `constructionWindowSize`,
+  `graphMaxDegree` and `searchWindowSize` tune construction and search;
+  it also accepts `epsilon`. Nonpositive tuning values are omitted,
+  preserving the server's defaults.
 
 `sortable` keeps a field's value so `SortBy` and `AGGREGATE` read it without
 touching the document; `unf` keeps it un-normalized too; `noIndex` stores it
@@ -347,7 +350,13 @@ fn main(): ()! {
 To use an SVS-VAMANA index for the article embeddings, choose
 `VecAlgo.SvsVamana` in the same vector schema. This requires Redis 8.2 or
 later and accepts `FLOAT32` or `FLOAT16`; the server rejects `FLOAT64`.
-The example uses server defaults, without compression or algorithm tuning.
+The same article index can set a construction window, graph degree and search
+window with `constructionWindowSize`, `graphMaxDegree` and `searchWindowSize`.
+`epsilon` sets the range-search approximation factor. Each option is sent only
+when positive; zero or a negative value omits it, preserving the server's default.
+Redis validates the settings, and a rejected combination returns `RedisError`;
+the client neither substitutes another algorithm nor retries the request.
+See Redis's [SVS-VAMANA attributes](https://redis.io/docs/latest/develop/ai/search-and-query/vectors/#svs-vamana-index).
 Keep `Flat` when exact search is required; choosing a different index does
 not by itself establish better performance for your workload.
 
@@ -361,7 +370,13 @@ fn main(): ()! {
   defer r.close()
   let articles = r.search("idx:svs:articles")
   articles.create(
-    schema().vector("embedding", 2, VectorOptions{ algo = VecAlgo.SvsVamana }),
+    schema().vector(
+      "embedding", 2,
+      VectorOptions{
+        algo = VecAlgo.SvsVamana, constructionWindowSize = 250, graphMaxDegree = 40,
+        searchWindowSize = 20, epsilon = 0.02,
+      },
+    ),
     CreateOptions{ prefixes = ["svs:article:"] },
   )?
   defer {
