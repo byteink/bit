@@ -75,10 +75,12 @@ fn requireAdmin(c: Ctx): ()! {
 }
 ```
 
-Both fail with `forbidden()`, `403 Forbidden`, never `401`: the caller is
-authenticated (`currentUserId`/`currentRole` already proved that, or the
-request would have failed earlier), the problem is what they are allowed to
-do, not who they are.
+`requireAdmin` rejects a missing or disallowed role with `403 Forbidden` and
+`admin role required`. `requireOwnerOrAdmin` first calls `currentUserId`:
+a missing user id returns `401 Unauthorized`. An authenticated nonowner
+without the admin role gets `403 Forbidden` and
+`you may only modify your own resource`. `currentRole` reads the session's
+role; it does not prove that the caller is authenticated.
 
 ## Guarding an article's own routes
 
