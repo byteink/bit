@@ -135,6 +135,7 @@ against its own PostgreSQL, Redis and SeaweedFS containers.
 43. [API tokens with JWT](34-api-tokens-with-jwt.md)
 44. [Refresh tokens](35-refresh-tokens.md)
 45. [Sign in with Google](36-sign-in-with-google.md)
+46. [Restrict administrative routes by role](38-role-based-access-control.md)
 46. [Idempotency keys: retry a write without doing it twice](40-idempotency-keys.md)
 
 Idempotency closes this part by making the app's two creating routes safe
