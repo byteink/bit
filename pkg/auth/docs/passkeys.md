@@ -126,7 +126,8 @@ Before anything is stored the server checks, in this order:
    biometric.
 4. The key's algorithm is one you offered, the credential id matches the one
    the browser reported, and no credential with that id exists yet.
-5. The attestation format is `none`.
+5. The attestation is `none`, or explicitly permitted packed self attestation
+   verifies the credential key over the exact authenticator and client data.
 
 A failure is an error whose message names the check, for example
 `clientData origin 'https://evil.example' is not an allowed origin`,
@@ -136,9 +137,28 @@ A failure is an error whose message names the check, for example
 "could not add the passkey" and log the message.
 
 Attestation `none` means you do not ask which authenticator model made the
-key, which is what almost every site wants. A response in another format
-(`packed`, `fido-u2f`, `tpm`) fails with
-`attestation format 'packed' is not supported yet, only 'none'`.
+key, which is what almost every site wants. It is the default acceptance policy.
+To accept a key's own proof of possession too, opt in when building Inkwell's
+relying party:
+
+```bit
+fn inkwellSelfAttestedPasskeys(): WebAuthn! {
+  let rp = RelyingParty{
+    id = "inkwell.example",
+    name = "Inkwell",
+    origins = ["https://inkwell.example"],
+  }
+  let opts = WebAuthnOptions{ allowPackedSelfAttestation = true }
+  return WebAuthn(rp, MemoryCredentialStore(), opts)?
+}
+```
+
+The same options and registration routes above still apply. Packed self
+attestation verifies the credential key's signature, including the verbatim
+client data JSON and authenticator data. It does not establish an authenticator
+model, manufacturer or certificate trust. Certificate-based `packed` (`x5c`)
+and every other format remain rejected. The browser's `attestation` conveyance
+preference is separate: choosing `Direct` alone does not enable this policy.
 
 ## The user handle
 
