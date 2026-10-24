@@ -122,6 +122,7 @@ against its own PostgreSQL, Redis and SeaweedFS containers.
 32. [Read a cover without buffering the download](20-serving-and-streaming-files.md)
 33. [Keep cover bytes in object storage](21-object-storage.md)
 34. [Send a welcome email after registration](22-sending-email.md)
+35. [Verify an email address and recover a password](23-email-verification-and-password-reset.md)
 34. [Run a nightly article digest](25-scheduled-jobs.md)
 35. [Cache article lists in Redis](26-caching-with-redis.md)
 36. [Share sessions across servers](27-sessions-in-redis.md)
