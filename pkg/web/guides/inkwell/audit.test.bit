@@ -1,0 +1,181 @@
+fn auditRows(db: Db, target: string): []AuditLog {
+  return db.table<AuditLog>().where("target", target).orderBy("id", Dir.Asc).all() catch e {
+    panic(e.message())
+  }
+}
+
+fn assertAudit(db: Db, target: string, actorId: i64, actions: []string) {
+  let rows = auditRows(db, target)
+  assert(len(rows) == len(actions), "audit action count differs for ${target}")
+  for (i, action) in actions {
+    let row = rows[i]
+    assert(row.actorId == actorId, "audit must record the acting user")
+    assert(row.action == action, "audit action differs for ${target}")
+    assert(row.target == target && row.createdAt > 0, "audit target or timestamp differs")
+  }
+}
+
+fn auditUser(db: Db, name: string): User {
+  return findUserByUsername(db, name) catch e {
+    panic(e.message())
+  }
+}
+
+test "audit records article create update delete and refuses stale or repeated mutations" {
+  let db = rbacDatabase()
+  defer db.pool.close()
+  let app = testApp()
+  let name = uniqueName("article-audit")
+  let cookie = registerAndLogin(app, name, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let actor = auditUser(db, name)
+  let id = postArticle(app, cookie, "Audited article", "[]") catch e {
+    panic(e.message())
+  }
+  let target = "article/${id}"
+  assertAudit(db, target, actor.id, ["article.create"])
+  let revision = articleRevision(readCachedArticle(app, id, ""))
+  let updated = putWithIfMatch(app, cookie, id, "Audited update", "${revision}")
+  assert(updated.status == 200, "audited update failed: ${updated.body}")
+  assertAudit(db, target, actor.id, ["article.create", "article.update"])
+  let stale = putWithIfMatch(app, cookie, id, "Rejected update", "${revision}")
+  assert(stale.status == 412, "stale audit control must fail")
+  assertAudit(db, target, actor.id, ["article.create", "article.update"])
+  let removed = app.handle(jsonReq("DELETE", "/v1/articles/${id}", cookie, ""))
+  assert(removed.status == 204, "audited delete failed: ${removed.body}")
+  assertAudit(db, target, actor.id, ["article.create", "article.update", "article.delete"])
+  let repeated = app.handle(jsonReq("DELETE", "/v1/articles/${id}", cookie, ""))
+  assert(repeated.status == 404, "repeated delete must fail")
+  assertAudit(db, target, actor.id, ["article.create", "article.update", "article.delete"])
+}
+
+test "audit records comment create delete and rejects another author's deletion" {
+  let db = rbacDatabase()
+  defer db.pool.close()
+  let app = testApp()
+  let name = uniqueName("comment-audit")
+  let cookie = registerAndLogin(app, name, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let other = registerAndLogin(app, uniqueName("audit-other"), "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let actor = auditUser(db, name)
+  let articleId = postArticle(app, cookie, "Comments with history", "[]") catch e {
+    panic(e.message())
+  }
+  let created = app.handle(
+    jsonReq("POST", "/v1/articles/${articleId}/comments", cookie, "{\"body\":\"Audited comment\"}"),
+  )
+  assert(created.status == 201, "audited comment failed: ${created.body}")
+  let parentId = parseId(articleId) catch e {
+    panic(e.message())
+  }
+  let rows = db.table<Comment>().where("articleId", parentId).all() catch e {
+    panic(e.message())
+  }
+  assert(len(rows) == 1, "comment fixture must create one row")
+  let id = rows[0].id
+  let target = "comment/${id}"
+  assertAudit(db, target, actor.id, ["comment.create"])
+  let forbidden = app.handle(jsonReq("DELETE", "/v1/comments/${id}", other, ""))
+  assert(forbidden.status == 403, "non-owner audit control must fail")
+  assertAudit(db, target, actor.id, ["comment.create"])
+  let removed = app.handle(jsonReq("DELETE", "/v1/comments/${id}", cookie, ""))
+  assert(removed.status == 204, "audited comment delete failed: ${removed.body}")
+  assertAudit(db, target, actor.id, ["comment.create", "comment.delete"])
+  let repeated = app.handle(jsonReq("DELETE", "/v1/comments/${id}", cookie, ""))
+  assert(repeated.status == 404, "repeated comment delete must fail")
+  assertAudit(db, target, actor.id, ["comment.create", "comment.delete"])
+}
+
+test "audit records an administrator as actor instead of the article owner" {
+  let db = rbacDatabase()
+  defer db.pool.close()
+  let app = testApp()
+  let name = uniqueName("audit-owner")
+  let ownerCookie = registerAndLogin(app, name, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let adminName = uniqueName("audit-admin")
+  registerAndLogin(app, adminName, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  db.exec("update users set role = 'admin' where username = ?", adminName) catch e {
+    panic(e.message())
+  }
+  let login = app.handle(
+    jsonReq(
+      "POST", "/v1/auth/login", "", "{\"username\":\"${adminName}\",\"password\":\"correct horse battery\"}",
+    ),
+  )
+  assert(login.status == 204, "administrator login failed")
+  let cookie = cookiePair(login.getHeader("Set-Cookie"))
+  let admin = auditUser(db, adminName)
+  let articleId = postArticle(app, ownerCookie, "Admin edit", "[]") catch e {
+    panic(e.message())
+  }
+  let revision = articleRevision(readCachedArticle(app, articleId, ""))
+  let response = putWithIfMatch(app, cookie, articleId, "Admin changed", "${revision}")
+  assert(response.status == 200, "administrator audit edit failed: ${response.body}")
+  let rows = auditRows(db, "article/${articleId}")
+  assert(len(rows) == 2, "administrator update must add one audit row")
+  assert(rows[0].actorId == auditUser(db, name).id, "create must name the article owner")
+  assert(rows[1].actorId == admin.id, "administrator update must name the administrator")
+  assert(rows[1].action == "article.update", "administrator update action differs")
+}
+
+test "audit insert failure rolls back the real article update and leaves no audit row" {
+  let db = rbacDatabase()
+  defer db.pool.close()
+  let name = uniqueName("audit-rollback")
+  let owner = db.table<User>().insert(newUser(name, "${name}@example.test", "unused", "author")) catch e {
+    panic(e.message())
+  }
+  let article: Article = Article{}
+  db.tx((tx) => {
+    article = insertArticle(
+      tx,
+      owner.id,
+      CreateArticleInput{ title = "Before rollback", body = "", tags = []string(0) },
+    )?
+  }) catch e {
+    panic(e.message())
+  }
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let redis = openRedis(cfg.redisUrl) catch e {
+    panic(e.message())
+  }
+  defer redis.close()
+  let app = App(Config{ secret = "audit-rollback", sessions = MemoryStore(100) })
+  app.get("/session", (c) => {
+    let session = c.session()?
+    session.set(sessionRoleKey, "admin")
+    // A missing actor makes the audit foreign key fail after the article update.
+    session.set(sessionUserIdKey, "-1")
+    return c.noContent()
+  })
+  app.put("/articles/:id", (c) => updateArticle(c, db, redis))
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  let cookie = cookiePair(app.handle(jsonReq("GET", "/session", "", "")).getHeader("Set-Cookie"))
+  let request = jsonReq(
+    "PUT",
+    "/articles/${article.id}",
+    cookie,
+    "{\"title\":\"Must roll back\",\"body\":\"\"}",
+  )
+  request.headers = request.headers + "\r\nIf-Match: ${article.version}"
+  let response = app.handle(request)
+  assert(response.status == 500, "missing audit actor must fail the real update")
+  let saved = findArticleById(db, article.id) catch e {
+    panic(e.message())
+  }
+  assert(saved.title == article.title, "audit failure must roll back the article title")
+  assert(saved.version == article.version, "audit failure must roll back the article version")
+  assert(len(auditRows(db, "article/${article.id}")) == 0, "failed update must not commit an audit")
+}
