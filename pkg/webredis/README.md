@@ -9,13 +9,13 @@ stores belong here too.
 
 ## Install
 
-`bit add bitlang.org/pkg/webredis@v0.1.0` writes the dependency below, and
+`bit add bitlang.org/pkg/webredis@v0.1.1` writes the dependency below, and
 `bit add` fetches `web` and `redis` with it:
 
 ```json
 {
   "dependencies": {
-    "webredis": "bitlang.org/pkg/webredis@v0.1.0"
+    "webredis": "bitlang.org/pkg/webredis@v0.1.1"
   }
 }
 ```
