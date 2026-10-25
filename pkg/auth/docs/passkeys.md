@@ -126,8 +126,9 @@ Before anything is stored the server checks, in this order:
    biometric.
 4. The key's algorithm is one you offered, the credential id matches the one
    the browser reported, and no credential with that id exists yet.
-5. The attestation is `none`, or explicitly permitted packed self attestation
-   verifies the credential key over the exact authenticator and client data.
+5. The attestation matches your policy. Packed statements verify their signature
+   over the exact authenticator and client data; certificate leaves meet the
+   packed profile, and configured trust roots are checked when required.
 
 A failure is an error whose message names the check, for example
 `clientData origin 'https://evil.example' is not an allowed origin`,
@@ -136,29 +137,69 @@ A failure is an error whose message names the check, for example
 `no registration is in progress for this session`. Show the author a generic
 "could not add the passkey" and log the message.
 
-Attestation `none` means you do not ask which authenticator model made the
-key, which is what almost every site wants. It is the default acceptance policy.
-To accept a key's own proof of possession too, opt in when building Inkwell's
-relying party:
+## Choose an attestation policy
+
+Most Inkwell authors use synced passkeys. Their keys need no manufacturer
+identity. The default `AttestationPolicy` accepts `none` and `packed`, allows
+self attestation, and uses `AttestationTrust.Ignore`. Packed signatures and
+certificate profiles are still verified. The result never claims certificate
+trust unless a configured root validates the path.
+
+An Inkwell installation that issues security keys can require certificate
+attestation from its approved manufacturer. Load that manufacturer's trusted
+root certificates from your deployment configuration, then build the same
+relying party and use the registration routes above:
 
 ```bit
-fn inkwellSelfAttestedPasskeys(): WebAuthn! {
+import { AttestationPolicy, AttestationResult, AttestationTrust } from "auth"
+import { Certificate } from "std/crypto"
+
+fn inkwellAttestedPasskeys(roots: []Certificate): WebAuthn! {
   let rp = RelyingParty{
     id = "inkwell.example",
     name = "Inkwell",
     origins = ["https://inkwell.example"],
   }
-  let opts = WebAuthnOptions{ allowPackedSelfAttestation = true }
-  return WebAuthn(rp, MemoryCredentialStore(), opts)?
+  let policy = AttestationPolicy{
+    trust = AttestationTrust.Verify,
+    roots = roots,
+    allowSelf = false,
+    formats = ["packed"],
+  }
+  return WebAuthn(rp, MemoryCredentialStore(), WebAuthnOptions{
+    attestationPolicy = policy,
+  })?
+}
+
+fn inkwellAttestationSummary(result: AttestationResult): string {
+  return "${result.fmt}: ${result.kind}, trusted=${result.trusted}, certificates=${len(result.chain)}"
 }
 ```
 
-The same options and registration routes above still apply. Packed self
-attestation verifies the credential key's signature, including the verbatim
-client data JSON and authenticator data. It does not establish an authenticator
-model, manufacturer or certificate trust. Certificate-based `packed` (`x5c`)
-and every other format remain rejected. The browser's `attestation` conveyance
-preference is separate: choosing `Direct` alone does not enable this policy.
+Pass `credential.attestation` from `finishRegistration` to
+`inkwellAttestationSummary` for your audit log. Its `fmt` is the wire format;
+`kind` is `none`, `self` or `basic`; `chain` contains the presented x5c
+certificates in leaf-first order. `trusted` is true only after `Verify`
+validates certificate signatures, validity, critical extensions and path
+constraints to a configured root. No hostname or TLS server purpose is imposed
+on an authenticator certificate. A basic result does not distinguish a
+manufacturer's batch key from an Attestation CA.
+
+`Verify` with empty `roots` fails at construction with `attestation trust
+Verify requires roots`. An untrusted path, malformed leaf, changed signature,
+disallowed format or refused self attestation fails registration before store
+writes. Configure roots from an independent trusted source; certificates sent
+by the browser do not become trust anchors. Root revocation and authenticator
+metadata remain your deployment's responsibility.
+
+For ordinary consumer passkeys, keep the default. To accept only `none`, set
+`formats = ["none"]`. Self attestation proves key possession and always has
+`trusted = false`, even when `Verify` is selected and `allowSelf` is true.
+`none` also has no trust path. The browser's `attestation` conveyance
+preference is separate from this server policy. `allowPackedSelfAttestation`
+is retained for source compatibility; `attestationPolicy` controls acceptance.
+The formats `fido-u2f`, `apple`, `android-key` and `tpm` currently fail with
+an error naming the format, including when listed in `formats`.
 
 ## The user handle
 
