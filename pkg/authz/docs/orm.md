@@ -39,6 +39,8 @@ fn main(): ()! {
     Sql(sql, _) => println(sql)
     _ => panic("expected the author filter")
   }
+  let columns = guard.columnsInRules(user, GuardOp.Update, "articles")?
+  assert(len(columns) == 1 && columns[0] == "authorId", "rule columns")
   let row = Article{ id = 1, authorId = "sara" }
   assert(
     guard.allows(user, GuardOp.Create, "articles", ["id", "authorId"], row.__values())?,
@@ -73,3 +75,10 @@ The ORM requires `$n` placeholders for both databases. The adapter calls
 `compileSql(cond, info, dialect, firstParam, true)` to request numbering
 without changing MySQL's identifier quoting. Existing four-argument calls
 still emit `?` on MySQL. A numbered call requires `firstParam >= 1`.
+
+`columnsInRules(user, op, table)` returns unique model field names in resource
+declaration order. It includes every applicable allow and deny condition before
+constant folding, including conditions beneath `Not` and `Known`. An unconditional
+allow does not hide other rule columns. The same actor, store and unsupported-rule
+checks as `filter` apply. This port supplies rule metadata; scoped bulk updates
+remain separate work (#7041).
