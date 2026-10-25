@@ -7,6 +7,26 @@ fn sliceBaseFixture(): IrModule {
   )
 }
 
+// #8721: keep deferred SliceBase safety checks explicit in their fixture IR.
+fn optimizeSliceBaseFixture(m: IrModule) {
+  let i = 0
+  while (i < len(m.funcs)) {
+    m.funcs[i] = biasSliceAddresses(m.ctx, m.funcs[i], false)
+    i = i + 1
+  }
+  optimizeModule(m, false)
+}
+
+fn checkSliceBaseDeferred() {
+  let m = sliceBaseFixture()
+  optimizeModule(m, false)
+  for f of m.funcs {
+    assert(optCountOp(f, Op.SliceBase) == 0, "8721/release/slice-base-deferred")
+  }
+  assert(optCountOp(optFuncNamed(m, "read"), Op.IndexGet) == 1, "8721/release/read-preserved")
+  assert(optCountOp(optFuncNamed(m, "write"), Op.IndexSet) == 1, "8721/release/write-preserved")
+}
+
 fn sliceBaseFirst(f: IrFunc, op: Op): int {
   let i = 0
   while (i < len(f.instrs)) {
@@ -104,7 +124,7 @@ fn checkSliceBaseClobber() {
       "    print(\"\")\n    s = s + xs[i]\n    i = i + 1\n  }\n  return s\n}\n" +
       "fn main() {}\n",
   )
-  optimizeModule(m, false)
+  optimizeSliceBaseFixture(m)
   let f = optFuncNamed(m, "withCall")
   assert(optCountOp(f, Op.SliceBase) > 0, "8640/call/base-present")
   assert(optCountOpInBlock(f, 0, Op.SliceBase) == 0, "8640/call/no-hoist")
@@ -117,7 +137,7 @@ fn checkSliceBaseHoistOwner() {
       "    s = s + xs[i]\n    i = i + 1\n  }\n  return s\n}\n" +
       "fn main() {}\n",
   )
-  optimizeModule(m, false)
+  optimizeSliceBaseFixture(m)
   let f = optFuncNamed(m, "sum")
   assert(optCountOpInBlock(f, 0, Op.SliceBase) == 1, "8640/hoist/preheader")
   let owners = 0
@@ -166,7 +186,7 @@ fn checkSliceBaseCseFullOpt() {
   let m = sliceBaseCseFixture()
   let before = biasSliceAddresses(m.ctx, optFuncNamed(m, "same"), false)
   assert(optCountOp(before, Op.SliceBase) == 3, "8648/fullopt/three-accesses-built")
-  optimizeModule(m, false)
+  optimizeSliceBaseFixture(m)
   let same = optFuncNamed(m, "same")
   assert(optCountOp(same, Op.SliceBase) == 1, "8648/fullopt/same-header-dedup")
   assert(optCountOp(same, Op.IndexSet) == 1, "8648/fullopt/store-preserved")
@@ -346,7 +366,7 @@ fn checkSliceBaseBorrowDeadCopies() {
       "  let i = 0\n  while (i < n) { print(i); i = i + 1 }\n" +
       "  return out\n}\nfn main() {}\n",
   )
-  optimizeModule(m, false)
+  optimizeSliceBaseFixture(m)
   let f = optFuncNamed(m, "dead")
   assert(optCountOp(f, Op.SliceBase) > 0, "8679/borrow/fullopt-address")
   let lastRead = sliceBaseFirst(f, Op.IndexGet)
@@ -362,7 +382,131 @@ fn checkSliceBaseBorrowDeadCopies() {
   checkSliceBaseCseOwner(m.ctx, f)
 }
 
+// #8700: the effective buffer address reads a header without copying it.
+fn checkSliceBaseAppendReads() {
+  let m = sliceBaseFixture()
+  let f = biasSliceAddresses(m.ctx, optFuncNamed(m, "read"), false)
+  let ins = f.instrs[sliceBaseFirst(f, Op.SliceBase)]
+  assert(ownHeaderUse(ins, ins.lhs), "8700/header-read/owned")
+  let b = borrowNew([f])
+  let fo = ownedFieldsOf(m)
+  borrowScanFunc(b, newOwnFn(f, fo))
+  borrowSolve(b)
+  assert(b.ok[b.base["read"] - 1], "8700/header-read/parameter")
+}
+
+fn sliceBaseAppendFixture(): IrModule {
+  return lowerSourceModule(
+      "class Held { xs: []int }\n" +
+      "fn readHeader(xs: []int, n: int): int {\n" +
+      "  if (n > 0) { return readHeader(xs, n - 1) }\n  return xs[0]\n}\n" +
+      "fn saveHeader(h: Held, xs: []int, n: int): int {\n" +
+      "  if (n > 0) { return saveHeader(h, xs, n - 1) }\n" +
+      "  h.xs = xs\n  return xs[0]\n}\n" +
+      "fn direct(): []int {\n  let xs = [1, 2, 3]\n  let i = 0\n" +
+      "  while (i < len(xs)) { if (i < 3) { xs = append(xs, xs[i] * 10) }; i = i + 1 }\n" +
+      "  return xs\n}\n" +
+      "fn called(n: int): []int {\n  let xs = [1]\n  let i = 0\n" +
+      "  while (i < n) { let v = readHeader(xs, i); xs = append(xs, v); i = i + 1 }\n" +
+      "  return xs\n}\n" +
+      "fn escaped(h: Held, n: int): []int {\n  let xs = [1]\n" +
+      "  let v = saveHeader(h, xs, n)\n  return append(xs, v)\n}\n" +
+      "fn alias(n: int): int {\n  let xs = [1]\n  let saved = xs\n" +
+      "  let v = xs[0]\n  xs = append(xs, n)\n  return len(saved) + v + len(xs)\n}\n" +
+      "fn snapshot(n: int): int {\n  let xs = [1]\n  let saved = xs\n  let i = 0\n" +
+      "  while (i < n) { if (i == 1) { saved = xs }; let v = xs[0]; " +
+      "xs = append(xs, v); i = i + 1 }\n  return len(saved)\n}\n",
+  )
+}
+
+fn checkSliceBaseAppendTarget(m: IrModule, name: string, fresh: int) {
+  let f = optFuncNamed(m, name)
+  let calls = 0
+  let owned = 0
+  for ins of f.instrs {
+    if (ins.op == Op.RtCall && ins.name == "slice_append_fresh") {
+      calls = calls + 1
+    }
+    if (ins.op == Op.RtCall && ins.name == "slice_append") {
+      owned = owned + 1
+    }
+  }
+  assert(calls == fresh, "8700/append/${name}/header-ownership")
+  assert(owned + calls == 1, "8700/append/${name}/append-preserved")
+}
+
+fn checkSliceBaseAppendOwnership() {
+  let m = sliceBaseAppendFixture()
+  optimizeSliceBaseFixture(m)
+  assert(optCountOp(optFuncNamed(m, "direct"), Op.SliceBase) > 0, "8700/append/direct/base")
+  assert(optCountOp(optFuncNamed(m, "readHeader"), Op.SliceBase) > 0, "8700/append/callee/base")
+  checkSliceBaseAppendTarget(m, "direct", 0)
+  checkSliceBaseAppendTarget(m, "called", 0)
+  checkSliceBaseAppendTarget(m, "escaped", 1)
+  checkSliceBaseAppendTarget(m, "alias", 1)
+  checkSliceBaseAppendTarget(m, "snapshot", 1)
+}
+
+fn sliceBaseFieldFixture(body: string): IrModule {
+  return lowerSourceModule(
+      "class FieldBag { items: []int }\n" +
+      "fn pushField(h: FieldBag, v: int, d: int) {\n" +
+      "  if (d > 0) { pushField(h, v, d - 1); return }\n" +
+      "  h.items = append(h.items, v)\n}\n" +
+      body +
+      "fn main() { let h = FieldBag{ items = []int(0, 8) }; pushField(h, 7, 2) }\n",
+  )
+}
+
+fn sliceBaseFieldCopies(f: IrFunc): int {
+  let n = 0
+  for ins of f.instrs {
+    if (ins.op == Op.RtCall && ins.name == "slice_slice") {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+// #8709: reading an owned field's effective address cannot escape its header.
+fn checkSliceBaseFieldReads() {
+  let m = sliceBaseFieldFixture(
+    "fn readField(h: FieldBag, i: int): int { return h.items[i] }\n",
+  )
+  optimizeSliceBaseFixture(m)
+  let f = optFuncNamed(m, "readField")
+  assert(optCountOp(f, Op.SliceBase) > 0, "8709/field-read/address")
+  assert(sliceBaseFieldCopies(f) == 0, "8709/field-read/no-snapshot")
+  let returned = sliceBaseFieldFixture("fn returned(h: FieldBag): []int { return h.items }\n")
+  optimizeSliceBaseFixture(returned)
+  assert(
+    sliceBaseFieldCopies(optFuncNamed(returned, "returned")) == 1,
+    "8709/field-return/snapshot",
+  )
+  let stored = sliceBaseFieldFixture(
+      "class SavedField { items: []int }\n" +
+      "fn stored(h: FieldBag, saved: SavedField) { saved.items = h.items }\n",
+  )
+  optimizeSliceBaseFixture(stored)
+  assert(sliceBaseFieldCopies(optFuncNamed(stored, "stored")) == 1, "8709/field-store/snapshot")
+}
+
+fn checkSliceBaseFieldAliases() {
+  let alias = sliceBaseFieldFixture(
+      "fn alias(h: FieldBag): int {\n  let kept = h.items\n" +
+      "  pushField(h, 9, 2)\n  return len(kept)\n}\n",
+  )
+  optimizeSliceBaseFixture(alias)
+  checkSliceBaseAppendTarget(alias, "pushField", 1)
+  let view = sliceBaseFieldFixture(
+    "fn view(h: FieldBag, lo: int, hi: int): []int { return h.items[lo:hi] }\n",
+  )
+  optimizeSliceBaseFixture(view)
+  assert(sliceBaseFieldCopies(optFuncNamed(view, "view")) > 0, "8709/field-view/not-erased")
+}
+
 fn checkSliceBase() {
+  checkSliceBaseDeferred()
   checkSliceBaseRead()
   checkSliceBaseRefusals()
   checkSliceBaseStores()
@@ -379,4 +523,8 @@ fn checkSliceBase() {
   checkSliceBaseBorrowRawOwner()
   checkSliceBaseBorrowPtrOf()
   checkSliceBaseBorrowDeadCopies()
+  checkSliceBaseAppendReads()
+  checkSliceBaseAppendOwnership()
+  checkSliceBaseFieldReads()
+  checkSliceBaseFieldAliases()
 }
