@@ -143,4 +143,34 @@ fn mountEditorial(app: App) {
 
 The existing `requireAdmin` and owner-or-admin checks retain their behavior.
 Role changes take effect after a new login; this change does not add live role
-refresh, TOTP or an audit log.
+refresh or TOTP.
+
+
+## Inspect article and comment changes
+
+After applying the migrations, each article create, update or delete and each
+comment create or delete writes an `audit_logs` row in the same PostgreSQL
+transaction. The row stores the acting user's ID, the action, the target and the
+creation time in Unix nanoseconds. An administrator's edit records the
+administrator as the actor, even when another user owns the article.
+
+Create an article through the existing authenticated example, then inspect its
+history in PostgreSQL:
+
+```sql
+select actor_id, action, target, created_at
+from audit_logs
+where target = 'article/1'
+order by id;
+```
+
+An article's actions are `article.create`, `article.update` and `article.delete`.
+Comment actions are `comment.create` and `comment.delete`, with `comment/<id>`
+targets. A rejected write adds no row. An audit insert error rolls back the
+mutation; it is returned to the caller. Deleting an article records its soft deletion; existing comment rows remain.
+The target remains readable after deletion. The actor foreign key restricts user
+deletion so that existing history survives.
+
+Redis cache invalidation follows the database commit. A cache error can therefore
+return an error after the mutation and its audit row have committed. Login and
+cover-image changes are outside this audit example.
