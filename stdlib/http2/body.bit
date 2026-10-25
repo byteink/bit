@@ -1,0 +1,95 @@
+// Bit standard library: incremental HTTP/2 response bodies (RFC 9113 §8.1).
+
+// A handler-owned response writer. One thread writes and closes it. Writes
+// finish only after flow-controlled DATA has left; close sends END_STREAM.
+export class H2BodyStream {
+  s: Stream
+  closed: bool
+
+  export write(data: []byte): ()! {
+    if (this.closed) {
+      fail newError("http2: response body is closed")
+    }
+    if (len(data) == 0) {
+      return
+    }
+    h2connBodyCommand(this.s, h2cmdWrite, Response(0, data))?
+  }
+
+  export close(): ()! {
+    if (this.closed) {
+      return
+    }
+    this.closed = true
+    h2connBodyCommand(this.s, h2cmdBodyClose, h2connZeroResponse())?
+  }
+}
+
+fn h2connBodyCommand(s: Stream, kind: int, response: Response): ()! {
+  let replyCh = chan<h2connMsg>(1)
+  s.cmdCh <- h2connCmd{
+    kind = kind,
+    readCh = h2connDummyRead(),
+    request = h2connZeroRequest(),
+    response = response,
+    streamId = s.id,
+    errorCode = 0,
+    replyCh = replyCh,
+  }
+  let message = <- replyCh
+  if (!message.ok) {
+    fail newError(message.errMsg)
+  }
+}
+
+fn h2connBodyHeaderError(response: Response): string {
+  if (response.status < 200 ||
+    response.status > 599 ||
+    response.status == 204 ||
+    response.status == 205 ||
+    response.status == 304) {
+    return "http2: streaming response requires a body-bearing final status"
+  }
+  for header of response.headers {
+    if (header.name == "content-length" || header.name == "transfer-encoding") {
+      return "http2: streaming response cannot declare a body length or transfer encoding"
+    }
+  }
+  return ""
+}
+
+fn h2connBodyUnavailable(st: h2connState, s: h2connStream): bool {
+  return st.isClient || !st.running || s.reset || s.state == h2stClosed || s.state == h2stHCLocal
+}
+
+fn h2connCmdBodyOpen(st: h2connState, cmd: h2connCmd) {
+  let (s, ok) = st.streams[cmd.streamId]
+  if (!ok || h2connBodyUnavailable(st, s)) {
+    h2connFailMsg(cmd.replyCh, "http2: response stream is closed")
+    return
+  }
+  if (s.tunnel || s.replied || getHeader(s.recvHeaders, ":method") == "HEAD") {
+    h2connFailMsg(cmd.replyCh, "http2: response stream is already answered or is a tunnel")
+    return
+  }
+  let invalid = h2connBodyHeaderError(cmd.response)
+  if (invalid != "") {
+    h2connFailMsg(cmd.replyCh, invalid)
+    return
+  }
+  let fields = h2connResponseFields(cmd.response)
+  let size = h2connHeaderListSize(fields)
+  if (size > st.peerMaxHeaderListBytes) {
+    h2connFailMsg(cmd.replyCh, h2connHeaderListMsg(size, st.peerMaxHeaderListBytes))
+    return
+  }
+  s.streaming = true
+  s.replied = true
+  // Hold the actor for close/error replies without exempting request DATA
+  // from its ordinary body budget, as marking a CONNECT tunnel would do.
+  st.tunnels[s.id] = true
+  h2connSendHeaderBlock(st, s.id, st.enc.encode(fields), false)
+  cmd.replyCh <- h2connMsg{
+    ok = true, response = h2connZeroResponse(), errMsg = "", streamId = s.id, hasBody = false,
+  }
+}
