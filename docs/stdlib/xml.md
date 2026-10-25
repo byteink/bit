@@ -628,8 +628,7 @@ fn legacyProvider(body: []byte, idp: EcdsaPublicKey): string! {
 
 ## Decrypting an encrypted assertion
 
-An identity provider can encrypt an assertion to your RSA key. Pass its `EncryptedData` child
-to `decryptElement`, then verify the result with the provider's trusted signing key before reading it.
+An identity provider can encrypt an assertion to your RSA key. Pass its `EncryptedData` child to `decryptElement`, then verify the result with the provider's trusted signing key before reading it.
 
 ```bit
 import { parse, decryptElement, verifySignature, DsigKey, DsigOptions, SignedElement } from "std/xml"
