@@ -166,9 +166,13 @@ fn inkwellAttestedPasskeys(roots: []Certificate): WebAuthn! {
     allowSelf = false,
     formats = ["packed"],
   }
-  return WebAuthn(rp, MemoryCredentialStore(), WebAuthnOptions{
-    attestationPolicy = policy,
-  })?
+  return WebAuthn(
+    rp,
+    MemoryCredentialStore(),
+    WebAuthnOptions{
+      attestationPolicy = policy,
+    },
+  )?
 }
 
 fn inkwellAttestationSummary(result: AttestationResult): string {
