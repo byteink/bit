@@ -217,6 +217,10 @@ returns after the peer acknowledges the data. It leaves the send side open.
 Use one writer per stream; mixing this operation with queue-only `write` does
 not bound bytes already queued by `write`.
 
+### `streamAbort(s: Stream, code: int)`
+
+Abandons both stream directions with RESET_STREAM and STOP_SENDING. Command sends observe connection completion, including a full command queue after actor exit. The live actor admits these commands in FIFO order; receive-credit discard uses the existing completion-aware notification. This waits for queue admission, not peer acknowledgment. Legacy `reset` and `stopSending` keep their existing individual contracts.
+
 ### `streamWriteUntil(s: Stream, data: []byte, wake: chan<int>): ()!`
 
 The wake-aware form of `writeAll`. A value on `wake` fails with `Woken`;
@@ -226,14 +230,14 @@ starting another write. Reset and connection close also fail a parked writer.
 Send a preface, then a cancellable message without sending FIN:
 
 ```bit
-import { Stream, streamWriteUntil, Woken } from "std/quic"
+import { Stream, streamWriteUntil, streamAbort, Woken } from "std/quic"
 
 fn sendMessage(s: Stream, message: []byte, wake: chan<int>): ()! {
   s.writeAll([]byte("ready\n"))?
   streamWriteUntil(s, message, wake) catch e {
     let (_, woken) = e.(Woken)
     if (woken) {
-      s.reset(1)?
+      streamAbort(s, 1)
     }
     fail e
   }

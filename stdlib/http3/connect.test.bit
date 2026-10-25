@@ -1,3 +1,5 @@
+import { after, Second } from "std/time"
+
 // RFC 9220 extended CONNECT settings, malformed requests and real QUIC tunnels.
 fn h3tReq(): H3Request {
   return H3Request{
@@ -194,6 +196,140 @@ fn h3tLargeData(c: H3Conn): ()! {
 
 test "extended CONNECT reads DATA larger than the header buffer limit incrementally" {
   h3tWithConn(h3tLargeData) catch e {
+    assert(false, e.message())
+  }
+}
+
+class h3wPeer {
+  ready: chan<H3Conn> ,
+  tunnel: chan<H3Stream> ,
+  release: chan<int> ,
+  done: chan<string> ,
+}
+
+fn h3wServe(sock: UdpSocket, peer: h3wPeer) {
+  let c = h3Accept(sock, h3cPem("CERTIFICATE", h3cLeafHex), h3cPem("PRIVATE KEY", h3cKeyHex), true) catch e {
+    peer.done <- e.message()
+    return
+  }
+  defer c.close()
+  peer.ready <- c
+  let sr = c.accept() catch e {
+    peer.done <- e.message()
+    return
+  }
+  let tunnel = sr.acceptExtendedConnect() catch e {
+    peer.done <- e.message()
+    return
+  }
+  peer.tunnel <- tunnel
+  <- peer.release
+  peer.done <- "ok"
+}
+
+fn h3wWrite(t: H3Stream, wake: chan<int>, done: chan<string>) {
+  t.writeUntil(string([]byte(65553)), wake) catch e {
+    done <- e.message()
+    return
+  }
+  done <- "ok"
+}
+
+fn h3wResult(done: chan<string>): string! {
+  select {
+    case result = <- done:
+      return result
+    case _ = <- after(2 * Second):
+      fail newError("h3 test: writer did not return")
+  }
+}
+
+fn h3wRun(mode: int): ()! {
+  let sock = udpBind("127.0.0.1", 0)?
+  defer sock.close()
+  let peer = h3wPeer{
+    ready = chan<H3Conn>(1), tunnel = chan<H3Stream>(1),
+    release = chan<int>(1), done = chan<string>(1),
+  }
+  spawn h3wServe(sock, peer)
+  let c = h3DialTls("127.0.0.1", sock.port()?, "localhost", h3cClientConfig())?
+  defer c.close()
+  let server = <- peer.ready
+  defer server.close()
+  defer {
+    peer.release <- 1
+  }
+  let tunnel = c.openTunnel(h3tReq())?
+  let remote = <- peer.tunnel
+  let wake = chan<int>(1)
+  let done = chan<string>(1)
+  spawn h3wWrite(tunnel, wake, done)
+  if (mode == 0) {
+    h3wDrain(remote)?
+    assert(h3wResult(done)? == "ok", "ACKed frames complete without FIN")
+    remote.write("ok")?
+    assert(tunnel.read(2)? == "ok", "reverse DATA before FIN")
+    tunnel.close()?
+    assert(remote.read(1)? == "", "clean FIN after acknowledged DATA")
+    return
+  }
+  sleep(50 * Millisecond)
+  select {
+    case _ = <- done:
+      assert(false, "writer completed while peer flow control was stalled")
+    default:
+      {}
+  }
+  h3wStop(remote, wake, mode)
+  let result = h3wResult(done)?
+  assert(result != "ok", "interrupted write must fail")
+  if (mode == 1) {
+    assert(result == "http3: request aborted", "cancellation preserves the H3 error contract")
+  }
+  assert(tunnel.closed, "partial DATA frame closes the local handle")
+  tunnel.write("retry") catch _ {
+    return
+  }
+  assert(false, "a partial DATA frame was resumed")
+}
+
+fn h3wDrain(remote: H3Stream): ()! {
+  let total = 0
+  let reads = 0
+  while (total < 65553 && reads < 65553) {
+    let data = remote.read(16384)?
+    assert(len(data) > 0, "DATA arrived before FIN")
+    for b of []byte(data) {
+      assert(b == 0, "payload remains exact across released ACK prefixes")
+    }
+    total = total + len(data)
+    reads = reads + 1
+  }
+  assert(total == 65553, "multiple flow windows arrive exactly")
+}
+
+fn h3wStop(remote: H3Stream, wake: chan<int>, mode: int) {
+  if (mode == 1) {
+    wake <- 1
+    return
+  }
+  remote.reset()
+}
+
+test "extended CONNECT bounded DATA drains multiple flow windows before FIN" {
+  h3wRun(0) catch e {
+    assert(false, e.message())
+  }
+}
+
+test "extended CONNECT stalled DATA wakes and forbids partial frame retry" {
+  h3wRun(1) catch e {
+    assert(false, e.message())
+  }
+}
+
+test "extended CONNECT peer reset fails a stalled DATA writer" {
+  h3wRun(2) catch e {
     assert(false, e.message())
   }
 }

@@ -187,11 +187,11 @@ fn acceptDraftFeed(conn: H3Conn, received: H3ServerRequest): H3Stream! {
   return received.acceptExtendedConnect()?
 }
 
-fn exchangeDraftChunk(stream: H3Stream, encodedFrame: string): string! {
+fn exchangeDraftChunk(stream: H3Stream, encodedFrame: string, wake: chan<int>): string! {
   if (len(encodedFrame) == 0 || len(encodedFrame) > 4096) {
     fail newError("draft feed: chunk must contain 1 to 4096 bytes")
   }
-  stream.write(encodedFrame) catch e {
+  stream.writeUntil(encodedFrame, wake) catch e {
     stream.reset()
     fail e
   }
@@ -200,6 +200,11 @@ fn exchangeDraftChunk(stream: H3Stream, encodedFrame: string): string! {
     fail e
   }
   return chunk
+}
+
+// Use this form only when the connection idle bound is the intended limit.
+fn sendDraftNotice(stream: H3Stream, encodedFrame: string): ()! {
+  stream.write(encodedFrame)?
 }
 
 fn finishDraftFeed(stream: H3Stream, abort: bool): ()! {
@@ -219,8 +224,12 @@ a complete frame. For a positive read size, an empty string means peer FIN.
 `reset()` aborts both directions without closing the other request streams.
 
 The byte transport is available here; `std/websocket` and `pkg/web` do not yet
-wire it into their WebSocket APIs. Keep exchanges finite: repeated writes on a
-long-lived stream do not yet have a bounded acknowledged-byte release contract.
+wire it into their WebSocket APIs. DATA writes now wait for QUIC acknowledgments
+before retaining another frame. Supply a capacity-one `wake` channel to
+`writeUntil` and signal it from your deadline or cancellation path. Cancellation
+aborts this tunnel because an interrupted DATA frame cannot be resumed safely.
+One reader and one writer may use a tunnel; application framing, message size
+limits and WebSocket close handshakes remain the caller's responsibility.
 
 `h3: peer did not enable extended CONNECT` means the server did not opt in;
 do not retry the same tunnel on that connection. `h3: tunnel is closed` means
@@ -409,7 +418,11 @@ Reads up to `n` bytes, preserving any remaining DATA for the next call. With pos
 
 ### `H3Stream.write(data: string): ()!`
 
-Writes bytes as DATA frames. The application supplies its own protocol framing. A write after local `close` or `reset` fails. Keep the total exchange bounded until acknowledged-prefix release is available.
+Writes DATA in payloads of at most 16384 bytes and waits for each frame to be acknowledged before the next frame is retained. It does not send FIN. The application supplies its own protocol framing. A write after local `close` or `reset` fails. `write` has no caller cancellation; the connection idle bound still applies.
+
+### `H3Stream.writeUntil(data: string, wake: chan<int>): ()!`
+
+Like `write`, but a value on the capacity-one `wake` channel interrupts the write with `H3Aborted`. The running example uses this form for a deadline or cancellation. Any write error aborts both tunnel directions and closes the handle; queued bytes may already have reached the peer. Retry on a new tunnel, never within the partial DATA frame.
 
 ### `H3Stream.close(): ()!`
 
