@@ -70,8 +70,8 @@ billing operation.
 
 ## Register the handler before starting the queue
 
-The same file opens the queue, connects the job type to its handler, and
-adds the schedule:
+The following example isolates digest registration. It opens a queue with
+only the digest handler; the running app also registers its mail handlers:
 
 ```bit
 fn openDigestQueue(db: Db, redis: RedisClient): Queue! {
@@ -95,12 +95,18 @@ Registration and scheduling can fail, so `?` returns those errors to startup.
 instances share the schedule without each enqueueing the same tick. Use
 the same dedicated Redis service and prefix on those instances.
 
-The app's [main.bit](inkwell/main.bit) starts the returned queue before
-listening for requests. These lines are an excerpt from that existing
-function; `db`, `redis` and `app` are its already-open resources:
+The app's full `openDigestQueue(db, redis, cfg)` first calls
+`openMailQueue(cfg, redis)` to configure mail and register welcome messages.
+It then registers password-reset messages and the digest on the same queue
+and adds the nightly schedule. See [jobs.bit](inkwell/jobs.bit) for that
+complete startup path. `cfg` is the app's loaded `AppConfig`.
+
+The app's [main.bit](inkwell/main.bit) starts that queue before listening
+for requests. These lines are an excerpt from the existing function, using
+its open resources and loaded settings:
 
 ```text
-  let jobs = openDigestQueue(db, redis)?
+  let jobs = openDigestQueue(db, redis, cfg)?
   jobs.start()
   defer jobs.stop()
   app.listen()?
