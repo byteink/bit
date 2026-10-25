@@ -1,0 +1,162 @@
+// #8640: expose a checked word-slice's effective base as one header read,
+// so existing LICM can move it without moving a dependent arithmetic DAG.
+// The interior address stays i64; the original header remains its GC owner.
+
+fn opIsSliceHeaderRead(op: Op): bool {
+  return op == Op.SliceLen || op == Op.SliceBase
+}
+
+fn foldWithSliceBases(ctx: TypeContext, f: IrFunc, debug: bool, arm64: bool): IrFunc {
+  return foldConstantsAndPrune(ctx, biasSliceAddresses(ctx, f, debug), debug, arm64)
+}
+
+fn sliceBaseWordType(ctx: TypeContext, ty: int): bool {
+  let t = ctx.types[ty]
+  return t.kind == TypeKind.Prim && (t.prim == 3 || t.prim == 7 || t.prim == 9)
+}
+
+fn sliceBaseHeaderType(ctx: TypeContext, ty: int, elem: int): bool {
+  let t = ctx.types[ty]
+  return t.kind == TypeKind.Slice && t.elem == elem && sliceBaseWordType(ctx, elem)
+}
+
+fn sliceBaseAccessType(ins: IrInstr): int {
+  if (ins.op == Op.IndexGet) {
+    return ins.ty
+  }
+  if (ins.op == Op.IndexSet) {
+    return ins.ival2
+  }
+  return -1
+}
+
+fn sliceBaseValid(ctx: TypeContext, f: IrFunc, ins: IrInstr): bool {
+  if (ins.op != Op.SliceBase || ins.ty != primType(ctx, 3)) {
+    return false
+  }
+  let header = ctx.types[f.instrs[ins.lhs].ty]
+  return header.kind == TypeKind.Slice && sliceBaseWordType(ctx, header.elem)
+}
+
+// Only the exact address emitted by emitSliceElemAddr (loweraccess.bit).
+// Refusing other arithmetic keeps packed elements and unrelated raw pointers
+// outside this transform, including a buffer and offset from different views.
+fn sliceBaseBufferShape(buf: IrInstr, slot: IrInstr): bool {
+  return buf.op == Op.FieldGet && buf.ival == 0 && slot.op == Op.Add
+}
+
+fn sliceBaseAddressTypes(ctx: TypeContext, buf: IrInstr, off: IrInstr, slot: IrInstr): bool {
+  let ty = primType(ctx, 3)
+  return buf.ty == ty && off.ty == ty && slot.ty == ty
+}
+
+fn sliceBaseOwner(ctx: TypeContext, f: IrFunc, ins: IrInstr): int {
+  let elem = sliceBaseAccessType(ins)
+  if (elem < 0 || !sliceBaseWordType(ctx, elem)) {
+    return -1
+  }
+  let buf = f.instrs[ins.lhs]
+  let slot = f.instrs[ins.rhs]
+  if (!sliceBaseBufferShape(buf, slot)) {
+    return -1
+  }
+  let off = f.instrs[slot.lhs]
+  if (off.op != Op.FieldGet || off.ival != 16 || off.lhs != buf.lhs) {
+    return -1
+  }
+  if (!sliceBaseAddressTypes(ctx, buf, off, slot)) {
+    return -1
+  }
+  if (!sliceBaseHeaderType(ctx, f.instrs[buf.lhs].ty, elem)) {
+    return -1
+  }
+  return buf.lhs
+}
+
+class SliceBaseRewrite {
+  ctx: TypeContext,
+  f: IrFunc,
+  b: IrBuilder,
+  remap: []int,
+  blockMap: []int,
+  known: []ConstVal,
+}
+
+fn sliceBaseEmit(x: SliceBaseRewrite, idx: int, owner: int) {
+  let ins = x.f.instrs[idx]
+  let base = mkInstr(Op.SliceBase, primType(x.ctx, 3))
+  base.lhs = x.remap[owner]
+  base.span = ins.span
+  let address = builderEmit(x.b, base)
+  builderKeepAlive(x.b, address, base.lhs)
+  emitTranslated(x.b, x.f, x.known, x.remap, x.blockMap, idx)
+  let access = x.b.instrs[x.remap[idx]]
+  access.lhs = address
+  access.rhs = x.remap[x.f.instrs[ins.rhs].rhs]
+}
+
+fn sliceBaseBlock(x: SliceBaseRewrite, bi: int) {
+  let blk = x.f.blocks[bi]
+  builderBeginBlock(x.b, x.blockMap[bi])
+  let idx = blk.instsStart
+  let paramsEnd = idx + blk.paramCount
+  while (idx < paramsEnd) {
+    x.remap[idx] = builderAddParam(x.b, x.f.instrs[idx].ty)
+    idx = idx + 1
+  }
+  let end = blk.instsStart + blk.instsLen
+  while (idx < end) {
+    let owner = sliceBaseOwner(x.ctx, x.f, x.f.instrs[idx])
+    if (owner >= 0) {
+      sliceBaseEmit(x, idx, owner)
+    } else {
+      emitTranslated(x.b, x.f, x.known, x.remap, x.blockMap, idx)
+    }
+    idx = idx + 1
+  }
+  builderEndBlock(x.b)
+}
+
+fn hasSliceBaseAccess(ctx: TypeContext, f: IrFunc): bool {
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (sliceBaseOwner(ctx, f, f.instrs[i]) >= 0) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Debug retains the original signed off+index operation and its trap policy.
+// Release addresses are equivalent modulo64; no check or memory access moves
+// here. LICM alone decides whether the null-safe header read may leave a loop.
+fn biasSliceAddresses(ctx: TypeContext, f: IrFunc, debug: bool): IrFunc {
+  if (debug || !hasSliceBaseAccess(ctx, f)) {
+    return f
+  }
+  let remap = []int(len(f.instrs))
+  let known = []ConstVal(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    known = append(known, noConst())
+    i = i + 1
+  }
+  let blockMap = []int(len(f.blocks))
+  let b = newBuilder()
+  let order = blockEmissionOrder(f)
+  for bi of order {
+    blockMap[bi] = builderNewBlock(b)
+  }
+  let x = SliceBaseRewrite{
+    ctx = ctx, f = f, b = b, remap = remap, blockMap = blockMap, known = known,
+  }
+  for bi of order {
+    sliceBaseBlock(x, bi)
+  }
+  let edges = trKeepAlive(f.keepAlive, remap)
+  for v of b.keepAlive {
+    edges = append(edges, v)
+  }
+  return irFuncRebuilt(f, b, edges)
+}
