@@ -1,0 +1,150 @@
+import { totp } from "auth"
+import { Second } from "std/time"
+
+class TotpFixture { app: App, db: Db, user: User, cookie: string, secret: Secret }
+
+fn totpFixture(): TotpFixture {
+  let app = testApp()
+  let db = redisGuideDb() catch e {
+    panic(e.message())
+  }
+  let name = uniqueName("totp")
+  let cookie = registerAndLogin(app, name, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let user = findUserByUsername(db, name) catch e {
+    panic(e.message())
+  }
+  let enrolled = app.handle(
+    jsonReq(
+      "POST", "/v1/auth/2fa/enroll", cookie,
+      "{\"username\":\"${name}\",\"password\":\"correct horse battery\"}",
+    ),
+  )
+  assert(enrolled.status == 200, "password-confirmed enrollment: ${enrolled.body}")
+  assert(contains(enrolled.body, "otpauth://totp/"), "authenticator provisioning URI")
+  assert(enrolled.getHeader("Cache-Control") == "no-store", "provisioning must not be cached")
+  let loaded = findUserById(db, user.id) catch e {
+    panic(e.message())
+  }
+  let secret = parseSecret(loaded.totpSecret) catch e {
+    panic(e.message())
+  }
+  return TotpFixture{
+    app = app, db = db, user = loaded,
+    cookie = cookiePair(enrolled.getHeader("Set-Cookie")), secret = secret,
+  }
+}
+
+fn totpCode(f: TotpFixture, step: int): string {
+  return totp(f.secret, now().ns / Second + step * 30)
+}
+
+fn totpSignIn(f: TotpFixture, path: string, code: string): Response {
+  return f.app.handle(
+    jsonReq(
+      "POST", path, "",
+      "{\"username\":\"${f.user.username}\",\"password\":\"correct horse battery\",\"code\":\"${code}\"}",
+    ),
+  )
+}
+
+fn enableTotp(f: TotpFixture) {
+  let code = totpCode(f, 0)
+  let response = f.app.handle(
+    jsonReq("POST", "/v1/auth/2fa/verify", f.cookie, "{\"code\":\"${code}\"}"),
+  )
+  assert(response.status == 204, "valid enrollment confirmation: ${response.body}")
+  let loaded = findUserById(f.db, f.user.id) catch e {
+    panic(e.message())
+  }
+  assert(
+    loaded.totpEnabled && loaded.totpLastCounter > 0,
+    "enrollment persisted with replay counter",
+  )
+}
+
+test "Inkwell TOTP: confirmation gates cookie sign-in and rejects code replay" {
+  let f = totpFixture()
+  defer f.db.pool.close()
+  assert(!f.user.totpEnabled, "enrollment remains pending until proof")
+  enableTotp(f)
+  let code = totpCode(f, 1)
+  let login = totpSignIn(f, "/v1/auth/login", code)
+  assert(login.status == 204, "correct password and fresh authenticator code")
+  let me = f.app.handle(jsonReq("GET", "/v1/me", cookiePair(login.getHeader("Set-Cookie")), ""))
+  assert(me.status == 200, "full session only after second factor")
+  assert(
+    !contains(me.body, "totp") && !contains(me.body, f.user.totpSecret),
+    "secrets stay private",
+  )
+  assert(
+    totpSignIn(f, "/v1/auth/login", code).status == 401,
+    "a consumed code cannot log in twice",
+  )
+}
+
+test "Inkwell TOTP: token credentials cannot bypass second factor" {
+  let f = totpFixture()
+  defer f.db.pool.close()
+  enableTotp(f)
+  assert(
+    totpSignIn(f, "/v1/auth/token", totpCode(f, 1)).status == 200,
+    "fresh authenticator code allows token issuance",
+  )
+  let missing = totpSignIn(f, "/v1/auth/token", "")
+  assert(missing.status == 401, "password alone must not issue tokens")
+  assert(!contains(missing.body, "accessToken"), "no credential material on refusal")
+}
+
+test "Inkwell TOTP: unauthenticated enrollment and secret replacement fail closed" {
+  let app = testApp()
+  assert(
+    app.handle(jsonReq("POST", "/v1/auth/2fa/enroll", "", "{}")).status == 401,
+    "enrollment needs authenticated account",
+  )
+  let f = totpFixture()
+  defer f.db.pool.close()
+  let duplicate = f.app.handle(
+    jsonReq(
+      "POST", "/v1/auth/2fa/enroll", f.cookie,
+      "{\"username\":\"${f.user.username}\",\"password\":\"correct horse battery\"}",
+    ),
+  )
+  assert(duplicate.status == 409, "existing pending secret cannot be silently replaced")
+  let loaded = findUserById(f.db, f.user.id) catch e {
+    panic(e.message())
+  }
+  assert(loaded.totpSecret == f.user.totpSecret, "duplicate enrollment preserves shared secret")
+}
+
+test "Inkwell TOTP: new account starts without an authenticator" {
+  let user = newUser("totp-default", "totp@example.test", "fixture hash", "author")
+  assert(
+    !user.totpEnabled && user.totpSecret == "" && user.totpLastCounter == 0,
+    "existing password accounts keep their authentication behavior",
+  )
+}
+
+fn totpCounterWorker(db: Db, id: i64, counter: uint, wins: chan<bool>, wait: WaitGroup) {
+  let accepted = advanceTotp(db, id, counter) catch e {
+    panic(e.message())
+  }
+  wins <- accepted
+  wait.done()
+}
+
+test "Inkwell TOTP: concurrent counter advancement has one winner" {
+  let f = totpFixture()
+  defer f.db.pool.close()
+  let counter = uint(now().ns / Second / 30)
+  let wins = chan<bool>(2)
+  let wait = WaitGroup()
+  wait.add(2)
+  spawn totpCounterWorker(f.db, f.user.id, counter, wins, wait)
+  spawn totpCounterWorker(f.db, f.user.id, counter, wins, wait)
+  wait.wait()
+  let first = <- wins
+  let second = <- wins
+  assert(first != second, "one accepted counter despite concurrent requests")
+}

@@ -1,0 +1,131 @@
+import {
+  LoginThrottle,
+  TotpFactor,
+  TotpFactorOptions,
+  Secret,
+  generateSecret,
+  parseSecret,
+  provisioningUri,
+} from "auth"
+
+@json class TotpInput { code: string = "" }
+@json class TotpProvisioning { secret: string, uri: string }
+
+fn inkwellTotp(db: Db): TotpFactor! {
+  return TotpFactor(
+    (subject) => {
+      let user = findUserById(
+        db,
+        parseId(subject) catch _ {
+          return Option<Secret>.None
+        },
+      ) catch _ {
+        return Option<Secret>.None
+      }
+      if (user.totpSecret == "") {
+        return Option<Secret>.None
+      }
+      let secret = parseSecret(user.totpSecret) catch _ {
+        return Option<Secret>.None
+      }
+      return Option.Some(secret)
+    },
+    TotpFactorOptions{
+      throttle = Option.Some(LoginThrottle(MemoryCounter(rateLimitCounterCap))?),
+      lastCounter = (subject) => uint(findUserById(db, parseId(subject)?)?.totpLastCounter),
+      advanceCounter = (subject, counter) => advanceTotp(db, parseId(subject)?, counter),
+    },
+  )?
+}
+
+// Both cookie and token routes consume the same complete credential strategy.
+class InkwellPassword {
+  db: Db
+  factor: TotpFactor
+
+  name(): string { return "password" }
+
+  authenticate(c: Ctx): Identity! {
+    let identity = PasswordStrategy(userLookup(this.db)).authenticate(c)?
+    requireTotp(c, this.db, identity.id, this.factor) catch e {
+      c.session()?.destroy()?
+      fail e
+    }
+    return identity
+  }
+}
+
+// Lock and advance in one transaction so concurrent uses of one code have one winner.
+fn advanceTotp(db: Db, id: i64, counter: uint): bool! {
+  let accepted = false
+  db.tx((tx) => {
+    let rows = tx.query<User>("select * from users where id = ? for update", id)?
+    if (len(rows) != 1 || i64(counter) <= rows[0].totpLastCounter) {
+      return
+    }
+    let user = rows[0]
+    let changed = tx.exec(
+      "update users set totp_last_counter = ?, totp_enabled = true where id = ? and totp_secret <> ''",
+      i64(counter), id,
+    )?
+    if (changed != 1) {
+      return
+    }
+    if (!user.totpEnabled) {
+      tx.exec("update refresh_tokens set revoked = 1 where subject = ?", "${id}")?
+    }
+    accepted = true
+  })?
+  return accepted
+}
+
+fn requireTotp(c: Ctx, db: Db, subject: string, factor: TotpFactor): ()! {
+  let user = findUserById(db, parseId(subject)?)?
+  if (!user.totpEnabled) {
+    return
+  }
+  let input = c.body<TotpInput>()?
+  if (!factor.verify(c, subject, input.code)?) {
+    fail unauthorized("invalid authenticator code")
+  }
+}
+
+fn enrollTotp(c: Ctx, db: Db): Res! {
+  let id = currentUserId(c)?
+  let user = findUserById(db, id)?
+  let verified = PasswordStrategy(userLookup(db)).authenticate(
+    c,
+  )?
+  if (verified.id != "${id}") {
+    fail unauthorized()
+  }
+  c.session()?.set(sessionUserIdKey, verified.id)
+  c.session()?.set(sessionRoleKey, user.role)
+  let secret = generateSecret()
+  let changed = db.exec(
+    "update users set totp_secret = ? where id = ? and totp_secret = '' and not totp_enabled",
+    secret.base32(), id,
+  )?
+  if (changed != 1) {
+    fail conflict("authenticator enrollment already exists")
+  }
+  return c.json(
+    TotpProvisioning{
+      secret = secret.base32(), uri = provisioningUri(secret, "Inkwell", user.email)?,
+    },
+  ).header("Cache-Control", "no-store")
+}
+
+fn confirmTotp(c: Ctx, factor: TotpFactor): Res! {
+  let id = currentUserId(c)?
+  let input = c.body<TotpInput>()?
+  if (!factor.verify(c, "${id}", input.code)?) {
+    fail unauthorized("invalid authenticator code")
+  }
+  return c.noContent()
+}
+
+fn mountTwoFactor(app: Routes, db: Db, factor: TotpFactor) {
+  app.post("/auth/2fa/enroll", (c) => enrollTotp(c, db))
+  app.post("/auth/2fa/verify", (c) => confirmTotp(c, factor))
+}
