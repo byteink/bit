@@ -145,7 +145,6 @@ The existing `requireAdmin` and owner-or-admin checks retain their behavior.
 Role changes take effect after a new login; this change does not add live role
 refresh or TOTP.
 
-
 ## Inspect article and comment changes
 
 After applying the migrations, each article create, update or delete and each
@@ -154,8 +153,19 @@ transaction. The row stores the acting user's ID, the action, the target and the
 creation time in Unix nanoseconds. An administrator's edit records the
 administrator as the actor, even when another user owns the article.
 
-Create an article through the existing authenticated example, then inspect its
-history in PostgreSQL:
+Log in as the account registered above, then create an article:
+
+```sh
+curl --fail-with-body -c audit.cookies http://127.0.0.1:8080/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"new-author","password":"development-password"}'
+curl --fail-with-body -i -b audit.cookies http://127.0.0.1:8080/v1/articles \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Audited article","body":"First draft","tags":[]}'
+```
+
+The article response returns a `Location` header ending in its ID. In PostgreSQL,
+replace `1` below with that ID to inspect its history:
 
 ```sql
 select actor_id, action, target, created_at
@@ -167,7 +177,8 @@ order by id;
 An article's actions are `article.create`, `article.update` and `article.delete`.
 Comment actions are `comment.create` and `comment.delete`, with `comment/<id>`
 targets. A rejected write adds no row. An audit insert error rolls back the
-mutation; it is returned to the caller. Deleting an article records its soft deletion; existing comment rows remain.
+mutation; it is returned to the caller. Deleting an article records its soft
+deletion; existing comment rows remain.
 The target remains readable after deletion. The actor foreign key restricts user
 deletion so that existing history survives.
 
