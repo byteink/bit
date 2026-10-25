@@ -1,0 +1,290 @@
+// Bounded writes before FIN: ACK-prefix release, retransmission and wake paths.
+fn qwFrame(offset: int, data: []byte): Frame {
+  return Frame.Stream(
+    StreamFrame{
+      id = 0, offset = u64(offset), data = data, hasOffset = true, hasLength = true, fin = false,
+    },
+  )
+}
+
+fn qwAck(st: quicconnState, offset: int, data: []byte) {
+  quicconnNoteAckedFrames(
+    st,
+    quicconnSent{
+      pn = offset, frames = [qwFrame(offset, data)],
+    },
+  )
+}
+
+test "bounded write releases only contiguous ACKed bytes and preserves retransmission data" {
+  let st = qaState()
+  defer st.sock.close()
+  let s = quicconnNewStream(st, 0, false)
+  st.streams[0] = s
+  st.present[0] = 1
+  s.sendBuf = []byte("abcdef")
+  s.sendLen = 6
+  s.sendOff = 6
+  let lost = qwFrame(2, s.sendBuf[2:4])
+  qwAck(st, 4, []byte("ef"))
+  assert(s.sendBase == 0 && len(s.sendBuf) == 6, "a gap retains the unacknowledged prefix")
+  qwAck(st, 0, []byte("ab"))
+  assert(s.sendBase == 2 && string(s.sendBuf) == "cdef", "only the contiguous prefix is released")
+  quicconnAccumulateLost(quicconnSent{ pn = 7, frames = [lost] }, st, st.aLevel)
+  match (st.aLevel.pending[0]) {
+    Stream(f) => assert(
+      int(f.offset) == 2 && string(f.data) == "cd",
+      "retransmission keeps absolute bytes",
+    )
+    _ => assert(false, "lost STREAM frame disappeared")
+  }
+  qwAck(st, 2, []byte("cd"))
+  assert(s.sendBase == 6 && len(s.sendBuf) == 0, "the full ACKed buffer is released without FIN")
+  assert(!s.finQueued && !s.finAcked, "the stream remains open")
+}
+
+test "bounded write packetization uses absolute offsets after a prefix release" {
+  let st = qaState()
+  defer st.sock.close()
+  let s = quicconnNewStream(st, 0, false)
+  s.sendBase = 2
+  s.sendOff = 2
+  s.sendLen = 6
+  s.sendBuf = []byte("cdef")
+  s.peerMaxStreamData = 100
+  st.peerMaxData = 100
+  let sink = StreamFrameSink{ frames = []Frame(0) }
+  quicconnFillStreamData(st, 0, s, 100, sink)
+  match (sink.frames[0]) {
+    Stream(f) => assert(
+      int(f.offset) == 2 && string(f.data) == "cdef",
+      "absolute offset with relative storage",
+    )
+    _ => assert(false, "packetizer emitted no STREAM data")
+  }
+}
+
+fn qwWriteCmd(): quicconnCmd {
+  return quicconnCmd{
+    kind = quicconnCmdWriteDrained, id = 0, data = []byte("abc"),
+    replyOpen = chan<quicconnOpenReply>(1), replyInt = chan<int>(1),
+  }
+}
+
+test "bounded write ACK completion works without FIN and keeps retained bytes within one chunk" {
+  let st = qaState()
+  defer st.sock.close()
+  let s = quicconnNewStream(st, 0, false)
+  st.streams[0] = s
+  st.present[0] = 1
+  let i = 0
+  while (i < 12) {
+    let cmd = qwWriteCmd()
+    assert(quicconnArmWrite(s, cmd), "write admission")
+    s.sendBuf = cmd.data
+    s.sendLen = s.sendBase + len(cmd.data)
+    s.sendOff = s.sendLen
+    quicconnCheckDelivered(st)
+    select {
+      case _ = <- cmd.replyInt:
+        assert(false, "writer completed before ACK")
+      default:
+        {}
+    }
+    qwAck(st, s.sendBase, cmd.data)
+    quicconnCheckDelivered(st)
+    assert(<- cmd.replyInt == 1, "writer resumes after prefix ACK")
+    assert(
+      len(s.sendBuf) == 0 && !s.hasDrain && !s.delivered,
+      "no retained payload or terminal FIN state",
+    )
+    i = i + 1
+  }
+  assert(s.sendBase == 36 && s.sendLen == 36, "absolute offsets survive repeated prefix release")
+}
+
+test "bounded write reset and connection close release the parked waiter with an error" {
+  for reset of []bool{ false, true } {
+    let st = qaState()
+    let s = quicconnNewStream(st, 0, false)
+    st.streams[0] = s
+    st.present[0] = 1
+    let cmd = qwWriteCmd()
+    assert(quicconnArmWrite(s, cmd), "write admitted")
+    if (reset) {
+      quicconnAbortSend(st, 0, 9)
+    } else {
+      quicconnReleaseWaiters(st)
+    }
+    assert(<- cmd.replyInt == -1 && !s.hasDrain, "parked writer failed")
+    st.sock.close()
+  }
+}
+
+fn qwServer(sock: UdpSocket, done: chan<string>, release: chan<int>) {
+  let c = acceptQuic(sock, quicRefusalCertPem(), quicRefusalKeyPem()) catch e {
+    done <- e.message()
+    return
+  }
+  defer c.close()
+  qwServe(c, release) catch e {
+    done <- e.message()
+    return
+  }
+  done <- "ok"
+}
+
+fn qwServe(c: Conn, release: chan<int>): ()! {
+  let s = c.acceptStream()?
+  let total = 0
+  let target = 2 * quicconnFlowWindow + 17
+  while (total < target) {
+    let chunk = s.read()?
+    assert(!chunk.fin && !chunk.reset, "all DATA arrives before FIN")
+    assert(len(chunk.data) > 0, "each read advances the bounded payload")
+    for b of chunk.data {
+      assert(b == byte(42), "payload byte")
+    }
+    total = total + len(chunk.data)
+  }
+  assert(total == target, "complete payload")
+  s.writeAll([]byte("ok"))?
+  <- release
+  s.finish()?
+}
+
+fn qwReadReply(s: Stream): ()! {
+  let reply = ""
+  let guard = 0
+  while (len(reply) < 2 && guard < 2) {
+    guard = guard + 1
+    let chunk = s.read()?
+    assert(!chunk.fin && !chunk.reset && len(chunk.data) > 0, "reply before either FIN")
+    reply = reply + string(chunk.data)
+  }
+  assert(reply == "ok", "bidirectional reply")
+}
+
+fn qwRoundTrip(): ()! {
+  let sock = udpBind("127.0.0.1", 0)?
+  defer sock.close()
+  let done = chan<string>(1)
+  let release = chan<int>(1)
+  spawn qwServer(sock, done, release)
+  let c = dialQuicTls("127.0.0.1", sock.port()?, "localhost", quicAcceptClientConfig())?
+  defer c.close()
+  let s = c.openStream()?
+  let data = []byte(2 * quicconnFlowWindow + 17)
+  let i = 0
+  while (i < len(data)) {
+    data[i] = 42
+    i = i + 1
+  }
+  s.writeAll(data)?
+  qwReadReply(s)?
+  s.finish()?
+  release <- 1
+  assert(s.read()?.fin, "server clean FIN")
+  assert(<- done == "ok", "server completed")
+}
+
+test "bounded write exchanges multiple flow windows in both directions before FIN" {
+  qwRoundTrip() catch e {
+    assert(false, e.message())
+  }
+}
+
+fn qwHoldServer(sock: UdpSocket, accepted: chan<Stream>, hold: chan<int>) {
+  let c = acceptQuic(sock, quicRefusalCertPem(), quicRefusalKeyPem()) catch e {
+    assert(false, e.message())
+    return
+  }
+  defer c.close()
+  let s = c.acceptStream() catch e {
+    assert(false, e.message())
+    return
+  }
+  accepted <- s
+  <- hold
+}
+
+fn qwBlockedWrite(s: Stream, wake: chan<int>, done: chan<string>) {
+  streamWriteUntil(s, []byte(2 * quicconnFlowWindow), wake) catch e {
+    done <- e.message()
+    return
+  }
+  done <- "unexpected success"
+}
+
+fn qwStalled(cancel: bool): ()! {
+  let sock = udpBind("127.0.0.1", 0)?
+  defer sock.close()
+  let accepted = chan<Stream>(1)
+  let hold = chan<int>(1)
+  spawn qwHoldServer(sock, accepted, hold)
+  let c = dialQuicTls("127.0.0.1", sock.port()?, "localhost", quicAcceptClientConfig())?
+  defer c.close()
+  let s = c.openStream()?
+  let wake = chan<int>(1)
+  let done = chan<string>(1)
+  spawn qwBlockedWrite(s, wake, done)
+  let peer = <- accepted
+  assert(peer.id() == s.id(), "same stream")
+  sleep(50 * Millisecond)
+  select {
+    case _ = <- done:
+      assert(false, "a stalled receiver did not block the writer")
+    default:
+      {}
+  }
+  if (cancel) {
+    wake <- 1
+  } else {
+    c.close()
+  }
+  let result = <- done
+  assert(result != "unexpected success", "writer fails on cancel or close")
+  if (cancel) {
+    assert(result == "quic: wait woken", "wake has its own error")
+    s.reset(9)?
+  }
+  hold <- 1
+}
+
+test "bounded write stalls under flow control and wakes on cancellation" {
+  qwStalled(true) catch e {
+    assert(false, e.message())
+  }
+}
+
+test "bounded write stalls under flow control and wakes on connection close" {
+  qwStalled(false) catch e {
+    assert(false, e.message())
+  }
+}
+
+fn qwRejected(s: quicconnStream, cmd: quicconnCmd) {
+  assert(!quicconnArmWrite(s, cmd), "invalid drained write must be refused")
+  assert(<- cmd.replyInt == -1, "refusal reports an error")
+}
+
+test "bounded write refuses concurrent finished oversized overflowed and reset writes" {
+  let st = qaState()
+  defer st.sock.close()
+  let s = quicconnNewStream(st, 0, false)
+  let cmd = qwWriteCmd()
+  s.hasDrain = true
+  qwRejected(s, cmd)
+  s.hasDrain = false
+  s.finQueued = true
+  qwRejected(s, cmd)
+  s.finQueued = false
+  cmd.data = []byte(quicconnFlowWindow + 1)
+  qwRejected(s, cmd)
+  cmd.data = []byte("abc")
+  s.sendLen = (1 << 62) - 2
+  qwRejected(s, cmd)
+  s.sendLen = 0
+  s.sendAborted = true
+  qwRejected(s, cmd)
+}
