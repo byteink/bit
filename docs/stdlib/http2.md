@@ -123,7 +123,9 @@ fn event(body: H2BodyStream, text: string): ()! {
 }
 
 fn feed(_req: Request, s: Stream): Response {
-  let headers = [HeaderField{ name = "content-type", value = "text/event-stream", sensitive = false }]
+  let headers = [
+    HeaderField{ name = "content-type", value = "text/event-stream", sensitive = false },
+  ]
   let body = s.openBodyStream(200, headers) catch _ {
     return Response(500, []byte(0))
   }
