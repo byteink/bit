@@ -194,8 +194,18 @@ import the `otpauth://` URI into an authenticator, then send its `code` to
 `POST /v1/auth/2fa/verify` using the cookie returned by enrollment. The account
 requires a second factor only after that confirmation succeeds.
 
-Both `/v1/auth/login` and `/v1/auth/token` then require `code` beside
-`username` and `password`. Each accepted code can be used once. Attempts are
+Both `/v1/auth/login` and `/v1/auth/token` then require the authenticator
+code in `X-TOTP-Code`, with the usual `username` and `password` JSON body.
+The password strategy keeps its strict credentials decoder. Each accepted code
+can be used once. For example:
+
+```sh
+curl --fail-with-body http://127.0.0.1:8080/v1/auth/login \
+  -H 'Content-Type: application/json' -H 'X-TOTP-Code: 123456' \
+  -d '{"username":"ada","password":"your password"}'
+```
+
+Use a fresh authenticator code in place of `123456`. Attempts are
 throttled; missing, invalid and reused codes issue neither an app session nor
 a token. Google sign-in refuses accounts with TOTP enabled: use the password
 and authenticator route. Confirmation revokes existing refresh tokens; already
