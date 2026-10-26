@@ -57,6 +57,13 @@ fn coverTestClient(): CoverClient {
   }
 }
 
+fn assertNoCoverAudit(id: string) {
+  let db = coverDb()
+  defer db.pool.close()
+  let rows = auditRows(db, "article/${id}")
+  assert(len(rows) == 1 && rows[0].action == "article.create", "refused cover added an audit row")
+}
+
 fn assertNoCoverObjects(id: string) {
   let rows = coverList(coverTestClient(), "articles/${id}/covers/")
   let first = rows.next() catch e {
@@ -81,6 +88,8 @@ test "cover image: owner uploads and public readers fetch a genuine signed objec
   let db = coverDb()
   defer db.pool.close()
   let key = currentCoverKey(db, id)
+  let actorId = auditRows(db, "article/${id}")[0].actorId
+  assertAudit(db, "article/${id}", actorId, ["article.create", "article.cover"])
   assert(
     contains(key, "articles/${id}/covers/") && !contains(key, ".."),
     "untrusted filename reached storage key",
@@ -103,6 +112,7 @@ test "cover image: owner uploads and public readers fetch a genuine signed objec
   let replaced = postCover(app, id, cookie, testCoverPng)
   assert(replaced.status == 204, "cover replacement failed: ${replaced.body}")
   assert(currentCoverKey(db, id) != key, "replacement reused an untrusted or stable object key")
+  assertAudit(db, "article/${id}", actorId, ["article.create", "article.cover", "article.cover"])
   let old = coverTestClient().get(key) catch e {
     let (missing, ok) = e.(CoverS3Error)
     assert(ok && missing.status == 404, "old-object probe failed without a storage404")
@@ -127,6 +137,7 @@ test "cover image: authentication and ownership precede body parsing or storage"
   let refused = app.handle(coverRequest(id, other, "malformed", "text/plain"))
   assert(refused.status == 403, "another author must be refused before body parsing")
   assertNoCoverObjects(id)
+  assertNoCoverAudit(id)
 }
 
 test "cover image: malformed, mismatched and oversized files leave no object" {
@@ -153,6 +164,7 @@ test "cover image: malformed, mismatched and oversized files leave no object" {
   )
   assert(overBody.status == 413, "the request-body cap must run before multipart parsing")
   assertNoCoverObjects(id)
+  assertNoCoverAudit(id)
 }
 
 test "cover image: database refusal compensates the uploaded object" {
@@ -185,7 +197,9 @@ test "cover image: database refusal compensates the uploaded object" {
     panic(e.message())
   }
   assert(isNone(article.coverImageKey), "failed database update retained a cover reference")
+  assert(len(auditRows(db, "article/${id}")) == 1, "refused cover added an audit row")
   assertNoCoverObjects(id)
+  assertNoCoverAudit(id)
 }
 
 test "cover image: an administrator can replace another author's cover" {
@@ -216,6 +230,12 @@ test "cover image: an administrator can replace another author's cover" {
   assert(login.status == 204, "administrator login failed")
   let saved = postCover(app, id, cookiePair(login.getHeader("Set-Cookie")), testCoverPng)
   assert(saved.status == 204, "administrator cover write was refused")
+  let rows = auditRows(db, "article/${id}")
+  assert(
+    len(rows) == 2 && rows[1].action == "article.cover",
+    "administrator cover audit is missing",
+  )
+  assert(rows[1].actorId == auditUser(db, name).id, "cover audit must name the administrator")
 }
 
 test "cover image: storage failure leaves the database reference empty" {
@@ -248,7 +268,9 @@ test "cover image: storage failure leaves the database reference empty" {
     panic(e.message())
   }
   assert(isNone(article.coverImageKey), "storage refusal changed the database reference")
+  assert(len(auditRows(db, "article/${id}")) == 1, "storage refusal added an audit row")
   assertNoCoverObjects(id)
+  assertNoCoverAudit(id)
 }
 
 fn committedCoverForFailure(db: Db): CoverUpload {
@@ -273,7 +295,7 @@ fn committedCoverForFailure(db: Db): CoverUpload {
     body = testCoverPng,
     contentType = "image/png",
   }
-  storeCover(coverTestClient(), upload, db) catch e {
+  storeCover(coverTestClient(), upload, db, article.authorId) catch e {
     panic(e.message())
   }
   assert(
@@ -338,4 +360,50 @@ test "cover image: unreadable commit state preserves the object, reference and o
   let verification = coverDb()
   defer verification.pool.close()
   assertCommittedCoverPreserved(verification, upload)
+}
+
+test "cover image: audit refusal rolls back replacement and preserves the old object" {
+  let db = coverDb()
+  defer db.pool.close()
+  let upload = committedCoverForFailure(db)
+  let before = findArticleById(db, upload.article.id) catch e {
+    panic(e.message())
+  }
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let redis = openRedis(cfg.redisUrl) catch e {
+    panic(e.message())
+  }
+  defer redis.close()
+  let app = App(Config{ secret = "cover-audit-refusal", sessions = MemoryStore(100) })
+  app.get("/session", (c) => {
+    let session = c.session()?
+    session.set(sessionRoleKey, "admin")
+    session.set(sessionUserIdKey, "-1")
+    return c.noContent()
+  })
+  app.post("/v1/articles/:id/cover", (c) => uploadCover(c, db, cfg, redis))
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  let cookie = cookiePair(app.handle(jsonReq("GET", "/session", "", "")).getHeader("Set-Cookie"))
+  let response = postCover(app, "${upload.article.id}", cookie, testCoverPng)
+  assert(response.status == 500, "missing audit actor must fail the real cover update")
+  let saved = findArticleById(db, upload.article.id) catch e {
+    panic(e.message())
+  }
+  assert(saved.version == before.version, "audit failure must roll back the article version")
+  assert(saved.updatedAt == before.updatedAt, "audit failure must roll back the article timestamp")
+  assertCommittedCoverPreserved(db, upload)
+  assertAudit(db, "article/${before.id}", before.authorId, ["article.create", "article.cover"])
+  let objects = coverList(coverTestClient(), "articles/${before.id}/covers/")
+  let first = objects.next() catch e {
+    panic(e.message())
+  }
+  let second = objects.next() catch e {
+    panic(e.message())
+  }
+  assert(isSome(first) && unwrap(first).key == upload.key, "old cover must remain in storage")
+  assert(isNone(second), "audit failure must compensate the uncommitted object")
 }
