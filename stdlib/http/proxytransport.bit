@@ -1,0 +1,198 @@
+// Private proxy transport primitives for #6613; callers own deadlines and cancellation.
+import { encodeBase64 } from "std/crypto"
+
+class proxyEndpoint { url: Url, authorization: string }
+
+fn proxyUri(value: string): string! {
+  if (len(value) == 0 || len(value) > maxHeaderBytes || firstForbiddenUrlByte(value) >= 0) {
+    fail newError("http proxy: invalid endpoint")
+  }
+  if (indexOf(value, "://") < 0) {
+    return "http://${value}"
+  }
+  let lower = toLower(value)
+  if (!hasPrefix(lower, "http://") && !hasPrefix(lower, "https://")) {
+    fail newError("http proxy: unsupported endpoint scheme")
+  }
+  return value
+}
+
+fn proxyUserByte(c: byte): bool {
+  if (isUnreservedQueryByte(c)) {
+    return true
+  }
+  let allowed = "!$&'()*+,;=:"
+  for (let i = 0; i < len(allowed); i = i + 1) {
+    if (c == allowed[i]) {
+      return true
+    }
+  }
+  return false
+}
+
+// URI userinfo keeps '+' literal; query percentDecode deliberately does not.
+fn proxyUserinfo(s: string): string! {
+  if (len(s) > maxHeaderBytes / 2) {
+    fail newError("http proxy: credentials exceed header budget")
+  }
+  let out = []byte(len(s))
+  let used = 0
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == '%') {
+      if (i + 2 >= len(s)) {
+        fail newError("http proxy: invalid credential escape")
+      }
+      let hi = queryHexDigit(s[i + 1])
+      let lo = queryHexDigit(s[i + 2])
+      if (hi < 0 || lo < 0) {
+        fail newError("http proxy: invalid credential escape")
+      }
+      c = byte(hi * 16 + lo)
+      i = i + 2
+    } else if (!proxyUserByte(c)) {
+      fail newError("http proxy: invalid credential byte")
+    }
+    if (c < 32 || c == 127) {
+      fail newError("http proxy: control byte in credentials")
+    }
+    out[used] = c
+    used = used + 1
+    i = i + 1
+  }
+  return string(out[0:used])
+}
+
+fn proxyBasicAuth(raw: string): string! {
+  if (len(raw) > maxHeaderBytes / 2) {
+    fail newError("http proxy: credentials exceed header budget")
+  }
+  let colon = indexOf(raw, ":")
+  let user = raw
+  let password = ""
+  if (colon >= 0) {
+    user = raw[0:colon]
+    password = raw[colon + 1:len(raw)]
+  }
+  user = proxyUserinfo(user)?
+  password = proxyUserinfo(password)?
+  if (indexOf(user, ":") >= 0) {
+    fail newError("http proxy: colon in Basic username")
+  }
+  return "Basic " + encodeBase64([]byte(user + ":" + password))
+}
+
+fn parseProxyEndpoint(value: string): proxyEndpoint! {
+  let uri = proxyUri(value)?
+  let start = indexOf(uri, "://") + 3
+  let authority = uri[start:len(uri)]
+  let slash = indexOf(authority, "/")
+  if (slash >= 0) {
+    if (authority[slash:len(authority)] != "/") {
+      fail newError("http proxy: endpoint has a resource path")
+    }
+    authority = authority[0:slash]
+  }
+  if (indexOf(authority, "?") >= 0 || indexOf(authority, "#") >= 0) {
+    fail newError("http proxy: endpoint has a query or fragment")
+  }
+  let auth = ""
+  let at = indexOf(authority, "@")
+  if (at >= 0) {
+    auth = proxyBasicAuth(authority[0:at])?
+    authority = authority[at + 1:len(authority)]
+  }
+  if (indexOf(authority, "@") >= 0) {
+    fail newError("http proxy: invalid endpoint authority")
+  }
+  let endpoint = parseUrl(uri[0:start] + authority) catch _ {
+    fail newError("http proxy: invalid endpoint authority")
+  }
+  if (len(endpoint.host) > 253) {
+    fail newError("http proxy: endpoint host is too long")
+  }
+  return proxyEndpoint{ url = endpoint, authorization = auth }
+}
+
+fn proxyConnectAuthority(target: Url): string! {
+  if (len(target.host) == 0 || len(target.host) > 253 || firstForbiddenUrlByte(target.host) >= 0) {
+    fail newError("http proxy: invalid CONNECT host")
+  }
+  if (target.port <= 0 || target.port > 65535) {
+    fail newError("http proxy: invalid CONNECT port")
+  }
+  for delimiter of ["/", "?", "#", "@", "[", "]"] {
+    if (indexOf(target.host, delimiter) >= 0) {
+      fail newError("http proxy: invalid CONNECT host")
+    }
+  }
+  return "${hostForAuthority(target.host)}:${itoa(target.port)}"
+}
+
+fn proxyConnectRequest(target: Url, authorization: string): string! {
+  let authority = proxyConnectAuthority(target)?
+  if (len(authorization) > maxHeaderBytes) {
+    fail newError("http proxy: authorization exceeds header budget")
+  }
+  if (hasForbiddenValueByte(authorization)) {
+    fail newError("http proxy: invalid authorization header")
+  }
+  let request = "CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n"
+  if (len(authorization) > 0) {
+    request = request + "Proxy-Authorization: ${authorization}\r\n"
+  }
+  request = request + "\r\n"
+  if (len(request) > maxHeaderBytes) {
+    fail newError("http proxy: CONNECT request exceeds header budget")
+  }
+  return request
+}
+
+// TLS will wrap the raw Conn, so tunneled bytes must remain in its socket.
+fn proxyReadConnectHead(s: byteStream): string! {
+  let head = Builder()
+  let tail = ""
+  for (let i = 0; i < maxHeaderBytes + 4; i = i + 1) {
+    let piece = s.readUp(1)?
+    if (len(piece) != 1) {
+      fail newError("http proxy: incomplete CONNECT response head")
+    }
+    head.write(piece)
+    tail = lastBytes(tail + piece, 4)
+    if (tail == "\r\n\r\n") {
+      let all = head.toString()
+      return all[0:len(all) - 4]
+    }
+  }
+  fail newError("http proxy: CONNECT response exceeds header budget")
+}
+
+fn proxyConnectCode(head: string): int! {
+  let end = indexOf(head, "\r\n")
+  let line = end < 0 ? head : head[0:end]
+  if (len(line) < 13 || line[8] != ' ' || line[12] != ' ') {
+    fail newError("http proxy: malformed CONNECT status line")
+  }
+  if (!hasPrefix(line, "HTTP/1.") || line[7] < '0' || line[7] > '9') {
+    fail newError("http proxy: malformed CONNECT status line")
+  }
+  if (hasForbiddenValueByte(line)) {
+    fail newError("http proxy: malformed CONNECT status line")
+  }
+  return parseStatusCode(line)?
+}
+
+fn proxyConnect(s: byteStream, target: Url, authorization: string): ()! {
+  s.writeStr(proxyConnectRequest(target, authorization)?)?
+  for (let seen = 0; seen < maxInterimResponses; seen = seen + 1) {
+    let status = proxyConnectCode(proxyReadConnectHead(s)?)?
+    if (status >= 200 && status < 300) {
+      return
+    }
+    if (status < 100 || status >= 200 || status == 101) {
+      fail newError("http proxy: CONNECT failed with status ${status}")
+    }
+  }
+  fail newError("http proxy: too many interim CONNECT responses")
+}
