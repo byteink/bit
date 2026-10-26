@@ -198,7 +198,11 @@ order by id;
 ```
 
 A refused password or unverified Google address adds no sign-in event. If the
-audit write fails, sign-in fails and its provisional session is destroyed.
+audit write fails, sign-in fails and the current request's session is locally
+invalidated. Its provisional id is not sent in a new cookie, even if the
+session store refuses deletion. That store error still propagates; remote
+revocation is not confirmed, and a client that already knows a saved id may
+still use it until the store revokes or expires it.
 An initial refresh credential and its audit row share one PostgreSQL
 transaction; failure rolls both back. Refresh rotation does not create a new
 sign-in event. Audit rows contain account IDs, never passwords, bearer tokens

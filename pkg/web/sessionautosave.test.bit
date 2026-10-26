@@ -58,6 +58,7 @@ class CountingStore {
   loads: int
   writes: int
   failRotation: bool
+  failDestroy: bool = false
   export load(sid: string): Option<(map<string, string>, i64, map<string, string>)>! {
     this.loads = this.loads + 1
     return this.inner.load(sid)?
@@ -87,6 +88,9 @@ class CountingStore {
   }
   export destroy(sid: string, tombstoneTtl: i64): ()! {
     this.writes = this.writes + 1
+    if (this.failDestroy) {
+      fail newError("web: test: session deletion unavailable")
+    }
     return this.inner.destroy(sid, tombstoneTtl)?
   }
   export destroyIndexed(key: string, value: string, except: string, tombstoneTtl: i64): int! {
@@ -299,4 +303,96 @@ test "a session store failure while autosaving becomes a 500, never the handler'
     contains(sinkText(sink), "FailingStore refuses"),
     "the real save failure must be logged, got: '${sinkText(sink)}'",
   )
+}
+
+fn failedDestroyHandler(c: Ctx): Res! {
+  let session = c.session()?
+  session.regenerate()?
+  session.set("k", "authenticated")
+  session.index("user", "alice")
+  session.save()?
+  session.set("pending", "unsaved")
+  session.destroy()?
+  return c.text("unreachable")
+}
+
+test "a failed session delete cannot autosave or publish its provisional cookie" {
+  let store = newCountingStore()
+  store.failDestroy = true
+  let app = App(Config{ secret = "test-secret", sessions = store })
+  app.get("/login", failedDestroyHandler)
+  freezeOrPanic(app)
+  let response = app.handle(req("GET", "/login"))
+  assert(response.status == 500, "remote revocation failure must propagate")
+  assert(store.writes == 3, "rotation, identity save and deletion only; no final autosave")
+  assert(
+    response.getHeader("Set-Cookie") == "",
+    "failed deletion must not publish the provisional ID",
+  )
+}
+
+test "explicit destroy after a store failure confirms remote revocation before success" {
+  let store = newCountingStore()
+  let session = loadSession(store, "") catch e {
+    panic(e.message())
+  }
+  session.set("k", "authenticated")
+  session.index("user", "alice")
+  mustSave(session)
+  let sid = session.id()
+  store.failDestroy = true
+  let refused = false
+  session.destroy() catch _ {
+    refused = true
+  }
+  assert(refused && store.writes == 2, "first deletion must fail without any automatic retry")
+  assert(
+    session.get("k") == "" && !session.isNew(),
+    "failed deletion must invalidate local data and cookie",
+  )
+  assert(
+    mustRead(store.inner, sid)["k"] == "authenticated",
+    "fixture must retain the unrevoked remote entry",
+  )
+  store.failDestroy = false
+  session.destroy() catch e {
+    panic(e.message())
+  }
+  assert(store.writes == 3, "explicit second destroy must confirm remote deletion")
+  let stored = store.inner.load(sid) catch e {
+    panic(e.message())
+  }
+  assert(!isSome(stored), "the successful explicit deletion must revoke the saved id")
+  session.destroy() catch e {
+    panic(e.message())
+  }
+  mustSave(session)
+  assert(store.writes == 3, "confirmed deletion and later save remain idempotent")
+}
+
+test "explicit destroy repeats a persistent store error without publishing local state" {
+  let store = newCountingStore()
+  let session = loadSession(store, "") catch e {
+    panic(e.message())
+  }
+  session.set("k", "authenticated")
+  mustSave(session)
+  store.failDestroy = true
+  for attempt of [0, 1] {
+    let message = ""
+    session.destroy() catch e {
+      message = e.message()
+    }
+    assert(
+      message == "web: test: session deletion unavailable",
+      "each explicit failed deletion must return its error",
+    )
+    assert(store.writes == attempt + 2, "one store attempt per explicit call; no automatic retry")
+    assert(
+      session.get("k") == "" && !session.isNew(),
+      "the failed deletion must stay locally invalidated",
+    )
+    mustSave(session)
+    assert(store.writes == attempt + 2, "the failed deletion must not autosave")
+  }
 }

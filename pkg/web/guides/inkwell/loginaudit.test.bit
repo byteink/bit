@@ -147,3 +147,110 @@ test "audit insert failure rolls back the initial refresh row" {
   assert(rows == 0, "audit failure must roll back refresh credential storage")
   assert(len(auditRows(db, "user/-1")) == 0, "failed grant leaves no audit row")
 }
+
+import { SessionStore } from "web"
+import { bindSession } from "auth"
+
+// A remote delete can fail while the same store still accepts session writes.
+class DestroyFailureStore {
+  inner: MemoryStore
+  destroys: int = 0
+  writesAfterDestroy: int = 0
+
+  export load(sid: string): Option<(map<string, string>, i64, map<string, string>)>! {
+    return this.inner.load(sid)?
+  }
+
+  export compareAndSet(
+    sid: string,
+    expectedVersion: i64,
+    data: map<string, string>,
+    index: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    if (this.destroys > 0) {
+      this.writesAfterDestroy = this.writesAfterDestroy + 1
+    }
+    return this.inner.compareAndSet(sid, expectedVersion, data, index, ttl)?
+  }
+
+  export rotate(
+    source: (string, i64),
+    destination: string,
+    data: map<string, string>,
+    index: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    return this.inner.rotate(source, destination, data, index, ttl)?
+  }
+
+  export destroy(sid: string, tombstoneTtl: i64): ()! {
+    this.destroys = this.destroys + 1
+    fail newError("test: remote session deletion failed")
+  }
+
+  export destroyIndexed(key: string, value: string, except: string, tombstoneTtl: i64): int! {
+    return this.inner.destroyIndexed(key, value, except, tombstoneTtl)?
+  }
+}
+
+class BoundMissingAuditActor {
+  name(): string { return "bound-missing-audit-actor" }
+
+  authenticate(c: Ctx): Identity! {
+    let session = c.session()?
+    session.regenerate()?
+    let identity = Identity{ id = "-1", claims = Json.JsonObject([]JsonEntry(0)) }
+    bindSession(c, identity)?
+    return identity
+  }
+}
+
+fn failedDestroyAuditApp(db: Db, store: SessionStore): App {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let tokens = RefreshTokens(LoginRefreshStore(db)) catch e {
+    panic(e.message())
+  }
+  let access = buildAccessTokens(cfg) catch e {
+    panic(e.message())
+  }
+  let app = App(Config{ secret = "audit-failed-destroy", sessions = store })
+  app.post("/login", (c) => login(c, db, BoundMissingAuditActor{}))
+  app.post("/token", (c) => issueTokens(c, db, tokens, BoundMissingAuditActor{}, access))
+  app.get("/protected", (c) => {
+    currentUserId(c)?
+    return c.noContent()
+  })
+  app.get("/package-protected", (c) => {
+    currentIdentity(c) catch _ {
+      fail unauthorized()
+    }
+    return c.noContent()
+  })
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  return app
+}
+
+test "audit refusal publishes no authenticated cookie when remote session deletion fails" {
+  let db = loginAuditDb()
+  defer db.pool.close()
+  for path of ["/login", "/token"] {
+    let store = DestroyFailureStore{ inner = MemoryStore(100) }
+    let app = failedDestroyAuditApp(db, store)
+    let response = app.handle(jsonReq("POST", path, "", "{}"))
+    assert(response.status == 500, "failed audit or issuance remains an error")
+    assert(store.destroys == 1, "remote destruction must be attempted once")
+    let cookie = response.getHeader("Set-Cookie")
+    assert(cookie == "", "failure must not publish the provisional session ID")
+    assert(store.writesAfterDestroy == 0, "failure must not autosave the authenticated session")
+    for route of ["/protected", "/package-protected"] {
+      let probe = app.handle(jsonReq("GET", route, cookiePair(cookie), ""))
+      assert(probe.status == 401, "failure must not authorize app or package identity")
+    }
+    assert(!contains(response.body, "accessToken"), "failure must not expose credentials")
+  }
+}
