@@ -122,6 +122,120 @@ A server expecting more than one client uses `h3Listen` instead of `h3Accept`: i
 demultiplexes many clients on one socket, and each established connection arrives
 through `H3Listener.accept()`.
 
+## Extended CONNECT
+
+An Inkwell draft feed can keep one request stream open while ordinary requests
+continue on the same connection. Enable extended CONNECT when accepting the
+connection, then use `openTunnel` on the client. It waits for the peer's settings
+and fails if the peer has not advertised support.
+
+The following helpers establish a draft feed and exchange a bounded chunk of
+already encoded WebSocket bytes. Your application supplies WebSocket framing
+and checks authentication and browser origins before accepting a request.
+`H3Stream` carries DATA bytes; it does not perform those application checks.
+
+```bit
+import {
+  h3Accept, H3Conn, H3Request, H3Response, H3ServerRequest, H3Stream,
+  HeaderField, isExtendedConnect,
+} from "std/http3"
+import { UdpSocket } from "std/net"
+
+fn acceptDraftPeer(sock: UdpSocket, certPem: string, keyPem: string): H3Conn! {
+  return h3Accept(sock, certPem, keyPem, true)?
+}
+
+fn openDraftFeed(conn: H3Conn): H3Stream! {
+  return conn.openTunnel(
+    H3Request{
+      method = "CONNECT", protocol = "websocket", scheme = "https",
+      authority = "localhost", path = "/drafts",
+      headers = []HeaderField{
+        HeaderField{ name = "sec-websocket-version", value = "13", sensitive = false },
+      },
+      body = []byte(0),
+    },
+  )?
+}
+
+fn draftVersion(req: H3Request): bool {
+  let versions = 0
+  for field of req.headers {
+    if (field.name == "sec-websocket-version") {
+      if (field.value != "13") {
+        return false
+      }
+      versions = versions + 1
+    }
+  }
+  return versions == 1
+}
+
+fn acceptDraftFeed(conn: H3Conn, received: H3ServerRequest): H3Stream! {
+  if (!isExtendedConnect(received.req) || received.req.path != "/drafts") {
+    conn.respond(received, H3Response{ status = 400 })?
+    fail newError("draft feed: invalid request")
+  }
+  if (received.req.protocol != "websocket") {
+    conn.respond(received, H3Response{ status = 501 })?
+    fail newError("draft feed: unsupported protocol")
+  }
+  if (!draftVersion(received.req)) {
+    conn.respond(received, H3Response{ status = 400 })?
+    fail newError("draft feed: invalid request")
+  }
+  return received.acceptExtendedConnect()?
+}
+
+fn exchangeDraftChunk(stream: H3Stream, encodedFrame: string, wake: chan<int>): string! {
+  if (len(encodedFrame) == 0 || len(encodedFrame) > 4096) {
+    fail newError("draft feed: chunk must contain 1 to 4096 bytes")
+  }
+  stream.writeUntil(encodedFrame, wake) catch e {
+    stream.reset()
+    fail e
+  }
+  let chunk = stream.read(4096) catch e {
+    stream.reset()
+    fail e
+  }
+  return chunk
+}
+
+// Use this form only when the connection idle bound is the intended limit.
+fn sendDraftNotice(stream: H3Stream, encodedFrame: string): ()! {
+  stream.write(encodedFrame)?
+}
+
+fn finishDraftFeed(stream: H3Stream, abort: bool): ()! {
+  if (abort) {
+    stream.reset()
+    return
+  }
+  stream.close()?
+}
+```
+
+Use `conn.accept()` to obtain the server request passed to `acceptDraftFeed`.
+Both peers may exchange DATA before either sends FIN. Reads can split an
+application frame, so keep feeding chunks to your protocol decoder until it has
+a complete frame. For a positive read size, an empty string means peer FIN.
+`close()` ends your sending half; you can still read the peer's final bytes.
+`reset()` aborts both directions without closing the other request streams.
+
+The byte transport is available here; `std/websocket` and `pkg/web` do not yet
+wire it into their WebSocket APIs. DATA writes now wait for QUIC acknowledgments
+before retaining another frame. Supply a capacity-one `wake` channel to
+`writeUntil` and signal it from your deadline or cancellation path. Cancellation
+aborts this tunnel because an interrupted DATA frame cannot be resumed safely.
+One reader and one writer may use a tunnel; application framing, message size
+limits and WebSocket close handshakes remain the caller's responsibility.
+
+`h3: peer did not enable extended CONNECT` means the server did not opt in;
+do not retry the same tunnel on that connection. `h3: tunnel is closed` means
+you tried to write after closing or resetting your handle. Establish another
+tunnel for a new exchange.
+
 ## Sharp edges
 
 **Our encoder never grows the table; the peer's may.** `H3Conn` advertises a
@@ -276,7 +390,11 @@ use the dynamic table; see [Sharp edges](#sharp-edges).
 
 ### `H3Request`
 
-An HTTP/3 request: `method`, `scheme`, `authority`, and `path` become the pseudo-headers; `headers` are the regular header fields; `body` is the request body.
+An HTTP/3 request: `method`, `scheme`, `authority`, and `path` become the pseudo-headers; `headers` are the regular header fields; `body` is the request body. Set `protocol` for an extended CONNECT request, as in [Extended CONNECT](#extended-connect); leave it empty for an ordinary request.
+
+### `isExtendedConnect(req: H3Request): bool`
+
+Reports whether the method is `CONNECT` and `protocol` is nonempty. It does not validate the protocol's handshake; the draft feed example performs its own header checks.
 
 ### `H3Response`
 
@@ -289,6 +407,30 @@ An established HTTP/3 connection over one QUIC connection. It owns the per-conne
 ### `H3ServerRequest`
 
 A received request paired with the stream it arrived on. `req` is the decoded `H3Request`; `respond` answers on the stream it carries.
+
+### `H3Stream`
+
+The DATA byte stream returned by `H3Conn.openTunnel` or `H3ServerRequest.acceptExtendedConnect`. Use at most one reader and one writer at a time. [Extended CONNECT](#extended-connect) shows its request and lifecycle.
+
+### `H3Stream.read(n: int): string!`
+
+Reads up to `n` bytes, preserving any remaining DATA for the next call. With positive `n`, an empty string marks peer FIN. A nonpositive `n` returns an empty string without reading. A chunk can contain part of an application frame.
+
+### `H3Stream.write(data: string): ()!`
+
+Writes DATA in payloads of at most 16384 bytes and waits for each frame to be acknowledged before the next frame is retained. It does not send FIN. The application supplies its own protocol framing. A write after local `close` or `reset` fails. `write` has no caller cancellation; the connection idle bound still applies.
+
+### `H3Stream.writeUntil(data: string, wake: chan<int>): ()!`
+
+Like `write`, but a value on the capacity-one `wake` channel interrupts the write with `H3Aborted`. The running example uses this form for a deadline or cancellation. Any write error aborts both tunnel directions and closes the handle; queued bytes may already have reached the peer. Retry on a new tunnel, never within the partial DATA frame.
+
+### `H3Stream.close(): ()!`
+
+Ends the local sending half with FIN and waits for queued bytes to be acknowledged. Calling it again does nothing. Reads remain available, and other request streams on the connection remain open.
+
+### `H3Stream.reset()`
+
+Aborts both directions of this stream with request cancellation. Use it when a protocol exchange fails or is abandoned; other request streams remain open.
 
 ### `h3Dial(host: string, port: int, serverName: string): H3Conn!`
 
@@ -338,13 +480,17 @@ Starts reading the peer's own streams so that `reusable` learns of a `GOAWAY` or
 
 Whether a new request may be started on this connection: false once either side sent `GOAWAY` or the connection ended. It sees the peer's side only after `watchPeer`.
 
-### `h3Accept(sock: UdpSocket, certChainPem: string, keyPem: string): H3Conn!`
+### `h3Accept(sock: UdpSocket, certChainPem: string, keyPem: string, enableConnectProtocol: bool = false): H3Conn!`
 
 Accepts one HTTP/3 connection on the bound UDP socket `sock`, using the certificate chain and private key for the handshake. Serves a single connection; use `h3Listen` for many.
 
-### `h3Listen(sock: UdpSocket, certChainPem: string, keyPem: string): H3Listener!`
+Extended CONNECT is disabled by default. Pass `true` only when your application accepts and validates those requests.
+
+### `h3Listen(sock: UdpSocket, certChainPem: string, keyPem: string, enableConnectProtocol: bool = false): H3Listener!`
 
 Starts an HTTP/3 listener on the bound UDP socket `sock`. The underlying QUIC listener demultiplexes many client connections on the one socket. Returns immediately; each established connection is handed back by `accept`.
+
+Pass `enableConnectProtocol = true` to advertise extended CONNECT on each accepted connection. The default preserves ordinary request/response behavior.
 
 ### `H3Listener`
 
@@ -362,9 +508,17 @@ Stops admitting new connections on the underlying socket; connections already ac
 
 Sends `req` and reads the response back on the same stream. Fails on a transport or decode error.
 
+### `H3Conn.openTunnel(req: H3Request): H3Stream!`
+
+Opens an extended CONNECT request. The peer must advertise support, the request must include its method, protocol, scheme, authority and path, and the response must be successful. The returned stream carries DATA without waiting for FIN. See [Extended CONNECT](#extended-connect).
+
 ### `H3Conn.accept(): H3ServerRequest!`
 
 Accepts the next request, blocking until one opens. Fails on a transport or decode error.
+
+### `H3ServerRequest.acceptExtendedConnect(): H3Stream!`
+
+Accepts this request with status 200 after your application validates the protocol handshake. The connection must have advertised support. Rejects a malformed, ordinary or already accepted request; use the handle from the same connection that received it.
 
 ### `H3Conn.respond(sr: H3ServerRequest, resp: H3Response): ()!`
 

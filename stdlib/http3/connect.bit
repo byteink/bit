@@ -1,0 +1,333 @@
+// Bit standard library — HTTP/3 extended CONNECT (RFC 9220 section 3).
+// HEADERS establish the tunnel; DATA carries its bytes until QUIC FIN.
+import { sleep, Millisecond } from "std/time"
+import { streamWriteUntil, streamAbort } from "std/quic"
+
+const h3TunnelFrameMax: int = 65536
+
+// Whether the request uses extended CONNECT; the application selects its protocol.
+export fn isExtendedConnect(req: H3Request): bool {
+  return req.method == "CONNECT" && req.protocol != ""
+}
+
+fn h3connectSetting(payload: []byte): bool {
+  let r = h3Reader{ data = payload }
+  while (r.pos < len(payload)) {
+    let id = h3readVarint(r) catch _ {
+      return false
+    }
+    let value = h3readVarint(r) catch _ {
+      return false
+    }
+    if (id == 0x08) {
+      return value == 1
+    }
+  }
+  return false
+}
+
+fn h3setRequestField(req: H3Request, hf: HeaderField) {
+  if (hf.name == ":method") {
+    req.method = hf.value
+  } else if (hf.name == ":scheme") {
+    req.scheme = hf.value
+  } else if (hf.name == ":authority") {
+    req.authority = hf.value
+  } else if (hf.name == ":path") {
+    req.path = hf.value
+  } else if (hf.name == ":protocol") {
+    req.protocol = hf.value
+  } else {
+    req.headers = append(req.headers, hf)
+  }
+}
+
+fn h3fieldsRequest(fields: []HeaderField): H3Request! {
+  let req = H3Request{}
+  let protocols = 0
+  for hf of fields {
+    if (hf.name == ":protocol") {
+      protocols = protocols + 1
+    }
+    h3setRequestField(req, hf)
+  }
+  if (protocols > 0) {
+    if (protocols != 1 || !h3connectShape(req)) {
+      fail newError("h3: malformed extended CONNECT")
+    }
+  }
+  return req
+}
+
+fn h3connectShape(req: H3Request): bool {
+  return isExtendedConnect(req) && req.scheme != "" && req.authority != "" && req.path != ""
+}
+
+// A bounded incremental frame reader. Bytes following HEADERS remain available
+// to the tunnel, including when DATA and HEADERS arrive in the same QUIC chunk.
+class h3TunnelReader {
+  s: Stream,
+  buf: []byte,
+  fin: bool,
+  frameType: int,
+  remaining: int,
+}
+
+fn h3tunnelFill(r: h3TunnelReader): ()! {
+  if (r.fin) {
+    fail newError("h3: truncated tunnel frame")
+  }
+  let chunk = r.s.read()?
+  if (chunk.reset) {
+    fail newError("h3: tunnel reset (${chunk.resetCode})")
+  }
+  r.buf = qpackAppendBytes(r.buf, chunk.data)
+  r.fin = chunk.fin
+}
+
+fn h3tunnelFrame(r: h3TunnelReader): h3Frame! {
+  let guard = 0
+  while (guard < h3TunnelFrameMax + 16) {
+    guard = guard + 1
+    let f = h3tunnelBuffered(r)?
+    if (isSome(f)) {
+      return unwrap(f)
+    }
+    h3tunnelFill(r)?
+  }
+  fail newError("h3: tunnel frame exceeds read bound")
+}
+
+fn h3tunnelBuffered(r: h3TunnelReader): Option<h3Frame>! {
+  let cursor = h3Reader{ data = r.buf }
+  let ft = h3readVarint(cursor) catch _ {
+    return Option.None
+  }
+  let size = h3readVarint(cursor) catch _ {
+    return Option.None
+  }
+  if (size > u64(h3TunnelFrameMax)) {
+    fail newError("h3: tunnel frame exceeds size limit")
+  }
+  let end = cursor.pos + int(size)
+  if (end > len(r.buf)) {
+    return Option.None
+  }
+  let f = h3Frame{ ftype = ft, payload = r.buf[cursor.pos:end] }
+  r.buf = r.buf[end:len(r.buf)]
+  return Option.Some(f)
+}
+
+fn h3acceptRequest(c: H3Conn, s: Stream, first: StreamChunk): H3ServerRequest! {
+  let reader = h3TunnelReader{ s = s, buf = first.data, fin = first.fin }
+  let head = h3tunnelHead(reader)?
+  let req = h3fieldsRequest(h3decodeSection(c, s.id(), head.payload)?)?
+  if (isExtendedConnect(req)) {
+    if (!c.enableConnectProtocol) {
+      fail newError("h3: extended CONNECT was not advertised")
+    }
+  } else {
+    let rest = h3readRest(s, StreamChunk{ data = reader.buf, fin = reader.fin }, chan<int>(1))?
+    for frame of h3parseFrames(rest)? {
+      if (int(frame.ftype) == h3FrameData) {
+        req.body = qpackAppendBytes(req.body, frame.payload)
+      }
+    }
+  }
+  return H3ServerRequest{ req = req, stream = s, reader = reader, conn = c }
+}
+
+// Bidirectional DATA bytes on one request stream. One reader and one writer may
+// use this handle; closing ends the local half and preserves the connection.
+export class H3Stream {
+  reader: h3TunnelReader
+  pending: []byte
+  closed: bool
+
+  // Read up to n bytes; an empty string marks an orderly peer FIN.
+  export read(n: int): string! {
+    if (n <= 0) {
+      return ""
+    }
+    if (len(this.pending) == 0) {
+      this.pending = h3tunnelData(this.reader)?
+    }
+    let size = len(this.pending)
+    if (size > n) {
+      size = n
+    }
+    let data = string(this.pending[0:size])
+    this.pending = this.pending[size:len(this.pending)]
+    return data
+  }
+
+  // Each DATA frame waits for ACKs before the next frame is retained.
+  export write(data: string): ()! {
+    this.writeUntil(data, chan<int>(1))?
+  }
+
+  // An interrupted frame cannot be resumed safely; abort both stream directions.
+  export writeUntil(data: string, wake: chan<int>): ()! {
+    if (this.closed) {
+      fail newError("h3: tunnel is closed")
+    }
+    let offset = 0
+    while (offset < len(data)) {
+      let end = offset + 16384
+      if (end > len(data)) {
+        end = len(data)
+      }
+      streamWriteUntil(this.reader.s, h3frame(h3FrameData, []byte(data[offset:end])), wake) catch e {
+        this.reset()
+        let (_, woken) = e.(Woken)
+        if (woken) {
+          fail H3Aborted{}
+        }
+        fail e
+      }
+      offset = end
+    }
+  }
+
+  // Send FIN and wait for queued bytes to reach the peer. Idempotent.
+  export close(): ()! {
+    if (this.closed) {
+      return
+    }
+    this.closed = true
+    this.reader.s.finish()?
+  }
+
+  // Abort both stream directions with H3_REQUEST_CANCELLED (RFC 9220 section 3).
+  export reset() {
+    this.closed = true
+    streamAbort(this.reader.s, h3ErrRequestCancelled)
+  }
+}
+
+// DATA and unknown frames stream through without buffering their declared size.
+fn h3tunnelBegin(r: h3TunnelReader): bool! {
+  let cursor = h3Reader{ data = r.buf }
+  let ft = h3readVarint(cursor) catch _ {
+    return false
+  }
+  let size = h3readVarint(cursor) catch _ {
+    return false
+  }
+  if (int(ft) == h3FrameHeaders) {
+    fail newError("h3: HEADERS on established tunnel")
+  }
+  r.frameType = int(ft)
+  r.remaining = int(size)
+  r.buf = r.buf[cursor.pos:len(r.buf)]
+  return true
+}
+
+fn h3tunnelEof(r: h3TunnelReader): bool! {
+  if (!r.fin || len(r.buf) > 0) {
+    return false
+  }
+  if (r.remaining > 0) {
+    fail newError("h3: truncated tunnel DATA")
+  }
+  return true
+}
+
+fn h3tunnelPayload(r: h3TunnelReader): []byte {
+  let size = r.remaining
+  if (size > len(r.buf)) {
+    size = len(r.buf)
+  }
+  let data = r.buf[0:size]
+  r.buf = r.buf[size:len(r.buf)]
+  r.remaining = r.remaining - size
+  return data
+}
+
+fn h3tunnelData(r: h3TunnelReader): []byte! {
+  let guard = 0
+  while (guard < h3TunnelFrameMax) {
+    guard = guard + 1
+    if (len(r.buf) == 0 && !r.fin) {
+      h3tunnelFill(r)?
+    }
+    if (h3tunnelEof(r)?) {
+      return []byte(0)
+    }
+    if (r.remaining == 0) {
+      if (!h3tunnelBegin(r)?) {
+        h3tunnelFill(r)?
+        continue
+      }
+    }
+    let data = h3tunnelPayload(r)
+    if (r.frameType == h3FrameData && len(data) > 0) {
+      return data
+    }
+  }
+  fail newError("h3: tunnel exceeds frame scan bound")
+}
+
+fn h3acceptTunnel(c: H3Conn, sr: H3ServerRequest): H3Stream! {
+  if (!c.enableConnectProtocol || !h3connectShape(sr.req) || sr.accepted) {
+    fail newError("h3: request cannot establish an extended CONNECT tunnel")
+  }
+  let head = h3responseFields(H3Response{ status = 200 })
+  sr.stream.write(h3frame(h3FrameHeaders, h3encodeSection(c, sr.stream.id(), head)))?
+  sr.accepted = true
+  return H3Stream{ reader = sr.reader }
+}
+
+fn h3awaitSettings(c: H3Conn): ()! {
+  c.watchPeer()
+  let guard = 0
+  while (!c.peerSettings && !c.gone && guard < 500) {
+    sleep(10 * Millisecond)
+    guard = guard + 1
+  }
+  if (!c.peerConnectProtocol) {
+    fail newError("h3: peer did not enable extended CONNECT")
+  }
+}
+
+fn h3openTunnel(c: H3Conn, req: H3Request): H3Stream! {
+  if (!h3connectShape(req)) {
+    fail newError("h3: malformed extended CONNECT")
+  }
+  h3awaitSettings(c)?
+  let s = c.conn.openStream()?
+  let section = h3encodeSection(c, s.id(), h3requestFields(req))
+  s.write(h3frame(h3FrameHeaders, section))?
+  let reader = h3TunnelReader{ s = s, buf = []byte(0) }
+  let res = h3tunnelResponse(c, s.id(), reader) catch e {
+    h3abortStream(s, h3ErrRequestCancelled)
+    h3cancelStream(c, s.id())
+    fail e
+  }
+  if (res.status < 200 || res.status >= 300) {
+    h3abortStream(s, h3ErrRequestCancelled)
+    fail newError("h3: extended CONNECT refused with status ${res.status}")
+  }
+  return H3Stream{ reader = reader }
+}
+
+fn h3tunnelResponse(c: H3Conn, sid: int, reader: h3TunnelReader): H3Response! {
+  let head = h3tunnelHead(reader)?
+  return h3parseResponse(c, sid, h3frame(h3FrameHeaders, head.payload))?
+}
+
+// Unknown frames may precede HEADERS; DATA cannot precede the message headers.
+fn h3tunnelHead(reader: h3TunnelReader): h3Frame! {
+  let guard = 0
+  while (guard < h3AcceptScan) {
+    guard = guard + 1
+    let head = h3tunnelFrame(reader)?
+    if (int(head.ftype) == h3FrameHeaders) {
+      return head
+    }
+    if (int(head.ftype) == h3FrameData) {
+      fail newError("h3: DATA before HEADERS")
+    }
+  }
+  fail newError("h3: missing HEADERS within frame scan bound")
+}

@@ -1,0 +1,335 @@
+import { after, Second } from "std/time"
+
+// RFC 9220 extended CONNECT settings, malformed requests and real QUIC tunnels.
+fn h3tReq(): H3Request {
+  return H3Request{
+    method = "CONNECT", scheme = "https", authority = "localhost", path = "/echo",
+    protocol = "websocket",
+  }
+}
+
+test "extended CONNECT settings advertise opt-in and reject illegal values" {
+  assert(!h3connectSetting(h3settingsPayload()), "disabled by default")
+  assert(h3connectSetting(h3settingsPayload(true)), "server advertises setting 0x08")
+  let st = h3newControl(true)
+  assert(h3controlFeed(st, h3frame(h3FrameSettings, h3settingsPayload(true))) == 0, "valid setting")
+  assert(st.connectProtocol, "client records advertisement")
+  for v of []u64{ 2, 4611686018427387903 } {
+    let payload = qpackAppendBytes(encodeVarint(u64(8)), encodeVarint(v))
+    assert(h3checkSettings(payload) == h3ErrSettings, "invalid setting ${v}")
+  }
+}
+
+fn h3tMalformed(req: H3Request): bool {
+  h3fieldsRequest(h3requestFields(req)) catch _ {
+    return true
+  }
+  return false
+}
+
+test "extended CONNECT requires CONNECT scheme path authority and a single protocol" {
+  let req = h3tReq()
+  assert(!h3tMalformed(req), "valid extended CONNECT")
+  req.method = "GET"
+  assert(h3tMalformed(req), "protocol requires CONNECT")
+  req.method = "CONNECT"
+  req.scheme = ""
+  assert(h3tMalformed(req), "scheme required")
+  req.scheme = "https"
+  req.path = ""
+  assert(h3tMalformed(req), "path required")
+  req.path = "/"
+  req.authority = ""
+  assert(h3tMalformed(req), "authority required")
+  let fields = h3requestFields(h3tReq())
+  fields = append(fields, HeaderField{ name = ":protocol", value = "websocket" })
+  h3fieldsRequest(fields) catch _ {
+    return
+  }
+  assert(false, "duplicate protocol accepted")
+}
+
+fn h3tServer(sock: UdpSocket, ready: chan<H3Conn>, done: chan<string>, enable: bool) {
+  let c = h3Accept(
+    sock,
+    h3cPem("CERTIFICATE", h3cLeafHex),
+    h3cPem("PRIVATE KEY", h3cKeyHex),
+    enable,
+  ) catch e {
+    done <- e.message()
+    return
+  }
+  ready <- c
+  h3tEcho(c) catch e {
+    done <- e.message()
+    return
+  }
+  done <- "ok"
+}
+
+fn h3tEcho(c: H3Conn): ()! {
+  let sr = c.accept()?
+  let t = sr.acceptExtendedConnect()?
+  let data = t.read(3)?
+  let rest = t.read(100)?
+  t.write(data + rest)?
+  assert(t.read(1)? == "", "peer clean FIN")
+  t.close()?
+  let next = c.accept()?
+  c.respond(next, H3Response{ status = 200, body = []byte("still open") })?
+}
+
+fn h3tRoundTrip(): ()! {
+  let sock = udpBind("127.0.0.1", 0)?
+  defer sock.close()
+  let port = sock.port()?
+  let ready = chan<H3Conn>(1)
+  let done = chan<string>(1)
+  spawn h3tServer(sock, ready, done, true)
+  let client = h3DialTls("127.0.0.1", port, "localhost", h3cClientConfig())?
+  defer client.close()
+  let server = <- ready
+  defer server.close()
+  let t = client.openTunnel(h3tReq())?
+  t.write("hello world")?
+  assert(t.read(100)? == "hello world", "DATA echoed before either FIN")
+  t.close()?
+  assert(t.read(1)? == "", "server clean FIN")
+  let res = client.request(
+    H3Request{ method = "GET", scheme = "https", authority = "localhost", path = "/" },
+  )?
+  assert(res.status == 200 && string(res.body) == "still open", "connection remains reusable")
+  assert(<- done == "ok", "server completed")
+}
+
+test "extended CONNECT exchanges DATA both ways before FIN and keeps connection usable" {
+  h3tRoundTrip() catch e {
+    assert(false, e.message())
+  }
+}
+
+fn h3tUnadvertised(): ()! {
+  let out = chan<H3Conn>(1)
+  let hold = chan<int>(1)
+  let client = h3qPair(out, hold)?
+  defer client.close()
+  let server = <- out
+  defer server.close()
+  server.watchPeer()
+  defer {
+    hold <- 1
+  }
+  client.openTunnel(h3tReq()) catch e {
+    assert(e.message() == "h3: peer did not enable extended CONNECT", e.message())
+    assert(server.highWater == -1, "client sent no request")
+    return
+  }
+  assert(false, "client opened an unadvertised tunnel")
+}
+
+test "extended CONNECT client refuses a peer without advertisement before opening a stream" {
+  h3tUnadvertised() catch e {
+    assert(false, e.message())
+  }
+}
+
+fn h3tRelease(hold: chan<int>) { hold <- 1 }
+
+fn h3tWithConn(run: (H3Conn) => ()!): ()! {
+  let out = chan<H3Conn>(1)
+  let hold = chan<int>(1)
+  let client = h3qPair(out, hold)?
+  defer client.close()
+  let server = <- out
+  defer server.close()
+  defer h3tRelease(hold)
+  run(server)?
+}
+
+fn h3tDisabled(c: H3Conn): ()! {
+  let s = c.rawConn().openStream()?
+  let sr = H3ServerRequest{ req = h3tReq(), conn = c, stream = s, reader = h3TunnelReader{ s = s } }
+  sr.acceptExtendedConnect() catch e {
+    assert(e.message() == "h3: request cannot establish an extended CONNECT tunnel", e.message())
+    assert(!sr.accepted, "refusal leaves the request unanswered")
+    return
+  }
+  assert(false, "server accepted an unadvertised tunnel")
+}
+
+test "extended CONNECT server refuses an unadvertised tunnel" {
+  h3tWithConn(h3tDisabled) catch e {
+    assert(false, e.message())
+  }
+}
+
+fn h3tUnknownHead(c: H3Conn): ()! {
+  let s = c.rawConn().openStream()?
+  let wire = qpackAppendBytes(h3frame(0x21, []byte{ 7 }), h3frame(h3FrameHeaders, []byte{ 9 }))
+  let reader = h3TunnelReader{ s = s, buf = wire, fin = true }
+  let head = h3tunnelHead(reader)?
+  assert(
+    int(head.ftype) == h3FrameHeaders && int(head.payload[0]) == 9,
+    "HEADERS after unknown frame",
+  )
+}
+
+test "extended CONNECT preserves unknown frames before HEADERS" {
+  h3tWithConn(h3tUnknownHead) catch e {
+    assert(false, e.message())
+  }
+}
+
+fn h3tLargeData(c: H3Conn): ()! {
+  let s = c.rawConn().openStream()?
+  let data = []byte(h3TunnelFrameMax + 1)
+  data[0] = 7
+  data[h3TunnelFrameMax] = 9
+  let reader = h3TunnelReader{ s = s, buf = h3frame(h3FrameData, data), fin = true }
+  let t = H3Stream{ reader = reader }
+  let first = t.read(1)?
+  assert(int(first[0]) == 7, "first DATA byte")
+  let rest = t.read(h3TunnelFrameMax)?
+  assert(len(rest) == h3TunnelFrameMax && int(rest[h3TunnelFrameMax - 1]) == 9, "remaining DATA")
+  assert(t.read(1)? == "", "orderly EOF after the large DATA frame")
+}
+
+test "extended CONNECT reads DATA larger than the header buffer limit incrementally" {
+  h3tWithConn(h3tLargeData) catch e {
+    assert(false, e.message())
+  }
+}
+
+class h3wPeer {
+  ready: chan<H3Conn>,
+  tunnel: chan<H3Stream>,
+  release: chan<int>,
+  done: chan<string>,
+}
+
+fn h3wServe(sock: UdpSocket, peer: h3wPeer) {
+  let c = h3Accept(sock, h3cPem("CERTIFICATE", h3cLeafHex), h3cPem("PRIVATE KEY", h3cKeyHex), true) catch e {
+    peer.done <- e.message()
+    return
+  }
+  defer c.close()
+  peer.ready <- c
+  let sr = c.accept() catch e {
+    peer.done <- e.message()
+    return
+  }
+  let tunnel = sr.acceptExtendedConnect() catch e {
+    peer.done <- e.message()
+    return
+  }
+  peer.tunnel <- tunnel
+  <- peer.release
+  peer.done <- "ok"
+}
+
+fn h3wWrite(t: H3Stream, wake: chan<int>, done: chan<string>) {
+  t.writeUntil(string([]byte(65553)), wake) catch e {
+    done <- e.message()
+    return
+  }
+  done <- "ok"
+}
+
+fn h3wResult(done: chan<string>): string! {
+  select {
+    case result = <- done:
+      return result
+    case _ = <- after(2 * Second):
+      fail newError("h3 test: writer did not return")
+  }
+}
+
+fn h3wRun(mode: int): ()! {
+  let sock = udpBind("127.0.0.1", 0)?
+  defer sock.close()
+  let peer = h3wPeer{
+    ready = chan<H3Conn>(1), tunnel = chan<H3Stream>(1),
+    release = chan<int>(1), done = chan<string>(1),
+  }
+  spawn h3wServe(sock, peer)
+  let c = h3DialTls("127.0.0.1", sock.port()?, "localhost", h3cClientConfig())?
+  defer c.close()
+  let server = <- peer.ready
+  defer server.close()
+  defer {
+    peer.release <- 1
+  }
+  let tunnel = c.openTunnel(h3tReq())?
+  let remote = <- peer.tunnel
+  let wake = chan<int>(1)
+  let done = chan<string>(1)
+  spawn h3wWrite(tunnel, wake, done)
+  if (mode == 0) {
+    h3wDrain(remote)?
+    assert(h3wResult(done)? == "ok", "ACKed frames complete without FIN")
+    remote.write("ok")?
+    assert(tunnel.read(2)? == "ok", "reverse DATA before FIN")
+    tunnel.close()?
+    assert(remote.read(1)? == "", "clean FIN after acknowledged DATA")
+    return
+  }
+  sleep(50 * Millisecond)
+  select {
+    case _ = <- done:
+      assert(false, "writer completed while peer flow control was stalled")
+    default:
+      {}
+  }
+  h3wStop(remote, wake, mode)
+  let result = h3wResult(done)?
+  assert(result != "ok", "interrupted write must fail")
+  if (mode == 1) {
+    assert(result == "http3: request aborted", "cancellation preserves the H3 error contract")
+  }
+  assert(tunnel.closed, "partial DATA frame closes the local handle")
+  tunnel.write("retry") catch _ {
+    return
+  }
+  assert(false, "a partial DATA frame was resumed")
+}
+
+fn h3wDrain(remote: H3Stream): ()! {
+  let total = 0
+  let reads = 0
+  while (total < 65553 && reads < 65553) {
+    let data = remote.read(16384)?
+    assert(len(data) > 0, "DATA arrived before FIN")
+    for b of []byte(data) {
+      assert(b == 0, "payload remains exact across released ACK prefixes")
+    }
+    total = total + len(data)
+    reads = reads + 1
+  }
+  assert(total == 65553, "multiple flow windows arrive exactly")
+}
+
+fn h3wStop(remote: H3Stream, wake: chan<int>, mode: int) {
+  if (mode == 1) {
+    wake <- 1
+    return
+  }
+  remote.reset()
+}
+
+test "extended CONNECT bounded DATA drains multiple flow windows before FIN" {
+  h3wRun(0) catch e {
+    assert(false, e.message())
+  }
+}
+
+test "extended CONNECT stalled DATA wakes and forbids partial frame retry" {
+  h3wRun(1) catch e {
+    assert(false, e.message())
+  }
+}
+
+test "extended CONNECT peer reset fails a stalled DATA writer" {
+  h3wRun(2) catch e {
+    assert(false, e.message())
+  }
+}

@@ -1,0 +1,167 @@
+// Bit standard library — bounded non-FIN writes and acknowledged send storage.
+// Stream offsets remain absolute; sendBase is the start of the retained buffer.
+
+fn quicconnAckedThrough(s: quicconnStream, end: int): bool {
+  if (end == 0) {
+    return true
+  }
+  for r of s.ackedRanges {
+    if (r.lo <= 0 && r.hi >= end - 1) {
+      return true
+    }
+  }
+  return false
+}
+
+fn quicconnReleaseSendPrefix(s: quicconnStream) {
+  if (s.sendAborted) {
+    return
+  }
+  for r of s.ackedRanges {
+    if (r.lo <= 0 && r.hi >= s.sendBase) {
+      let end = quicconnMin(r.hi + 1, s.sendLen)
+      let count = end - s.sendBase
+      if (count > len(s.sendBuf)) {
+        panic("quic: acknowledged bytes exceed retained send buffer")
+      }
+      s.sendBuf = s.sendBuf[count:len(s.sendBuf)]
+      s.sendBase = end
+      if (len(s.sendBuf) == 0) {
+        s.sendBuf = []byte(0)
+      }
+      return
+    }
+  }
+}
+
+fn quicconnDrainComplete(s: quicconnStream): bool {
+  if (s.writeWait) {
+    return quicconnAckedThrough(s, s.drainTo)
+  }
+  return s.finSent && s.sendOff == s.sendLen && quicconnStreamFullyAcked(s)
+}
+
+fn quicconnRejectWrite(cmd: quicconnCmd) {
+  if (cmd.kind == quicconnCmdWriteDrained) {
+    cmd.replyInt <- -1
+  }
+}
+
+// Legacy write keeps its queue-only contract. The drained operation admits one
+// receive-window-sized chunk, then parks its caller until that prefix is ACKed.
+fn quicconnArmWrite(s: quicconnStream, cmd: quicconnCmd): bool {
+  if (s.sendAborted) {
+    quicconnRejectWrite(cmd)
+    return false
+  }
+  if (cmd.kind != quicconnCmdWriteDrained) {
+    return true
+  }
+  if (s.finQueued || s.hasDrain || len(cmd.data) > quicconnFlowWindow) {
+    quicconnRejectWrite(cmd)
+    return false
+  }
+  if (s.sendLen > (1 << 62) - 1 - len(cmd.data)) {
+    quicconnRejectWrite(cmd)
+    return false
+  }
+  s.hasDrain = true
+  s.writeWait = true
+  s.drainTo = s.sendLen + len(cmd.data)
+  s.drainCh = cmd.replyInt
+  return true
+}
+
+// Write the bytes with bounded additional storage. Each chunk waits for ACKs
+// before the next is copied. A wake fails with Woken; the caller may reset the
+// stream to abandon bytes already queued. Connection close and reset fail too.
+export fn streamWriteUntil(s: Stream, data: []byte, wake: chan<int>): ()! {
+  let offset = 0
+  while (offset < len(data)) {
+    let size = quicconnMin(len(data) - offset, quicconnFlowWindow)
+    quicconnWriteChunk(s, data[offset:offset + size], wake)?
+    offset = offset + size
+  }
+}
+
+fn quicconnWriteChunk(s: Stream, data: []byte, wake: chan<int>): ()! {
+  quicconnWriteLive(s, wake)?
+  let done = chan<int>(1)
+  let cmd = quicconnCmd{
+    kind = quicconnCmdWriteDrained,
+    id = s.streamId,
+    data = append([]byte(0), ...data),
+    replyOpen = chan<quicconnOpenReply>(1),
+    replyInt = done,
+  }
+  select {
+    case s.cmdCh <- cmd:
+      {}
+    case _ = <- s.doneCh:
+      fail newError("quic: connection closed before write")
+    case _ = <- wake:
+      fail Woken{}
+  }
+  let result = quicconnAwaitWrite(s, done, wake)?
+  if (result < 0) {
+    fail newError("quic: stream write did not drain")
+  }
+}
+
+fn quicconnWriteLive(s: Stream, wake: chan<int>): ()! {
+  select {
+    case _ = <- wake:
+      fail Woken{}
+    case _ = <- s.doneCh:
+      fail newError("quic: connection closed before write")
+    default:
+      {}
+  }
+}
+
+fn quicconnAwaitWrite(s: Stream, done: chan<int>, wake: chan<int>): int! {
+  select {
+    case result = <- done:
+      return result
+    case _ = <- wake:
+      fail Woken{}
+    case _ = <- s.doneCh:
+      select {
+        case result = <- done:
+          return result
+        default:
+          return -1
+      }
+  }
+}
+
+// Abort both halves without parking on a connection actor that has exited.
+// Queue admission, not peer acknowledgement, completes this operation.
+export fn streamAbort(s: Stream, code: int) {
+  if (!quicconnAbortCommand(s, code, quicconnCmdReset)) {
+    return
+  }
+  if (!quicconnAbortCommand(s, code, quicconnCmdStopSending)) {
+    return
+  }
+  streamSendRead(s, quicconnRead{ id = s.streamId, bytes = 0, chunks = 0, discard = true })
+}
+
+fn quicconnAbortCommand(s: Stream, code: int, kind: int): bool {
+  select {
+    case _ = <- s.doneCh:
+      return false
+    default:
+      {}
+  }
+  let cmd = quicconnCmd{
+    kind = kind, id = s.streamId, data = encodeVarint(u64(code)),
+    replyOpen = chan<quicconnOpenReply>(1), replyInt = chan<int>(1),
+  }
+  select {
+    case s.cmdCh <- cmd:
+      return true
+    case _ = <- s.doneCh:
+      return false
+  }
+}

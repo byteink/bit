@@ -172,11 +172,11 @@ unknown.
 
 ### `Woken`
 
-What the three functions above fail with when their `wake` channel received a value first.
+What the wake-aware waits fail with when their `wake` channel received a value first.
 
 ### `Woken.message`
 
-The fixed text `quic: wait woken`. A woken wait is the caller's own doing and not a fault of the connection, so test for it with `e.(Woken)` and treat any other error as a real failure; the text is for logs.
+The fixed text `quic: wait woken`. A woken wait is the caller's own doing and not a fault of the connection. Use `let (_, woken) = e.(Woken)` to test its type and treat any other error as a real failure; the text is for logs.
 
 ### `Conn.openStream(): Stream!`
 
@@ -208,6 +208,44 @@ direction.
 ### `Stream.write(data: []byte): ()!`
 
 Queues `data` to send on this stream.
+
+### `Stream.writeAll(data: []byte): ()!`
+
+For a long-lived stream, wait for acknowledged bytes before queuing the next
+chunk. `writeAll` copies at most one receive-window-sized chunk at a time and
+returns after the peer acknowledges the data. It leaves the send side open.
+Use one writer per stream; mixing this operation with queue-only `write` does
+not bound bytes already queued by `write`.
+
+### `streamAbort(s: Stream, code: int)`
+
+Abandons both stream directions with RESET_STREAM and STOP_SENDING. Command sends observe connection completion, including a full command queue after actor exit. The live actor admits these commands in FIFO order; receive-credit discard uses the existing completion-aware notification. This waits for queue admission, not peer acknowledgment. Legacy `reset` and `stopSending` keep their existing individual contracts.
+
+### `streamWriteUntil(s: Stream, data: []byte, wake: chan<int>): ()!`
+
+The wake-aware form of `writeAll`. A value on `wake` fails with `Woken`;
+already queued data stays queued. Reset the stream to abandon it before
+starting another write. Reset and connection close also fail a parked writer.
+
+Send a preface, then a cancellable message without sending FIN:
+
+```bit
+import { Stream, streamWriteUntil, streamAbort, Woken } from "std/quic"
+
+fn sendMessage(s: Stream, message: []byte, wake: chan<int>): ()! {
+  s.writeAll([]byte("ready\n"))?
+  streamWriteUntil(s, message, wake) catch e {
+    let (_, woken) = e.(Woken)
+    if (woken) {
+      streamAbort(s, 1)
+    }
+    fail e
+  }
+}
+```
+
+The peer can reply while the stream remains open. Call `finish` only when no
+more messages will be sent.
 
 ### `Stream.finish(): ()!`
 
