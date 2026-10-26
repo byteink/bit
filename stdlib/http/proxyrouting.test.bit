@@ -1,0 +1,465 @@
+import { x509Parse as routingParseCert } from "std/crypto"
+
+fn routingMode(): string {
+  match (lookupEnv("BIT_PROXY_CONTROL")) {
+    Some(mode) => return mode
+    None => return ""
+  }
+}
+
+test "proxy-only headers cannot reach a destination (#8743)" {
+  let block = "X-Draft: yes\r\npRoXy-AuThOrIzAtIoN: Basic caller\r\n"
+  let extras = newRequestExtras(defaultClientConfig(), block, "")
+  assert(header(extras.block, "proxy-authorization") == "")
+  let c = Client()
+  defer c.close()
+  assert(header(c.extrasWith(block).block, "proxy-authorization") == "")
+  let u = Url{ host = "origin.example", port = 443, path = "/draft", https = true }
+  let (target, clean) = proxyRequestParts(u, block) catch e {
+    panic(e.message())
+  }
+  assert(target == "/draft" && header(clean, "proxy-authorization") == "")
+  assert(header(clean, "x-draft") == "yes")
+}
+
+fn routingForward(conn: Conn, count: int, location: string): string! {
+  assert(count > 0 && count <= 2)
+  let s = netStream{ conn = conn }
+  let seen = Builder()
+  for (let i = 0; i < count; i = i + 1) {
+    let head = proxyReadConnectHead(s)?
+    seen.write(head + "\r\n\r\n")
+    let length = atoi(header(head, "content-length"))
+    if (length > 0) {
+      assert(length == 5, "unexpected request body length")
+      let body = readContentLengthBody(s, "", length)?
+      assert(body == "abcde", "proxy did not receive streamed request bytes")
+    }
+    let reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+    if (len(location) > 0) {
+      reply = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: ${location}\r\n"
+    }
+    if (count == 1) {
+      reply = reply + "Connection: close\r\n"
+    }
+    reply = reply + "\r\n"
+    if (len(location) == 0) {
+      reply = reply + "ok"
+    }
+    s.writeStr(reply)?
+  }
+  return seen.toString()
+}
+
+fn routingForwardJob(l: Listener, count: int, location: string, out: chan<string>) {
+  let conn = l.accept() catch e {
+    out <- "ERROR: ${e.message()}"
+    return
+  }
+  defer conn.close()
+  conn.setDeadline(monotonic().ns + 4 * Second)
+  let seen = routingForward(conn, count, location) catch e {
+    out <- "ERROR: ${e.message()}"
+    return
+  }
+  conn.close()
+  out <- seen
+}
+
+fn routingCall(mode: string, url: string, c: Client): Response! {
+  if (mode == "package") {
+    return get(url)?
+  }
+  if (mode == "timeout") {
+    return getTimeout(url, 3000)?
+  }
+  if (mode == "reader") {
+    let res = c.send(ClientRequest{ url = url, timeoutMs = 3000 }, true)?
+    let reader = readerOf(res)?
+    defer reader.close()
+    assert(drain(reader, 2)? == "ok")
+    return res
+  }
+  if (mode == "download") {
+    let sink = capturingSink{ parts = []string(0) }
+    let res = getStreaming(url, []Header(0), sinkInto(sink), 100, 3000)?
+    assert(joinParts(sink) == "ok")
+    return res
+  }
+  if (mode == "upload") {
+    let body = StreamBody{ source = patternSource(5, 5), length = Option.Some(5) }
+    return requestWithStreamingBody("PUT", url, []Header(0), body, 3000)?
+  }
+  return c.getTimeout(url, 3000)?
+}
+
+fn routingProxyListener(https: bool): Listener! {
+  let p = proxyHttpEndpoint(Url{ host = "127.0.0.2", https = https })?
+  return listen(p.url.host, p.url.port)?
+}
+
+fn routingHttpControl(mode: string): ()! {
+  let l = routingProxyListener(false)?
+  defer l.close()
+  let out = chan<string>(1)
+  let count = mode == "pool" ? 2 : 1
+  spawn routingForwardJob(l, count, "", out)
+  let c = Client()
+  defer c.close()
+  c.setHeader("Proxy-Authorization", "Basic caller")?
+  let url = "http://127.0.0.2:1/draft?published=no"
+  let res = routingCall(mode, url, c)?
+  assert(res.status == 200)
+  if (count == 2) {
+    let second = c.getTimeout(url, 3000)?
+    assert(second.body == "ok")
+  }
+  c.close()
+  let seen = <- out
+  assert(hasPrefix(seen, mode == "upload" ? "PUT http://" : "GET http://"), seen)
+  assert(indexOf(seen, "http://127.0.0.2:1/draft?published=no HTTP/1.1") >= 0, seen)
+  assert(header(seen, "host") == "127.0.0.2:1", seen)
+  assert(header(seen, "proxy-authorization") == "Basic dXNlcjpwYXNz", seen)
+  let u = parseUrl(url)?
+  let key = poolKey(u, c.extrasWith(""))
+  assert(indexOf(key, "#proxy=") > 0 && indexOf(key, "user:pass") < 0)
+}
+
+fn routingDirectJob(l: Listener, out: chan<string>) {
+  let c = l.accept() catch e {
+    out <- "ERROR: ${e.message()}"
+    return
+  }
+  defer c.close()
+  c.setDeadline(monotonic().ns + 4 * Second)
+  let head = proxyReadConnectHead(netStream{ conn = c }) catch e {
+    out <- "ERROR: ${e.message()}"
+    return
+  }
+  c.writeDeadline("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok") catch e {
+    out <- "ERROR: ${e.message()}"
+    return
+  }
+  c.close()
+  out <- head
+}
+
+fn routingRedirectControl(): ()! {
+  let origin = listen("127.0.0.1", 0)?
+  defer origin.close()
+  let direct = chan<string>(1)
+  spawn routingDirectJob(origin, direct)
+  let destination = "http://127.0.0.1:${origin.port()?}/next"
+  let l = routingProxyListener(false)?
+  defer l.close()
+  let forwarded = chan<string>(1)
+  spawn routingForwardJob(l, 1, destination, forwarded)
+  let res = getTimeout("http://127.0.0.2:1/start", 3000)?
+  assert(res.body == "ok")
+  assert(hasPrefix(<- forwarded, "GET http://127.0.0.2:1/start HTTP/1.1"))
+  let head = <- direct
+  assert(hasPrefix(head, "GET /next HTTP/1.1"), head)
+  assert(header(head, "proxy-authorization") == "", head)
+}
+
+fn routingPump(a: Conn, b: Conn, done: chan<bool>) {
+  for (let i = 0; i < 256; i = i + 1) {
+    let bytes = a.readDeadline(4096) catch _ {
+      break
+    }
+    if (len(bytes) == 0) {
+      break
+    }
+    b.writeDeadline(bytes) catch _ {
+      break
+    }
+  }
+  a.shutdown()
+  b.shutdown()
+  done <- true
+}
+
+fn routingTunnelJob(l: Listener, originPort: int, out: chan<string>) {
+  let c = l.accept() catch e {
+    out <- "ERROR: ${e.message()}"
+    return
+  }
+  defer c.close()
+  c.setDeadline(monotonic().ns + 4 * Second)
+  let head = proxyReadConnectHead(netStream{ conn = c }) catch e {
+    out <- "ERROR: ${e.message()}"
+    return
+  }
+  let upstream = dialDeadline("127.0.0.1", originPort, monotonic().ns + 4 * Second) catch e {
+    out <- "ERROR: ${e.message()}"
+    return
+  }
+  defer upstream.close()
+  c.writeDeadline("HTTP/1.1 200 Connection Established\r\n\r\n") catch e {
+    out <- "ERROR: ${e.message()}"
+    return
+  }
+  let done = chan<bool>(2)
+  spawn routingPump(c, upstream, done)
+  routingPump(upstream, c, done)
+  let _ = <- done
+  let _ = <- done
+  upstream.close()
+  c.close()
+  out <- head
+}
+
+fn routingTlsHandler(req: Request): Response {
+  assert(header(req.headers, "proxy-authorization") == "", "proxy credential reached origin")
+  return ok("verified")
+}
+
+fn routingServeTls(ts: TlsServer) {
+  serveTlsServerOn(ts, routingTlsHandler) catch _ {
+    return
+  }
+}
+
+fn routingStopTls(ts: TlsServer) {
+  ts.shutdown(2000) catch e {
+    panic(e.message())
+  }
+}
+
+fn routingStartTls(): TlsServer! {
+  let ts = tlsServe(
+    "127.0.0.1",
+    0,
+    tls5916Pem("CERTIFICATE", routingIpHex),
+    tls5916Pem("PRIVATE KEY", routingKeyHex),
+  )?
+  spawn routingServeTls(ts)
+  return ts
+}
+
+fn routingVerifiedConfig(): TlsConfig! {
+  let root = routingParseCert(decodeHex(routingCaHex)?)?
+  return TlsConfig(TlsTrustStore{ roots = [root] }, nowUnix = 1800000000, alpn = ["http/1.1"])
+}
+
+fn routingDirectTlsControl(): ()! {
+  let ts = routingStartTls()?
+  defer routingStopTls(ts)
+  let c = Client(tls = routingVerifiedConfig()?)
+  defer c.close()
+  let url = "https://127.0.0.1:${ts.port()?}/draft"
+  assert(!proxyActive(parseUrl(url)?), "empty lowercase HTTPS proxy did not disable uppercase")
+  let res = c.getTimeout(url, 3000)?
+  assert(res.body == "verified")
+}
+
+fn routingTlsBody(mode: string, url: string, c: Client): string! {
+  if (mode == "tls-reader") {
+    let res = c.send(ClientRequest{ url = url, timeoutMs = 3000 }, true)?
+    let reader = readerOf(res)?
+    defer reader.close()
+    return drain(reader, 3)?
+  }
+  let res = c.getTimeout(url, 3000)?
+  return res.body
+}
+
+fn routingTlsControl(mode: string): ()! {
+  let ts = routingStartTls()?
+  defer routingStopTls(ts)
+  let l = routingProxyListener(true)?
+  defer l.close()
+  let out = chan<string>(1)
+  let port = ts.port()?
+  spawn routingTunnelJob(l, port, out)
+  let root = routingParseCert(decodeHex(routingCaHex)?)?
+  let roots = TlsTrustStore{ roots = [root] }
+  if (mode == "wrong-root") {
+    roots = emptyTrustStore()
+  }
+  let cfg = TlsConfig(roots, nowUnix = 1800000000, alpn = [mode == "h2" ? "h2" : "http/1.1"])
+  if (mode == "wrong-name") {
+    cfg.serverName = "inkwell.invalid"
+  }
+  let c = Client(tls = cfg)
+  defer c.close()
+  c.setHeader("Proxy-Authorization", "Basic caller")?
+  c.h3Ports["127.0.0.1:${port}"] = 1
+  let body = routingTlsBody(mode, "https://127.0.0.1:${port}/draft", c) catch e {
+    c.close()
+    assert(mode == "wrong-root" || mode == "wrong-name", e.message())
+    let expected = mode == "wrong-root" ? "unable to build chain to a trusted root" : "certificate is not valid for hostname inkwell.invalid"
+    assert(indexOf(e.message(), expected) >= 0, e.message())
+    let head = <- out
+    assert(hasPrefix(head, "CONNECT 127.0.0.1:${port} HTTP/1.1"), head)
+    return
+  }
+  assert(mode != "wrong-root" && mode != "wrong-name", "untrusted destination accepted")
+  assert(body == "verified")
+  c.close()
+  let head = <- out
+  assert(hasPrefix(head, "CONNECT 127.0.0.1:${port} HTTP/1.1"), head)
+  assert(header(head, "proxy-authorization") == "Basic dXNlcjpwYXNz", head)
+}
+
+fn routingExplicitH3(): ()! {
+  let c = Client()
+  defer c.close()
+  let _ = c.getTimeout("https+h3://127.0.0.2:1/draft", 3000) catch e {
+    assert(indexOf(e.message(), "UDP proxy transport") >= 0, e.message())
+    return
+  }
+  assert(false, "explicit HTTP/3 bypassed its proxy")
+}
+
+fn routingStallJob(l: Listener, ready: chan<string>, release: chan<bool>, done: chan<bool>) {
+  let c = l.accept() catch e {
+    ready <- "ERROR: ${e.message()}"
+    return
+  }
+  defer c.close()
+  c.setDeadline(monotonic().ns + 4 * Second)
+  let head = proxyReadConnectHead(netStream{ conn = c }) catch e {
+    ready <- "ERROR: ${e.message()}"
+    return
+  }
+  ready <- head
+  let _ = <- release
+  c.close()
+  done <- true
+}
+
+fn routingIsTimeout(e: error): bool {
+  let (_, bare) = e.(TimeoutError)
+  if (bare) {
+    return true
+  }
+  let (r, wrapped) = e.(RequestError)
+  if (!wrapped) {
+    return false
+  }
+  let (_, inner) = r.cause.(TimeoutError)
+  return inner
+}
+
+fn routingBlockedCall(c: Client, req: ClientRequest, cancel: bool, result: chan<bool>) {
+  let res = c.send(req, true) catch e {
+    result <- cancel ? isCancelled(e) : routingIsTimeout(e)
+    return
+  }
+  match (res.reader) {
+    Some(reader) => { reader.close() }
+    None => {}
+  }
+  result <- false
+}
+
+fn routingBlockedControl(mode: string): ()! {
+  let l = routingProxyListener(true)?
+  defer l.close()
+  let ready = chan<string>(1)
+  let release = chan<bool>(1)
+  let done = chan<bool>(1)
+  spawn routingStallJob(l, ready, release, done)
+  let c = Client()
+  defer c.close()
+  let tok = Cancel()
+  let req = ClientRequest{ url = "https://127.0.0.2:1/draft", timeoutMs = 1000 }
+  if (mode == "cancel") {
+    req.timeoutMs = 3000
+    req.cancel = Option.Some(tok)
+  }
+  let result = chan<bool>(1)
+  spawn routingBlockedCall(c, req, mode == "cancel", result)
+  let head = <- ready
+  assert(hasPrefix(head, "CONNECT 127.0.0.2:1 HTTP/1.1"), head)
+  let at = AtomicI64(0)
+  if (mode == "cancel") {
+    at.store(monotonic().ns)
+    tok.cancel()
+  }
+  let classified = <- result
+  if (mode == "cancel") {
+    assertWithin(at, "proxy CONNECT cancellation")
+  }
+  release <- true
+  let _ = <- done
+  assert(classified, "CONNECT did not preserve its cancellation/deadline cause")
+}
+
+fn routingDirectControl(): ()! {
+  let origin = listen("127.0.0.1", 0)?
+  defer origin.close()
+  let out = chan<string>(1)
+  spawn routingDirectJob(origin, out)
+  let url = "http://127.0.0.1:${origin.port()?}/draft"
+  assert(!proxyActive(parseUrl(url)?), "direct control unexpectedly selected a proxy")
+  let res = getTimeout(url, 3000)?
+  assert(res.body == "ok")
+  let head = <- out
+  assert(hasPrefix(head, "GET /draft HTTP/1.1"), head)
+  assert(header(head, "proxy-authorization") == "", head)
+}
+
+fn routingUnsupportedTlsProxy(): ()! {
+  let _ = getTimeout("http://127.0.0.2:1/draft", 3000) catch e {
+    assert(indexOf(e.message(), "TLS proxy transport is not available") >= 0, e.message())
+    return
+  }
+  assert(false, "TLS proxy endpoint silently dialed origin")
+}
+
+fn routingControl(mode: string): ()! {
+  if (mode == "tls-direct") {
+    routingDirectTlsControl()?
+    return
+  }
+  if (mode == "direct") {
+    routingDirectControl()?
+    return
+  }
+  if (mode == "https-proxy") {
+    routingUnsupportedTlsProxy()?
+    return
+  }
+  routingRoutedControl(mode)?
+}
+
+fn routingRoutedControl(mode: string): ()! {
+  if (mode == "cancel" || mode == "deadline") {
+    routingBlockedControl(mode)?
+    return
+  }
+  if (mode == "redirect") {
+    routingRedirectControl()?
+    return
+  }
+  if (mode == "tls" ||
+    mode == "h2" ||
+    mode == "tls-reader" ||
+    mode == "wrong-root" ||
+    mode == "wrong-name") {
+    routingTlsControl(mode)?
+    return
+  }
+  if (mode == "explicit-h3") {
+    routingExplicitH3()?
+    return
+  }
+  routingHttpControl(mode)?
+}
+
+test "public proxy subprocess control (#8743)" {
+  let mode = routingMode()
+  if (len(mode) == 0) {
+    return
+  }
+  routingControl(mode) catch e {
+    panic(e.message())
+  }
+}
+
+// Fixed test CA keeps destination chain and IP identity verification enabled.
+const routingCaHex: string = "308201773082011ca00302010202143705d242de6585aed882a6cb81c7334589513413300a06082a8648ce3d04030230193117301506035504030c0e4269742049502054657374204341301e170d3236313030363032303230365a170d3336313030333032303230365a30193117301506035504030c0e42697420495020546573742043413059301306072a8648ce3d020106082a8648ce3d03010703420004bdc18cc2bcfd3337447e3ba737bccc9e7adcb963b140807da6e4a9b0d81697cc8dd8891fac7aab81b52f5e794db257ce92f061f8e158bf793e304d1c3d07d727a3423040301d0603551d0e04160414a94cb239de212a1097e501ecc37b4cb4408461c0300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020204300a06082a8648ce3d0403020349003046022100f4ad18805334d02c03dbd5123e62c0e0d33d0978d3431e7cd5b9a497bb58b62f022100dc9bd8c5ebbde47d1f456f7339fc8189d154217e513d9f84808f40fa71f2fddb"
+const routingIpHex: string = "3082024b308201f2a00302010202143870fbdd83f1887a753eb75113bfc57c36e42ddb300a06082a8648ce3d04030230193117301506035504030c0e4269742049502054657374204341301e170d3236313030363032303230375a170d3336313030333032303230375a30143112301006035504030c093132372e302e302e3130820122300d06092a864886f70d01010105000382010f003082010a0282010100af6616e6fd76d391e2f46d4fb9662e9d6daeec7b4f8bb01a46db84dbf4af23450692f3ec8f7a5ffb31e85020b1ade2493c31d712686df0c70731978e0640beffccdbe75b6a7a69e317efb7dc64bbe26f93a18b6cdbcd4287b4b05a701b6b5a4e26e9dfda6bbad4b66110ba6e33cd2e573c7e844da9957ad81c884103abab509851cc173ec51b7054e4484fe2b10be97fbdda2a56b37890bf8e65c6d7639c45bd2306f7ec286a39a8e919a4e57d74d1e57bd8a451049664d5cb43872a2ad574021540dc2d09732375f4d396d6366a761fd4c5a3d799e87b1e71368468294d02c88b0cc191f59ba0b449efcde7427a2095d637ee831316bbdda1d476c8c5ac78f70203010001a352305030210603551d11041a301887047f00000187100000000000000000000000000000000130090603551d1304023000300b0603551d0f04040302078030130603551d25040c300a06082b06010505070301300a06082a8648ce3d040302034700304402202d293aad34ad950934b5063e15135f69e5ce0a8ebe6a963b18ac8ba6c4f7d67102202fa866d50620217b1c35bce6481ee960d4e4ceffabc1b9847eaaa93ca12bbae0"
+const routingKeyHex: string = "308204bd020100300d06092a864886f70d0101010500048204a7308204a30201000282010100af6616e6fd76d391e2f46d4fb9662e9d6daeec7b4f8bb01a46db84dbf4af23450692f3ec8f7a5ffb31e85020b1ade2493c31d712686df0c70731978e0640beffccdbe75b6a7a69e317efb7dc64bbe26f93a18b6cdbcd4287b4b05a701b6b5a4e26e9dfda6bbad4b66110ba6e33cd2e573c7e844da9957ad81c884103abab509851cc173ec51b7054e4484fe2b10be97fbdda2a56b37890bf8e65c6d7639c45bd2306f7ec286a39a8e919a4e57d74d1e57bd8a451049664d5cb43872a2ad574021540dc2d09732375f4d396d6366a761fd4c5a3d799e87b1e71368468294d02c88b0cc191f59ba0b449efcde7427a2095d637ee831316bbdda1d476c8c5ac78f70203010001028201000a10d0c5a6cc17ee2a591ea0d1a1f490e2478498bb02e83349d7b5332e4292c29652fe9e97c94d12cc5569abc6a694f2e0fa773e3e31f8fc63044c8f40fa9c3b6fd53adcbb2a95430c0f9cbc90275c224d159b3bbf0d7380f8349aac0e56c5d2f056c19af64dbd814de6b8dc342ad53afa64c450f4a7786a4890e53241bace202753bb22b52737c084bd79eb5d41b28edaf65b1d385571a6e1b5b97227334bade9ac480bdfeaf668a95ba8721c797018829b9f2eb02084635adc6012ecb12d4dc0da7145f557a67051bea4e232857eeb9c5c244f1ac63df537551b9a0f58bec3055a31dda07366142b2a9f4997f0ffd12c8592bfc335bcb3934135742797ada102818100db35d94625799880e59ac4e0e1a38995eea49f587029a0cf184d6aae4e63a9b22ed359230e0c0854bde74dd9344bc9cd9543b0edb12718b44fa28e3346d1af12e861f8163f52c62c2f7333837f98793e01e4a60664b82806f8b9e666c3568be894651b7c7140cc50a10a6248b996d9990b3f6e387527e3bf33ebeaee8f2778f102818100ccd5ebda3efb6cfb199091d31aaf846d7bd00cc1fe3e4306e61799c4fafc1b2d820a412ecc2b8752afe7d1ecb5480807616f0d3b7c543d5e743a54f878decf2629a87f2fba6df9c6bac2b3b895374f3c66df95a86e11b67035d3bf58ccc1d7577b3c168afaa74d0891c4835c276020ed1d47eab9b47f49d66adc2d8e0af7d067028181009b05e2e90b998973266d246c50c60187e9a3bc18a4019c7ab89a0f26c3c3118034433cd76098bbcf8a1928e1c16d1382f2db53255551ebd3a039ba4ca2f9a8d13b4c05515e68e042e12f9c2f93adb598576866cd40af47875ea0c142cd43c85fab8a313cf92eb50f14442eab75ac2ba862def1c8b579874371a996942ce2e25102818010317534cab7dbb4ba1fa8b794ab7d7f9e43234f0ec7634b1f538c4f7b3c04f6030ac67e699ba356111bf5878e0944c1389dabe1210213dbecba53cf54d6e06f76e9a02c68c39af46ffd4671f831e82cb14149b688051474287d35ea523d9cc588b38660b452178feede273858d08ba9d31fc559ab0049190f579aae5905a04f028180679af81888a26e519287a71915abc1970a916248b36d23d00a3064b07fe2eaa94f3e7c4becebdac2e14489d8adc2304cc495c2507a60ac707fe8815104e58d0dff671318054e8b5793228b2a4f295558fe9ae2f689880280c76238b9482f56346877d768fc9e3bfa4e827e0504d3f3c1c762d6841e7fe1d39f0e3859d8a1e38d"

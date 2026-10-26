@@ -9,6 +9,36 @@ See the [HTTP overview and server reference](../http.md) and
 
 <!-- doctest: per-block -->
 
+## Send Inkwell requests through a proxy
+
+When Inkwell must reach another service through your network's HTTP proxy,
+set the environment before starting the program. Existing client calls,
+including streamed uploads and downloads, use the same settings.
+
+```text
+http_proxy=http://proxy.example:3128
+https_proxy=http://user:password@proxy.example:3128
+no_proxy=localhost,127.0.0.0/8,::1
+```
+
+An HTTP destination uses an absolute request target. An HTTPS destination
+uses CONNECT, then verifies the destination's TLS certificate with the
+client's configured roots and server name. Proxy URL credentials are sent
+only to the proxy; a caller's `Proxy-Authorization` header is never forwarded
+to a destination. Redirects select the route again for their new destination.
+
+Lowercase settings win when present, including an empty value that disables
+an uppercase fallback. `https_proxy` can fall back to `HTTPS_PROXY`, and
+`no_proxy` to `NO_PROXY`. Uppercase `HTTP_PROXY` is always ignored because
+CGI request headers can create it. `no_proxy` accepts exact hosts, domain
+suffixes at label boundaries, IP literals, CIDR ranges and a standalone `*`.
+
+A selected TCP proxy prevents a cached HTTP/3 advertisement from bypassing
+it. An explicit `https+h3://` request fails rather than opening a direct UDP
+connection. TLS connections to the proxy itself (`https://` proxy URLs)
+currently fail explicitly; they never cause a direct-origin fallback.
+Use `http://` for the proxy endpoint even when the destination is HTTPS.
+
 ## Clients
 
 ### `get(url: string): Response!`
