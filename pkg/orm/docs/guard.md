@@ -58,6 +58,10 @@ class OwnDrafts {
     return false
   }
 
+  export columnsInRules(actor: Actor, op: GuardOp, table: string): []string! {
+    return ["authorId"]
+  }
+
   export denied(actor: Actor, op: GuardOp, table: string): error {
     return newError("not allowed to change ${table}")
   }
@@ -106,6 +110,9 @@ class Author { export id: string }
   `Sql(fragment, args)`, a WHERE condition already numbered from
   `firstParam` with its arguments in order. `op` is a `GuardOp`: `Read`,
   `Create`, `Update` or `Delete`.
+- `columnsInRules(actor, op, table)` lists all model field names read by the
+  actor's applicable allow and deny rules, before simplification. Return each
+  name once. Rule introspection errors must fail closed.
 - `allows(actor, op, table, columns, values)` judges the column values of
   one create or update.
 - `denied(actor, op, table)` and `notFound(table)` build the errors the
