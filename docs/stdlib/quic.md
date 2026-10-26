@@ -230,7 +230,15 @@ starting another write. Reset and connection close also fail a parked writer.
 Send a preface, then a cancellable message without sending FIN:
 
 ```bit
-import { Stream, streamWriteUntil, streamTryAbort, Woken } from "std/quic"
+import {
+  Stream,
+  StreamChunk,
+  streamWriteUntil,
+  streamTryAbort,
+  streamReadBounded,
+  streamFinishBounded,
+  Woken,
+} from "std/quic"
 
 fn sendMessage(s: Stream, message: []byte, wake: chan<int>): ()! {
   s.writeAll([]byte("ready\n"))?
@@ -242,14 +250,33 @@ fn sendMessage(s: Stream, message: []byte, wake: chan<int>): ()! {
     fail e
   }
 }
+
+fn finishAfterReply(s: Stream, wake: chan<int>, deadlineNs: int): StreamChunk! {
+  let reply = streamReadBounded(s, wake, deadlineNs)?
+  streamFinishBounded(s, wake, deadlineNs) catch e {
+    if (!streamTryAbort(s, 1)) {
+      fail newError("${e.message()}; stream cleanup incomplete")
+    }
+    fail e
+  }
+  return reply
+}
 ```
 
 The peer can reply while the stream remains open. Call `finish` only when no
 more messages will be sent.
 
+### `streamReadBounded(s: Stream, wake: chan<int>, deadlineNs: int): StreamChunk!`
+
+Read one chunk with the existing `streamReadUntil` wake contract and an absolute monotonic deadline. Zero disables the deadline. A deadline or wake leaves unread chunks available for a later read. FIN and peer reset retain their separate flags. Each active wait owns at most one stoppable timer slot.
+
+### `streamFinishBounded(s: Stream, wake: chan<int>, deadlineNs: int): ()!`
+
+Like `streamFinishUntil`, with one absolute deadline covering command admission and the FIN acknowledgment. Connection exit, wake and expiry all end a full-queue admission wait. An interrupted FIN can already be queued; use `streamTryAbort` when abandoning it without another wait. The existing two-argument `streamReadUntil` and `streamFinishUntil` retain their signatures and use no deadline.
+
 ### `streamTryAbort(s: Stream, code: int): bool`
 
-Try to queue RESET, STOP_SENDING and receive-credit discard without waiting. Returns true only when all three were admitted; it does not wait for peer acknowledgement. A full queue or closed connection returns false, and earlier admitted commands remain queued. Use this form after cancellation when cleanup must not start another wait. The running example reports incomplete cleanup separately from the original write failure.
+Try to queue RESET, STOP_SENDING and receive-credit discard without waiting. Returns true only when all three were admitted; it does not wait for peer acknowledgement. A full queue or closed connection returns false, and earlier admitted commands remain queued. Use this form after a deadline or cancellation when cleanup must not start another wait. The running example reports incomplete cleanup separately from the original FIN failure.
 
 ### `Stream.finish(): ()!`
 

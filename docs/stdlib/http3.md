@@ -137,7 +137,7 @@ and checks authentication and browser origins before accepting a request.
 ```bit
 import {
   h3Accept, H3Conn, H3Request, H3Response, H3ServerRequest, H3Stream,
-  HeaderField, isExtendedConnect, H3CleanupIncomplete,
+  HeaderField, isExtendedConnect, H3Bound, H3CleanupIncomplete,
 } from "std/http3"
 import { UdpSocket } from "std/net"
 
@@ -187,22 +187,29 @@ fn acceptDraftFeed(conn: H3Conn, received: H3ServerRequest): H3Stream! {
   return received.acceptExtendedConnect()?
 }
 
-fn exchangeDraftChunk(stream: H3Stream, encodedFrame: string, wake: chan<int>): string! {
+fn exchangeDraftChunk(stream: H3Stream, encodedFrame: string, bound: H3Bound): string! {
   if (len(encodedFrame) == 0 || len(encodedFrame) > 4096) {
     fail newError("draft feed: chunk must contain 1 to 4096 bytes")
   }
-  stream.writeUntil(encodedFrame, wake) catch e {
+  stream.writeUntil(encodedFrame, bound.wake) catch e {
     let (incomplete, ok) = e.(H3CleanupIncomplete)
     if (ok) {
       fail newError("draft feed cleanup incomplete: ${incomplete.cause.message()}")
     }
     fail e
   }
-  let chunk = stream.read(4096) catch e {
-    stream.reset()
+  let chunk = stream.readUntil(4096, bound)?
+  return chunk
+}
+
+fn finishDraftFeedUntil(stream: H3Stream, bound: H3Bound): ()! {
+  stream.closeUntil(bound) catch e {
+    let (incomplete, ok) = e.(H3CleanupIncomplete)
+    if (ok) {
+      fail newError("draft feed cleanup incomplete: ${incomplete.cause.message()}")
+    }
     fail e
   }
-  return chunk
 }
 
 // Use this form only when the connection idle bound is the intended limit.
@@ -231,6 +238,8 @@ wire it into their WebSocket APIs. DATA writes now wait for QUIC acknowledgments
 before retaining another frame. Supply a capacity-one `wake` channel to
 `writeUntil` and signal it from your deadline or cancellation path. Cancellation
 aborts this tunnel because an interrupted DATA frame cannot be resumed safely.
+The example passes one `H3Bound` to its read and final FIN wait. Use an absolute
+`monotonic().ns` deadline; the wake channel also cancels an active write.
 One reader and one writer may use a tunnel; application framing, message size
 limits and WebSocket close handshakes remain the caller's responsibility.
 
@@ -419,6 +428,10 @@ The DATA byte stream returned by `H3Conn.openTunnel` or `H3ServerRequest.acceptE
 
 Reads up to `n` bytes, preserving any remaining DATA for the next call. With positive `n`, an empty string marks peer FIN. A nonpositive `n` returns an empty string without reading. A chunk can contain part of an application frame.
 
+### `H3Stream.readUntil(n: int, bound: H3Bound): string!`
+
+Like `read`, with an absolute `monotonic().ns` deadline (zero disables it) and a capacity-one wake channel. A deadline or `Woken` stops this read without losing an incomplete DATA header, length varint or payload. Resume with a new bound, or call `reset` to abandon the tunnel. A later ordinary `read` clears the bound. Peer FIN remains an empty string; a peer reset remains an error. The bound belongs to this stream and never changes the connection timeout.
+
 ### `H3Stream.write(data: string): ()!`
 
 Writes DATA in payloads of at most 16384 bytes and waits for each frame to be acknowledged before the next frame is retained. It does not send FIN. The application supplies its own protocol framing. A write after local `close` or `reset` fails. `write` has no caller cancellation; the connection idle bound still applies.
@@ -432,6 +445,12 @@ If cleanup cannot be queued immediately, the failure is `H3CleanupIncomplete`. I
 ### `H3Stream.close(): ()!`
 
 Ends the local sending half with FIN and waits for queued bytes to be acknowledged. Calling it again does nothing. Reads remain available, and other request streams on the connection remain open.
+
+### `H3Stream.closeUntil(bound: H3Bound): ()!`
+
+Ends the local half and bounds both FIN command admission and its acknowledgment wait. A deadline or cancellation aborts only this tunnel. A wake reports `H3Aborted`; queued bytes may already have reached the peer. Other request streams remain usable. The running example uses this form when shutdown has a deadline.
+
+Cleanup after an interrupted FIN never waits for queue admission. If RESET, STOP_SENDING or receive-credit discard cannot be queued immediately, it fails with `H3CleanupIncomplete`; its `cause` retains the deadline error or `H3Aborted`. The local handle remains closed, and previously admitted cleanup commands remain queued. This reports incomplete cleanup rather than waiting beyond the requested bound or closing the connection.
 
 ### `H3Stream.reset()`
 
