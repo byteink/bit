@@ -137,7 +137,7 @@ and checks authentication and browser origins before accepting a request.
 ```bit
 import {
   h3Accept, H3Conn, H3Request, H3Response, H3ServerRequest, H3Stream,
-  HeaderField, isExtendedConnect,
+  HeaderField, isExtendedConnect, H3CleanupIncomplete,
 } from "std/http3"
 import { UdpSocket } from "std/net"
 
@@ -192,7 +192,10 @@ fn exchangeDraftChunk(stream: H3Stream, encodedFrame: string, wake: chan<int>): 
     fail newError("draft feed: chunk must contain 1 to 4096 bytes")
   }
   stream.writeUntil(encodedFrame, wake) catch e {
-    stream.reset()
+    let (incomplete, ok) = e.(H3CleanupIncomplete)
+    if (ok) {
+      fail newError("draft feed cleanup incomplete: ${incomplete.cause.message()}")
+    }
     fail e
   }
   let chunk = stream.read(4096) catch e {
@@ -422,7 +425,9 @@ Writes DATA in payloads of at most 16384 bytes and waits for each frame to be ac
 
 ### `H3Stream.writeUntil(data: string, wake: chan<int>): ()!`
 
-Like `write`, but a value on the capacity-one `wake` channel interrupts the write with `H3Aborted`. The running example uses this form for a deadline or cancellation. Any write error aborts both tunnel directions and closes the handle; queued bytes may already have reached the peer. Retry on a new tunnel, never within the partial DATA frame.
+Like `write`, but a value on the capacity-one `wake` channel interrupts the write with `H3Aborted`. The running example uses this form for a deadline or cancellation. Any write error closes the local writer and tries to abort both tunnel directions without waiting for command admission; queued bytes may already have reached the peer. Retry on a new tunnel, never within the partial DATA frame.
+
+If cleanup cannot be queued immediately, the failure is `H3CleanupIncomplete`. Its `cause` retains `H3Aborted` or the original transport error. Earlier admitted cleanup commands remain queued, and other streams remain open. Do not call the unbounded `reset` from this error path when cancellation must stay bounded; the example reports incomplete cleanup instead of starting another wait.
 
 ### `H3Stream.close(): ()!`
 
