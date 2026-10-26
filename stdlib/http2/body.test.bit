@@ -1,0 +1,303 @@
+// Incremental response framing and actor lifetime over real HTTP/2 peers.
+
+test "body stream delivers DATA before close and ignores the returned response" {
+  let next = chan<int>(1)
+  let finished = chan<string>(1)
+  let conn = btLoopback(defaultConfig(), (_req, s) => {
+    let body = s.openBodyStream(201) catch _ {
+      return Response(500, []byte(0))
+    }
+    body.write([]byte("first")) catch _ {
+      return Response(0, []byte(0))
+    }
+    <- next
+    body.write([]byte("second")) catch _ {
+      return Response(0, []byte(0))
+    }
+    body.close() catch _ {
+      return Response(0, []byte(0))
+    }
+    body.close() catch _ {
+      return Response(0, []byte(0))
+    }
+    body.write([]byte("late")) catch e {
+      finished <- e.message()
+      return Response(500, []byte("discarded"))
+    }
+    finished <- "write after close succeeded"
+    return Response(500, []byte("discarded"))
+  }) catch e {
+    assert(false, e.message())
+    return
+  }
+  defer conn.close()
+  let (response, stream) = conn.roundTripStream(Request("GET", "example.com", "/body")) catch e {
+    assert(false, e.message())
+    return
+  }
+  assert(response.status == 201, "opening headers were replaced")
+  let first = stream.read() catch e {
+    assert(false, e.message())
+    return
+  }
+  assert(string(first.data) == "first" && !first.eof, "body ended before explicit close")
+  next <- 1
+  let rest = ""
+  let ended = false
+  for (let i = 0; i < 4 && !ended; i = i + 1) {
+    let part = stream.read() catch e {
+      assert(false, e.message())
+      return
+    }
+    rest = rest + string(part.data)
+    ended = part.eof
+  }
+  assert(ended && rest == "second", "END_STREAM or incremental bytes differ")
+  assert(<- finished == "http2: response body is closed", "late write was accepted")
+}
+
+fn bsBigResponse(_req: Request, s: Stream): Response {
+  let body = s.openBodyStream(200) catch _ {
+    return Response(500, []byte(0))
+  }
+  body.write(btPattern(200000)) catch _ {
+    return Response(0, []byte(0))
+  }
+  body.close() catch _ {
+    return Response(0, []byte(0))
+  }
+  return Response(500, []byte("discarded"))
+}
+
+test "body stream crosses connection and stream windows without ending early" {
+  let cfg = defaultConfig()
+  cfg.streamBodies = true
+  let conn = btLoopbackCfg(cfg, defaultConfig(), bsBigResponse) catch e {
+    assert(false, e.message())
+    return
+  }
+  defer conn.close()
+  let (response, stream) = conn.roundTripStream(Request("GET", "example.com", "/big")) catch e {
+    assert(false, e.message())
+    return
+  }
+  assert(response.status == 200, "body response refused")
+  let received = []byte(0)
+  let ended = false
+  for (let i = 0; i < 32 && !ended; i = i + 1) {
+    let part = stream.read() catch e {
+      assert(false, e.message())
+      return
+    }
+    received = h2connAppendBytes(received, part.data)
+    ended = part.eof
+  }
+  assert(
+    ended && string(received) == string(btPattern(200000)),
+    "flow-controlled body was truncated",
+  )
+}
+
+test "body stream closes when its handler returns" {
+  let conn = btLoopback(defaultConfig(), (_req, s) => {
+    let body = s.openBodyStream(200) catch _ {
+      return Response(500, []byte(0))
+    }
+    body.write([]byte("streamed")) catch _ {
+      return Response(0, []byte(0))
+    }
+    return Response(500, []byte("discarded"))
+  }) catch e {
+    assert(false, e.message())
+    return
+  }
+  defer conn.close()
+  let response = conn.roundTrip(Request("GET", "example.com", "/body")) catch e {
+    assert(false, e.message())
+    return
+  }
+  assert(
+    response.status == 200 && string(response.body) == "streamed",
+    "handler return replaced body",
+  )
+}
+
+fn bsOpenCommand(status: int): h2connCmd {
+  return h2connCmd{
+    kind = h2cmdBodyOpen,
+    readCh = h2connDummyRead(),
+    request = h2connZeroRequest(),
+    response = Response(status, []byte(0)),
+    streamId = 1,
+    errorCode = 0,
+    replyCh = chan<h2connMsg>(1),
+  }
+}
+
+test "body stream opening headers leave response DATA open" {
+  let st = btState(false, 1048576)
+  let s = h2connNewStream(1, 65535, 65535, h2connDummyReply())
+  s.state = h2stHCRemote
+  s.recvEnded = true
+  st.streams[1] = s
+  st.activeStreams = 1
+  let cmd = bsOpenCommand(200)
+  h2connCmdBodyOpen(st, cmd)
+  assert((<- cmd.replyCh).ok, "response refused")
+  let wire = <- st.writeCh
+  let frame = readFrame(wire.data, maxMaxFrameSize) catch e {
+    assert(false, e.message())
+    return
+  }
+  let headers = decodeHeaders(frame) catch e {
+    assert(false, e.message())
+    return
+  }
+  assert(!headers.endStream, "opening HEADERS ended the streamed response")
+}
+
+test "body stream open is single-use and preserves request body budgets" {
+  let p = srNewPeer()
+  srServeStart(p, 1, "/body") catch e {
+    assert(false, e.message())
+    return
+  }
+  let cmd = bsOpenCommand(200)
+  h2connCmdBodyOpen(p.st, cmd)
+  assert((<- cmd.replyCh).ok, "ordinary response open was refused")
+  let (s, _) = p.st.streams[1]
+  assert(s.streaming && !s.tunnel, "ordinary request gained tunnel budget exemption")
+  h2connCmdBodyOpen(p.st, cmd)
+  assert(!(<- cmd.replyCh).ok, "duplicate response headers accepted")
+  h2connCmdEnd(p.st, cmd)
+  assert(len(p.st.tunnels) == 0, "close retained the actor hold")
+}
+
+test "body stream rejects bodyless statuses and fixed framing headers" {
+  for status of [100, 199, 204, 205, 304, 600] {
+    assert(h2connBodyHeaderError(Response(status, []byte(0))) != "", "invalid status accepted")
+  }
+  for name of ["content-length", "transfer-encoding"] {
+    let response = Response(200, []byte(0))
+    response.headers = [HeaderField{ name = name, value = "0", sensitive = false }]
+    assert(h2connBodyHeaderError(response) != "", "fixed body framing accepted")
+  }
+}
+
+test "body stream writes fail after reset and close releases the actor" {
+  let p = srNewPeer()
+  srServeStart(p, 1, "/body") catch e {
+    assert(false, e.message())
+    return
+  }
+  let cmd = bsOpenCommand(200)
+  h2connCmdBodyOpen(p.st, cmd)
+  assert((<- cmd.replyCh).ok, "response refused")
+  h2connStreamErrorMsg(p.st, 1, errorCancel, "test reset")
+  cmd.kind = h2cmdWrite
+  cmd.response = Response(0, []byte("late"))
+  h2connCmdWrite(p.st, cmd)
+  assert(!(<- cmd.replyCh).ok, "write after reset succeeded")
+  cmd.kind = h2cmdBodyClose
+  h2connHandleCmd(p.st, cmd)
+  assert((<- cmd.replyCh).ok && len(p.st.tunnels) == 0, "reset body retained its actor")
+}
+
+fn bsRequestWhileClosing(conn: Conn, finished: chan<int>) {
+  conn.roundTrip(Request("GET", "example.com", "/closed")) catch _ {
+    finished <- 1
+    return
+  }
+  finished <- 0
+}
+
+fn bsServeClosing(
+  transport: Transport, entered: chan<int>, release: chan<int>,
+  finished: chan<string>, stopped: chan<int>,
+) {
+  let conn = accept(transport, defaultConfig(), 0) catch e {
+    entered <- 0
+    finished <- e.message()
+    stopped <- 1
+    return
+  }
+  conn.serve((_req, s) => {
+    entered <- 1
+    <- release
+    s.openBodyStream(200) catch e {
+      finished <- e.message()
+      return Response(0, []byte(0))
+    }
+    finished <- "body open succeeded after actor shutdown"
+    return Response(0, []byte(0))
+  }) catch e {
+    finished <- e.message()
+  }
+  conn.waitReaderDone()
+  conn.waitWriterDone()
+  stopped <- 1
+}
+
+test "body stream open fails after actor shutdown before handler reply" {
+  let entered = chan<int>(1)
+  let release = chan<int>(1)
+  let finished = chan<string>(1)
+  let stopped = chan<int>(1)
+  let requestDone = chan<int>(1)
+  let toServer = chan<btChunk>(1024)
+  let toClient = chan<btChunk>(1024)
+  let clientEnd = btEnd{
+    incoming = toClient, outgoing = toServer, leftover = []byte(0), closed = false,
+  }
+  let serverEnd = btEnd{
+    incoming = toServer, outgoing = toClient, leftover = []byte(0), closed = false,
+  }
+  let ct = Transport(btRead(clientEnd), btWrite(clientEnd), btShutdown(clientEnd))
+  let st = Transport(btRead(serverEnd), btWrite(serverEnd), btShutdown(serverEnd))
+  spawn bsServeClosing(st, entered, release, finished, stopped)
+  let client = connect(ct, defaultConfig(), 0) catch e {
+    assert(false, e.message())
+    return
+  }
+  spawn bsRequestWhileClosing(client, requestDone)
+  assert(<- entered == 1, "GET handler was not entered")
+  ct.shutdown()
+  <- stopped
+  println("body stream actor shutdown reached before open")
+  release <- 1
+  assert(<- finished == "http2: response stream is closed", "closed actor did not refuse body open")
+  assert(<- requestDone == 1, "closed GET unexpectedly completed")
+  client.waitReaderDone()
+  client.waitWriterDone()
+}
+
+test "body stream closed actor releases a full command queue and its handler" {
+  let commands = chan<h2connCmd>(1)
+  commands <- bsOpenCommand(200)
+  let done = chan<int>(0)
+  let s = Stream{ cmdCh = commands, loopDone = done, id = 1 }
+  close(done)
+  h2connBodyCommand(s, h2cmdBodyOpen, Response(200, []byte(0))) catch e {
+    assert(e.message() == "http2: response stream is closed", "wrong closed-actor error")
+    h2connHandle(s, Request("GET", "example.com", "/closed"), false, (_req, _s) => {
+      return Response(0, []byte(0))
+    })
+    return
+  }
+  assert(false, "body command reached a closed actor")
+}
+
+test "body stream preserves a real reply published before actor shutdown" {
+  let done = chan<int>(0)
+  let s = Stream{ cmdCh = chan<h2connCmd>(1), loopDone = done, id = 1 }
+  let replies = chan<h2connMsg>(1)
+  replies <- h2connMsg{
+    ok = true, response = h2connZeroResponse(), errMsg = "", streamId = 1, hasBody = false,
+  }
+  close(done)
+  let reply = h2connBodyReply(s, replies) catch e {
+    assert(false, e.message())
+    return
+  }
+  assert(reply.ok && reply.streamId == 1, "published reply was replaced by shutdown")
+}
