@@ -143,7 +143,7 @@ fn mountEditorial(app: App) {
 
 The existing `requireAdmin` and owner-or-admin checks retain their behavior.
 Role changes take effect after a new login; this change does not add live role
-refresh or TOTP.
+refresh. Authenticator enrollment is described below.
 
 ## Inspect article and comment changes
 
@@ -185,3 +185,33 @@ deletion so that existing history survives.
 Redis cache invalidation follows the database commit. A cache error can therefore
 return an error after the mutation and its audit row have committed. Login and
 cover-image changes are outside this audit example.
+
+## Add an authenticator before the next sign-in
+
+A signed-in user sends their username and password to
+`POST /v1/auth/2fa/enroll`. The JSON response contains `secret` and `uri`;
+import the `otpauth://` URI into an authenticator, then send its `code` to
+`POST /v1/auth/2fa/verify` using the cookie returned by enrollment. The account
+requires a second factor only after that confirmation succeeds.
+
+Both `/v1/auth/login` and `/v1/auth/token` then require the authenticator
+code in `X-TOTP-Code`, with the usual `username` and `password` JSON body.
+The password strategy keeps its strict credentials decoder. Each accepted code
+can be used once. For example:
+
+```sh
+curl --fail-with-body http://127.0.0.1:8080/v1/auth/login \
+  -H 'Content-Type: application/json' -H 'X-TOTP-Code: 123456' \
+  -d '{"username":"ada","password":"your password"}'
+```
+
+Use a fresh authenticator code in place of `123456`. Attempts are
+throttled; missing, invalid and reused codes issue neither an app session nor
+a token. Google sign-in refuses accounts with TOTP enabled: use the password
+and authenticator route. Confirmation revokes existing refresh tokens; already
+issued short-lived access tokens keep their existing expiry.
+
+Enrollment cannot replace a pending or enabled secret. Account recovery and
+authenticator removal are separate future work. Store the secret as sensitive
+account data, and serve provisioning only over HTTPS; the response is marked
+`Cache-Control: no-store`.
