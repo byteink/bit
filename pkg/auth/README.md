@@ -175,14 +175,16 @@ protected route that is not itself doing the authenticating just reads
   them. A trusted enrollment route uses `CompleteOptions.enrollment`; see
   [Choose the first login's second step](docs/mfa.md#choose-the-first-logins-second-step).
 - `WebAuthn`, `RelyingParty`, `UserEntity`, `WebAuthnOptions`, `UserVerification`,
-  `ResidentKey`, `Attachment`, `AttestationConveyance`, `Credential`,
+  `ResidentKey`, `Attachment`, `AttestationConveyance`, `AttestationPolicy`,
+  `AttestationTrust`, `AttestationResult`, `Credential`,
   `CredentialStore`, `MemoryCredentialStore` - passkey registration: `WebAuthn(rp,
   store, opts)` fails at construction for an RP id no origin matches, a non-https
   origin (localhost excepted) or an algorithm nothing can verify;
   `beginRegistration` returns the creation options and keeps a single-use 5 minute
   challenge in the session, `finishRegistration` spends it first, then checks the
   client data, `rpIdHash`, flags, algorithm and credential id, accepts attestation
-  `none` and stores the `Credential`; see
+  `none` and `packed` by policy, and stores the `Credential` with its attestation
+  result. `AttestationTrust.Verify` requires configured roots; see
   [Let an author sign in with a passkey](docs/passkeys.md), including the
   [complete browser page](docs/passkeys.md#the-browser-page) for registration.
 - `WebAuthnStrategy`, `PasskeyLoginOptions`, `CloneAction` - passkey login, a

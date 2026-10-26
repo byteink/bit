@@ -1,0 +1,186 @@
+// W3C WebAuthn Level 3 section 8.2; trust is an explicit relying-party policy.
+import {
+  x509VerifyPath, x509KeyRSA, x509KeyECDSA, x509KeyEd25519,
+  rsaParsePkcs1PublicKey, ecdsaPublicKey, nistecP256, nistecP384,
+  bigintBitLen, bigintToBytes,
+} from "std/crypto"
+
+export enum AttestationTrust {
+  Ignore,
+  Verify,
+}
+
+export class AttestationPolicy {
+  export trust: AttestationTrust = AttestationTrust.Ignore,
+  export roots: []Certificate = [],
+  export allowSelf: bool = true,
+  export formats: []string = ["none", "packed"],
+}
+
+export class AttestationResult {
+  export fmt: string = "none",
+  export kind: string = "none",
+  export trusted: bool = false,
+  export chain: []Certificate = [],
+}
+
+fn checkAttestationPolicy(policy: AttestationPolicy): ()! {
+  if (policy.trust == AttestationTrust.Verify && len(policy.roots) == 0) {
+    fail newError("auth: webauthn: attestation trust Verify requires roots")
+  }
+}
+
+fn waAttestationAllowed(formats: []string, fmt: string): bool {
+  for allowed of formats {
+    if (allowed == fmt) {
+      return true
+    }
+  }
+  return false
+}
+
+fn verifyAttestation(
+  obj: AttestationObject,
+  clientDataHash: []byte,
+  policy: AttestationPolicy,
+): AttestationResult! {
+  checkAttestationPolicy(policy)?
+  if (!waAttestationAllowed(policy.formats, obj.fmt)) {
+    fail newError("auth: webauthn: attestation format '${obj.fmt}' is not allowed")
+  }
+  if (obj.fmt == "none") {
+    checkNoneStatement(obj)?
+    return AttestationResult{}
+  }
+  if (obj.fmt == "packed") {
+    return waPackedAttestation(obj, clientDataHash, policy)?
+  }
+  fail newError("auth: webauthn: attestation format '${obj.fmt}' is not supported")
+}
+
+fn waPackedEntries(stmt: Cbor): []CborEntry! {
+  match (stmt) {
+    Map(entries) => {
+      if (len(entries) == 2 || len(entries) == 3) {
+        return entries
+      }
+    }
+    _ => {}
+  }
+  fail newError("auth: webauthn: invalid packed attestation statement")
+}
+
+fn waPackedCertificates(value: Cbor, aaguid: []byte): []Certificate! {
+  match (value) {
+    Array(items) => {
+      if (len(items) == 0 || len(items) > 8) {
+        fail newError("auth: webauthn: packed x5c needs 1 to 8 certificates")
+      }
+      let chain = []Certificate(0)
+      for item of items {
+        chain = append(chain, waPackedCertificate(item, aaguid, len(chain) == 0)?)
+      }
+      return chain
+    }
+    _ => fail newError("auth: webauthn: packed x5c must be an array")
+  }
+}
+
+fn waPackedCertificate(value: Cbor, aaguid: []byte, leaf: bool): Certificate! {
+  match (value) {
+    Bytes(der) => {
+      if (len(der) > 65536) {
+        fail newError("auth: webauthn: packed certificate exceeds 65536 bytes")
+      }
+      if (leaf) {
+        return waCheckPackedCertificate(der, aaguid)?
+      }
+      return x509Parse(der)?
+    }
+    _ => fail newError("auth: webauthn: packed certificate must be bytes")
+  }
+}
+
+fn waPackedKey(cert: Certificate, alg: int): CoseKey! {
+  if (cert.pubKeyAlg == x509KeyRSA && (alg == -257 || alg == -37)) {
+    return waPackedRsaKey(cert, alg)?
+  }
+  if (cert.pubKeyAlg == x509KeyEd25519 && alg == -8) {
+    return CoseKey.Okp(cert.pubKeyBytes)
+  }
+  if (cert.pubKeyAlg == x509KeyECDSA) {
+    return waPackedEcKey(cert, alg)?
+  }
+  fail newError("auth: webauthn: packed algorithm does not match certificate key")
+}
+
+fn waPackedRsaKey(cert: Certificate, alg: int): CoseKey! {
+  let key = rsaParsePkcs1PublicKey(cert.pubKeyBytes)?
+  let nbits = bigintBitLen(key.n)
+  let ebits = bigintBitLen(key.e)
+  // Apply the same work and key-strength limits as credential COSE keys.
+  if (nbits < 2048 || nbits > 8192 || ebits < 17 || ebits > 64) {
+    fail newError("auth: webauthn: packed RSA key exceeds COSE key limits")
+  }
+  let n = bigintToBytes(key.n, (nbits + 7) / 8)?
+  let e = bigintToBytes(key.e, (ebits + 7) / 8)?
+  if (n[len(n) - 1] % 2 == 0 || e[len(e) - 1] % 2 == 0) {
+    fail newError("auth: webauthn: packed RSA modulus and exponent must be odd")
+  }
+  return CoseKey.Rsa(key, alg)
+}
+
+fn waPackedEcKey(cert: Certificate, alg: int): CoseKey! {
+  if (alg == -7 && cert.ecCurveOid == "1.2.840.10045.3.1.7") {
+    return CoseKey.Ec2(ecdsaPublicKey(nistecP256(), cert.pubKeyBytes)?)
+  }
+  if (alg == -35 && cert.ecCurveOid == "1.3.132.0.34") {
+    return CoseKey.Ec2(ecdsaPublicKey(nistecP384(), cert.pubKeyBytes)?)
+  }
+  fail newError("auth: webauthn: packed algorithm does not match certificate curve")
+}
+
+fn waPackedAttestation(
+  obj: AttestationObject,
+  hash: []byte,
+  policy: AttestationPolicy,
+): AttestationResult! {
+  let entries = waPackedEntries(obj.attStmt)?
+  let x5c = waMapGet(entries, "x5c")?
+  if (!isSome(x5c)) {
+    if (!policy.allowSelf) {
+      fail newError("auth: webauthn: packed self attestation is not allowed")
+    }
+    verifyPackedSelfAttestation(obj, hash)?
+    return AttestationResult{ fmt = "packed", kind = "self" }
+  }
+  if (len(entries) != 3 || len(hash) != 32 || !isSome(obj.authData.attested)) {
+    fail newError("auth: webauthn: invalid packed attestation")
+  }
+  let chain = waPackedCertificates(unwrap(x5c), unwrap(obj.authData.attested).aaguid)?
+  let alg = waSelfAlg(waRequire(entries, "alg")?)?
+  let sig = waSelfSignature(waRequire(entries, "sig")?)?
+  let message = append([]byte(0), ...obj.authData.raw)
+  message = append(message, ...hash)
+  if (!coseVerify(waPackedKey(chain[0], alg)?, alg, message, sig)?) {
+    fail newError("auth: webauthn: invalid packed attestation signature")
+  }
+  let trusted = policy.trust == AttestationTrust.Verify
+  if (trusted) {
+    x509VerifyPath(chain[0], chain[1:], policy.roots, int(now().ns / Second))?
+  }
+  return AttestationResult{ fmt = "packed", kind = "basic", trusted = trusted, chain = chain }
+}
+
+// Section 7.1: format none carries no statement, signature or trust path.
+fn checkNoneStatement(att: AttestationObject): ()! {
+  match (att.attStmt) {
+    Map(entries) => {
+      if (len(entries) == 0) {
+        return
+      }
+    }
+    _ => {}
+  }
+  fail newError("auth: webauthn: attestation format 'none' must have an empty statement")
+}
