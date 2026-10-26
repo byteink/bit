@@ -83,11 +83,14 @@ credentials or extending its use beyond this cover flow.
 This is the complete `storeCover` body in its app context:
 
 ```text
-fn storeCover(client: CoverClient, upload: CoverUpload, db: Db): ()! {
+fn storeCover(client: CoverClient, upload: CoverUpload, db: Db, actorId: i64): ()! {
   client.put(upload.key, upload.body, upload.contentType)?
   upload.article.coverImageKey = Option<string>.Some(upload.key)
   upload.article.updatedAt = now().ns
-  db.table<Article>().update(upload.article)?
+  db.tx((tx) => {
+    tx.table<Article>().update(upload.article)?
+    recordAudit(tx, actorId, "article.cover", "article/${upload.article.id}")?
+  })?
 }
 ```
 
@@ -95,6 +98,11 @@ fn storeCover(client: CoverClient, upload: CoverUpload, db: Db): ()! {
 type. `coverImageKey` is nullable, so old articles need no object until
 someone uploads a cover. The migration adds that optional column; apply
 the app's normal migrations before you start the new code.
+
+The route supplies the authenticated actor id. The article update and its
+`article.cover` audit row commit in one database transaction; an audit insert
+error rolls both back. The object upload remains outside that transaction,
+so the failure path must still compensate an unreferenced new object.
 
 Every upload uses a fresh generated key. The ORM's existing version check
 refuses a stale article instead of silently replacing a concurrent edit.
