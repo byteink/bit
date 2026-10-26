@@ -626,36 +626,60 @@ fn legacyProvider(body: []byte, idp: EcdsaPublicKey): string! {
 - A failure says which rule broke and is for your log. Do not send it to the
   client.
 
+## Decrypting an encrypted assertion
+
+An identity provider can encrypt an assertion to your RSA key. Pass its `EncryptedData` child to `decryptElement`, then verify the result with the provider's trusted signing key before reading it.
+
+```bit
+import { parse, decryptElement, verifySignature, DsigKey, DsigOptions, SignedElement } from "std/xml"
+import { RsaPrivateKey, RsaPublicKey } from "std/crypto"
+
+fn encryptedAssertion(body: []byte, recipient: RsaPrivateKey, idp: RsaPublicKey): SignedElement! {
+  let encrypted = parse(body)?
+  let assertion = decryptElement(encrypted, recipient)?
+  let opts = DsigOptions{ expectRoot = "{urn:oasis:names:tc:SAML:2.0:assertion}Assertion" }
+  return verifySignature(assertion, DsigKey.Rsa(idp), opts)?
+}
+```
+
+`decryptElement(encrypted: Element, key: RsaPrivateKey): Element!` accepts
+only `xmlenc#Element`, an inline `EncryptedKey`, RSA-OAEP with SHA-1 or
+SHA-256 and independently selected MGF1 SHA-1/SHA-256, and AES-128/256
+GCM or CBC. Legacy `rsa-oaep-mgf1p` fixes MGF1 to SHA-1 and rejects an
+explicit MGF. OAEP labels are supported. RSA1.5, references, unknown algorithms and decrypted DOCTYPE declarations fail. There is no fallback.
+
+Keys must have 2048-8192-bit RSA moduli. Decoded ciphertext and plaintext
+are limited to 1 MiB; plaintext uses the parser's default depth, attribute
+and name limits. Every failure returns the same `xml-enc: decryption failed`
+error value. This does not make the whole operation constant time. Prefer
+GCM: CBC remains vulnerable to chosen-ciphertext attacks despite uniform
+errors. Keep CBC behind an authenticated transport and verify the signature.
+
 ## Where to go next
 
 [std/json](json.md) is the sibling data format; [std/strings](strings.md)
 covers the text helpers you will use on the values you get back.
 
 ## Reference
+ ### `Tokenizer`
 
-### `Tokenizer`
-
-`Tokenizer(src: []byte, maxDepth: int = 256, maxAttrs: int = 256, maxInput:
-int = 67108864)` reads the document `src`. Fails with `BadLimit` for a limit
-below 1 and `TooLarge` for an input longer than `maxInput`, before reading
-anything. Call it with `?` or `catch`.
+`Tokenizer(src: []byte, maxDepth: int = 256, maxAttrs: int = 256, maxInput: int = 67108864)` reads the
+document `src`. Fails with `BadLimit` for a limit below 1 and `TooLarge` for an input longer than `maxInput`,
+before reading anything. Call it with `?` or `catch`.
 
 ### `Tokenizer.next`
 
-`next(): Token!` returns the next token, `Eof` once the root element has
-closed and the input is spent (and on every call after that), or an
-`XmlError`. After an error, returns that same error every time.
+`next(): Token!` returns the next token, `Eof` once the root element has closed and the input is spent (and on
+every call after that), or an `XmlError`. After an error, returns that same error every time.
 
 ### `Token`
 
-One unit of a document: `Start(Tag)`, `Empty(Tag)` (an `<a/>` with no `End`
-after it), `End(string)` (the element name), `Text(string)`,
-`CData(string)`, and `Eof`.
+One unit of a document: `Start(Tag)`, `Empty(Tag)` (an `<a/>` with no `End` after it), `End(string)` (the
+element name), `Text(string)`, `CData(string)`, and `Eof`.
 
 ### `Tag`
 
-The element `name` and its `attrs`, a list of `Attr` in document order with
-no duplicate names.
+The element `name` and its `attrs`, a list of `Attr` in document order with no duplicate names.
 
 ### `Attr`
 
@@ -663,32 +687,29 @@ One attribute: `name` and `value`, the value decoded and normalised.
 
 ### `XmlErrorKind`
 
-Why a document was refused: `Doctype`, `UnexpectedEof`, `MismatchedTag`,
-`BadName`, `BadAttribute`, `DuplicateAttribute`, `BadReference`,
-`BadComment`, `BadChar`, `Syntax`, `TooDeep`, `TooManyAttributes`,
+Why a document was refused: `Doctype`, `UnexpectedEof`, `MismatchedTag`, `BadName`, `BadAttribute`,
+`DuplicateAttribute`, `BadReference`, `BadComment`, `BadChar`, `Syntax`, `TooDeep`, `TooManyAttributes`,
 `TooLarge`, `Unsupported` and `BadLimit`.
 
 ### `XmlError`
 
-The error every failure produces: `kind`, `offset` (byte offset of the
-construct that failed), `line` and `column` (1-based, columns count bytes),
-and `reason`, one phrase saying what was wrong. Reach the fields with
+The error every failure produces: `kind`, `offset` (byte offset of the construct that failed), `line` and
+`column` (1-based, columns count bytes), and `reason`, one phrase saying what was wrong. Reach the fields with
 `e.(XmlError)`.
 
 ### `XmlError.message`
 
-The one-sentence summary the caught `error` reports, callable on the
-narrowed value too.
+The one-sentence summary the caught `error` reports, callable on the narrowed value too.
 
 ### `Writer`
 
-`Writer(maxDepth: int = 256, maxAttrs: int = 256)` starts an empty document.
-Fails with `BadLimit` for a limit below 1.
+`Writer(maxDepth: int = 256, maxAttrs: int = 256)` starts an empty document. Fails with `BadLimit` for a limit
+below 1.
 
 ### `Writer.start`
 
-`start(name: string, attrs: []Attr = [])!` opens the element `name`. The
-namespace declarations among `attrs` are in scope for the element itself.
+`start(name: string, attrs: []Attr = [])!` opens the element `name`. The namespace declarations among `attrs`
+are in scope for the element itself.
 
 ### `Writer.empty`
 
@@ -696,8 +717,7 @@ namespace declarations among `attrs` are in scope for the element itself.
 
 ### `Writer.text`
 
-`text(s: string)!` writes `s` as escaped character data inside the open
-element.
+`text(s: string)!` writes `s` as escaped character data inside the open element.
 
 ### `Writer.end`
 
@@ -705,20 +725,18 @@ element.
 
 ### `Writer.finish`
 
-`finish(): []byte!` returns the finished document, and takes no more input
-afterwards.
+`finish(): []byte!` returns the finished document, and takes no more input afterwards.
 
 ### `parse`
 
-`parse(src: []byte, maxDepth: int = 256, maxAttrs: int = 256, maxInput: int =
-67108864, maxName: int = 1024): Element!` reads the document `src` into its
-root `Element`. Fails with what `Tokenizer(...)` and `Tokenizer.next` fail
-with, and with the namespace errors above.
+`parse(src: []byte, maxDepth: int = 256, maxAttrs: int = 256, maxInput: int = 67108864, maxName: int = 1024):
+Element!` reads the document `src` into its root `Element`. Fails with what `Tokenizer(...)` and
+`Tokenizer.next` fail with, and with the namespace errors above.
 
 ### `Element`
 
-One element: `name`, `local`, `space`, `attrs` (a `[]Attr` as written, `xmlns`
-declarations included) and `nodes` (a `[]Node`).
+One element: `name`, `local`, `space`, `attrs` (a `[]Attr` as written, `xmlns` declarations included) and
+`nodes` (a `[]Node`).
 
 ### `Node`
 
@@ -726,67 +744,57 @@ One unit of an element's content: `Elem(Element)` or `Text(string)`.
 
 ### `Element.child`
 
-`child(name: string, space: Option<string> = None): Option<Element>` is the
-first child element whose local name is `name`, in any namespace when `space`
-is `None`. Panics for a `name` that is empty or has a colon.
+`child(name: string, space: Option<string> = None): Option<Element>` is the first child element whose local
+name is `name`, in any namespace when `space` is `None`. Panics for a `name` that is empty or has a colon.
 
 ### `Element.children`
 
-`children(name: string, space: Option<string> = None): []Element` is every
-such child in document order; empty when there are none.
+`children(name: string, space: Option<string> = None): []Element` is every such child in document order; empty
+when there are none.
 
 ### `Element.text`
 
-`text(): string` is the element's own text nodes joined, child elements left
-out.
+`text(): string` is the element's own text nodes joined, child elements left out.
 
 ### `Element.attr`
 
-`attr(name: string, space: string = ""): Option<string>` is the value of the
-attribute with local name `name` in namespace `space`; the empty `space` means
-no namespace.
+`attr(name: string, space: string = ""): Option<string>` is the value of the attribute with local name `name`
+in namespace `space`; the empty `space` means no namespace.
 
 ### `canonicalizeExclusive`
 
-`canonicalizeExclusive(root: Element, opts: C14nOptions = C14nOptions{}):
-[]byte!` is `root` and its content in Exclusive XML Canonicalization 1.0 form,
-as UTF-8. Fails for a relative namespace URI in the subtree and for an
-`inclusivePrefixes` entry that is not `#default` or a prefix, or `wholeDocument`
-on a child. Never panics on an `Element` that `parse` returned.
+`canonicalizeExclusive(root: Element, opts: C14nOptions = C14nOptions{}): []byte!` is `root` and its content
+in Exclusive XML Canonicalization 1.0 form, as UTF-8. Fails for a relative namespace URI in the subtree and
+for an `inclusivePrefixes` entry that is not `#default` or a prefix, or `wholeDocument` on a child. Never
+panics on an `Element` that `parse` returned.
 
 ### `C14nOptions`
 
-`C14nOptions{ inclusivePrefixes, withComments, wholeDocument }`:
-`inclusivePrefixes` is a
-`[]string` of prefixes (`#default` for the default namespace) whose declarations
-in scope are written on every element; empty by default. `withComments` is a
-`bool`, false by default, that keeps comments. `wholeDocument` is a `bool`, false
-by default, that includes the root's leading/trailing misc with LF separators.
+`C14nOptions{ inclusivePrefixes, withComments, wholeDocument }`: `inclusivePrefixes` is a `[]string` of
+prefixes (`#default` for the default namespace) whose declarations in scope are written on every element;
+empty by default. `withComments` is a `bool`, false by default, that keeps comments. `wholeDocument` is a
+`bool`, false by default, that includes the root's leading/trailing misc with LF separators.
 
 ### `verifySignature`
 
-`verifySignature(doc: Element, key: DsigKey, opts: DsigOptions =
-DsigOptions{}): SignedElement!` verifies the enveloped XML signature in `doc`
-and returns the signed element. Fails with the rule that broke for anything
-outside the profile in "Verifying a signed assertion", for a digest that does
-not match and for a signature that does not verify. Never reads `KeyInfo`.
+`verifySignature(doc: Element, key: DsigKey, opts: DsigOptions = DsigOptions{}): SignedElement!` verifies the
+enveloped XML signature in `doc` and returns the signed element. Fails with the rule that broke for anything
+outside the profile in "Verifying a signed assertion", for a digest that does not match and for a signature
+that does not verify. Never reads `KeyInfo`.
 
 ### `DsigKey`
 
-`enum DsigKey { Rsa(RsaPublicKey), Ecdsa(EcdsaPublicKey) }`, the caller's
-public key. `Rsa` is for `rsa-sha256` with a modulus of 2048 bits or more,
-`Ecdsa` for `ecdsa-sha256` with a P-256 key.
+`enum DsigKey { Rsa(RsaPublicKey), Ecdsa(EcdsaPublicKey) }`, the caller's public key. `Rsa` is for
+`rsa-sha256` with a modulus of 2048 bits or more, `Ecdsa` for `ecdsa-sha256` with a P-256 key.
 
 ### `DsigOptions`
 
-`DsigOptions{ expectRoot, allowSha1, maxElements, maxDepth, maxSignatureBytes
-}`. `expectRoot` is `{namespace-uri}local` or a bare `local`, `""` by default,
-meaning the signed element is `doc`. `allowSha1` accepts a SHA-1 digest method,
-false by default. `maxElements` is 100000, `maxDepth` 256 and
+`DsigOptions{ expectRoot, allowSha1, maxElements, maxDepth, maxSignatureBytes }`. `expectRoot` is
+`{namespace-uri}local` or a bare `local`, `""` by default, meaning the signed element is `doc`. `allowSha1`
+accepts a SHA-1 digest method, false by default. `maxElements` is 100000, `maxDepth` 256 and
 `maxSignatureBytes` 1024 by default.
 
 ### `SignedElement`
 
-`SignedElement{ element, id }`: `element` is the signed element with its
-`Signature` child removed, and `id` the ID the `Reference` named. Read
-`element`; do not look `id` up in the document again.
+`SignedElement{ element, id }`: `element` is the signed element with its `Signature` child removed, and `id`
+the ID the `Reference` named. Read `element`; do not look `id` up in the document again.
