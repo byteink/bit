@@ -268,7 +268,7 @@ more messages will be sent.
 
 ### `streamReadBounded(s: Stream, wake: chan<int>, deadlineNs: int): StreamChunk!`
 
-Read one chunk with the existing `streamReadUntil` wake contract and an absolute monotonic deadline. Zero disables the deadline. A deadline or wake leaves unread chunks available for a later read. FIN and peer reset retain their separate flags. Each active wait owns at most one stoppable timer slot.
+Read one chunk with the existing `streamReadUntil` wake contract and an absolute monotonic deadline. Zero disables the deadline. The same bound covers receive-credit admission after a chunk arrives. If that queue is full when the wait expires, one unreturned chunk and its uncommitted credit stay on the stream. A later bounded, woken or ordinary read resumes that chunk before receiving another; no data or credit is lost. FIN and peer reset retain their separate flags. Each active wait owns at most one stoppable timer slot.
 
 ### `streamFinishBounded(s: Stream, wake: chan<int>, deadlineNs: int): ()!`
 
