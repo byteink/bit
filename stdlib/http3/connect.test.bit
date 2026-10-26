@@ -1,4 +1,4 @@
-import { after, Second } from "std/time"
+import { after, Second, Timer } from "std/time"
 
 // RFC 9220 extended CONNECT settings, malformed requests and real QUIC tunnels.
 fn h3tReq(): H3Request {
@@ -330,6 +330,236 @@ test "extended CONNECT stalled DATA wakes and forbids partial frame retry" {
 
 test "extended CONNECT peer reset fails a stalled DATA writer" {
   h3wRun(2) catch e {
+    assert(false, e.message())
+  }
+}
+
+class h3dPair { client: H3Conn, server: H3Conn, local: H3Stream, remote: H3Stream }
+
+fn h3dWith(run: (h3dPair) => ()!): ()! {
+  let sock = udpBind("127.0.0.1", 0)?
+  defer sock.close()
+  let peer = h3wPeer{
+    ready = chan<H3Conn>(1), tunnel = chan<H3Stream>(1),
+    release = chan<int>(1), done = chan<string>(1),
+  }
+  spawn h3wServe(sock, peer)
+  let c = h3DialTls("127.0.0.1", sock.port()?, "localhost", h3cClientConfig())?
+  defer c.close()
+  let server = <- peer.ready
+  defer server.close()
+  defer {
+    peer.release <- 1
+  }
+  let local = c.openTunnel(h3tReq())?
+  let remote = <- peer.tunnel
+  run(h3dPair{ client = c, server = server, local = local, remote = remote })?
+}
+
+fn h3dRead(t: H3Stream, bound: H3Bound, done: chan<string>) {
+  t.readUntil(1, bound) catch e {
+    done <- e.message()
+    return
+  }
+  done <- "unexpected success"
+}
+
+fn h3dResult(done: chan<string>): string! {
+  let timer = Timer(Second)
+  defer {
+    let _ = timer.stop()
+  }
+  select {
+    case value = <- done:
+      return value
+    case _ = <- timer.c:
+      fail newError("h3 test: bounded read did not return")
+  }
+}
+
+fn h3dPartial(p: h3dPair, deadline: bool): ()! {
+  p.remote.reader.s.writeAll([]byte{ 0, 64 })?
+  let bound = H3Bound{ wake = chan<int>(1) }
+  if (deadline) {
+    bound.deadlineNs = monotonic().ns + 10 * Millisecond
+  }
+  let done = chan<string>(1)
+  spawn h3dRead(p.local, bound, done)
+  sleep(30 * Millisecond)
+  bound.wake <- 1
+  let result = h3dResult(done)?
+  if (deadline) {
+    assert(
+      result == "quic: stream deadline exceeded",
+      "read deadline must win before fallback wake: ${result}",
+    )
+  } else {
+    assert(result == "quic: wait woken", "read wake must stop the active receive: ${result}")
+  }
+  assert(len(p.local.reader.buf) == 2, "partial DATA type and length varint remain buffered")
+  p.remote.reader.s.writeAll(qpackAppendBytes([]byte{ 70 }, []byte(70)))?
+  let first = p.local.readUntil(
+    1,
+    H3Bound{ wake = chan<int>(1), deadlineNs = monotonic().ns + Second },
+  )?
+  assert(len(first) == 1 && int(first[0]) == 0, "partial varint resumes exactly")
+  assert(len(p.local.read(69)?) == 69, "remaining DATA is preserved")
+  p.remote.closeUntil(H3Bound{ wake = chan<int>(1), deadlineNs = monotonic().ns + Second })?
+  assert(p.local.read(1)? == "", "FIN remains orderly EOF")
+}
+
+fn h3dPayload(p: h3dPair): ()! {
+  p.remote.reader.s.writeAll([]byte{ 0, 3, 97 })?
+  let bound = H3Bound{ wake = chan<int>(1), deadlineNs = monotonic().ns + Second }
+  assert(p.local.readUntil(1, bound)? == "a", "partial DATA payload begins exactly")
+  let stopped = H3Bound{ wake = chan<int>(1), deadlineNs = monotonic().ns + 10 * Millisecond }
+  let done = chan<string>(1)
+  spawn h3dRead(p.local, stopped, done)
+  sleep(30 * Millisecond)
+  stopped.wake <- 1
+  assert(h3dResult(done)? == "quic: stream deadline exceeded", "partial DATA wait expires")
+  assert(p.local.reader.remaining == 2, "deadline retains outstanding DATA bytes")
+  p.remote.reader.s.writeAll([]byte("bc"))?
+  assert(p.local.readUntil(2, bound)? == "bc", "partial DATA resumes without loss")
+  p.remote.closeUntil(bound)?
+  assert(p.local.read(1)? == "", "resumed DATA ends at orderly FIN")
+}
+
+fn h3dDeadline(p: h3dPair): ()! { h3dPartial(p, true)? }
+fn h3dWake(p: h3dPair): ()! { h3dPartial(p, false)? }
+
+fn h3dAnswer(c: H3Conn, done: chan<string>) {
+  let sr = c.accept() catch e {
+    done <- e.message()
+    return
+  }
+  c.respond(sr, H3Response{ status = 200, body = []byte("still open") }) catch e {
+    done <- e.message()
+    return
+  }
+  done <- "ok"
+}
+
+fn h3dNext(p: h3dPair): ()! {
+  let done = chan<string>(1)
+  spawn h3dAnswer(p.server, done)
+  let res = p.client.request(
+    H3Request{ method = "GET", scheme = "https", authority = "localhost", path = "/" },
+  )?
+  assert(string(res.body) == "still open" && res.status == 200, "another stream remains usable")
+  assert(h3dResult(done)? == "ok", "ordinary request finishes on the same connection")
+}
+
+fn h3dReadError(t: H3Stream, bound: H3Bound): string {
+  t.readUntil(1, bound) catch e {
+    return e.message()
+  }
+  return "unexpected success"
+}
+
+fn h3dReset(p: h3dPair): ()! {
+  p.remote.reset()
+  let message = h3dReadError(
+    p.local,
+    H3Bound{ wake = chan<int>(1), deadlineNs = monotonic().ns + Second },
+  )
+  assert(message == "h3: tunnel reset (${h3ErrRequestCancelled})", message)
+  h3dNext(p)?
+}
+
+fn h3dFinish(p: h3dPair, wake: bool): ()! {
+  let bound = H3Bound{ wake = chan<int>(1), deadlineNs = monotonic().ns + 10 * Millisecond }
+  if (wake) {
+    bound.wake <- 1
+  } else {
+    p.local.reader.s.write(h3frame(h3FrameData, []byte(65536)))?
+  }
+  let failed = false
+  let started = monotonic().ns
+  print("FIN bounded wait starts\n")
+  p.local.closeUntil(bound) catch e {
+    failed = true
+    let want = "quic: stream deadline exceeded"
+    if (wake) {
+      want = "http3: request aborted"
+    }
+    assert(e.message() == want, e.message())
+  }
+  assert(failed && p.local.closed, "an interrupted FIN wait aborts only this stream")
+  assert(monotonic().ns - started < Second, "FIN deadline completes before peer cleanup")
+  print("FIN bounded wait returned before peer cleanup\n")
+  // The fixture retained delivered bytes; release its receiver-owned credit.
+  p.remote.reset()
+  h3dNext(p)?
+}
+
+fn h3dFinishWake(p: h3dPair): ()! { h3dFinish(p, true)? }
+fn h3dFinishDeadline(p: h3dPair): ()! { h3dFinish(p, false)? }
+
+fn h3dIncomplete(p: h3dPair): ()! {
+  p.client.rawConn().close()
+  p.client.rawConn().openStream() catch _ {
+    h3dClosedCleanup(p.local)?
+    return
+  }
+  assert(false, "closed actor cannot open another stream")
+}
+
+fn h3dClosedCleanup(t: H3Stream): ()! {
+  let wake = chan<int>(1)
+  wake <- 1
+  t.closeUntil(H3Bound{ wake = wake }) catch e {
+    let (incomplete, ok) = e.(H3CleanupIncomplete)
+    assert(ok && t.closed, "incomplete cleanup leaves the local handle terminal")
+    let (_, woken) = incomplete.cause.(H3Aborted)
+    assert(woken, "the original cancellation cause remains inspectable")
+    assert(e.message() == "http3: request aborted; h3: stream cleanup incomplete", e.message())
+    t.closeUntil(H3Bound{ wake = chan<int>(1) }) catch _ {
+      assert(false, "terminal close remains idempotent")
+    }
+    return
+  }
+  assert(false, "unavailable cleanup cannot be reported complete")
+}
+
+test "tunnel close keeps its wake cause when a closed actor refuses cleanup" {
+  h3dWith(h3dIncomplete) catch e {
+    assert(false, e.message())
+  }
+}
+
+test "tunnel read deadline preserves a partial length varint for resume and FIN" {
+  h3dWith(h3dDeadline) catch e {
+    assert(false, e.message())
+  }
+}
+
+test "tunnel read cancellation preserves a partial length varint for resume" {
+  h3dWith(h3dWake) catch e {
+    assert(false, e.message())
+  }
+}
+
+test "tunnel bounded read reports peer reset and preserves other request streams" {
+  h3dWith(h3dReset) catch e {
+    assert(false, e.message())
+  }
+}
+
+test "tunnel FIN cancellation aborts this stream without closing the connection" {
+  h3dWith(h3dFinishWake) catch e {
+    assert(false, e.message())
+  }
+}
+
+test "tunnel FIN deadline expires behind an unread flow window and preserves the connection" {
+  h3dWith(h3dFinishDeadline) catch e {
+    assert(false, e.message())
+  }
+}
+
+test "tunnel read deadline preserves a partial DATA payload for resume" {
+  h3dWith(h3dPayload) catch e {
     assert(false, e.message())
   }
 }

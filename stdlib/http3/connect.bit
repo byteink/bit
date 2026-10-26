@@ -1,7 +1,7 @@
 // Bit standard library — HTTP/3 extended CONNECT (RFC 9220 section 3).
 // HEADERS establish the tunnel; DATA carries its bytes until QUIC FIN.
 import { sleep, Millisecond } from "std/time"
-import { streamWriteUntil, streamAbort, streamTryAbort } from "std/quic"
+import { streamWriteUntil, streamAbort, streamTryAbort, streamReadBounded, streamFinishBounded } from "std/quic"
 
 const h3TunnelFrameMax: int = 65536
 
@@ -71,13 +71,21 @@ class h3TunnelReader {
   fin: bool,
   frameType: int,
   remaining: int,
+  readBounded: bool,
+  wake: chan<int>,
+  deadlineNs: int,
 }
 
 fn h3tunnelFill(r: h3TunnelReader): ()! {
   if (r.fin) {
     fail newError("h3: truncated tunnel frame")
   }
-  let chunk = r.s.read()?
+  let chunk = StreamChunk{}
+  if (r.readBounded) {
+    chunk = streamReadBounded(r.s, r.wake, r.deadlineNs)?
+  } else {
+    chunk = r.s.read()?
+  }
   if (chunk.reset) {
     fail newError("h3: tunnel reset (${chunk.resetCode})")
   }
@@ -167,19 +175,20 @@ export class H3Stream {
 
   // Read up to n bytes; an empty string marks an orderly peer FIN.
   export read(n: int): string! {
+    this.reader.readBounded = false
+    return h3tunnelRead(this, n)?
+  }
+
+  // A stopped read retains its partial frame; a later read may resume it.
+  export readUntil(n: int, bound: H3Bound): string! {
     if (n <= 0) {
       return ""
     }
-    if (len(this.pending) == 0) {
-      this.pending = h3tunnelData(this.reader)?
-    }
-    let size = len(this.pending)
-    if (size > n) {
-      size = n
-    }
-    let data = string(this.pending[0:size])
-    this.pending = this.pending[size:len(this.pending)]
-    return data
+    this.reader.readBounded = true
+    this.reader.wake = bound.wake
+    this.reader.deadlineNs = bound.deadlineNs
+    h3tunnelReadBound(this.reader)?
+    return h3tunnelRead(this, n)?
   }
 
   // Each DATA frame waits for ACKs before the next frame is retained.
@@ -215,10 +224,49 @@ export class H3Stream {
     this.reader.s.finish()?
   }
 
+  // An interrupted FIN wait aborts this stream, leaving other streams usable.
+  export closeUntil(bound: H3Bound): ()! {
+    if (this.closed) {
+      return
+    }
+    this.closed = true
+    streamFinishBounded(this.reader.s, bound.wake, bound.deadlineNs) catch e {
+      fail h3boundedAbort(this.reader.s, e)
+    }
+  }
+
   // Abort both stream directions with H3_REQUEST_CANCELLED (RFC 9220 section 3).
   export reset() {
     this.closed = true
     streamAbort(this.reader.s, h3ErrRequestCancelled)
+  }
+}
+
+fn h3tunnelRead(t: H3Stream, n: int): string! {
+  if (n <= 0) {
+    return ""
+  }
+  if (len(t.pending) == 0) {
+    t.pending = h3tunnelData(t.reader)?
+  }
+  let size = len(t.pending)
+  if (size > n) {
+    size = n
+  }
+  let data = string(t.pending[0:size])
+  t.pending = t.pending[size:len(t.pending)]
+  return data
+}
+
+fn h3tunnelReadBound(r: h3TunnelReader): ()! {
+  select {
+    case _ = <- r.wake:
+      fail Woken{}
+    default:
+      {}
+  }
+  if (r.deadlineNs != 0 && monotonic().ns >= r.deadlineNs) {
+    fail newError("quic: stream deadline exceeded")
   }
 }
 
