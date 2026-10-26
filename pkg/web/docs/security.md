@@ -45,6 +45,16 @@ type implementing `SessionStore` directly - a future `SqlStore` or
 tombstone bounded by the same session ttl, so a stale writer can never bring
 a destroyed id back once its tombstone exists.
 
+`session.destroy()` invalidates the current request's session data and index
+before it asks the store to revoke the id. The framework will neither save
+that session again nor send its newly created id in a cookie, even if the
+store fails. The store error still reaches the caller. A failed remote
+revocation can leave an already saved session usable by a client that
+already knows its id; local invalidation is not proof that every session was
+revoked. Handle the error before reporting a successful logout.
+A later explicit `destroy()` call can request remote revocation again. After
+the store confirms deletion, another call is a no-op.
+
 ### Revoking every session of one user
 
 A session is addressable by its id alone, so "log this user out everywhere"

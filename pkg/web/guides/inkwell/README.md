@@ -147,9 +147,9 @@ refresh. Authenticator enrollment is described below.
 
 ## Inspect article and comment changes
 
-After applying the migrations, each article create, update or delete and each
-comment create or delete writes an `audit_logs` row in the same PostgreSQL
-transaction. The row stores the acting user's ID, the action, the target and the
+After applying the migrations, each article create, update, delete or cover
+replacement and each comment create or delete writes an `audit_logs` row in
+the same PostgreSQL transaction. The row stores the acting user's ID, the action, the target and the
 creation time in Unix nanoseconds. An administrator's edit records the
 administrator as the actor, even when another user owns the article.
 
@@ -174,7 +174,8 @@ where target = 'article/1'
 order by id;
 ```
 
-An article's actions are `article.create`, `article.update` and `article.delete`.
+An article's actions are `article.create`, `article.update`, `article.delete` and
+`article.cover`.
 Comment actions are `comment.create` and `comment.delete`, with `comment/<id>`
 targets. A rejected write adds no row. An audit insert error rolls back the
 mutation; it is returned to the caller. Deleting an article records its soft
@@ -183,8 +184,34 @@ The target remains readable after deletion. The actor foreign key restricts user
 deletion so that existing history survives.
 
 Redis cache invalidation follows the database commit. A cache error can therefore
-return an error after the mutation and its audit row have committed. Login and
-cover-image changes are outside this audit example.
+return an error after the mutation and its audit row have committed.
+
+Successful cookie, initial-token and Google sign-ins add an `auth.login` row
+with a `user/<id>` target. Inspect an account's history without copying its
+credentials into a log:
+
+```sql
+select actor_id, action, target, created_at
+from audit_logs
+where target = 'user/1'
+order by id;
+```
+
+A refused password or unverified Google address adds no sign-in event. If the
+audit write fails, sign-in fails and the current request's session is locally
+invalidated. Its provisional id is not sent in a new cookie, even if the
+session store refuses deletion. That store error still propagates; remote
+revocation is not confirmed, and a client that already knows a saved id may
+still use it until the store revokes or expires it.
+An initial refresh credential and its audit row share one PostgreSQL
+transaction; failure rolls both back. Refresh rotation does not create a new
+sign-in event. Audit rows contain account IDs, never passwords, bearer tokens
+or authenticator secrets. The session store is separate: a later session or
+response error can follow an audit commit.
+
+For a cover replacement, object upload happens before the database transaction.
+Old-object deletion and Redis invalidation happen after commit and can still
+fail after the new article key and its `article.cover` audit row are stored.
 
 ## Add an authenticator before the next sign-in
 
