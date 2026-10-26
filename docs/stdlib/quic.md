@@ -230,14 +230,14 @@ starting another write. Reset and connection close also fail a parked writer.
 Send a preface, then a cancellable message without sending FIN:
 
 ```bit
-import { Stream, streamWriteUntil, streamAbort, Woken } from "std/quic"
+import { Stream, streamWriteUntil, streamTryAbort, Woken } from "std/quic"
 
 fn sendMessage(s: Stream, message: []byte, wake: chan<int>): ()! {
   s.writeAll([]byte("ready\n"))?
   streamWriteUntil(s, message, wake) catch e {
     let (_, woken) = e.(Woken)
-    if (woken) {
-      streamAbort(s, 1)
+    if (woken && !streamTryAbort(s, 1)) {
+      fail newError("${e.message()}; stream cleanup incomplete")
     }
     fail e
   }
@@ -246,6 +246,10 @@ fn sendMessage(s: Stream, message: []byte, wake: chan<int>): ()! {
 
 The peer can reply while the stream remains open. Call `finish` only when no
 more messages will be sent.
+
+### `streamTryAbort(s: Stream, code: int): bool`
+
+Try to queue RESET, STOP_SENDING and receive-credit discard without waiting. Returns true only when all three were admitted; it does not wait for peer acknowledgement. A full queue or closed connection returns false, and earlier admitted commands remain queued. Use this form after cancellation when cleanup must not start another wait. The running example reports incomplete cleanup separately from the original write failure.
 
 ### `Stream.finish(): ()!`
 
