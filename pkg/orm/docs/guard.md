@@ -369,6 +369,31 @@ table, or a repository with no guard, keeps the plain repository's behavior.
 Use `db.asSystem()` for a trusted maintenance job that must bypass these
 rules. Request handlers should keep using the actor's scoped handle.
 
+## Revising a group of drafts
+
+To replace a shared outline without touching another author's drafts, narrow
+that batch and assign the new value:
+
+```bit
+fn reviseOutlines(mine: ScopedRepo<Draft>): int! {
+  return mine.where("body", "outline").set("body", "Revised outline").updateAll()?
+}
+```
+
+`set` returns a new scoped chain. `updateAll` appends the actor's `Update`
+filter to your condition and returns the number of rows actually changed.
+A bare call without `where()` fails before consulting the guard. `None`
+returns zero without SQL, and a policy error fails without running a write.
+The original chain keeps its predicates and assigned values.
+
+A bulk operation cannot check the new values row by row. It therefore
+refuses any assigned field named by the actor's `Update` **or** `Delete`
+rules. For the guard above, changing `body` is allowed but changing
+`authorId` is refused, even when the proposed value looks unchanged. Rule
+introspection errors also fail closed. The automatic `updatedAt` assignment
+on a timestamped model follows the same restriction. Use a guarded single-row
+`update` when the change needs a value check.
+
 ## Removing a group of drafts
 
 To discard every outline you may delete, narrow the batch explicitly:
