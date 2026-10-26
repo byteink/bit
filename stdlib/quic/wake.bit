@@ -4,6 +4,8 @@
 // in another module. `Stream.finish` is `streamFinishUntil` with a wake nothing
 // ever sends on.
 
+import { Timer } from "std/time"
+
 // What `streamReadUntil`, `streamFinishUntil` and `dialQuicTlsUntil` fail with
 // when their `wake` channel received a value first. The connection is not
 // touched by the wake (a dial that was woken is closed, since nobody holds it).
@@ -13,51 +15,116 @@ export class Woken {
   }
 }
 
-// `Stream.read`, but a value on `wake` ends the wait with `Woken`. The wake is
-// looked at before the stream, so a peer sending as fast as it is read cannot
-// outrun it.
-export fn streamReadUntil(s: Stream, wake: chan<int>): StreamChunk! {
-  select {
-    case _ = <- wake:
-      fail Woken{}
-    default:
-      {}
+// One timer slot per operation, released even when data wins the race.
+class quicconnStreamBound {
+  wake: chan<int>
+  timeout: chan<bool>
+  timer: Option<Timer>
+  deadlineNs: int
+
+  init(wake: chan<int>, deadlineNs: int) {
+    this.wake = wake
+    this.deadlineNs = deadlineNs
+    this.timeout = chan<bool>(0)
+    this.timer = Option.None
+    if (deadlineNs != 0) {
+      let timer = Timer(deadlineNs - monotonic().ns)
+      this.timer = Option.Some(timer)
+      this.timeout = timer.c
+    }
   }
-  select {
-    case c = <- s.recvCh:
-      // Every chunk the loop sends carries data, FIN or a reset; the zero value
-      // is what a receive on the channel the loop closed at exit returns.
-      if (len(c.data) == 0 && !c.fin) {
-        fail newError("quic: connection closed")
-      }
-      streamNoteRead(s, c)
-      return c
-    case _ = <- wake:
-      fail Woken{}
+
+  check(): ()! {
+    select {
+      case _ = <- this.wake:
+        fail Woken{}
+      default:
+        {}
+    }
+    if (this.deadlineNs != 0 && monotonic().ns >= this.deadlineNs) {
+      fail newError("quic: stream deadline exceeded")
+    }
+  }
+
+  stop() {
+    if (isSome(this.timer)) {
+      let _ = unwrap(this.timer).stop()
+    }
   }
 }
 
-// Mark the send half of `s` finished (FIN) and block until every queued byte has
-// been acknowledged, the connection ends, or `wake` receives a value (`Woken`:
-// the FIN stays queued, a `Stream.reset` abandons it).
-export fn streamFinishUntil(s: Stream, wake: chan<int>): ()! {
-  let done = chan<int>(1)
-  s.cmdCh <- quicconnCmd{
-    kind = quicconnCmdFinish,
-    id = s.streamId,
-    data = []byte(0),
-    replyOpen = chan<quicconnOpenReply>(1),
-    replyInt = done,
+// A cancelled credit admission retains the unreturned chunk for a later read.
+export fn streamReadUntil(s: Stream, wake: chan<int>): StreamChunk! {
+  return streamReadBounded(s, wake, 0)?
+}
+
+export fn streamReadBounded(s: Stream, wake: chan<int>, deadlineNs: int): StreamChunk! {
+  let bound = quicconnStreamBound(wake, deadlineNs)
+  defer bound.stop()
+  bound.check()?
+  let c = quicconnBoundedChunk(s, bound)?
+  quicconnReadCredit(s, c, bound) catch e {
+    s.acct.pending = Option.Some(c)
+    fail e
   }
-  let r = -1
+  s.acct.pending = Option.None
+  return c
+}
+
+fn quicconnBoundedChunk(s: Stream, bound: quicconnStreamBound): StreamChunk! {
+  if (isSome(s.acct.pending)) {
+    return unwrap(s.acct.pending)
+  }
   select {
-    case v = <- done:
-      r = v
-    case _ = <- s.doneCh:
-      {}
-    case _ = <- wake:
+    case c = <- s.recvCh:
+      if (len(c.data) == 0 && !c.fin && !c.reset) {
+        fail newError("quic: connection closed")
+      }
+      return c
+    case _ = <- bound.wake:
       fail Woken{}
+    case _ = <- bound.timeout:
+      fail newError("quic: stream deadline exceeded")
   }
+}
+
+fn quicconnReadCredit(s: Stream, c: StreamChunk, bound: quicconnStreamBound): ()! {
+  let a = s.acct
+  let bytes = a.bytes + len(c.data)
+  let chunks = a.chunks + 1
+  if (!c.fin && bytes < quicconnReadBatchBytes && chunks < quicconnReadBatchChunks) {
+    a.bytes = bytes
+    a.chunks = chunks
+    return
+  }
+  let n = quicconnRead{ id = s.streamId, bytes = bytes, chunks = chunks }
+  select {
+    case s.tx.readCh <- n:
+      streamWakeRead(s)
+    case _ = <- s.doneCh:
+      // Received data stays readable after exit; connection credit is obsolete.
+      {}
+    case _ = <- bound.wake:
+      fail Woken{}
+    case _ = <- bound.timeout:
+      fail newError("quic: stream deadline exceeded")
+  }
+  a.bytes = 0
+  a.chunks = 0
+}
+
+// The same deadline bounds both command admission and acknowledgement of FIN.
+export fn streamFinishUntil(s: Stream, wake: chan<int>): ()! {
+  streamFinishBounded(s, wake, 0)?
+}
+
+export fn streamFinishBounded(s: Stream, wake: chan<int>, deadlineNs: int): ()! {
+  let bound = quicconnStreamBound(wake, deadlineNs)
+  defer bound.stop()
+  bound.check()?
+  let done = chan<int>(1)
+  quicconnFinishSend(s, done, bound)?
+  let r = quicconnFinishWait(s, done, bound)?
   if (r < 0) {
     fail newError("quic: connection closed before the stream drained")
   }
@@ -102,5 +169,35 @@ fn quicconnTryAbortCommand(s: Stream, code: int, kind: int): bool {
       return true
     default:
       return false
+  }
+}
+
+fn quicconnFinishSend(s: Stream, done: chan<int>, bound: quicconnStreamBound): ()! {
+  let cmd = quicconnCmd{
+    kind = quicconnCmdFinish, id = s.streamId, data = []byte(0),
+    replyOpen = chan<quicconnOpenReply>(1), replyInt = done,
+  }
+  select {
+    case s.cmdCh <- cmd:
+      {}
+    case _ = <- s.doneCh:
+      fail newError("quic: connection closed before the stream drained")
+    case _ = <- bound.wake:
+      fail Woken{}
+    case _ = <- bound.timeout:
+      fail newError("quic: stream deadline exceeded")
+  }
+}
+
+fn quicconnFinishWait(s: Stream, done: chan<int>, bound: quicconnStreamBound): int! {
+  select {
+    case r = <- done:
+      return r
+    case _ = <- s.doneCh:
+      return -1
+    case _ = <- bound.wake:
+      fail Woken{}
+    case _ = <- bound.timeout:
+      fail newError("quic: stream deadline exceeded")
   }
 }
