@@ -1,0 +1,293 @@
+// IMDS follows Smithy 5d104567b718 credential-provider-imds, independently
+// of the default chain. Credentials.Provider composes this stateful provider.
+import { randomU64 } from "std/crypto"
+import { Rand } from "std/rand"
+import { monotonic } from "std/time"
+import { TimeoutError as ImdsHttpTimeout } from "std/http"
+import { getDefault as imdsLogger } from "std/log"
+import { lookupEnv as imdsLookupEnv } from "std/os"
+
+const imdsDisabled: string = "AWS_EC2_METADATA_DISABLED"
+const imdsV1Disabled: string = "AWS_EC2_METADATA_V1_DISABLED"
+const imdsEndpointVar: string = "AWS_EC2_METADATA_SERVICE_ENDPOINT"
+const imdsModeVar: string = "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE"
+const imdsPath: string = "/latest/meta-data/iam/security-credentials/"
+const imdsTimeoutMs: int = 1000
+const imdsMaxBytes: int = 16384
+
+class ImdsPolicyError {
+  text: string
+  message(): string { return "aws: imds: ${this.text}" }
+}
+
+class ImdsTimeout {
+  message(): string { return "aws: imds: endpoint timed out" }
+}
+
+fn imdsFlag(value: string): bool {
+  return value != "" && value != "false"
+}
+
+fn imdsProfile(): map<string, string>! {
+  let data = loadSharedProfiles()?
+  let (profile, found) = data.sections[profileName()]
+  if (!found) {
+    return map<string, string>()
+  }
+  return profile
+}
+
+fn imdsSetting(
+  get: (string) => Option<string>,
+  profile: map<string, string>,
+  envName: string,
+  key: string,
+  fallback: string = "",
+): string {
+  match (get(envName)) {
+    Some(value) => return value
+    None => {}
+  }
+  let (configured, found) = profile[key]
+  if (found) {
+    return configured
+  }
+  return fallback
+}
+
+fn imdsEndpoint(get: (string) => Option<string>, profile: map<string, string>): string! {
+  let endpoint = imdsSetting(get, profile, imdsEndpointVar, "ec2_metadata_service_endpoint")
+  if (endpoint != "") {
+    return imdsEndpointUri(endpoint)?
+  }
+  let mode = imdsSetting(get, profile, imdsModeVar, "ec2_metadata_service_endpoint_mode", "IPv4")
+  if (mode == "IPv4") {
+    return "http://169.254.169.254"
+  }
+  if (mode == "IPv6") {
+    return "http://[fd00:ec2::254]"
+  }
+  fail ImdsPolicyError{ text = "endpoint mode must be IPv4 or IPv6" }
+}
+
+fn imdsEndpointUri(uri: string): string! {
+  containerUriBytes(uri) catch _ {
+    fail ImdsPolicyError{ text = "invalid endpoint URI" }
+  }
+  let offset = 7
+  let lower = toLower(uri)
+  if (hasPrefix(lower, "https://")) {
+    offset = 8
+  } else if (!hasPrefix(lower, "http://")) {
+    fail ImdsPolicyError{ text = "endpoint must use HTTP or HTTPS" }
+  }
+  let end = offset
+  while (end < len(uri) && uri[end] != '/') {
+    end = end + 1
+  }
+  let authority = lower[offset:end]
+  if (indexOf(uri, "?") >= 0 || indexOf(uri, "#") >= 0) {
+    fail ImdsPolicyError{ text = "endpoint must not contain a query or fragment" }
+  }
+  containerAuthority(authority) catch _ {
+    fail ImdsPolicyError{ text = "invalid endpoint authority" }
+  }
+  return "${lower[0:offset]}${authority}"
+}
+
+fn imdsFetch(method: string, url: string, token: string): Response! {
+  let client = ContainerHttp()
+  defer client.close()
+  client.setRedirects(Redirects.None)
+  client.setMaxBodyBytes(imdsMaxBytes)
+  if (method == "PUT") {
+    client.setHeader("x-aws-ec2-metadata-token-ttl-seconds", "21600")?
+  }
+  if (token != "") {
+    client.setHeader("x-aws-ec2-metadata-token", token) catch _ {
+      fail ImdsPolicyError{ text = "invalid metadata token" }
+    }
+  }
+  let started = monotonic().ns
+  return client.requestTimeout(method, url, "", imdsTimeoutMs) catch e {
+    let (_, timed) = e.(ImdsHttpTimeout)
+    if (timed || monotonic().ns - started >= imdsTimeoutMs * 1000000) {
+      fail ImdsTimeout{}
+    }
+    fail newError("aws: imds: endpoint request failed")
+  }
+}
+
+fn imdsRole(body: string): string! {
+  let role = trimSpace(body)
+  if (len(role) == 0 || len(role) > 256) {
+    fail ImdsPolicyError{ text = "invalid role name" }
+  }
+  let i = 0
+  while (i < len(role)) {
+    if (!isSessionNameByte(role[i])) {
+      fail ImdsPolicyError{ text = "invalid role name" }
+    }
+    i = i + 1
+  }
+  return role
+}
+
+fn imdsIdentity(body: string): AwsCredential! {
+  if (len(body) > imdsMaxBytes) {
+    fail newError("aws: imds: response exceeds the byte limit")
+  }
+  let json = jsonParse(body) catch _ {
+    fail newError("aws: imds: invalid credential JSON")
+  }
+  let expiration = parseRfc3339(containerField(json, "Expiration")?) catch _ {
+    fail newError("aws: imds: invalid Expiration timestamp")
+  }
+  return AwsCredential(
+    accessKeyId = containerField(json, "AccessKeyId")?,
+    secretAccessKey = containerField(json, "SecretAccessKey")?,
+    sessionToken = Option.Some(containerField(json, "Token")?),
+    expiration = Option.Some(expiration),
+  )?
+}
+
+fn imdsTokenValue(token: string): string! {
+  if (len(token) == 0 || len(token) > imdsMaxBytes) {
+    fail ImdsPolicyError{ text = "invalid metadata token" }
+  }
+  if (hasControl([]byte(token)) || hasEdgeSpace([]byte(token))) {
+    fail ImdsPolicyError{ text = "invalid metadata token" }
+  }
+  return token
+}
+
+fn imdsJitter(): int {
+  return Rand(randomU64()).intn(300)
+}
+
+fn imdsWarn() {
+  imdsLogger().warn().log("aws: imds: credential service unavailable; extending credential expiration")
+}
+
+// One IMDS provider. Share this instance through Credentials.Provider so its
+// v1 fallback state and the last successful identity survive refreshes.
+export class Imds {
+  lookup: (string) => Option<string>
+  profile: () => map<string, string>!
+  send: (string, string, string) => Response!
+  clock: () => int
+  jitter: () => int
+  warn: () => ()
+  mu: Mutex
+  useV1: bool
+  past: Option<AwsCredential>
+
+  init() {
+    this.lookup = imdsLookupEnv
+    this.profile = imdsProfile
+    this.send = imdsFetch
+    this.clock = wallNs
+    this.jitter = imdsJitter
+    this.warn = imdsWarn
+    this.mu = Mutex()
+    this.useV1 = false
+    this.past = Option<AwsCredential>.None
+  }
+
+  export resolve(): AwsCredential! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (imdsFlag(unwrapOr(this.lookup(imdsDisabled), ""))) {
+      fail ImdsPolicyError{ text = "metadata credentials are disabled" }
+    }
+    let profile = this.profile()?
+    let endpoint = imdsEndpoint(this.lookup, profile)?
+    let blocked = imdsFlag(
+      imdsSetting(this.lookup, profile, imdsV1Disabled, "ec2_metadata_v1_disabled"),
+    )
+    let credential = this.fetch(endpoint, blocked) catch e {
+      let (_, policy) = e.(ImdsPolicyError)
+      if (policy) {
+        fail e
+      }
+      match (this.past) {
+        Some(previous) => return this.remember(this.extend(previous))
+        None => fail e
+      }
+    }
+    match (credential.expiration) {
+      Some(expiration) => {
+        if (expiration.ns < this.clock()) {
+          credential = this.extend(credential)
+        }
+      }
+      None => {}
+    }
+    return this.remember(credential)
+  }
+
+  remember(credential: AwsCredential): AwsCredential {
+    this.past = Option.Some(credential)
+    return credential
+  }
+
+  extend(credential: AwsCredential): AwsCredential {
+    let seconds = this.jitter()
+    assert(seconds >= 0 && seconds < 300, "imds jitter must be 0..299 seconds")
+    let copy = AwsCredential{
+      accessKeyId = credential.accessKeyId, secretAccessKey = credential.secretAccessKey,
+      sessionToken = credential.sessionToken, accountId = credential.accountId,
+      expiration = Option.Some(Timestamp{ ns = this.clock() + (300 + seconds) * 1000000000 }),
+    }
+    this.warn()
+    return copy
+  }
+
+  fetch(endpoint: string, blocked: bool): AwsCredential! {
+    let token = ""
+    if (!this.useV1) {
+      token = this.token(endpoint)?
+    }
+    if (token == "" && blocked) {
+      fail ImdsPolicyError{ text = "IMDSv1 fallback is disabled" }
+    }
+    let role = imdsRole(this.get(endpoint + imdsPath, token)?)?
+    return imdsIdentity(this.get(endpoint + imdsPath + role, token)?)?
+  }
+
+  token(endpoint: string): string! {
+    let response = this.send("PUT", endpoint + "/latest/api/token", "") catch e {
+      let (_, timed) = e.(ImdsTimeout)
+      if (timed) {
+        this.useV1 = true
+      }
+      return ""
+    }
+    if (response.status == 400) {
+      fail newError("aws: imds: token request returned HTTP 400")
+    }
+    if (response.status == 403 || response.status == 404 || response.status == 405) {
+      this.useV1 = true
+    }
+    if (response.status != 200) {
+      return ""
+    }
+    return imdsTokenValue(response.body)?
+  }
+
+  get(url: string, token: string): string! {
+    let response = this.send("GET", url, token) catch _ {
+      fail newError("aws: imds: endpoint request failed")
+    }
+    if (response.status == 401) {
+      this.useV1 = false
+    }
+    if (response.status != 200) {
+      fail newError("aws: imds: endpoint returned HTTP ${response.status}")
+    }
+    if (len(response.body) > imdsMaxBytes) {
+      fail newError("aws: imds: response exceeds the byte limit")
+    }
+    return response.body
+  }
+}

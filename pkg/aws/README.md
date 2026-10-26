@@ -9,12 +9,12 @@ client to get a signature.
 
 ## Install
 
-`bit add bitlang.org/pkg/aws@v0.1.0` writes:
+`bit add bitlang.org/pkg/aws@v0.4.0` writes:
 
 ```json
 {
   "dependencies": {
-    "aws": "bitlang.org/pkg/aws@v0.1.0"
+    "aws": "bitlang.org/pkg/aws@v0.4.0"
   }
 }
 ```
@@ -42,7 +42,9 @@ Signature Version 4, checked against AWS's own published test suite
 
 Signing a request, presigning a URL, resolving credentials from the
 environment or a shared config profile, and finding a region's partition are
-in [`docs/`](docs/README.md).
+in [`docs/`](docs/README.md). `Imds().resolve()` supplies EC2 role credentials
+through `Credentials.Provider`; its instance-role example is in
+[`the credentials guide`](docs/guide.md#an-ec2-instance-role-for-inkwell).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).

@@ -1,0 +1,653 @@
+// IMDS protocol and stability vectors from smithy-typescript 5d104567b718.
+// Existing AWS test-module imports provide the HTTP server and credential cache.
+import { hasSuffix as imdsHasSuffix } from "std/strings"
+
+const imdsTestSecond: int = 1000000000
+const imdsTestRolePath = "/latest/meta-data/iam/security-credentials/"
+const imdsTestTokenPath = "/latest/api/token"
+const imdsTestIdentity = "{\"AccessKeyId\":\"IMDSKEY\",\"SecretAccessKey\":\"private-imds-secret\",\"Token\":\"private-imds-session\",\"Expiration\":\"2099-01-01T00:00:00Z\"}"
+
+class ImdsTestCall {
+  method: string,
+  url: string,
+  token: string,
+}
+
+class ImdsTestFake {
+  vars: map<string, string>
+  profileVars: map<string, string>
+  profileCalls: int
+  calls: []ImdsTestCall
+  tokenPlan: []int
+  tokens: int
+  roleStatus: int
+  identityStatus: int
+  body: string
+  role: string
+  nowNs: int
+  jitterSeconds: int
+  warnings: int
+  tokenBody: string
+
+  init() {
+    this.vars = map<string, string>()
+    this.profileVars = map<string, string>()
+    this.profileCalls = 0
+    this.calls = []ImdsTestCall(0)
+    this.tokenPlan = []int(0)
+    this.tokens = 0
+    this.roleStatus = 200
+    this.identityStatus = 200
+    this.body = imdsTestIdentity
+    this.role = "  inkwell-role\n"
+    this.nowNs = at("2026-01-01T00:00:00Z").ns
+    this.jitterSeconds = 0
+    this.warnings = 0
+    this.tokenBody = "private-imds-token"
+  }
+
+  lookup(key: string): Option<string> {
+    let (value, found) = this.vars[key]
+    if (!found) {
+      return Option.None
+    }
+    return Option.Some(value)
+  }
+
+  profile(): map<string, string>! {
+    this.profileCalls = this.profileCalls + 1
+    return this.profileVars
+  }
+
+  tokenReply(): Response! {
+    let status = 200
+    if (this.tokens < len(this.tokenPlan)) {
+      status = this.tokenPlan[this.tokens]
+    }
+    this.tokens = this.tokens + 1
+    if (status == -1) {
+      fail ImdsTimeout{}
+    }
+    if (status == -2) {
+      fail newError("private-imds-secret transport unavailable")
+    }
+    return respond(status, this.tokenBody)
+  }
+
+  send(method: string, url: string, token: string): Response! {
+    assert(len(this.calls) < 64, "IMDS request loop exceeded fixture bound")
+    this.calls = append(this.calls, ImdsTestCall{ method = method, url = url, token = token })
+    if (method == "PUT") {
+      return this.tokenReply()?
+    }
+    if (imdsHasSuffix(url, imdsTestRolePath)) {
+      return respond(this.roleStatus, this.role)
+    }
+    return respond(this.identityStatus, this.body)
+  }
+
+  provider(): Imds {
+    let p = Imds()
+    p.lookup = (key) => this.lookup(key)
+    p.profile = () => this.profile()
+    p.send = (method, url, token) => this.send(method, url, token)
+    p.clock = () => this.nowNs
+    p.jitter = () => this.jitterSeconds
+    p.warn = () => {
+      this.warnings = this.warnings + 1
+    }
+    return p
+  }
+}
+
+fn imdsTestResolve(p: Imds): AwsCredential {
+  return p.resolve() catch e {
+    panic(e.message())
+  }
+}
+
+fn imdsTestError(p: Imds): string {
+  p.resolve() catch e {
+    assert(!contains(e.message(), "private-imds"), "IMDS error exposed a secret or remote body")
+    return e.message()
+  }
+  return ""
+}
+
+fn imdsTestSigned(credential: AwsCredential) {
+  let signer = credential.sigV4Config("eu-west-1", "sts")
+  assert(signer.accessKeyId == "IMDSKEY", "provider access key lost")
+  assert(signer.secretKey == "private-imds-secret", "provider signing secret changed")
+  assert(signer.sessionToken == "private-imds-session", "provider session token lost")
+  assert(signer.region == "eu-west-1" && signer.service == "sts", "signing scope changed")
+}
+
+// A real in-process HTTP peer. Its mutex also protects main-test mutations.
+class ImdsTestWire {
+  mu: Mutex
+  requests: []Request
+  tokenStatus: int
+  roleStatus: int
+  identityStatus: int
+  body: string
+  tokenDelay: int
+  location: string
+
+  init() {
+    this.mu = Mutex()
+    this.requests = []Request(0)
+    this.tokenStatus = 200
+    this.roleStatus = 200
+    this.identityStatus = 200
+    this.body = imdsTestIdentity
+    this.tokenDelay = 0
+    this.location = ""
+  }
+
+  answer(request: Request): Response {
+    this.mu.lock()
+    assert(len(this.requests) < 64, "HTTP fixture exceeded request budget")
+    this.requests = append(this.requests, request)
+    let status = this.identityStatus
+    let body = this.body
+    let delay = 0
+    let location = this.location
+    if (request.path == imdsTestTokenPath) {
+      status = this.tokenStatus
+      body = "private-imds-token"
+      delay = this.tokenDelay
+    }
+    if (request.path == imdsTestRolePath) {
+      status = this.roleStatus
+      body = "  inkwell-role\n"
+    }
+    this.mu.unlock()
+    if (delay > 0) {
+      sleep(delay * Millisecond)
+    }
+    let response = respond(status, body)
+    if (location != "") {
+      response.setHeader("Location", location) catch e {
+        panic(e.message())
+      }
+    }
+    return response
+  }
+
+  count(): int {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return len(this.requests)
+  }
+
+  request(index: int): Request {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.requests[index]
+  }
+
+  failIdentity(status: int) {
+    this.mu.lock()
+    this.identityStatus = status
+    this.mu.unlock()
+  }
+}
+
+fn imdsTestServe(server: Server, wire: ImdsTestWire) {
+  listenAndServeOn(server, (request) => wire.answer(request)) catch _ {
+    return
+  }
+}
+
+fn imdsTestServer(wire: ImdsTestWire): (Server, string) {
+  let server = serve("127.0.0.1", 0) catch e {
+    panic(e.message())
+  }
+  let port = server.port() catch e {
+    server.close()
+    panic(e.message())
+  }
+  spawn imdsTestServe(server, wire)
+  return (server, "http://127.0.0.1:${port}")
+}
+
+fn imdsTestWireProvider(endpoint: string): (ImdsTestFake, Imds) {
+  let fake = ImdsTestFake()
+  fake.vars["AWS_EC2_METADATA_SERVICE_ENDPOINT"] = endpoint
+  let p = fake.provider()
+  p.send = imdsFetch
+  return (fake, p)
+}
+
+test "IMDS fake server 1 of 5: token PUT TTL 21600 and both authenticated GETs compose with Provider cache and signer" {
+  let wire = ImdsTestWire()
+  let (server, endpoint) = imdsTestServer(wire)
+  defer server.close()
+  let (fake, p) = imdsTestWireProvider(endpoint)
+  let cache = Credentials.Provider(() => p.resolve()).resolver() catch e {
+    panic(e.message())
+  }
+  cache.clock = () => fake.nowNs
+  let credential = cache.resolve() catch e {
+    panic(e.message())
+  }
+  imdsTestSigned(credential)
+  assert(wire.count() == 3, "v2 needs exactly PUT, role GET, credentials GET")
+  let token = wire.request(0)
+  assert(token.method == "PUT" && token.path == imdsTestTokenPath, "wrong token request")
+  assert(
+    contains(toLower(token.headers), "x-aws-ec2-metadata-token-ttl-seconds: 21600"),
+    "token TTL header",
+  )
+  for i of [1, 2] {
+    let request = wire.request(i)
+    assert(request.method == "GET", "metadata request must use GET")
+    assert(
+      contains(toLower(request.headers), "x-aws-ec2-metadata-token: private-imds-token"),
+      "GET lost v2 token",
+    )
+  }
+  assert(wire.request(1).path == imdsTestRolePath, "role path")
+  assert(wire.request(2).path == imdsTestRolePath + "inkwell-role", "trimmed role path")
+  cache.resolve() catch e {
+    panic(e.message())
+  }
+  assert(wire.count() == 3, "real credential cache should reuse fresh credential")
+}
+
+test "IMDS fake server 2 of 5: token 403 enters permanent v1 fallback" {
+  let wire = ImdsTestWire()
+  wire.tokenStatus = 403
+  let (server, endpoint) = imdsTestServer(wire)
+  defer server.close()
+  let (_, p) = imdsTestWireProvider(endpoint)
+  imdsTestSigned(imdsTestResolve(p))
+  let _ = imdsTestResolve(p)
+  assert(wire.count() == 5 && p.useV1, "v1 fallback should skip the second PUT")
+  for i of [1, 2, 3, 4] {
+    assert(
+      !contains(toLower(wire.request(i).headers), "x-aws-ec2-metadata-token:"),
+      "v1 request sent a token",
+    )
+  }
+}
+
+test "IMDS fake server 3 of 5: v1 disabled refuses after token error without role or credential requests" {
+  let wire = ImdsTestWire()
+  wire.tokenStatus = 403
+  let (server, endpoint) = imdsTestServer(wire)
+  defer server.close()
+  let (fake, p) = imdsTestWireProvider(endpoint)
+  fake.vars["AWS_EC2_METADATA_V1_DISABLED"] = "true"
+  assert(imdsTestError(p) != "", "v1 disabled must fail closed")
+  assert(wire.count() == 1, "v1 disabled must not GET metadata")
+}
+
+fn imdsTestExtension(credential: AwsCredential, clock: int, seconds: int) {
+  match (credential.expiration) {
+    Some(expiry) => assert(
+      expiry.ns == clock + seconds * imdsTestSecond,
+      "wrong static-stability window",
+    )
+    None => panic("static-stability credential lost expiration")
+  }
+}
+
+test "IMDS fake server 4 of 5: failed refresh serves previous identity with a bounded extension" {
+  let wire = ImdsTestWire()
+  let (server, endpoint) = imdsTestServer(wire)
+  defer server.close()
+  let (fake, p) = imdsTestWireProvider(endpoint)
+  let cache = Credentials.Provider(() => p.resolve()).resolver() catch e {
+    panic(e.message())
+  }
+  cache.clock = () => fake.nowNs
+  let first = cache.resolve() catch e {
+    panic(e.message())
+  }
+  fake.nowNs = at("2100-01-01T00:00:00Z").ns
+  fake.jitterSeconds = 299
+  wire.failIdentity(503)
+  let extended = cache.resolve(Refresh.Force) catch e {
+    panic(e.message())
+  }
+  imdsTestSigned(extended)
+  imdsTestExtension(extended, fake.nowNs, 599)
+  match (first.expiration) {
+    Some(expiry) => assert(
+      expiry.ns == at("2099-01-01T00:00:00Z").ns,
+      "previous credential was mutated",
+    )
+    None => panic("previous credential lost expiration")
+  }
+  assert(wire.count() == 6 && fake.warnings == 1, "refresh attempted once then warned")
+}
+
+test "IMDS fake server 5 of 5: disabled means zero requests and wins over prior stability credentials" {
+  let wire = ImdsTestWire()
+  let (server, endpoint) = imdsTestServer(wire)
+  defer server.close()
+  let (fake, p) = imdsTestWireProvider(endpoint)
+  fake.vars["AWS_EC2_METADATA_DISABLED"] = "true"
+  assert(imdsTestError(p) != "" && wire.count() == 0, "disabled provider contacted IMDS")
+  assert(fake.profileCalls == 0, "disabled provider read profile before refusing")
+  fake.vars["AWS_EC2_METADATA_DISABLED"] = "false"
+  let _ = imdsTestResolve(p)
+  fake.vars["AWS_EC2_METADATA_DISABLED"] = "true"
+  assert(
+    imdsTestError(p) != "" && wire.count() == 3,
+    "disabled returned previous credential or made a request",
+  )
+  assert(fake.warnings == 0, "disabled entered stability fallback")
+}
+
+fn imdsTestPermanent(status: int) {
+  let fake = ImdsTestFake()
+  fake.tokenPlan = [status, 200]
+  let p = fake.provider()
+  let _ = imdsTestResolve(p)
+  let _ = imdsTestResolve(p)
+  assert(len(fake.calls) == 5 && fake.tokens == 1 && p.useV1, "permanent fallback retried token")
+}
+
+test "IMDS pinned token errors: 400 is hard, 403 404 405 and typed timeout permanently disable PUT" {
+  let bad = ImdsTestFake()
+  bad.tokenPlan = [400]
+  assert(
+    imdsTestError(bad.provider()) != "" && len(bad.calls) == 1,
+    "400 must not fall back or retry",
+  )
+  for status of [403, 404, 405, -1] {
+    imdsTestPermanent(status)
+  }
+}
+
+test "IMDS other token failures permit v1 for one call only" {
+  for status of [406, 500, -2] {
+    let fake = ImdsTestFake()
+    fake.tokenPlan = [status, 200]
+    let p = fake.provider()
+    let _ = imdsTestResolve(p)
+    let _ = imdsTestResolve(p)
+    assert(
+      len(fake.calls) == 6 && fake.tokens == 2 && !p.useV1,
+      "per-call fallback became permanent",
+    )
+    assert(fake.calls[3].method == "PUT", "second call must attempt v2")
+  }
+}
+
+fn imdsTestUnauthorized(credentials: bool) {
+  let fake = ImdsTestFake()
+  fake.tokenPlan = [403, 200]
+  let p = fake.provider()
+  let _ = imdsTestResolve(p)
+  if (credentials) {
+    fake.identityStatus = 401
+  } else {
+    fake.roleStatus = 401
+  }
+  let attempts = len(fake.calls)
+  let _ = imdsTestResolve(p)
+  let expected = 1
+  if (credentials) {
+    expected = 2
+  }
+  assert(len(fake.calls) == attempts + expected, "GET 401 retried within the same call")
+  assert(!p.useV1, "GET 401 must re-enable token fetch")
+  let before = len(fake.calls)
+  fake.roleStatus = 200
+  fake.identityStatus = 200
+  let _ = imdsTestResolve(p)
+  assert(fake.calls[before].method == "PUT" && fake.tokens == 2, "next call did not retry token")
+}
+
+test "IMDS role or credential GET 401 resets permanent v1 mode without a same-call retry" {
+  imdsTestUnauthorized(false)
+  imdsTestUnauthorized(true)
+}
+
+test "IMDS default retry budget makes one attempt per metadata GET" {
+  for credentialError of [false, true] {
+    let fake = ImdsTestFake()
+    if (credentialError) {
+      fake.identityStatus = 503
+    } else {
+      fake.roleStatus = 503
+    }
+    assert(
+      imdsTestError(fake.provider()) != "",
+      "first-fetch GET failure must not invent credentials",
+    )
+    let expected = 2
+    if (credentialError) {
+      expected = 3
+    }
+    assert(len(fake.calls) == expected && fake.tokens == 1, "default zero-retry bound violated")
+  }
+}
+
+fn imdsTestEndpoint(fake: ImdsTestFake): string {
+  return imdsEndpoint((key) => fake.lookup(key), fake.profileVars) catch e {
+    panic(e.message())
+  }
+}
+
+test "IMDS endpoint precedence covers default IPv4 IPv6 profile and explicit overrides" {
+  let fake = ImdsTestFake()
+  assert(imdsTestEndpoint(fake) == "http://169.254.169.254", "default IPv4 endpoint")
+  fake.profileVars["ec2_metadata_service_endpoint_mode"] = "IPv6"
+  assert(imdsTestEndpoint(fake) == "http://[fd00:ec2::254]", "profile IPv6 mode")
+  fake.vars["AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE"] = "IPv6"
+  assert(imdsTestEndpoint(fake) == "http://[fd00:ec2::254]", "environment IPv6 mode")
+  fake.vars["AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE"] = "IPv4"
+  assert(imdsTestEndpoint(fake) == "http://169.254.169.254", "environment mode precedence")
+  fake.profileVars["ec2_metadata_service_endpoint"] = "http://profile.example:8181"
+  assert(imdsTestEndpoint(fake) == "http://profile.example:8181", "endpoint override precedes mode")
+  fake.vars["AWS_EC2_METADATA_SERVICE_ENDPOINT"] = "http://[::1]:8182"
+  assert(imdsTestEndpoint(fake) == "http://[::1]:8182", "environment override precedes profile")
+  fake.vars["AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE"] = "invalid"
+  assert(
+    imdsTestEndpoint(fake) == "http://[::1]:8182",
+    "explicit endpoint must bypass invalid mode",
+  )
+}
+
+test "IMDS malformed endpoints fail before network even with a previous credential" {
+  for endpoint of [
+    "http://user:private-imds@localhost",
+    "http://host/?query",
+    "http://host/#fragment",
+    "file:///metadata",
+    "http://host:65536",
+    "http://bad\r\nInjected: value",
+  ] {
+    let fake = ImdsTestFake()
+    let p = fake.provider()
+    let _ = imdsTestResolve(p)
+    fake.calls = []ImdsTestCall(0)
+    fake.vars["AWS_EC2_METADATA_SERVICE_ENDPOINT"] = endpoint
+    assert(
+      imdsTestError(p) != "" && len(fake.calls) == 0,
+      "bad endpoint bypassed configuration policy",
+    )
+  }
+}
+
+test "IMDS v1 blocking precedence and policy cannot be bypassed by static stability" {
+  let fake = ImdsTestFake()
+  let p = fake.provider()
+  let _ = imdsTestResolve(p)
+  fake.tokenPlan = [200, 403]
+  fake.profileVars["ec2_metadata_v1_disabled"] = "true"
+  assert(imdsTestError(p) != "", "previous credentials bypassed v1 restriction")
+  assert(len(fake.calls) == 4, "v1 block must stop before GET")
+  fake.vars["AWS_EC2_METADATA_V1_DISABLED"] = "false"
+  let _ = imdsTestResolve(p)
+  assert(len(fake.calls) == 6, "environment false should override profile v1 block")
+}
+
+test "IMDS absent v1 environment uses profile while present empty explicitly permits v1" {
+  let absent = ImdsTestFake()
+  absent.profileVars["ec2_metadata_v1_disabled"] = "true"
+  absent.tokenPlan = [403]
+  assert(
+    imdsTestError(absent.provider()) != "",
+    "missing environment must keep profile restriction",
+  )
+  assert(len(absent.calls) == 1, "profile restriction allowed metadata GETs")
+  let empty = ImdsTestFake()
+  empty.profileVars["ec2_metadata_v1_disabled"] = "true"
+  empty.vars["AWS_EC2_METADATA_V1_DISABLED"] = ""
+  empty.tokenPlan = [403]
+  imdsTestSigned(imdsTestResolve(empty.provider()))
+  assert(len(empty.calls) == 3, "present empty environment must override the profile restriction")
+}
+
+test "IMDS empty endpoint overrides profile and empty endpoint mode is not missing" {
+  let fake = ImdsTestFake()
+  fake.profileVars["ec2_metadata_service_endpoint"] = "http://profile.example:8181"
+  fake.vars["AWS_EC2_METADATA_SERVICE_ENDPOINT"] = ""
+  assert(
+    imdsTestEndpoint(fake) == "http://169.254.169.254",
+    "empty endpoint fell back to profile endpoint",
+  )
+  fake.profileVars["ec2_metadata_service_endpoint_mode"] = "IPv6"
+  fake.vars["AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE"] = ""
+  assert(imdsTestError(fake.provider()) != "", "present empty endpoint mode must be rejected")
+  assert(len(fake.calls) == 0, "invalid mode contacted metadata endpoint")
+}
+
+test "IMDS expired first success and repeated refresh failures extend only from the fake clock" {
+  for jitter of [0, 299] {
+    let fake = ImdsTestFake()
+    fake.nowNs = at("2100-01-01T00:00:00Z").ns
+    fake.jitterSeconds = jitter
+    let p = fake.provider()
+    let credential = imdsTestResolve(p)
+    imdsTestExtension(credential, fake.nowNs, 300 + jitter)
+    assert(fake.warnings == 1, "expired first response must warn once")
+    fake.nowNs = fake.nowNs + 20 * imdsTestSecond
+    fake.identityStatus = 503
+    credential = imdsTestResolve(p)
+    imdsTestExtension(credential, fake.nowNs, 300 + jitter)
+    imdsTestSigned(credential)
+    assert(fake.warnings == 2 && len(fake.calls) == 6, "failed refresh must attempt then extend")
+  }
+}
+
+test "IMDS malformed tokens cannot become headers or bypass policy through past credentials" {
+  for token of ["", " leading", "trailing ", "private-imds\r\nInjected: yes", repeat("x", 16385)] {
+    let fake = ImdsTestFake()
+    let p = fake.provider()
+    let _ = imdsTestResolve(p)
+    fake.tokenBody = token
+    assert(imdsTestError(p) != "", "malformed token returned prior credential")
+    assert(
+      len(fake.calls) == 4 && fake.warnings == 0,
+      "invalid token reached metadata GET or stability fallback",
+    )
+  }
+}
+
+test "IMDS role names are trimmed and bounded without accepting path or header injection" {
+  for role of [
+    "",
+    "../private-imds",
+    "role/private-imds",
+    "private-imds\r\nInjected: yes",
+    repeat("r", 257),
+  ] {
+    let fake = ImdsTestFake()
+    let p = fake.provider()
+    let _ = imdsTestResolve(p)
+    fake.role = role
+    assert(imdsTestError(p) != "", "malformed role returned prior credential")
+    assert(
+      len(fake.calls) == 5 && fake.warnings == 0,
+      "invalid role reached credentials GET or stability fallback",
+    )
+  }
+  let allowed = ImdsTestFake()
+  allowed.role = "  Role_+=,.@-09\n"
+  let _ = imdsTestResolve(allowed.provider())
+  assert(imdsHasSuffix(allowed.calls[2].url, "/Role_+=,.@-09"), "IAM role alphabet changed")
+}
+
+test "IMDS first credential response requires valid nonempty identity fields and expiration" {
+  let invalid = [
+    "private-imds invalid JSON", "{}",
+    "{\"AccessKeyId\":1,\"SecretAccessKey\":\"private-imds\",\"Token\":\"t\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "{\"AccessKeyId\":\"k\",\"SecretAccessKey\":\"\",\"Token\":\"t\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "{\"AccessKeyId\":\"k\",\"SecretAccessKey\":\"private-imds\",\"Token\":\"\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "{\"AccessKeyId\":\"k\",\"SecretAccessKey\":\"private-imds\",\"Token\":\"t\",\"Expiration\":\"invalid\"}",
+    repeat("x", 16385),
+  ]
+  for body of invalid {
+    let fake = ImdsTestFake()
+    fake.body = body
+    assert(imdsTestError(fake.provider()) != "", "malformed first response produced credentials")
+    assert(
+      len(fake.calls) == 3 && fake.warnings == 0,
+      "invalid response retried or invented stability credentials",
+    )
+  }
+}
+
+test "IMDS real HTTP transport refuses credential redirects and oversized responses" {
+  for redirect of [true, false] {
+    let wire = ImdsTestWire()
+    if (redirect) {
+      wire.identityStatus = 302
+      wire.location = "/redirected"
+    } else {
+      wire.body = repeat("x", 16385)
+    }
+    let (server, endpoint) = imdsTestServer(wire)
+    defer server.close()
+    let (_, p) = imdsTestWireProvider(endpoint)
+    assert(imdsTestError(p) != "", "redirect or oversized response accepted")
+    assert(wire.count() == 3, "transport followed a redirect or retried")
+  }
+}
+
+test "IMDS real HTTP token timeout uses the one second budget and permanent v1 fallback" {
+  let wire = ImdsTestWire()
+  wire.tokenDelay = 1100
+  let (server, endpoint) = imdsTestServer(wire)
+  defer server.close()
+  let (_, p) = imdsTestWireProvider(endpoint)
+  imdsTestSigned(imdsTestResolve(p))
+  let _ = imdsTestResolve(p)
+  assert(imdsTimeoutMs == 1000, "pinned SDK timeout changed")
+  assert(wire.count() == 5 && p.useV1, "timeout retried PUT instead of using permanent v1 fallback")
+}
+
+test "IMDS HTTP 400 after first success extends the prior identity without v1 requests" {
+  let fake = ImdsTestFake()
+  let p = fake.provider()
+  let previous = imdsTestResolve(p)
+  previous.accountId = Option.Some("123456789012")
+  p.past = Option.Some(previous)
+  fake.tokenPlan = [200, 400]
+  let extended = imdsTestResolve(p)
+  imdsTestExtension(extended, fake.nowNs, 300)
+  imdsTestSigned(extended)
+  match (extended.accountId) {
+    Some(account) => assert(account == "123456789012", "extension lost account identity")
+    None => panic("extension lost account identity")
+  }
+  assert(fake.warnings == 1 && len(fake.calls) == 4, "400 stability path fetched v1 or retried")
+}
+
+test "IMDS disabled environment values use exact false exception before profile or network" {
+  for value of ["true", "TRUE", "False", "0", "disabled"] {
+    let fake = ImdsTestFake()
+    fake.vars["AWS_EC2_METADATA_DISABLED"] = value
+    assert(imdsTestError(fake.provider()) != "", "non-false disabled value was ignored")
+    assert(
+      fake.profileCalls == 0 && len(fake.calls) == 0,
+      "disabled read profile or requested metadata",
+    )
+  }
+}

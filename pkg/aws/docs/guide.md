@@ -169,6 +169,60 @@ has an 8 KiB budget; token files and responses have a 16 KiB budget each.
 These are this provider's resource limits. Errors name fields or HTTP status
 without copying tokens, credentials, response bodies or endpoint URLs.
 
+### An EC2 instance role for Inkwell
+
+On an EC2 instance with a role attached, Inkwell can ask the instance metadata
+service for its temporary identity. Keep one `Imds` instance across refreshes
+so it remembers the last successful identity and whether the endpoint needs
+IMDSv1 fallback:
+
+```bit
+import { Credentials, Imds, Refresh } from "aws"
+
+fn main(): ()! {
+  let instance = Imds()
+  let identity = Credentials.Provider(() => instance.resolve()).resolver()?
+  println(identity.resolve(Refresh.IfNeeded)?.show())
+  println(identity.resolve(Refresh.Force)?.show())
+  return
+}
+```
+
+`Imds.resolve()` requests an IMDSv2 token with a six-hour lifetime, then the
+role name and its credentials. Each request has a one-second deadline and
+no retries, the pinned SDK defaults. Responses have a 16 KiB budget, and
+redirects never carry a metadata token to another endpoint.
+
+Set `AWS_EC2_METADATA_DISABLED=true` to prevent requests and cached fallback.
+`AWS_EC2_METADATA_SERVICE_ENDPOINT` overrides the endpoint; otherwise
+`AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE` selects `IPv4` (the default,
+`169.254.169.254`) or `IPv6` (`fd00:ec2::254`). The selected shared profile
+can supply `ec2_metadata_service_endpoint` and
+`ec2_metadata_service_endpoint_mode`. A present environment variable wins,
+including an empty value: an empty endpoint selects the endpoint mode instead
+of the profile endpoint; an empty mode is invalid.
+An explicit endpoint uses HTTP or HTTPS with no userinfo, query or fragment.
+The metadata paths replace any path in that endpoint.
+
+A token timeout or HTTP 403, 404 or 405 enables IMDSv1 on subsequent calls.
+Other token failures permit fallback for that call; HTTP 400 fails.
+HTTP 401 on either metadata GET makes the next call request a token again.
+Set `AWS_EC2_METADATA_V1_DISABLED=true`, or the profile's
+`ec2_metadata_v1_disabled=true`, to refuse this fallback. These controls
+also refuse it when an earlier call obtained an identity. An absent
+`AWS_EC2_METADATA_V1_DISABLED` uses the profile setting; a present empty value
+explicitly permits fallback even when the profile disables it.
+
+When refresh fails after a success, or the service returns expired
+credentials, the provider warns and returns a copy with its expiration
+extended by five minutes plus a random zero to 299 seconds. The previous
+credential stays unchanged. Errors and warnings never print credentials,
+response bodies, metadata tokens or endpoint URLs.
+
+This provider composes explicitly through `Credentials.Provider`.
+`Credentials.Default` and the S3 client's static configuration do not select
+it automatically. Default-chain and S3 client integration are separate work.
+
 ## Signing a request
 
 A signed request needs the credential's view for one region and service, and
