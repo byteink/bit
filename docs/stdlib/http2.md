@@ -343,67 +343,183 @@ The inverse of `huffmanEncode`. Fails on invalid Huffman-coded input.
 
 ## The frame header
 
-See the [frame codec reference](http2-frames.md#the-frame-header).
+### `FrameHeader` ([reference](http2-frames.md#the-frame-header))
+
+### `Frame` ([reference](http2-frames.md#the-frame-header))
+
+### `encodeFrameHeader(h: FrameHeader): []byte!` ([reference](http2-frames.md#the-frame-header))
+
+### `decodeFrameHeader(b: []byte): FrameHeader!` ([reference](http2-frames.md#the-frame-header))
+
+### `readFrame(buf: []byte, maxFrameSize: int): Frame!` ([reference](http2-frames.md#the-frame-header))
 
 ## Frame types
 
-See the [frame codec reference](http2-frames.md#frame-types).
+### `frameData: int` ([reference](http2-frames.md#frame-types))
+
+### `frameHeaders: int` ([reference](http2-frames.md#frame-types))
+
+### `framePriority: int` ([reference](http2-frames.md#frame-types))
+
+### `frameRstStream: int` ([reference](http2-frames.md#frame-types))
+
+### `frameSettings: int` ([reference](http2-frames.md#frame-types))
+
+### `framePushPromise: int` ([reference](http2-frames.md#frame-types))
+
+### `framePing: int` ([reference](http2-frames.md#frame-types))
+
+### `frameGoaway: int` ([reference](http2-frames.md#frame-types))
+
+### `frameWindowUpdate: int` ([reference](http2-frames.md#frame-types))
+
+### `frameContinuation: int` ([reference](http2-frames.md#frame-types))
 
 ## Frame flags
 
-See the [frame codec reference](http2-frames.md#frame-flags).
+### `flagEndStream: int` ([reference](http2-frames.md#frame-flags))
+
+### `flagEndHeaders: int` ([reference](http2-frames.md#frame-flags))
+
+### `flagPadded: int` ([reference](http2-frames.md#frame-flags))
+
+### `flagPriority: int` ([reference](http2-frames.md#frame-flags))
+
+### `flagAck: int` ([reference](http2-frames.md#frame-flags))
 
 ## Settings parameter ids
 
-See the [frame codec reference](http2-frames.md#settings-parameter-ids).
+### `settingsHeaderTableSize: int` ([reference](http2-frames.md#settings-parameter-ids))
+
+### `settingsEnablePush: int` ([reference](http2-frames.md#settings-parameter-ids))
+
+### `settingsMaxConcurrentStreams: int` ([reference](http2-frames.md#settings-parameter-ids))
+
+### `settingsInitialWindowSize: int` ([reference](http2-frames.md#settings-parameter-ids))
+
+### `settingsMaxFrameSize: int` ([reference](http2-frames.md#settings-parameter-ids))
+
+### `settingsMaxHeaderListSize: int` ([reference](http2-frames.md#settings-parameter-ids))
+
+### `settingsEnableConnectProtocol: int` ([reference](http2-frames.md#settings-parameter-ids))
 
 ## Frame-size bounds
 
-See the [frame codec reference](http2-frames.md#frame-size-bounds).
+### `defaultMaxFrameSize: int` ([reference](http2-frames.md#frame-size-bounds))
+
+### `maxMaxFrameSize: int` ([reference](http2-frames.md#frame-size-bounds))
 
 ## Error codes
 
-See the [frame codec reference](http2-frames.md#error-codes).
+### `errorNoError: int` ([reference](http2-frames.md#error-codes))
+
+### `errorProtocolError: int` ([reference](http2-frames.md#error-codes))
+
+### `errorInternalError: int` ([reference](http2-frames.md#error-codes))
+
+### `errorFlowControlError: int` ([reference](http2-frames.md#error-codes))
+
+### `errorSettingsTimeout: int` ([reference](http2-frames.md#error-codes))
+
+### `errorStreamClosed: int` ([reference](http2-frames.md#error-codes))
+
+### `errorFrameSizeError: int` ([reference](http2-frames.md#error-codes))
+
+### `errorRefusedStream: int` ([reference](http2-frames.md#error-codes))
+
+### `errorCancel: int` ([reference](http2-frames.md#error-codes))
+
+### `errorCompressionError: int` ([reference](http2-frames.md#error-codes))
+
+### `errorConnectError: int` ([reference](http2-frames.md#error-codes))
+
+### `errorEnhanceYourCalm: int` ([reference](http2-frames.md#error-codes))
+
+### `errorInadequateSecurity: int` ([reference](http2-frames.md#error-codes))
+
+### `errorHttp11Required: int` ([reference](http2-frames.md#error-codes))
 
 ## DATA frames
 
-See the [frame codec reference](http2-frames.md#data-frames).
+### `DataFrame` ([reference](http2-frames.md#data-frames))
+
+### `encodeData(f: DataFrame): []byte!` ([reference](http2-frames.md#data-frames))
+
+### `decodeData(f: Frame): DataFrame!` ([reference](http2-frames.md#data-frames))
 
 ## HEADERS frames
 
-See the [frame codec reference](http2-frames.md#headers-frames).
+### `HeadersFrame` ([reference](http2-frames.md#headers-frames))
+
+### `encodeHeaders(f: HeadersFrame): []byte!` ([reference](http2-frames.md#headers-frames))
+
+### `decodeHeaders(f: Frame): HeadersFrame!` ([reference](http2-frames.md#headers-frames))
 
 ## PRIORITY frames
 
-See the [frame codec reference](http2-frames.md#priority-frames).
+### `PriorityFrame` ([reference](http2-frames.md#priority-frames))
+
+### `encodePriority(f: PriorityFrame): []byte!` ([reference](http2-frames.md#priority-frames))
+
+### `decodePriority(f: Frame): PriorityFrame!` ([reference](http2-frames.md#priority-frames))
 
 ## RST_STREAM frames
 
-See the [frame codec reference](http2-frames.md#rst_stream-frames).
+### `RstStreamFrame` ([reference](http2-frames.md#rst_stream-frames))
+
+### `encodeRstStream(f: RstStreamFrame): []byte!` ([reference](http2-frames.md#rst_stream-frames))
+
+### `decodeRstStream(f: Frame): RstStreamFrame!` ([reference](http2-frames.md#rst_stream-frames))
 
 ## SETTINGS frames
 
-See the [frame codec reference](http2-frames.md#settings-frames).
+### `Setting` ([reference](http2-frames.md#settings-frames))
+
+### `SettingsFrame` ([reference](http2-frames.md#settings-frames))
+
+### `encodeSettings(f: SettingsFrame): []byte!` ([reference](http2-frames.md#settings-frames))
+
+### `decodeSettings(f: Frame): SettingsFrame!` ([reference](http2-frames.md#settings-frames))
 
 ## PUSH_PROMISE frames
 
-See the [frame codec reference](http2-frames.md#push_promise-frames).
+### `PushPromiseFrame` ([reference](http2-frames.md#push_promise-frames))
+
+### `encodePushPromise(f: PushPromiseFrame): []byte!` ([reference](http2-frames.md#push_promise-frames))
+
+### `decodePushPromise(f: Frame): PushPromiseFrame!` ([reference](http2-frames.md#push_promise-frames))
 
 ## PING frames
 
-See the [frame codec reference](http2-frames.md#ping-frames).
+### `PingFrame` ([reference](http2-frames.md#ping-frames))
+
+### `encodePing(f: PingFrame): []byte!` ([reference](http2-frames.md#ping-frames))
+
+### `decodePing(f: Frame): PingFrame!` ([reference](http2-frames.md#ping-frames))
 
 ## GOAWAY frames
 
-See the [frame codec reference](http2-frames.md#goaway-frames).
+### `GoawayFrame` ([reference](http2-frames.md#goaway-frames))
+
+### `encodeGoaway(f: GoawayFrame): []byte!` ([reference](http2-frames.md#goaway-frames))
+
+### `decodeGoaway(f: Frame): GoawayFrame!` ([reference](http2-frames.md#goaway-frames))
 
 ## WINDOW_UPDATE frames
 
-See the [frame codec reference](http2-frames.md#window_update-frames).
+### `WindowUpdateFrame` ([reference](http2-frames.md#window_update-frames))
+
+### `encodeWindowUpdate(f: WindowUpdateFrame): []byte!` ([reference](http2-frames.md#window_update-frames))
+
+### `decodeWindowUpdate(f: Frame): WindowUpdateFrame!` ([reference](http2-frames.md#window_update-frames))
 
 ## CONTINUATION frames
 
-See the [frame codec reference](http2-frames.md#continuation-frames).
+### `ContinuationFrame` ([reference](http2-frames.md#continuation-frames))
+
+### `encodeContinuation(f: ContinuationFrame): []byte!` ([reference](http2-frames.md#continuation-frames))
+
+### `decodeContinuation(f: Frame): ContinuationFrame!` ([reference](http2-frames.md#continuation-frames))
 
 ## The connection engine
 
@@ -620,3 +736,19 @@ ended.
 
 One take from a stream's body: `data` is the bytes taken, `eof` says the peer
 has ended the stream.
+
+### `Stream.openBodyStream(status: int, headers: []HeaderField = []HeaderField(0)): H2BodyStream!`
+
+Opens the handler-owned response writer shown in [Streaming a response](#streaming-a-response).
+
+### `H2BodyStream`
+
+One response writer; use one handler thread and finish it before returning.
+
+### `H2BodyStream.write(data: []byte): ()!`
+
+Sends flow-controlled DATA, as the `event` function above shows. Empty writes do nothing; writes after close fail.
+
+### `H2BodyStream.close(): ()!`
+
+Ends the response body. Repeated closes are safe; connection and stream failures still propagate.

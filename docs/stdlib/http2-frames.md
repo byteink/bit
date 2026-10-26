@@ -5,6 +5,132 @@ Use these codecs when building or inspecting an HTTP/2 peer.
 
 <!-- doctest: per-block -->
 
+## Inspecting a draft response
+
+To inspect a peer, first decode its frame header, then decode the matching
+payload. This example round-trips the frame shapes an inspector can receive.
+The header fragments contain opaque compressed bytes; use the connection
+engine when you need it to manage compression and stream state for you.
+
+```bit
+import {
+  FrameHeader, Frame, DataFrame, HeadersFrame, PriorityFrame, RstStreamFrame,
+  Setting, SettingsFrame, PushPromiseFrame, PingFrame, GoawayFrame,
+  WindowUpdateFrame, ContinuationFrame, encodeFrameHeader, decodeFrameHeader,
+  readFrame, encodeData, decodeData, encodeHeaders, decodeHeaders,
+  encodePriority, decodePriority, encodeRstStream, decodeRstStream,
+  encodeSettings, decodeSettings, encodePushPromise, decodePushPromise,
+  encodePing, decodePing, encodeGoaway, decodeGoaway, encodeWindowUpdate,
+  decodeWindowUpdate, encodeContinuation, decodeContinuation,
+  frameData, frameHeaders, framePriority, frameRstStream, frameSettings,
+  framePushPromise, framePing, frameGoaway, frameWindowUpdate, frameContinuation,
+  flagEndStream, flagEndHeaders, flagPadded, flagPriority, flagAck,
+  settingsHeaderTableSize, settingsEnablePush, settingsMaxConcurrentStreams,
+  settingsInitialWindowSize, settingsMaxFrameSize, settingsMaxHeaderListSize,
+  settingsEnableConnectProtocol, defaultMaxFrameSize, maxMaxFrameSize,
+  errorNoError, errorProtocolError, errorInternalError, errorFlowControlError,
+  errorSettingsTimeout, errorStreamClosed, errorFrameSizeError, errorRefusedStream,
+  errorCancel, errorCompressionError, errorConnectError, errorEnhanceYourCalm,
+  errorInadequateSecurity, errorHttp11Required,
+} from "std/http2"
+
+fn knownFrame(frame: Frame): bool {
+  let types = [
+    frameData, frameHeaders, framePriority, frameRstStream, frameSettings,
+    framePushPromise, framePing, frameGoaway, frameWindowUpdate, frameContinuation,
+  ]
+  for code of types {
+    if (frame.header.ftype == code) {
+      return true
+    }
+  }
+  return false
+}
+
+fn inspectDraft(): ()! {
+  let header = FrameHeader{ length = 5, ftype = frameData, flags = flagEndStream, streamId = 1 }
+  assert(decodeFrameHeader(encodeFrameHeader(header)?)?.streamId == 1)
+  let data = DataFrame{ streamId = 1, data = []byte("draft"), endStream = true, padLength = -1 }
+  let frame = readFrame(encodeData(data)?, defaultMaxFrameSize)?
+  assert(knownFrame(frame) && string(decodeData(frame)?.data) == "draft")
+  let headers = HeadersFrame{
+    streamId = 1, blockFragment = []byte(0), endStream = false,
+    endHeaders = true, padLength = -1, hasPriority = false, exclusive = false,
+    streamDependency = 0, weight = 16,
+  }
+  assert(decodeHeaders(readFrame(encodeHeaders(headers)?, defaultMaxFrameSize)?)?.endHeaders)
+  let priority = PriorityFrame{ streamId = 1, exclusive = false, streamDependency = 0, weight = 16 }
+  assert(decodePriority(readFrame(encodePriority(priority)?, defaultMaxFrameSize)?)?.weight == 16)
+  let reset = RstStreamFrame{ streamId = 1, errorCode = errorCancel }
+  assert(
+      decodeRstStream(readFrame(encodeRstStream(reset)?, defaultMaxFrameSize)?)?.errorCode ==
+      errorCancel,
+  )
+  let settings = [
+    Setting{ id = settingsHeaderTableSize, value = 4096 },
+    Setting{ id = settingsEnablePush, value = 0 },
+    Setting{ id = settingsMaxConcurrentStreams, value = 8 },
+    Setting{ id = settingsInitialWindowSize, value = 65535 },
+    Setting{ id = settingsMaxFrameSize, value = defaultMaxFrameSize },
+    Setting{ id = settingsMaxHeaderListSize, value = 8192 },
+    Setting{ id = settingsEnableConnectProtocol, value = 1 },
+  ]
+  let config = SettingsFrame{ ack = false, settings = settings }
+  assert(len(decodeSettings(readFrame(encodeSettings(config)?, maxMaxFrameSize)?)?.settings) == 7)
+  let push = PushPromiseFrame{
+    streamId = 1, promisedStreamId = 2,
+    blockFragment = []byte(0), endHeaders = true, padLength = -1,
+  }
+  assert(
+      decodePushPromise(readFrame(encodePushPromise(push)?, defaultMaxFrameSize)?)?.promisedStreamId ==
+      2,
+  )
+  let ping = PingFrame{ ack = false, data = []byte("draft-id") }
+  assert(string(decodePing(readFrame(encodePing(ping)?, defaultMaxFrameSize)?)?.data) == "draft-id")
+  let goodbye = GoawayFrame{ lastStreamId = 1, errorCode = errorNoError, debugData = []byte(0) }
+  assert(decodeGoaway(readFrame(encodeGoaway(goodbye)?, defaultMaxFrameSize)?)?.lastStreamId == 1)
+  let credit = WindowUpdateFrame{ streamId = 1, increment = 4096 }
+  assert(
+      decodeWindowUpdate(readFrame(encodeWindowUpdate(credit)?, defaultMaxFrameSize)?)?.increment ==
+      4096,
+  )
+  let continued = ContinuationFrame{ streamId = 1, blockFragment = []byte(0), endHeaders = true }
+  assert(decodeContinuation(readFrame(encodeContinuation(continued)?, defaultMaxFrameSize)?)?.endHeaders)
+}
+
+fn inspectFlags(flags: int): []bool {
+  return [
+    (flags & flagEndStream) != 0, (flags & flagEndHeaders) != 0,
+    (flags & flagPadded) != 0, (flags & flagPriority) != 0, (flags & flagAck) != 0,
+  ]
+}
+
+fn knownError(code: int): bool {
+  let codes = [
+    errorNoError, errorProtocolError, errorInternalError, errorFlowControlError,
+    errorSettingsTimeout, errorStreamClosed, errorFrameSizeError, errorRefusedStream,
+    errorCancel, errorCompressionError, errorConnectError, errorEnhanceYourCalm,
+    errorInadequateSecurity, errorHttp11Required,
+  ]
+  for value of codes {
+    if (value == code) {
+      return true
+    }
+  }
+  return false
+}
+
+fn main(): ()! {
+  inspectDraft()?
+  assert(inspectFlags(flagEndStream)[0])
+  assert(knownError(errorCancel))
+}
+```
+
+`inspectFlags` reports bits only. Their meaning depends on the frame type:
+ACK and END_STREAM share the same bit, for example. Unknown frame types and
+error codes are possible; retain their numeric values when you log them.
+
 ## The frame header
 
 Every HTTP/2 message is a stream of frames: a fixed 9-byte header followed by

@@ -642,8 +642,8 @@ fn encryptedAssertion(body: []byte, recipient: RsaPrivateKey, idp: RsaPublicKey)
 }
 ```
 
-`decryptElement(encrypted: Element, key: RsaPrivateKey): Element!` accepts
-only `xmlenc#Element`, an inline `EncryptedKey`, RSA-OAEP with SHA-1 or
+### `decryptElement(encrypted: Element, key: RsaPrivateKey): Element!`
+Accepts only `xmlenc#Element`, an inline `EncryptedKey`, RSA-OAEP with SHA-1 or
 SHA-256 and independently selected MGF1 SHA-1/SHA-256, and AES-128/256
 GCM or CBC. Legacy `rsa-oaep-mgf1p` fixes MGF1 to SHA-1 and rejects an
 explicit MGF. OAEP labels are supported. RSA1.5, references, unknown algorithms and decrypted DOCTYPE declarations fail. There is no fallback.

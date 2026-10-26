@@ -194,7 +194,7 @@ fn exchangeDraftChunk(stream: H3Stream, encodedFrame: string, wake: chan<int>): 
   stream.writeUntil(encodedFrame, wake) catch e {
     let (incomplete, ok) = e.(H3CleanupIncomplete)
     if (ok) {
-      fail newError("draft feed cleanup incomplete: ${incomplete.cause.message()}")
+      fail newError("draft feed cleanup incomplete: ${incomplete.message()}")
     }
     fail e
   }
@@ -427,7 +427,13 @@ Writes DATA in payloads of at most 16384 bytes and waits for each frame to be ac
 
 Like `write`, but a value on the capacity-one `wake` channel interrupts the write with `H3Aborted`. The running example uses this form for a deadline or cancellation. Any write error closes the local writer and tries to abort both tunnel directions without waiting for command admission; queued bytes may already have reached the peer. Retry on a new tunnel, never within the partial DATA frame.
 
+### `H3CleanupIncomplete`
+
 If cleanup cannot be queued immediately, the failure is `H3CleanupIncomplete`. Its `cause` retains `H3Aborted` or the original transport error. Earlier admitted cleanup commands remain queued, and other streams remain open. Do not call the unbounded `reset` from this error path when cancellation must stay bounded; the example reports incomplete cleanup instead of starting another wait.
+
+### `H3CleanupIncomplete.message(): string`
+
+Returns the original cause message followed by `; h3: stream cleanup incomplete`. Use it for diagnostics; inspect `cause` when handling cancellation. The [extended CONNECT example](#extended-connect) shows both the typed error and its message.
 
 ### `H3Stream.close(): ()!`
 
