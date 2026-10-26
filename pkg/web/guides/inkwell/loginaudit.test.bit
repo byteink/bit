@@ -1,0 +1,149 @@
+fn loginAuditDb(): Db {
+  return googleFixtureDb() catch e {
+    panic(e.message())
+  }
+}
+
+test "cookie sign-in records one account audit and denied credentials add no event" {
+  let app = testApp()
+  let name = uniqueName("login-audit")
+  let cookie = registerAndLogin(app, name, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let db = loginAuditDb()
+  defer db.pool.close()
+  let user = auditUser(db, name)
+  assertAudit(db, "user/${user.id}", user.id, ["auth.login"])
+  assert(app.handle(jsonReq("GET", "/v1/me", cookie, "")).status == 200, "audited session works")
+  let bad = app.handle(
+    jsonReq(
+      "POST", "/v1/auth/login", "",
+      "{\"username\":\"${name}\",\"password\":\"wrong-password\"}",
+    ),
+  )
+  assert(bad.status == 401, "denied sign-in stays unauthorized")
+  assertAudit(db, "user/${user.id}", user.id, ["auth.login"])
+}
+
+test "token sign-in records one audit while refresh rotation adds no sign-in event" {
+  let app = testApp()
+  let name = uniqueName("token-audit")
+  registerAndLogin(app, name, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let response = app.handle(
+    jsonReq(
+      "POST", "/v1/auth/token", "",
+      "{\"username\":\"${name}\",\"password\":\"correct horse battery\"}",
+    ),
+  )
+  assert(response.status == 200, "audited token sign-in succeeds")
+  let access = jsonStringField(response.body, "accessToken")
+  let refresh = jsonStringField(response.body, "refreshToken")
+  assert(len(access) > 0 && len(refresh) > 0, "token pair remains available")
+  let db = loginAuditDb()
+  defer db.pool.close()
+  let user = auditUser(db, name)
+  assertAudit(db, "user/${user.id}", user.id, ["auth.login", "auth.login"])
+  assert(postRefresh(app, refresh).status == 200, "existing refresh semantics remain")
+  assertAudit(db, "user/${user.id}", user.id, ["auth.login", "auth.login"])
+  let denied = app.handle(
+    jsonReq(
+      "POST", "/v1/auth/token", "",
+      "{\"username\":\"${name}\",\"password\":\"wrong-password\"}",
+    ),
+  )
+  assert(denied.status == 401, "token sign-in rejects bad credentials")
+  assertAudit(db, "user/${user.id}", user.id, ["auth.login", "auth.login"])
+}
+
+test "verified Google sign-in records its mapped local account once" {
+  let db = loginAuditDb()
+  defer db.pool.close()
+  let box = GoogleTokenBox{ token = "", calls = 0 }
+  let app = googleFixtureApp(db, box) catch e {
+    panic(e.message())
+  }
+  let email = uniqueName("ga") + "@example.test"
+  let response = googleFixtureLogin(
+    app, box, uniqueName("google-subject"), email,
+    Option.Some(Json.JsonBool(true)),
+  )
+  assert(response.status == 204, "verified local Google callback succeeds")
+  let user = auditUser(db, email)
+  assertAudit(db, "user/${user.id}", user.id, ["auth.login"])
+  let denied = googleFixtureLogin(
+    app, box, uniqueName("unverified-subject"), email,
+    Option.Some(Json.JsonBool(false)),
+  )
+  assert(denied.status == 401, "unverified Google callback stays unauthorized")
+  assertAudit(db, "user/${user.id}", user.id, ["auth.login"])
+}
+
+class MissingAuditActor {
+  name(): string { return "missing-audit-actor" }
+
+  authenticate(c: Ctx): Identity! {
+    c.session()?.set(sessionUserIdKey, "-1")
+    return Identity{ id = "-1", claims = Json.JsonObject([]JsonEntry(0)) }
+  }
+}
+
+fn failedAuditApp(db: Db): App {
+  let cfg = testConfig() catch e {
+    panic(e.message())
+  }
+  let tokens = RefreshTokens(LoginRefreshStore(db)) catch e {
+    panic(e.message())
+  }
+  let access = buildAccessTokens(cfg) catch e {
+    panic(e.message())
+  }
+  let app = App(Config{ secret = "audit-failure", sessions = MemoryStore(100) })
+  app.post("/login", (c) => login(c, db, MissingAuditActor{}))
+  app.post("/token", (c) => issueTokens(c, db, tokens, MissingAuditActor{}, access))
+  app.get("/protected", (c) => {
+    currentUserId(c)?
+    return c.noContent()
+  })
+  app.freeze() catch e {
+    panic(e.message())
+  }
+  return app
+}
+
+test "failed cookie audit and token issuance destroy their provisional sessions" {
+  let db = loginAuditDb()
+  defer db.pool.close()
+  let app = failedAuditApp(db)
+  for path of ["/login", "/token"] {
+    let response = app.handle(jsonReq("POST", path, "", "{}"))
+    assert(response.status == 500, "missing actor must refuse the sign-in")
+    let cookie = cookiePair(response.getHeader("Set-Cookie"))
+    let probe = app.handle(jsonReq("GET", "/protected", cookie, ""))
+    assert(probe.status == 401, "failed sign-in must not retain account access")
+    assert(!contains(response.body, "accessToken"), "failure must not expose credentials")
+  }
+  assert(len(auditRows(db, "user/-1")) == 0, "missing actor cannot acquire audit history")
+}
+
+test "audit insert failure rolls back the initial refresh row" {
+  let db = loginAuditDb()
+  defer db.pool.close()
+  let hash = uniqueName("failed-login-refresh")
+  let rec = RefreshRecord{
+    hash = hash, family = uniqueName("failed-login-family"), subject = "-1",
+    expiresAt = now().ns / Second + 3600, familyExpiresAt = now().ns / Second + 7200,
+    rotatedAt = 0, revoked = false, data = "",
+  }
+  let rejected = false
+  LoginRefreshStore(db).insert(rec) catch _ {
+    rejected = true
+  }
+  assert(rejected, "audit foreign key must reject the missing actor")
+  let rows = db.table<RefreshRow>().where("tokenHash", hash).count() catch e {
+    panic(e.message())
+  }
+  assert(rows == 0, "audit failure must roll back refresh credential storage")
+  assert(len(auditRows(db, "user/-1")) == 0, "failed grant leaves no audit row")
+}
