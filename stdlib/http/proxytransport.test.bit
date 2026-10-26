@@ -1,0 +1,218 @@
+test "proxy endpoint parsing keeps credentials separate from the endpoint (#8735)" {
+  let inputs = [
+    "proxy.example", "http://proxy.example:8080/", "https://proxy.example",
+    "HTTP://[::1]:3128", "http://user:pass@proxy.example", "http://user@proxy.example",
+    "http://@proxy.example", "http://a+b:p%2B%3A%40@proxy.example", "http://user:p:q@proxy.example",
+  ]
+  let hosts = [
+    "proxy.example", "proxy.example", "proxy.example", "::1",
+    "proxy.example", "proxy.example", "proxy.example", "proxy.example", "proxy.example",
+  ]
+  let ports = [80, 8080, 443, 3128, 80, 80, 80, 80, 80]
+  let secure = [false, false, true, false, false, false, false, false, false]
+  let auth = [
+    "", "", "", "", "Basic dXNlcjpwYXNz", "Basic dXNlcjo=", "Basic Og==", "Basic YStiOnArOkA=",
+    "Basic dXNlcjpwOnE=",
+  ]
+  for (let i = 0; i < len(inputs); i = i + 1) {
+    let p = parseProxyEndpoint(inputs[i]) catch e {
+      assert(false, "proxy endpoint row ${i}: ${e.message()}")
+      return
+    }
+    assert(p.url.host == hosts[i], "proxy host row ${i}")
+    assert(p.url.port == ports[i], "proxy port row ${i}")
+    assert(p.url.https == secure[i], "proxy scheme row ${i}")
+    assert(p.authorization == auth[i], "proxy authorization row ${i}")
+  }
+}
+
+fn proxyEndpointRejects(value: string): bool {
+  let _ = parseProxyEndpoint(value) catch _ {
+    return true
+  }
+  return false
+}
+
+test "proxy endpoint parsing rejects invalid URI and credential data (#8735)" {
+  let bad = [
+    "", "socks5://proxy", "http://", "http://proxy:bad", "http://proxy:65536",
+    "http://[invalid]/", "http://[::1", "http://user:p@ss@proxy", "http://proxy/path",
+    "http://proxy?x", "http://proxy#frag", "http://user:%@proxy", "http://user:%0g@proxy",
+    "http://user:%00@proxy", "http://user:%0A@proxy", "http://user:%7F@proxy",
+    "http://u%3Ax:p@proxy", "http://u[p]:x@proxy", "http://proxy\r\nx",
+  ]
+  assert(len(bad) == 19)
+  for (let i = 0; i < len(bad); i = i + 1) {
+    assert(proxyEndpointRejects(bad[i]), "invalid proxy row ${i}")
+  }
+  assert(proxyEndpointRejects(repeat("x", maxHeaderBytes + 1)))
+  assert(proxyEndpointRejects("http://" + repeat("x", 254)))
+  assert(proxyEndpointRejects("http://" + repeat("u", maxHeaderBytes / 2 + 1) + "@proxy"))
+}
+
+test "proxy endpoint errors never echo credential-bearing URLs (#8735)" {
+  let _ = parseProxyEndpoint("http://user:pass@proxy:bad") catch e {
+    assert(e.message() == "http proxy: invalid endpoint authority")
+    return
+  }
+  assert(false, "bad proxy port accepted")
+}
+
+fn proxyTestTarget(): Url {
+  return Url{ host = "::1", port = 8443, path = "/private?token=hidden", https = true, h3 = false }
+}
+
+test "CONNECT sends authority and proxy auth without consuming tunneled bytes (#8735)" {
+  let head = "HTTP/1.1 200 Connection Established\r\nContent-Length: 900\r\n" +
+    "Transfer-Encoding: chunked\r\n\r\n"
+  let s = watch(head + "TLS", 4096)
+  proxyConnect(s, proxyTestTarget(), "Basic dXNlcjpwYXNz") catch e {
+    assert(false, e.message())
+    return
+  }
+  assert(
+      s.wrote ==
+        "CONNECT [::1]:8443 HTTP/1.1\r\nHost: [::1]:8443\r\n" +
+        "Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+  )
+  assert(s.pos == len(head), "CONNECT consumed tunnel bytes")
+  let tail = s.readUp(3) catch e {
+    assert(false, e.message())
+    return
+  }
+  assert(tail == "TLS")
+  assert(s.shuts == 0, "successful tunnel was shut")
+}
+
+test "CONNECT accepts any 2xx and omits absent proxy auth (#8735)" {
+  for status of ["200 OK", "204 No Content", "299 Private"] {
+    let s = watch("HTTP/1.1 ${status}\r\n\r\n", 4096)
+    proxyConnect(s, proxyTestTarget(), "") catch e {
+      assert(false, e.message())
+      return
+    }
+    assert(indexOf(s.wrote, "Proxy-Authorization") < 0)
+    assert(indexOf(s.wrote, "/private") < 0)
+  }
+}
+
+fn proxyConnectRejects(data: string): bool {
+  proxyConnect(watch(data, 4096), proxyTestTarget(), "") catch _ {
+    return true
+  }
+  return false
+}
+
+test "CONNECT rejects failed or malformed status lines (#8735)" {
+  for line of [
+    "HTTP/1.1 101 Switching Protocols", "HTTP/1.1 300 Moved", "HTTP/1.1 407 Proxy Auth",
+    "HTTP/1.1 500 Failed", "HTTP/1.1 099 Invalid", "HTTP/1.1 600 Invalid",
+    "HTTP/2 200 OK", "HTTP/1.1 2000 Invalid", "HTTP/1.Z 200 OK", "HTTP/1.1 2e0 Invalid",
+    "HTTP/1.1 20 Invalid", "HTTP/1.1 200", "junk HTTP/1.1 200 OK", "HTTP/1.1 200\nX",
+  ] {
+    assert(proxyConnectRejects(line + "\r\n\r\n"), "bad CONNECT status accepted")
+  }
+  assert(proxyConnectRejects("HTTP/1.1 200 OK\r\n"))
+}
+
+test "CONNECT bounds interim responses and preserves the final tunnel prefix (#8735)" {
+  let interim = "HTTP/1.1 100 Continue\r\n\r\n"
+  let s = watch(interim + "HTTP/1.1 200 OK\r\n\r\nZ", 4096)
+  proxyConnect(s, proxyTestTarget(), "") catch e {
+    assert(false, e.message())
+    return
+  }
+  let prefix = s.readUp(1) catch e {
+    assert(false, e.message())
+    return
+  }
+  assert(prefix == "Z")
+  let full = repeat(interim, maxInterimResponses) + "HTTP/1.1 200 OK\r\n\r\n"
+  let capped = watch(full, 4096)
+  proxyConnect(capped, proxyTestTarget(), "") catch _ {
+    assert(capped.pos == len(interim) * maxInterimResponses)
+    return
+  }
+  assert(false, "unbounded interim responses accepted")
+}
+
+test "CONNECT reads exactly the bounded head without a response body (#8735)" {
+  let prefix = "HTTP/1.1 200 OK\r\nX: "
+  let head = prefix + repeat("a", maxHeaderBytes - len(prefix))
+  let s = watch(head + "\r\n\r\nZ", 4096)
+  proxyConnect(s, proxyTestTarget(), "") catch e {
+    assert(false, e.message())
+    return
+  }
+  assert(s.pos == maxHeaderBytes + 4)
+  assert(proxyConnectRejects(head + "a\r\n\r\nZ"))
+}
+
+test "CONNECT refuses authority and header injection before writing (#8735)" {
+  for host of ["", "a\rb", "a\nb", "a b", "a@b", "a/b", "a?b", "a#b", "[::1]"] {
+    let target = proxyTestTarget()
+    target.host = host
+    let s = watch("HTTP/1.1 200 OK\r\n\r\n", 4096)
+    proxyConnect(s, target, "") catch _ {
+      assert(s.wrote == "", "invalid authority reached the proxy")
+      continue
+    }
+    assert(false, "bad CONNECT host accepted")
+  }
+  for auth of ["Basic x\r\nInjected: y", "Basic x\0y", repeat("x", maxHeaderBytes + 1)] {
+    let s = watch("HTTP/1.1 200 OK\r\n\r\n", 4096)
+    proxyConnect(s, proxyTestTarget(), auth) catch _ {
+      assert(s.wrote == "", "invalid authorization reached the proxy")
+      continue
+    }
+    assert(false, "bad CONNECT auth accepted")
+  }
+}
+
+class proxyFaultStream {
+  inner: watchedStream
+  problem: error
+  onWrite: bool
+
+  readUp(n: int): string! { fail this.problem }
+
+  writeStr(s: string): ()! {
+    if (this.onWrite) {
+      fail this.problem
+    }
+    this.inner.writeStr(s)?
+  }
+
+  writeBytes(b: []byte): ()! { this.inner.writeBytes(b)? }
+
+  shut() { this.inner.shut() }
+
+  forceClose() { this.inner.forceClose() }
+
+  peer(): string { return this.inner.peer() }
+
+  unread(extra: string) { this.inner.unread(extra) }
+
+  setIdleDeadline(deadlineNs: int) { this.inner.setIdleDeadline(deadlineNs) }
+}
+
+fn proxyPreservesFault(problem: error, onWrite: bool) {
+  let s = proxyFaultStream{ inner = watch("", 1), problem = problem, onWrite = onWrite }
+  proxyConnect(s, proxyTestTarget(), "") catch e {
+    assert(e.message() == problem.message())
+    let (_, wasCancel) = problem.(Cancelled)
+    let (_, isCancel) = e.(Cancelled)
+    let (_, wasTimeout) = problem.(TimeoutError)
+    let (_, isTimeout) = e.(TimeoutError)
+    assert(wasCancel == isCancel && wasTimeout == isTimeout)
+    return
+  }
+  assert(false, "CONNECT swallowed a stream error")
+}
+
+test "CONNECT preserves typed stream deadline and cancellation errors (#8735)" {
+  proxyPreservesFault(Cancelled{ op = "send" }, false)
+  proxyPreservesFault(Cancelled{ op = "send" }, true)
+  proxyPreservesFault(TimeoutError{ op = "read", ms = 7 }, false)
+  proxyPreservesFault(TimeoutError{ op = "write", ms = 7 }, true)
+}
